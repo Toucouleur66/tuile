@@ -780,7 +780,9 @@ impl Live {
         loader: Arc<dyn TileLoader>,
         config: SessionConfig,
     ) -> std::io::Result<Self> {
-        let traversal = exact_traversal(config.traversal.clone());
+        let mut traversal = exact_traversal(config.traversal.clone());
+        traversal.resident_budget_bytes =
+            residency_budget(config.finish, traversal.resident_budget_bytes);
         // Every knob that can move a selection, once, at the top of the
         // stream. A run that differs because it was configured differently is
         // not the bug worth chasing, and this is what tells the two apart
@@ -1131,6 +1133,21 @@ async fn converge(
                 }
             }
         }
+    }
+}
+
+/// The bytes of tiles the geometry server may count as resident before it
+/// evicts, for a session that finishes its tiles as `finish` says.
+///
+/// The budget bounds what the session holds, tile by tile: meshes and
+/// pictures. A session that finishes by identity holds neither, so the
+/// server's count — which goes on weighing what it sent — measures nothing
+/// that exists, and evicting on it only removes tiles a frame still needs.
+/// There the budget is none.
+fn residency_budget(finish: Finish, resolved: usize) -> usize {
+    match finish {
+        Finish::Pictures => resolved,
+        Finish::Identity => usize::MAX,
     }
 }
 
@@ -2518,6 +2535,20 @@ pub(crate) mod tests {
         assert_eq!(without.drape(), with.drape());
         assert_eq!(without.origin_ecef, with.origin_ecef);
         assert!(with.memoized.is_some() && without.memoized.is_none());
+    }
+
+    /// A residency budget is there so that what a session holds fits its
+    /// machine. A session that finishes by identity holds nothing of a tile,
+    /// so there is nothing for a budget to bound — and a budget that still
+    /// evicted would only take away, mid-frame, tiles the frame is waiting
+    /// on: a frame that never converges (measured: frame 19 of a 4K bake at
+    /// a three-pixel error spent its fifteen minutes this way).
+    #[test]
+    fn a_session_that_holds_nothing_has_no_residency_budget() {
+        let four_gigabytes = 4usize << 30;
+        assert_eq!(residency_budget(Finish::Identity, four_gigabytes), usize::MAX);
+        // What draws keeps its tiles, and its budget.
+        assert_eq!(residency_budget(Finish::Pictures, four_gigabytes), four_gigabytes);
     }
 
     /// What [`quad_flight`] gave before anything was optimised.
