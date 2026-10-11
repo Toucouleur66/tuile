@@ -780,9 +780,7 @@ impl Live {
         loader: Arc<dyn TileLoader>,
         config: SessionConfig,
     ) -> std::io::Result<Self> {
-        let mut traversal = exact_traversal(config.traversal.clone());
-        traversal.resident_budget_bytes =
-            residency_budget(config.finish, traversal.resident_budget_bytes);
+        let traversal = exact_traversal(config.traversal.clone());
         // Every knob that can move a selection, once, at the top of the
         // stream. A run that differs because it was configured differently is
         // not the bug worth chasing, and this is what tells the two apart
@@ -1136,21 +1134,6 @@ async fn converge(
     }
 }
 
-/// The bytes of tiles the geometry server may count as resident before it
-/// evicts, for a session that finishes its tiles as `finish` says.
-///
-/// The budget bounds what the session holds, tile by tile: meshes and
-/// pictures. A session that finishes by identity holds neither, so the
-/// server's count — which goes on weighing what it sent — measures nothing
-/// that exists, and evicting on it only removes tiles a frame still needs.
-/// There the budget is none.
-fn residency_budget(finish: Finish, resolved: usize) -> usize {
-    match finish {
-        Finish::Pictures => resolved,
-        Finish::Identity => usize::MAX,
-    }
-}
-
 /// The pool tiles are finished on: one thread per core (unless
 /// `TUILE_FINISH_THREADS` says), built once per process.
 fn finish_pool() -> &'static rayon::ThreadPool {
@@ -1231,14 +1214,15 @@ fn env_knob<T: std::str::FromStr + PartialOrd>(name: &str, default: T) -> T {
 /// Holes are forbidden for the same reason, whichever way the caller's config
 /// leans.
 ///
-/// Residency budgets are interactive kindnesses too — they exist so a viewer
-/// stays inside a device. On a farm node the budget is effectively infinite
-/// (an eviction *during* convergence keeps the request count above zero
-/// forever — a hang, not a limit), and TUILE_RESIDENT_BUDGET_GB says so per
-/// job. The DEFAULT stays finite on purpose: "infinite" run on a laptop
-/// alongside a renderer took the whole machine down (measured the hard way,
-/// 2026-09-08). Generous enough for every local gate render so far, bounded
-/// enough to fail a frame instead of the host.
+/// A residency budget is an interactive notion: it lets a viewer stay inside
+/// its device by giving up tiles it can ask for again. This path has none.
+/// A batch frame converges when every tile it selects is there, so an
+/// eviction *during* convergence takes away what the frame is waiting on and
+/// keeps the request count above zero for ever — a hang, not a limit
+/// (measured: frame 19 of a 4K bake). What a batch job may hold is bounded
+/// where it is held — by what a session keeps of a tile ([`Finish`]), and by
+/// the machine it is given — not by evicting from under a frame.
+/// `TUILE_RESIDENT_BUDGET_GB` is no longer read.
 ///
 /// Public because a **bake** has to be able to name what it baked. A pack is
 /// the bake of the settings it was made with, not of the defaults, so the
@@ -1249,8 +1233,7 @@ fn env_knob<T: std::str::FromStr + PartialOrd>(name: &str, default: T) -> T {
 pub fn exact_traversal(mut config: Config) -> Config {
     config.stand_ins = false;
     config.forbid_holes = true;
-    let budget_gb: usize = env_knob("TUILE_RESIDENT_BUDGET_GB", 4).max(1);
-    config.resident_budget_bytes = budget_gb.saturating_mul(1024 * 1024 * 1024);
+    config.resident_budget_bytes = usize::MAX;
     config.resident_tile_limit = usize::MAX;
     // Micro-batches, not one bulk flood: the wave is sized to the connection
     // pool, because beyond it nothing goes any faster.
@@ -2537,18 +2520,21 @@ pub(crate) mod tests {
         assert!(with.memoized.is_some() && without.memoized.is_none());
     }
 
-    /// A residency budget is there so that what a session holds fits its
-    /// machine. A session that finishes by identity holds nothing of a tile,
-    /// so there is nothing for a budget to bound — and a budget that still
-    /// evicted would only take away, mid-frame, tiles the frame is waiting
-    /// on: a frame that never converges (measured: frame 19 of a 4K bake at
-    /// a three-pixel error spent its fifteen minutes this way).
+    /// A residency budget is an interactive notion: it keeps a viewer inside
+    /// its device by letting go of tiles it can fetch again. A batch frame is
+    /// exact or it is nothing — it converges when every tile it selects is
+    /// there — so evicting on a budget while it converges only takes away
+    /// tiles it is waiting on, and the frame never ends (measured: frame 19
+    /// of a 4K bake spent its fifteen minutes this way). The batch path has
+    /// no budget, whatever the caller or the environment asked.
     #[test]
-    fn a_session_that_holds_nothing_has_no_residency_budget() {
-        let four_gigabytes = 4usize << 30;
-        assert_eq!(residency_budget(Finish::Identity, four_gigabytes), usize::MAX);
-        // What draws keeps its tiles, and its budget.
-        assert_eq!(residency_budget(Finish::Pictures, four_gigabytes), four_gigabytes);
+    fn the_batch_path_has_no_residency_budget() {
+        let exact = exact_traversal(Config {
+            resident_budget_bytes: 1,
+            ..Config::default()
+        });
+        assert_eq!(exact.resident_budget_bytes, usize::MAX);
+        assert_eq!(exact.resident_tile_limit, usize::MAX);
     }
 
     /// What [`quad_flight`] gave before anything was optimised.
