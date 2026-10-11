@@ -51,7 +51,7 @@ pub use frame::{shadow_reach, FrameUniform, SunView, TileFrame};
 /// How many tiles may be resident at once. Fixed because the scan that bins
 /// pixels by tile runs over all of them in one workgroup; it matches
 /// `MAX_SLOTS` in `bin.wgsl`.
-pub const MAX_SLOTS: u32 = 8192;
+pub const MAX_SLOTS: u32 = 16384;
 /// Dynamic uniform offsets must be 256-aligned on every backend.
 const SLOT_STRIDE: u64 = 256;
 

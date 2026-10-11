@@ -10,7 +10,7 @@
 //            and its indirect dispatch size
 //   scatter: pixel indices into the list, grouped by slot
 
-const MAX_SLOTS: u32 = 8192u;
+const MAX_SLOTS: u32 = 16384u;
 const SCAN_THREADS: u32 = 256u;
 const PER_THREAD: u32 = MAX_SLOTS / SCAN_THREADS;
 const RESOLVE_GROUP: u32 = 64u;
