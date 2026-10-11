@@ -630,6 +630,10 @@ async fn main() -> Result<(), Error> {
         "tiles: {} from the store, {} from the pack, {} source tiles renewed since the bake",
         done.tiles_from_store, done.tiles_from_pack, done.renewed,
     );
+    println!(
+        "drapes: {} kept from a smaller level, their tiles being far; {} entered again larger, their tiles come closer",
+        done.drapes_reduced, done.drapes_regrown,
+    );
     if let Some((fine, coarse)) = done.shadow_texel {
         println!(
             "shadows: a texel of the sun's map is {fine:.1} to {coarse:.1} m of ground, frame by frame"

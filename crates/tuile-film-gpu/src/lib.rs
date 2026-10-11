@@ -227,6 +227,9 @@ pub struct FilmGpu {
     /// Drapes to compose before the next frame is drawn — and before their
     /// mips, which are made from what this writes.
     pending_drapes: Vec<Drape>,
+    /// Drapes to be kept from one of their levels down: the whole one, the
+    /// one kept, the first level kept.
+    pending_tails: Vec<(wgpu::Texture, wgpu::Texture, u32)>,
 }
 
 /// One imagery tile of a drape and where it lies on the terrain tile.
@@ -918,6 +921,7 @@ impl FilmGpu {
             free: (0..MAX_SLOTS).rev().collect(),
             pending_mips: Vec::new(),
             pending_drapes: Vec::new(),
+            pending_tails: Vec::new(),
         }
     }
 
@@ -1214,6 +1218,23 @@ impl FilmGpu {
         })
     }
 
+    /// The mip chain of `whole` from `level` down, as a texture of its own:
+    /// what a tile too small on screen to be read above that level is entered
+    /// with, in place of `whole`. Its texels are the very ones `whole` would
+    /// have had there. `whole` is the caller's to fill or [`Self::compose`]
+    /// before the next frame is drawn, and to drop; a `level` past the chain
+    /// is its last.
+    pub fn tail(&mut self, whole: &wgpu::Texture, level: u32) -> wgpu::Texture {
+        let level = level.min(whole.mip_level_count() - 1);
+        let kept = self.create_albedo(
+            (whole.width() >> level).max(1),
+            (whole.height() >> level).max(1),
+        );
+        self.pending_tails
+            .push((whole.clone(), kept.clone(), level));
+        kept
+    }
+
     /// Composes a drape into level 0 of `albedo`, before the next frame is
     /// drawn: `base` where no layer reaches, then each layer over its
     /// rectangle, in order. The arithmetic is the bake's.
@@ -1235,6 +1256,22 @@ impl FilmGpu {
     /// drawing a frame.
     pub fn record_pending(&mut self, encoder: &mut wgpu::CommandEncoder) {
         self.record_drapes(encoder);
+        if !self.pending_tails.is_empty() {
+            // The whole chains first: a tail is cut from a level they made.
+            let whole: Vec<wgpu::Texture> =
+                self.pending_tails.iter().map(|t| t.0.clone()).collect();
+            Self::record_mips(&self.device, &self.pipelines.mips, encoder, &whole);
+            for (whole, kept, level) in self.pending_tails.drain(..) {
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        mip_level: level,
+                        ..whole.as_image_copy()
+                    },
+                    kept.as_image_copy(),
+                    kept.size(),
+                );
+            }
+        }
         Self::record_mips(
             &self.device,
             &self.pipelines.mips,

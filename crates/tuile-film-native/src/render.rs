@@ -17,6 +17,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
+use glam::DVec3;
+use tuile_film::drape::{on_screen_px, spared, sphere};
 use tuile_film::from_store::{compose, imagery_texture, is_baked, terrain_mesh};
 use tuile_film::{
     refs_of, texture_of_span, Content, Cursor, FrameCamera, Look, Mesh, Overlays, Pack, TileKey,
@@ -102,6 +104,10 @@ pub struct Done {
     /// With shadows: the finest and the coarsest a texel of the sun's map
     /// was on the ground over the frames rendered, in metres.
     pub shadow_texel: Option<(f32, f32)>,
+    /// Tiles entered with less than their whole drape, being far; and tiles
+    /// entered again with more of it, having come closer.
+    pub drapes_reduced: u64,
+    pub drapes_regrown: u64,
 }
 
 /// Store tiles asked for at once.
@@ -109,6 +115,29 @@ const AT_ONCE: usize = 48;
 
 /// Imagery tiles kept on the GPU before they are let go.
 const TEXTURES_HELD: usize = 2048;
+
+/// Tiles entered before what they queued — drapes to compose, mips to make —
+/// is handed to the GPU and waited for. A frame that enters ten thousand
+/// tiles otherwise holds every imagery tile and every whole drape of all of
+/// them at once, until it is drawn.
+const ENTERED_AT_ONCE: usize = 256;
+
+/// A drape is kept for this many times the pixels its tile spans, so that a
+/// tile coming closer is not composed again at every step.
+const DRAPE_HEADROOM: f64 = 1.5;
+
+/// A tile as it is resident.
+struct Held {
+    /// The imagery levels of its drape.
+    levels: Vec<u8>,
+    /// Its drape's side as baked, and the levels of it not kept; no side
+    /// for a drape that is kept whole whatever the distance.
+    side: u32,
+    spared: u32,
+    /// The sphere around its mesh.
+    centre: DVec3,
+    radius: f64,
+}
 
 /// A tile's corners as the composition is handed them, each taken at
 /// `strength`: every number of a corner is one that blends, so a part of
@@ -246,7 +275,7 @@ pub async fn render(
         ..Done::default()
     };
     // What is resident, and the imagery levels of each one's drape.
-    let mut resident: HashMap<TileKey, Vec<u8>> = HashMap::new();
+    let mut resident: HashMap<TileKey, Held> = HashMap::new();
     let mut textures: HashMap<(u8, u32, u32), (wgpu::Texture, bool)> = HashMap::new();
     // The frame's overlays, the same allocation from one frame to the next.
     let mut shapes = Vec::new();
@@ -398,82 +427,123 @@ pub async fn render(
             let mut timings = Timings::default();
             let mut entered = 0usize;
 
-            // Everything the entering tiles read from the store, asked for
-            // at once: a frame's reads wait on one another for nothing.
-            // Let go between frames only: what a frame was told it need not
-            // read must still be there when the frame composes with it.
-            if textures.len() >= TEXTURES_HELD {
-                textures.clear();
-            }
-            let (mut terrain_read, mut imagery_read) = (HashMap::new(), HashMap::new());
-            if let Some((terrain_layer, imagery_layer)) = layers {
-                let (mut terrain_wanted, mut imagery_wanted) = (HashSet::new(), HashSet::new());
-                for tile in &diff.enter {
-                    if resident.contains_key(&TileKey::of(tile)) {
-                        continue;
-                    }
-                    let Some(refs) = refs_of(tile) else { continue };
-                    terrain_wanted.insert((refs.terrain.level, refs.terrain.x, refs.terrain.y));
-                    for placed in &refs.imagery {
-                        let at = (placed.tile.level, placed.tile.x, placed.tile.y);
-                        if !textures.contains_key(&at) {
-                            imagery_wanted.insert(at);
-                        }
+            // The pixels a tile's sphere can span in this frame's picture, as
+            // the raster samples it.
+            let eye = DVec3::from_array(diff.view.position);
+            let rows = f64::from(height * order.supersample.max(1));
+            let span = |centre: DVec3, radius: f64| {
+                on_screen_px(radius, (centre - eye).length(), rows, diff.view.fovy_rad)
+            };
+
+            // What this frame builds: the tiles it draws that the frame
+            // before did not, and those come close enough to be read at a
+            // level of their drape that was not kept. The latter are let go
+            // and entered again before the frame is drawn, never between
+            // two frames: nothing is drawn without them.
+            let mut entering: Vec<tuile_film::fb::Tile<'_>> = diff
+                .enter
+                .iter()
+                .filter(|tile| !resident.contains_key(&TileKey::of(tile)))
+                .copied()
+                .collect();
+            let closer: HashSet<TileKey> = diff
+                .selection
+                .iter()
+                .filter(|key| {
+                    resident.get(key).is_some_and(|held| {
+                        held.spared > 0
+                            && spared(held.side, span(held.centre, held.radius)) < held.spared
+                    })
+                })
+                .copied()
+                .collect();
+            if !closer.is_empty() {
+                for tile in pack.frame(diff.frame)? {
+                    let key = TileKey::of(&tile);
+                    if closer.contains(&key) && resident.remove(&key).is_some() {
+                        gpu.leave(&key);
+                        entering.push(tile);
+                        done.drapes_regrown += 1;
                     }
                 }
-                let store = &sources.store.tiles;
-                for (layer, wanted, read, spent) in [
-                    (
-                        terrain_layer,
-                        terrain_wanted,
-                        &mut terrain_read,
-                        &mut timings.read_terrain,
-                    ),
-                    (
-                        imagery_layer,
-                        imagery_wanted,
-                        &mut imagery_read,
-                        &mut timings.read_imagery,
-                    ),
-                ] {
-                    let t = Instant::now();
-                    let wanted: Vec<(u8, u32, u32)> = wanted.into_iter().collect();
-                    // Held since the read ahead, and then nothing is asked;
-                    // otherwise their zones' manifests come together.
-                    store.open_zones(layer, wanted.iter().copied()).await?;
-                    for some in wanted.chunks(AT_ONCE) {
-                        let found = futures_util::future::join_all(
-                            some.iter().map(|at| store.tile(layer, at.0, at.1, at.2)),
-                        )
-                        .await;
-                        for (at, tile) in some.iter().zip(found) {
-                            if let Some(tile) = tile? {
-                                read.insert(*at, tile.bytes);
+            }
+            let batches = entering.len().div_ceil(ENTERED_AT_ONCE);
+
+            for batch in entering.chunks(ENTERED_AT_ONCE) {
+                // Everything the batch reads from the store, asked for at once:
+                // its reads wait on one another for nothing. Imagery is let go
+                // between batches only: what a batch was told it need not read
+                // must still be there when the batch composes with it.
+                if textures.len() >= TEXTURES_HELD {
+                    textures.clear();
+                }
+                let (mut terrain_read, mut imagery_read) = (HashMap::new(), HashMap::new());
+                if let Some((terrain_layer, imagery_layer)) = layers {
+                    let (mut terrain_wanted, mut imagery_wanted) = (HashSet::new(), HashSet::new());
+                    for tile in batch {
+                        let Some(refs) = refs_of(tile) else { continue };
+                        terrain_wanted.insert((refs.terrain.level, refs.terrain.x, refs.terrain.y));
+                        for placed in &refs.imagery {
+                            let at = (placed.tile.level, placed.tile.x, placed.tile.y);
+                            if !textures.contains_key(&at) {
+                                imagery_wanted.insert(at);
                             }
                         }
                     }
-                    *spent += ms(t);
+                    let store = &sources.store.tiles;
+                    for (layer, wanted, read, spent) in [
+                        (
+                            terrain_layer,
+                            terrain_wanted,
+                            &mut terrain_read,
+                            &mut timings.read_terrain,
+                        ),
+                        (
+                            imagery_layer,
+                            imagery_wanted,
+                            &mut imagery_read,
+                            &mut timings.read_imagery,
+                        ),
+                    ] {
+                        let t = Instant::now();
+                        let wanted: Vec<(u8, u32, u32)> = wanted.into_iter().collect();
+                        // Held since the read ahead, and then nothing is asked;
+                        // otherwise their zones' manifests come together.
+                        store.open_zones(layer, wanted.iter().copied()).await?;
+                        for some in wanted.chunks(AT_ONCE) {
+                            let found = futures_util::future::join_all(
+                                some.iter().map(|at| store.tile(layer, at.0, at.1, at.2)),
+                            )
+                            .await;
+                            for (at, tile) in some.iter().zip(found) {
+                                if let Some(tile) = tile? {
+                                    read.insert(*at, tile.bytes);
+                                }
+                            }
+                        }
+                        *spent += ms(t);
+                    }
                 }
-            }
 
-            for tile in &diff.enter {
-                let key = TileKey::of(tile);
-                if resident.contains_key(&key) {
-                    continue;
-                }
-                let factor = match tile.base_color_factor() {
-                    Some(v) if v.len() == 4 => [v.get(0), v.get(1), v.get(2), v.get(3)],
-                    _ => [1.0; 4],
-                };
-                let refs = layers.and_then(|_| refs_of(tile));
-                let terrain_of = refs
-                    .as_ref()
-                    .map(|r| (r.terrain.level, r.terrain.x, r.terrain.y));
-                let (mesh, texture, origin, imagery_of) = match (refs, layers, scheme.as_ref()) {
-                    (Some(refs), Some((terrain_layer, imagery_layer)), Some(scheme)) => {
-                        let source = refs.terrain;
-                        // Shared by the tiles cut from one ancestor.
-                        let terrain = terrain_read
+                for tile in batch {
+                    let key = TileKey::of(tile);
+                    let factor = match tile.base_color_factor() {
+                        Some(v) if v.len() == 4 => [v.get(0), v.get(1), v.get(2), v.get(3)],
+                        _ => [1.0; 4],
+                    };
+                    let refs = layers.and_then(|_| refs_of(tile));
+                    let terrain_of = refs
+                        .as_ref()
+                        .map(|r| (r.terrain.level, r.terrain.x, r.terrain.y));
+                    let (mesh, texture, origin, imagery_of, drape) = match (
+                        refs,
+                        layers,
+                        scheme.as_ref(),
+                    ) {
+                        (Some(refs), Some((terrain_layer, imagery_layer)), Some(scheme)) => {
+                            let source = refs.terrain;
+                            // Shared by the tiles cut from one ancestor.
+                            let terrain = terrain_read
                             .get(&(source.level, source.x, source.y))
                             .ok_or_else(|| {
                                 format!(
@@ -481,168 +551,207 @@ pub async fn render(
                                     source.level, source.x, source.y
                                 )
                             })?;
-                        if !is_baked(&source, terrain) {
-                            done.renewed += 1;
-                        }
-                        let t = Instant::now();
-                        let mesh = terrain_mesh(tile.id(), &refs, terrain, factor)?;
-                        timings.mesh += ms(t);
+                            if !is_baked(&source, terrain) {
+                                done.renewed += 1;
+                            }
+                            let t = Instant::now();
+                            let mesh = terrain_mesh(tile.id(), &refs, terrain, factor)?;
+                            timings.mesh += ms(t);
 
-                        let mut drape = Vec::with_capacity(refs.imagery.len());
-                        let mut translucent = false;
-                        for placed in &refs.imagery {
-                            let at = (placed.tile.level, placed.tile.x, placed.tile.y);
-                            if !textures.contains_key(&at) {
-                                let found = imagery_read.get(&at).ok_or_else(|| {
+                            let mut drape = Vec::with_capacity(refs.imagery.len());
+                            let mut translucent = false;
+                            for placed in &refs.imagery {
+                                let at = (placed.tile.level, placed.tile.x, placed.tile.y);
+                                if !textures.contains_key(&at) {
+                                    let found = imagery_read.get(&at).ok_or_else(|| {
                                     format!(
                                         "imagery {}/{}/{} of layer {imagery_layer} is no longer in the tile store",
                                         at.0, at.1, at.2
                                     )
                                 })?;
-                                let renewed = !is_baked(&placed.tile, found);
-                                done.renewed += u64::from(renewed);
-                                let t = Instant::now();
-                                observer.imagery(&ImageryIn {
-                                    level: at.0,
-                                    x: at.1,
-                                    y: at.2,
-                                    bytes: found,
-                                    renewed,
-                                    grade: Default::default(),
-                                });
-                                timings.observe += ms(t);
-                                let t = Instant::now();
-                                let decoded = imagery_texture(&placed.tile, scheme, found)?;
-                                let opaque = decoded.rgba8.chunks_exact(4).all(|p| p[3] == 255);
-                                timings.decode += ms(t);
-                                let t = Instant::now();
-                                let texture = gpu.create_imagery(decoded.width, decoded.height);
-                                gpu.write_rgba(&texture, &decoded.rgba8);
-                                timings.upload += ms(t);
-                                textures.insert(at, (texture, opaque));
+                                    let renewed = !is_baked(&placed.tile, found);
+                                    done.renewed += u64::from(renewed);
+                                    let t = Instant::now();
+                                    observer.imagery(&ImageryIn {
+                                        level: at.0,
+                                        x: at.1,
+                                        y: at.2,
+                                        bytes: found,
+                                        renewed,
+                                        grade: Default::default(),
+                                    });
+                                    timings.observe += ms(t);
+                                    let t = Instant::now();
+                                    let decoded = imagery_texture(&placed.tile, scheme, found)?;
+                                    let opaque = decoded.rgba8.chunks_exact(4).all(|p| p[3] == 255);
+                                    timings.decode += ms(t);
+                                    let t = Instant::now();
+                                    let texture = gpu.create_imagery(decoded.width, decoded.height);
+                                    gpu.write_rgba(&texture, &decoded.rgba8);
+                                    timings.upload += ms(t);
+                                    textures.insert(at, (texture, opaque));
+                                }
+                                let (texture, opaque) = &textures[&at];
+                                translucent |= !opaque;
+                                drape.push((placed, texture.clone()));
                             }
-                            let (texture, opaque) = &textures[&at];
-                            translucent |= !opaque;
-                            drape.push((placed, texture.clone()));
-                        }
-                        let imagery_of: Vec<(u8, u32, u32)> = refs
-                            .imagery
-                            .iter()
-                            .map(|p| (p.tile.level, p.tile.x, p.tile.y))
-                            .collect();
-                        let t = Instant::now();
-                        let texture = if drape.is_empty() {
-                            None
-                        } else if translucent {
-                            // A translucent layer blends with what is under
-                            // it, which the GPU's composition cannot read:
-                            // that drape is composed here, exactly.
-                            let mut decoded = HashMap::new();
-                            for placed in &refs.imagery {
-                                let at = (placed.tile.level, placed.tile.x, placed.tile.y);
-                                let found = sources
-                                    .store
-                                    .tiles
-                                    .tile(imagery_layer, at.0, at.1, at.2)
-                                    .await?
-                                    .ok_or("an imagery tile left the store mid-frame")?;
-                                let mut texels =
-                                    imagery_texture(&placed.tile, scheme, &found.bytes)?;
-                                let (w, h) = (texels.width, texels.height);
-                                fielded(at, &mut texels.rgba8, w, h);
-                                decoded.insert(at, std::sync::Arc::new(texels));
-                            }
-                            compose(&refs, factor, |t| decoded[&(t.level, t.x, t.y)].clone()).map(
-                                |texels| {
-                                    let texture = gpu.create_albedo(texels.width, texels.height);
-                                    gpu.write_rgba(&texture, &texels.rgba8);
-                                    texture
-                                },
-                            )
-                        } else {
-                            let side = refs.composed_side.max(1);
-                            let albedo = gpu.create_albedo(side, side);
-                            let layers = drape
-                                .into_iter()
-                                .map(|(placed, texture)| DrapeLayer {
-                                    texture,
-                                    coverage: placed.coverage,
-                                    translation: placed.translation,
-                                    scale: placed.scale,
-                                    grade: LayerGrade::IDENTITY,
-                                    field: {
-                                        let at =
-                                            (placed.tile.level as u8, placed.tile.x, placed.tile.y);
-                                        matrices(at).or_else(|| {
-                                            corners(at).map(|c| layer_field(&c, strength))
-                                        })
-                                    },
-                                })
+                            let imagery_of: Vec<(u8, u32, u32)> = refs
+                                .imagery
+                                .iter()
+                                .map(|p| (p.tile.level, p.tile.x, p.tile.y))
                                 .collect();
-                            gpu.compose(&albedo, factor, layers);
-                            Some(albedo)
-                        };
-                        timings.enter += ms(t);
-                        done.tiles_from_store += 1;
-                        (mesh, texture, Origin::Store, imagery_of)
-                    }
-                    _ => {
-                        let span = pack.span_of(tile).ok_or_else(|| {
-                            format!(
-                                "tile {} is neither in the tile store nor in the pack",
-                                tile.id()
-                            )
-                        })?;
-                        let t = Instant::now();
-                        let part = sources
-                            .packs
-                            .objects
-                            .read(&file.key, blobs + span.start..blobs + span.end)
-                            .await?;
-                        timings.read_pack += ms(t);
-                        let t = Instant::now();
-                        let mesh = Mesh::of_span(&pack, tile, span.start, &part)?;
-                        let texture = match texture_of_span(&pack, tile, span.start, &part)? {
-                            Some(png) => {
-                                let rgba = image::load_from_memory(&png)?.to_rgba8();
-                                let texture = gpu.create_albedo(rgba.width(), rgba.height());
-                                gpu.write_rgba(&texture, &rgba);
-                                Some(texture)
-                            }
-                            None => None,
-                        };
-                        timings.decode += ms(t);
-                        done.tiles_from_pack += 1;
-                        (mesh, texture, Origin::Pack, Vec::new())
-                    }
-                };
-                let t = Instant::now();
-                observer.tile(&TileIn {
-                    frame: diff.frame,
-                    key,
-                    origin,
-                    imagery: &imagery_of,
-                    terrain: terrain_of,
-                    mesh: &mesh,
-                });
-                timings.observe += ms(t);
-                let t = Instant::now();
-                gpu.enter(
-                    key,
-                    &TileMesh {
-                        origin_ecef: mesh.origin_ecef,
-                        positions: &mesh.positions,
-                        normals: &mesh.normals,
-                        uvs: &mesh.uvs,
-                        indices: &mesh.indices,
-                        index_count: mesh.index_count,
-                        base_color_factor: mesh.base_color_factor,
-                    },
-                    texture,
-                )?;
-                timings.enter += ms(t);
-                resident.insert(key, imagery_of.iter().map(|at| at.0).collect());
-                entered += 1;
+                            let t = Instant::now();
+                            let mut kept = (0, 0);
+                            let texture = if drape.is_empty() {
+                                None
+                            } else if translucent {
+                                // A translucent layer blends with what is under
+                                // it, which the GPU's composition cannot read:
+                                // that drape is composed here, exactly.
+                                let mut decoded = HashMap::new();
+                                for placed in &refs.imagery {
+                                    let at = (placed.tile.level, placed.tile.x, placed.tile.y);
+                                    let found = sources
+                                        .store
+                                        .tiles
+                                        .tile(imagery_layer, at.0, at.1, at.2)
+                                        .await?
+                                        .ok_or("an imagery tile left the store mid-frame")?;
+                                    let mut texels =
+                                        imagery_texture(&placed.tile, scheme, &found.bytes)?;
+                                    let (w, h) = (texels.width, texels.height);
+                                    fielded(at, &mut texels.rgba8, w, h);
+                                    decoded.insert(at, std::sync::Arc::new(texels));
+                                }
+                                compose(&refs, factor, |t| decoded[&(t.level, t.x, t.y)].clone())
+                                    .map(|texels| {
+                                        let texture =
+                                            gpu.create_albedo(texels.width, texels.height);
+                                        gpu.write_rgba(&texture, &texels.rgba8);
+                                        texture
+                                    })
+                            } else {
+                                // Composed whole, as the bake composed it; kept
+                                // from the first level this frame can read.
+                                let side = refs.composed_side.max(1);
+                                let (centre, radius) = sphere(mesh.origin_ecef, &mesh.positions);
+                                let spare = spared(side, span(centre, radius) * DRAPE_HEADROOM);
+                                kept = (side, spare);
+                                let albedo = gpu.create_albedo(side, side);
+                                let layers = drape
+                                    .into_iter()
+                                    .map(|(placed, texture)| DrapeLayer {
+                                        texture,
+                                        coverage: placed.coverage,
+                                        translation: placed.translation,
+                                        scale: placed.scale,
+                                        grade: LayerGrade::IDENTITY,
+                                        field: {
+                                            let at = (
+                                                placed.tile.level as u8,
+                                                placed.tile.x,
+                                                placed.tile.y,
+                                            );
+                                            matrices(at).or_else(|| {
+                                                corners(at).map(|c| layer_field(&c, strength))
+                                            })
+                                        },
+                                    })
+                                    .collect();
+                                gpu.compose(&albedo, factor, layers);
+                                Some(if spare == 0 {
+                                    albedo
+                                } else {
+                                    done.drapes_reduced += 1;
+                                    gpu.tail(&albedo, spare)
+                                })
+                            };
+                            timings.enter += ms(t);
+                            done.tiles_from_store += 1;
+                            (mesh, texture, Origin::Store, imagery_of, kept)
+                        }
+                        _ => {
+                            let span = pack.span_of(tile).ok_or_else(|| {
+                                format!(
+                                    "tile {} is neither in the tile store nor in the pack",
+                                    tile.id()
+                                )
+                            })?;
+                            let t = Instant::now();
+                            let part = sources
+                                .packs
+                                .objects
+                                .read(&file.key, blobs + span.start..blobs + span.end)
+                                .await?;
+                            timings.read_pack += ms(t);
+                            let t = Instant::now();
+                            let mesh = Mesh::of_span(&pack, tile, span.start, &part)?;
+                            let texture = match texture_of_span(&pack, tile, span.start, &part)? {
+                                Some(png) => {
+                                    let rgba = image::load_from_memory(&png)?.to_rgba8();
+                                    let texture = gpu.create_albedo(rgba.width(), rgba.height());
+                                    gpu.write_rgba(&texture, &rgba);
+                                    Some(texture)
+                                }
+                                None => None,
+                            };
+                            timings.decode += ms(t);
+                            done.tiles_from_pack += 1;
+                            (mesh, texture, Origin::Pack, Vec::new(), (0, 0))
+                        }
+                    };
+                    let t = Instant::now();
+                    observer.tile(&TileIn {
+                        frame: diff.frame,
+                        key,
+                        origin,
+                        imagery: &imagery_of,
+                        terrain: terrain_of,
+                        mesh: &mesh,
+                    });
+                    timings.observe += ms(t);
+                    let t = Instant::now();
+                    gpu.enter(
+                        key,
+                        &TileMesh {
+                            origin_ecef: mesh.origin_ecef,
+                            positions: &mesh.positions,
+                            normals: &mesh.normals,
+                            uvs: &mesh.uvs,
+                            indices: &mesh.indices,
+                            index_count: mesh.index_count,
+                            base_color_factor: mesh.base_color_factor,
+                        },
+                        texture,
+                    )?;
+                    timings.enter += ms(t);
+                    let (centre, radius) = sphere(mesh.origin_ecef, &mesh.positions);
+                    resident.insert(
+                        key,
+                        Held {
+                            levels: imagery_of.iter().map(|at| at.0).collect(),
+                            side: drape.0,
+                            spared: drape.1,
+                            centre,
+                            radius,
+                        },
+                    );
+                    entered += 1;
+                }
+                // More than one batch: this one's drapes and mips are made now,
+                // and what they were made from is let go before the next.
+                if batches > 1 {
+                    let t = Instant::now();
+                    let mut made =
+                        gpu.device()
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("film tiles entering"),
+                            });
+                    gpu.record_pending(&mut made);
+                    gpu.queue().submit([made.finish()]);
+                    gpu.device().poll(wgpu::PollType::wait_indefinitely())?;
+                    timings.enter += ms(t);
+                }
             }
 
             let t = Instant::now();
@@ -700,7 +809,7 @@ pub async fn render(
             timings.leave += ms(t);
 
             let mut layers_drawn: BTreeMap<u8, u32> = BTreeMap::new();
-            for level in resident.values().flatten() {
+            for level in resident.values().flat_map(|held| &held.levels) {
                 *layers_drawn.entry(*level).or_default() += 1;
             }
             let layers: Vec<(u8, u32)> = layers_drawn.into_iter().collect();
