@@ -55,6 +55,32 @@ pub struct SessionConfig {
     /// `UsdUVTexture` per tile and knows nothing about layers. This caps the
     /// bake; the bake itself picks the finest layer's scale below it.
     pub bake_max_size: u32,
+    /// What each tile is finished into. See [`Finish`].
+    pub finish: Finish,
+}
+
+/// What a session makes of a tile once its content has arrived.
+///
+/// A renderer is handed geometry and a picture. A bake that writes a pack
+/// which only *refers* to the tile store is handed neither: such a pack names
+/// each tile, its drape, and where both come from in the store, and whoever
+/// renders it reads the terrain and the imagery there. Composing a mosaic and
+/// encoding it to PNG for that pack is the cost of a frame — CPU, and the
+/// memory of every picture held until the film is over — spent on bytes
+/// nothing ever reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Finish {
+    /// The mesh and the drape's mosaic, composed and encoded: what a renderer
+    /// draws, and what a pack that carries its tiles stores.
+    #[default]
+    Pictures,
+    /// The tile's identity only — its drape's fingerprint and what it refers
+    /// to in the tile store. Nothing is composed, nothing encoded, and the
+    /// mesh and the imagery are let go as soon as they have been named. The
+    /// selection, the drapes and the fetches are exactly those of
+    /// [`Finish::Pictures`]; a frame's tiles then carry no geometry, so this
+    /// is for a pack by reference and nothing that draws.
+    Identity,
 }
 
 impl Default for SessionConfig {
@@ -94,6 +120,7 @@ impl Default for SessionConfig {
             // TUILE_BAKE_MAX caps the baked mosaic's side per job: sharper
             // shots raise it where the RAM is real, a laptop lowers it.
             bake_max_size: env_knob("TUILE_BAKE_MAX", 2048_u32).clamp(64, 8192),
+            finish: Finish::Pictures,
         }
     }
 }
@@ -156,6 +183,18 @@ pub struct TileGeometry {
     /// source notes it: the terrain tile its mesh was built from, and the
     /// imagery tiles of its drape with their placement.
     pub(crate) refs: Option<tuile_pack::TileRefs>,
+    /// What is left of the mesh when the tile was finished by identity
+    /// ([`Finish::Identity`]): its counts, which a pack by reference records
+    /// beside each tile. `None` for a tile that still has its mesh.
+    pub(crate) shape: Option<Shape>,
+}
+
+/// The size of a mesh that was let go, and its base colour.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Shape {
+    pub vertex_count: u32,
+    pub index_count: u32,
+    pub base_color_factor: [f32; 4],
 }
 
 impl TileGeometry {
@@ -186,6 +225,7 @@ impl TileGeometry {
             }),
             memoized,
             refs: None,
+            shape: None,
         }
     }
 
@@ -865,6 +905,7 @@ impl Live {
 
         let timeout = self.config.frame_timeout;
         let bake_max_size = self.config.bake_max_size;
+        let finish = self.config.finish;
         let provenance = self.provenance.clone();
         // Copied out before the destructure below, which leaves `config`
         // behind its `..`.
@@ -891,6 +932,7 @@ impl Live {
                     Arc::clone(textures),
                     &dataset,
                     bake_max_size,
+                    finish,
                     provenance,
                     generation,
                     &mut errors,
@@ -988,6 +1030,7 @@ async fn converge(
     memo: Arc<TextureMemo>,
     dataset: &str,
     bake_max_size: u32,
+    finish: Finish,
     provenance: Option<Arc<tuile_planetary::Provenance>>,
     generation: u64,
     errors: &mut Vec<(Option<TileId>, String)>,
@@ -1062,13 +1105,14 @@ async fn converge(
                         let provenance = provenance.clone();
                         let (done, result) = tokio::sync::oneshot::channel();
                         pool.spawn(move || {
-                            let _ = done.send(finish_tile_from(
+                            let _ = done.send(finish_tile_as(
                                 &memo,
                                 &dataset,
                                 tile,
                                 decoded,
                                 bake_max_size,
                                 provenance.as_deref(),
+                                finish,
                             ));
                         });
                         finishing.spawn(async move {
@@ -1346,13 +1390,27 @@ fn refs_of(
 }
 
 /// [`finish_tile`], noting where the tile comes from when `provenance` knows.
+#[cfg(test)]
 fn finish_tile_from(
+    memo: &TextureMemo,
+    dataset: &str,
+    tile: TileId,
+    decoded: DecodedTileContent,
+    bake_max_size: u32,
+    provenance: Option<&tuile_planetary::Provenance>,
+) -> TileGeometry {
+    finish_tile_as(memo, dataset, tile, decoded, bake_max_size, provenance, Finish::Pictures)
+}
+
+/// A tile as the session keeps it, finished as `finish` says.
+pub(crate) fn finish_tile_as(
     memo: &TextureMemo,
     dataset: &str,
     tile: TileId,
     mut decoded: DecodedTileContent,
     bake_max_size: u32,
     provenance: Option<&tuile_planetary::Provenance>,
+    finish: Finish,
 ) -> TileGeometry {
     // Before the layers are composed and gone: they are what a reference
     // into the tile store is made of.
@@ -1382,6 +1440,30 @@ fn finish_tile_from(
             texture_index: 0,
         })
         .or_else(|| drape_key(tile, &decoded, bake_max_size));
+    if finish == Finish::Identity {
+        // Named — its drape from its layers, its references from the record
+        // of what was fetched — and that is all a pack by reference keeps.
+        // The layers, the mesh and any texture go now rather than at the end
+        // of the film: they are megabytes a tile, and nothing will read them.
+        let origin_ecef = decoded.local_origin_ecef;
+        let shape = decoded.meshes.first().map(|mesh| Shape {
+            vertex_count: mesh.positions.len() as u32,
+            index_count: mesh.indices.len() as u32,
+            base_color_factor: mesh.material.base_color_factor,
+        });
+        decoded.imagery.clear();
+        decoded.textures.clear();
+        decoded.meshes.clear();
+        return TileGeometry {
+            tile,
+            origin_ecef,
+            content: decoded,
+            baked,
+            memoized: None,
+            refs,
+            shape,
+        };
+    }
     let memoized = baked.and_then(|key| memo.get(key));
     match &memoized {
         // The same tile under the same drape was baked and encoded by an
@@ -1434,6 +1516,7 @@ fn finish_tile_from(
         baked,
         memoized,
         refs,
+        shape: None,
     }
 }
 
@@ -1510,7 +1593,7 @@ fn drape_key(tile: TileId, content: &DecodedTileContent, bake_max_size: u32) -> 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 
     /// The imagery level follows the camera's height above the **ellipsoid**.
     ///
@@ -1566,6 +1649,7 @@ mod tests {
                 baked: None,
                 memoized: None,
                 refs: None,
+                shape: None,
             })],
         )
     }
@@ -1824,7 +1908,7 @@ mod tests {
     /// terrain tile reports `base_color_texture == -1` and renders untextured.
     /// One tile of terrain with one draped imagery layer — the shape every
     /// ion tile arrives in, and the only one the bake path acts on.
-    fn draped_content() -> DecodedTileContent {
+    pub(crate) fn draped_content() -> DecodedTileContent {
         use tuile_core::content::{DecodedMesh, MaterialDesc};
         use tuile_core::geo::{geodetic_to_ecef, Geodetic};
         use tuile_core::raster::{uvs_geographic, GeoRect, ImageryCoord, ImageryLayer};
@@ -2176,6 +2260,278 @@ mod tests {
             "the bake size is part of what the pixels are"
         );
     }
+
+    /// A flat square of ground as a quadtree five levels deep: 341 tiles, each
+    /// with its own mesh and its own picture, so that two tiles can never be
+    /// mistaken for one another in a digest.
+    struct Quad;
+
+    const QUAD_LEVELS: u32 = 5;
+    const QUAD_SIDE_M: f64 = 1600.0;
+
+    fn quad_base(level: u32) -> u64 {
+        (4u64.pow(level) - 1) / 3
+    }
+
+    fn quad_id(level: u32, x: u64, y: u64) -> TileId {
+        TileId(quad_base(level) + y * (1 << level) + x)
+    }
+
+    fn quad_coord(id: TileId) -> (u32, u64, u64) {
+        let level = (0..QUAD_LEVELS)
+            .rev()
+            .find(|l| id.0 >= quad_base(*l))
+            .expect("a tile of the quad");
+        let within = id.0 - quad_base(level);
+        (level, within % (1 << level), within / (1 << level))
+    }
+
+    impl TileTree for Quad {
+        fn roots(&self) -> Vec<TileId> {
+            vec![quad_id(0, 0, 0)]
+        }
+        fn children(&self, id: TileId) -> Vec<TileId> {
+            let (level, x, y) = quad_coord(id);
+            if level + 1 >= QUAD_LEVELS {
+                return Vec::new();
+            }
+            [(0, 0), (1, 0), (0, 1), (1, 1)]
+                .into_iter()
+                .map(|(dx, dy)| quad_id(level + 1, 2 * x + dx, 2 * y + dy))
+                .collect()
+        }
+        fn parent(&self, id: TileId) -> Option<TileId> {
+            let (level, x, y) = quad_coord(id);
+            (level > 0).then(|| quad_id(level - 1, x / 2, y / 2))
+        }
+        fn properties(&self, id: TileId) -> tuile_core::source::TileProperties {
+            use tuile_core::math::{BoundingVolume, Sphere};
+            let (level, x, y) = quad_coord(id);
+            let side = QUAD_SIDE_M / f64::from(1u32 << level);
+            tuile_core::source::TileProperties {
+                bounding_volume: BoundingVolume::Sphere(Sphere {
+                    center: DVec3::new((x as f64 + 0.5) * side, (y as f64 + 0.5) * side, 0.0),
+                    radius: side * std::f64::consts::FRAC_1_SQRT_2,
+                }),
+                geometric_error: if level + 1 >= QUAD_LEVELS { 0.0 } else { side / 4.0 },
+                refine: tuile_core::tileset::Refine::Replace,
+                has_content: true,
+            }
+        }
+    }
+
+    /// Serves the quad, counting loads; each tile's mesh and picture are its
+    /// own.
+    struct QuadLoader(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl TileLoader for QuadLoader {
+        async fn load(
+            &self,
+            id: TileId,
+        ) -> Result<tuile_core::source::Loaded, tuile_core::source::LoadError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (level, x, y) = quad_coord(id);
+            let mut content = draped_content();
+            content.meshes[0].positions[1] = [id.0 as f32, 1.0, 0.0];
+            let layer = &mut content.imagery[0];
+            layer.coord = tuile_core::raster::ImageryCoord {
+                level,
+                x,
+                y,
+            };
+            layer.texture = Arc::new(DecodedTexture {
+                width: 2,
+                height: 2,
+                rgba8: [(id.0 % 251) as u8, (id.0 / 251) as u8, level as u8 * 40, 255].repeat(4),
+            });
+            Ok(tuile_core::source::Loaded::Content(content))
+        }
+    }
+
+    fn quad_view(x: f64, y: f64, height: f64) -> ViewStateParams {
+        ViewStateParams {
+            position: DVec3::new(x, y, height),
+            direction: DVec3::new(0.0, 0.0, -1.0),
+            up: DVec3::new(0.0, 1.0, 0.0),
+            viewport_px: glam::DVec2::new(960.0, 720.0),
+            fovy_rad: 45f64.to_radians(),
+        }
+    }
+
+    /// Bytes folded into one number, the same on every machine and toolchain.
+    fn fnv(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+            (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
+
+    /// What a flight over the quad hands a consumer, frame by frame: which
+    /// tiles, under which drape, with which mesh and which encoded picture —
+    /// and how many tiles were fetched to get there.
+    fn quad_flight() -> (Vec<Vec<(u64, u64, u64, u64)>>, usize) {
+        let (frames, loads) = quad_flight_finished(Finish::Pictures);
+        let frames = frames
+            .into_iter()
+            .map(|(frame, tiles)| {
+                tiles
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (id, drape))| {
+                        let tile = frame
+                            .tiles
+                            .iter()
+                            .position(|t| t.tile.0 == id)
+                            .expect("the tile is in its frame");
+                        let _ = index;
+                        let mesh = &frame.tiles[tile].content.meshes[0];
+                        let positions: Vec<u8> = mesh
+                            .positions
+                            .iter()
+                            .flatten()
+                            .flat_map(|v| v.to_le_bytes())
+                            .collect();
+                        let png = frame
+                            .texture_png(tile, 0)
+                            .expect("encoding")
+                            .expect("a draped tile has its picture");
+                        (id, drape, fnv(&positions), fnv(&png.png))
+                    })
+                    .collect()
+            })
+            .collect();
+        (frames, loads)
+    }
+
+    /// The flight, finished one way or the other: each frame, and the tiles
+    /// it names with their drapes, in order.
+    #[allow(clippy::type_complexity)]
+    fn quad_flight_finished(finish: Finish) -> (Vec<(Frame, Vec<(u64, u64)>)>, usize) {
+        let loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut session = Session::new(
+            Box::new(Quad),
+            Arc::new(QuadLoader(Arc::clone(&loads))),
+            SessionConfig {
+                finish,
+                ..SessionConfig::default()
+            },
+        )
+        .expect("session");
+        let poses = [
+            (800.0, 800.0, 6000.0),
+            (800.0, 800.0, 1500.0),
+            (500.0, 700.0, 600.0),
+            (1100.0, 300.0, 250.0),
+            (1100.0, 300.0, 2500.0),
+            (300.0, 1200.0, 400.0),
+        ];
+        let frames = poses
+            .into_iter()
+            .map(|(x, y, height)| {
+                let frame = session.frame(vec![quad_view(x, y, height)]).expect("a frame");
+                let mut tiles: Vec<(u64, u64)> =
+                    frame.tiles.iter().map(|t| (t.tile.0, t.drape())).collect();
+                tiles.sort_unstable();
+                (frame, tiles)
+            })
+            .collect();
+        (frames, loads.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// The behaviour every change to how a frame is resolved must leave alone:
+    /// the same flight gives the same tiles, drapes, meshes and pictures, and
+    /// fetches no more than it did. Printed in full when it moves, so the
+    /// difference can be read rather than guessed.
+    #[test]
+    fn a_flight_over_the_quad_resolves_as_it_always_has() {
+        let (frames, loads) = quad_flight();
+        let summary: Vec<(usize, u64)> = frames
+            .iter()
+            .map(|tiles| {
+                let bytes: Vec<u8> = tiles
+                    .iter()
+                    .flat_map(|(id, drape, mesh, png)| {
+                        [id, drape, mesh, png].into_iter().flat_map(|v| v.to_le_bytes())
+                    })
+                    .collect();
+                (tiles.len(), fnv(&bytes))
+            })
+            .collect();
+        println!("QUAD-FLIGHT loads={loads} frames={summary:?}");
+        assert_eq!(
+            (loads, summary.as_slice()),
+            QUAD_FLIGHT,
+            "the flight no longer resolves as it did"
+        );
+    }
+
+    /// A pack that refers to the tile store holds no mesh and no picture: a
+    /// tile's identity and its drape's are all a bake by reference needs. The
+    /// same flight then names exactly the same tiles under the same drapes,
+    /// fetches the same, and composes and encodes nothing.
+    #[test]
+    fn a_flight_finished_by_identity_names_the_same_tiles_and_makes_no_picture() {
+        let (pictures, loads_with) = quad_flight_finished(Finish::Pictures);
+        let (identity, loads_without) = quad_flight_finished(Finish::Identity);
+        assert_eq!(loads_without, loads_with, "the same tiles are fetched");
+        let named = |flight: &[(Frame, Vec<(u64, u64)>)]| -> Vec<Vec<(u64, u64)>> {
+            flight.iter().map(|(_, tiles)| tiles.clone()).collect()
+        };
+        assert_eq!(named(&identity), named(&pictures), "the same tiles, the same drapes");
+        assert!(named(&identity).iter().flatten().all(|(_, drape)| *drape != 0));
+        for (frame, _) in &identity {
+            for (index, tile) in frame.tiles.iter().enumerate() {
+                assert!(tile.memoized.is_none(), "tile {}: a picture was encoded", tile.tile.0);
+                assert!(tile.content.textures.is_empty() && tile.content.imagery.is_empty());
+                assert!(tile.content.meshes.is_empty(), "tile {}: a mesh was kept", tile.tile.0);
+                assert!(frame.texture_png(index, 0).expect("asked").is_none());
+            }
+        }
+        // And with pictures, every tile still has its own.
+        for (frame, _) in &pictures {
+            assert!(frame.tiles.iter().all(|t| t.memoized.is_some() && !t.content.meshes.is_empty()));
+        }
+    }
+
+    /// What a tile refers to in the tile store — its terrain tile, its imagery
+    /// tiles and how they are placed, the side its mosaic would have — is the
+    /// same whether or not the picture is made: that is what a pack by
+    /// reference stores.
+    #[test]
+    fn what_a_tile_refers_to_does_not_depend_on_its_picture_being_made() {
+        let tile = TileId(7);
+        let (level, x, y) = tile.terrain_coord();
+        let noted = tuile_planetary::Provenance::default();
+        noted.fetched_terrain(
+            tuile_terrain::TileCoord::new(level, x, y),
+            draped_content().local_origin_ecef.to_array(),
+            tuile_planetary::digest(b"terrain bytes"),
+        );
+        noted.fetched_imagery(draped_content().imagery[0].coord, b"imagery bytes");
+        let memo = TextureMemo::default();
+        let finished = |finish| {
+            finish_tile_as(&memo, "t", tile, draped_content(), 256, Some(&noted), finish)
+        };
+        let (with, without) = (finished(Finish::Pictures), finished(Finish::Identity));
+        assert!(with.refs.is_some(), "a reference");
+        assert_eq!(without.refs, with.refs);
+        assert_eq!(without.drape(), with.drape());
+        assert_eq!(without.origin_ecef, with.origin_ecef);
+        assert!(with.memoized.is_some() && without.memoized.is_none());
+    }
+
+    /// What [`quad_flight`] gave before anything was optimised.
+    const QUAD_FLIGHT: (usize, &[(usize, u64)]) = (
+        341,
+        &[
+            (16, 16587390133593125620),
+            (256, 16996631967489129171),
+            (80, 15948968281700671764),
+            (24, 15794992583552988641),
+            (256, 16996631967489129171),
+            (42, 3053308558410328886),
+        ],
+    );
 
     /// Eviction must never strand a frame that already promised a texture:
     /// the frame holds its own reference to the bytes.
