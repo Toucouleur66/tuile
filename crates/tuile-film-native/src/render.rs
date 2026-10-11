@@ -303,6 +303,10 @@ pub async fn render(
             let ahead = Instant::now();
             let (terrain, imagery) = tuile_film::referred(&pack, a, b)?;
             let (count, store) = (terrain.len() + imagery.len(), &sources.store.tiles);
+            // What the film names and the store does not hold: all of it is
+            // said before a frame is drawn, not the first of it when a frame
+            // comes to need it.
+            let mut absent = Vec::new();
             for (layer, wanted) in [(terrain_layer, terrain), (imagery_layer, imagery)] {
                 let wanted: Vec<tuile_film::StoreAt> = wanted.into_iter().collect();
                 // Their zones' manifests first, all in one exchange with
@@ -314,10 +318,25 @@ pub async fn render(
                         some.iter().map(|at| store.tile(layer, at.0, at.1, at.2)),
                     )
                     .await;
-                    for tile in found {
-                        tile?;
+                    for (at, tile) in some.iter().zip(found) {
+                        if tile?.is_none() {
+                            absent.push((layer, *at));
+                        }
                     }
                 }
+            }
+            if let Some((layer, at)) = absent.first() {
+                for (layer, at) in &absent {
+                    println!("not in the tile store: {layer} {}/{}/{}", at.0, at.1, at.2);
+                }
+                return Err(format!(
+                    "frames {a}–{b} name {} tiles that are not in the tile store, {layer} {}/{}/{} the first of them",
+                    absent.len(),
+                    at.0,
+                    at.1,
+                    at.2
+                )
+                .into());
             }
             println!(
                 "ahead of frames {a}–{b}: {count} tiles of the store asked for in {:.1} s",
