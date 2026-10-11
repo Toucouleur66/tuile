@@ -235,6 +235,10 @@ pub struct FilmGpu {
     pending_stitches: Vec<(wgpu::BindGroup, u32)>,
     /// Paint what shows through a gap: see [`Self::probe_holes`].
     probe_holes: bool,
+    /// PROTOTYPE (terrain smoothing): how much of the vertices' normals a
+    /// face takes (1 as before), and whether the mesh is drawn as lines.
+    normal_strength: f32,
+    wire: bool,
     tiles: Vec<TileFrame>,
     resident: HashMap<TileKey, Resident>,
     free: Vec<u32>,
@@ -946,6 +950,8 @@ impl FilmGpu {
             empty,
             pending_stitches: Vec::new(),
             probe_holes: false,
+            normal_strength: 1.0,
+            wire: false,
             tiles: vec![TileFrame::default(); MAX_SLOTS as usize],
             resident: HashMap::new(),
             free: (0..MAX_SLOTS).rev().collect(),
@@ -1573,6 +1579,14 @@ impl FilmGpu {
         (r.buffers[0] != r.as_meshed).then_some(&r.buffers[0])
     }
 
+    /// PROTOTYPE (terrain smoothing): how much of its vertices' normals a
+    /// face is lit by, 0 to 1 — at 0 a mesh with normals is lit as one with
+    /// none — and whether the mesh is drawn as lines over a pale ground.
+    pub fn smoothing_probe(&mut self, normal_strength: f32, wire: bool) {
+        self.normal_strength = normal_strength.clamp(0.0, 1.0);
+        self.wire = wire;
+    }
+
     /// Paints magenta what a gap between two tiles shows: a pixel whose
     /// ground is further than any an eye over the Earth can see — the far
     /// side of the planet, where the frame draws it — or that no tile covers
@@ -1755,6 +1769,8 @@ impl FilmGpu {
         if let Some((view, _, side)) = &sun {
             uniform = uniform.shadowed(view, self.settings.look.shadow, *side);
         }
+        uniform.zenith[3] = self.normal_strength;
+        uniform.horizon[3] = f32::from(u8::from(self.wire));
         if self.probe_holes {
             // Up at the eye and its distance from the Earth's centre, as a
             // look with air sets them: the probe needs both with no air.

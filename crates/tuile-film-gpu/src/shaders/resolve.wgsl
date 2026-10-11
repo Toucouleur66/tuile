@@ -123,7 +123,11 @@ fn resolve(@builtin(global_invocation_id) id: vec3u) {
         let n = normal_at(i0) * (1.0 - b.x - b.y)
             + normal_at(i1) * b.x
             + normal_at(i2) * b.y;
-        normal = normalize(n);
+        // PROTOTYPE (terrain smoothing): how much of the vertices' normals a
+        // face takes, against its own — `zenith.w`, 1 as before.
+        var flat = normal;
+        if (dot(flat, n) < 0.0) { flat = -flat; }
+        normal = normalize(mix(flat, normalize(n), frame.zenith.w));
     }
     // Seen from behind, a surface is lit as its visible side.
     if (dot(normal, d) > 0.0) { normal = -normal; }
@@ -139,6 +143,18 @@ fn resolve(@builtin(global_invocation_id) id: vec3u) {
         base *= textureSampleGrad(albedo, samp, uv, ddx, ddy).rgb;
     }
 
+    // PROTOTYPE (terrain smoothing): the mesh, drawn — a pale ground with
+    // each triangle's edges a pixel wide — when `horizon.w` asks.
+    if (frame.horizon.w != 0.0) {
+        let bx = bary(ray(px + vec2f(1.0, 0.0)), a, e1, e2) - b;
+        let by = bary(ray(px + vec2f(0.0, 1.0)), a, e1, e2) - b;
+        let third = 1.0 - b.x - b.y;
+        let near = min(
+            min(b.x / length(vec2f(bx.x, by.x)), b.y / length(vec2f(bx.y, by.y))),
+            third / length(vec2f(bx.x + bx.y, by.x + by.y)),
+        );
+        base = mix(vec3f(0.02, 0.02, 0.05), vec3f(0.55), smoothstep(0.6, 1.6, near));
+    }
     let cos = max(dot(normal, frame.to_sun.xyz), 0.0);
     var radiance = base * (frame.world.xyz + frame.sun.xyz * cos);
     if (frame.shadow.x > 0.0 || frame.haze.w != 0.0) {

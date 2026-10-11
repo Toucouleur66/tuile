@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use tuile_film::from_store::{compose, imagery_texture, is_baked, terrain_mesh};
+use tuile_film::smoothing::Smooth;
 use tuile_film::stitching::{decoded, encoded, Stitching};
 use tuile_film::{
     refs_of, texture_of_span, Content, Cursor, FrameCamera, Look, Mesh, Overlays, Pack, TileKey,
@@ -70,6 +71,12 @@ pub struct Order {
     pub skirts: bool,
     /// A probe: paint magenta what shows through a gap in the ground.
     pub holes: bool,
+    /// PROTOTYPE (terrain smoothing): how the ground is smoothed, how much
+    /// of a vertex's normal a face takes (0 to 1), and whether the mesh is
+    /// drawn as lines.
+    pub smooth: Smooth,
+    pub smooth_strength: f32,
+    pub wire: bool,
 }
 
 impl Default for Order {
@@ -86,6 +93,9 @@ impl Default for Order {
             stitch: true,
             skirts: true,
             holes: false,
+            smooth: Smooth::Off,
+            smooth_strength: 1.0,
+            wire: false,
         }
     }
 }
@@ -127,6 +137,15 @@ pub struct Done {
     /// With the probe of holes: the pixels a hole touches, over the frames
     /// rendered.
     pub hole_pixels: u64,
+    /// PROTOTYPE (terrain smoothing): tiles that came with normals of their
+    /// own, triangles before and after, the furthest a vertex was put from
+    /// the source's surface (metres) and the sum of the tiles' means.
+    pub with_normals: u64,
+    pub triangles: (u64, u64),
+    pub smooth_furthest: f32,
+    pub smooth_mean_sum: f64,
+    pub smoothed_tiles: u64,
+    pub smooth_ms: f64,
     /// With shadows: the finest and the coarsest a texel of the sun's map
     /// was on the ground over the frames rendered, in metres.
     pub shadow_texel: Option<(f32, f32)>,
@@ -250,6 +269,7 @@ pub async fn render(
         },
     );
     gpu.probe_holes(order.holes);
+    gpu.smoothing_probe(order.smooth_strength, order.wire);
     let mut stitching = order.stitch.then(Stitching::default);
     let padded = (width * 4).div_ceil(256) * 256;
     let picture = gpu.device().create_buffer(&wgpu::BufferDescriptor {
@@ -655,6 +675,28 @@ pub async fn render(
                         mesh.origin_ecef,
                         mesh.base_color_factor,
                     )
+                };
+                // PROTOTYPE (terrain smoothing), before anything else sees
+                // the mesh: stitching and the seam log are handed the
+                // smoothed one.
+                let mesh = {
+                    let began = Instant::now();
+                    let origin = glam::DVec3::from_array(mesh.origin_ecef);
+                    let (smoothed, did) =
+                        tuile_film::smoothing::smooth(&decoded(&mesh), origin, order.smooth);
+                    done.with_normals += u64::from(did.had_normals);
+                    done.triangles.0 += did.triangles_before as u64;
+                    done.triangles.1 += did.triangles_after as u64;
+                    done.smooth_furthest = done.smooth_furthest.max(did.furthest);
+                    done.smooth_mean_sum += f64::from(did.mean);
+                    done.smoothed_tiles += 1;
+                    let out = if order.smooth == Smooth::Off {
+                        mesh
+                    } else {
+                        encoded(&smoothed, mesh.origin_ecef, mesh.base_color_factor)
+                    };
+                    done.smooth_ms += ms(began);
+                    out
                 };
                 let t = Instant::now();
                 observer.tile(&TileIn {

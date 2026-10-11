@@ -17,6 +17,7 @@ mod mesh;
 mod overlay;
 mod ranges;
 mod slice;
+pub mod smoothing;
 pub mod stitching;
 mod survey;
 
