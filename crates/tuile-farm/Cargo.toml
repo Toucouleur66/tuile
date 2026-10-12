@@ -22,14 +22,7 @@ path = "src/bin/tuile-launch-job.rs"
 name = "tuile-migrate-packs"
 path = "src/bin/tuile-migrate-packs.rs"
 
-[[bin]]
-name = "tuile-film-produce"
-path = "src/bin/tuile-film-produce.rs"
-
 [dependencies]
-# What a bake or a render it supervises is using: processor time and memory,
-# read the same way on every system a film is produced on.
-sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 # One client for every byte a job moves, and one we did not write.
 #
 # `aws` is the S3 protocol, which every bucket the farm talks to speaks; `fs`

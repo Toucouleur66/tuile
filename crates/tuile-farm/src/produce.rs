@@ -10,33 +10,52 @@
 //! film    ═══════════════════════════════════════     the segments, joined
 //! ```
 //!
-//! Each pack is a lane: its bake, then its parts one after the other. Several
-//! lanes run at once ([`Order::at_once`]). A bake and a render are processes
-//! of their own, run under [`crate::watch`]: one that stalls or outgrows its
-//! memory is killed and tried again, and a lane that fails does not stop the
-//! others.
+//! Each pack is a lane: its bake, then its parts one after the other.
+//! Several lanes run at once ([`Order::at_once`]), each step on a thread of
+//! the runtime's blocking pool, in this process: a bake and a render are
+//! functions of the [`Host`], called, not programs run.
 //!
-//! # What counts as done
+//! # Where it all is
 //!
-//! A part is done when its **receipt** says so: written after the segment was
+//! In the run store — a bucket, unless the environment names a directory —
+//! and nowhere else: packs, segments, receipts and the film. A step writes
+//! into a scratch directory that is gone when the production ends; what it
+//! wrote is put in the store and removed.
+//!
+//! The [`Host`] says under which keys: [`Host::packs`] names the bake's own
+//! parameters and [`Host::film`] the render's, so a pack or a segment found
+//! there was made with the parameters asked for now, and one made with
+//! others is somewhere else.
+//!
+//! # What counts as done, and is not done again
+//!
+//! A part is done when its **receipt** says so: put after the segment was
 //! opened and found to hold exactly the part's frames, naming its size. Not
-//! the segment's presence — a render killed mid-way leaves a file behind —
-//! and not the process's exit code alone. A pack is done when it is at its
-//! place, where it is moved only once its bake has ended well.
+//! the segment's presence — a render that stopped mid-way leaves a file
+//! behind — and not the render's own word alone. A pack is done when it is at
+//! its key, where it is put only once its bake has ended well.
 //!
-//! So a production can be stopped at any moment and asked for again: what is
-//! done is kept, what is not is done. And the film is joined only when every
-//! part is there, and must hold every frame: a film with a hole in it is not
-//! written, the holes are named.
+//! What is done is not done again unless the order says so
+//! ([`Order::render_again`], [`Order::bake_again`]). So a production can be
+//! stopped at any moment and asked for again: it goes on from there. And the
+//! film is joined only when every part is there, and must hold every frame:
+//! a film with a hole in it is not written, the holes are named.
+//!
+//! # What a thread cannot do
+//!
+//! A step that never returns cannot be taken back: a thread is not killed.
+//! Past [`Order::step_timeout`] the production stops and says so — its
+//! process is then the thing to end — and asked again, goes on from what was
+//! done.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
-use tokio::process::Command;
 
-use crate::concat;
-use crate::watch::{supervise, Ended, Limits, Ran};
+use crate::{concat, RunStore, StoreError};
 
 /// Frames `first..=last`.
 #[derive(
@@ -59,7 +78,7 @@ impl std::fmt::Display for Stretch {
     }
 }
 
-/// What to produce, and where.
+/// What to produce.
 #[derive(Debug, Clone)]
 pub struct Order {
     pub frames: Stretch,
@@ -70,14 +89,31 @@ pub struct Order {
     pub at_once: usize,
     /// How many times a bake or a render is tried.
     pub tries: u32,
-    /// Where the packs are kept, as `<first>-<last>.tuilepack`.
-    pub packs: PathBuf,
-    /// Segments, receipts, logs and the journal.
-    pub work: PathBuf,
-    /// The film.
-    pub out: PathBuf,
+    /// How long a bake or a render may take. `None`: as long as it does.
+    pub step_timeout: Option<Duration>,
     /// The film's cadence, checked against what was joined. `None`: not checked.
     pub fps: Option<f64>,
+    /// Bakes the packs its parts need even where they are baked already.
+    pub bake_again: bool,
+    /// Renders every part even where it is rendered already.
+    pub render_again: bool,
+}
+
+impl Order {
+    /// `frames`, cut and tried as a film usually is, nothing done again.
+    pub fn of(frames: Stretch) -> Self {
+        Self {
+            frames,
+            pack_frames: 150,
+            part_frames: 50,
+            at_once: 1,
+            tries: 3,
+            step_timeout: None,
+            fps: None,
+            bake_again: false,
+            render_again: false,
+        }
+    }
 }
 
 /// One pack and the parts rendered from it.
@@ -97,10 +133,18 @@ pub enum ProduceError {
         #[source]
         source: std::io::Error,
     },
+    #[error(transparent)]
+    Store(#[from] StoreError),
     #[error("{} of {} parts are missing, the film is not written: frames {}", .missing.len(), .parts, named(.missing))]
     Missing { missing: Vec<Stretch>, parts: usize },
     #[error("stopped: {0} is there")]
-    Stopped(PathBuf),
+    Stopped(String),
+    #[error("the {step} of frames {frames} has not returned in {seconds} s: it cannot be taken back, end this process and ask again")]
+    Stalled {
+        step: &'static str,
+        frames: Stretch,
+        seconds: u64,
+    },
     #[error("the film: {0}")]
     Film(String),
 }
@@ -162,55 +206,77 @@ impl Step {
     }
 }
 
-/// What knows how a pack is baked and a part rendered: the commands, and
-/// nothing of how they are run.
-pub trait Host: Send + Sync {
-    /// Bakes `frames` into the pack at `out`.
-    fn bake(&self, frames: Stretch, out: &Path) -> Command;
-    /// Renders `frames` to the segment at `out`. Their pack is at its place.
-    fn render(&self, frames: Stretch, out: &Path) -> Command;
-    /// After a failed try whose output is in `log`: something to run before
-    /// the next, or `None`. If it fails, the step is not tried again.
-    fn mend(&self, _step: Step, _frames: Stretch, _log: &Path) -> Option<Command> {
-        None
+/// Why a step did not end well.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failed {
+    pub why: String,
+    /// Whether trying again can end otherwise. A part that names what is not
+    /// there to be read fails the same way every time.
+    pub again: bool,
+}
+
+impl Failed {
+    /// A failure worth another try.
+    pub fn once(why: impl Into<String>) -> Self {
+        Self {
+            why: why.into(),
+            again: true,
+        }
+    }
+
+    /// A failure another try would only repeat.
+    pub fn for_good(why: impl Into<String>) -> Self {
+        Self {
+            why: why.into(),
+            again: false,
+        }
     }
 }
 
-/// What is said as the production goes: on standard output, and kept in
-/// `journal.log` of the work directory.
+/// What bakes a pack and renders a part, and says where they are kept.
+/// [`Host::bake`] and [`Host::render`] are called on a thread of their own
+/// and block it for as long as they take; several are called at once when
+/// the order says so.
+pub trait Host: Send + Sync + 'static {
+    /// The prefix of the packs' keys. It names everything a pack depends
+    /// on — the cameras, the picture's size, the selection's settings, the
+    /// sources: two bakes that differ in any of them have two prefixes.
+    fn packs(&self) -> String;
+    /// The prefix of the film's keys: its parts, their receipts, the film.
+    /// It names the packs and everything a rendered picture depends on.
+    fn film(&self) -> String;
+    /// Bakes `frames` into a pack written at `out`, a scratch file.
+    fn bake(&self, frames: Stretch, out: &Path) -> Result<(), Failed>;
+    /// Renders `frames`, whose pack is in the store at the key `pack`, to a
+    /// segment written at `out`, a scratch file.
+    fn render(&self, frames: Stretch, pack: &str, out: &Path) -> Result<(), Failed>;
+}
+
+/// What is said as the production goes: on standard output as it is said,
+/// and kept, to be put beside the film.
+#[derive(Default)]
 pub struct Journal {
-    file: Mutex<std::fs::File>,
+    said: Mutex<Vec<String>>,
 }
 
 impl Journal {
-    pub fn open(work: &Path) -> Result<Self, ProduceError> {
-        let path = work.join("journal.log");
-        let io = |source| ProduceError::Io {
-            path: path.clone(),
-            source,
-        };
-        std::fs::create_dir_all(work).map_err(io)?;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(io)?;
-        Ok(Self {
-            file: Mutex::new(file),
-        })
-    }
-
     pub fn say(&self, line: &str) {
-        use std::io::Write;
         let line = format!(
             "{} {line}",
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
         );
         println!("{line}");
-        if let Ok(mut file) = self.file.lock() {
-            // A journal that cannot be written does not stop a film.
-            let _ = writeln!(file, "{line}");
+        if let Ok(mut said) = self.said.lock() {
+            said.push(line);
         }
+    }
+
+    /// Everything said so far, a line each.
+    pub fn text(&self) -> String {
+        self.said
+            .lock()
+            .map(|said| said.join("\n") + "\n")
+            .unwrap_or_default()
     }
 }
 
@@ -223,300 +289,385 @@ pub struct Receipt {
     pub bytes: u64,
     pub tries: u32,
     pub seconds: f64,
-    pub peak_mb: u64,
 }
 
-struct Places<'a> {
-    order: &'a Order,
+/// The keys of a production.
+struct Keys {
+    packs: String,
+    film: String,
 }
 
-impl Places<'_> {
-    fn pack(&self, frames: Stretch) -> PathBuf {
-        self.order.packs.join(format!("{frames}.tuilepack"))
+impl Keys {
+    fn of(host: &dyn Host) -> Self {
+        let trimmed = |prefix: String| prefix.trim_matches('/').to_string();
+        Self {
+            packs: trimmed(host.packs()),
+            film: trimmed(host.film()),
+        }
     }
-    fn baking(&self, frames: Stretch) -> PathBuf {
-        self.order
-            .work
-            .join("baking")
-            .join(format!("{frames}.tuilepack"))
+    fn pack(&self, frames: Stretch) -> String {
+        format!("{}/{frames}.tuilepack", self.packs)
     }
-    fn segment(&self, frames: Stretch) -> PathBuf {
-        self.order
-            .work
-            .join("segments")
-            .join(format!("{frames}.mp4"))
+    fn parts(&self) -> String {
+        format!("{}/parts", self.film)
     }
-    fn receipt(&self, frames: Stretch) -> PathBuf {
-        self.order
-            .work
-            .join("segments")
-            .join(format!("{frames}.json"))
+    fn segment(&self, frames: Stretch) -> String {
+        format!("{}/parts/{frames}.mp4", self.film)
     }
-    fn log(&self, step: Step, frames: Stretch, name: &str) -> PathBuf {
-        self.order
-            .work
-            .join("logs")
-            .join(format!("{}-{frames}.{name}.log", step.name()))
+    fn receipt(&self, frames: Stretch) -> String {
+        format!("{}/parts/{frames}.json", self.film)
     }
-    fn stop(&self) -> PathBuf {
-        self.order.work.join("STOP")
+    fn stop(&self) -> String {
+        format!("{}/STOP", self.film)
+    }
+    fn journal(&self) -> String {
+        format!("{}/journal.log", self.film)
+    }
+    fn film(&self) -> String {
+        format!("{}/film.mp4", self.film)
     }
 }
 
-/// Whether the part is done: its receipt, and the segment it vouches for.
-fn done(places: &Places<'_>, frames: Stretch) -> bool {
-    let Ok(text) = std::fs::read(places.receipt(frames)) else {
-        return false;
-    };
-    let Ok(receipt) = serde_json::from_slice::<Receipt>(&text) else {
-        return false;
-    };
-    let size = std::fs::metadata(places.segment(frames))
-        .map(|m| m.len())
-        .ok();
-    receipt.frames == frames && size == Some(receipt.bytes)
+/// The parts done: each one's receipt, and the segment it vouches for — of
+/// the frames it says, of the size it says.
+async fn done(
+    store: &dyn RunStore,
+    keys: &Keys,
+    parts: &[Stretch],
+) -> Result<Vec<Stretch>, StoreError> {
+    let listed: HashMap<String, u64> = store
+        .list(&keys.parts())
+        .await?
+        .into_iter()
+        .map(|e| (e.key, e.size))
+        .collect();
+    let mut done = Vec::new();
+    for part in parts {
+        let (Some(size), Some(segment)) = (
+            listed.get(&keys.receipt(*part)),
+            listed.get(&keys.segment(*part)),
+        ) else {
+            continue;
+        };
+        let bytes = store.get_range(&keys.receipt(*part), 0..*size).await?;
+        // A receipt that cannot be read vouches for nothing.
+        let Ok(receipt) = serde_json::from_slice::<Receipt>(&bytes) else {
+            continue;
+        };
+        if receipt.frames == *part && receipt.bytes == *segment {
+            done.push(*part);
+        }
+    }
+    Ok(done)
 }
 
-/// A production under way: what was asked, of whom, within what.
-#[derive(Clone, Copy)]
+/// A production under way: what was asked, of whom.
 struct Run<'a> {
     order: &'a Order,
-    host: &'a dyn Host,
-    limits: &'a Limits,
+    store: &'a dyn RunStore,
+    host: &'a Arc<dyn Host>,
     journal: &'a Journal,
+    keys: &'a Keys,
+    /// The parts already done, as the store had them when it began.
+    done: &'a [Stretch],
+    /// Where steps write, gone with the production.
+    scratch: &'a Path,
 }
 
-/// Runs a step until it ends well and `whole` finds its output so, at most
-/// [`Order::tries`] times. `None` when it never did.
+/// Calls a step on a thread of its own until it ends well and `whole` finds
+/// its output so, at most [`Order::tries`] times. `None` when it never did.
 async fn attempt(
     run: &Run<'_>,
     step: Step,
     frames: Stretch,
-    command: impl Fn() -> Command,
+    call: impl Fn(Arc<dyn Host>) -> Result<(), Failed> + Clone + Send + 'static,
     whole: impl Fn() -> Result<(), String>,
-) -> Option<(u32, Ran)> {
+) -> Result<Option<(u32, f64)>, ProduceError> {
     let Run {
         order,
         host,
-        limits,
         journal,
+        ..
     } = *run;
-    let places = Places { order };
     for tried in 1..=order.tries.max(1) {
-        let log = places.log(step, frames, &tried.to_string());
-        let said = |ran: &Ran, how: &str| {
-            journal.say(&format!(
-                "{} {frames} try {tried}: {how} — {:.0} s, peak {} MB — {}",
-                step.name(),
-                ran.seconds,
-                ran.peak_bytes >> 20,
-                log.display()
-            ));
+        let began = Instant::now();
+        let (call, host) = (call.clone(), host.clone());
+        let called = tokio::task::spawn_blocking(move || call(host));
+        let joined = match order.step_timeout {
+            Some(within) => match tokio::time::timeout(within, called).await {
+                Ok(joined) => joined,
+                Err(_) => {
+                    let stalled = ProduceError::Stalled {
+                        step: step.name(),
+                        frames,
+                        seconds: within.as_secs(),
+                    };
+                    journal.say(&stalled.to_string());
+                    return Err(stalled);
+                }
+            },
+            None => called.await,
         };
-        let ran = match supervise(command(), &log, limits).await {
-            Ok(ran) => ran,
-            Err(e) => {
+        let seconds = began.elapsed().as_secs_f64();
+        let ended = match joined {
+            Ok(Ok(())) => whole().map_err(|why| {
+                Failed::once(format!("it ended well, and its output is not whole: {why}"))
+            }),
+            Ok(Err(failed)) => Err(failed),
+            // It panicked: said, and the lanes beside it go on.
+            Err(e) => Err(Failed::once(e.to_string())),
+        };
+        match ended {
+            Ok(()) => {
                 journal.say(&format!(
-                    "{} {frames} try {tried}: not run: {e}",
+                    "{} {frames} try {tried}: done in {seconds:.0} s",
                     step.name()
                 ));
-                return None;
+                return Ok(Some((tried, seconds)));
             }
-        };
-        match ran.ended {
-            Ended::Done => match whole() {
-                Ok(()) => {
-                    said(&ran, "done");
-                    return Some((tried, ran));
-                }
-                Err(why) => said(
-                    &ran,
-                    &format!("ended well, and its output is not whole: {why}"),
-                ),
-            },
-            other => said(&ran, &other.to_string()),
-        }
-        if tried == order.tries.max(1) {
-            break;
-        }
-        if let Some(mend) = host.mend(step, frames, &log) {
-            let mend_log = places.log(step, frames, &format!("{tried}.mend"));
-            match supervise(mend, &mend_log, limits).await {
-                Ok(Ran {
-                    ended: Ended::Done,
-                    seconds,
-                    ..
-                }) => {
-                    journal.say(&format!(
-                        "{} {frames}: mended in {seconds:.0} s",
-                        step.name()
-                    ));
-                }
-                Ok(ran) => {
-                    journal.say(&format!(
-                        "{} {frames}: not mended ({}), not tried again — {}",
-                        step.name(),
-                        ran.ended,
-                        mend_log.display()
-                    ));
-                    return None;
-                }
-                Err(e) => {
-                    journal.say(&format!(
-                        "{} {frames}: the mending was not run: {e}",
-                        step.name()
-                    ));
-                    return None;
+            Err(failed) => {
+                journal.say(&format!(
+                    "{} {frames} try {tried}: failed after {seconds:.0} s — {}{}",
+                    step.name(),
+                    failed.why,
+                    if failed.again {
+                        ""
+                    } else {
+                        " — not tried again"
+                    }
+                ));
+                if !failed.again {
+                    break;
                 }
             }
         }
     }
-    None
+    Ok(None)
 }
 
 /// One lane: the pack if a part needs it, then the parts not yet done. Gives
 /// back the parts still missing.
 async fn work(run: &Run<'_>, lane: &Lane) -> Result<Vec<Stretch>, ProduceError> {
-    let Run { order, host, .. } = *run;
-    let places = Places { order };
+    let Run {
+        order,
+        store,
+        keys,
+        scratch,
+        ..
+    } = *run;
     let wanted: Vec<Stretch> = lane
         .parts
         .iter()
         .copied()
-        .filter(|p| !done(&places, *p))
+        .filter(|part| order.render_again || !run.done.contains(part))
         .collect();
     if wanted.is_empty() {
         return Ok(wanted);
     }
-    if places.stop().exists() {
-        return Err(ProduceError::Stopped(places.stop()));
-    }
-    let pack = places.pack(lane.pack);
-    if !pack.exists() {
-        let baking = places.baking(lane.pack);
-        for dir in [baking.parent(), pack.parent()].into_iter().flatten() {
-            std::fs::create_dir_all(dir).map_err(|source| ProduceError::Io {
-                path: dir.into(),
-                source,
-            })?;
+    let stopped = || async {
+        match store.exists(&keys.stop()).await? {
+            true => Err(ProduceError::Stopped(keys.stop())),
+            false => Ok(()),
         }
+    };
+    stopped().await?;
+    // Written here, put in the store, and gone.
+    let gone = |path: &Path| {
+        let _ = std::fs::remove_file(path);
+    };
+    let pack = keys.pack(lane.pack);
+    if order.bake_again || !store.exists(&pack).await? {
+        let baking = scratch.join(format!("{}.tuilepack", lane.pack));
+        let (frames, out, found) = (lane.pack, baking.clone(), baking.clone());
         let baked = attempt(
             run,
             Step::Bake,
             lane.pack,
-            || host.bake(lane.pack, &baking),
-            || match std::fs::metadata(&baking) {
+            move |host| {
+                let _ = std::fs::remove_file(&out);
+                host.bake(frames, &out)
+            },
+            move || match std::fs::metadata(&found) {
                 Ok(m) if m.len() > 0 => Ok(()),
                 Ok(_) => Err("an empty pack".into()),
                 Err(e) => Err(format!("no pack: {e}")),
             },
         )
         .await;
-        if baked.is_none() {
-            return Ok(wanted);
+        if !matches!(baked, Ok(Some(_))) {
+            gone(&baking);
+            return baked.map(|_| wanted);
         }
-        // At its place only now: a pack found there is a pack baked whole.
-        std::fs::rename(&baking, &pack).map_err(|source| ProduceError::Io {
-            path: pack.clone(),
-            source,
-        })?;
+        // At its key only now: a pack found there is a pack baked whole.
+        let put = store.put(&baking, &pack).await;
+        gone(&baking);
+        put?;
     }
     let mut missing = Vec::new();
     for part in wanted {
-        if places.stop().exists() {
-            return Err(ProduceError::Stopped(places.stop()));
-        }
-        let segment = places.segment(part);
-        if let Some(dir) = segment.parent() {
-            std::fs::create_dir_all(dir).map_err(|source| ProduceError::Io {
-                path: dir.into(),
-                source,
-            })?;
-        }
-        // A receipt that vouches for nothing, or a segment with no receipt:
-        // neither is kept beside the new try.
-        let _ = std::fs::remove_file(places.receipt(part));
+        stopped().await?;
+        let segment = scratch.join(format!("{part}.mp4"));
+        let (from, out, found) = (pack.clone(), segment.clone(), segment.clone());
         let rendered = attempt(
             run,
             Step::Render,
             part,
-            || {
-                let _ = std::fs::remove_file(&segment);
-                host.render(part, &segment)
+            move |host| {
+                let _ = std::fs::remove_file(&out);
+                host.render(part, &from, &out)
             },
-            || match concat::count_frames(&segment) {
+            move || match concat::count_frames(&found) {
                 Ok(frames) if frames == part.frames() => Ok(()),
                 Ok(frames) => Err(format!("{frames} frames of {}", part.frames())),
                 Err(e) => Err(e.to_string()),
             },
         )
         .await;
-        let Some((tries, ran)) = rendered else {
+        let Ok(Some((tries, seconds))) = rendered else {
+            gone(&segment);
+            rendered?;
             missing.push(part);
             continue;
         };
+        // The segment, then the receipt that vouches for it: a receipt is
+        // never there before what it names.
+        let put = store.put(&segment, &keys.segment(part)).await;
+        gone(&segment);
         let receipt = Receipt {
             frames: part,
-            bytes: std::fs::metadata(&segment)
-                .map_err(|source| ProduceError::Io {
-                    path: segment.clone(),
-                    source,
-                })?
-                .len(),
+            bytes: put?,
             tries,
-            seconds: ran.seconds,
-            peak_mb: ran.peak_bytes >> 20,
+            seconds,
         };
-        let path = places.receipt(part);
         let json =
             serde_json::to_vec_pretty(&receipt).map_err(|e| ProduceError::Film(e.to_string()))?;
-        std::fs::write(&path, json).map_err(|source| ProduceError::Io { path, source })?;
+        put_bytes(
+            store,
+            scratch,
+            &format!("{part}.json"),
+            &json,
+            &keys.receipt(part),
+        )
+        .await?;
     }
     Ok(missing)
+}
+
+/// Puts `bytes` at `key`, by way of a scratch file that does not outlive it.
+async fn put_bytes(
+    store: &dyn RunStore,
+    scratch: &Path,
+    name: &str,
+    bytes: &[u8],
+    key: &str,
+) -> Result<(), ProduceError> {
+    let path = scratch.join(name);
+    std::fs::write(&path, bytes).map_err(|source| ProduceError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    let put = store.put(&path, key).await;
+    let _ = std::fs::remove_file(&path);
+    put?;
+    Ok(())
 }
 
 /// The film an order made.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Film {
+    /// Its key in the store.
+    pub key: String,
     pub frames: u64,
+    pub bytes: u64,
     pub parts: usize,
     pub seconds: f64,
 }
 
-/// Produces the film of `order`: bakes what is not baked, renders what is not
-/// rendered, and joins the parts once all are there.
+/// Produces the film of `order` in `store`: bakes what is not baked, renders
+/// what is not rendered, and joins the parts once all are there.
 ///
-/// Stopped by a file named `STOP` in the work directory: nothing new is
+/// Stopped by an object named `STOP` under the film's prefix: nothing new is
 /// begun, what is running ends, and the same order asked again goes on from
 /// there.
 pub async fn produce(
     order: &Order,
-    host: &dyn Host,
-    limits: &Limits,
+    store: &dyn RunStore,
+    host: Arc<dyn Host>,
     journal: &Journal,
 ) -> Result<Film, ProduceError> {
     let lanes = plan(order)?;
-    let places = Places { order };
+    let keys = Keys::of(host.as_ref());
     let parts: Vec<Stretch> = lanes.iter().flat_map(|l| l.parts.iter().copied()).collect();
-    let kept = parts.iter().filter(|p| done(&places, **p)).count();
+    let done = done(store, &keys, &parts).await?;
     journal.say(&format!(
-        "frames {}: {} packs, {} parts ({kept} already done), {} at once, {} tries each",
+        "frames {}: {} packs under {}, {} parts under {} ({}), {} at once, {} tries each",
         order.frames,
         lanes.len(),
+        keys.packs,
         parts.len(),
+        keys.film,
+        match order.render_again {
+            true => format!("{} already done, rendered again", done.len()),
+            false => format!("{} already done", done.len()),
+        },
         order.at_once.max(1),
         order.tries.max(1)
     ));
+    let scratch = tempfile::tempdir().map_err(|source| ProduceError::Io {
+        path: std::env::temp_dir(),
+        source,
+    })?;
+    let made = lanes_then_film(
+        order,
+        store,
+        &host,
+        journal,
+        &keys,
+        &done,
+        scratch.path(),
+        &lanes,
+    )
+    .await;
+    // Whatever came of it, what was said is beside the film.
+    let said = journal.text();
+    if let Err(e) = put_bytes(
+        store,
+        scratch.path(),
+        "journal.log",
+        said.as_bytes(),
+        &keys.journal(),
+    )
+    .await
+    {
+        eprintln!("the journal was not put in the store: {e}");
+    }
+    made
+}
 
+#[allow(clippy::too_many_arguments)]
+async fn lanes_then_film(
+    order: &Order,
+    store: &dyn RunStore,
+    host: &Arc<dyn Host>,
+    journal: &Journal,
+    keys: &Keys,
+    done: &[Stretch],
+    scratch: &Path,
+    lanes: &[Lane],
+) -> Result<Film, ProduceError> {
+    let parts: Vec<Stretch> = lanes.iter().flat_map(|l| l.parts.iter().copied()).collect();
     let mut missing = Vec::new();
     let mut stopped = None;
     let run = Run {
         order,
+        store,
         host,
-        limits,
         journal,
+        keys,
+        done,
+        scratch,
     };
-    let mut running = futures_util::stream::iter(&lanes)
+    let mut running = futures_util::stream::iter(lanes)
         .map(|lane| work(&run, lane))
         .buffer_unordered(order.at_once.max(1));
     while let Some(ended) = running.next().await {
@@ -529,7 +680,7 @@ pub async fn produce(
     }
     drop(running);
     if let Some(by) = stopped {
-        journal.say(&format!("stopped: {} is there", by.display()));
+        journal.say(&format!("stopped: {by} is there"));
         return Err(ProduceError::Stopped(by));
     }
     if !missing.is_empty() {
@@ -542,231 +693,191 @@ pub async fn produce(
         return Err(e);
     }
 
-    // Joined beside its place, and moved there whole.
-    let segments: Vec<PathBuf> = parts.iter().map(|p| places.segment(*p)).collect();
-    let joining = order.work.join("film.joining.mp4");
+    // Every part is in the store: brought here, joined, and the film put.
+    let fetched: Vec<PathBuf> = futures_util::stream::iter(parts.iter().copied())
+        .map(|part| async move {
+            let local = scratch.join(format!("join-{part}.mp4"));
+            store.get(&keys.segment(part), &local).await?;
+            Ok::<_, StoreError>(local)
+        })
+        .buffered(4)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<_, _>>()?;
+    let joining = scratch.join("film.mp4");
     let film = |e: String| ProduceError::Film(e);
-    let frames = concat::concat(&segments, &joining).map_err(|e| film(e.to_string()))?;
-    if frames != order.frames.frames() {
+    let (segments, joined) = (fetched, joining.clone());
+    let probe = tokio::task::spawn_blocking(move || {
+        concat::concat(&segments, &joined)?;
+        concat::probe(&joined)
+    })
+    .await
+    .map_err(|e| film(e.to_string()))?
+    .map_err(|e| film(e.to_string()))?;
+    if probe.frames != order.frames.frames() {
         return Err(film(format!(
-            "{frames} frames joined of {}",
+            "{} frames joined of {}",
+            probe.frames,
             order.frames.frames()
-        )));
-    }
-    let probe = concat::probe(&joining).map_err(|e| film(e.to_string()))?;
-    if probe.frames != frames {
-        return Err(film(format!(
-            "{} frames in the film of {frames} joined",
-            probe.frames
         )));
     }
     if let Some(fps) = order.fps {
         concat::check_cadence(probe, fps).map_err(film)?;
     }
-    if let Some(dir) = order.out.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir).map_err(|source| ProduceError::Io {
-            path: dir.into(),
-            source,
-        })?;
-    }
-    std::fs::rename(&joining, &order.out).map_err(|source| ProduceError::Io {
-        path: order.out.clone(),
-        source,
-    })?;
+    let key = keys.film();
+    let bytes = store.put(&joining, &key).await?;
     journal.say(&format!(
-        "film: {} — {frames} frames, {:.1} s, {} parts",
-        order.out.display(),
+        "film: {key} — {} frames, {:.1} s, {} parts, {:.1} MB",
+        probe.frames,
         probe.seconds,
-        parts.len()
+        parts.len(),
+        bytes as f64 / 1e6
     ));
     Ok(Film {
-        frames,
+        key,
+        frames: probe.frames,
+        bytes,
         parts: parts.len(),
         seconds: probe.seconds,
     })
 }
 
-/// A host whose commands are written out: a program and its arguments, with
-/// `{first}`, `{last}` and `{out}` standing for the frames and the output.
-/// A command that names no frame is given `--frames <first>:<last>`, and one
-/// that names no output `--out <file>`, after its own arguments.
-/// Split on spaces before anything is put in, so a path put in may hold
-/// spaces and a template may not quote.
-#[derive(Debug, Clone, Default)]
-pub struct Templates {
-    pub bake: String,
-    pub render: String,
-    /// Run after a failed render whose log names tiles the store lacks
-    /// (`not in the tile store: <layer> <level>/<x>/<y>`, one a line):
-    /// `{list}` stands for a file of those names, `<layer> <level>/<x>/<y>`
-    /// a line. What it does about them is the host's own business.
-    pub on_absent: Option<String>,
-}
-
-/// What a render prints for each tile it needs and the store does not hold.
-pub const ABSENT: &str = "not in the tile store: ";
-
-impl Templates {
-    /// `template`'s command, `{name}` replaced by its value in every word.
-    pub fn command(template: &str, values: &[(&str, &str)]) -> Result<Command, String> {
-        let mut words = template.split_whitespace().map(|word| {
-            values.iter().fold(word.to_string(), |word, (name, value)| {
-                word.replace(&format!("{{{name}}}"), value)
-            })
-        });
-        let program = words.next().ok_or("an empty command")?;
-        let mut command = Command::new(program);
-        command.args(words);
-        Ok(command)
-    }
-
-    fn filled(template: &str, frames: Stretch, out: &Path) -> Command {
-        let (first, last) = (frames.first.to_string(), frames.last.to_string());
-        let out = out.to_string_lossy();
-        let values = [
-            ("first", first.as_str()),
-            ("last", last.as_str()),
-            ("out", &*out),
-        ];
-        // An empty template is refused when the order is read; here it
-        // becomes a command that cannot be run, and is said so.
-        let mut command = Self::command(template, &values).unwrap_or_else(|_| Command::new(""));
-        // What the template leaves unsaid goes the way the engine's own
-        // programs take it.
-        if !template.contains("{first}") && !template.contains("{last}") {
-            command.arg("--frames").arg(format!("{first}:{last}"));
-        }
-        if !template.contains("{out}") {
-            command.arg("--out").arg(&*out);
-        }
-        command
-    }
-}
-
-impl Host for Templates {
-    fn bake(&self, frames: Stretch, out: &Path) -> Command {
-        Self::filled(&self.bake, frames, out)
-    }
-
-    fn render(&self, frames: Stretch, out: &Path) -> Command {
-        Self::filled(&self.render, frames, out)
-    }
-
-    fn mend(&self, step: Step, _frames: Stretch, log: &Path) -> Option<Command> {
-        let template = self.on_absent.as_ref().filter(|_| step == Step::Render)?;
-        let said = std::fs::read_to_string(log).ok()?;
-        let absent: Vec<&str> = said
-            .lines()
-            .filter_map(|line| line.strip_prefix(ABSENT))
-            .collect();
-        if absent.is_empty() {
-            return None;
-        }
-        let list = log.with_extension("absent");
-        std::fs::write(&list, absent.join("\n") + "\n").ok()?;
-        Self::command(template, &[("list", &*list.to_string_lossy())]).ok()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use crate::{ObjectRunStore, Tuning};
 
     const SPS: &[u8] = &[0x67, 0x64, 0x00, 0x0a, 0xac, 0xd9, 0x5e];
 
-    fn order(dir: &Path, frames: (u32, u32)) -> Order {
+    fn order(frames: (u32, u32)) -> Order {
         Order {
-            frames: Stretch {
-                first: frames.0,
-                last: frames.1,
-            },
             pack_frames: 30,
             part_frames: 10,
-            at_once: 1,
-            tries: 3,
-            packs: dir.join("packs"),
-            work: dir.join("work"),
-            out: dir.join("out/film.mp4"),
-            fps: None,
+            ..Order::of(Stretch {
+                first: frames.0,
+                last: frames.1,
+            })
         }
     }
 
-    fn limits() -> Limits {
-        Limits {
-            memory_bytes: None,
-            stall: Duration::from_secs(60),
-            every: Duration::from_millis(50),
-        }
+    type Bake = Box<dyn Fn(Stretch, &Path) -> Result<(), Failed> + Send + Sync>;
+    type Render = Box<dyn Fn(Stretch, &Path) -> Result<(), Failed> + Send + Sync>;
+
+    /// A host that writes a pack of four bytes and a segment of the part's
+    /// frames, says what it was asked, and can be told to do otherwise.
+    struct Told {
+        asked: Mutex<Vec<String>>,
+        packs: String,
+        film: String,
+        bake: Bake,
+        render: Render,
     }
 
-    /// A host made of shell lines. `$first`, `$last`, `$out` and `$n` (the
-    /// part's frames) are the step's; `$here` is the test's directory, where
-    /// `seg-<n>.mp4` is a segment of n frames.
-    struct Shell {
-        here: PathBuf,
-        bake: String,
-        render: String,
-        mend: Option<String>,
+    fn segment(frames: u64, out: &Path) -> Result<(), Failed> {
+        concat::write_test_segment(out, frames as u32, SPS, 1)
+            .map_err(|e| Failed::once(e.to_string()))
     }
 
-    impl Shell {
-        fn new(here: &Path) -> Self {
-            for frames in [5u32, 7, 10] {
-                concat::write_test_segment(&here.join(format!("seg-{frames}.mp4")), frames, SPS, 1)
-                    .expect("segment");
-            }
+    impl Told {
+        fn new() -> Self {
             Self {
-                here: here.to_path_buf(),
-                bake: "echo baked >> $here/bakes; echo pack > $out".into(),
-                render: "echo $first-$last >> $here/renders; cp $here/seg-$n.mp4 $out".into(),
-                mend: None,
+                asked: Mutex::new(Vec::new()),
+                packs: "packs/scene-a".into(),
+                film: "films/scene-a/look-1".into(),
+                bake: Box::new(|_, out| {
+                    std::fs::write(out, b"pack").map_err(|e| Failed::once(e.to_string()))
+                }),
+                render: Box::new(|frames, out| segment(frames.frames(), out)),
             }
         }
 
-        fn line(&self, script: &str, frames: Stretch, out: &Path) -> Command {
-            let mut command = Command::new("sh");
-            command
-                .arg("-c")
-                .arg(script)
-                .env("here", &self.here)
-                .env("first", frames.first.to_string())
-                .env("last", frames.last.to_string())
-                .env("n", frames.frames().to_string())
-                .env("out", out);
-            command
+        fn asked(&self, what: &str) -> Vec<String> {
+            let asked = self.asked.lock().expect("lock");
+            asked
+                .iter()
+                .filter_map(|a| a.strip_prefix(what))
+                .map(String::from)
+                .collect()
         }
     }
 
-    impl Host for Shell {
-        fn bake(&self, frames: Stretch, out: &Path) -> Command {
-            self.line(&self.bake, frames, out)
+    impl Host for Told {
+        fn packs(&self) -> String {
+            self.packs.clone()
         }
-        fn render(&self, frames: Stretch, out: &Path) -> Command {
-            self.line(&self.render, frames, out)
+        fn film(&self) -> String {
+            self.film.clone()
         }
-        fn mend(&self, _: Step, frames: Stretch, log: &Path) -> Option<Command> {
-            let mut command = self.line(self.mend.as_ref()?, frames, Path::new(""));
-            command.env("log", log);
-            Some(command)
+        fn bake(&self, frames: Stretch, out: &Path) -> Result<(), Failed> {
+            self.asked
+                .lock()
+                .expect("lock")
+                .push(format!("bake {frames}"));
+            (self.bake)(frames, out)
+        }
+        fn render(&self, frames: Stretch, pack: &str, out: &Path) -> Result<(), Failed> {
+            self.asked
+                .lock()
+                .expect("lock")
+                .push(format!("render {frames} from {pack}"));
+            (self.render)(frames, out)
         }
     }
 
-    fn lines(path: &Path) -> Vec<String> {
-        std::fs::read_to_string(path)
-            .unwrap_or_default()
-            .lines()
-            .map(String::from)
-            .collect()
+    /// A store on a directory: the same reads and writes as a bucket's.
+    struct World {
+        root: tempfile::TempDir,
+        store: ObjectRunStore,
+        journal: Journal,
+    }
+
+    impl World {
+        fn new() -> Self {
+            let root = tempfile::tempdir().expect("dir");
+            let store = ObjectRunStore::local(root.path(), Tuning::default()).expect("store");
+            Self {
+                root,
+                store,
+                journal: Journal::default(),
+            }
+        }
+
+        async fn made(&self, order: &Order, host: &Arc<Told>) -> Result<Film, ProduceError> {
+            produce(order, &self.store, host.clone(), &self.journal).await
+        }
+
+        fn at(&self, key: &str) -> PathBuf {
+            self.root.path().join(key)
+        }
+
+        /// Every key in the store, sorted.
+        async fn keys(&self) -> Vec<String> {
+            self.store
+                .list("")
+                .await
+                .expect("list")
+                .into_iter()
+                .map(|e| e.key)
+                .collect()
+        }
+    }
+
+    fn missing(failed: &ProduceError) -> Vec<(u32, u32)> {
+        match failed {
+            ProduceError::Missing { missing, .. } => {
+                missing.iter().map(|m| (m.first, m.last)).collect()
+            }
+            _ => Vec::new(),
+        }
     }
 
     #[test]
     fn parts_cover_the_frames_once_and_never_straddle_two_packs() {
-        let dir = Path::new("/nowhere");
         let lanes = plan(&Order {
             pack_frames: 150,
             part_frames: 50,
-            ..order(dir, (1, 18000))
+            ..order((1, 18000))
         })
         .expect("plan");
         assert_eq!(lanes.len(), 120);
@@ -794,7 +905,7 @@ mod tests {
         let lanes = plan(&Order {
             pack_frames: 7,
             part_frames: 3,
-            ..order(dir, (5, 30))
+            ..order((5, 30))
         })
         .expect("plan");
         let mut next = 5;
@@ -813,13 +924,13 @@ mod tests {
         let lanes = plan(&Order {
             pack_frames: 4,
             part_frames: 9,
-            ..order(dir, (1, 8))
+            ..order((1, 8))
         })
         .expect("plan");
         assert_eq!(lanes[1].parts, [Stretch { first: 5, last: 8 }]);
         // The last frame there is does not overflow.
         let top = u32::MAX;
-        let lanes = plan(&order(dir, (top - 3, top))).expect("plan");
+        let lanes = plan(&order((top - 3, top))).expect("plan");
         assert_eq!(
             lanes[0].parts,
             [Stretch {
@@ -828,345 +939,374 @@ mod tests {
             }]
         );
 
-        assert!(plan(&order(dir, (9, 3))).is_err());
+        assert!(plan(&order((9, 3))).is_err());
         assert!(plan(&Order {
             part_frames: 0,
-            ..order(dir, (1, 9))
+            ..order((1, 9))
         })
         .is_err());
     }
 
     #[tokio::test]
-    async fn a_film_is_baked_rendered_and_joined_and_asked_again_does_nothing_over() {
-        let dir = tempfile::tempdir().expect("dir");
-        let host = Shell::new(dir.path());
+    async fn a_film_is_baked_rendered_and_joined_in_the_store_and_nowhere_else() {
+        let world = World::new();
+        let host = Arc::new(Told::new());
         // 55 frames: two packs (30, 25), parts of 10, 10, 10 | 10, 10, 5.
-        let order = order(dir.path(), (101, 155));
-        let journal = Journal::open(&order.work).expect("journal");
-
-        let film = produce(&order, &host, &limits(), &journal)
-            .await
-            .expect("film");
+        let film = world.made(&order((101, 155)), &host).await.expect("film");
         assert_eq!((film.frames, film.parts), (55, 6));
-        assert_eq!(concat::count_frames(&order.out).expect("film"), 55);
-        assert_eq!(lines(&dir.path().join("bakes")).len(), 2);
+        assert_eq!(film.key, "films/scene-a/look-1/film.mp4");
         assert_eq!(
-            lines(&dir.path().join("renders")),
-            ["101-110", "111-120", "121-130", "131-140", "141-150", "151-155"]
+            concat::count_frames(&world.at(&film.key)).expect("film"),
+            55
         );
-        assert!(order.packs.join("101-130.tuilepack").exists());
-        assert!(order.packs.join("131-155.tuilepack").exists());
+        assert_eq!(host.asked("bake "), ["101-130", "131-155"]);
+        assert_eq!(
+            host.asked("render "),
+            [
+                "101-110 from packs/scene-a/101-130.tuilepack",
+                "111-120 from packs/scene-a/101-130.tuilepack",
+                "121-130 from packs/scene-a/101-130.tuilepack",
+                "131-140 from packs/scene-a/131-155.tuilepack",
+                "141-150 from packs/scene-a/131-155.tuilepack",
+                "151-155 from packs/scene-a/131-155.tuilepack",
+            ]
+        );
+        // Two packs; six segments and their receipts, the film, the journal.
+        let keys = world.keys().await;
+        assert_eq!(
+            keys.iter()
+                .filter(|k| k.starts_with("packs/scene-a/"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            keys.iter()
+                .filter(|k| k.starts_with("films/scene-a/look-1/parts/"))
+                .count(),
+            12
+        );
+        assert_eq!(keys.len(), 2 + 12 + 2, "{keys:?}");
+        let said =
+            std::fs::read_to_string(world.at("films/scene-a/look-1/journal.log")).expect("journal");
+        assert!(
+            said.contains("film: films/scene-a/look-1/film.mp4"),
+            "{said}"
+        );
+    }
 
-        // Asked again with a host that can do nothing: nothing is asked of it.
-        let idle = Shell {
-            bake: "exit 1".into(),
-            render: "exit 1".into(),
-            ..Shell::new(dir.path())
-        };
-        std::fs::remove_file(&order.out).expect("remove");
-        let film = produce(&order, &idle, &limits(), &journal)
+    #[tokio::test]
+    async fn what_is_done_is_not_done_again_unless_the_order_says_so() {
+        let world = World::new();
+        let order = order((1, 40));
+        world
+            .made(&order, &Arc::new(Told::new()))
             .await
             .expect("film");
-        assert_eq!(film.frames, 55);
-        assert_eq!(lines(&dir.path().join("renders")).len(), 6);
 
-        // One segment lost: that part alone is rendered again, from the
-        // pack that is there.
-        std::fs::remove_file(order.work.join("segments/121-130.mp4")).expect("remove");
-        produce(
-            &order,
-            &Shell {
-                bake: "exit 1".into(),
-                ..Shell::new(dir.path())
-            },
-            &limits(),
-            &journal,
-        )
-        .await
-        .expect("film");
+        // Asked again: the film is joined from what is there, and nothing is
+        // asked of the host.
+        let idle = Arc::new(Told::new());
+        assert_eq!(world.made(&order, &idle).await.expect("film").frames, 40);
+        assert!(idle.asked("").is_empty(), "{:?}", idle.asked(""));
+
+        // One segment lost: that part alone is rendered again, from the pack
+        // that is there.
+        std::fs::remove_file(world.at("films/scene-a/look-1/parts/21-30.mp4")).expect("remove");
+        world.made(&order, &idle).await.expect("film");
         assert_eq!(
-            lines(&dir.path().join("renders"))
-                .last()
-                .map(String::as_str),
-            Some("121-130")
+            idle.asked(""),
+            ["render 21-30 from packs/scene-a/1-30.tuilepack"]
         );
-        assert_eq!(lines(&dir.path().join("renders")).len(), 7);
-        assert!(std::fs::read_to_string(order.work.join("journal.log"))
-            .expect("journal")
-            .contains("film: "));
+
+        // Told to render again: every part, and no pack.
+        let again = Arc::new(Told::new());
+        world
+            .made(
+                &Order {
+                    render_again: true,
+                    ..order.clone()
+                },
+                &again,
+            )
+            .await
+            .expect("film");
+        assert_eq!(again.asked("render ").len(), 4);
+        assert!(again.asked("bake ").is_empty());
+
+        // Told to bake again: nothing, since no part needs a pack…
+        let again = Arc::new(Told::new());
+        world
+            .made(
+                &Order {
+                    bake_again: true,
+                    ..order.clone()
+                },
+                &again,
+            )
+            .await
+            .expect("film");
+        assert!(again.asked("").is_empty());
+        // …and both packs when the parts are rendered again too.
+        let both = Order {
+            bake_again: true,
+            render_again: true,
+            ..order.clone()
+        };
+        world.made(&both, &again).await.expect("film");
+        assert_eq!(again.asked("bake "), ["1-30", "31-40"]);
+    }
+
+    #[tokio::test]
+    async fn other_parameters_are_other_keys_and_share_nothing_they_should_not() {
+        let world = World::new();
+        let order = order((1, 30));
+        world
+            .made(&order, &Arc::new(Told::new()))
+            .await
+            .expect("film");
+
+        // Another look over the same bake: its parts are rendered, from the
+        // pack already there.
+        let look = Arc::new(Told {
+            film: "films/scene-a/look-2".into(),
+            ..Told::new()
+        });
+        let film = world.made(&order, &look).await.expect("film");
+        assert_eq!(film.key, "films/scene-a/look-2/film.mp4");
+        assert!(look.asked("bake ").is_empty());
+        assert_eq!(look.asked("render ").len(), 3);
+
+        // Another bake: nothing of the first one is taken for it.
+        let scene = Arc::new(Told {
+            packs: "packs/scene-b".into(),
+            film: "films/scene-b/look-1".into(),
+            ..Told::new()
+        });
+        world.made(&order, &scene).await.expect("film");
+        assert_eq!(scene.asked("bake "), ["1-30"]);
+        assert_eq!(scene.asked("render ").len(), 3);
     }
 
     #[tokio::test]
     async fn a_part_that_fails_is_tried_again_and_one_that_never_ends_well_is_named() {
-        let dir = tempfile::tempdir().expect("dir");
-        let mut host = Shell::new(dir.path());
-        // Part 11-20 fails its first try; part 21-30 always does.
-        host.render = "echo $first-$last >> $here/renders; \
-                       [ $first = 21 ] && exit 9; \
-                       [ $first = 11 ] && [ ! -f $here/once ] && { touch $here/once; exit 9; }; \
-                       cp $here/seg-$n.mp4 $out"
-            .into();
-        let order = order(dir.path(), (1, 40));
-        let journal = Journal::open(&order.work).expect("journal");
+        let world = World::new();
+        let once = Mutex::new(false);
+        let host = Arc::new(Told {
+            // Part 11-20 fails its first try; part 21-30 always does.
+            render: Box::new(move |frames, out| match frames.first {
+                21 => Err(Failed::once("no")),
+                11 if !std::mem::replace(&mut *once.lock().expect("lock"), true) => {
+                    Err(Failed::once("not yet"))
+                }
+                _ => segment(frames.frames(), out),
+            }),
+            ..Told::new()
+        });
+        let order = order((1, 40));
 
-        let failed = produce(&order, &host, &limits(), &journal)
-            .await
-            .expect_err("a hole");
-        assert!(
-            matches!(&failed, ProduceError::Missing { missing, parts }
-                if *missing == [Stretch { first: 21, last: 30 }] && *parts == 4),
-            "{failed}"
-        );
+        let failed = world.made(&order, &host).await.expect_err("a hole");
+        assert_eq!(missing(&failed), [(21, 30)], "{failed}");
         // No film with a hole in it; the other parts are done all the same,
         // the second lane's too.
-        assert!(!order.out.exists());
-        let renders = lines(&dir.path().join("renders"));
+        assert!(!world.at("films/scene-a/look-1/film.mp4").exists());
+        let renders: Vec<String> = host
+            .asked("render ")
+            .iter()
+            .map(|r| r.split(' ').next().unwrap_or_default().to_string())
+            .collect();
         assert_eq!(renders.iter().filter(|r| *r == "11-20").count(), 2);
         assert_eq!(renders.iter().filter(|r| *r == "21-30").count(), 3);
         assert_eq!(renders.iter().filter(|r| *r == "31-40").count(), 1);
+        // What was said is in the store all the same.
+        let said =
+            std::fs::read_to_string(world.at("films/scene-a/look-1/journal.log")).expect("journal");
+        assert!(said.contains("1 of 4 parts are missing"), "{said}");
 
         // The fault gone, the same order renders the hole alone and joins.
-        let mended = Shell::new(dir.path());
-        let film = produce(&order, &mended, &limits(), &journal)
+        let mended = Arc::new(Told::new());
+        assert_eq!(world.made(&order, &mended).await.expect("film").frames, 40);
+        assert_eq!(
+            mended.asked(""),
+            ["render 21-30 from packs/scene-a/1-30.tuilepack"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_another_try_would_repeat_is_tried_once() {
+        let world = World::new();
+        let host = Arc::new(Told {
+            render: Box::new(|_, _| Err(Failed::for_good("tiles the store lacks"))),
+            ..Told::new()
+        });
+        let failed = world
+            .made(&order((1, 10)), &host)
             .await
-            .expect("film");
-        assert_eq!(film.frames, 40);
-        assert_eq!(lines(&dir.path().join("renders")).len(), renders.len() + 1);
+            .expect_err("for good");
+        assert_eq!(missing(&failed), [(1, 10)]);
+        assert_eq!(host.asked("render ").len(), 1);
+        assert!(world
+            .journal
+            .text()
+            .contains("tiles the store lacks — not tried again"));
     }
 
     #[tokio::test]
     async fn a_segment_short_of_its_frames_is_not_a_part_done() {
-        let dir = tempfile::tempdir().expect("dir");
-        let mut host = Shell::new(dir.path());
+        let world = World::new();
         // Ends well, with seven frames where ten were asked.
-        host.render = "cp $here/seg-7.mp4 $out".into();
-        let order = Order {
-            tries: 2,
-            ..order(dir.path(), (1, 10))
-        };
-        let journal = Journal::open(&order.work).expect("journal");
-        let failed = produce(&order, &host, &limits(), &journal)
+        let host = Arc::new(Told {
+            render: Box::new(|_, out| segment(7, out)),
+            ..Told::new()
+        });
+        let failed = world
+            .made(
+                &Order {
+                    tries: 2,
+                    ..order((1, 10))
+                },
+                &host,
+            )
             .await
             .expect_err("short");
+        assert_eq!(missing(&failed), [(1, 10)], "{failed}");
+        assert_eq!(host.asked("render ").len(), 2);
         assert!(
-            matches!(failed, ProduceError::Missing { ref missing, .. } if missing.len() == 1),
-            "{failed}"
+            world.keys().await.iter().all(|k| !k.contains("/parts/")),
+            "{:?}",
+            world.keys().await
         );
-        assert!(!order.work.join("segments/1-10.json").exists());
-        let said = std::fs::read_to_string(order.work.join("journal.log")).expect("journal");
-        assert!(said.contains("7 frames of 10"), "{said}");
+        assert!(world.journal.text().contains("7 frames of 10"));
     }
 
     #[tokio::test]
-    async fn a_bake_that_fails_leaves_no_pack_at_its_place_and_its_parts_missing() {
-        let dir = tempfile::tempdir().expect("dir");
-        let mut host = Shell::new(dir.path());
-        host.bake = "echo half > $out; exit 4".into();
-        let order = Order {
-            tries: 2,
-            ..order(dir.path(), (1, 30))
-        };
-        let journal = Journal::open(&order.work).expect("journal");
-        let failed = produce(&order, &host, &limits(), &journal)
+    async fn a_bake_that_fails_leaves_no_pack_at_its_key_and_its_parts_missing() {
+        let world = World::new();
+        let host = Arc::new(Told {
+            bake: Box::new(|_, out| {
+                std::fs::write(out, b"half").map_err(|e| Failed::once(e.to_string()))?;
+                Err(Failed::once("the source went away"))
+            }),
+            ..Told::new()
+        });
+        let failed = world
+            .made(
+                &Order {
+                    tries: 2,
+                    ..order((1, 30))
+                },
+                &host,
+            )
             .await
             .expect_err("no pack");
-        assert!(
-            matches!(failed, ProduceError::Missing { ref missing, .. } if missing.len() == 3),
-            "{failed}"
-        );
-        assert!(!order.packs.join("1-30.tuilepack").exists());
-        assert!(lines(&dir.path().join("renders")).is_empty());
+        assert_eq!(missing(&failed), [(1, 10), (11, 20), (21, 30)], "{failed}");
+        assert_eq!(host.asked("bake ").len(), 2);
+        assert!(host.asked("render ").is_empty());
+        assert_eq!(world.keys().await, ["films/scene-a/look-1/journal.log"]);
     }
 
     #[tokio::test]
-    async fn a_failed_try_is_mended_before_the_next_and_not_tried_again_if_it_cannot_be() {
-        let dir = tempfile::tempdir().expect("dir");
-        let mut host = Shell::new(dir.path());
-        // Fails until it has been mended.
-        host.render =
-            "[ -f $here/mended ] || { echo broken; exit 9; }; cp $here/seg-$n.mp4 $out".into();
-        host.mend = Some("grep -q broken $log && touch $here/mended".into());
-        let order = order(dir.path(), (1, 10));
-        let journal = Journal::open(&order.work).expect("journal");
-        assert_eq!(
-            produce(&order, &host, &limits(), &journal)
-                .await
-                .expect("film")
-                .frames,
-            10
-        );
-
-        // A mending that fails: one try, and no more.
-        let other = tempfile::tempdir().expect("dir");
-        let mut host = Shell::new(other.path());
-        host.render = "echo try >> $here/renders; exit 9".into();
-        host.mend = Some("exit 1".into());
-        let order = super::tests::order(other.path(), (1, 10));
-        let journal = Journal::open(&order.work).expect("journal");
-        produce(&order, &host, &limits(), &journal)
+    async fn a_step_that_panics_fails_its_part_and_not_the_production() {
+        let world = World::new();
+        let host = Arc::new(Told {
+            render: Box::new(|frames, out| {
+                assert!(frames.first != 11, "the renderer gave up");
+                segment(frames.frames(), out)
+            }),
+            ..Told::new()
+        });
+        let failed = world
+            .made(
+                &Order {
+                    tries: 1,
+                    ..order((1, 30))
+                },
+                &host,
+            )
             .await
-            .expect_err("not mended");
-        assert_eq!(lines(&other.path().join("renders")).len(), 1);
+            .expect_err("a hole");
+        assert_eq!(missing(&failed), [(11, 20)], "{failed}");
+        assert_eq!(host.asked("render ").len(), 3);
     }
 
-    #[tokio::test]
-    async fn lanes_at_once_give_the_same_film() {
-        let dir = tempfile::tempdir().expect("dir");
-        let host = Shell::new(dir.path());
-        let order = Order {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lanes_at_once_run_together_and_give_the_same_film() {
+        let world = World::new();
+        // Each bake waits until three are in at once: with fewer lanes than
+        // that, none would ever return.
+        let gate = Arc::new(std::sync::Barrier::new(3));
+        let host = Arc::new(Told {
+            bake: Box::new(move |_, out| {
+                gate.wait();
+                std::fs::write(out, b"pack").map_err(|e| Failed::once(e.to_string()))
+            }),
+            ..Told::new()
+        });
+        let together = Order {
             at_once: 3,
-            ..order(dir.path(), (1, 95))
+            step_timeout: Some(Duration::from_secs(20)),
+            ..order((1, 90))
         };
-        let journal = Journal::open(&order.work).expect("journal");
-        let film = produce(&order, &host, &limits(), &journal)
-            .await
-            .expect("film");
-        assert_eq!((film.frames, film.parts), (95, 10));
+        let film = world.made(&together, &host).await.expect("film");
+        assert_eq!((film.frames, film.parts), (90, 9));
 
-        let alone = tempfile::tempdir().expect("dir");
-        let one = Order {
-            at_once: 1,
-            ..super::tests::order(alone.path(), (1, 95))
-        };
-        let journal = Journal::open(&one.work).expect("journal");
-        produce(&one, &Shell::new(alone.path()), &limits(), &journal)
+        let alone = World::new();
+        let one = alone
+            .made(&order((1, 90)), &Arc::new(Told::new()))
             .await
             .expect("film");
         assert_eq!(
-            std::fs::read(&order.out).expect("film"),
-            std::fs::read(&one.out).expect("film")
+            std::fs::read(world.at(&film.key)).expect("film"),
+            std::fs::read(alone.at(&one.key)).expect("film")
         );
     }
 
     #[tokio::test]
-    async fn a_stop_file_begins_nothing_and_the_order_goes_on_once_it_is_gone() {
-        let dir = tempfile::tempdir().expect("dir");
-        let host = Shell::new(dir.path());
-        let order = order(dir.path(), (1, 30));
-        let journal = Journal::open(&order.work).expect("journal");
-        std::fs::write(order.work.join("STOP"), "").expect("stop");
-        let stopped = produce(&order, &host, &limits(), &journal)
+    async fn a_step_that_does_not_return_stops_the_production_and_says_which() {
+        let world = World::new();
+        let host = Arc::new(Told {
+            render: Box::new(|frames, out| {
+                if frames.first == 11 {
+                    std::thread::sleep(Duration::from_secs(3));
+                }
+                segment(frames.frames(), out)
+            }),
+            ..Told::new()
+        });
+        let order = Order {
+            step_timeout: Some(Duration::from_millis(300)),
+            ..order((1, 30))
+        };
+        let stalled = world.made(&order, &host).await.expect_err("stalled");
+        assert!(
+            matches!(stalled, ProduceError::Stalled { step: "render", frames, .. } if frames.first == 11),
+            "{stalled}"
+        );
+        // What was done before it is kept.
+        assert!(world.at("films/scene-a/look-1/parts/1-10.json").exists());
+        assert!(!world.at("films/scene-a/look-1/film.mp4").exists());
+    }
+
+    #[tokio::test]
+    async fn a_stop_object_begins_nothing_and_the_order_goes_on_once_it_is_gone() {
+        let world = World::new();
+        let host = Arc::new(Told::new());
+        let stop = world.at("films/scene-a/look-1/STOP");
+        std::fs::create_dir_all(stop.parent().expect("parent")).expect("dir");
+        std::fs::write(&stop, "").expect("stop");
+        let stopped = world
+            .made(&order((1, 30)), &host)
             .await
             .expect_err("stopped");
         assert!(matches!(stopped, ProduceError::Stopped(_)), "{stopped}");
-        assert!(lines(&dir.path().join("bakes")).is_empty());
-        std::fs::remove_file(order.work.join("STOP")).expect("remove");
+        assert!(host.asked("").is_empty());
+        std::fs::remove_file(&stop).expect("remove");
         assert_eq!(
-            produce(&order, &host, &limits(), &journal)
+            world
+                .made(&order((1, 30)), &host)
                 .await
                 .expect("film")
                 .frames,
             30
         );
-    }
-
-    #[test]
-    fn a_template_is_split_before_its_values_are_put_in() {
-        let command = Templates::command(
-            "render film --frames {first}:{last} --out {out}",
-            &[("first", "1"), ("last", "50"), ("out", "/a dir/part.mp4")],
-        )
-        .expect("command");
-        let std = command.as_std();
-        assert_eq!(std.get_program(), "render");
-        let args: Vec<_> = std
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(
-            args,
-            ["film", "--frames", "1:50", "--out", "/a dir/part.mp4"]
-        );
-        assert!(Templates::command("  ", &[]).is_err());
-    }
-
-    #[test]
-    fn a_template_that_does_not_say_where_the_frames_and_the_output_go_is_given_them() {
-        let args = |command: Command| -> Vec<String> {
-            command
-                .as_std()
-                .get_args()
-                .map(|a| a.to_string_lossy().into_owned())
-                .collect()
-        };
-        let host = Templates {
-            bake: "bake --tape flight.mcap".into(),
-            render: "render film --range={first}..{last} --codec h264".into(),
-            on_absent: None,
-        };
-        let frames = Stretch {
-            first: 51,
-            last: 100,
-        };
-        // Neither said: both are added, as the engine's own programs take them.
-        assert_eq!(
-            args(host.bake(frames, Path::new("/w/51-100.tuilepack"))),
-            [
-                "--tape",
-                "flight.mcap",
-                "--frames",
-                "51:100",
-                "--out",
-                "/w/51-100.tuilepack"
-            ]
-        );
-        // The frames said in the template's own way: left as they are said,
-        // and only the output is added.
-        assert_eq!(
-            args(host.render(frames, Path::new("/w/a part.mp4"))),
-            [
-                "film",
-                "--range=51..100",
-                "--codec",
-                "h264",
-                "--out",
-                "/w/a part.mp4"
-            ]
-        );
-        // Everything said: nothing is added.
-        let host = Templates {
-            render: "render -o {out} {first} {last}".into(),
-            ..host
-        };
-        assert_eq!(
-            args(host.render(frames, Path::new("p.mp4"))),
-            ["-o", "p.mp4", "51", "100"]
-        );
-    }
-
-    #[test]
-    fn the_tiles_a_render_found_absent_are_handed_to_the_hosts_own_command() {
-        let dir = tempfile::tempdir().expect("dir");
-        let log = dir.path().join("render-1-50.1.log");
-        std::fs::write(
-            &log,
-            "ahead of frames\nnot in the tile store: imagery 17/65451/48330\n\
-             not in the tile store: terrain 12/4000/3000\nError: 2 tiles\n",
-        )
-        .expect("log");
-        let host = Templates {
-            on_absent: Some("fetch-again --from {list}".into()),
-            ..Default::default()
-        };
-        let frames = Stretch { first: 1, last: 50 };
-        let command = host.mend(Step::Render, frames, &log).expect("a mending");
-        let list = dir.path().join("render-1-50.1.absent");
-        let args: Vec<_> = command
-            .as_std()
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(args, ["--from", &*list.to_string_lossy()]);
-        assert_eq!(
-            std::fs::read_to_string(&list).expect("list"),
-            "imagery 17/65451/48330\nterrain 12/4000/3000\n"
-        );
-        // Nothing absent, a bake, or no command: nothing to run.
-        std::fs::write(&log, "Error: out of memory\n").expect("log");
-        assert!(host.mend(Step::Render, frames, &log).is_none());
-        assert!(host.mend(Step::Bake, frames, &log).is_none());
-        assert!(Templates::default()
-            .mend(Step::Render, frames, &log)
-            .is_none());
     }
 }
