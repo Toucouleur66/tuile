@@ -588,6 +588,8 @@ pub async fn produce(
 
 /// A host whose commands are written out: a program and its arguments, with
 /// `{first}`, `{last}` and `{out}` standing for the frames and the output.
+/// A command that names no frame is given `--frames <first>:<last>`, and one
+/// that names no output `--out <file>`, after its own arguments.
 /// Split on spaces before anything is put in, so a path put in may hold
 /// spaces and a template may not quote.
 #[derive(Debug, Clone, Default)]
@@ -628,7 +630,16 @@ impl Templates {
         ];
         // An empty template is refused when the order is read; here it
         // becomes a command that cannot be run, and is said so.
-        Self::command(template, &values).unwrap_or_else(|_| Command::new(""))
+        let mut command = Self::command(template, &values).unwrap_or_else(|_| Command::new(""));
+        // What the template leaves unsaid goes the way the engine's own
+        // programs take it.
+        if !template.contains("{first}") && !template.contains("{last}") {
+            command.arg("--frames").arg(format!("{first}:{last}"));
+        }
+        if !template.contains("{out}") {
+            command.arg("--out").arg(&*out);
+        }
+        command
     }
 }
 
@@ -1067,6 +1078,60 @@ mod tests {
             ["film", "--frames", "1:50", "--out", "/a dir/part.mp4"]
         );
         assert!(Templates::command("  ", &[]).is_err());
+    }
+
+    #[test]
+    fn a_template_that_does_not_say_where_the_frames_and_the_output_go_is_given_them() {
+        let args = |command: Command| -> Vec<String> {
+            command
+                .as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let host = Templates {
+            bake: "bake --tape flight.mcap".into(),
+            render: "render film --range={first}..{last} --codec h264".into(),
+            on_absent: None,
+        };
+        let frames = Stretch {
+            first: 51,
+            last: 100,
+        };
+        // Neither said: both are added, as the engine's own programs take them.
+        assert_eq!(
+            args(host.bake(frames, Path::new("/w/51-100.tuilepack"))),
+            [
+                "--tape",
+                "flight.mcap",
+                "--frames",
+                "51:100",
+                "--out",
+                "/w/51-100.tuilepack"
+            ]
+        );
+        // The frames said in the template's own way: left as they are said,
+        // and only the output is added.
+        assert_eq!(
+            args(host.render(frames, Path::new("/w/a part.mp4"))),
+            [
+                "film",
+                "--range=51..100",
+                "--codec",
+                "h264",
+                "--out",
+                "/w/a part.mp4"
+            ]
+        );
+        // Everything said: nothing is added.
+        let host = Templates {
+            render: "render -o {out} {first} {last}".into(),
+            ..host
+        };
+        assert_eq!(
+            args(host.render(frames, Path::new("p.mp4"))),
+            ["-o", "p.mp4", "51", "100"]
+        );
     }
 
     #[test]

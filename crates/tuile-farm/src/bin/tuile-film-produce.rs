@@ -5,18 +5,23 @@
 //!
 //! ```text
 //! tuile-film-produce --frames 1:18000 --out film.mp4 --packs packs/loop --work work/loop \
-//!   --bake   "tuile-bake --tape flight.mcap --frames {first}:{last} --out {out}" \
-//!   --render "tuile-film-render loop --frames {first}:{last} --out {out} --codec h264"
+//!   --bake   "tuile-bake --tape flight.mcap" \
+//!   --render "tuile-film-render loop --codec h264"
 //! ```
 //!
 //! The frames are cut in packs (`--pack-frames`) and each pack in parts
 //! (`--part-frames`). Each pack is baked by the `--bake` command, each part
 //! rendered to an H.264 segment by the `--render` command, several packs at
 //! once (`--at-once`), and the segments are joined into `--out` once every
-//! one is there. In both commands `{first}`, `{last}` and `{out}` stand for
-//! the frames and the file to write; a command is split on spaces, with no
-//! quoting. What the two commands need of the world — a store, a token — they
-//! find in the environment, which is theirs as it is this program's.
+//! one is there.
+//!
+//! Each command is given its frames and the file to write as
+//! `--frames <first>:<last> --out <file>`, after its own arguments. One that
+//! takes them another way says where: `{first}`, `{last}` and `{out}` stand
+//! for them, and what a command says itself is not added. A command is split
+//! on spaces, with no quoting. What the two commands need of the world — a
+//! store, a token — they find in the environment, which is theirs as it is
+//! this program's.
 //!
 //! Each bake and each render is watched: killed over `--memory-mb`, or after
 //! `--stall-seconds` without processor time, and tried `--tries` times. A
