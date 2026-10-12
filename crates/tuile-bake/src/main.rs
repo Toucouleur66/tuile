@@ -1135,6 +1135,11 @@ fn bake_with(args: Args, tiles: Option<&tiles::Tiles>) -> Result<(), String> {
         .collect(),
     );
 
+    // A pack that only refers to the tile store holds no mesh and no picture:
+    // its tiles are named, not drawn, so none is composed or encoded.
+    if args.content == tuile_pack::Content::References {
+        config.session.finish = tuile_bake::Finish::Identity;
+    }
     let mut session =
         tuile_bake::Session::globe(config).map_err(|e| format!("opening the globe: {e}"))?;
     bake_frames(

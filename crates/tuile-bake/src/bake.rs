@@ -208,7 +208,7 @@ pub fn bake_frames(
                 reused += 1;
                 continue;
             }
-            open.push(baked_tile(&frame, index, tile)?);
+            open.push(packed_tile(&frame, index, tile, job.content.content)?);
             job.packed.insert(tile.tile.0, tile.drape());
         }
         open.end();
@@ -337,6 +337,55 @@ fn drape_has_its_pixels(drape: u64, has_texture: bool) -> bool {
 /// The mapping is deliberately the same one `tuile_frame_tile` makes, field for
 /// field: a pack is a substitute for a live session, and a substitute that
 /// reshapes the data is a second implementation.
+/// One tile as a pack of `content` takes it.
+///
+/// A tile that still has its mesh and its picture goes as [`baked_tile`]
+/// makes it, whatever the pack keeps of it. A tile finished by identity
+/// ([`crate::Finish::Identity`]) has neither: it can only go into a pack that
+/// refers to the tile store, and only with its references — then the record
+/// is the one the same tile would have left with its pictures, since such a
+/// pack stores a tile's counts and never its bytes.
+pub fn packed_tile(
+    frame: &Frame,
+    index: usize,
+    tile: &Arc<TileGeometry>,
+    content: tuile_pack::Content,
+) -> Result<BakedTile, String> {
+    let Some(shape) = tile.shape else {
+        return baked_tile(frame, index, tile);
+    };
+    if content != tuile_pack::Content::References {
+        return Err(format!(
+            "tile {} was finished by identity and has no mesh or picture to embed: \
+             only a pack by reference can take it",
+            tile.tile.0
+        ));
+    }
+    let Some(refs) = tile.refs.clone() else {
+        return Err(format!(
+            "tile {} was finished by identity and its source noted nothing of where it \
+             comes from: there is nothing to refer to",
+            tile.tile.0
+        ));
+    };
+    Ok(BakedTile {
+        id: tile.tile.0,
+        drape: tile.drape(),
+        origin_ecef: tile.origin_ecef.to_array(),
+        positions: Vec::new(),
+        normals: Vec::new(),
+        uvs: Vec::new(),
+        indices: Vec::new(),
+        vertex_count: shape.vertex_count,
+        index_count: shape.index_count,
+        base_color_factor: shape.base_color_factor,
+        // What the picture would have been encoded as, had it been made.
+        texture_format: if tile.drape() != 0 { TextureFormat::Png } else { TextureFormat::None },
+        refs: Some(refs),
+        texture: None,
+    })
+}
+
 pub fn baked_tile(frame: &Frame, index: usize, tile: &Arc<TileGeometry>) -> Result<BakedTile, String> {
     // One prim per tile, as the consumer expects; terrain produces one mesh.
     let mesh = tile
@@ -437,6 +486,86 @@ mod tests {
         assert_eq!(tuile_pack::Pack::open(&bytes).expect("open").scene_digest(), "named-after-the-poses");
         let session = Session::from_pack(&path, Some("named-after-the-poses")).expect("the late name is the one a render checks");
         assert!(session.heights().is_none());
+    }
+
+    /// A pack that refers to the tile store is the same file, byte for byte,
+    /// whether its tiles were finished with their pictures or by identity
+    /// alone: nothing of a mesh or of a mosaic goes into it.
+    #[test]
+    fn a_pack_by_reference_is_the_same_bytes_without_the_pictures() {
+        use crate::session::{finish_tile_as, tests::draped_content, Finish, TextureMemo};
+        use tuile_core::source::TileId;
+
+        let pack_of = |finish: Finish| -> Vec<u8> {
+            let noted = tuile_planetary::Provenance::default();
+            let memo = Arc::new(TextureMemo::default());
+            let tiles: Vec<Arc<TileGeometry>> = [7u64, 8, 9]
+                .into_iter()
+                .map(|id| {
+                    let tile = TileId(id);
+                    let (level, x, y) = tile.terrain_coord();
+                    let content = draped_content();
+                    noted.fetched_terrain(
+                        tuile_terrain::TileCoord::new(level, x, y),
+                        content.local_origin_ecef.to_array(),
+                        tuile_planetary::digest(&id.to_le_bytes()),
+                    );
+                    noted.fetched_imagery(content.imagery[0].coord, b"imagery bytes");
+                    Arc::new(finish_tile_as(&memo, "t", tile, content, 256, Some(&noted), finish))
+                })
+                .collect();
+            let frame = Frame::with_memo("t", tiles, memo);
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut writer = PackWriter::new("scene".to_string(), [0.0; 3], dir.path().join("blob.part"))
+                .expect("writer")
+                .with_content(tuile_pack::Content::References, "terrain", "imagery");
+            let mut open = writer.begin_frame(
+                1,
+                tuile_pack::BakedView {
+                    position: [1.0, 2.0, 3.0],
+                    direction: [0.0, 0.0, -1.0],
+                    up: [0.0, 1.0, 0.0],
+                    viewport_px: [540.0, 960.0],
+                    fovy_rad: std::f64::consts::FRAC_PI_4,
+                },
+            );
+            for (index, tile) in frame.tiles.iter().enumerate() {
+                open.push(
+                    packed_tile(&frame, index, tile, tuile_pack::Content::References).expect("a tile for the pack"),
+                );
+            }
+            open.end();
+            let path = dir.path().join("p.tuilepack");
+            writer.finish_to(&path).expect("pack");
+            std::fs::read(&path).expect("read")
+        };
+        let (with, without) = (pack_of(Finish::Pictures), pack_of(Finish::Identity));
+        assert!(with.len() > 200, "a pack was written");
+        assert_eq!(without, with);
+    }
+
+    /// A tile finished by identity has no mesh and no picture to embed: asked
+    /// for a pack that carries its tiles, it is refused rather than stored
+    /// empty.
+    #[test]
+    fn a_tile_finished_by_identity_cannot_go_into_a_pack_that_embeds() {
+        use crate::session::{finish_tile_as, tests::draped_content, Finish, TextureMemo};
+        let memo = Arc::new(TextureMemo::default());
+        let tile = Arc::new(finish_tile_as(
+            &memo,
+            "t",
+            tuile_core::source::TileId(7),
+            draped_content(),
+            256,
+            None,
+            Finish::Identity,
+        ));
+        let frame = Frame::with_memo("t", vec![Arc::clone(&tile)], memo);
+        for content in [tuile_pack::Content::Embedded, tuile_pack::Content::Both] {
+            assert!(packed_tile(&frame, 0, &tile, content).is_err(), "{content:?}");
+        }
+        // And by reference it needs its references.
+        assert!(packed_tile(&frame, 0, &tile, tuile_pack::Content::References).is_err());
     }
 
     #[test]
