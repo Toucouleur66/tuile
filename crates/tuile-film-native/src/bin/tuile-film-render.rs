@@ -25,6 +25,23 @@
 //!   --seams-tolerance <px>  what a residual is held against (0.25)
 //!   --seams-strict        fail if, in the picture, any stretch is over it
 //!                         or any edge has nothing drawn across it
+//!                         (the tiles are measured as the render draws
+//!                         them: stitched, unless --no-stitch)
+//!   --no-stitch           draw each tile's edges as its own data states
+//!                         them, not put on one line with its neighbours'
+//!   --no-skirts           a probe: tiles without their skirts, to see what
+//!                         stitching closes by itself
+//!   --holes               a probe: paint magenta what shows through a gap
+//!                         in the ground, and count the pixels it touches
+//!   --smooth <off|shading|geometry>
+//!                         PROTOTYPE (exploration terrain-smoothing): off,
+//!                         the mesh as it comes (the default); shading, a
+//!                         normal a vertex and no vertex moved; geometry,
+//!                         each triangle cut in four on a curved patch
+//!   --smooth-strength <0..1>  how much of a vertex's normal a face takes
+//!   --smooth-bound <m>    geometry: the furthest a new vertex may be from
+//!                         the source's flat triangle (default 2)
+//!   --wire                PROTOTYPE: the mesh drawn as lines
 //!   --meter <dir>         measure light going in and coming out; write
 //!                         tiles.csv, frames.csv, tone.json, report.md,
 //!                         and each place's table of grades under the key
@@ -144,45 +161,6 @@ use tuile_radiometry::{
 use tuile_repository::tone::{pack_seen_key, pack_tone_key};
 use tuile_repository::Objects;
 use tuile_repository::TileRepository;
-
-/// The look's colours as the command line gives them: the two lights, and
-/// the air's two ends. Naming either end of the air asks for the air.
-fn colours(
-    look: &mut tuile_film::Look,
-    value: &dyn Fn(&str) -> Option<String>,
-) -> Result<(), Error> {
-    if let Some(colour) = value("--sun-light") {
-        look.sun = rgb("--sun-light", &colour)?;
-    }
-    if let Some(colour) = value("--sky-light") {
-        look.world = rgb("--sky-light", &colour)?;
-    }
-    let horizon = value("--haze-horizon");
-    let zenith = value("--haze-zenith");
-    if horizon.is_some() || zenith.is_some() {
-        let haze = look.haze.get_or_insert_with(tuile_film::Haze::default);
-        if let Some(colour) = horizon {
-            haze.horizon = rgb("--haze-horizon", &colour)?;
-        }
-        if let Some(colour) = zenith {
-            haze.zenith = rgb("--haze-zenith", &colour)?;
-        }
-    }
-    Ok(())
-}
-
-/// `r,g,b`: a colour as three linear values, none below zero.
-fn rgb(name: &str, colour: &str) -> Result<Vec3, Error> {
-    let parts: Vec<f32> = colour
-        .split(',')
-        .map(|part| part.trim().parse())
-        .collect::<Result<_, _>>()
-        .map_err(|_| format!("{name} is <r>,<g>,<b>, not {colour}"))?;
-    match parts[..] {
-        [r, g, b] if parts.iter().all(|c| c.is_finite() && *c >= 0.0) => Ok(Vec3::new(r, g, b)),
-        _ => Err(format!("{name} is <r>,<g>,<b>, each zero or more, not {colour}").into()),
-    }
-}
 
 /// The look's colours as the command line gives them: the two lights, and
 /// the air's two ends. Naming either end of the air asks for the air.
@@ -369,6 +347,22 @@ async fn main() -> Result<(), Error> {
     if let Some(n) = value("--supersample") {
         order.supersample = n.parse()?;
     }
+    order.stitch = !flag("--no-stitch");
+    order.skirts = !flag("--no-skirts");
+    order.holes = flag("--holes");
+    order.wire = flag("--wire");
+    let bound: f32 = value("--smooth-bound").map_or(Ok(2.0), |b| b.parse())?;
+    order.smooth = match value("--smooth").as_deref() {
+        None | Some("off") => tuile_film::smoothing::Smooth::Off,
+        Some("shading") => tuile_film::smoothing::Smooth::Shading,
+        Some("geometry") => tuile_film::smoothing::Smooth::Geometry { bound },
+        Some(other) => {
+            return Err(format!("--smooth is off, shading or geometry, not {other}").into())
+        }
+    };
+    if let Some(strength) = value("--smooth-strength") {
+        order.smooth_strength = strength.parse()?;
+    }
     if let Some(n) = value("--fps") {
         order.fps = n.parse()?;
     }
@@ -490,7 +484,7 @@ async fn main() -> Result<(), Error> {
                 Some(px) => tuile_core::seam::Tolerance::Pixels(px.parse()?),
                 None => tuile_core::seam::Tolerance::QUARTER_PIXEL,
             };
-            Some(tuile_film_native::SeamLog::into(dir, tolerance))
+            Some(tuile_film_native::SeamLog::into(dir, tolerance).stitched(order.stitch))
         }
         None => None,
     };
@@ -551,6 +545,38 @@ async fn main() -> Result<(), Error> {
             .into());
         }
     }
+    if order.stitch {
+        println!(
+            "stitching: {} frames planned ({:.1} ms each, the rule and the meshes cut again), \
+             {} tiles stitched anew, {} of them given vertices; at most {} knots a tile, {} \
+             bytes of strips uploaded",
+            done.planned,
+            done.plan_ms / done.planned.max(1) as f64,
+            done.restitched,
+            done.resplit,
+            done.most_knots,
+            done.strip_bytes
+        );
+    } else {
+        println!("stitching: off (--no-stitch)");
+    }
+    if order.holes {
+        println!("holes: {} pixels touched", done.hole_pixels);
+    }
+    println!(
+        "smoothing ({:?}, strength {}): {} of {} tiles came with normals of their own; {} \
+         triangles -> {}; a vertex at most {:.2} m from the source's surface, {:.3} m on \
+         average over the vertices added; {:.2} ms a tile",
+        order.smooth,
+        order.smooth_strength,
+        done.with_normals,
+        done.smoothed_tiles,
+        done.triangles.0,
+        done.triangles.1,
+        done.smooth_furthest,
+        done.smooth_mean_sum / done.smoothed_tiles.max(1) as f64,
+        done.smooth_ms / done.smoothed_tiles.max(1) as f64,
+    );
     let megabytes = |b: u64| b as f64 / 1e6;
     println!(
         "{} frames at {}×{} in {:.1} s ({:.2} frames/s), {:.1} s of it before the first frame",

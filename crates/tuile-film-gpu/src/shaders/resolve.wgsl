@@ -123,7 +123,11 @@ fn resolve(@builtin(global_invocation_id) id: vec3u) {
         let n = normal_at(i0) * (1.0 - b.x - b.y)
             + normal_at(i1) * b.x
             + normal_at(i2) * b.y;
-        normal = normalize(n);
+        // PROTOTYPE (terrain smoothing): how much of the vertices' normals a
+        // face takes, against its own — `zenith.w`, 1 as before.
+        var flat = normal;
+        if (dot(flat, n) < 0.0) { flat = -flat; }
+        normal = normalize(mix(flat, normalize(n), frame.zenith.w));
     }
     // Seen from behind, a surface is lit as its visible side.
     if (dot(normal, d) > 0.0) { normal = -normal; }
@@ -139,6 +143,18 @@ fn resolve(@builtin(global_invocation_id) id: vec3u) {
         base *= textureSampleGrad(albedo, samp, uv, ddx, ddy).rgb;
     }
 
+    // PROTOTYPE (terrain smoothing): the mesh, drawn — a pale ground with
+    // each triangle's edges a pixel wide — when `horizon.w` asks.
+    if (frame.horizon.w != 0.0) {
+        let bx = bary(ray(px + vec2f(1.0, 0.0)), a, e1, e2) - b;
+        let by = bary(ray(px + vec2f(0.0, 1.0)), a, e1, e2) - b;
+        let third = 1.0 - b.x - b.y;
+        let near = min(
+            min(b.x / length(vec2f(bx.x, by.x)), b.y / length(vec2f(bx.y, by.y))),
+            third / length(vec2f(bx.x + bx.y, by.x + by.y)),
+        );
+        base = mix(vec3f(0.02, 0.02, 0.05), vec3f(0.55), smoothstep(0.6, 1.6, near));
+    }
     let cos = max(dot(normal, frame.to_sun.xyz), 0.0);
     var radiance = base * (frame.world.xyz + frame.sun.xyz * cos);
     if (frame.shadow.x > 0.0 || frame.haze.w != 0.0) {
@@ -174,5 +190,21 @@ fn resolve(@builtin(global_invocation_id) id: vec3u) {
             radiance = radiance * left + frame.horizon.xyz * (1.0 - left);
         }
     }
-    textureStore(hdr, xy, vec4f(radiance, 1.0));
+    // The probe of holes: a pixel whose ground is not a place, or is
+    // further than the horizon of a sphere well under any ground (6 350 km)
+    // by half again, is a ray that went through a gap — the far side of
+    // the planet seen through it. It is marked, in the alpha nothing else
+    // reads, for `present` to paint.
+    var mark = 1.0;
+    if (frame.local_up.w != 0.0) {
+        let inside = clamp(b, vec2f(0.0), vec2f(1.0));
+        let held = inside / max(inside.x + inside.y, 1.0);
+        let p = a + held.x * e1 + held.y * e2;
+        let number = all((bitcast<vec3u>(p) & vec3u(0x7f800000u)) != vec3u(0x7f800000u));
+        // The eye is `r` from the Earth's centre.
+        let r = 0.5 / frame.haze.z;
+        let far = dot(p, p) > 1.5 * (r - 6.35e6) * (r + 6.35e6);
+        if (!number || far) { mark = 2.0; }
+    }
+    textureStore(hdr, xy, vec4f(radiance, mark));
 }
