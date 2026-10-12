@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use common::*;
 use object_store::ObjectStoreExt;
-use tuile_tile_server::{Compaction, Zone};
+use bytes::Bytes;
+use tuile_tile_server::{Compaction, Scrub, Zone};
 
 #[tokio::test]
 async fn a_tile_is_readable_the_moment_it_is_put() {
@@ -299,4 +300,80 @@ async fn a_past_month_s_deltas_are_merged_among_themselves_and_never_with_anothe
     for v in 0..fanout + 2 {
         assert_eq!(fresh.get(IMAGERY, LEVEL, X0 + v, Y0).await.expect("get"), Some(body(LEVEL, X0 + v, Y0, v)));
     }
+}
+
+/// A picture a source served in place of tiles it does not have: the same
+/// bytes wherever it was served.
+const PLACEHOLDER: &[u8] = b"no imagery here";
+
+#[tokio::test]
+async fn a_scrub_takes_out_the_tiles_it_is_told_to_and_no_other() {
+    let clock = TestClock::new();
+    let objects = memory();
+    let s = store_on(objects.clone(), &clock, eager());
+    let placeholder = Bytes::from_static(PLACEHOLDER);
+    let mut expected = std::collections::BTreeMap::new();
+
+    // First archive: forty real tiles, and the placeholder at five places.
+    for i in 0..40u32 {
+        let (x, y) = in_zone(i);
+        s.put(IMAGERY, LEVEL, x, y, body(LEVEL, x, y, 1)).await.expect("put");
+        expected.insert((x, y), Some(body(LEVEL, x, y, 1)));
+    }
+    for i in 100..105u32 {
+        let (x, y) = in_zone(i);
+        s.put(IMAGERY, LEVEL, x, y, placeholder.clone()).await.expect("put");
+        expected.insert((x, y), None);
+    }
+    s.flush_all().await.expect("flush");
+    // Second archive: real tiles only — it is not to be touched.
+    for i in 200..220u32 {
+        let (x, y) = in_zone(i);
+        s.put(IMAGERY, LEVEL, x, y, body(LEVEL, x, y, 2)).await.expect("put");
+        expected.insert((x, y), Some(body(LEVEL, x, y, 2)));
+    }
+    s.flush_all().await.expect("flush");
+    // Third archive: nothing but the placeholder — over a real tile of the
+    // first archive, which is seen again once it is gone, and at new places.
+    let (ox, oy) = in_zone(7);
+    s.put(IMAGERY, LEVEL, ox, oy, placeholder.clone()).await.expect("put");
+    for i in 300..303u32 {
+        let (x, y) = in_zone(i);
+        s.put(IMAGERY, LEVEL, x, y, placeholder.clone()).await.expect("put");
+        expected.insert((x, y), None);
+    }
+    s.flush_all().await.expect("flush");
+
+    let zone = zone();
+    let prefix = common::imagery().zone_prefix(zone);
+    let before = tuile_tile_server::manifest::read(objects.as_ref(), &prefix).await.expect("manifest").manifest;
+    assert_eq!(before.archives.len(), 3);
+
+    let outcome = s.scrub(IMAGERY, zone, |bytes| bytes == PLACEHOLDER).await.expect("scrub");
+    assert_eq!(outcome, Scrub::Removed { tiles: 9, archives: 2 });
+
+    // Read by a store that knows nothing of what was done: every real tile
+    // as it was, no placeholder anywhere.
+    let fresh = store_on(objects.clone(), &clock, eager());
+    for ((x, y), wanted) in &expected {
+        assert_eq!(fresh.get(IMAGERY, LEVEL, *x, *y).await.expect("get"), *wanted, "{x}/{y}");
+    }
+    // The same store that scrubbed sees it too, without being told.
+    assert_eq!(s.get(IMAGERY, LEVEL, ox, oy).await.expect("get"), Some(body(LEVEL, ox, oy, 1)));
+
+    let after = tuile_tile_server::manifest::read(objects.as_ref(), &prefix).await.expect("manifest").manifest;
+    // The archive of placeholders alone is gone, the clean one is the very
+    // same object, the mixed one was written again without them.
+    assert_eq!(after.archives.len(), 2);
+    assert_eq!(after.archives[1].key, before.archives[1].key);
+    assert_ne!(after.archives[0].key, before.archives[0].key);
+    assert_eq!(after.archives[0].tiles, 40);
+    assert_eq!(after.archives[0].epoch, before.archives[0].epoch);
+    assert_eq!(after.archives[0].oldest_fetch_ms, before.archives[0].oldest_fetch_ms);
+    assert_eq!(after.retired.len(), 2, "what was replaced waits out its grace");
+
+    // Nothing left to take out: nothing is written.
+    assert_eq!(s.scrub(IMAGERY, zone, |bytes| bytes == PLACEHOLDER).await.expect("scrub"), Scrub::Clean);
+    let again = tuile_tile_server::manifest::read(objects.as_ref(), &prefix).await.expect("manifest").manifest;
+    assert_eq!(again.generation, after.generation);
 }
