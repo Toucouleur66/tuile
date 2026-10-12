@@ -11,6 +11,7 @@
 
 mod camera;
 mod cursor;
+pub mod drape;
 pub mod from_store;
 mod look;
 mod mesh;

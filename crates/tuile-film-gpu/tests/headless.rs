@@ -1420,3 +1420,107 @@ fn the_sky_runs_from_the_horizon_to_the_zenith() {
     }
     assert!(pixel(&r, 32, 0)[0] + 30 < pixel(&r, 32, 23)[0]);
 }
+
+/// One level of a texture, tightly packed.
+fn level_of(film: &FilmGpu, texture: &wgpu::Texture, level: u32) -> Vec<u8> {
+    let (w, h) = (
+        (texture.width() >> level).max(1),
+        (texture.height() >> level).max(1),
+    );
+    let row = (w * 4).next_multiple_of(256);
+    let padded = read(film, |encoder| {
+        let buffer = film.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: u64::from(row * h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                mip_level: level,
+                ..texture.as_image_copy()
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        (buffer, 0)
+    });
+    padded
+        .chunks(row as usize)
+        .flat_map(|r| r[..(w * 4) as usize].to_vec())
+        .collect()
+}
+
+/// A drape kept from one of its levels down is the end of the whole drape's
+/// mip chain, byte for byte: a tile entered with it is sampled as it would
+/// have been with the whole one, wherever it is read at that level or under.
+#[test]
+fn the_tail_of_a_drape_is_the_end_of_its_mip_chain() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no adapter: skipped");
+        return;
+    };
+    let mut film = FilmGpu::new(
+        device,
+        queue,
+        Settings {
+            width: 64,
+            height: 48,
+            supersample: 1,
+            look: Look::default(),
+        },
+    );
+    let whole = film.create_albedo(64, 64);
+    film.write_rgba(&whole, &noise(64, 7));
+    let kept = film.tail(&whole, 2);
+    assert_eq!((kept.width(), kept.height()), (16, 16));
+    assert_eq!(kept.mip_level_count(), 5);
+    // Entered as a tile's drape, so that its own levels are made.
+    let (p, n, uv, i) = square();
+    film.enter(
+        TileKey { id: 1, drape: 0 },
+        &TileMesh {
+            origin_ecef: [A, 0.0, 0.0],
+            positions: &p,
+            normals: &n,
+            uvs: &uv,
+            indices: &i,
+            index_count: 6,
+            base_color_factor: [1.0; 4],
+        },
+        Some(kept.clone()),
+    )
+    .expect("enter");
+    let mut pending = film.device().create_command_encoder(&Default::default());
+    film.record_pending(&mut pending);
+    film.queue().submit([pending.finish()]);
+
+    let mut seen = std::collections::HashSet::new();
+    for level in 0..kept.mip_level_count() {
+        let (of_kept, of_whole) = (
+            level_of(&film, &kept, level),
+            level_of(&film, &whole, level + 2),
+        );
+        assert_eq!(of_kept.len() as u32, (16 >> level) * (16 >> level) * 4);
+        assert_eq!(of_kept, of_whole, "level {level} of the tail");
+        seen.insert(of_kept);
+    }
+    // And they are pictures, not five blanks that agree.
+    assert_eq!(seen.len(), 5);
+    assert!(level_of(&film, &kept, 0)
+        .chunks(4)
+        .any(|p| p[..3] != [0, 0, 0]));
+    // A level past the chain is its last.
+    assert_eq!(film.tail(&whole, 40).width(), 1);
+}
