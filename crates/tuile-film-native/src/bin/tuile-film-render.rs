@@ -127,7 +127,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use glam::DVec3;
+use glam::{DVec3, Vec3};
 use tuile_core::geo::{enu_frame, geodetic_to_ecef, Geodetic};
 use tuile_film::{BakedView, OverlayDepth, OverlayMesh, Overlays};
 
@@ -144,6 +144,45 @@ use tuile_radiometry::{
 use tuile_repository::tone::{pack_seen_key, pack_tone_key};
 use tuile_repository::Objects;
 use tuile_repository::TileRepository;
+
+/// The look's colours as the command line gives them: the two lights, and
+/// the air's two ends. Naming either end of the air asks for the air.
+fn colours(
+    look: &mut tuile_film::Look,
+    value: &dyn Fn(&str) -> Option<String>,
+) -> Result<(), Error> {
+    if let Some(colour) = value("--sun-light") {
+        look.sun = rgb("--sun-light", &colour)?;
+    }
+    if let Some(colour) = value("--sky-light") {
+        look.world = rgb("--sky-light", &colour)?;
+    }
+    let horizon = value("--haze-horizon");
+    let zenith = value("--haze-zenith");
+    if horizon.is_some() || zenith.is_some() {
+        let haze = look.haze.get_or_insert_with(tuile_film::Haze::default);
+        if let Some(colour) = horizon {
+            haze.horizon = rgb("--haze-horizon", &colour)?;
+        }
+        if let Some(colour) = zenith {
+            haze.zenith = rgb("--haze-zenith", &colour)?;
+        }
+    }
+    Ok(())
+}
+
+/// `r,g,b`: a colour as three linear values, none below zero.
+fn rgb(name: &str, colour: &str) -> Result<Vec3, Error> {
+    let parts: Vec<f32> = colour
+        .split(',')
+        .map(|part| part.trim().parse())
+        .collect::<Result<_, _>>()
+        .map_err(|_| format!("{name} is <r>,<g>,<b>, not {colour}"))?;
+    match parts[..] {
+        [r, g, b] if parts.iter().all(|c| c.is_finite() && *c >= 0.0) => Ok(Vec3::new(r, g, b)),
+        _ => Err(format!("{name} is <r>,<g>,<b>, each zero or more, not {colour}").into()),
+    }
+}
 
 /// The look's colours as the command line gives them: the two lights, and
 /// the air's two ends. Naming either end of the air asks for the air.
