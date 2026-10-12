@@ -968,9 +968,56 @@ fn bake(args: Args) -> Result<(), String> {
     result.and(flushed.map(|_| ()))
 }
 
+/// Bakes the frames asked for of the tape asked for, and says what a launcher
+/// reads: the sources, then the key the pack belongs under.
+fn bake_tape(token: String, args: &Args, tiles: Option<&tiles::Tiles>) -> Result<(), String> {
+    let bake = tuile_bake::tape::TapeBake {
+        token,
+        cache_dir: std::env::var("TUILE_CACHE_DIR").ok().map(Into::into),
+        poses: tuile_bake::tape::TapeBake::poses_of(&args.tape)?,
+        viewport: args.viewport,
+        sse: args.sse,
+        terrain: args.terrain,
+        imagery: args.imagery,
+        content: args.content,
+    };
+    let layers = bake.layers();
+    println!(
+        "BAKE-SOURCES terrain={} imagery={} ({})",
+        layers.0,
+        layers.1.as_deref().unwrap_or("none"),
+        if args.terrain.is_some() || args.imagery.is_some() { "as asked" } else { "the defaults" }
+    );
+    // The memory line, on a beat, from here to the end of the process: a
+    // bake that dies of memory dies without saying so.
+    tuile_bake::memory::watch(
+        std::time::Duration::from_secs(
+            std::env::var("TUILE_MEMORY_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(15),
+        ),
+        [
+            std::env::var("TUILE_CACHE_DIR").ok().map(std::path::PathBuf::from),
+            args.out.parent().map(std::path::Path::to_path_buf),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+    );
+    let wanted = (args.last as usize).min(bake.poses.len());
+    bake.bake(args.first, args.last, &args.out, tiles)?;
+    // On stdout, and parseable, because the launcher turns it into an object
+    // key.
+    println!("BAKE-KEY {}/{}-{wanted}.tuilepack", bake.packs(), args.first);
+    Ok(())
+}
+
 fn bake_with(args: Args, tiles: Option<&tiles::Tiles>) -> Result<(), String> {
     let token = std::env::var("TUILE_ION_TOKEN")
         .map_err(|_| "TUILE_ION_TOKEN is not set; a bake is the one job that needs it")?;
+    // A tape's frames: the library's own bake, the one a film's production
+    // calls too. What follows is the re-bake of an old pack.
+    if args.rebake.is_none() {
+        return bake_tape(token, &args, tiles);
+    }
 
     // La tape n'est lue qu'une fois, et pour ce qu'elle contient.
     //
@@ -1135,6 +1182,11 @@ fn bake_with(args: Args, tiles: Option<&tiles::Tiles>) -> Result<(), String> {
         .collect(),
     );
 
+    // A pack that only refers to the tile store holds no mesh and no picture:
+    // its tiles are named, not drawn, so none is composed or encoded.
+    if args.content == tuile_pack::Content::References {
+        config.session.finish = tuile_bake::Finish::Identity;
+    }
     let mut session =
         tuile_bake::Session::globe(config).map_err(|e| format!("opening the globe: {e}"))?;
     bake_frames(

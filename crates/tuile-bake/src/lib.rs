@@ -47,6 +47,7 @@ mod globe;
 pub mod memory;
 pub mod packed;
 mod session;
+pub mod tape;
 pub mod tiles;
 
 pub use globe::{
@@ -56,7 +57,8 @@ pub use globe::{
 };
 pub use packed::PackedError;
 pub use session::{
-    exact_traversal, EncodedTexture, Frame, FrameError, Session, SessionConfig, TileGeometry,
+    exact_traversal, EncodedTexture, Finish, Frame, FrameError, Session, SessionConfig,
+    TileGeometry,
 };
 /// What a caller already holds, so a bake never fetches it twice. See
 /// [`GlobeConfig::held_drape`].

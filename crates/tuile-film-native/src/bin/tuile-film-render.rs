@@ -25,6 +25,23 @@
 //!   --seams-tolerance <px>  what a residual is held against (0.25)
 //!   --seams-strict        fail if, in the picture, any stretch is over it
 //!                         or any edge has nothing drawn across it
+//!                         (the tiles are measured as the render draws
+//!                         them: stitched, unless --no-stitch)
+//!   --no-stitch           draw each tile's edges as its own data states
+//!                         them, not put on one line with its neighbours'
+//!   --no-skirts           a probe: tiles without their skirts, to see what
+//!                         stitching closes by itself
+//!   --holes               a probe: paint magenta what shows through a gap
+//!                         in the ground, and count the pixels it touches
+//!   --smooth <off|shading|geometry>
+//!                         PROTOTYPE (exploration terrain-smoothing): off,
+//!                         the mesh as it comes (the default); shading, a
+//!                         normal a vertex and no vertex moved; geometry,
+//!                         each triangle cut in four on a curved patch
+//!   --smooth-strength <0..1>  how much of a vertex's normal a face takes
+//!   --smooth-bound <m>    geometry: the furthest a new vertex may be from
+//!                         the source's flat triangle (default 2)
+//!   --wire                PROTOTYPE: the mesh drawn as lines
 //!   --meter <dir>         measure light going in and coming out; write
 //!                         tiles.csv, frames.csv, tone.json, report.md,
 //!                         and each place's table of grades under the key
@@ -94,6 +111,15 @@
 //!   --haze-density <per m>, --haze-height <m>
 //!                         that air's extinction at the ellipsoid, and the
 //!                         height over which it thins by e
+//!   --haze-horizon <r,g,b>, --haze-zenith <r,g,b>
+//!                         that air's colour at the horizon — what distance
+//!                         fades to — and the sky's straight up: linear
+//!                         radiance, as the look's lights. Either asks for
+//!                         the air, as --haze does
+//!   --sun-light <r,g,b>   the sun's strength: what a white surface facing
+//!                         it comes out at, linear
+//!   --sky-light <r,g,b>   the dome's radiance, linear: what lights ground
+//!                         the sun does not reach
 //!   --anchor <level>      the level --meter's own solve holds still (10)
 //!   --cache <dir>         chunks of packs and archives (default
 //!                         $TUILE_CACHE_DIR, else ./film-cache)
@@ -118,14 +144,15 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use glam::DVec3;
+use glam::{DVec3, Vec3};
 use tuile_core::geo::{enu_frame, geodetic_to_ecef, Geodetic};
 use tuile_film::{BakedView, OverlayDepth, OverlayMesh, Overlays};
 
 use tuile_farm::{BucketConfig, ObjectRunStore, RunStore, Tuning};
+use tuile_film_native::setup::{bucket, film_sink, rgb, sun_at};
 use tuile_film_native::{
-    render, Av1Film, Error, Film, LightMeter, Nothing, Observer, Order, Pictures, Reference, Sink,
-    Sources, Tone,
+    render, Error, Film, LightMeter, Nothing, Observer, Order, Pictures, Reference, Sink, Sources,
+    Tone,
 };
 use tuile_radiometry::{
     Bounds, CornerField, FieldBounds, FilmGrade, Local, LookTarget, MatrixBounds, MatrixField,
@@ -135,15 +162,30 @@ use tuile_repository::tone::{pack_seen_key, pack_tone_key};
 use tuile_repository::Objects;
 use tuile_repository::TileRepository;
 
-fn bucket(name: &str) -> Result<Arc<dyn Objects>, Error> {
-    let config = BucketConfig {
-        bucket: name.to_string(),
-        ..BucketConfig::from_env()?
-    };
-    Ok(Arc::new(ObjectRunStore::bucket(
-        &config,
-        Tuning::from_env(),
-    )?))
+/// The look's colours as the command line gives them: the two lights, and
+/// the air's two ends. Naming either end of the air asks for the air.
+fn colours(
+    look: &mut tuile_film::Look,
+    value: &dyn Fn(&str) -> Option<String>,
+) -> Result<(), Error> {
+    if let Some(colour) = value("--sun-light") {
+        look.sun = rgb("--sun-light", &colour)?;
+    }
+    if let Some(colour) = value("--sky-light") {
+        look.world = rgb("--sky-light", &colour)?;
+    }
+    let horizon = value("--haze-horizon");
+    let zenith = value("--haze-zenith");
+    if horizon.is_some() || zenith.is_some() {
+        let haze = look.haze.get_or_insert_with(tuile_film::Haze::default);
+        if let Some(colour) = horizon {
+            haze.horizon = rgb("--haze-horizon", &colour)?;
+        }
+        if let Some(colour) = zenith {
+            haze.zenith = rgb("--haze-zenith", &colour)?;
+        }
+    }
+    Ok(())
 }
 
 /// The same shapes in every frame: `--ribbon` and `--marker`.
@@ -275,40 +317,6 @@ impl Sink for Both {
     }
 }
 
-/// The film's encoder: the one asked for, or the best this binary has —
-/// the machine's own before software.
-fn film_sink(path: String, bitrate: u32, codec: Option<&str>) -> Result<Box<dyn Sink>, Error> {
-    #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
-    if matches!(codec, Some("h264") | None) {
-        return Ok(Box::new(tuile_film_native::H264Film::at(path, bitrate)));
-    }
-    #[cfg(all(target_os = "linux", feature = "nvenc"))]
-    {
-        use tuile_film_native::{NvencCodec, NvencFilm};
-        let device = std::env::var("TUILE_CUDA_DEVICE")
-            .ok()
-            .and_then(|d| d.parse().ok())
-            .unwrap_or(0);
-        match codec {
-            Some("nvenc-av1") | None => {
-                return Ok(Box::new(
-                    NvencFilm::at(path, bitrate, NvencCodec::Av1).on_device(device),
-                ))
-            }
-            Some("nvenc-h264") | Some("h264") => {
-                return Ok(Box::new(
-                    NvencFilm::at(path, bitrate, NvencCodec::H264).on_device(device),
-                ))
-            }
-            _ => {}
-        }
-    }
-    match codec {
-        Some("av1") | None => Ok(Box::new(Av1Film::at(path, bitrate))),
-        Some(other) => Err(format!("no {other} encoder was built into this binary").into()),
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     dotenvy::dotenv().ok();
@@ -338,6 +346,22 @@ async fn main() -> Result<(), Error> {
     }
     if let Some(n) = value("--supersample") {
         order.supersample = n.parse()?;
+    }
+    order.stitch = !flag("--no-stitch");
+    order.skirts = !flag("--no-skirts");
+    order.holes = flag("--holes");
+    order.wire = flag("--wire");
+    let bound: f32 = value("--smooth-bound").map_or(Ok(2.0), |b| b.parse())?;
+    order.smooth = match value("--smooth").as_deref() {
+        None | Some("off") => tuile_film::smoothing::Smooth::Off,
+        Some("shading") => tuile_film::smoothing::Smooth::Shading,
+        Some("geometry") => tuile_film::smoothing::Smooth::Geometry { bound },
+        Some(other) => {
+            return Err(format!("--smooth is off, shading or geometry, not {other}").into())
+        }
+    };
+    if let Some(strength) = value("--smooth-strength") {
+        order.smooth_strength = strength.parse()?;
     }
     if let Some(n) = value("--fps") {
         order.fps = n.parse()?;
@@ -378,6 +402,7 @@ async fn main() -> Result<(), Error> {
         }
         order.look.haze = Some(haze);
     }
+    colours(&mut order.look, &value)?;
     let calibrating = value("--calibrate");
     if flag("--no-tone") || calibrating.is_some() {
         order.tone = Tone::Off;
@@ -398,33 +423,11 @@ async fn main() -> Result<(), Error> {
         )?),
         _ => bucket(&std::env::var("TUILE_STORE_BUCKET")?)?,
     };
-    // The blocks of a remote store, counted where they cross the network.
-    let mut remote_blocks: Option<Arc<tuile_repository::Kept<tuile_repository::HttpGet>>> = None;
-    // Their store, to be closed on the way out: what it has not written by
-    // then is lost, and downloaded again by the next render.
-    let mut block_store: Option<tuile_storage_foyer::FoyerStore> = None;
-    let tiles: Arc<dyn Objects> = match tuile_repository::HttpGet::from_env()? {
-        Some(get) => {
-            println!("tile store: {}/store, by its routes", get.root());
-            // A block is downloaded once: kept in a store of its own beside
-            // the film's other caches — memory over disk — for this render
-            // and the next. Sized well above a film's blocks: what the store
-            // gives up is downloaded again.
-            let blocks =
-                tuile_storage_foyer::FoyerStore::keeping(tuile_storage_foyer::StoreConfig {
-                    dir: PathBuf::from(&cache).join("store-blocks"),
-                    memory_bytes: 256 << 20,
-                    disk_bytes: 32 << 30,
-                    default_ttl: None,
-                })
-                .await?;
-            block_store = Some(blocks.clone());
-            let kept = Arc::new(tuile_repository::Kept::new(get, Arc::new(blocks)));
-            remote_blocks = Some(kept.clone());
-            Arc::new(tuile_repository::RemoteStore::new(kept, "store"))
-        }
-        None => bucket(&std::env::var("TUILE_TILES_BUCKET")?)?,
-    };
+    let tuile_film_native::setup::TileStore {
+        objects: tiles,
+        remote_blocks,
+        block_store,
+    } = tuile_film_native::setup::tile_store(&PathBuf::from(&cache)).await?;
     let sources = Sources::open(runs, tiles, &PathBuf::from(cache)).await?;
     let film = if prefix.ends_with(".tuilepack") {
         Film::of(sources.packs.objects.as_ref(), &[prefix.as_str()]).await?
@@ -441,10 +444,7 @@ async fn main() -> Result<(), Error> {
         let (azimuth, elevation) = sun
             .split_once(',')
             .ok_or("--sun is <azimuth>,<elevation>")?;
-        let (azimuth, elevation) = (
-            azimuth.parse::<f64>()?.to_radians(),
-            elevation.parse::<f64>()?.to_radians(),
-        );
+        let (azimuth, elevation) = (azimuth.parse::<f64>()?, elevation.parse::<f64>()?);
         // East, north and up where the first frame rendered is seen from.
         let from = order.frames.map_or(first, |f| f.0);
         let pack = film
@@ -455,9 +455,7 @@ async fn main() -> Result<(), Error> {
         let eye = tuile_film::Pack::open_table(&pack.head)?
             .view_of(from)?
             .position;
-        let local = enu_frame(tuile_core::geo::ecef_to_geodetic(DVec3::from_array(eye)));
-        let level = local.x_axis * azimuth.sin() + local.y_axis * azimuth.cos();
-        order.look.to_sun = (level * elevation.cos() + local.z_axis * elevation.sin()).as_vec3();
+        order.look.to_sun = sun_at(eye, azimuth, elevation);
     }
 
     let mut sinks: Vec<Box<dyn Sink>> = Vec::new();
@@ -486,7 +484,7 @@ async fn main() -> Result<(), Error> {
                 Some(px) => tuile_core::seam::Tolerance::Pixels(px.parse()?),
                 None => tuile_core::seam::Tolerance::QUARTER_PIXEL,
             };
-            Some(tuile_film_native::SeamLog::into(dir, tolerance))
+            Some(tuile_film_native::SeamLog::into(dir, tolerance).stitched(order.stitch))
         }
         None => None,
     };
@@ -521,7 +519,18 @@ async fn main() -> Result<(), Error> {
         shapes.0.push(marker(&point, size)?);
     }
 
-    let done = render(&sources, &film, &order, &mut shapes, &mut sink, observer).await?;
+    let done = match render(&sources, &film, &order, &mut shapes, &mut sink, observer).await {
+        Ok(done) => done,
+        Err(e) => {
+            // Each of them on a line of its own, for whoever goes and gets them.
+            if let Some(absent) = e.downcast_ref::<tuile_film_native::AbsentTiles>() {
+                for (layer, at) in &absent.tiles {
+                    println!("not in the tile store: {layer} {}/{}/{}", at.0, at.1, at.2);
+                }
+            }
+            return Err(e);
+        }
+    };
     if let Some(seams) = &seams {
         println!("{}", seams.summary());
         if let Some(why) = seams.failure() {
@@ -536,6 +545,38 @@ async fn main() -> Result<(), Error> {
             .into());
         }
     }
+    if order.stitch {
+        println!(
+            "stitching: {} frames planned ({:.1} ms each, the rule and the meshes cut again), \
+             {} tiles stitched anew, {} of them given vertices; at most {} knots a tile, {} \
+             bytes of strips uploaded",
+            done.planned,
+            done.plan_ms / done.planned.max(1) as f64,
+            done.restitched,
+            done.resplit,
+            done.most_knots,
+            done.strip_bytes
+        );
+    } else {
+        println!("stitching: off (--no-stitch)");
+    }
+    if order.holes {
+        println!("holes: {} pixels touched", done.hole_pixels);
+    }
+    println!(
+        "smoothing ({:?}, strength {}): {} of {} tiles came with normals of their own; {} \
+         triangles -> {}; a vertex at most {:.2} m from the source's surface, {:.3} m on \
+         average over the vertices added; {:.2} ms a tile",
+        order.smooth,
+        order.smooth_strength,
+        done.with_normals,
+        done.smoothed_tiles,
+        done.triangles.0,
+        done.triangles.1,
+        done.smooth_furthest,
+        done.smooth_mean_sum / done.smoothed_tiles.max(1) as f64,
+        done.smooth_ms / done.smoothed_tiles.max(1) as f64,
+    );
     let megabytes = |b: u64| b as f64 / 1e6;
     println!(
         "{} frames at {}×{} in {:.1} s ({:.2} frames/s), {:.1} s of it before the first frame",
@@ -580,6 +621,10 @@ async fn main() -> Result<(), Error> {
     println!(
         "tiles: {} from the store, {} from the pack, {} source tiles renewed since the bake",
         done.tiles_from_store, done.tiles_from_pack, done.renewed,
+    );
+    println!(
+        "drapes: {} kept from a smaller level, their tiles being far; {} entered again larger, their tiles come closer",
+        done.drapes_reduced, done.drapes_regrown,
     );
     if let Some((fine, coarse)) = done.shadow_texel {
         println!(
@@ -1313,4 +1358,84 @@ fn said(grade: &FilmGrade) -> String {
         out += &format!("  held back at a bound: {}\n", grade.limited.join("; "));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use glam::Vec3;
+    use tuile_film::{Haze, Look};
+
+    fn given<'a>(args: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            args.iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    #[test]
+    fn with_no_colour_named_the_look_is_left_as_it_is() {
+        let mut look = Look::default();
+        colours(&mut look, &given(&[])).unwrap();
+        assert_eq!(look, Look::default());
+        // And air already asked for keeps its own colours.
+        look.haze = Some(Haze::default());
+        colours(&mut look, &given(&[])).unwrap();
+        assert_eq!(look.haze, Some(Haze::default()));
+    }
+
+    #[test]
+    fn the_lights_take_the_colours_named() {
+        let mut look = Look::default();
+        colours(
+            &mut look,
+            &given(&[
+                ("--sun-light", "3, 1.2,0.4"),
+                ("--sky-light", "0.2,0.25,0.4"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(look.sun, Vec3::new(3.0, 1.2, 0.4));
+        assert_eq!(look.world, Vec3::new(0.2, 0.25, 0.4));
+        // Naming a light asks for no air.
+        assert_eq!(look.haze, None);
+    }
+
+    #[test]
+    fn one_end_of_the_air_asks_for_the_air_and_leaves_the_other_end() {
+        let mut look = Look::default();
+        colours(&mut look, &given(&[("--haze-horizon", "1,0.35,0.1")])).unwrap();
+        let haze = look.haze.expect("the air was asked for");
+        assert_eq!(haze.horizon, Vec3::new(1.0, 0.35, 0.1));
+        assert_eq!(haze.zenith, Haze::default().zenith);
+        assert_eq!(haze.density, Haze::default().density);
+
+        // Over air whose density was set, only the colour changes.
+        let mut look = Look {
+            haze: Some(Haze {
+                density: 2.0e-5,
+                ..Haze::default()
+            }),
+            ..Look::default()
+        };
+        colours(&mut look, &given(&[("--haze-zenith", "0.05,0.1,0.3")])).unwrap();
+        let haze = look.haze.unwrap();
+        assert_eq!(haze.zenith, Vec3::new(0.05, 0.1, 0.3));
+        assert_eq!(
+            (haze.density, haze.horizon),
+            (2.0e-5, Haze::default().horizon)
+        );
+    }
+
+    #[test]
+    fn a_colour_is_three_values_none_below_zero() {
+        for wrong in ["1,2", "1,2,3,4", "red", "1,-0.1,0", "1,nan,0", ""] {
+            let mut look = Look::default();
+            assert!(
+                colours(&mut look, &given(&[("--sun-light", wrong)])).is_err(),
+                "{wrong:?} was taken for a colour"
+            );
+        }
+    }
 }

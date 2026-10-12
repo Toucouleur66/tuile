@@ -11,12 +11,15 @@
 
 mod camera;
 mod cursor;
+pub mod drape;
 pub mod from_store;
 mod look;
 mod mesh;
 mod overlay;
 mod ranges;
 mod slice;
+pub mod smoothing;
+pub mod stitching;
 mod survey;
 
 pub use camera::{FrameCamera, NEAR_FRACTION};

@@ -171,6 +171,18 @@ pub enum Compaction {
     Superseded,
 }
 
+/// What a scrub did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Scrub {
+    /// No tile of the zone was one to take out; nothing was written.
+    Clean,
+    /// `tiles` tiles were taken out of `archives` archives.
+    Removed { tiles: u64, archives: usize },
+    /// Another writer changed the archives first; what had been published
+    /// until then stays, the rest is to be asked again.
+    Superseded,
+}
+
 /// A failure injected on purpose by the tests.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1075,6 +1087,138 @@ impl TileStore {
             }
         }
         Ok(Compaction::Nothing)
+    }
+
+    // ── Scrubbing ────────────────────────────────────────────────────────
+
+    /// Takes out of the zone every tile whose bytes `unwanted` says so — a
+    /// source's placeholder stored as if it were a tile, a body that should
+    /// never have been kept. For maintenance: a server does not call it.
+    ///
+    /// Each archive that holds such tiles is written again without them and
+    /// published in its place, one archive at a time, the way a compaction
+    /// publishes: readers see the old archive or the new one, and a writer
+    /// that got there first wins ([`Scrub::Superseded`]). An archive left
+    /// with no tile leaves the manifest. Archives with none of them are not
+    /// touched. A tile taken out uncovers whatever an older archive holds at
+    /// its place, which is scrubbed like the rest.
+    ///
+    /// What the store's own buffer still holds is not looked at: flush first.
+    pub async fn scrub(
+        &self,
+        layer: &str,
+        zone: Zone,
+        unwanted: impl Fn(&[u8]) -> bool,
+    ) -> Result<Scrub, StoreError> {
+        let l = self.layer(layer)?.clone();
+        let key = (l.name.clone(), zone);
+        let lock = self.zone_lock(&key);
+        let _held = lock.lock().await;
+        let prefix = l.zone_prefix(zone);
+        let now = (self.clock)();
+        let now_s = now_secs(now);
+        let m = manifest::read(self.store.as_ref(), &prefix).await?.manifest;
+        let (mut removed, mut rewritten) = (0u64, 0usize);
+
+        for old in &m.archives {
+            // One archive on disk at a time.
+            let dir = tempfile::tempdir()?;
+            let local = dir.path().join("archive.pmtiles");
+            download(self.store.as_ref(), &old.key, &local).await?;
+            let reader = Arc::new(archive::open_local(&local).await?);
+            let ids = archive::ids(reader.clone()).await?;
+            // Read once to know whether anything is to be written at all:
+            // most archives hold nothing unwanted, and stay as they are.
+            let mut kept = Vec::with_capacity(ids.len());
+            for id in &ids {
+                let bytes = reader
+                    .get_tile(pmtiles::TileId::new(*id)?)
+                    .await?
+                    .ok_or_else(|| StoreError::Corrupt(format!("tile {id} listed but absent")))?;
+                if !unwanted(&bytes) {
+                    kept.push(*id);
+                }
+            }
+            let gone = (ids.len() - kept.len()) as u64;
+            if gone == 0 {
+                continue;
+            }
+
+            // What is left, written as the archive it was: same epoch, same
+            // fetch times — or nothing at all, if nothing is left.
+            let entry = if kept.is_empty() {
+                None
+            } else {
+                let header = reader.get_header();
+                let zooms = Some((header.min_zoom, header.max_zoom));
+                let (tx, mut rx) =
+                    tokio::sync::mpsc::channel::<Result<(u64, Bytes), StoreError>>(MERGE_QUEUE);
+                let (layer_of, epoch) = (l.clone(), old.epoch.clone());
+                let writer = tokio::task::spawn_blocking(move || {
+                    archive::write(&layer_of, &epoch, zooms, std::iter::from_fn(move || rx.blocking_recv()))
+                });
+                let mut bytes = 0u64;
+                for id in kept {
+                    let tile = match reader.get_tile(pmtiles::TileId::new(id)?).await {
+                        Ok(Some(body)) => Ok((id, body)),
+                        Ok(None) => Err(StoreError::Corrupt(format!("tile {id} listed but absent"))),
+                        Err(e) => Err(e.into()),
+                    };
+                    let failed = tile.is_err();
+                    if let Ok((_, body)) = &tile {
+                        bytes += body.len() as u64;
+                    }
+                    if tx.send(tile).await.is_err() || failed {
+                        break;
+                    }
+                }
+                drop(tx);
+                let (file, count) =
+                    writer.await.map_err(|e| StoreError::Corrupt(format!("archive writer: {e}")))??;
+                let object = archive_key(&prefix, &old.epoch, now);
+                upload(self.store.as_ref(), file.path(), &object).await?;
+                Some(ArchiveRef {
+                    key: object,
+                    epoch: old.epoch.clone(),
+                    created: now_s,
+                    tiles: count,
+                    bytes,
+                    oldest_fetch_ms: old.oldest_fetch_ms,
+                    newest_fetch_ms: old.newest_fetch_ms,
+                })
+            };
+
+            let published = self
+                .publish(&key, &prefix, |m| {
+                    // The archive must still be there: otherwise a
+                    // compaction merged it into another first.
+                    let at = m.archives.iter().position(|a| a.key == old.key)?;
+                    let mut next = m.clone();
+                    next.archives.splice(at..at + 1, entry.clone());
+                    next.retired.push(Retired { key: old.key.clone(), retired: now_s });
+                    Some(next)
+                })
+                .await?;
+            match published {
+                Some(m) => {
+                    self.remember_manifest(&key, Arc::new(m));
+                    metrics::counter!("tuile_tiles_scrubbed_total", "layer" => l.name.clone()).increment(gone);
+                    removed += gone;
+                    rewritten += 1;
+                }
+                None => {
+                    if let Some(entry) = entry {
+                        let _ = self.store.delete(&Path::from(entry.key)).await;
+                    }
+                    return Ok(Scrub::Superseded);
+                }
+            }
+        }
+        if rewritten == 0 {
+            return Ok(Scrub::Clean);
+        }
+        self.cleanup(&l, zone).await?;
+        Ok(Scrub::Removed { tiles: removed, archives: rewritten })
     }
 
     /// Merges a given run, as a compaction planned on an older manifest would

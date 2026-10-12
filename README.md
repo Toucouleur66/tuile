@@ -301,6 +301,37 @@ CESIUM_ION_TOKEN=... cargo run -p tuile-wgpu-viewer
 Drag to orbit, right-drag to pan, wheel to zoom. `TUILE_RECORD=path.jsonl`
 writes the camera path; `TUILE_REPLAY=path.jsonl` flies it again exactly.
 
+It opens straight down on France from 2 000 km. To open somewhere else, say
+where the eye is and where it looks — degrees and metres, `--help` for the
+bounds and the keys:
+
+```bash
+CESIUM_ION_TOKEN=... cargo run -p tuile-wgpu-viewer -- \
+    --lon 6.86 --lat 45.83 --altitude 6000 --heading 120 --pitch 25
+```
+
+`N`, or a click on the compass ring, turns the view north-up about the point at
+its centre. `--here` at start, or `L` in the window, centres on the current
+location: the operating system's location service is asked (macOS; it asks you
+first), the view moves when it answers and stays put if it does not, and the
+coordinates are never logged or written anywhere.
+
+On macOS the viewer also packages as an application — `Tuile.app`, with an
+icon — that other programs can steer:
+
+```bash
+cargo run --release -p tuile-viewer-bundle -- app --out ~/Applications
+open "tuile://goto?lon=6.86&lat=45.83&altitude=6000&heading=120&pitch=25"
+```
+
+See `crates/tuile-viewer/macos/README.md` for the token file, the URL
+vocabulary and what the signature is worth.
+
+The viewer is a library, `tuile-viewer`; `tuile-wgpu-viewer` is that library
+over the public connectors. A program with its own tile service reuses the whole
+application — window, controls, URLs, scripting, bundle — by implementing one
+trait: see `docs/16-embedding-the-viewer.md`.
+
 Render a baked film to an mp4:
 
 ```bash
