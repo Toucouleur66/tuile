@@ -1886,17 +1886,30 @@ pub(crate) mod tests {
         let layer = content.imagery[0].clone();
         let side = tuile_core::raster::composed_side(&content.imagery, 256);
         let finished = finish_tile_from(&memo, "t", tile, content, 256, Some(&noted));
-        assert!(finished.content.imagery.is_empty(), "the layers are consumed");
+        assert!(
+            finished.content.imagery.is_empty(),
+            "the layers are consumed"
+        );
         let refs = finished.refs.expect("a reference");
-        assert_eq!(refs.terrain.digest, tuile_planetary::digest(b"terrain bytes"));
         assert_eq!(
-            (u32::from(refs.terrain.level), u64::from(refs.terrain.x), u64::from(refs.terrain.y)),
+            refs.terrain.digest,
+            tuile_planetary::digest(b"terrain bytes")
+        );
+        assert_eq!(
+            (
+                u32::from(refs.terrain.level),
+                u64::from(refs.terrain.x),
+                u64::from(refs.terrain.y)
+            ),
             (level, x, y)
         );
         assert_eq!(refs.composed_side, side);
         assert_eq!(refs.imagery.len(), 1);
         let placed = refs.imagery[0];
-        assert_eq!(placed.tile.digest, tuile_planetary::digest(b"imagery bytes"));
+        assert_eq!(
+            placed.tile.digest,
+            tuile_planetary::digest(b"imagery bytes")
+        );
         assert_eq!(
             (placed.coverage, placed.translation, placed.scale),
             (layer.coverage, layer.translation, layer.scale)
@@ -1939,6 +1952,7 @@ pub(crate) mod tests {
             }],
             textures: Vec::new(),
             imagery: vec![ImageryLayer {
+                source: 0,
                 coord: ImageryCoord {
                     level: 0,
                     x: 0,
@@ -1991,6 +2005,7 @@ pub(crate) mod tests {
             }],
             textures: Vec::new(),
             imagery: vec![ImageryLayer {
+                source: 0,
                 coord: ImageryCoord {
                     level: 0,
                     x: 0,

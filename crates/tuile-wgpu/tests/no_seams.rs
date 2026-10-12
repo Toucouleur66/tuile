@@ -532,6 +532,7 @@ fn holes_at_a_lod_boundary(gpu: &GpuContext, skirts: bool, stitched: bool) -> u6
 /// One flat imagery layer covering a whole tile, edge to edge.
 fn whole_tile_layer() -> tuile_core::raster::ImageryLayer {
     tuile_core::raster::ImageryLayer {
+        source: 0,
         coord: tuile_core::raster::ImageryCoord {
             level: 0,
             x: 0,

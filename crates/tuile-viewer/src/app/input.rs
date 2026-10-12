@@ -9,7 +9,8 @@
 //! on one the widget has taken.
 
 use super::setup::configure_surface;
-use super::{App, DIAGNOSTICS};
+use super::App;
+use crate::steer::Command;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, NamedKey};
@@ -26,6 +27,9 @@ pub(super) struct Pointer {
     pub(super) cursor: (f64, f64),
     pub(super) dragging: bool,
     pub(super) tilting: bool,
+    /// Whether Command, Control or Option is held: a key pressed with one is
+    /// not one of the application's bare keys.
+    pub(super) chord: bool,
 }
 
 /// What the debug keys have switched on.
@@ -49,7 +53,10 @@ impl App {
             return;
         }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.ended_by = Some("the window was closed");
+                event_loop.exit();
+            }
             // Dragging the window to a display of a different density changes
             // how many device pixels a point is worth, and so how deep the
             // imagery should go. Winit sends the new size straight after, so
@@ -70,21 +77,31 @@ impl App {
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 match event.logical_key {
-                    Key::Character(ref c) if c.eq_ignore_ascii_case("w") => {
-                        self.views.wireframe = !self.views.wireframe;
+                    // One table for the keys and the menu: see `crate::menu`.
+                    // A key held with Command, Control or Option is a
+                    // shortcut of the system's or the menu's, not one of
+                    // these.
+                    Key::Character(ref c) if !self.pointer.chord => {
+                        let mut typed = c.chars();
+                        let ask = match (typed.next(), typed.next()) {
+                            (Some(only), None) => crate::menu::key(only),
+                            _ => None,
+                        };
+                        if let Some(ask) = ask {
+                            let command = ask.command(&self.published());
+                            self.apply(command);
+                        }
                     }
-                    Key::Character(ref c) if c.eq_ignore_ascii_case("d") => {
-                        self.views.diagnostic = (self.views.diagnostic + 1) % DIAGNOSTICS.len();
-                        let (name, reads) = DIAGNOSTICS[self.views.diagnostic];
-                        tracing::info!("view: {name} — {reads}");
+                    Key::Named(NamedKey::Escape) => {
+                        self.ended_by = Some("Esc was pressed");
+                        event_loop.exit();
                     }
-                    Key::Character(ref c) if c.eq_ignore_ascii_case("f") => {
-                        self.views.freeze = !self.views.freeze;
-                        tracing::info!("traversal freeze: {}", self.views.freeze);
-                    }
-                    Key::Named(NamedKey::Escape) => event_loop.exit(),
                     _ => {}
                 }
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                let held = modifiers.state();
+                self.pointer.chord = held.super_key() || held.control_key() || held.alt_key();
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
@@ -98,7 +115,11 @@ impl App {
                     }
                     MouseButton::Left => {
                         self.pointer.dragging = false;
-                        self.nav.release();
+                        // A ring let go where it was pressed was clicked, not
+                        // turned — and a click on a compass means north up.
+                        if self.nav.release() == Some(tuile_ui::Part::Ring) {
+                            self.apply(Command::NorthUp);
+                        }
                     }
                     MouseButton::Right => self.pointer.tilting = pressed,
                     _ => {}
