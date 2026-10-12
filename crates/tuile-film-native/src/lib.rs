@@ -25,6 +25,7 @@
 //! film's imagery, for its tiles to be measured against.
 
 pub mod av1;
+pub mod engine;
 pub mod meter;
 #[cfg(all(target_os = "linux", feature = "nvenc"))]
 pub mod nvenc;
@@ -32,6 +33,7 @@ pub mod observe;
 pub mod reference;
 pub mod render;
 pub mod seams;
+pub mod setup;
 pub mod sink;
 pub mod source;
 #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
@@ -42,7 +44,7 @@ pub use meter::LightMeter;
 pub use nvenc::{NvencCodec, NvencFilm};
 pub use observe::{FrameOut, ImageryIn, Observer, Origin, TileIn, Timings};
 pub use reference::{Reference, SetAgainst};
-pub use render::{render, Order, Tone};
+pub use render::{render, AbsentTiles, Order, Tone};
 pub use seams::SeamLog;
 pub use sink::{Av1Film, Nothing, Pictures, Sink};
 pub use source::{Counting, Film, Reads, Sources};
