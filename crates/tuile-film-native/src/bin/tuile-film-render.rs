@@ -127,14 +127,15 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use glam::{DVec3, Vec3};
+use glam::DVec3;
 use tuile_core::geo::{enu_frame, geodetic_to_ecef, Geodetic};
 use tuile_film::{BakedView, OverlayDepth, OverlayMesh, Overlays};
 
 use tuile_farm::{BucketConfig, ObjectRunStore, RunStore, Tuning};
+use tuile_film_native::setup::{bucket, film_sink, rgb, sun_at};
 use tuile_film_native::{
-    render, Av1Film, Error, Film, LightMeter, Nothing, Observer, Order, Pictures, Reference, Sink,
-    Sources, Tone,
+    render, Error, Film, LightMeter, Nothing, Observer, Order, Pictures, Reference, Sink, Sources,
+    Tone,
 };
 use tuile_radiometry::{
     Bounds, CornerField, FieldBounds, FilmGrade, Local, LookTarget, MatrixBounds, MatrixField,
@@ -143,30 +144,6 @@ use tuile_radiometry::{
 use tuile_repository::tone::{pack_seen_key, pack_tone_key};
 use tuile_repository::Objects;
 use tuile_repository::TileRepository;
-
-fn bucket(name: &str) -> Result<Arc<dyn Objects>, Error> {
-    let config = BucketConfig {
-        bucket: name.to_string(),
-        ..BucketConfig::from_env()?
-    };
-    Ok(Arc::new(ObjectRunStore::bucket(
-        &config,
-        Tuning::from_env(),
-    )?))
-}
-
-/// `r,g,b`: a colour as three linear values, none below zero.
-fn rgb(name: &str, colour: &str) -> Result<Vec3, Error> {
-    let parts: Vec<f32> = colour
-        .split(',')
-        .map(|part| part.trim().parse())
-        .collect::<Result<_, _>>()
-        .map_err(|_| format!("{name} is <r>,<g>,<b>, not {colour}"))?;
-    match parts[..] {
-        [r, g, b] if parts.iter().all(|c| c.is_finite() && *c >= 0.0) => Ok(Vec3::new(r, g, b)),
-        _ => Err(format!("{name} is <r>,<g>,<b>, each zero or more, not {colour}").into()),
-    }
-}
 
 /// The look's colours as the command line gives them: the two lights, and
 /// the air's two ends. Naming either end of the air asks for the air.
@@ -323,40 +300,6 @@ impl Sink for Both {
     }
 }
 
-/// The film's encoder: the one asked for, or the best this binary has —
-/// the machine's own before software.
-fn film_sink(path: String, bitrate: u32, codec: Option<&str>) -> Result<Box<dyn Sink>, Error> {
-    #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
-    if matches!(codec, Some("h264") | None) {
-        return Ok(Box::new(tuile_film_native::H264Film::at(path, bitrate)));
-    }
-    #[cfg(all(target_os = "linux", feature = "nvenc"))]
-    {
-        use tuile_film_native::{NvencCodec, NvencFilm};
-        let device = std::env::var("TUILE_CUDA_DEVICE")
-            .ok()
-            .and_then(|d| d.parse().ok())
-            .unwrap_or(0);
-        match codec {
-            Some("nvenc-av1") | None => {
-                return Ok(Box::new(
-                    NvencFilm::at(path, bitrate, NvencCodec::Av1).on_device(device),
-                ))
-            }
-            Some("nvenc-h264") | Some("h264") => {
-                return Ok(Box::new(
-                    NvencFilm::at(path, bitrate, NvencCodec::H264).on_device(device),
-                ))
-            }
-            _ => {}
-        }
-    }
-    match codec {
-        Some("av1") | None => Ok(Box::new(Av1Film::at(path, bitrate))),
-        Some(other) => Err(format!("no {other} encoder was built into this binary").into()),
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     dotenvy::dotenv().ok();
@@ -447,33 +390,11 @@ async fn main() -> Result<(), Error> {
         )?),
         _ => bucket(&std::env::var("TUILE_STORE_BUCKET")?)?,
     };
-    // The blocks of a remote store, counted where they cross the network.
-    let mut remote_blocks: Option<Arc<tuile_repository::Kept<tuile_repository::HttpGet>>> = None;
-    // Their store, to be closed on the way out: what it has not written by
-    // then is lost, and downloaded again by the next render.
-    let mut block_store: Option<tuile_storage_foyer::FoyerStore> = None;
-    let tiles: Arc<dyn Objects> = match tuile_repository::HttpGet::from_env()? {
-        Some(get) => {
-            println!("tile store: {}/store, by its routes", get.root());
-            // A block is downloaded once: kept in a store of its own beside
-            // the film's other caches — memory over disk — for this render
-            // and the next. Sized well above a film's blocks: what the store
-            // gives up is downloaded again.
-            let blocks =
-                tuile_storage_foyer::FoyerStore::keeping(tuile_storage_foyer::StoreConfig {
-                    dir: PathBuf::from(&cache).join("store-blocks"),
-                    memory_bytes: 256 << 20,
-                    disk_bytes: 32 << 30,
-                    default_ttl: None,
-                })
-                .await?;
-            block_store = Some(blocks.clone());
-            let kept = Arc::new(tuile_repository::Kept::new(get, Arc::new(blocks)));
-            remote_blocks = Some(kept.clone());
-            Arc::new(tuile_repository::RemoteStore::new(kept, "store"))
-        }
-        None => bucket(&std::env::var("TUILE_TILES_BUCKET")?)?,
-    };
+    let tuile_film_native::setup::TileStore {
+        objects: tiles,
+        remote_blocks,
+        block_store,
+    } = tuile_film_native::setup::tile_store(&PathBuf::from(&cache)).await?;
     let sources = Sources::open(runs, tiles, &PathBuf::from(cache)).await?;
     let film = if prefix.ends_with(".tuilepack") {
         Film::of(sources.packs.objects.as_ref(), &[prefix.as_str()]).await?
@@ -490,10 +411,7 @@ async fn main() -> Result<(), Error> {
         let (azimuth, elevation) = sun
             .split_once(',')
             .ok_or("--sun is <azimuth>,<elevation>")?;
-        let (azimuth, elevation) = (
-            azimuth.parse::<f64>()?.to_radians(),
-            elevation.parse::<f64>()?.to_radians(),
-        );
+        let (azimuth, elevation) = (azimuth.parse::<f64>()?, elevation.parse::<f64>()?);
         // East, north and up where the first frame rendered is seen from.
         let from = order.frames.map_or(first, |f| f.0);
         let pack = film
@@ -504,9 +422,7 @@ async fn main() -> Result<(), Error> {
         let eye = tuile_film::Pack::open_table(&pack.head)?
             .view_of(from)?
             .position;
-        let local = enu_frame(tuile_core::geo::ecef_to_geodetic(DVec3::from_array(eye)));
-        let level = local.x_axis * azimuth.sin() + local.y_axis * azimuth.cos();
-        order.look.to_sun = (level * elevation.cos() + local.z_axis * elevation.sin()).as_vec3();
+        order.look.to_sun = sun_at(eye, azimuth, elevation);
     }
 
     let mut sinks: Vec<Box<dyn Sink>> = Vec::new();
@@ -570,7 +486,18 @@ async fn main() -> Result<(), Error> {
         shapes.0.push(marker(&point, size)?);
     }
 
-    let done = render(&sources, &film, &order, &mut shapes, &mut sink, observer).await?;
+    let done = match render(&sources, &film, &order, &mut shapes, &mut sink, observer).await {
+        Ok(done) => done,
+        Err(e) => {
+            // Each of them on a line of its own, for whoever goes and gets them.
+            if let Some(absent) = e.downcast_ref::<tuile_film_native::AbsentTiles>() {
+                for (layer, at) in &absent.tiles {
+                    println!("not in the tile store: {layer} {}/{}/{}", at.0, at.1, at.2);
+                }
+            }
+            return Err(e);
+        }
+    };
     if let Some(seams) = &seams {
         println!("{}", seams.summary());
         if let Some(why) = seams.failure() {
@@ -1371,6 +1298,7 @@ fn said(grade: &FilmGrade) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glam::Vec3;
     use tuile_film::{Haze, Look};
 
     fn given<'a>(args: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {

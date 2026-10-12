@@ -6248,6 +6248,7 @@ name = "tuile-film-native"
 version = "0.4.0"
 dependencies = [
  "async-trait",
+ "clap",
  "cudarc",
  "dotenvy",
  "futures-util",
@@ -6261,6 +6262,7 @@ dependencies = [
  "rav1e",
  "tempfile",
  "tokio",
+ "tuile-bake",
  "tuile-core",
  "tuile-farm",
  "tuile-film",

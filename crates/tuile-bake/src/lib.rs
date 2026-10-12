@@ -47,6 +47,7 @@ mod globe;
 pub mod memory;
 pub mod packed;
 mod session;
+pub mod tape;
 pub mod tiles;
 
 pub use globe::{

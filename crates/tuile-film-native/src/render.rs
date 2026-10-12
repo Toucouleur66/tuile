@@ -110,6 +110,35 @@ pub struct Done {
     pub drapes_regrown: u64,
 }
 
+/// Tiles a stretch of frames names that the tile store does not hold. A
+/// render that meets it draws nothing; trying again gives the same until
+/// the store has them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbsentTiles {
+    /// The frames whose tiles were asked for.
+    pub frames: (u32, u32),
+    /// Each one's layer, then its level, x and y.
+    pub tiles: Vec<(String, (u8, u32, u32))>,
+}
+
+impl std::fmt::Display for AbsentTiles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "frames {}–{} name {} tiles that are not in the tile store",
+            self.frames.0,
+            self.frames.1,
+            self.tiles.len()
+        )?;
+        if let Some((layer, at)) = self.tiles.first() {
+            write!(f, ", {layer} {}/{}/{} the first of them", at.0, at.1, at.2)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for AbsentTiles {}
+
 /// Store tiles asked for at once.
 const AT_ONCE: usize = 48;
 
@@ -320,23 +349,16 @@ pub async fn render(
                     .await;
                     for (at, tile) in some.iter().zip(found) {
                         if tile?.is_none() {
-                            absent.push((layer, *at));
+                            absent.push((layer.to_string(), (at.0, at.1, at.2)));
                         }
                     }
                 }
             }
-            if let Some((layer, at)) = absent.first() {
-                for (layer, at) in &absent {
-                    println!("not in the tile store: {layer} {}/{}/{}", at.0, at.1, at.2);
-                }
-                return Err(format!(
-                    "frames {a}–{b} name {} tiles that are not in the tile store, {layer} {}/{}/{} the first of them",
-                    absent.len(),
-                    at.0,
-                    at.1,
-                    at.2
-                )
-                .into());
+            if !absent.is_empty() {
+                return Err(Box::new(AbsentTiles {
+                    frames: (a, b),
+                    tiles: absent,
+                }));
             }
             println!(
                 "ahead of frames {a}–{b}: {count} tiles of the store asked for in {:.1} s",
