@@ -5,8 +5,9 @@
 //!
 //! ```text
 //! frames  1 ───────────────────────────────────────────────── 18000
-//! packs   [   1–150   ][  151–300  ][  301–450  ] …   baked, each once
-//! parts   [1–50][51–100][101–150][151–200] …          rendered, each to a segment
+//! packs   [   1–450   ][  451–900  ][  901–1350 ] …   baked, each once
+//! parts   [   1–450   ][  451–900  ][  901–1350 ] …   rendered, each to a segment
+//!         (a pack may be cut in several parts; by default it is one)
 //! film    ═══════════════════════════════════════     the segments, joined
 //! ```
 //!
@@ -100,12 +101,13 @@ pub struct Order {
 }
 
 impl Order {
-    /// `frames`, cut and tried as a film usually is, nothing done again.
+    /// `frames`, cut and tried as a film usually is, nothing done again:
+    /// packs and parts of 450 frames, one at a time, three tries.
     pub fn of(frames: Stretch) -> Self {
         Self {
             frames,
-            pack_frames: 150,
-            part_frames: 50,
+            pack_frames: 450,
+            part_frames: 450,
             at_once: 1,
             tries: 3,
             step_timeout: None,
@@ -945,6 +947,30 @@ mod tests {
             ..order((1, 9))
         })
         .is_err());
+    }
+
+    #[test]
+    fn an_order_left_as_it_is_cuts_a_pack_and_a_part_of_fifteen_seconds_each() {
+        // Measured on a 4K film: a part pays some eighty seconds before its
+        // first frame, then a seventh of a second a frame. At 450 frames
+        // that start is two fifths of the part; at 50 it was six sevenths.
+        let order = Order::of(Stretch {
+            first: 1,
+            last: 18000,
+        });
+        assert_eq!(
+            (
+                order.pack_frames,
+                order.part_frames,
+                order.at_once,
+                order.tries
+            ),
+            (450, 450, 1, 3)
+        );
+        assert!(!order.bake_again && !order.render_again);
+        let lanes = plan(&order).expect("plan");
+        assert_eq!(lanes.len(), 40);
+        assert!(lanes.iter().all(|lane| lane.parts == [lane.pack]));
     }
 
     #[tokio::test]

@@ -142,12 +142,15 @@ struct Args {
 
     // ── how it is produced ─────────────────────────────────────────────
     /// Frames to a pack.
-    #[arg(long, default_value_t = 150)]
+    #[arg(long, default_value_t = 450)]
     pack_frames: u32,
-    /// Frames to a part.
-    #[arg(long, default_value_t = 50)]
+    /// Frames to a part: never more than a pack's. Each part pays its own
+    /// start — its tiles read, its first frame — so few long parts are
+    /// rendered sooner than many short ones.
+    #[arg(long, default_value_t = 450)]
     part_frames: u32,
-    /// Packs worked on at once.
+    /// Packs worked on at once, each on a thread: so many bakes or renders
+    /// run together. A 4K render holds 4 to 6.5 GB.
     #[arg(long, default_value_t = 1)]
     at_once: usize,
     /// Times a bake or a render is tried.
@@ -427,7 +430,7 @@ mod tests {
                 args.at_once,
                 args.tries
             ),
-            (30, 150, 50, 1, 3)
+            (30, 450, 450, 1, 3)
         );
         assert_eq!(args.content, tuile_pack::Content::References);
         assert!(!args.bake_again && !args.render_again);
