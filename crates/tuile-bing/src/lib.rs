@@ -270,17 +270,55 @@ impl<F: TileFetcher> ImageryProvider for BingImageryProvider<F> {
         // Named as `NotFound` because that is what it is, and because the drape
         // already knows what to do with one: climb to the ancestor and use its
         // picture of the same ground.
-        if fetched.value.is_empty() {
+        if is_no_tile(None, &fetched.value) {
             return Err(RasterError::Fetch(FetchError::NotFound(url)));
         }
         Ok(fetched)
     }
 }
 
+/// The header Bing marks an answer with when it stands for a tile it does
+/// not have: `X-VE-Tile-Info: no-tile`.
+pub const TILE_INFO_HEADER: &str = "x-ve-tile-info";
+
+/// Whether an answer Bing gave at HTTP 200 is **no tile**, and not a picture
+/// to keep: `tile_info` is the value of [`TILE_INFO_HEADER`] if the answer
+/// carried one, `body` what came with it.
+///
+/// Bing has no imagery everywhere at every level — at sea, past a level it
+/// stops — and says so two ways. Asked with `n=z`, as
+/// [`BingMetadata::tile_url`] asks, the body is empty. Asked without, the
+/// body is a pale square with a crossed-out camera: a valid picture, which
+/// nothing after this can tell from aerial photography. Both carry the
+/// header. So the header is believed whatever the body, and an empty body
+/// whatever the headers.
+///
+/// Here, once, for every host that fetches Bing's tiles itself instead of
+/// through [`BingImageryProvider`]: a host that did not ask this stored the
+/// placeholder as tiles, and a film was drawn with them over the sea.
+pub fn is_no_tile(tile_info: Option<&str>, body: &[u8]) -> bool {
+    body.is_empty() || tile_info.is_some_and(|info| info.trim().eq_ignore_ascii_case("no-tile"))
+}
+
 #[cfg(test)]
 mod missing_tile_tests {
     use super::tests::MockFetcher;
     use super::*;
+
+    #[test]
+    fn an_answer_bing_marks_no_tile_or_leaves_empty_is_no_tile() {
+        // As Bing answers a tile it does not have: empty when asked with
+        // `n=z`, its placeholder picture when not — the mark on both.
+        assert!(is_no_tile(Some("no-tile"), b""));
+        assert!(is_no_tile(Some("no-tile"), b"\x89PNG a pale square"));
+        assert!(is_no_tile(Some(" No-Tile "), b"\x89PNG a pale square"));
+        // An empty body is no tile even from a relay that dropped the header.
+        assert!(is_no_tile(None, b""));
+        // A tile it has: a body, and no such mark.
+        assert!(!is_no_tile(None, b"\xff\xd8\xff a photograph"));
+        assert!(!is_no_tile(Some("tile"), b"\xff\xd8\xff a photograph"));
+        assert_eq!(TILE_INFO_HEADER, "x-ve-tile-info");
+    }
 
     fn metadata(template: &str) -> BingMetadata {
         BingMetadata {
