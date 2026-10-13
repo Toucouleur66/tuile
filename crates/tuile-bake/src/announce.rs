@@ -21,6 +21,9 @@ pub type StoreAt = (u8, u32, u32);
 pub struct Announced {
     /// The frames they were found in, first and last.
     pub frames: (u32, u32),
+    /// The tile store's layers they are of.
+    pub terrain_layer: String,
+    pub imagery_layer: String,
     pub terrain: Vec<StoreAt>,
     pub imagery: Vec<StoreAt>,
 }
@@ -38,6 +41,7 @@ pub const ANNOUNCE_EVERY: u32 = 25;
 /// [`ANNOUNCE_EVERY`] frames, each store tile once.
 pub struct Herald<'a> {
     to: &'a dyn Announce,
+    layers: (String, String),
     told: HashSet<(bool, StoreAt)>,
     terrain: BTreeSet<StoreAt>,
     imagery: BTreeSet<StoreAt>,
@@ -49,9 +53,12 @@ fn at(tile: &StoreTile) -> StoreAt {
 }
 
 impl<'a> Herald<'a> {
-    pub fn new(to: &'a dyn Announce) -> Self {
+    /// `terrain_layer` and `imagery_layer`: the store's layers the pack
+    /// refers to.
+    pub fn new(to: &'a dyn Announce, terrain_layer: &str, imagery_layer: &str) -> Self {
         Self {
             to,
+            layers: (terrain_layer.to_string(), imagery_layer.to_string()),
             told: HashSet::new(),
             terrain: BTreeSet::new(),
             imagery: BTreeSet::new(),
@@ -85,6 +92,8 @@ impl<'a> Herald<'a> {
         }
         let announced = Announced {
             frames: (first, frame),
+            terrain_layer: self.layers.0.clone(),
+            imagery_layer: self.layers.1.clone(),
             terrain: std::mem::take(&mut self.terrain).into_iter().collect(),
             imagery: std::mem::take(&mut self.imagery).into_iter().collect(),
         };
@@ -153,7 +162,7 @@ mod tests {
     #[test]
     fn each_store_tile_is_told_once_a_stretch_of_frames_at_a_time_and_the_last_stretch_too() {
         let heard = Heard::default();
-        let mut herald = Herald::new(&heard);
+        let mut herald = Herald::new(&heard, "asset-1", "asset-2");
         let last = ANNOUNCE_EVERY + 10;
         for frame in 1..=last {
             // The same terrain every frame; a new imagery tile every frame,
@@ -167,6 +176,10 @@ mod tests {
         let heard = heard.0.into_inner().expect("lock");
         assert_eq!(heard.len(), 2);
         assert_eq!(heard[0].frames, (1, ANNOUNCE_EVERY));
+        assert_eq!(
+            (heard[0].terrain_layer.as_str(), heard[0].imagery_layer.as_str()),
+            ("asset-1", "asset-2")
+        );
         assert_eq!(heard[0].terrain, [(12, 1, 2)]);
         assert_eq!(heard[0].imagery.len(), ANNOUNCE_EVERY as usize);
         assert_eq!(heard[1].frames, (ANNOUNCE_EVERY + 1, last));
@@ -182,7 +195,7 @@ mod tests {
     #[test]
     fn a_tile_with_nothing_of_the_store_and_a_stretch_with_nothing_new_tell_nothing() {
         let heard = Heard::default();
-        let mut herald = Herald::new(&heard);
+        let mut herald = Herald::new(&heard, "asset-1", "asset-2");
         herald.tile(
             1,
             &BakedTile {

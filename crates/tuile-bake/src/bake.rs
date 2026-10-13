@@ -158,7 +158,9 @@ pub fn bake_frames(
     let spill = job.out.with_extension("blob.part");
     let mut writer: Option<PackWriter> = None;
     let mut poses = Vec::with_capacity((job.last - job.first + 1) as usize);
-    let mut herald = job.announce.map(crate::announce::Herald::new);
+    let mut herald = job.announce.map(|to| {
+        crate::announce::Herald::new(to, &job.content.terrain_layer, &job.content.imagery_layer)
+    });
 
     for number in job.first..=job.last {
         let pose = source.pose(number, session).map_err(|e| format!("frame {number}: {e}"))?;
