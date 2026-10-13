@@ -279,7 +279,9 @@ impl TileStore {
 
         // Newest first: the first archive to hold a tile wins it. Each archive
         // comes down in one request, then is read locally.
-        let scratch = tempfile::tempdir()?;
+        // The archives come down beside the projections, on their volume.
+        std::fs::create_dir_all(dir)?;
+        let scratch = tempfile::tempdir_in(dir)?;
         let mut tiles: BTreeMap<u64, Bytes> = BTreeMap::new();
         for (i, a) in archives.iter().enumerate().rev() {
             let local = scratch.path().join(format!("{i}.pmtiles"));
@@ -324,9 +326,11 @@ impl TileStore {
         }
         let epoch = archives.last().map(|a| a.epoch.clone()).unwrap_or_default();
         let zooms = archive::zoom_range(tiles.keys());
-        let l = layer.clone();
+        let (l, near) = (layer.clone(), path.parent().unwrap_or(dir).to_path_buf());
+        // Written beside where it goes: a rename does not leave its file
+        // system, and the projections may have a volume of their own.
         let file = tokio::task::spawn_blocking(move || {
-            archive::write(&l, &epoch, zooms, tiles.into_iter().map(Ok))
+            archive::write_in(&near, &l, &epoch, zooms, tiles.into_iter().map(Ok))
         })
         .await
         .map_err(|e| StoreError::Corrupt(format!("projection writer: {e}")))??

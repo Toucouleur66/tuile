@@ -38,6 +38,10 @@ fn evict_oldest(dir: &std::path::Path, budget: u64) -> (u64, u64) {
             return;
         };
         for entry in entries.flatten() {
+            // What a projection is being made of, or into: not ours to take.
+            if entry.file_name().to_string_lossy().starts_with(".tmp") {
+                continue;
+            }
             let Ok(meta) = entry.metadata() else { continue };
             if meta.is_dir() {
                 walk(&entry.path(), out);
@@ -310,6 +314,9 @@ mod eviction_tests {
         let old = zone("asset-1/zones/z4/1/2.pmtiles", 400, 300);
         let middle = zone("asset-2/zones/z4/1/2.pmtiles", 400, 200);
         let new = zone("asset-2/top.pmtiles", 400, 100);
+        // Being written by another bake, however old: left alone.
+        let making = zone(".tmpAbC/0.pmtiles", 400, 900);
+        let renaming = zone("asset-1/zones/z4/.tmpXyZ", 400, 900);
         assert_eq!(evict_oldest(dir.path(), 1000), (1, 400));
         assert!(!old.exists() && middle.exists() && new.exists());
         assert_eq!(
@@ -318,6 +325,7 @@ mod eviction_tests {
             "under the budget: nothing goes"
         );
         assert_eq!(evict_oldest(dir.path(), 0), (2, 800));
+        assert!(making.exists() && renaming.exists());
         assert_eq!(evict_oldest(&dir.path().join("none"), 0), (0, 0));
     }
 }

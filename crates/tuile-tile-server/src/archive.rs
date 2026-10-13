@@ -48,7 +48,22 @@ pub fn write<I>(
 where
     I: IntoIterator<Item = Result<(u64, Bytes), StoreError>>,
 {
-    let file = tempfile::NamedTempFile::new()?;
+    write_in(&std::env::temp_dir(), layer, epoch, zooms, tiles)
+}
+
+/// [`write`], the temporary file in `dir`: on the file system of where it
+/// will be persisted, which a rename cannot leave.
+pub fn write_in<I>(
+    dir: &FsPath,
+    layer: &Layer,
+    epoch: &str,
+    zooms: Option<(u8, u8)>,
+    tiles: I,
+) -> Result<(tempfile::NamedTempFile, u64), StoreError>
+where
+    I: IntoIterator<Item = Result<(u64, Bytes), StoreError>>,
+{
+    let file = tempfile::NamedTempFile::new_in(dir)?;
     let out = file.reopen()?;
     let metadata = json!({
         "name": layer.name,
