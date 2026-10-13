@@ -157,6 +157,9 @@ struct Args {
     /// The ground's height over the ellipsoid, metres, for the convergence.
     #[arg(long, requires = "stereo")]
     stereo_ground: Option<f64>,
+    /// The eyes this many metres apart, whatever the distance (hyperstereo).
+    #[arg(long, requires = "stereo")]
+    stereo_baseline: Option<f64>,
 
     // ── how it is produced ─────────────────────────────────────────────
     /// Frames to a pack.
@@ -303,6 +306,7 @@ fn rendering(args: &Args) -> Result<Rendering, Error> {
                 .unwrap_or(tuile_film::DEFAULT_DIVERGENCE),
             convergence_m: args.stereo_convergence,
             ground_m: args.stereo_ground.unwrap_or(0.0),
+            baseline_m: args.stereo_baseline,
         }),
         ..RenderSpec::default()
     }
