@@ -68,7 +68,7 @@ impl Gauge {
     pub fn dec(&self) {
         let _ = self
             .0
-            .fetch_update(ORDER, ORDER, |v| Some(v.saturating_sub(1)));
+            .try_update(ORDER, ORDER, |v| Some(v.saturating_sub(1)));
     }
 }
 
