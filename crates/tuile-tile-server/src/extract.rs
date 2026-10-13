@@ -44,6 +44,9 @@ pub const PUT_PART_BYTES: usize = 32 << 20;
 /// …this many of them in flight at once.
 const PUT_PARTS_AT_ONCE: usize = 8;
 
+/// Tiles of one archive read at once, each by its own range.
+const TILES_AT_ONCE: usize = 32;
+
 /// Zones read at once while extracting.
 const ZONES_AT_ONCE: usize = 16;
 
@@ -67,7 +70,8 @@ pub struct ExtractAsk {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExtractReport {
     pub zones: u64,
-    /// Archives fetched whole, and their bytes.
+    /// Archives read, and the bytes read of them: every byte for a zone
+    /// taken whole, the asked tiles' alone otherwise.
     pub archives: u64,
     pub archive_bytes: u64,
     /// Tiles kept, and the archive's bytes.
@@ -82,6 +86,8 @@ pub struct ExtractReport {
 /// Which tiles of a zone are kept.
 struct Keep {
     ids: HashSet<u64>,
+    /// The ids asked for, by the zone they lie in.
+    by_zone: std::collections::HashMap<Zone, Vec<u64>>,
     whole: HashSet<Zone>,
     levels: Option<(u8, u8)>,
 }
@@ -90,9 +96,19 @@ impl Keep {
     fn of(layer: &Layer, ask: &ExtractAsk) -> Result<(Self, BTreeSet<Zone>), StoreError> {
         let mut zones = BTreeSet::new();
         let mut ids = HashSet::with_capacity(ask.tiles.len());
+        let mut by_zone: std::collections::HashMap<Zone, Vec<u64>> = Default::default();
         for &(level, x, y) in &ask.tiles {
-            zones.insert(layer.zone_of(level, x, y)?);
-            ids.insert(layer.grid.to_id(level, x, y)?);
+            if ask
+                .levels
+                .is_some_and(|(low, high)| level < low || level > high)
+            {
+                continue;
+            }
+            let (zone, id) = (layer.zone_of(level, x, y)?, layer.grid.to_id(level, x, y)?);
+            zones.insert(zone);
+            if ids.insert(id) {
+                by_zone.entry(zone).or_default().push(id);
+            }
         }
         let mut whole = HashSet::new();
         for &(level, x, y) in &ask.whole_zones {
@@ -103,6 +119,7 @@ impl Keep {
         Ok((
             Self {
                 ids,
+                by_zone,
                 whole,
                 levels: ask.levels,
             },
@@ -205,6 +222,70 @@ impl TileStore {
     /// The tiles `keep` wants of one zone, from its live archives, newest
     /// first.
     async fn extract_zone(
+        &self,
+        layer: &Layer,
+        zone: Zone,
+        keep: &Keep,
+    ) -> Result<(BTreeMap<u64, Bytes>, ExtractReport), StoreError> {
+        if keep.whole.contains(&zone) {
+            return self.extract_zone_whole(layer, zone, keep).await;
+        }
+        // The tiles asked for, and only them: each live archive, newest
+        // first, opened by its header and directories, and a range read for
+        // each tile it holds that no newer one did.
+        let mut report = ExtractReport::default();
+        let now = self.now();
+        let m = manifest::read(self.object_store().as_ref(), &layer.zone_prefix(zone))
+            .await?
+            .manifest;
+        let mut missing: Vec<u64> = keep.by_zone.get(&zone).cloned().unwrap_or_default();
+        let mut tiles = BTreeMap::new();
+        for archive in m.archives.iter().rev() {
+            if missing.is_empty() {
+                break;
+            }
+            if layer.is_expired(&archive.epoch, now) {
+                continue;
+            }
+            let reader = match archive::open_remote(self.object_store().clone(), &archive.key).await
+            {
+                Ok(reader) => Arc::new(reader),
+                // Gone under us (merged, expired): nothing of it to take.
+                Err(e) => match object_store::ObjectStoreExt::head(
+                    self.object_store().as_ref(),
+                    &object_store::path::Path::from(archive.key.as_str()),
+                )
+                .await
+                {
+                    Err(object_store::Error::NotFound { .. }) => continue,
+                    _ => return Err(e),
+                },
+            };
+            report.archives += 1;
+            let found: Vec<(u64, Option<Bytes>)> = futures_util::stream::iter(missing.clone())
+                .map(|id| {
+                    let reader = reader.clone();
+                    async move {
+                        let tile = reader.get_tile(pmtiles::TileId::new(id)?).await?;
+                        Ok::<_, StoreError>((id, tile))
+                    }
+                })
+                .buffer_unordered(TILES_AT_ONCE)
+                .try_collect()
+                .await?;
+            for (id, tile) in found {
+                if let Some(bytes) = tile {
+                    report.archive_bytes += bytes.len() as u64;
+                    tiles.insert(id, bytes);
+                }
+            }
+            missing.retain(|id| !tiles.contains_key(id));
+        }
+        Ok((tiles, report))
+    }
+
+    /// A zone taken whole: each live archive fetched whole, newest first.
+    async fn extract_zone_whole(
         &self,
         layer: &Layer,
         zone: Zone,
@@ -530,6 +611,9 @@ mod tests {
             "the newest wins, the tile not asked for and the one never written are not there"
         );
         assert_eq!((report.zones, report.archives, report.tiles), (2, 3, 3));
+        // Read by ranges: the bytes of the three tiles kept ("new", "c",
+        // "far"), not the archives they lie in.
+        assert_eq!(report.archive_bytes, 7);
         assert_eq!(
             report.bytes,
             std::fs::metadata(file.path()).expect("meta").len()

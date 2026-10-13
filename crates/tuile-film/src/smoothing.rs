@@ -23,6 +23,11 @@ use glam::{DVec3, Vec3};
 use tuile_core::content::DecodedMesh;
 use tuile_core::stitch;
 
+/// How far, in metres, geometry smoothing lifts a new vertex off its chord at
+/// most, unless told otherwise: what a camera kept over the ground must
+/// allow for, since the ground it sees is the smoothed one.
+pub const DEFAULT_BOUND_M: f32 = 2.0;
+
 /// How a film's ground is smoothed.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Smooth {

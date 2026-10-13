@@ -274,6 +274,7 @@ fn rendering(args: &Args) -> Result<Rendering, Error> {
         sun_light: args.sun_light.clone(),
         sky_light: args.sky_light.clone(),
         no_tone: args.no_tone,
+        ..RenderSpec::default()
     }
     .rendering()
 }
