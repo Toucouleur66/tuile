@@ -335,11 +335,17 @@ fn encode_eyes(
     // profile, MV-HEVC on, and the 3D reference displays SEI, whose info
     // goes with the first picture.
     config.profileGUID = NV_ENC_HEVC_PROFILE_MAIN_GUID;
+    // Probes, while MV-HEVC is brought up on a card: TUILE_NVENC_PROBE=plain
+    // encodes plain HEVC (the views as frames one after the other),
+    // =nopic passes no per-picture HEVC parameters.
+    let probe = std::env::var("TUILE_NVENC_PROBE").unwrap_or_default();
+    let multiview = probe != "plain";
+    step(&format!("probe {probe:?}"));
     // SAFETY: the preset asked for is HEVC's, so the codec config is.
     unsafe {
         let hevc = &mut config.encodeCodecConfig.hevcConfig;
-        hevc.set_enableMVHEVC(1);
-        hevc.set_outputHevc3DReferenceDisplayInfo(1);
+        hevc.set_enableMVHEVC(u32::from(multiview));
+        hevc.set_outputHevc3DReferenceDisplayInfo(u32::from(multiview));
         // Nothing MV-HEVC refuses: no temporal filter.
         hevc.tfLevel = NV_ENC_TEMPORAL_FILTER_LEVEL::NV_ENC_TEMPORAL_FILTER_LEVEL_0;
     }
@@ -397,7 +403,8 @@ fn encode_eyes(
                     hevc.p3DReferenceDisplayInfo = &raw mut displays;
                 }
                 let params = EncodePictureParams {
-                    codec_params: Some(CodecPictureParams::Hevc(hevc)),
+                    codec_params: (multiview && probe != "nopic")
+                        .then_some(CodecPictureParams::Hevc(hevc)),
                     ..Default::default()
                 };
                 match session.encode_picture(&mut inputs[view], &mut outputs[view], params) {
