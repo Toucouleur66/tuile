@@ -85,6 +85,13 @@ impl Layer {
         }
     }
 
+    /// The instant every tile of `epoch` has outlived the layer's expiry —
+    /// the end of the epoch, plus the expiry. `None` for a layer whose tiles
+    /// do not expire, or an epoch that is not a month.
+    pub fn expires_at(&self, epoch: &str) -> Option<SystemTime> {
+        Some(epoch_end(epoch)? + self.expiry?)
+    }
+
     /// Is every tile of `epoch` past its expiry at `now`? Measured from the
     /// end of the epoch, so no tile is dropped before its full lifetime.
     pub fn is_expired(&self, epoch: &str, now: SystemTime) -> bool {
