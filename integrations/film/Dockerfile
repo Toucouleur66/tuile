@@ -59,7 +59,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 
 FROM nvidia/cuda:${CUDA}-runtime-ubuntu${UBUNTU}
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates libvulkan1 libx11-6 libxext6 \
+        ca-certificates libvulkan1 libx11-6 libxext6 libegl1 libgbm1 vulkan-tools \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /usr/local/bin/tuile-film-produce /usr/local/bin/tuile-film-render /usr/local/bin/
 # The Vulkan loader finds a driver by its manifest, and the host mounts the
@@ -71,7 +71,10 @@ COPY --from=build /usr/local/bin/tuile-film-produce /usr/local/bin/tuile-film-re
 # the loader skips the driver ("libX11.so.6: cannot open shared object file").
 RUN mkdir -p /etc/vulkan/icd.d \
     && printf '%s\n' '{"file_format_version": "1.0.0", "ICD": {"library_path": "libGLX_nvidia.so.0", "api_version": "1.3.0"}}' \
-        > /etc/vulkan/icd.d/nvidia_icd.json
+        > /etc/vulkan/icd.d/nvidia_icd.json \
+    && mkdir -p /etc/vulkan/egl \
+    && printf '%s\n' '{"file_format_version": "1.0.0", "ICD": {"library_path": "libEGL_nvidia.so.0", "api_version": "1.3.0"}}' \
+        > /etc/vulkan/egl/nvidia_icd.json
 # The card's Vulkan driver, its encoder and CUDA, all from the host.
 # The render asks wgpu for Vulkan by name: a card that offers it is not
 # left to pick another backend.
