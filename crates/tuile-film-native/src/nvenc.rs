@@ -303,6 +303,10 @@ fn encode_eyes(
         }
     };
     let cuda = CudaContext::new(device).map_err(|e| format!("CUDA device {device}: {e:?}"))?;
+    // The context current on this thread, as FFmpeg pushes it around every
+    // call: MV-HEVC's encode wants it where a single view does not.
+    cuda.bind_to_thread()
+        .map_err(|e| format!("CUDA device {device}: {e:?}"))?;
     let encoder = Encoder::initialize_with_cuda(cuda).map_err(told)?;
     step("encoder open");
     let guid = NV_ENC_CODEC_HEVC_GUID;
