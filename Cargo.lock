@@ -3665,9 +3665,8 @@ dependencies = [
 
 [[package]]
 name = "nvidia-video-codec-sdk"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b150dfc88653e761947906dfc0ea14af16ae366cfc55122caab94381761605a"
+version = "0.5.0-lapoule.1"
+source = "git+https://github.com/lapoule-dev/nvidia-video-codec-sdk?branch=feat%2Fsdk-13#cf3ecd848448429898b012423ebb070c0788f76f"
 dependencies = [
  "cudarc",
  "lazy_static",

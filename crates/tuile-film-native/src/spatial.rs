@@ -66,12 +66,8 @@ fn ns(cf: &CFString) -> &NSString {
 /// distance in micrometres, and their horizontal field in thousandths of a
 /// degree.
 pub fn stereo_metadata(eyes: &Eyes<'_>) -> (u32, u32) {
-    let baseline_um = (eyes.pair.baseline_m * 1e6)
-        .round()
-        .clamp(1.0, f64::from(u32::MAX)) as u32;
-    let t = 1.0 / f64::from(eyes.left_camera.projection.x_axis.x);
-    let hfov = (2.0 * t.atan()).to_degrees() * 1000.0;
-    (baseline_um, hfov.round() as u32)
+    let info = crate::sink::stereo_info(eyes);
+    (info.baseline_um, info.hfov_millidegrees)
 }
 
 /// I420 planes into an NV12 buffer: the luma as it is, the two chromas
