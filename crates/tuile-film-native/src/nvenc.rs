@@ -22,8 +22,9 @@ use std::time::{Duration, Instant};
 
 use cudarc::driver::CudaContext;
 use nvidia_video_codec_sdk::sys::nvEncodeAPI::{
-    NV_ENC_BUFFER_FORMAT, NV_ENC_CAPS, NV_ENC_CODEC_AV1_GUID, NV_ENC_CODEC_H264_GUID,
-    NV_ENC_CODEC_HEVC_GUID, NV_ENC_MULTI_PASS, NV_ENC_PARAMS_RC_MODE, NV_ENC_PIC_TYPE,
+    HEVC_3D_REFERENCE_DISPLAY_INFO, NV_ENC_BUFFER_FORMAT, NV_ENC_CAPS, NV_ENC_CODEC_AV1_GUID,
+    NV_ENC_CODEC_H264_GUID, NV_ENC_CODEC_HEVC_GUID, NV_ENC_HEVC_PROFILE_MAIN_GUID,
+    NV_ENC_MULTI_PASS, NV_ENC_PARAMS_RC_MODE, NV_ENC_PIC_PARAMS_HEVC, NV_ENC_PIC_TYPE,
     NV_ENC_PRESET_P4_GUID, NV_ENC_TUNING_INFO,
 };
 use nvidia_video_codec_sdk::{
@@ -327,8 +328,16 @@ fn encode_eyes(
     config.rcParams.multiPass = NV_ENC_MULTI_PASS::NV_ENC_MULTI_PASS_DISABLED;
     config.rcParams.averageBitRate = bitrate;
     config.rcParams.maxBitRate = bitrate.saturating_mul(2);
+    // As FFmpeg's encoder asks for it (libavcodec/nvenc.c): the main
+    // profile, MV-HEVC on, and the 3D reference displays SEI, whose info
+    // goes with the first picture.
+    config.profileGUID = NV_ENC_HEVC_PROFILE_MAIN_GUID;
     // SAFETY: the preset asked for is HEVC's, so the codec config is.
-    unsafe { config.enable_mv_hevc(2) };
+    unsafe {
+        let hevc = &mut config.encodeCodecConfig.hevcConfig;
+        hevc.set_enableMVHEVC(1);
+        hevc.set_outputHevc3DReferenceDisplayInfo(1);
+    }
     let mut init = EncoderInitParams::new(guid, width as u32, height as u32);
     init.preset_guid(NV_ENC_PRESET_P4_GUID)
         .tuning_info(tuning)
@@ -355,6 +364,14 @@ fn encode_eyes(
 
     let mut muxer: Option<tuile_mp4::spatial::SpatialMuxer> = None;
     let mut busy = 0.0f64;
+    // One reference display: the left eye view 0, the right view 1.
+    let mut displays = HEVC_3D_REFERENCE_DISPLAY_INFO {
+        precRefDisplayWidth: 31,
+        ..Default::default()
+    };
+    displays.leftViewId[0] = 0;
+    displays.rightViewId[0] = 1;
+    let mut first = true;
     for (left, right) in waiting {
         let began = Instant::now();
         for (view, i420) in [left, right].into_iter().enumerate() {
@@ -366,8 +383,15 @@ fn encode_eyes(
             }
             step(&format!("view {view} written"));
             loop {
+                let mut hevc = NV_ENC_PIC_PARAMS_HEVC {
+                    viewId: view as u32,
+                    ..Default::default()
+                };
+                if first {
+                    hevc.p3DReferenceDisplayInfo = &raw mut displays;
+                }
                 let params = EncodePictureParams {
-                    codec_params: Some(CodecPictureParams::hevc_view(view as u32)),
+                    codec_params: Some(CodecPictureParams::Hevc(hevc)),
                     ..Default::default()
                 };
                 match session.encode_picture(&mut inputs[view], &mut outputs[view], params) {
@@ -379,6 +403,7 @@ fn encode_eyes(
                 }
             }
         }
+        first = false;
         // The base layer, then the second: one access unit.
         let mut sample = Vec::new();
         let mut sets: Vec<Vec<u8>> = Vec::new();
