@@ -26,6 +26,7 @@
 
 pub mod av1;
 pub mod engine;
+pub mod extract;
 pub mod meter;
 #[cfg(all(target_os = "linux", feature = "nvenc"))]
 pub mod nvenc;

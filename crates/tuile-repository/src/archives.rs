@@ -193,6 +193,12 @@ struct Opened {
     root: Directory,
 }
 
+/// What is added to the ids of each layer of an extract, in the order its
+/// layers were asked for: the first at its own ids, the second in the
+/// PMTiles numbering's zoom 30, where no grid tile reaches. The tile
+/// server's `extract::BANDS`, which writes them.
+pub const EXTRACT_BANDS: [u64; 2] = [0, 1 << 60];
+
 /// The tile store, as a [`TileRepository`] over any [`Objects`].
 ///
 /// It is handed the store twice, because the store holds two kinds of
@@ -217,7 +223,13 @@ pub struct ArchivedTiles {
     /// frame asks for many tiles of one zone at once, and they wait for one
     /// read of its manifest and of each archive's head.
     opening: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    /// Zones read from an extract rather than their manifest: by zone,
+    /// where it lies, its key there, and what is added to a tile's id in it.
+    extracts: Mutex<HashMap<String, ZoneExtract>>,
 }
+
+/// Where a zone's extract lies, its key there, and its band.
+type ZoneExtract = (Arc<dyn Objects>, String, u64);
 
 /// A zone's manifest as read, with when: `None` if the zone has none.
 type HeldManifest = (u64, Option<Arc<Manifest>>);
@@ -272,7 +284,47 @@ impl ArchivedTiles {
             leaves: Mutex::new(HashMap::new()),
             manifests: Mutex::new(HashMap::new()),
             opening: Mutex::new(HashMap::new()),
+            extracts: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// The key prefix of the zone tile `level/x/y` of `layer` lies in.
+    pub fn zone_of(&self, layer: &str, level: u8, x: u32, y: u32) -> Option<String> {
+        let l = self.layers.iter().find(|l| l.name == layer)?;
+        l.grid.id(level, x, y)?;
+        Some(l.zone_prefix(level, x, y))
+    }
+
+    /// Reads the zone `zone_prefix` from the archive `key` of `objects` from
+    /// now on, a tile at its id plus `band`: an extract, holding every tile
+    /// of the zone a reader will ask for. A tile it does not hold is not
+    /// there; the zone's manifest is no longer read.
+    pub fn read_zone_from(
+        &self,
+        zone_prefix: &str,
+        objects: Arc<dyn Objects>,
+        key: &str,
+        band: u64,
+    ) {
+        if let Ok(mut extracts) = self.extracts.lock() {
+            extracts.insert(zone_prefix.to_string(), (objects, key.to_string(), band));
+        }
+    }
+
+    /// Forgets every extract: zones are read from their manifests again.
+    pub fn forget_extracts(&self) {
+        if let Ok(mut extracts) = self.extracts.lock() {
+            extracts.clear();
+        }
+    }
+
+    /// Forgets every zone's manifest read so far: the next read of a zone
+    /// reads it again. For a reader told that tiles were just published —
+    /// its clock may not move, and a manifest held is believed until it does.
+    pub fn forget_manifests(&self) {
+        if let Ok(mut held) = self.manifests.lock() {
+            held.clear();
+        }
     }
 
     /// A zone's manifest, read again once it is [`MANIFEST_TTL`] old: that
@@ -384,12 +436,13 @@ impl ArchivedTiles {
 
     async fn directory(
         &self,
+        objects: &dyn Objects,
         key: &str,
         header: &Header,
         offset: u64,
         length: u64,
     ) -> Result<Directory, RepoError> {
-        let bytes = self.archives.read(key, offset..offset + length).await?;
+        let bytes = objects.read(key, offset..offset + length).await?;
         parse_directory(key, header, bytes)
     }
 
@@ -397,6 +450,7 @@ impl ArchivedTiles {
     /// what was at an offset of one is there for good.
     async fn leaf(
         &self,
+        objects: &dyn Objects,
         key: &str,
         header: &Header,
         offset: u64,
@@ -406,7 +460,7 @@ impl ArchivedTiles {
         if let Some(held) = self.leaves.lock().ok().and_then(|l| l.get(&at).cloned()) {
             return Ok(held);
         }
-        let leaf = Arc::new(self.directory(key, header, offset, length).await?);
+        let leaf = Arc::new(self.directory(objects, key, header, offset, length).await?);
         if let Ok(mut held) = self.leaves.lock() {
             if held.len() >= LEAVES {
                 held.clear();
@@ -416,7 +470,7 @@ impl ArchivedTiles {
         Ok(leaf)
     }
 
-    async fn opened(&self, key: &str) -> Result<Arc<Opened>, RepoError> {
+    async fn opened(&self, objects: &dyn Objects, key: &str) -> Result<Arc<Opened>, RepoError> {
         if let Some(held) = self.opened.lock().ok().and_then(|o| o.get(key).cloned()) {
             return Ok(held);
         }
@@ -425,8 +479,8 @@ impl ArchivedTiles {
         if let Some(held) = self.opened.lock().ok().and_then(|o| o.get(key).cloned()) {
             return Ok(held);
         }
-        let size = self.archives.size(key).await?;
-        let mut initial = self.archives.read(key, 0..size.min(INITIAL_BYTES)).await?;
+        let size = objects.size(key).await?;
+        let mut initial = objects.read(key, 0..size.min(INITIAL_BYTES)).await?;
         if initial.len() < HEADER_BYTES {
             return Err(malformed(key, "shorter than a PMTiles header"));
         }
@@ -438,7 +492,7 @@ impl ArchivedTiles {
             let bytes = initial.drain(start as usize..end as usize).collect();
             parse_directory(key, &header, bytes)?
         } else {
-            self.directory(key, &header, start, length).await?
+            self.directory(objects, key, &header, start, length).await?
         };
         let opened = Arc::new(Opened { header, root });
         if let Ok(mut held) = self.opened.lock() {
@@ -454,8 +508,13 @@ impl ArchivedTiles {
 
     /// The stored bytes of tile `id` in one archive, or `None` when the
     /// archive does not hold it.
-    async fn read_tile(&self, key: &str, id: u64) -> Result<Option<Vec<u8>>, RepoError> {
-        let opened = self.opened(key).await?;
+    async fn read_tile(
+        &self,
+        objects: &dyn Objects,
+        key: &str,
+        id: u64,
+    ) -> Result<Option<Vec<u8>>, RepoError> {
+        let opened = self.opened(objects, key).await?;
         let header = &opened.header;
         let id = TileId::new(id).map_err(|e| malformed(key, e))?;
         let mut leaf: Option<Arc<Directory>> = None;
@@ -467,10 +526,10 @@ impl ArchivedTiles {
             let (offset, length) = (entry.offset(), u64::from(entry.length()));
             if !entry.points_to_leaf() {
                 let start = header.data_offset() + offset;
-                return Ok(Some(self.archives.read(key, start..start + length).await?));
+                return Ok(Some(objects.read(key, start..start + length).await?));
             }
             let start = header.leaf_offset() + offset;
-            leaf = Some(self.leaf(key, header, start, length).await?);
+            leaf = Some(self.leaf(objects, key, header, start, length).await?);
         }
         Err(malformed(key, "directories nested too deep"))
     }
@@ -529,6 +588,20 @@ impl TileRepository for ArchivedTiles {
             )));
         };
         let zone = l.zone_prefix(level, x, y);
+        let extract = self
+            .extracts
+            .lock()
+            .ok()
+            .and_then(|e| e.get(&zone).cloned());
+        if let Some((objects, key, band)) = extract {
+            return Ok(self
+                .read_tile(objects.as_ref(), &key, id + band)
+                .await?
+                .map(|bytes| Tile {
+                    bytes,
+                    content_type: l.content_type.clone(),
+                }));
+        }
         let now = (self.now)();
         // Twice at most: a manifest held from a moment ago may name an
         // archive that has since been merged into another and removed. The
@@ -545,7 +618,10 @@ impl TileRepository for ArchivedTiles {
                 if l.is_expired(&archive.epoch, now) {
                     continue;
                 }
-                match self.read_tile(&archive.key, id).await {
+                match self
+                    .read_tile(self.archives.as_ref(), &archive.key, id)
+                    .await
+                {
                     Ok(Some(bytes)) => {
                         return Ok(Some(Tile {
                             bytes,

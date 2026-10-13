@@ -23,7 +23,9 @@ pub mod stitching;
 mod survey;
 
 pub use camera::{FrameCamera, NEAR_FRACTION};
-pub use cursor::{referred, Cursor, FilmError, FrameDiff, StoreAt, TileKey};
+pub use cursor::{
+    referred, store_tiles, Cursor, FilmError, FrameDiff, LayerTiles, StoreAt, TileKey,
+};
 pub use look::{Haze, HazeAt, Imagery, Look};
 pub use mesh::{texture, texture_of_span, Mesh};
 pub use overlay::{OverlayDepth, OverlayMesh, Overlays};

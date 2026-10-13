@@ -45,7 +45,7 @@ pub mod tone;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
 
-pub use archives::{ArchivedTiles, Now};
+pub use archives::{ArchivedTiles, Now, EXTRACT_BANDS};
 pub use bench::{
     block_segment, Asked, Bench, Later, LiveAnswer, LiveAnswers, LiveAsk, LiveAsked, Project,
     Reply, StoreAt, StoreObjects, BLOCK, LIVE_AT_ONCE, LIVE_MANY,

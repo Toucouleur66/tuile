@@ -188,6 +188,19 @@ impl Tiles {
         crate::TileCache(Arc::new(StoreContent::read_only(self.store.clone())))
     }
 
+    /// The tiles `asks` name, gathered into one archive put in the store's
+    /// bucket under `key`: an extract, for a server of the bucket to serve
+    /// (`tuile_tile_server::TileStore::extract_into`).
+    pub fn extract_into(
+        &self,
+        asks: &[tuile_tile_server::ExtractAsk],
+        key: &str,
+    ) -> Result<tuile_tile_server::ExtractReport, String> {
+        self.runtime
+            .block_on(self.store.extract_into(asks, key))
+            .map_err(|e| format!("extract {key}: {e}"))
+    }
+
     /// Publishes whatever is still buffered. Called on the way out, success or
     /// not: tiles fetched by a failed bake are still worth keeping.
     pub fn flush(&self) -> Result<(), String> {
