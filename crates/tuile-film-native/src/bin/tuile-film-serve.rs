@@ -8,8 +8,8 @@
 //! curl -X POST localhost:8080/segments -d '{"pack": "…", "frames": [1, 450], "out": "…/1-450.mp4"}'
 //! ```
 //!
-//! `POST /segments` takes a [`SegmentOrder`] and answers when the segment is
-//! in the store, with its [`SegmentDone`]; a pack not there yet is waited for
+//! `POST /segments` takes a [`SegmentOrder`](tuile_film_native::serve::SegmentOrder) and answers when the segment is
+//! in the store, with its [`SegmentDone`](tuile_film_native::serve::SegmentDone); a pack not there yet is waited for
 //! up to `pack_within_seconds`. `GET /` says the service is up.
 //!
 //! The stores are the environment's, as for `tuile-film-produce`:
