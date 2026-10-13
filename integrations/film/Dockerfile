@@ -1,14 +1,18 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 # Copyright (c) lapoule.dev
 #
-# tuile-film-render for a Linux x86-64 machine with an NVIDIA card: the
-# render on Vulkan, the film encoded by the card (NVENC, over CUDA).
+# The film for a Linux x86-64 machine with an NVIDIA card: the render on
+# Vulkan, the film encoded by the card (NVENC, over CUDA).
 #
-#   docker build -f integrations/film/Dockerfile -t tuile-film-render .
+# tuile-film-produce, the entry point, bakes, renders and joins a whole film
+# kept in the run store; on a Cloud Run job of N tasks, each task takes its
+# share of the packs and the last to finish joins. tuile-film-render is
+# beside it, for one render by hand.
+#
+#   docker build -f integrations/film/Dockerfile -t tuile-film .
 #   docker run --gpus all -e TUILE_STORE_ENDPOINT=… -e TUILE_STORE_BUCKET=… \
-#     -e TUILE_TILES_BUCKET=… -e TUILE_STORE_ACCESS_KEY_ID=… \
-#     -e TUILE_STORE_SECRET_ACCESS_KEY=… -v film-cache:/cache \
-#     tuile-film-render <packs prefix> --out /out/film.mp4
+#     -e TUILE_STORE_ACCESS_KEY_ID=… -e TUILE_STORE_SECRET_ACCESS_KEY=… \
+#     -e TUILE_TILES_BUCKET=… tuile-film store:tapes/flight.mcap --resolution 3840x2160
 #
 # The build has been through a compiler; nothing here has yet run on a card.
 
@@ -46,16 +50,21 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked -j ${FILM_BUILD_JOBS} \
         -p tuile-film-native --features nvenc,asm \
-    && cp target/release/tuile-film-render /usr/local/bin/ \
-    && ldd /usr/local/bin/tuile-film-render \
-    && ldd /usr/local/bin/tuile-film-render | grep -q libnvidia-encode
+        --bin tuile-film-produce --bin tuile-film-render \
+    && cp target/release/tuile-film-produce target/release/tuile-film-render /usr/local/bin/ \
+    && ldd /usr/local/bin/tuile-film-produce \
+    && for bin in tuile-film-produce tuile-film-render; do \
+        ldd /usr/local/bin/$bin | grep -q libnvidia-encode || exit 1; \
+    done
 
 FROM nvidia/cuda:${CUDA}-runtime-ubuntu${UBUNTU}
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates libvulkan1 \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=build /usr/local/bin/tuile-film-render /usr/local/bin/
+COPY --from=build /usr/local/bin/tuile-film-produce /usr/local/bin/tuile-film-render /usr/local/bin/
 # The card's Vulkan driver, its encoder and CUDA, all from the host.
-ENV NVIDIA_DRIVER_CAPABILITIES=all TUILE_CACHE_DIR=/cache
+# The render asks wgpu for Vulkan by name: a card that offers it is not
+# left to pick another backend.
+ENV NVIDIA_DRIVER_CAPABILITIES=all TUILE_CACHE_DIR=/cache WGPU_BACKEND=vulkan
 VOLUME /cache
-ENTRYPOINT ["tuile-film-render"]
+ENTRYPOINT ["tuile-film-produce"]

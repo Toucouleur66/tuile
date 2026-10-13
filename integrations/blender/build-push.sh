@@ -101,8 +101,19 @@ case "${1:-}" in
         CONTEXT=integrations/blender
         DESTS=(ecr)
         ;;
+    film)
+        # The wgpu film, not Blender: it lives here because this is where the
+        # farm's images are built and pushed. Its build jobs are its own
+        # argument (FILM_BUILD_JOBS, through TUILE_EXTRA_BUILD_ARGS).
+        DOCKERFILE=integrations/film/Dockerfile
+        IMAGE=film
+        TAG="${TUILE_FILM_TAG:-$(git rev-parse --short HEAD)}"
+        CONTEXT=.
+        # Run on Cloud Run only: Artifact Registry, nowhere else.
+        DESTS=(gar)
+        ;;
     *)
-        echo "usage: $0 {shared-usd|globe|render} [--gcp] [--runpod] [--registry]" >&2
+        echo "usage: $0 {shared-usd|globe|render|film} [--gcp] [--runpod] [--registry]" >&2
         exit 2
         ;;
 esac
