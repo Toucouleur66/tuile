@@ -237,29 +237,29 @@ impl TileStore {
     }
 }
 
-/// Extracts built and not yet all read, kept on disk under the key their
-/// asker gave them: prepared ahead — as a bake ends, for the render that
-/// follows — and taken in parts, each a request of its own, as many at once
-/// as the reader likes. A file read whole a moment ago is in the page cache:
-/// what memory is free serves it, what is not is not taken from the server.
+/// Extracts of a bucket, served in parts from a local copy.
 ///
-/// Kept until read whole or too old, within a budget of bytes: an extract
-/// that would not fit is refused rather than another one dropped, and the
-/// asker asks again later.
+/// An extract is built once and put in the bucket, under a key. A reader
+/// takes it in parts, each a request of its own, as many at once as it
+/// likes; the first part asked of a key brings the whole object to this
+/// server's disk — once, however many parts ask at the same time — and every
+/// part after it is read from there. A file read a moment ago is in the page
+/// cache: what memory is free serves it.
+///
+/// Copies are kept within a budget of bytes: the least recently read go
+/// first to make room.
 pub struct Extracts {
     dir: std::path::PathBuf,
     held: std::sync::Mutex<std::collections::HashMap<String, Held>>,
+    /// One copy at a time per key.
+    fetching: tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     budget: u64,
-    ttl: std::time::Duration,
 }
 
 struct Held {
     path: std::path::PathBuf,
     bytes: u64,
-    at: Instant,
-    /// Parts not read yet, by part size: the extract goes once all of one
-    /// division have been.
-    unread: std::collections::HashMap<u64, BTreeSet<u64>>,
+    read: Instant,
 }
 
 impl Drop for Held {
@@ -268,95 +268,60 @@ impl Drop for Held {
     }
 }
 
-/// What an asker is told of an extract it had prepared.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ExtractHeld {
-    pub key: String,
-    pub bytes: u64,
-    pub report: ExtractReport,
-}
-
 /// The number of parts of `bytes`, each of `part` bytes but the last.
 pub fn parts(bytes: u64, part: u64) -> u64 {
     bytes.div_ceil(part.max(1)).max(1)
 }
 
 impl Extracts {
-    /// Extracts kept under `dir`, at most `budget` bytes of them, none
-    /// longer than `ttl`.
-    pub fn new(
-        dir: impl Into<std::path::PathBuf>,
-        budget: u64,
-        ttl: std::time::Duration,
-    ) -> Result<Self, StoreError> {
+    /// Copies kept under `dir`, at most `budget` bytes of them.
+    pub fn new(dir: impl Into<std::path::PathBuf>, budget: u64) -> Result<Self, StoreError> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
         Ok(Self {
             dir,
             held: Default::default(),
+            fetching: Default::default(),
             budget,
-            ttl,
         })
     }
 
-    /// Keeps `file` under `key`, in place of what it kept; `false` when it
-    /// does not fit in what is left of the budget.
-    pub fn hold(&self, key: &str, file: tempfile::NamedTempFile) -> Result<bool, StoreError> {
-        let bytes = file.as_file().metadata()?.len();
-        let mut held = self.held.lock().map_err(|_| StoreError::Poisoned)?;
-        let ttl = self.ttl;
-        held.retain(|k, h| h.at.elapsed() < ttl && k != key);
-        let used: u64 = held.values().map(|h| h.bytes).sum();
-        if used + bytes > self.budget {
-            return Ok(false);
-        }
-        let path = self.dir.join(format!(
-            "{:016x}{:016x}.pmtiles",
-            rand::random::<u64>(),
-            rand::random::<u64>()
-        ));
-        file.persist(&path).map_err(|e| StoreError::Io(e.error))?;
-        held.insert(
-            key.to_string(),
-            Held {
-                path,
-                bytes,
-                at: Instant::now(),
-                unread: Default::default(),
-            },
-        );
-        Ok(true)
-    }
-
-    /// The size of the extract kept under `key`.
-    pub fn bytes_of(&self, key: &str) -> Option<u64> {
-        let held = self.held.lock().ok()?;
-        held.get(key).map(|h| h.bytes)
-    }
-
-    /// Part `n` of the extract under `key` cut in parts of `part` bytes;
-    /// `None` when there is no such extract or part. Once every part of that
-    /// cut has been read, the extract is let go.
-    pub async fn part(&self, key: &str, part: u64, n: u64) -> Result<Option<Bytes>, StoreError> {
-        let (path, range, last) = {
-            let mut held = self.held.lock().map_err(|_| StoreError::Poisoned)?;
-            let Some(h) = held.get_mut(key) else {
-                return Ok(None);
+    /// Part `n`, of `part` bytes, of the object `key` of `bucket`: from the
+    /// local copy, made first if there is none. `None` when the object has
+    /// no such part or is not in the bucket.
+    pub async fn part(
+        &self,
+        bucket: &dyn object_store::ObjectStore,
+        key: &str,
+        part: u64,
+        n: u64,
+    ) -> Result<Option<Bytes>, StoreError> {
+        if self.local(key).is_none() {
+            let turn = {
+                let mut fetching = self.fetching.lock().await;
+                fetching.entry(key.to_string()).or_default().clone()
             };
-            let count = parts(h.bytes, part);
-            if n >= count {
-                return Ok(None);
+            let _mine = turn.lock().await;
+            if self.local(key).is_none() {
+                let copy = tempfile::NamedTempFile::new_in(&self.dir)?;
+                match download(bucket, key, copy.path()).await {
+                    Ok(()) => {}
+                    Err(StoreError::ObjectStore(object_store::Error::NotFound { .. })) => {
+                        return Ok(None)
+                    }
+                    Err(e) => return Err(e),
+                }
+                self.keep(key, copy)?;
             }
-            let unread = h.unread.entry(part).or_insert_with(|| (0..count).collect());
-            unread.remove(&n);
-            let last = unread.is_empty();
-            (
-                h.path.clone(),
-                n * part..((n + 1) * part).min(h.bytes),
-                last,
-            )
+        }
+        let Some((path, bytes)) = self.local(key) else {
+            return Ok(None);
         };
-        // Read before it is let go: the file goes with the last part's entry.
+        let count = parts(bytes, part);
+        if n >= count {
+            return Ok(None);
+        }
+        let range = n * part..((n + 1) * part).min(bytes);
         let read = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
             let file = std::fs::File::open(&path)?;
             let mut out = vec![0u8; (range.end - range.start) as usize];
@@ -365,12 +330,47 @@ impl Extracts {
         })
         .await
         .map_err(|e| StoreError::Corrupt(format!("extract reader: {e}")))??;
-        if last {
-            if let Ok(mut held) = self.held.lock() {
-                held.remove(key);
-            }
-        }
         Ok(Some(Bytes::from(read)))
+    }
+
+    /// The local copy of `key`, marked as read now.
+    fn local(&self, key: &str) -> Option<(std::path::PathBuf, u64)> {
+        let mut held = self.held.lock().ok()?;
+        let h = held.get_mut(key)?;
+        h.read = Instant::now();
+        Some((h.path.clone(), h.bytes))
+    }
+
+    /// Keeps `copy` as the local copy of `key`, letting the least recently
+    /// read go until it fits.
+    fn keep(&self, key: &str, copy: tempfile::NamedTempFile) -> Result<(), StoreError> {
+        let bytes = copy.as_file().metadata()?.len();
+        let path = self.dir.join(format!(
+            "{:016x}{:016x}.pmtiles",
+            rand::random::<u64>(),
+            rand::random::<u64>()
+        ));
+        copy.persist(&path).map_err(|e| StoreError::Io(e.error))?;
+        let mut held = self.held.lock().map_err(|_| StoreError::Poisoned)?;
+        while held.values().map(|h| h.bytes).sum::<u64>() + bytes > self.budget {
+            let Some(oldest) = held
+                .iter()
+                .min_by_key(|(_, h)| h.read)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            held.remove(&oldest);
+        }
+        held.insert(
+            key.to_string(),
+            Held {
+                path,
+                bytes,
+                read: Instant::now(),
+            },
+        );
+        Ok(())
     }
 
     /// Bytes kept now.
@@ -553,49 +553,70 @@ mod tests {
         assert!(store.extract(&three).await.is_err());
     }
 
-    fn file(bytes: &[u8]) -> tempfile::NamedTempFile {
-        let mut f = tempfile::NamedTempFile::new().expect("file");
-        std::io::Write::write_all(&mut f, bytes).expect("write");
-        f
-    }
-
     #[tokio::test]
-    async fn an_extract_is_read_in_parts_and_let_go_once_every_part_is_read() {
+    async fn an_object_is_copied_once_and_served_in_parts_within_a_budget() {
+        use object_store::{ObjectStoreExt, PutPayload};
+        let bucket = InMemory::new();
+        for (key, body) in [
+            ("_extracts/a", &b"0123456789"[..]),
+            ("_extracts/b", &[7u8; 60][..]),
+        ] {
+            bucket
+                .put(
+                    &object_store::path::Path::from(key),
+                    PutPayload::from(body.to_vec()),
+                )
+                .await
+                .expect("put");
+        }
         let dir = tempfile::tempdir().expect("dir");
-        let extracts =
-            Extracts::new(dir.path(), 100, std::time::Duration::from_secs(60)).expect("extracts");
-        let key = "run/c0001/imagery";
-        assert!(extracts.hold(key, file(b"0123456789")).expect("hold"));
-        assert_eq!(extracts.bytes_of(key), Some(10));
-        assert_eq!(parts(10, 4), 3);
-        let part = |n| extracts.part(key, 4, n);
-        assert_eq!(part(2).await.expect("part").as_deref(), Some(&b"89"[..]));
-        assert_eq!(part(3).await.expect("part"), None, "no fourth part");
-        assert_eq!(part(0).await.expect("part").as_deref(), Some(&b"0123"[..]));
-        assert_eq!(extracts.held_bytes(), 10, "a part still unread");
-        assert_eq!(part(1).await.expect("part").as_deref(), Some(&b"4567"[..]));
-        assert_eq!(extracts.held_bytes(), 0, "all read: gone");
-        assert_eq!(part(0).await.expect("part"), None);
+        let extracts = Arc::new(Extracts::new(dir.path(), 64).expect("extracts"));
+        // Many parts at once, before any copy: one copy made.
+        let parts: Vec<_> = futures_util::future::join_all((0..3).map(|n| {
+            let (extracts, bucket) = (extracts.clone(), &bucket);
+            async move {
+                extracts
+                    .part(bucket, "_extracts/a", 4, n)
+                    .await
+                    .expect("part")
+            }
+        }))
+        .await;
+        assert_eq!(
+            parts.iter().map(|p| p.as_deref()).collect::<Vec<_>>(),
+            [Some(&b"0123"[..]), Some(&b"4567"[..]), Some(&b"89"[..])]
+        );
         assert_eq!(
             std::fs::read_dir(dir.path()).expect("dir").count(),
-            0,
-            "its file too"
+            1,
+            "one copy"
+        );
+        assert_eq!(
+            extracts
+                .part(&bucket, "_extracts/a", 4, 3)
+                .await
+                .expect("part"),
+            None
+        );
+        assert_eq!(
+            extracts
+                .part(&bucket, "_extracts/none", 4, 0)
+                .await
+                .expect("part"),
+            None
         );
 
-        // Over the budget: refused, nothing dropped for it; the same key
-        // again replaces what it held.
-        assert!(extracts.hold("a", file(&[0u8; 60])).expect("hold"));
-        assert!(!extracts.hold("b", file(&[0u8; 60])).expect("hold"));
-        assert!(extracts.hold("a", file(&[0u8; 70])).expect("hold"));
-        assert_eq!(std::fs::read_dir(dir.path()).expect("dir").count(), 1);
-        let last = extracts.part("a", 32, 2).await.expect("part");
-        assert_eq!(last.map(|b| b.len()), Some(6));
-
-        // Too old: gone at the next hold.
-        let brief = Extracts::new(dir.path().join("brief"), 100, std::time::Duration::ZERO)
-            .expect("extracts");
-        assert!(brief.hold("old", file(b"x")).expect("hold"));
-        assert!(brief.hold("new", file(b"y")).expect("hold"));
-        assert_eq!(brief.part("old", 1, 0).await.expect("part"), None);
+        // Over the budget: the least recently read goes for the new one.
+        let b = extracts
+            .part(&bucket, "_extracts/b", 32, 1)
+            .await
+            .expect("part");
+        assert_eq!(b.map(|b| b.len()), Some(28));
+        assert_eq!(extracts.held_bytes(), 60);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).expect("dir").count(),
+            1,
+            "a let go, its file too"
+        );
     }
 }

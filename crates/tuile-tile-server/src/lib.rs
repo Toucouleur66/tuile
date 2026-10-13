@@ -48,7 +48,7 @@ pub use catalog::{Catalog, LayerDef};
 pub use content::StoreContent;
 pub use disk::DiskCacheConfig;
 pub use due::{due, Due, Why};
-pub use extract::{ExtractAsk, ExtractHeld, ExtractReport, Extracts};
+pub use extract::{ExtractAsk, ExtractReport, Extracts};
 pub use grid::{Grid, OutOfGrid};
 pub use layer::{Layer, Zone, DURABLE_EPOCH};
 pub use ledger::Ledger;
