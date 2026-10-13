@@ -42,6 +42,17 @@
 //!   --smooth-bound <m>    geometry: the furthest a new vertex may be from
 //!                         the source's flat triangle (default 2)
 //!   --wire                PROTOTYPE: the mesh drawn as lines
+//!   --stereo <side-by-side|top-bottom>
+//!                         two eyes, packed into one picture: each frame
+//!                         drawn from a pair of eyes its camera gives, out
+//!                         of the tiles selected for it
+//!   --stereo-half         each eye squeezed into half the picture (a 3D
+//!                         television's packing), not the picture doubled
+//!   --stereo-divergence <f>  how deep the furthest ground goes behind the
+//!                         screen, a fraction of an eye's width (0.02)
+//!   --stereo-convergence <m> the screen's distance from the eyes; else
+//!                         where the camera's axis meets the ground
+//!   --stereo-ground <m>   that ground's height over the ellipsoid (0)
 //!   --meter <dir>         measure light going in and coming out; write
 //!                         tiles.csv, frames.csv, tone.json, report.md,
 //!                         and each place's table of grades under the key
@@ -351,6 +362,29 @@ async fn main() -> Result<(), Error> {
     order.skirts = !flag("--no-skirts");
     order.holes = flag("--holes");
     order.wire = flag("--wire");
+    if let Some(packing) = value("--stereo") {
+        order.stereo = Some(
+            tuile_film_native::engine::StereoSpec {
+                packing: match packing.as_str() {
+                    "side-by-side" => tuile_film_native::engine::StereoPacking::SideBySide,
+                    "top-bottom" => tuile_film_native::engine::StereoPacking::TopBottom,
+                    other => {
+                        return Err(
+                            format!("--stereo is side-by-side or top-bottom, not {other}").into(),
+                        )
+                    }
+                },
+                half: flag("--stereo-half"),
+                divergence: value("--stereo-divergence")
+                    .map_or(Ok(tuile_film::DEFAULT_DIVERGENCE), |d| d.parse())?,
+                convergence_m: value("--stereo-convergence")
+                    .map(|m| m.parse())
+                    .transpose()?,
+                ground_m: value("--stereo-ground").map_or(Ok(0.0), |m| m.parse())?,
+            }
+            .stereo()?,
+        );
+    }
     let bound: f32 = value("--smooth-bound").map_or(Ok(2.0), |b| b.parse())?;
     order.smooth = match value("--smooth").as_deref() {
         None | Some("off") => tuile_film::smoothing::Smooth::Off,

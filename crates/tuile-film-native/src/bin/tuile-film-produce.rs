@@ -51,7 +51,7 @@ use clap::Parser;
 use tuile_bake::tape::TapeBake;
 use tuile_farm::produce::{produce, Host, Journal, Order, ProduceError, Stretch};
 use tuile_farm::{ObjectRunStore, RunStore};
-use tuile_film_native::engine::{Engine, RenderSpec, Rendering};
+use tuile_film_native::engine::{Engine, RenderSpec, Rendering, StereoPacking, StereoSpec};
 use tuile_film_native::setup::tile_store;
 use tuile_film_native::Error;
 
@@ -140,6 +140,23 @@ struct Args {
     /// The imagery as stored, without the film's tone correction.
     #[arg(long)]
     no_tone: bool,
+    /// For two eyes, packed into one picture: `side-by-side` or `top-bottom`.
+    #[arg(long, value_parser = ["side-by-side", "top-bottom"])]
+    stereo: Option<String>,
+    /// Each eye squeezed into half the picture, for a 3D television.
+    #[arg(long, requires = "stereo")]
+    stereo_half: bool,
+    /// How deep the furthest ground goes behind the screen, as a fraction
+    /// of an eye's width.
+    #[arg(long, requires = "stereo")]
+    stereo_divergence: Option<f64>,
+    /// The screen's distance from the eyes, metres; else where the camera's
+    /// axis meets the ground.
+    #[arg(long, requires = "stereo")]
+    stereo_convergence: Option<f64>,
+    /// The ground's height over the ellipsoid, metres, for the convergence.
+    #[arg(long, requires = "stereo")]
+    stereo_ground: Option<f64>,
 
     // ── how it is produced ─────────────────────────────────────────────
     /// Frames to a pack.
@@ -274,6 +291,19 @@ fn rendering(args: &Args) -> Result<Rendering, Error> {
         sun_light: args.sun_light.clone(),
         sky_light: args.sky_light.clone(),
         no_tone: args.no_tone,
+        stereo: args.stereo.as_deref().map(|packing| StereoSpec {
+            packing: if packing == "top-bottom" {
+                StereoPacking::TopBottom
+            } else {
+                StereoPacking::SideBySide
+            },
+            half: args.stereo_half,
+            divergence: args
+                .stereo_divergence
+                .unwrap_or(tuile_film::DEFAULT_DIVERGENCE),
+            convergence_m: args.stereo_convergence,
+            ground_m: args.stereo_ground.unwrap_or(0.0),
+        }),
     }
     .rendering()
 }
