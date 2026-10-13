@@ -637,6 +637,7 @@ fn the_pass_puts_every_vertex_where_the_engine_does() {
 
     let expected = contents(true);
     let (mut vertices, mut moved, mut worst, mut far) = (0usize, 0usize, 0.0f32, 0.0f32);
+    let mut drawn_worst = 0.0f32;
     for (key, (_, content)) in keys.iter().zip(&expected) {
         let cpu = &content.meshes[0].positions;
         let Some(buffer) = film.stitched_positions(key) else {
@@ -644,6 +645,15 @@ fn the_pass_puts_every_vertex_where_the_engine_does() {
         };
         let gpu = floats(&film, buffer);
         assert_eq!(gpu.len(), 3 * cpu.len(), "the same mesh on both sides");
+        // The ground a camera is kept over (`tuile_film::ground`) is read
+        // from the film's own bookkeeping: the same vertices, where the pass
+        // put them.
+        let (_, drawn) = stitching.drawn(key).expect("held");
+        assert_eq!(drawn.positions.len(), cpu.len(), "the same mesh for the camera");
+        for (p, q) in drawn.positions.iter().zip(gpu.as_chunks::<3>().0) {
+            let apart = (glam::Vec3::from(*p) - glam::Vec3::from_slice(q)).length();
+            drawn_worst = drawn_worst.max(apart);
+        }
         let before = contents(false);
         let as_meshed = &before
             .iter()
@@ -672,5 +682,9 @@ fn the_pass_puts_every_vertex_where_the_engine_does() {
     assert!(
         worst < 1.0e-4,
         "the GPU's pass and the engine are {worst} m apart"
+    );
+    assert!(
+        drawn_worst < 1.0e-4,
+        "the GPU's pass and the camera's ground are {drawn_worst} m apart"
     );
 }

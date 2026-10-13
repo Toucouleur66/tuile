@@ -150,6 +150,28 @@ impl Stitching {
         self.planned.clear();
     }
 
+    /// The mesh of `key` as the stitch pass leaves it for the frame last
+    /// planned, about its origin: split where the plan gives it vertices,
+    /// every vertex moved by `Stitch::offset` — the shaders' arithmetic, on
+    /// the CPU. `None` for a tile not held.
+    pub fn drawn(&self, key: &TileKey) -> Option<(DVec3, DecodedMesh)> {
+        let held = self.held.get(key)?;
+        let origin = held.edges.origin;
+        let mut mesh = if held.told.inserts.iter().all(Vec::is_empty) {
+            held.mesh.clone()
+        } else {
+            stitch::split(&held.mesh, origin, &held.told.inserts)
+        };
+        if !held.told.is_nothing() {
+            if let Some(uvs) = mesh.uvs.clone() {
+                for (p, uv) in mesh.positions.iter_mut().zip(&uvs) {
+                    *p = (glam::Vec3::from(*p) + held.told.offset(*uv, self.band)).to_array();
+                }
+            }
+        }
+        Some((origin, mesh))
+    }
+
     pub fn leave(&mut self, key: &TileKey) {
         self.held.remove(key);
     }
