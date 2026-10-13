@@ -14,6 +14,7 @@
 //! mismatch is an error, never a film that turns to garbage half-way.
 
 mod av1;
+pub mod spatial;
 
 use std::io::Cursor;
 
@@ -33,6 +34,8 @@ pub enum Mp4Error {
     NoKeyFrame,
     #[error(transparent)]
     Mp4(#[from] mp4::Error),
+    #[error("mp4 box: {0}")]
+    Atom(String),
 }
 
 /// The sequence and picture parameter sets of an `avcC` record (ISO/IEC
@@ -142,7 +145,7 @@ pub struct Muxer {
 
 /// Ticks per frame. 512 is what FFmpeg picks for common rates and divides
 /// everything a player cares about.
-const TICKS: u32 = 512;
+pub(crate) const TICKS: u32 = 512;
 
 impl Muxer {
     /// An H.264 film.
