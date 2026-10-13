@@ -35,6 +35,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && for lib in libnvidia-encode libnvcuvid; do \
         test -e $lib.so.1 && ln -sf $lib.so.1 $lib.so || exit 1; \
     done
+# The Vulkan loader, at the version of the API the card's driver offers: on
+# the Cloud Run L4, driver 580.126 gives Vulkan 1.4.312, and the system's
+# loader on this Ubuntu is 1.3.204. Built from Khronos's sources at that
+# tag, with no window system: nothing here has a display.
+ARG VULKAN=1.4.312
+RUN mkdir -p /tmp/vk && cd /tmp/vk \
+    && curl -sSfL https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v${VULKAN}.tar.gz | tar xz \
+    && curl -sSfL https://github.com/KhronosGroup/Vulkan-Loader/archive/refs/tags/v${VULKAN}.tar.gz | tar xz \
+    && cmake -S Vulkan-Headers-${VULKAN} -B headers -DCMAKE_INSTALL_PREFIX=/opt/vulkan \
+    && cmake --install headers \
+    && cmake -S Vulkan-Loader-${VULKAN} -B loader -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/opt/vulkan -DVULKAN_HEADERS_INSTALL_DIR=/opt/vulkan \
+        -DBUILD_WSI_XCB_SUPPORT=OFF -DBUILD_WSI_XLIB_SUPPORT=OFF \
+        -DBUILD_WSI_WAYLAND_SUPPORT=OFF -DBUILD_WSI_DIRECTFB_SUPPORT=OFF -DBUILD_TESTS=OFF \
+    && cmake --build loader -j 4 && cmake --install loader \
+    && ls -l /opt/vulkan/lib/libvulkan.so.1 \
+    && rm -rf /tmp/vk
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 ENV PATH=/root/.cargo/bin:$PATH CUDA_PATH=/usr/local/cuda
 WORKDIR /src
@@ -59,9 +76,11 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 
 FROM nvidia/cuda:${CUDA}-runtime-ubuntu${UBUNTU}
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates libvulkan1 libegl1 libgbm1 vulkan-tools \
+        ca-certificates libegl1 libgbm1 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /usr/local/bin/tuile-film-produce /usr/local/bin/tuile-film-render /usr/local/bin/
+# The loader built above, in place of the system's.
+COPY --from=build /opt/vulkan/lib/libvulkan.so* /usr/lib/x86_64-linux-gnu/
 # The Vulkan loader finds a driver by its manifest, and the host mounts the
 # NVIDIA driver's libraries (on Cloud Run: /usr/local/nvidia/lib64, on the
 # library path) without one. Measured on a Cloud Run L4, driver 580:
