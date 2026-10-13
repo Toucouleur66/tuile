@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 use cudarc::driver::CudaContext;
 use nvidia_video_codec_sdk::sys::nvEncodeAPI::{
     NV_ENC_BUFFER_FORMAT, NV_ENC_CAPS, NV_ENC_CODEC_AV1_GUID, NV_ENC_CODEC_H264_GUID,
-    NV_ENC_CODEC_HEVC_GUID, NV_ENC_PARAMS_RC_MODE, NV_ENC_PIC_TYPE, NV_ENC_PRESET_P4_GUID,
-    NV_ENC_TUNING_INFO,
+    NV_ENC_CODEC_HEVC_GUID, NV_ENC_MULTI_PASS, NV_ENC_PARAMS_RC_MODE, NV_ENC_PIC_TYPE,
+    NV_ENC_PRESET_P4_GUID, NV_ENC_TUNING_INFO,
 };
 use nvidia_video_codec_sdk::{
     CodecPictureParams, EncodeError, EncodePictureParams, Encoder, EncoderInitParams, EncoderInput,
@@ -313,7 +313,7 @@ fn encode_eyes(
     config.gopLength = 2 * fps;
     config.rcParams.set_enableLookahead(0);
     config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_VBR;
-    config.rcParams.multiPass = Default::default();
+    config.rcParams.multiPass = NV_ENC_MULTI_PASS::NV_ENC_MULTI_PASS_DISABLED;
     config.rcParams.averageBitRate = bitrate;
     config.rcParams.maxBitRate = bitrate.saturating_mul(2);
     // SAFETY: the preset asked for is HEVC's, so the codec config is.
