@@ -39,6 +39,11 @@ use crate::StoreError;
 /// were asked for.
 pub const BANDS: [u64; 2] = [0, 1 << 60];
 
+/// An extract goes into the bucket in parts of this size…
+pub const PUT_PART_BYTES: usize = 32 << 20;
+/// …this many of them in flight at once.
+const PUT_PARTS_AT_ONCE: usize = 8;
+
 /// Zones read at once while extracting.
 const ZONES_AT_ONCE: usize = 16;
 
@@ -69,6 +74,9 @@ pub struct ExtractReport {
     pub tiles: u64,
     pub bytes: u64,
     pub millis: u64,
+    /// Putting it in the bucket, when it went there.
+    #[serde(default)]
+    pub put_millis: u64,
 }
 
 /// Which tiles of a zone are kept.
@@ -180,6 +188,20 @@ impl TileStore {
         Ok((file, report))
     }
 
+    /// [`TileStore::extract`], put in this store's bucket under `key`: what
+    /// a server of the bucket then serves in parts ([`Extracts`]).
+    pub async fn extract_into(
+        &self,
+        asks: &[ExtractAsk],
+        key: &str,
+    ) -> Result<ExtractReport, StoreError> {
+        let (file, mut report) = self.extract(asks).await?;
+        let began = Instant::now();
+        put_file(self.object_store().as_ref(), file.path(), key).await?;
+        report.put_millis = began.elapsed().as_millis() as u64;
+        Ok(report)
+    }
+
     /// The tiles `keep` wants of one zone, from its live archives, newest
     /// first.
     async fn extract_zone(
@@ -235,6 +257,51 @@ impl TileStore {
         }
         Ok((tiles, report))
     }
+}
+
+/// Puts the file at `path` in `store` under `key`, in parts of
+/// [`PUT_PART_BYTES`], [`PUT_PARTS_AT_ONCE`] of them in flight.
+async fn put_file(
+    store: &dyn object_store::ObjectStore,
+    path: &std::path::Path,
+    key: &str,
+) -> Result<(), StoreError> {
+    use object_store::{ObjectStoreExt, PutPayload, WriteMultipart};
+    use tokio::io::AsyncReadExt;
+    let to = object_store::path::Path::from(key);
+    let mut file = tokio::fs::File::open(path).await?;
+    let size = file.metadata().await?.len();
+    if size <= PUT_PART_BYTES as u64 {
+        let mut data = Vec::with_capacity(size as usize);
+        file.read_to_end(&mut data).await?;
+        store.put(&to, PutPayload::from(data)).await?;
+        return Ok(());
+    }
+    let upload = store.put_multipart(&to).await?;
+    let mut writer = WriteMultipart::new_with_chunk_size(upload, PUT_PART_BYTES);
+    let mut buf = vec![0u8; PUT_PART_BYTES];
+    loop {
+        // A short part in the middle of a multipart upload is refused: fill
+        // each one unless the file ends.
+        let mut filled = 0;
+        while filled < buf.len() {
+            let n = file.read(&mut buf[filled..]).await?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        if filled == 0 {
+            break;
+        }
+        if let Err(e) = writer.wait_for_capacity(PUT_PARTS_AT_ONCE).await {
+            let _ = writer.abort().await;
+            return Err(e.into());
+        }
+        writer.write(&buf[..filled]);
+    }
+    writer.finish().await?;
+    Ok(())
 }
 
 /// Extracts of a bucket, served in parts from a local copy.
@@ -551,6 +618,39 @@ mod tests {
         assert_eq!(at(imagery + BANDS[1]).await, "imagery");
         let three = [ask("terrain"), ask("imagery"), ask("imagery")];
         assert!(store.extract(&three).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_extract_put_in_the_bucket_is_the_archive_it_built() {
+        use object_store::ObjectStoreExt;
+        let store = store().await;
+        put(&store, (7, 77, 50), "a").await;
+        store.flush_all().await.expect("flush");
+        let ask = ExtractAsk {
+            layer: "imagery".into(),
+            tiles: vec![(7, 77, 50)],
+            ..Default::default()
+        };
+        let (built, _) = store
+            .extract(std::slice::from_ref(&ask))
+            .await
+            .expect("built");
+        let report = store
+            .extract_into(&[ask], "_extracts/run/c0001.pmtiles")
+            .await
+            .expect("put");
+        let got = store
+            .object_store()
+            .get(&object_store::path::Path::from(
+                "_extracts/run/c0001.pmtiles",
+            ))
+            .await
+            .expect("there")
+            .bytes()
+            .await
+            .expect("bytes");
+        assert_eq!(got.to_vec(), std::fs::read(built.path()).expect("read"));
+        assert_eq!(report.bytes, got.len() as u64);
     }
 
     #[tokio::test]
