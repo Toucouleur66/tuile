@@ -30,8 +30,10 @@ pub mod archive;
 pub mod catalog;
 pub mod content;
 pub mod disk;
+pub mod due;
 pub mod grid;
 pub mod layer;
+pub mod ledger;
 pub mod lru;
 pub mod manifest;
 pub mod peers;
@@ -44,8 +46,10 @@ pub mod upstream;
 pub use catalog::{Catalog, LayerDef};
 pub use content::StoreContent;
 pub use disk::DiskCacheConfig;
+pub use due::{due, Due, Why};
 pub use grid::{Grid, OutOfGrid};
 pub use layer::{Layer, Zone, DURABLE_EPOCH};
+pub use ledger::Ledger;
 pub use peers::{Announce, Claim, Emitted, FreshTiles, SharedTile, SharedTiles};
 pub use pmtiles::{Compression, TileType};
 pub use service::{etag_of, LayerMeta, ServiceConfig, ServiceError, ServiceStats, Source, TileResponse, TileService};
@@ -76,6 +80,10 @@ pub enum StoreError {
     Contended(String),
     #[error("a lock was poisoned")]
     Poisoned,
+    /// The host's register could not record an archive about to be written;
+    /// it was not written.
+    #[error("ledger: {0}")]
+    Ledger(String),
     #[doc(hidden)]
     #[error("injected fault: {0}")]
     Fault(&'static str),

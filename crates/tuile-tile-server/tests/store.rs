@@ -11,7 +11,9 @@ use std::time::Duration;
 use common::*;
 use object_store::ObjectStoreExt;
 use bytes::Bytes;
-use tuile_tile_server::{Compaction, Scrub, Zone};
+use tuile_tile_server::manifest::Manifest;
+use tuile_tile_server::{Compaction, Due, Ledger, Scrub, Zone};
+use std::sync::Arc;
 
 #[tokio::test]
 async fn a_tile_is_readable_the_moment_it_is_put() {
@@ -376,4 +378,79 @@ async fn a_scrub_takes_out_the_tiles_it_is_told_to_and_no_other() {
     assert_eq!(s.scrub(IMAGERY, zone, |bytes| bytes == PLACEHOLDER).await.expect("scrub"), Scrub::Clean);
     let again = tuile_tile_server::manifest::read(objects.as_ref(), &prefix).await.expect("manifest").manifest;
     assert_eq!(again.generation, after.generation);
+}
+
+/// What a ledger was told, in order, and what the bucket held at each step.
+#[derive(Default)]
+struct Told {
+    said: std::sync::Mutex<Vec<String>>,
+    refuse_writing: std::sync::atomic::AtomicBool,
+    objects: std::sync::OnceLock<Arc<dyn object_store::ObjectStore>>,
+}
+
+#[async_trait::async_trait]
+impl Ledger for Told {
+    async fn writing(&self, layer: &str, _zone: Zone, key: &str) -> Result<(), String> {
+        // Told before the archive exists, never after.
+        let there = self.objects.get().expect("objects").head(&key.into()).await.is_ok();
+        self.said.lock().expect("lock").push(format!("writing {layer} {key} there={there}"));
+        if self.refuse_writing.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("the ledger is down".into());
+        }
+        Ok(())
+    }
+    async fn published(&self, layer: &str, _zone: Zone, manifest: &Manifest, due: &Due) -> Result<(), String> {
+        self.said.lock().expect("lock").push(format!(
+            "published {layer} g{} archives={} retired={} due={}",
+            manifest.generation,
+            manifest.archives.len(),
+            manifest.retired.len(),
+            due.at.is_some()
+        ));
+        Ok(())
+    }
+    async fn deleted(&self, layer: &str, _zone: Zone, keys: &[String]) -> Result<(), String> {
+        self.said.lock().expect("lock").push(format!("deleted {layer} {}", keys.len()));
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_ledger_is_told_of_every_archive_before_it_is_written_of_every_publication_and_of_every_deletion() {
+    let clock = TestClock::new();
+    let objects = memory();
+    let told = Arc::new(Told::default());
+    let _ = told.objects.set(objects.clone());
+    let s = store_on(objects.clone(), &clock, eager()).with_ledger(told.clone());
+
+    // Two deltas, then a merge of them, then the retired pair deleted once
+    // their grace is over.
+    for round in 0..2u32 {
+        let (x, y) = in_zone(round);
+        s.put(IMAGERY, LEVEL, x, y, body(LEVEL, x, y, round)).await.expect("put");
+        s.flush_all().await.expect("flush");
+    }
+    assert!(matches!(s.compact(IMAGERY, zone()).await.expect("compact"), Compaction::Merged { merged: 2, .. }));
+    clock.advance(eager().retire_grace + Duration::from_secs(1));
+    s.maintain(IMAGERY, zone()).await.expect("maintain");
+
+    let said = told.said.lock().expect("lock").clone();
+    let writing: Vec<&String> = said.iter().filter(|l| l.starts_with("writing")).collect();
+    assert_eq!(writing.len(), 3, "{said:#?}");
+    assert!(writing.iter().all(|l| l.ends_with("there=false")), "{said:#?}");
+    assert!(said.contains(&"published imagery g1 archives=1 retired=0 due=true".to_string()), "{said:#?}");
+    assert!(said.contains(&"published imagery g3 archives=1 retired=2 due=true".to_string()), "{said:#?}");
+    assert!(said.iter().any(|l| l == "deleted imagery 2"), "{said:#?}");
+    // Each archive was announced before the manifest that names it.
+    let first_writing = said.iter().position(|l| l.starts_with("writing")).expect("writing");
+    let first_published = said.iter().position(|l| l.starts_with("published")).expect("published");
+    assert!(first_writing < first_published, "{said:#?}");
+
+    // A ledger that cannot record an archive: the archive is not written.
+    told.refuse_writing.store(true, std::sync::atomic::Ordering::SeqCst);
+    let before = archives(objects.as_ref(), IMAGERY).await.len();
+    let (x, y) = in_zone(9);
+    s.put(IMAGERY, LEVEL, x, y, body(LEVEL, x, y, 9)).await.expect("put");
+    assert!(s.flush_all().await.is_err(), "an unrecorded archive must not be written");
+    assert_eq!(archives(objects.as_ref(), IMAGERY).await.len(), before);
 }

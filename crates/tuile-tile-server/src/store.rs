@@ -288,6 +288,7 @@ pub struct TileStore {
     projections: Mutex<HashMap<ZoneKey, Arc<archive::LocalReader>>>,
     /// Told of every manifest this store publishes, if anyone is to be.
     announcer: Option<Arc<dyn Announce>>,
+    ledger: Option<Arc<dyn crate::Ledger>>,
     stats: Stats,
 }
 
@@ -346,6 +347,7 @@ impl TileStore {
             gate: Mutex::default(),
             projections: Mutex::default(),
             announcer: None,
+            ledger: None,
             stats: Stats::default(),
         }
     }
@@ -400,6 +402,45 @@ impl TileStore {
     pub fn with_announcer(mut self, announcer: Arc<dyn Announce>) -> Self {
         self.announcer = Some(announcer);
         self
+    }
+
+    /// From now on `ledger` is told of every archive before it is written, of
+    /// every manifest published and of every archive deleted: see
+    /// [`crate::ledger`].
+    pub fn with_ledger(mut self, ledger: Arc<dyn crate::Ledger>) -> Self {
+        self.ledger = Some(ledger);
+        self
+    }
+
+    /// Tells the ledger an archive is about to be written; refused, it is not.
+    async fn record_writing(&self, layer: &str, zone: Zone, object: &str) -> Result<(), StoreError> {
+        match &self.ledger {
+            Some(ledger) => ledger.writing(layer, zone, object).await.map_err(StoreError::Ledger),
+            None => Ok(()),
+        }
+    }
+
+    /// Tells the ledger of a publication. A ledger that missed it is put right
+    /// by the next one: said, and not an error of the publication.
+    async fn record_published(&self, key: &ZoneKey, manifest: &Manifest) {
+        let (Some(ledger), Ok(layer)) = (&self.ledger, self.layer(&key.0)) else { return };
+        let due = crate::due::due(layer, manifest, &self.cfg, (self.clock)());
+        if let Err(error) = ledger.published(&key.0, key.1, manifest, &due).await {
+            tracing::warn!(layer = %key.0, zone = ?key.1, %error, "the ledger missed a publication");
+            metrics::counter!("tuile_tiles_ledger_missed_total", "what" => "published").increment(1);
+        }
+    }
+
+    /// Tells the ledger of archives deleted.
+    async fn record_deleted(&self, layer: &str, zone: Zone, keys: &[String]) {
+        let Some(ledger) = &self.ledger else { return };
+        if keys.is_empty() {
+            return;
+        }
+        if let Err(error) = ledger.deleted(layer, zone, keys).await {
+            tracing::warn!(layer, ?zone, %error, "the ledger missed a deletion");
+            metrics::counter!("tuile_tiles_ledger_missed_total", "what" => "deleted").increment(1);
+        }
     }
 
     /// What an instance does on hearing that a zone's manifest was published
@@ -919,6 +960,7 @@ impl TileStore {
         let (file, count) = tokio::task::spawn_blocking(move || archive::write(&l, &e, zooms, list.into_iter().map(Ok)))
             .await
             .map_err(|e| StoreError::Corrupt(format!("archive writer: {e}")))??;
+        self.record_writing(&key.0, key.1, &object).await?;
         upload(self.store.as_ref(), file.path(), &object).await?;
 
         let gate = self.gate.lock().ok().and_then(|mut g| g.take());
@@ -1035,6 +1077,7 @@ impl TileStore {
             let Some(mut next) = derive(&current.manifest) else { return Ok(None) };
             next.generation = current.manifest.generation + 1;
             if manifest::replace(self.store.as_ref(), prefix, &current, &next).await? {
+                self.record_published(key, &next).await;
                 if let Some(announcer) = &self.announcer {
                     announcer.published(&key.0, key.1, next.generation).await;
                     metrics::counter!("tuile_tiles_announced_total", "layer" => key.0.clone()).increment(1);
@@ -1176,6 +1219,7 @@ impl TileStore {
                 let (file, count) =
                     writer.await.map_err(|e| StoreError::Corrupt(format!("archive writer: {e}")))??;
                 let object = archive_key(&prefix, &old.epoch, now);
+                self.record_writing(&l.name, zone, &object).await?;
                 upload(self.store.as_ref(), file.path(), &object).await?;
                 Some(ArchiveRef {
                     key: object,
@@ -1208,7 +1252,9 @@ impl TileStore {
                 }
                 None => {
                     if let Some(entry) = entry {
-                        let _ = self.store.delete(&Path::from(entry.key)).await;
+                        if self.store.delete(&Path::from(entry.key.as_str())).await.is_ok() {
+                            self.record_deleted(&l.name, zone, &[entry.key]).await;
+                        }
                     }
                     return Ok(Scrub::Superseded);
                 }
@@ -1377,6 +1423,7 @@ impl TileStore {
         let (file, count) = writer.await.map_err(|e| StoreError::Corrupt(format!("archive writer: {e}")))??;
 
         let object = archive_key(&prefix, &epoch, now);
+        self.record_writing(&layer.name, zone, &object).await?;
         upload(self.store.as_ref(), file.path(), &object).await?;
         // A merged archive's fetch times span its inputs'; unknown if any
         // input's are.
@@ -1422,7 +1469,9 @@ impl TileStore {
                 Ok(Compaction::Merged { merged: run.len(), tiles: count })
             }
             None => {
-                let _ = self.store.delete(&Path::from(object)).await;
+                if self.store.delete(&Path::from(object.as_str())).await.is_ok() {
+                    self.record_deleted(&layer.name, zone, &[object]).await;
+                }
                 Ok(Compaction::Superseded)
             }
         }
@@ -1455,6 +1504,8 @@ impl TileStore {
                 Err(e) => return Err(e.into()),
             }
         }
+        self.record_deleted(&layer.name, zone, &expired).await;
+
 
         // Orphans: archives under the zone that no manifest mentions.
         let m = manifest::read(self.store.as_ref(), &prefix).await?.manifest;
@@ -1471,6 +1522,7 @@ impl TileStore {
             let old = now.duration_since(modified).map(|a| a >= self.cfg.orphan_grace).unwrap_or(false);
             if old {
                 self.store.delete(&meta.location).await?;
+                self.record_deleted(&layer.name, zone, &[k]).await;
                 removed += 1;
             }
         }
