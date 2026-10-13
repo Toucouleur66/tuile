@@ -64,6 +64,72 @@ pub struct RenderSpec {
     pub smooth_strength: f32,
     /// Neighbouring tiles of different levels sewn together where they meet.
     pub stitch: bool,
+    /// For two eyes, packed into one picture. Absent: one eye, as always.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stereo: Option<StereoSpec>,
+}
+
+/// A film for two eyes, as a caller writes it: see [`tuile_film::Stereo`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StereoSpec {
+    /// `side-by-side` or `top-bottom`.
+    pub packing: StereoPacking,
+    /// Each eye squeezed into half the picture, for a 3D television; else
+    /// the picture is doubled.
+    pub half: bool,
+    /// The parallax of the furthest ground, as a fraction of an eye's
+    /// width: how deep the picture goes behind the screen.
+    pub divergence: f64,
+    /// The screen's distance from the eyes, in metres. Absent: where the
+    /// camera's axis meets the ground, frame by frame.
+    pub convergence_m: Option<f64>,
+    /// The ground's height over the ellipsoid, in metres, where the screen
+    /// is put on it.
+    pub ground_m: f64,
+}
+
+/// How two eyes share a picture.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StereoPacking {
+    #[default]
+    SideBySide,
+    TopBottom,
+}
+
+impl Default for StereoSpec {
+    fn default() -> Self {
+        Self {
+            packing: StereoPacking::SideBySide,
+            half: false,
+            divergence: tuile_film::DEFAULT_DIVERGENCE,
+            convergence_m: None,
+            ground_m: 0.0,
+        }
+    }
+}
+
+impl StereoSpec {
+    /// The stereo it asks for, refused when it cannot be filmed.
+    pub fn stereo(&self) -> Result<tuile_film::Stereo, Error> {
+        let stereo = tuile_film::Stereo {
+            packing: match self.packing {
+                StereoPacking::SideBySide => tuile_film::Packing::SideBySide,
+                StereoPacking::TopBottom => tuile_film::Packing::TopBottom,
+            },
+            half: self.half,
+            divergence: self.divergence,
+            convergence: match self.convergence_m {
+                Some(metres) => tuile_film::Convergence::Distance(metres),
+                None => tuile_film::Convergence::Ground {
+                    height_m: self.ground_m,
+                },
+            },
+        };
+        stereo.check()?;
+        Ok(stereo)
+    }
 }
 
 impl Default for RenderSpec {
@@ -86,6 +152,7 @@ impl Default for RenderSpec {
             sun_light: None,
             sky_light: None,
             no_tone: false,
+            stereo: None,
             smooth: "geometry".into(),
             smooth_bound: tuile_film::smoothing::DEFAULT_BOUND_M,
             smooth_strength: 1.0,
@@ -108,6 +175,7 @@ impl RenderSpec {
         if self.no_tone {
             order.tone = crate::Tone::Off;
         }
+        order.stereo = self.stereo.as_ref().map(StereoSpec::stereo).transpose()?;
         order.smooth = match self.smooth.as_str() {
             "off" => tuile_film::smoothing::Smooth::Off,
             "shading" => tuile_film::smoothing::Smooth::Shading,
@@ -335,6 +403,51 @@ impl Host for Engine {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_spec_for_two_eyes_reads_from_json_and_is_held_to_its_bounds() {
+        // Mono unless asked: an order of before reads, and writes, as it did.
+        let mono: RenderSpec = serde_json::from_str(r#"{"fps": 30}"#).expect("a spec");
+        assert!(mono.rendering().expect("rendering").order.stereo.is_none());
+        assert!(!serde_json::to_string(&mono)
+            .expect("json")
+            .contains("stereo"));
+
+        let spec: RenderSpec = serde_json::from_str(
+            r#"{"stereo": {"packing": "top-bottom", "half": true, "convergence_m": 900}}"#,
+        )
+        .expect("a stereo spec");
+        let stereo = spec
+            .rendering()
+            .expect("rendering")
+            .order
+            .stereo
+            .expect("two eyes");
+        assert_eq!(stereo.packing, tuile_film::Packing::TopBottom);
+        assert!(stereo.half);
+        assert_eq!(stereo.divergence, tuile_film::DEFAULT_DIVERGENCE);
+        assert_eq!(stereo.convergence, tuile_film::Convergence::Distance(900.0));
+        // No distance: the ground, at the height given.
+        let ground: RenderSpec =
+            serde_json::from_str(r#"{"stereo": {"ground_m": 1200}}"#).expect("a spec");
+        assert_eq!(
+            ground
+                .rendering()
+                .expect("rendering")
+                .order
+                .stereo
+                .map(|s| s.convergence),
+            Some(tuile_film::Convergence::Ground { height_m: 1200.0 })
+        );
+        // Out of bounds, or a field nobody knows: refused.
+        let wild: RenderSpec =
+            serde_json::from_str(r#"{"stereo": {"divergence": 0.3}}"#).expect("parsed");
+        assert!(wild.rendering().is_err());
+        assert!(serde_json::from_str::<RenderSpec>(r#"{"stereo": {"ipd": 0.065}}"#).is_err());
+        assert!(
+            serde_json::from_str::<RenderSpec>(r#"{"stereo": {"packing": "anaglyph"}}"#).is_err()
+        );
+    }
+
     fn rendering() -> Rendering {
         Rendering {
             order: Order::default(),
@@ -392,6 +505,7 @@ mod tests {
             |r| r.codec = Some("h264".into()),
             |r| r.bitrate = 45_000_000,
             |r| r.sun = Some((255.0, 10.0)),
+            |r| r.order.stereo = Some(tuile_film::Stereo::default()),
         ] {
             let mut changed = rendering();
             change(&mut changed);

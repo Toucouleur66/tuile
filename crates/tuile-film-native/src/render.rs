@@ -23,7 +23,8 @@ use tuile_film::from_store::{compose, imagery_texture, is_baked, terrain_mesh};
 use tuile_film::smoothing::Smooth;
 use tuile_film::stitching::{decoded, encoded, Stitching};
 use tuile_film::{
-    refs_of, texture_of_span, Content, Cursor, FrameCamera, Look, Mesh, Overlays, Pack, TileKey,
+    refs_of, texture_of_span, Content, Cursor, Eye, FrameCamera, Look, Mesh, OverlayMesh, Overlays,
+    Pack, Stereo, TileKey,
 };
 use tuile_film_gpu::{
     DrapeLayer, FilmGpu, LayerCorner, LayerField, LayerGrade, Settings, TileMesh,
@@ -79,6 +80,10 @@ pub struct Order {
     pub smooth: Smooth,
     pub smooth_strength: f32,
     pub wire: bool,
+    /// Two eyes, packed into one picture: see [`tuile_film::Stereo`]. Each
+    /// frame is drawn twice, from the eyes its camera gives, out of the
+    /// tiles the pack selected for that camera.
+    pub stereo: Option<Stereo>,
 }
 
 impl Default for Order {
@@ -98,6 +103,7 @@ impl Default for Order {
             smooth: Smooth::Off,
             smooth_strength: 1.0,
             wire: false,
+            stereo: None,
         }
     }
 }
@@ -249,6 +255,65 @@ fn ms(since: Instant) -> f64 {
     since.elapsed().as_secs_f64() * 1000.0
 }
 
+/// Where one picture of a frame is read back to: its RGBA rows, padded to
+/// what a copy wants, and its I420 planes when the sink takes them.
+struct Readback {
+    picture: wgpu::Buffer,
+    planes: Option<wgpu::Buffer>,
+    width: u32,
+    height: u32,
+    padded: u32,
+}
+
+/// The frame through `camera`, drawn and read back: its RGBA, and its I420
+/// when the sink takes it.
+async fn shoot(
+    gpu: &mut FilmGpu,
+    camera: &FrameCamera,
+    selection: &[TileKey],
+    shapes: &[OverlayMesh],
+    back: &Readback,
+    timings: &mut Timings,
+    shadow_texel: &mut Option<(f32, f32)>,
+) -> Result<(Vec<u8>, Vec<u8>), Error> {
+    let t = Instant::now();
+    let mut encoder = gpu.render_with(camera, selection, shapes)?;
+    encoder.copy_texture_to_buffer(
+        gpu.output().as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &back.picture,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(back.padded),
+                rows_per_image: Some(back.height),
+            },
+        },
+        gpu.output().size(),
+    );
+    if let Some(planes) = &back.planes {
+        gpu.encode_i420(&mut encoder)?;
+        encoder.copy_buffer_to_buffer(gpu.i420_planes(), 0, planes, 0, planes.size());
+    }
+    gpu.queue().submit([encoder.finish()]);
+    if let Some(texel) = gpu.shadow_texel() {
+        let (fine, coarse) = shadow_texel.unwrap_or((texel, texel));
+        *shadow_texel = Some((fine.min(texel), coarse.max(texel)));
+    }
+    timings.draw += ms(t);
+    let t = Instant::now();
+    let rows = read_back(gpu, &back.picture).await?;
+    let mut rgba = Vec::with_capacity((back.width * back.height * 4) as usize);
+    for row in rows.chunks(back.padded as usize) {
+        rgba.extend_from_slice(&row[..(back.width * 4) as usize]);
+    }
+    let i420 = match &back.planes {
+        Some(planes) => read_back(gpu, planes).await?,
+        None => Vec::new(),
+    };
+    timings.readback += ms(t);
+    Ok((rgba, i420))
+}
+
 async fn read_back(film: &FilmGpu, buffer: &wgpu::Buffer) -> Result<Vec<u8>, Error> {
     let (done, mapped) = tokio::sync::oneshot::channel();
     buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
@@ -292,6 +357,16 @@ pub async fn render(
     let view = Pack::open_table(&opening.head)?.view_of(first)?;
     let width = (((view.viewport_px[0] as f32 * order.scale) as u32) / 8).max(1) * 8;
     let height = (((view.viewport_px[1] as f32 * order.scale) as u32) / 8).max(1) * 8;
+    // The film's framing, whatever share of the picture an eye is given.
+    let aspect = width as f32 / height as f32;
+    // For two eyes, `width × height` is an eye's, and the picture holds both.
+    let stereo = order.stereo;
+    if let Some(stereo) = &stereo {
+        stereo.check()?;
+    }
+    let (width, height) = stereo.map_or((width, height), |s| s.eye_size(width, height));
+    let (picture_width, picture_height) =
+        stereo.map_or((width, height), |s| s.picture_size((width, height)));
 
     // The film's grade, before anything is set up: one from its first
     // frame to its last, and part of it is how the picture is exposed.
@@ -338,25 +413,30 @@ pub async fn render(
     gpu.smoothing_probe(order.smooth_strength, order.wire);
     let mut stitching = order.stitch.then(Stitching::default);
     let padded = (width * 4).div_ceil(256) * 256;
-    let picture = gpu.device().create_buffer(&wgpu::BufferDescriptor {
-        label: Some("film picture readback"),
-        size: u64::from(padded * height),
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-    let planes = sink.wants_i420().then(|| {
-        gpu.device().create_buffer(&wgpu::BufferDescriptor {
-            label: Some("film i420 readback"),
-            size: gpu.i420_planes().size(),
+    let back = Readback {
+        picture: gpu.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("film picture readback"),
+            size: u64::from(padded * height),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
-        })
-    });
-    sink.open(width, height, order.fps)?;
-
-    let mut done = Done {
+        }),
+        planes: sink.wants_i420().then(|| {
+            gpu.device().create_buffer(&wgpu::BufferDescriptor {
+                label: Some("film i420 readback"),
+                size: gpu.i420_planes().size(),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        }),
         width,
         height,
+        padded,
+    };
+    sink.open(picture_width, picture_height, order.fps)?;
+
+    let mut done = Done {
+        width: picture_width,
+        height: picture_height,
         grade: film_grade.clone(),
         setup_seconds: began.elapsed().as_secs_f64(),
         ..Done::default()
@@ -929,44 +1009,53 @@ pub async fn render(
                 }
             }
             timings.stitch += ms(t);
-            let t = Instant::now();
-            let camera = FrameCamera::of(&diff.view, width as f32 / height as f32);
+            let camera = FrameCamera::of(&diff.view, aspect);
             shapes.clear();
             overlays.frame(diff.frame, &diff.view, &mut shapes);
-            let mut encoder = gpu.render_with(&camera, &diff.selection, &shapes)?;
-            encoder.copy_texture_to_buffer(
-                gpu.output().as_image_copy(),
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &picture,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(padded),
-                        rows_per_image: Some(height),
-                    },
-                },
-                gpu.output().size(),
-            );
-            if let Some(planes) = &planes {
-                gpu.encode_i420(&mut encoder)?;
-                encoder.copy_buffer_to_buffer(gpu.i420_planes(), 0, planes, 0, planes.size());
-            }
-            gpu.queue().submit([encoder.finish()]);
-            if let Some(texel) = gpu.shadow_texel() {
-                let (fine, coarse) = done.shadow_texel.unwrap_or((texel, texel));
-                done.shadow_texel = Some((fine.min(texel), coarse.max(texel)));
-            }
-            timings.draw += ms(t);
-            let t = Instant::now();
-            let rows = read_back(&gpu, &picture).await?;
-            let mut rgba = Vec::with_capacity((width * height * 4) as usize);
-            for row in rows.chunks(padded as usize) {
-                rgba.extend_from_slice(&row[..(width * 4) as usize]);
-            }
-            let i420 = match &planes {
-                Some(planes) => read_back(&gpu, planes).await?,
-                None => Vec::new(),
+            let (rgba, i420) = match &stereo {
+                None => {
+                    shoot(
+                        &mut gpu,
+                        &camera,
+                        &diff.selection,
+                        &shapes,
+                        &back,
+                        &mut timings,
+                        &mut done.shadow_texel,
+                    )
+                    .await?
+                }
+                // Both eyes from the same resident tiles, one after the
+                // other through the same target, then packed.
+                Some(stereo) => {
+                    let pair = stereo.eyes(&camera);
+                    let mut eyes = Vec::with_capacity(2);
+                    for eye in Eye::BOTH {
+                        eyes.push(
+                            shoot(
+                                &mut gpu,
+                                &camera.eye(&pair, eye),
+                                &diff.selection,
+                                &shapes,
+                                &back,
+                                &mut timings,
+                                &mut done.shadow_texel,
+                            )
+                            .await?,
+                        );
+                    }
+                    let (left, right) = (&eyes[0], &eyes[1]);
+                    let i420 = if back.planes.is_some() {
+                        tuile_film::pack_i420(stereo.packing, &left.1, &right.1, width, height)
+                    } else {
+                        Vec::new()
+                    };
+                    (
+                        tuile_film::pack_rgba(stereo.packing, &left.0, &right.0, width, height),
+                        i420,
+                    )
+                }
             };
-            timings.readback += ms(t);
             if order.holes {
                 // The probe's magenta, or a part of it under the
                 // supersampling filter.
@@ -1008,8 +1097,8 @@ pub async fn render(
             observer.frame(&FrameOut {
                 frame: diff.frame,
                 index,
-                width,
-                height,
+                width: picture_width,
+                height: picture_height,
                 rgba: &rgba,
                 tiles: diff.selection.len(),
                 entered,
