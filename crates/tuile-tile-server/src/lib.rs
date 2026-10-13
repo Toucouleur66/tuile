@@ -89,6 +89,10 @@ pub enum StoreError {
     /// it was not written.
     #[error("ledger: {0}")]
     Ledger(String),
+    /// Tiles a reader named that the store does not hold: `absent` of them,
+    /// `said` naming the first.
+    #[error("{said}")]
+    Incomplete { absent: u64, said: String },
     #[doc(hidden)]
     #[error("injected fault: {0}")]
     Fault(&'static str),

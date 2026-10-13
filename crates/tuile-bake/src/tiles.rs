@@ -265,6 +265,18 @@ impl Tiles {
             .map_err(|e| format!("extract {key}: {e}"))
     }
 
+    /// The same, put only if the store holds every tile `asks` name: for a
+    /// render, which draws every tile its pack names. A missing tile is
+    /// [`tuile_tile_server::StoreError::Incomplete`], and nothing is put.
+    pub fn extract_whole_into(
+        &self,
+        asks: &[tuile_tile_server::ExtractAsk],
+        key: &str,
+    ) -> Result<tuile_tile_server::ExtractReport, tuile_tile_server::StoreError> {
+        self.runtime
+            .block_on(self.store.extract_whole_into(asks, key))
+    }
+
     /// Publishes whatever is still buffered. Called on the way out, success or
     /// not: tiles fetched by a failed bake are still worth keeping.
     pub fn flush(&self) -> Result<(), String> {
