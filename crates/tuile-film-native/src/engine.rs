@@ -32,6 +32,118 @@ pub struct Rendering {
     pub sun: Option<(f64, f64)>,
 }
 
+/// How a film is to be rendered, as a caller writes it — the command line of
+/// `tuile-film-produce`, or the body of a request to `tuile-film-serve`.
+/// Colours are `r,g,b` linear; what is absent is the engine's own.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RenderSpec {
+    pub fps: u32,
+    pub scale: f32,
+    pub supersample: u32,
+    pub codec: String,
+    pub mbps: f64,
+    /// The sun's azimuth and elevation, in degrees, where the film begins.
+    pub sun: Option<(f64, f64)>,
+    pub exposure: Option<f32>,
+    pub contrast: Option<f32>,
+    pub saturation: Option<f32>,
+    pub shadow: Option<f32>,
+    pub haze_density: Option<f32>,
+    pub haze_height: Option<f32>,
+    pub haze_horizon: Option<String>,
+    pub haze_zenith: Option<String>,
+    pub sun_light: Option<String>,
+    pub sky_light: Option<String>,
+    pub no_tone: bool,
+}
+
+impl Default for RenderSpec {
+    fn default() -> Self {
+        Self {
+            fps: 30,
+            scale: 1.0,
+            supersample: 2,
+            codec: "h264".into(),
+            mbps: 12.0,
+            sun: None,
+            exposure: None,
+            contrast: None,
+            saturation: None,
+            shadow: None,
+            haze_density: None,
+            haze_height: None,
+            haze_horizon: None,
+            haze_zenith: None,
+            sun_light: None,
+            sky_light: None,
+            no_tone: false,
+        }
+    }
+}
+
+impl RenderSpec {
+    /// The rendering it asks for. A colour that is not three values, none
+    /// below zero, is refused.
+    pub fn rendering(&self) -> Result<Rendering, Error> {
+        use crate::setup::rgb;
+        let mut order = Order {
+            scale: self.scale,
+            supersample: self.supersample.max(1),
+            fps: self.fps.max(1),
+            ..Default::default()
+        };
+        if self.no_tone {
+            order.tone = crate::Tone::Off;
+        }
+        let look = &mut order.look;
+        if let Some(stops) = self.exposure {
+            look.exposure_ev = stops;
+        }
+        if let Some(power) = self.contrast {
+            look.contrast = power;
+        }
+        if let Some(factor) = self.saturation {
+            look.saturation = factor;
+        }
+        if let Some(strength) = self.shadow {
+            look.shadow = strength;
+        }
+        if let Some(colour) = &self.sun_light {
+            look.sun = rgb("sun-light", colour)?;
+        }
+        if let Some(colour) = &self.sky_light {
+            look.world = rgb("sky-light", colour)?;
+        }
+        // Naming anything of the air asks for the air.
+        if self.haze_density.is_some()
+            || self.haze_height.is_some()
+            || self.haze_horizon.is_some()
+            || self.haze_zenith.is_some()
+        {
+            let haze = look.haze.get_or_insert_with(tuile_film::Haze::default);
+            if let Some(density) = self.haze_density {
+                haze.density = density;
+            }
+            if let Some(height) = self.haze_height {
+                haze.scale_height = height;
+            }
+            if let Some(colour) = &self.haze_horizon {
+                haze.horizon = rgb("haze-horizon", colour)?;
+            }
+            if let Some(colour) = &self.haze_zenith {
+                haze.zenith = rgb("haze-zenith", colour)?;
+            }
+        }
+        Ok(Rendering {
+            order,
+            codec: Some(self.codec.clone()),
+            bitrate: (self.mbps * 1e6) as u32,
+            sun: self.sun,
+        })
+    }
+}
+
 /// The prefix of a film's keys: `films/<its packs' name>/<look>`, the look
 /// naming everything a rendered picture depends on beside its pack — and
 /// not which frames are rendered, so that every part of a film agrees.
