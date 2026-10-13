@@ -20,6 +20,50 @@ use tuile_tile_server::projection::DEFAULT_TILE_FACTOR;
 use tuile_tile_server::{Eye, Footprint, Grid, LayerDef, StoreConfig, StoreContent, TileStore};
 
 const DEFAULT_REGION: &str = "auto";
+/// Projections kept, in GiB, unless `TUILE_TILES_DIR_GIB` says.
+const DEFAULT_PROJECTIONS_GIB: u64 = 40;
+
+/// The files under `dir`, oldest first by when they were last written,
+/// removed until what is left holds at most `budget` bytes. A projection is
+/// written again by every bake that uses it, so the oldest is the one no
+/// bake has used for longest. A file still open by another bake is read
+/// to its end: removing it only unlinks it. Returns the files removed and
+/// their bytes.
+fn evict_oldest(dir: &std::path::Path, budget: u64) -> (u64, u64) {
+    fn walk(
+        dir: &std::path::Path,
+        out: &mut Vec<(std::time::SystemTime, u64, std::path::PathBuf)>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                walk(&entry.path(), out);
+            } else if let Ok(at) = meta.modified() {
+                out.push((at, meta.len(), entry.path()));
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(dir, &mut files);
+    let mut held: u64 = files.iter().map(|f| f.1).sum();
+    files.sort_by_key(|f| f.0);
+    let (mut removed, mut freed) = (0, 0);
+    for (_, bytes, path) in files {
+        if held <= budget {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            held -= bytes;
+            removed += 1;
+            freed += bytes;
+        }
+    }
+    (removed, freed)
+}
+
 /// Where the scene's projections are written, unless `TUILE_TILES_DIR` says.
 const DEFAULT_PROJECTION_DIR: &str = "/tmp/tuile-tiles";
 /// Imagery is kept eight times farther than terrain: a 2048² drape composes
@@ -152,6 +196,22 @@ impl Tiles {
         }
         let dir =
             std::env::var("TUILE_TILES_DIR").unwrap_or_else(|_| DEFAULT_PROJECTION_DIR.into());
+        // Projections stay after their bake, for the next one over the same
+        // ground; the least recently made go first to keep under a budget.
+        let budget = std::env::var("TUILE_TILES_DIR_GIB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_PROJECTIONS_GIB)
+            << 30;
+        let (evicted, freed) = evict_oldest(std::path::Path::new(&dir), budget);
+        if evicted > 0 {
+            tracing::info!(
+                evicted,
+                mb = freed as f64 / 1e6,
+                budget_gib = budget >> 30,
+                "TILES-PROJECTIONS-EVICTED"
+            );
+        }
         let report = self
             .runtime
             .block_on(self.store.project(&footprint, std::path::Path::new(&dir)))
@@ -224,5 +284,40 @@ impl Tiles {
             "TILES-FLUSHED"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod eviction_tests {
+    use super::evict_oldest;
+
+    #[test]
+    fn the_oldest_projections_go_until_the_rest_fits() {
+        let dir = tempfile::tempdir().expect("dir");
+        let zone = |name: &str, bytes: usize, age_s: u64| {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&path, vec![0u8; bytes]).expect("write");
+            let at = std::time::SystemTime::now() - std::time::Duration::from_secs(age_s);
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .expect("open")
+                .set_modified(at)
+                .expect("time");
+            path
+        };
+        let old = zone("asset-1/zones/z4/1/2.pmtiles", 400, 300);
+        let middle = zone("asset-2/zones/z4/1/2.pmtiles", 400, 200);
+        let new = zone("asset-2/top.pmtiles", 400, 100);
+        assert_eq!(evict_oldest(dir.path(), 1000), (1, 400));
+        assert!(!old.exists() && middle.exists() && new.exists());
+        assert_eq!(
+            evict_oldest(dir.path(), 1000),
+            (0, 0),
+            "under the budget: nothing goes"
+        );
+        assert_eq!(evict_oldest(dir.path(), 0), (2, 800));
+        assert_eq!(evict_oldest(&dir.path().join("none"), 0), (0, 0));
     }
 }
