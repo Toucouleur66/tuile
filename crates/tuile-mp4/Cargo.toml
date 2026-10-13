@@ -9,6 +9,9 @@ authors.workspace = true
 
 [dependencies]
 mp4 = "0.14.0"
+# The boxes of a spatial (MV-HEVC) film, Apple's stereo boxes included:
+# lapoule-dev's fork, until they are released upstream.
+mp4-atom = { git = "https://github.com/lapoule-dev/mp4-atom", branch = "feat/stereo-video-boxes" }
 thiserror = { workspace = true }
 
 [lints]
