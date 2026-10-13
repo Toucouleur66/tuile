@@ -159,10 +159,42 @@ struct KeyFile {
 #[derive(Serialize)]
 struct Claims<'a> {
     iss: &'a str,
-    scope: &'a str,
+    /// For an access token: what it may do.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<&'a str>,
+    /// For an identity token: the service it is shown to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_audience: Option<&'a str>,
     aud: &'a str,
     iat: u64,
     exp: u64,
+}
+
+/// What a key is exchanged for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Grant<'a> {
+    /// An access token, for Google's APIs.
+    Access,
+    /// An identity token for `audience`: what a private Cloud Run service
+    /// asks of its callers.
+    Identity { audience: &'a str },
+}
+
+impl<'a> Grant<'a> {
+    fn claims(self, iss: &'a str, token_uri: &'a str, now: u64) -> Claims<'a> {
+        let (scope, target_audience) = match self {
+            Grant::Access => (Some("https://www.googleapis.com/auth/cloud-platform"), None),
+            Grant::Identity { audience } => (None, Some(audience)),
+        };
+        Claims {
+            iss,
+            scope,
+            target_audience,
+            aud: token_uri,
+            iat: now,
+            exp: now + 3600,
+        }
+    }
 }
 
 impl ServiceAccountKey {
@@ -186,18 +218,21 @@ impl ServiceAccountKey {
         })
     }
 
-    async fn mint(&self) -> Result<Cached> {
+    /// Identity tokens for the service at `audience` (its URL), from this
+    /// key.
+    pub fn identity(self, audience: &str) -> IdentityToken {
+        IdentityToken {
+            key: self,
+            audience: audience.trim_end_matches('/').to_string(),
+        }
+    }
+
+    async fn mint(&self, grant: Grant<'_>) -> Result<Cached> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let claims = Claims {
-            iss: &self.key.client_email,
-            scope: "https://www.googleapis.com/auth/cloud-platform",
-            aud: &self.key.token_uri,
-            iat: now,
-            exp: now + 3600,
-        };
+        let claims = grant.claims(&self.key.client_email, &self.key.token_uri, now);
         let signer = jsonwebtoken::EncodingKey::from_rsa_pem(self.key.private_key.as_bytes())
             .map_err(|e| JobsError::Auth(format!("private key: {e}")))?;
         let assertion = jsonwebtoken::encode(
@@ -227,34 +262,75 @@ impl ServiceAccountKey {
         }
         #[derive(Deserialize)]
         struct Answer {
-            access_token: String,
-            expires_in: u64,
+            access_token: Option<String>,
+            id_token: Option<String>,
+            /// An identity token's answer has none: it lives an hour.
+            expires_in: Option<u64>,
         }
         let answer: Answer = serde_json::from_str(&body)
             .map_err(|e| JobsError::Auth(format!("token exchange answer: {e}")))?;
+        let token = match grant {
+            Grant::Access => answer.access_token,
+            Grant::Identity { .. } => answer.id_token,
+        }
+        .ok_or_else(|| {
+            JobsError::Auth(format!("token exchange answer without its token: {body}"))
+        })?;
         // Five minutes of margin: a token handed out one second before it
         // dies is a 401 waiting to happen.
-        let life = Duration::from_secs(answer.expires_in.saturating_sub(300).max(60));
+        let life = Duration::from_secs(
+            answer
+                .expires_in
+                .unwrap_or(3600)
+                .saturating_sub(300)
+                .max(60),
+        );
         Ok(Cached {
-            token: answer.access_token,
+            token,
             until: Instant::now() + life,
         })
     }
-}
 
-#[async_trait]
-impl TokenSource for ServiceAccountKey {
-    async fn token(&self, fresh: bool) -> Result<String> {
+    async fn cached(&self, grant: Grant<'_>, fresh: bool) -> Result<String> {
         let mut cached = self.cached.lock().await;
         if let Some(c) = cached.as_ref() {
             if !fresh && Instant::now() < c.until {
                 return Ok(c.token.clone());
             }
         }
-        let minted = self.mint().await?;
+        let minted = self.mint(grant).await?;
         let token = minted.token.clone();
         *cached = Some(minted);
         Ok(token)
+    }
+}
+
+/// Identity tokens for one private service, minted from a service account
+/// key: the `Authorization: Bearer` a Cloud Run service that does not take
+/// everyone's calls asks for.
+pub struct IdentityToken {
+    key: ServiceAccountKey,
+    audience: String,
+}
+
+#[async_trait]
+impl TokenSource for IdentityToken {
+    async fn token(&self, fresh: bool) -> Result<String> {
+        self.key
+            .cached(
+                Grant::Identity {
+                    audience: &self.audience,
+                },
+                fresh,
+            )
+            .await
+    }
+}
+
+#[async_trait]
+impl TokenSource for ServiceAccountKey {
+    async fn token(&self, fresh: bool) -> Result<String> {
+        self.cached(Grant::Access, fresh).await
     }
 }
 
@@ -637,6 +713,32 @@ impl JobsApi {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_key_asks_for_an_access_token_by_scope_and_an_identity_token_by_audience() {
+        let access = serde_json::to_value(super::Grant::Access.claims("me@x", "https://t", 10))
+            .expect("json");
+        assert_eq!(
+            access["scope"],
+            "https://www.googleapis.com/auth/cloud-platform"
+        );
+        assert!(access.get("target_audience").is_none(), "{access}");
+        let identity = serde_json::to_value(
+            super::Grant::Identity {
+                audience: "https://render.run.app",
+            }
+            .claims("me@x", "https://t", 10),
+        )
+        .expect("json");
+        // A scope beside an audience and the exchange gives an access token,
+        // which a private service refuses.
+        assert!(identity.get("scope").is_none(), "{identity}");
+        assert_eq!(identity["target_audience"], "https://render.run.app");
+        assert_eq!(
+            (identity["aud"].as_str(), identity["exp"].as_u64()),
+            (Some("https://t"), Some(3610))
+        );
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
