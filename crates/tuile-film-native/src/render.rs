@@ -432,7 +432,10 @@ pub async fn render(
         height,
         padded,
     };
-    sink.open(picture_width, picture_height, order.fps)?;
+    match stereo {
+        None => sink.open(picture_width, picture_height, order.fps)?,
+        Some(_) => sink.open_stereo((picture_width, picture_height), (width, height), order.fps)?,
+    }
 
     let mut done = Done {
         width: picture_width,
@@ -1012,6 +1015,8 @@ pub async fn render(
             let camera = FrameCamera::of(&diff.view, aspect);
             shapes.clear();
             overlays.frame(diff.frame, &diff.view, &mut shapes);
+            // For two eyes: each eye apart, the pair, the left eye's camera.
+            let mut apart = None;
             let (rgba, i420) = match &stereo {
                 None => {
                     shoot(
@@ -1050,10 +1055,12 @@ pub async fn render(
                     } else {
                         Vec::new()
                     };
-                    (
+                    let packed = (
                         tuile_film::pack_rgba(stereo.packing, &left.0, &right.0, width, height),
                         i420,
-                    )
+                    );
+                    apart = Some((eyes, pair, camera.eye(&pair, Eye::Left)));
+                    packed
                 }
             };
             if order.holes {
@@ -1109,7 +1116,21 @@ pub async fn render(
             });
             timings.observe += ms(t);
             let t = Instant::now();
-            sink.picture(index, diff.frame, &rgba, &i420)?;
+            match &apart {
+                None => sink.picture(index, diff.frame, &rgba, &i420)?,
+                Some((eyes, pair, left_camera)) => sink.stereo(
+                    index,
+                    diff.frame,
+                    &rgba,
+                    &i420,
+                    &crate::sink::Eyes {
+                        left: &eyes[0].1,
+                        right: &eyes[1].1,
+                        pair,
+                        left_camera,
+                    },
+                )?,
+            }
             timings.sink += ms(t);
             if index == 0 {
                 done.opening = timings;

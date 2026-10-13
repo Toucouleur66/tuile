@@ -106,6 +106,10 @@ pub fn film_sink(path: String, bitrate: u32, codec: Option<&str>) -> Result<Box<
     if matches!(codec, Some("h264") | None) {
         return Ok(Box::new(crate::H264Film::at(path, bitrate)));
     }
+    #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+    if codec == Some("mv-hevc") {
+        return Ok(Box::new(crate::SpatialFilm::at(path, bitrate)));
+    }
     #[cfg(all(target_os = "linux", feature = "nvenc"))]
     {
         use crate::{NvencCodec, NvencFilm};

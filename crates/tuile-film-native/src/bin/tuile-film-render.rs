@@ -322,6 +322,23 @@ impl Sink for Both {
             .iter_mut()
             .try_for_each(|s| s.picture(index, frame, rgba, i420))
     }
+    fn open_stereo(&mut self, picture: (u32, u32), eye: (u32, u32), fps: u32) -> Result<(), Error> {
+        self.0
+            .iter_mut()
+            .try_for_each(|s| s.open_stereo(picture, eye, fps))
+    }
+    fn stereo(
+        &mut self,
+        index: u32,
+        frame: u32,
+        rgba: &[u8],
+        i420: &[u8],
+        eyes: &tuile_film_native::sink::Eyes<'_>,
+    ) -> Result<(), Error> {
+        self.0
+            .iter_mut()
+            .try_for_each(|s| s.stereo(index, frame, rgba, i420, eyes))
+    }
     fn close(&mut self) -> Result<(), Error> {
         self.0.iter_mut().try_for_each(|s| s.close())
     }
