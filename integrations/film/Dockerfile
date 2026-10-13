@@ -6,8 +6,10 @@
 #
 # tuile-film-produce, the entry point, bakes, renders and joins a whole film
 # kept in the run store; on a Cloud Run job of N tasks, each task takes its
-# share of the packs and the last to finish joins. tuile-film-render is
-# beside it, for one render by hand.
+# share of the packs and the last to finish joins. tuile-film-serve is the
+# same render as a service: segments asked over HTTP, on a Cloud Run service
+# (`--command tuile-film-serve`). tuile-film-render is beside them, for one
+# render by hand.
 #
 #   docker build -f integrations/film/Dockerfile -t tuile-film .
 #   docker run --gpus all -e TUILE_STORE_ENDPOINT=… -e TUILE_STORE_BUCKET=… \
@@ -67,10 +69,10 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked -j ${FILM_BUILD_JOBS} \
         -p tuile-film-native --features nvenc,asm \
-        --bin tuile-film-produce --bin tuile-film-render \
-    && cp target/release/tuile-film-produce target/release/tuile-film-render /usr/local/bin/ \
+        --bin tuile-film-produce --bin tuile-film-serve --bin tuile-film-render \
+    && cp target/release/tuile-film-produce target/release/tuile-film-serve target/release/tuile-film-render /usr/local/bin/ \
     && ldd /usr/local/bin/tuile-film-produce \
-    && for bin in tuile-film-produce tuile-film-render; do \
+    && for bin in tuile-film-produce tuile-film-serve tuile-film-render; do \
         ldd /usr/local/bin/$bin | grep -q libnvidia-encode || exit 1; \
     done
 
@@ -78,7 +80,7 @@ FROM nvidia/cuda:${CUDA}-runtime-ubuntu${UBUNTU}
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates libegl1 libgbm1 \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=build /usr/local/bin/tuile-film-produce /usr/local/bin/tuile-film-render /usr/local/bin/
+COPY --from=build /usr/local/bin/tuile-film-produce /usr/local/bin/tuile-film-serve /usr/local/bin/tuile-film-render /usr/local/bin/
 # The loader built above, in place of the system's.
 COPY --from=build /opt/vulkan/lib/libvulkan.so* /usr/lib/x86_64-linux-gnu/
 # The Vulkan loader finds a driver by its manifest, and the host mounts the
