@@ -15,11 +15,89 @@
 
 use mp4_atom::{
     Blin, Cams, Cmfy, Co64, Ctts, CttsEntry, Dadj, Decode, Dinf, Dref, Encode, Eyes, FourCC, Ftyp,
-    Hdlr, Hero, Hfov, Hvc1, Hvcc, Lhvc, Mdat, Mdhd, Mdia, Minf, Moov, Mvhd, Stbl, Stco, Stri, Stsc,
-    StscEntry, Stsd, Stss, Stsz, StszSamples, Stts, SttsEntry, Tkhd, Trak, Url, Vexu, Visual, Vmhd,
+    Hdlr, Hero, Hfov, Hvc1, HvcCArray, Hvcc, Lhvc, Mdat, Mdhd, Mdia, Minf, Moov, Mvhd, Stbl, Stco,
+    Stri, Stsc, StscEntry, Stsd, Stss, Stsz, StszSamples, Stts, SttsEntry, Tkhd, Trak, Url, Vexu,
+    Visual, Vmhd,
 };
 
 use crate::Mp4Error;
+
+/// The two records of an MV-HEVC stream, from its parameter sets as an
+/// encoder emits them (NAL units without start codes): `hvcC` describes the
+/// base layer — the left eye — from its VPS, SPS and PPS; `lhvC` holds the
+/// second layer's SPS and PPS. Returned as the records' bodies.
+pub fn hevc_records(units: &[&[u8]]) -> Result<(Vec<u8>, Vec<u8>), Mp4Error> {
+    use std::io::Read;
+    let bad = |why: &str| Mp4Error::Atom(format!("parameter sets: {why}"));
+    // NAL header: forbidden(1) type(6) layer id(6) temporal id + 1(3).
+    let kind = |u: &[u8]| u.first().map(|b| (b >> 1) & 0x3f);
+    let layer = |u: &[u8]| match u {
+        [a, b, ..] => ((a & 1) << 5) | (b >> 3),
+        _ => 0,
+    };
+    let array = |nal_unit_type: u8, layer_id: u8| HvcCArray {
+        completeness: true,
+        nal_unit_type,
+        nalus: units
+            .iter()
+            .filter(|u| kind(u) == Some(nal_unit_type) && layer(u) == layer_id)
+            .map(|u| u.to_vec())
+            .collect(),
+    };
+    let sps = units
+        .iter()
+        .find(|u| kind(u) == Some(33) && layer(u) == 0)
+        .ok_or_else(|| bad("no SPS of the base layer"))?;
+    let parsed = scuffle_h265::SpsNALUnit::parse(*sps)
+        .map_err(|e| bad(&e.to_string()))?
+        .rbsp;
+    // The general profile, tier and level: twelve bytes of the RBSP after
+    // its first, as the record carries them.
+    let mut rbsp = Vec::new();
+    scuffle_bytes_util::EmulationPreventionIo::new(&sps[2..])
+        .read_to_end(&mut rbsp)
+        .map_err(|e| bad(&e.to_string()))?;
+    let ptl = rbsp.get(1..13).ok_or_else(|| bad("an SPS too short"))?;
+    let layers = parsed.sps_max_sub_layers_minus1 + 1;
+    let hvcc = Hvcc {
+        configuration_version: 1,
+        general_profile_space: ptl[0] >> 6,
+        general_tier_flag: ptl[0] & 0x20 != 0,
+        general_profile_idc: ptl[0] & 0x1f,
+        general_profile_compatibility_flags: [ptl[1], ptl[2], ptl[3], ptl[4]],
+        general_constraint_indicator_flags: [ptl[5], ptl[6], ptl[7], ptl[8], ptl[9], ptl[10]],
+        general_level_idc: ptl[11],
+        chroma_format_idc: parsed.chroma_format_idc,
+        bit_depth_luma_minus8: parsed.bit_depth_luma_minus8,
+        bit_depth_chroma_minus8: parsed.bit_depth_chroma_minus8,
+        num_temporal_layers: layers,
+        temporal_id_nested: parsed.sps_temporal_id_nesting_flag,
+        length_size_minus_one: 3,
+        arrays: vec![array(32, 0), array(33, 0), array(34, 0)],
+        ..Hvcc::new()
+    };
+    let second: Vec<HvcCArray> = [array(33, 1), array(34, 1)]
+        .into_iter()
+        .filter(|a| !a.nalus.is_empty())
+        .collect();
+    if second.is_empty() {
+        return Err(bad("no parameter set of the second layer: not MV-HEVC"));
+    }
+    let lhvc = Lhvc {
+        configuration_version: 1,
+        num_temporal_layers: layers,
+        temporal_id_nested: parsed.sps_temporal_id_nesting_flag,
+        length_size_minus_one: 3,
+        arrays: second,
+        ..Default::default()
+    };
+    let body = |atom: &dyn Fn(&mut Vec<u8>) -> mp4_atom::Result<()>| -> Result<Vec<u8>, Mp4Error> {
+        let mut out = Vec::new();
+        atom(&mut out).map_err(|e| Mp4Error::Atom(e.to_string()))?;
+        Ok(out[8..].to_vec())
+    };
+    Ok((body(&|b| hvcc.encode(b))?, body(&|b| lhvc.encode(b))?))
+}
 
 /// What a player is told of the eyes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -335,6 +413,88 @@ mod tests {
         assert_eq!(&file[at..at + 6], [0, 0, 0, 2, 0x26, 0x01]);
         assert_eq!(stbl.stss.as_ref().expect("stss").entries, [1]);
         assert!(stbl.ctts.is_none(), "nothing reordered, nothing said");
+    }
+
+    /// The records AVFoundation wrote, made again from the parameter sets
+    /// they hold: the same stream described the same way.
+    #[test]
+    fn records_are_made_again_from_the_parameter_sets_they_hold() {
+        const ENTRY: &[u8] = include_bytes!("../tests/spatial_hvc1.bin");
+        let apple = Hvc1::decode(&mut &ENTRY[..]).expect("an hvc1 entry");
+        let lhvc = apple.lhvc.clone().expect("lhvC");
+        let units: Vec<&[u8]> = apple
+            .hvcc
+            .arrays
+            .iter()
+            .chain(&lhvc.arrays)
+            .flat_map(|a| a.nalus.iter().map(Vec::as_slice))
+            .collect();
+        let (hvcc, made_lhvc) = hevc_records(&units).expect("records");
+        let hvcc = record::<Hvcc>(b"hvcC", &hvcc).expect("hvcC");
+        let made_lhvc = record::<Lhvc>(b"lhvC", &made_lhvc).expect("lhvC");
+        let a = &apple.hvcc;
+        assert_eq!(
+            (
+                hvcc.general_profile_space,
+                hvcc.general_tier_flag,
+                hvcc.general_profile_idc,
+                hvcc.general_level_idc
+            ),
+            (
+                a.general_profile_space,
+                a.general_tier_flag,
+                a.general_profile_idc,
+                a.general_level_idc
+            )
+        );
+        assert_eq!(
+            hvcc.general_profile_compatibility_flags,
+            a.general_profile_compatibility_flags
+        );
+        assert_eq!(
+            hvcc.general_constraint_indicator_flags,
+            a.general_constraint_indicator_flags
+        );
+        assert_eq!(
+            (
+                hvcc.chroma_format_idc,
+                hvcc.bit_depth_luma_minus8,
+                hvcc.bit_depth_chroma_minus8
+            ),
+            (
+                a.chroma_format_idc,
+                a.bit_depth_luma_minus8,
+                a.bit_depth_chroma_minus8
+            )
+        );
+        for t in [32u8, 33, 34] {
+            let of = |r: &Hvcc| {
+                r.arrays
+                    .iter()
+                    .filter(|x| x.nal_unit_type == t)
+                    .flat_map(|x| x.nalus.clone())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(of(&hvcc), of(a), "NAL type {t}");
+        }
+        let nalus = |l: &Lhvc| {
+            l.arrays
+                .iter()
+                .flat_map(|x| x.nalus.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            nalus(&made_lhvc),
+            nalus(&lhvc),
+            "the second layer's parameter sets"
+        );
+        let base: Vec<&[u8]> = apple
+            .hvcc
+            .arrays
+            .iter()
+            .flat_map(|a| a.nalus.iter().map(Vec::as_slice))
+            .collect();
+        assert!(hevc_records(&base).is_err(), "one layer is no MV-HEVC");
     }
 
     /// Frames decoded I P B, shown I B P: the first shown at zero, each

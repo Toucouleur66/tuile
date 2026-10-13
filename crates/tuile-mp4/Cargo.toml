@@ -12,6 +12,9 @@ mp4 = "0.14.0"
 # The boxes of a spatial (MV-HEVC) film, Apple's stereo boxes included:
 # lapoule-dev's fork, until they are released upstream.
 mp4-atom = { git = "https://github.com/lapoule-dev/mp4-atom", branch = "feat/stereo-video-boxes" }
+# The HEVC sequence parameter set, read to describe a stream in its record.
+scuffle-h265 = "0.2.2"
+scuffle-bytes-util = "0.1.3"
 thiserror = { workspace = true }
 
 [lints]
