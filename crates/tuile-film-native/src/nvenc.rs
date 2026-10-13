@@ -429,7 +429,12 @@ fn encode_eyes(
                     Err(e) if e.kind() == ErrorKind::EncoderBusy => {
                         std::thread::sleep(Duration::from_millis(2));
                     }
-                    Err(e) => return Err(told(e)),
+                    // Said before anything else: dropping a session whose
+                    // encode failed may end the process in the driver.
+                    Err(e) => {
+                        eprintln!("nvenc mv-hevc: view {view}: {e} ({:?})", e.kind());
+                        return Err(told(e));
+                    }
                 }
             }
         }
