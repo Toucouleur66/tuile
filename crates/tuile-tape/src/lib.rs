@@ -749,14 +749,22 @@ pub fn write_camera_channel<W: std::io::Write + std::io::Seek>(
     first: u64,
 ) -> Result<(), TapeError> {
     let schema = writer.add_schema(CAMERA_SCHEMA, "jsonschema", CAMERA_JSON_SCHEMA.as_bytes())?;
-    let channel = writer.add_channel(schema, CAMERA_TOPIC, "json", &std::collections::BTreeMap::new())?;
+    let channel = writer.add_channel(
+        schema,
+        CAMERA_TOPIC,
+        "json",
+        &std::collections::BTreeMap::new(),
+    )?;
     let mut started = first;
     let mut open: Option<Run> = None;
     for frame in frames {
         match &mut open {
             Some(run) if run.frame == *frame && run.hold < u32::MAX => run.hold += 1,
             _ => {
-                if let Some(finished) = open.replace(Run { frame: *frame, hold: 1 }) {
+                if let Some(finished) = open.replace(Run {
+                    frame: *frame,
+                    hold: 1,
+                }) {
                     write_camera(writer, channel, &finished, started)?;
                     started += u64::from(finished.hold);
                 }
@@ -925,11 +933,18 @@ mod tests {
         }
         tape.finish().expect("finish");
 
-        let mut writer =
-            mcap::Writer::new(BufWriter::new(File::create(&subject).expect("create"))).expect("writer");
-        let schema = writer.add_schema("other.Thing", "protobuf", b"descriptor").expect("schema");
+        let mut writer = mcap::Writer::new(BufWriter::new(File::create(&subject).expect("create")))
+            .expect("writer");
+        let schema = writer
+            .add_schema("other.Thing", "protobuf", b"descriptor")
+            .expect("schema");
         let channel = writer
-            .add_channel(schema, "/subject", "protobuf", &std::collections::BTreeMap::new())
+            .add_channel(
+                schema,
+                "/subject",
+                "protobuf",
+                &std::collections::BTreeMap::new(),
+            )
             .expect("channel");
         for n in 0..5u64 {
             writer
@@ -971,13 +986,19 @@ mod tests {
             assert_eq!(&message.data[..], &[n as u8, 0xfe]);
             assert_eq!(message.channel.message_encoding, "protobuf");
             let schema = message.channel.schema.as_ref().expect("schema");
-            assert_eq!((schema.name.as_str(), &schema.data[..]), ("other.Thing", &b"descriptor"[..]));
+            assert_eq!(
+                (schema.name.as_str(), &schema.data[..]),
+                ("other.Thing", &b"descriptor"[..])
+            );
         }
 
         // The same topic from two files is refused, not chosen between.
         let other = dir.path().join("camera-2.mcap");
         std::fs::copy(&camera, &other).expect("copy");
-        assert!(matches!(merge(&[&camera, &other], dir.path().join("no.mcap")), Err(TapeError::NotAPath(_))));
+        assert!(matches!(
+            merge(&[&camera, &other], dir.path().join("no.mcap")),
+            Err(TapeError::NotAPath(_))
+        ));
     }
 
     #[test]
@@ -989,18 +1010,36 @@ mod tests {
             up: [0.0, 1.0, 0.0],
             fovy: std::f64::consts::FRAC_PI_4,
         };
-        let moved = Frame { position: [1.0, 2.0, 3.000_000_000_000_001], ..still };
+        let moved = Frame {
+            position: [1.0, 2.0, 3.000_000_000_000_001],
+            ..still
+        };
         let path = [still, still, still, moved, still];
 
         let dir = tempfile::tempdir().expect("tempdir");
         let file = dir.path().join("shared.mcap");
-        let mut writer = mcap::Writer::new(BufWriter::new(File::create(&file).expect("create"))).expect("writer");
+        let mut writer = mcap::Writer::new(BufWriter::new(File::create(&file).expect("create")))
+            .expect("writer");
         write_camera_channel(&mut writer, &path, 0).expect("camera");
-        let schema = writer.add_schema("other.Thing", "jsonschema", b"{}").expect("schema");
-        let channel = writer.add_channel(schema, "/athlete", "json", &std::collections::BTreeMap::new()).expect("channel");
+        let schema = writer
+            .add_schema("other.Thing", "jsonschema", b"{}")
+            .expect("schema");
+        let channel = writer
+            .add_channel(
+                schema,
+                "/athlete",
+                "json",
+                &std::collections::BTreeMap::new(),
+            )
+            .expect("channel");
         writer
             .write_to_known_channel(
-                &mcap::records::MessageHeader { channel_id: channel, sequence: 0, log_time: 0, publish_time: 0 },
+                &mcap::records::MessageHeader {
+                    channel_id: channel,
+                    sequence: 0,
+                    log_time: 0,
+                    publish_time: 0,
+                },
                 br#"{"not":"a camera"}"#,
             )
             .expect("foreign message");

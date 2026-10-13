@@ -24,8 +24,14 @@ async fn three_tasks_make_one_film_in_frame_order() {
     let root = tempfile::tempdir().expect("tempdir");
     let make = tempfile::tempdir().expect("tempdir");
     // Small parts, so every segment goes through the ranged and multipart paths.
-    let store = ObjectRunStore::local(root.path(), Tuning { part_bytes: 8192, concurrency: 4 })
-        .expect("store");
+    let store = ObjectRunStore::local(
+        root.path(),
+        Tuning {
+            part_bytes: 8192,
+            concurrency: 4,
+        },
+    )
+    .expect("store");
     let run = RunKeys::new("renders/film", "e1");
 
     // Task t renders frames and owns segments t*4 .. t*4+3; only some of
@@ -41,7 +47,10 @@ async fn three_tasks_make_one_film_in_frame_order() {
         for (g, frames) in segs.iter() {
             let local = make.path().join(format!("seg{g}.mp4"));
             segment(&local, *frames, *g as u8);
-            store.put(&local, &run.segment(*g)).await.expect("put segment");
+            store
+                .put(&local, &run.segment(*g))
+                .await
+                .expect("put segment");
         }
         let receipt = Receipt {
             task: *task,
@@ -51,12 +60,20 @@ async fn three_tasks_make_one_film_in_frame_order() {
         };
         let body = make.path().join(format!("r{task}.json"));
         std::fs::write(&body, serde_json::to_vec(&receipt).expect("json")).expect("write");
-        store.put(&body, &run.receipt(*task)).await.expect("put receipt");
+        store
+            .put(&body, &run.receipt(*task))
+            .await
+            .expect("put receipt");
 
         let work = make.path().join(format!("work{task}"));
-        let outcome = assemble(&store, &run, 3, &work, Some(60.0)).await.expect("assemble");
+        let outcome = assemble(&store, &run, 3, &work, Some(60.0))
+            .await
+            .expect("assemble");
         if i > 0 {
-            assert!(matches!(outcome, Outcome::Waiting { .. }), "assembled early: {outcome:?}");
+            assert!(
+                matches!(outcome, Outcome::Waiting { .. }),
+                "assembled early: {outcome:?}"
+            );
         } else {
             assert!(
                 matches!(outcome, Outcome::Assembled { frames: 50, .. }),
@@ -80,11 +97,21 @@ async fn a_short_segment_fails_the_frame_count() {
     let local = make.path().join("seg0.mp4");
     segment(&local, 12, 0);
     store.put(&local, &run.segment(0)).await.expect("put");
-    let receipt = Receipt { task: 0, first: 1, last: 20, segments: vec![0] };
+    let receipt = Receipt {
+        task: 0,
+        first: 1,
+        last: 20,
+        segments: vec![0],
+    };
     let body = make.path().join("r.json");
     std::fs::write(&body, serde_json::to_vec(&receipt).expect("json")).expect("write");
     store.put(&body, &run.receipt(0)).await.expect("put");
-    let err = assemble(&store, &run, 1, &make.path().join("w"), None).await.expect_err("must refuse");
+    let err = assemble(&store, &run, 1, &make.path().join("w"), None)
+        .await
+        .expect_err("must refuse");
     assert!(err.to_string().contains("12 frames"), "{err}");
-    assert!(!store.exists(&run.film()).await.expect("exists"), "a short film was uploaded");
+    assert!(
+        !store.exists(&run.film()).await.expect("exists"),
+        "a short film was uploaded"
+    );
 }

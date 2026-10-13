@@ -66,7 +66,11 @@ fn tile_type(s: &str) -> Result<TileType, StoreError> {
         "avif" => TileType::Avif,
         "mvt" => TileType::Mvt,
         "other" => TileType::Unknown,
-        other => return Err(StoreError::Corrupt(format!("catalog: unknown tile type {other}"))),
+        other => {
+            return Err(StoreError::Corrupt(format!(
+                "catalog: unknown tile type {other}"
+            )))
+        }
     })
 }
 
@@ -76,7 +80,11 @@ fn compression(s: &str) -> Result<Compression, StoreError> {
         "gzip" => Compression::Gzip,
         "brotli" => Compression::Brotli,
         "zstd" => Compression::Zstd,
-        other => return Err(StoreError::Corrupt(format!("catalog: unknown compression {other}"))),
+        other => {
+            return Err(StoreError::Corrupt(format!(
+                "catalog: unknown compression {other}"
+            )))
+        }
     })
 }
 
@@ -88,7 +96,9 @@ impl LayerDef {
             tile_type: tile_type(&self.tile_type)?,
             tile_compression: compression(&self.tile_compression)?,
             zone_level: self.zone_level,
-            expiry: self.expiry_days.map(|d| Duration::from_secs(d * SECONDS_PER_DAY)),
+            expiry: self
+                .expiry_days
+                .map(|d| Duration::from_secs(d * SECONDS_PER_DAY)),
             content_type: self.content_type.clone(),
         })
     }
@@ -110,7 +120,10 @@ pub fn layers(catalog: &Catalog) -> Result<Vec<Layer>, StoreError> {
     let mut out = Vec::new();
     for def in &catalog.layers {
         if def.name.ends_with(ABSENT_SUFFIX) {
-            return Err(StoreError::Corrupt(format!("catalog: {} uses a reserved suffix", def.name)));
+            return Err(StoreError::Corrupt(format!(
+                "catalog: {} uses a reserved suffix",
+                def.name
+            )));
         }
         let layer = def.to_layer()?;
         out.push(absence_of(&layer));
@@ -129,8 +142,11 @@ pub async fn read(store: &dyn ObjectStore) -> Result<Catalog, StoreError> {
 /// Writes a bucket's catalog. Replaces the whole list: layers are few and
 /// created by hand.
 pub async fn write(store: &dyn ObjectStore, catalog: &Catalog) -> Result<(), StoreError> {
-    let body = serde_json::to_vec_pretty(catalog).map_err(|e| StoreError::Corrupt(e.to_string()))?;
-    store.put(&Path::from(CATALOG_KEY), PutPayload::from(body)).await?;
+    let body =
+        serde_json::to_vec_pretty(catalog).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+    store
+        .put(&Path::from(CATALOG_KEY), PutPayload::from(body))
+        .await?;
     Ok(())
 }
 

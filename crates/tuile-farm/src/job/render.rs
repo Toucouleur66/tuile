@@ -18,7 +18,9 @@ use super::plan::Plan;
 
 /// Blender's progress chatter, kept out of the job's log.
 pub fn is_chatter(line: &str) -> bool {
-    ["Fra:", "Saved:", "Time:", "Append frame"].iter().any(|p| line.starts_with(p))
+    ["Fra:", "Saved:", "Time:", "Append frame"]
+        .iter()
+        .any(|p| line.starts_with(p))
 }
 
 /// A stderr line worth raising to the job's log while the task runs: the
@@ -26,13 +28,19 @@ pub fn is_chatter(line: &str) -> bool {
 /// count made on the live logs concluded "zero errors" over a trace that
 /// held a hundred and ninety.
 pub fn is_error(line: &str) -> bool {
-    ["ERROR", "Error", "error:", "Could not", "FATAL", "Warning:"].iter().any(|p| line.contains(p))
+    ["ERROR", "Error", "error:", "Could not", "FATAL", "Warning:"]
+        .iter()
+        .any(|p| line.contains(p))
 }
 
 /// Variables no render process needs, and which it could leak into a trace:
 /// the job's own credentials.
-pub const WITHHELD: &[&str] =
-    &["TUILE_STORE_ACCESS_KEY_ID", "TUILE_STORE_SECRET_ACCESS_KEY", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"];
+pub const WITHHELD: &[&str] = &[
+    "TUILE_STORE_ACCESS_KEY_ID",
+    "TUILE_STORE_SECRET_ACCESS_KEY",
+    "R2_ACCESS_KEY_ID",
+    "R2_SECRET_ACCESS_KEY",
+];
 
 /// The command line of process `i` (after the program itself).
 pub fn blender_args(c: &Config, stage: &Path, i: usize, (a, b): (u64, u64)) -> Vec<String> {
@@ -73,9 +81,17 @@ fn seed_cache(seed: &Path, own: &Path) {
     if !seed.is_dir() || own.exists() {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(seed) else { return };
-    let foyers: Vec<PathBuf> =
-        entries.flatten().map(|e| e.path()).filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("foyer-"))).collect();
+    let Ok(entries) = std::fs::read_dir(seed) else {
+        return;
+    };
+    let foyers: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("foyer-"))
+        })
+        .collect();
     if foyers.is_empty() {
         return;
     }
@@ -163,11 +179,17 @@ pub async fn render_all(
         let trace = outdir.join(format!("trace-s{i}.jsonl"));
         let out_task = tokio::spawn(async move {
             let Some(stdout) = stdout else { return };
-            let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&per_proc).ok();
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&per_proc)
+                .ok();
             let mut lines = BufReader::new(stdout);
             let mut buf = Vec::new();
             while matches!(lines.read_until(b'\n', &mut buf).await, Ok(n) if n > 0) {
-                let line = String::from_utf8_lossy(&buf).trim_end_matches(['\n', '\r']).to_string();
+                let line = String::from_utf8_lossy(&buf)
+                    .trim_end_matches(['\n', '\r'])
+                    .to_string();
                 buf.clear();
                 if is_chatter(&line) {
                     continue;
@@ -188,7 +210,9 @@ pub async fn render_all(
                 if let Some(f) = file.as_mut() {
                     let _ = f.write_all(&buf);
                 }
-                let line = String::from_utf8_lossy(&buf).trim_end_matches(['\n', '\r']).to_string();
+                let line = String::from_utf8_lossy(&buf)
+                    .trim_end_matches(['\n', '\r'])
+                    .to_string();
                 buf.clear();
                 if is_error(&line) {
                     err_log.line(format!("{err_tag}{line}"));
@@ -208,7 +232,10 @@ pub async fn render_all(
         let _ = err_task.await;
         let code = status.ok().and_then(|s| s.code());
         if code != Some(0) {
-            log.line(format!("RENDER-EXIT j{i} {}", code.map_or("signal".to_string(), |c| c.to_string())));
+            log.line(format!(
+                "RENDER-EXIT j{i} {}",
+                code.map_or("signal".to_string(), |c| c.to_string())
+            ));
         }
         codes.push(code);
     }
@@ -257,7 +284,10 @@ mod tests {
         std::fs::write(seed.path().join("other"), b"x").expect("test");
         let own = seed.path().join("r0");
         seed_cache(seed.path(), &own);
-        assert_eq!(std::fs::read(own.join("foyer-0/blocks/a")).expect("test"), b"A");
+        assert_eq!(
+            std::fs::read(own.join("foyer-0/blocks/a")).expect("test"),
+            b"A"
+        );
         assert!(!own.join("other").exists());
     }
 }

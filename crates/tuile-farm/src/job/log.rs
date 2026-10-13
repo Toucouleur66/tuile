@@ -26,12 +26,16 @@ impl Log {
         if let Err(e) = &file {
             println!("JOB-LOG-UNAVAILABLE {}: {e}", path.display());
         }
-        Log { file: Arc::new(Mutex::new(file.ok())) }
+        Log {
+            file: Arc::new(Mutex::new(file.ok())),
+        }
     }
 
     /// A log that writes nowhere but stdout.
     pub fn stdout_only() -> Log {
-        Log { file: Arc::new(Mutex::new(None)) }
+        Log {
+            file: Arc::new(Mutex::new(None)),
+        }
     }
 
     pub fn line(&self, s: impl AsRef<str>) {
@@ -75,7 +79,10 @@ mod tests {
         log.line("frame 1: start");
         log.line("VIDEO-MISSING");
         // Read while the log is still alive: nothing waits in a buffer.
-        assert_eq!(std::fs::read_to_string(&path).expect("test"), "frame 1: start\nVIDEO-MISSING\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("test"),
+            "frame 1: start\nVIDEO-MISSING\n"
+        );
     }
 
     #[test]

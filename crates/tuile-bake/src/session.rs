@@ -1399,7 +1399,15 @@ fn finish_tile_from(
     bake_max_size: u32,
     provenance: Option<&tuile_planetary::Provenance>,
 ) -> TileGeometry {
-    finish_tile_as(memo, dataset, tile, decoded, bake_max_size, provenance, Finish::Pictures)
+    finish_tile_as(
+        memo,
+        dataset,
+        tile,
+        decoded,
+        bake_max_size,
+        provenance,
+        Finish::Pictures,
+    )
 }
 
 /// A tile as the session keeps it, finished as `finish` says.
@@ -2328,7 +2336,11 @@ pub(crate) mod tests {
                     center: DVec3::new((x as f64 + 0.5) * side, (y as f64 + 0.5) * side, 0.0),
                     radius: side * std::f64::consts::FRAC_1_SQRT_2,
                 }),
-                geometric_error: if level + 1 >= QUAD_LEVELS { 0.0 } else { side / 4.0 },
+                geometric_error: if level + 1 >= QUAD_LEVELS {
+                    0.0
+                } else {
+                    side / 4.0
+                },
                 refine: tuile_core::tileset::Refine::Replace,
                 has_content: true,
             }
@@ -2350,15 +2362,17 @@ pub(crate) mod tests {
             let mut content = draped_content();
             content.meshes[0].positions[1] = [id.0 as f32, 1.0, 0.0];
             let layer = &mut content.imagery[0];
-            layer.coord = tuile_core::raster::ImageryCoord {
-                level,
-                x,
-                y,
-            };
+            layer.coord = tuile_core::raster::ImageryCoord { level, x, y };
             layer.texture = Arc::new(DecodedTexture {
                 width: 2,
                 height: 2,
-                rgba8: [(id.0 % 251) as u8, (id.0 / 251) as u8, level as u8 * 40, 255].repeat(4),
+                rgba8: [
+                    (id.0 % 251) as u8,
+                    (id.0 / 251) as u8,
+                    level as u8 * 40,
+                    255,
+                ]
+                .repeat(4),
             });
             Ok(tuile_core::source::Loaded::Content(content))
         }
@@ -2443,7 +2457,9 @@ pub(crate) mod tests {
         let frames = poses
             .into_iter()
             .map(|(x, y, height)| {
-                let frame = session.frame(vec![quad_view(x, y, height)]).expect("a frame");
+                let frame = session
+                    .frame(vec![quad_view(x, y, height)])
+                    .expect("a frame");
                 let mut tiles: Vec<(u64, u64)> =
                     frame.tiles.iter().map(|t| (t.tile.0, t.drape())).collect();
                 tiles.sort_unstable();
@@ -2466,7 +2482,9 @@ pub(crate) mod tests {
                 let bytes: Vec<u8> = tiles
                     .iter()
                     .flat_map(|(id, drape, mesh, png)| {
-                        [id, drape, mesh, png].into_iter().flat_map(|v| v.to_le_bytes())
+                        [id, drape, mesh, png]
+                            .into_iter()
+                            .flat_map(|v| v.to_le_bytes())
                     })
                     .collect();
                 (tiles.len(), fnv(&bytes))
@@ -2492,19 +2510,37 @@ pub(crate) mod tests {
         let named = |flight: &[(Frame, Vec<(u64, u64)>)]| -> Vec<Vec<(u64, u64)>> {
             flight.iter().map(|(_, tiles)| tiles.clone()).collect()
         };
-        assert_eq!(named(&identity), named(&pictures), "the same tiles, the same drapes");
-        assert!(named(&identity).iter().flatten().all(|(_, drape)| *drape != 0));
+        assert_eq!(
+            named(&identity),
+            named(&pictures),
+            "the same tiles, the same drapes"
+        );
+        assert!(named(&identity)
+            .iter()
+            .flatten()
+            .all(|(_, drape)| *drape != 0));
         for (frame, _) in &identity {
             for (index, tile) in frame.tiles.iter().enumerate() {
-                assert!(tile.memoized.is_none(), "tile {}: a picture was encoded", tile.tile.0);
+                assert!(
+                    tile.memoized.is_none(),
+                    "tile {}: a picture was encoded",
+                    tile.tile.0
+                );
                 assert!(tile.content.textures.is_empty() && tile.content.imagery.is_empty());
-                assert!(tile.content.meshes.is_empty(), "tile {}: a mesh was kept", tile.tile.0);
+                assert!(
+                    tile.content.meshes.is_empty(),
+                    "tile {}: a mesh was kept",
+                    tile.tile.0
+                );
                 assert!(frame.texture_png(index, 0).expect("asked").is_none());
             }
         }
         // And with pictures, every tile still has its own.
         for (frame, _) in &pictures {
-            assert!(frame.tiles.iter().all(|t| t.memoized.is_some() && !t.content.meshes.is_empty()));
+            assert!(frame
+                .tiles
+                .iter()
+                .all(|t| t.memoized.is_some() && !t.content.meshes.is_empty()));
         }
     }
 
@@ -2525,7 +2561,15 @@ pub(crate) mod tests {
         noted.fetched_imagery(draped_content().imagery[0].coord, b"imagery bytes");
         let memo = TextureMemo::default();
         let finished = |finish| {
-            finish_tile_as(&memo, "t", tile, draped_content(), 256, Some(&noted), finish)
+            finish_tile_as(
+                &memo,
+                "t",
+                tile,
+                draped_content(),
+                256,
+                Some(&noted),
+                finish,
+            )
         };
         let (with, without) = (finished(Finish::Pictures), finished(Finish::Identity));
         assert!(with.refs.is_some(), "a reference");

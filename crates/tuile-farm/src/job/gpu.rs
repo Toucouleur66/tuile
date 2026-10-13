@@ -20,7 +20,8 @@ pub fn on_path(bin: &str) -> bool {
     if bin.contains('/') {
         return Path::new(bin).is_file();
     }
-    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
+    std::env::var_os("PATH")
+        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
 }
 
 /// Runs a command and returns its stdout and stderr together, as `2>&1` did;
@@ -56,7 +57,9 @@ pub fn gpu_counts(proc_dir: &Path, dev_dir: &Path) -> (usize, usize) {
             .filter(|e| {
                 let n = e.file_name();
                 let n = n.to_string_lossy();
-                n.strip_prefix("nvidia").is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+                n.strip_prefix("nvidia").is_some_and(|rest| {
+                    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
+                })
             })
             .count()
     });
@@ -101,7 +104,10 @@ print('BACKENDS', ' '.join(why))
 
 /// `(BACKENDS line, devices, backend)` from the probe's output.
 pub fn parse_probe(out: &str) -> (Option<String>, u32, String) {
-    let backends = out.lines().find(|l| l.starts_with("BACKENDS ")).map(str::to_string);
+    let backends = out
+        .lines()
+        .find(|l| l.starts_with("BACKENDS "))
+        .map(str::to_string);
     let found = out.lines().find_map(|l| {
         let mut w = l.split_whitespace();
         match (w.next(), w.next(), w.next()) {
@@ -115,12 +121,22 @@ pub fn parse_probe(out: &str) -> (Option<String>, u32, String) {
 
 /// The GPU count and the backend to hand Cycles. Storm draws through GL and
 /// never calls CUDA: for it the cards are counted.
-pub async fn probe(blender: &str, engine: &str, delegate: &str, backends: &[String], log: &Log) -> (u32, String) {
+pub async fn probe(
+    blender: &str,
+    engine: &str,
+    delegate: &str,
+    backends: &[String],
+    log: &Log,
+) -> (u32, String) {
     if engine == "hydra" && delegate == "storm" {
-        let n = capture("nvidia-smi", &["-L"]).await.map_or(0, |s| s.lines().filter(|l| l.starts_with("GPU")).count());
+        let n = capture("nvidia-smi", &["-L"])
+            .await
+            .map_or(0, |s| s.lines().filter(|l| l.starts_with("GPU")).count());
         return (n as u32, "none".into());
     }
-    let out = capture(blender, &["-b", "--python-expr", &probe_script(backends)]).await.unwrap_or_default();
+    let out = capture(blender, &["-b", "--python-expr", &probe_script(backends)])
+        .await
+        .unwrap_or_default();
     let (line, n, backend) = parse_probe(&out);
     if let Some(l) = line {
         log.line(l);
@@ -132,7 +148,10 @@ pub async fn probe(blender: &str, engine: &str, delegate: &str, backends: &[Stri
 /// build side and the driver side fail identically from outside.
 pub async fn bail_diagnostics(blender: &str, log: &Log) {
     log.line("--- what the driver sees ---");
-    for args in [&["-L"][..], &["--query-gpu=name,driver_version", "--format=csv,noheader"][..]] {
+    for args in [
+        &["-L"][..],
+        &["--query-gpu=name,driver_version", "--format=csv,noheader"][..],
+    ] {
         match capture("nvidia-smi", args).await {
             Some(s) => s.lines().take(8).for_each(|l| log.line(l)),
             None => log.line("nvidia-smi absent"),
@@ -142,19 +161,35 @@ pub async fn bail_diagnostics(blender: &str, log: &Log) {
     let libs = capture("ldconfig", &["-p"]).await.unwrap_or_default();
     let found: Vec<&str> = libs
         .lines()
-        .filter(|l| ["libcuda.so", "libnvoptix", "libnvidia-ml"].iter().any(|n| l.contains(n)))
+        .filter(|l| {
+            ["libcuda.so", "libnvoptix", "libnvidia-ml"]
+                .iter()
+                .any(|n| l.contains(n))
+        })
         .take(6)
         .collect();
     if found.is_empty() {
         log.line("  none");
     }
-    found.iter().for_each(|l| log.line(format!("  {}", l.trim())));
-    for v in ["NVIDIA_VISIBLE_DEVICES", "NVIDIA_DRIVER_CAPABILITIES", "CUDA_VISIBLE_DEVICES"] {
-        log.line(format!("  {v}={}", std::env::var(v).unwrap_or_else(|_| "<unset>".into())));
+    found
+        .iter()
+        .for_each(|l| log.line(format!("  {}", l.trim())));
+    for v in [
+        "NVIDIA_VISIBLE_DEVICES",
+        "NVIDIA_DRIVER_CAPABILITIES",
+        "CUDA_VISIBLE_DEVICES",
+    ] {
+        log.line(format!(
+            "  {v}={}",
+            std::env::var(v).unwrap_or_else(|_| "<unset>".into())
+        ));
     }
     log.line("--- device nodes ---");
     let nodes: Vec<String> = std::fs::read_dir("/dev").map_or(Vec::new(), |d| {
-        d.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with("nvidia")).collect()
+        d.flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("nvidia"))
+            .collect()
     });
     log.line(format!("  {}", nodes.join(" ")));
     log.line("--- cuInit, with its number ---");
@@ -173,8 +208,12 @@ else:
         rc2 = lib.cuDeviceGetCount(ctypes.byref(n))
         print(f'{label}: cuInit={rc} cuDeviceGetCount={rc2} devices={n.value}')
 ";
-    let out = capture(blender, &["-b", "--python-expr", cuinit]).await.unwrap_or_default();
-    out.lines().filter(|l| l.contains("cuInit=") || l.contains("will not load")).for_each(|l| log.line(format!("  {l}")));
+    let out = capture(blender, &["-b", "--python-expr", cuinit])
+        .await
+        .unwrap_or_default();
+    out.lines()
+        .filter(|l| l.contains("cuInit=") || l.contains("will not load"))
+        .for_each(|l| log.line(format!("  {l}")));
     log.line("--- what Cycles says when asked to explain itself ---");
     let devices = "
 import bpy
@@ -187,11 +226,15 @@ for b in ('OPTIX', 'CUDA'):
     p.get_devices()
     print('DEVICES', b, [(d.type, d.name) for d in p.devices])
 ";
-    let out = capture(blender, &["-b", "--debug-cycles", "--python-expr", devices]).await.unwrap_or_default();
+    let out = capture(blender, &["-b", "--debug-cycles", "--python-expr", devices])
+        .await
+        .unwrap_or_default();
     out.lines()
         .filter(|l| {
             let l = l.to_lowercase();
-            ["devices", "cuda", "optix", "device"].iter().any(|k| l.contains(k))
+            ["devices", "cuda", "optix", "device"]
+                .iter()
+                .any(|k| l.contains(k))
         })
         .take(20)
         .for_each(|l| log.line(l));
@@ -234,9 +277,16 @@ impl Sampler {
         let task = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(every_s.max(1))).await;
-                let args = ["--query-gpu=index,utilization.gpu,memory.used", "--format=csv,noheader,nounits"];
-                let Some(csv) = capture("nvidia-smi", &args).await else { break };
-                let Some((busy, line)) = gpu_use_line(&csv, expected) else { break };
+                let args = [
+                    "--query-gpu=index,utilization.gpu,memory.used",
+                    "--format=csv,noheader,nounits",
+                ];
+                let Some(csv) = capture("nvidia-smi", &args).await else {
+                    break;
+                };
+                let Some((busy, line)) = gpu_use_line(&csv, expected) else {
+                    break;
+                };
                 log.line(line);
                 p.fetch_max(busy, Ordering::Relaxed);
                 s.store(1, Ordering::Relaxed);
@@ -256,10 +306,16 @@ mod tests {
 
     #[test]
     fn the_probe_prefers_in_order_and_says_what_it_found() {
-        assert_eq!(backends_tuple(&["OPTIX".into(), "CUDA".into()]), "('OPTIX','CUDA',)");
+        assert_eq!(
+            backends_tuple(&["OPTIX".into(), "CUDA".into()]),
+            "('OPTIX','CUDA',)"
+        );
         assert!(probe_script(&["CUDA".into()]).contains("for backend in ('CUDA',):"));
         let out = "Blender 5.2\nNGPU 1 OPTIX\nBACKENDS OPTIX:1\n";
-        assert_eq!(parse_probe(out), (Some("BACKENDS OPTIX:1".into()), 1, "OPTIX".into()));
+        assert_eq!(
+            parse_probe(out),
+            (Some("BACKENDS OPTIX:1".into()), 1, "OPTIX".into())
+        );
         assert_eq!(parse_probe("crash").1, 0);
         assert_eq!(parse_probe("NGPU 0 none\n").2, "none");
     }
@@ -274,7 +330,11 @@ mod tests {
         for n in ["nvidia0", "nvidiactl", "nvidia-uvm"] {
             std::fs::write(dev_dir.path().join(n), "").expect("test");
         }
-        assert_eq!(gpu_counts(proc_dir.path(), dev_dir.path()), (2, 1), "nvidiactl and nvidia-uvm are not cards");
+        assert_eq!(
+            gpu_counts(proc_dir.path(), dev_dir.path()),
+            (2, 1),
+            "nvidiactl and nvidia-uvm are not cards"
+        );
     }
 
     #[test]

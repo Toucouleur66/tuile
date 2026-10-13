@@ -37,7 +37,13 @@ pub trait Ledger: Send + Sync {
     async fn writing(&self, layer: &str, zone: Zone, key: &str) -> Result<(), String>;
     /// `manifest` was published for `layer`'s `zone`, and `due` is when the
     /// zone next has something to be done.
-    async fn published(&self, layer: &str, zone: Zone, manifest: &Manifest, due: &Due) -> Result<(), String>;
+    async fn published(
+        &self,
+        layer: &str,
+        zone: Zone,
+        manifest: &Manifest,
+        due: &Due,
+    ) -> Result<(), String>;
     /// `keys`, archives of `layer`'s `zone`, were deleted.
     async fn deleted(&self, layer: &str, zone: Zone, keys: &[String]) -> Result<(), String>;
 }

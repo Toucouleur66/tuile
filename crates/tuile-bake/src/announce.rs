@@ -177,7 +177,10 @@ mod tests {
         assert_eq!(heard.len(), 2);
         assert_eq!(heard[0].frames, (1, ANNOUNCE_EVERY));
         assert_eq!(
-            (heard[0].terrain_layer.as_str(), heard[0].imagery_layer.as_str()),
+            (
+                heard[0].terrain_layer.as_str(),
+                heard[0].imagery_layer.as_str()
+            ),
             ("asset-1", "asset-2")
         );
         assert_eq!(heard[0].terrain, [(12, 1, 2)]);

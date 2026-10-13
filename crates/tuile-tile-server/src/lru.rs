@@ -28,7 +28,13 @@ pub struct Lru<K, V> {
 
 impl<K: Eq + Hash + Clone, V: Clone> Lru<K, V> {
     pub fn new(budget: u64) -> Self {
-        Self { budget, weight: 0, tick: 0, map: HashMap::new(), order: BTreeMap::new() }
+        Self {
+            budget,
+            weight: 0,
+            tick: 0,
+            map: HashMap::new(),
+            order: BTreeMap::new(),
+        }
     }
 
     fn bump(&mut self) -> u64 {
@@ -71,9 +77,18 @@ impl<K: Eq + Hash + Clone, V: Clone> Lru<K, V> {
         let tick = self.bump();
         self.weight += weight;
         self.order.insert(tick, key.clone());
-        self.map.insert(key, Slot { value, weight, tick });
+        self.map.insert(
+            key,
+            Slot {
+                value,
+                weight,
+                tick,
+            },
+        );
         while self.weight > self.budget {
-            let Some((_, oldest)) = self.order.pop_first() else { break };
+            let Some((_, oldest)) = self.order.pop_first() else {
+                break;
+            };
             if let Some(slot) = self.map.remove(&oldest) {
                 self.weight -= slot.weight;
                 evicted.push((oldest, slot.value));

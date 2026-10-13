@@ -31,14 +31,20 @@ fn bucket() -> Arc<dyn ObjectStore> {
     };
     let s3 = AmazonS3Builder::new()
         .with_bucket_name(var("TUILE_CENSUS_BUCKET"))
-        .with_endpoint(format!("https://{}.r2.cloudflarestorage.com", var("CLOUDFLARE_ACCOUNT_ID")))
+        .with_endpoint(format!(
+            "https://{}.r2.cloudflarestorage.com",
+            var("CLOUDFLARE_ACCOUNT_ID")
+        ))
         .with_region("auto")
         .with_access_key_id(var("R2_ACCESS_KEY_ID"))
         .with_secret_access_key(var("R2_SECRET_ACCESS_KEY"))
         .build()
         .expect("bucket client");
     let s3: Arc<dyn ObjectStore> = Arc::new(s3);
-    match std::env::var("TUILE_CENSUS_PREFIX").ok().filter(|p| !p.is_empty()) {
+    match std::env::var("TUILE_CENSUS_PREFIX")
+        .ok()
+        .filter(|p| !p.is_empty())
+    {
         Some(prefix) => Arc::new(PrefixStore::new(s3, prefix)),
         None => s3,
     }
@@ -47,10 +53,13 @@ fn bucket() -> Arc<dyn ObjectStore> {
 #[tokio::main]
 async fn main() {
     let only = std::env::args().nth(1);
-    let store = TileStore::open(bucket(), Default::default()).await.expect("opening the store");
+    let store = TileStore::open(bucket(), Default::default())
+        .await
+        .expect("opening the store");
     let mut zones = store.zones().await.expect("listing the zones");
     zones.sort();
-    let mut by_layer: std::collections::BTreeMap<String, (usize, Census)> = std::collections::BTreeMap::new();
+    let mut by_layer: std::collections::BTreeMap<String, (usize, Census)> =
+        std::collections::BTreeMap::new();
     let mut worst: Vec<(u64, String, Census)> = Vec::new();
     for (layer, zone) in zones {
         if only.as_deref().is_some_and(|l| l != layer) {
@@ -67,13 +76,26 @@ async fn main() {
             worst.push((c.repeated, format!("{layer} {zone:?}"), c));
         }
     }
-    println!("{:<24} {:>7} {:>9} {:>11} {:>11} {:>10} {:>7}", "layer", "zones", "archives", "tiles", "copies", "repeated", "share");
+    println!(
+        "{:<24} {:>7} {:>9} {:>11} {:>11} {:>10} {:>7}",
+        "layer", "zones", "archives", "tiles", "copies", "repeated", "share"
+    );
     for (layer, (n, c)) in &by_layer {
-        let share = if c.tiles == 0 { 0.0 } else { 100.0 * c.repeated as f64 / c.tiles as f64 };
-        println!("{layer:<24} {n:>7} {:>9} {:>11} {:>11} {:>10} {share:>6.1}%", c.archives, c.tiles, c.copies, c.repeated);
+        let share = if c.tiles == 0 {
+            0.0
+        } else {
+            100.0 * c.repeated as f64 / c.tiles as f64
+        };
+        println!(
+            "{layer:<24} {n:>7} {:>9} {:>11} {:>11} {:>10} {share:>6.1}%",
+            c.archives, c.tiles, c.copies, c.repeated
+        );
     }
     worst.sort_by_key(|w| std::cmp::Reverse(w.0));
     for (_, zone, c) in worst.iter().take(10) {
-        println!("  {zone}: {} of {} tiles held more than once, in {} archives", c.repeated, c.tiles, c.archives);
+        println!(
+            "  {zone}: {} of {} tiles held more than once, in {} archives",
+            c.repeated, c.tiles, c.archives
+        );
     }
 }

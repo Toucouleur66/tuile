@@ -30,7 +30,10 @@ pub struct TemplateUpstream<F> {
 
 impl<F: TileFetcher> TemplateUpstream<F> {
     pub fn new(template: impl Into<String>, fetcher: F) -> Self {
-        Self { template: template.into(), fetcher }
+        Self {
+            template: template.into(),
+            fetcher,
+        }
     }
 
     pub fn url(&self, level: u8, x: u32, y: u32) -> Result<Url, UpstreamError> {
@@ -50,7 +53,11 @@ impl<F: TileFetcher> Upstream for TemplateUpstream<F> {
         match self.fetcher.fetch(&url).await {
             Ok(bytes) if bytes.is_empty() => Ok(None),
             Ok(bytes) => Ok(Some(bytes)),
-            Err(FetchError::NotFound(_)) | Err(FetchError::Status { status: HTTP_NOT_FOUND, .. }) => Ok(None),
+            Err(FetchError::NotFound(_))
+            | Err(FetchError::Status {
+                status: HTTP_NOT_FOUND,
+                ..
+            }) => Ok(None),
             Err(e) => Err(UpstreamError(e.to_string())),
         }
     }

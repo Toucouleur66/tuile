@@ -75,11 +75,15 @@ pub struct Versioned {
 }
 
 pub(crate) fn now_secs(now: SystemTime) -> u64 {
-    now.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    now.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 pub(crate) fn now_ms(now: SystemTime) -> u64 {
-    now.duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    now.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 pub(crate) fn manifest_path(zone_prefix: &str) -> Path {
@@ -90,13 +94,22 @@ pub(crate) fn manifest_path(zone_prefix: &str) -> Path {
 pub async fn read(store: &dyn ObjectStore, zone_prefix: &str) -> Result<Versioned, StoreError> {
     match store.get(&manifest_path(zone_prefix)).await {
         Ok(got) => {
-            let version = UpdateVersion { e_tag: got.meta.e_tag.clone(), version: got.meta.version.clone() };
+            let version = UpdateVersion {
+                e_tag: got.meta.e_tag.clone(),
+                version: got.meta.version.clone(),
+            };
             let bytes = got.bytes().await?;
             let manifest = serde_json::from_slice(&bytes)
                 .map_err(|e| StoreError::Corrupt(format!("{zone_prefix}/manifest.json: {e}")))?;
-            Ok(Versioned { manifest, version: Some(version) })
+            Ok(Versioned {
+                manifest,
+                version: Some(version),
+            })
         }
-        Err(object_store::Error::NotFound { .. }) => Ok(Versioned { manifest: Manifest::default(), version: None }),
+        Err(object_store::Error::NotFound { .. }) => Ok(Versioned {
+            manifest: Manifest::default(),
+            version: None,
+        }),
         Err(e) => Err(e.into()),
     }
 }
@@ -114,10 +127,21 @@ pub async fn replace(
         Some(v) => PutMode::Update(v.clone()),
         None => PutMode::Create,
     };
-    let opts = PutOptions { mode, ..Default::default() };
-    match store.put_opts(&manifest_path(zone_prefix), PutPayload::from(Bytes::from(body)), opts).await {
+    let opts = PutOptions {
+        mode,
+        ..Default::default()
+    };
+    match store
+        .put_opts(
+            &manifest_path(zone_prefix),
+            PutPayload::from(Bytes::from(body)),
+            opts,
+        )
+        .await
+    {
         Ok(_) => Ok(true),
-        Err(object_store::Error::Precondition { .. }) | Err(object_store::Error::AlreadyExists { .. }) => Ok(false),
+        Err(object_store::Error::Precondition { .. })
+        | Err(object_store::Error::AlreadyExists { .. }) => Ok(false),
         Err(e) => Err(e.into()),
     }
 }

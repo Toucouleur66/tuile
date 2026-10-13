@@ -16,7 +16,10 @@ use bytes::Bytes;
 use futures_util::TryStreamExt;
 use object_store::path::Path;
 use object_store::ObjectStore;
-use pmtiles::{AsyncPmTilesReader, HashMapCache, MmapBackend, ObjectStoreBackend, PmTilesWriter, TileCoord, TileId};
+use pmtiles::{
+    AsyncPmTilesReader, HashMapCache, MmapBackend, ObjectStoreBackend, PmTilesWriter, TileCoord,
+    TileId,
+};
 use serde_json::json;
 
 use crate::layer::Layer;
@@ -55,7 +58,9 @@ where
     })
     .to_string();
 
-    let mut builder = PmTilesWriter::new(layer.tile_type).tile_compression(layer.tile_compression).metadata(&metadata);
+    let mut builder = PmTilesWriter::new(layer.tile_type)
+        .tile_compression(layer.tile_compression)
+        .metadata(&metadata);
     if let Some((min, max)) = zooms {
         builder = builder.min_zoom(min).max_zoom(max).center_zoom(min);
     }
@@ -66,7 +71,9 @@ where
         let (id, bytes) = tile?;
         if let Some(prev) = last {
             if id <= prev {
-                return Err(StoreError::Corrupt(format!("tile ids out of order: {id} after {prev}")));
+                return Err(StoreError::Corrupt(format!(
+                    "tile ids out of order: {id} after {prev}"
+                )));
             }
         }
         last = Some(id);
@@ -81,9 +88,12 @@ where
 
 /// The lowest and highest archive zoom of a set of tile ids.
 pub fn zoom_range<'a>(ids: impl IntoIterator<Item = &'a u64>) -> Option<(u8, u8)> {
-    ids.into_iter().filter_map(|id| TileId::new(*id).ok()).map(|t| TileCoord::from(t).z()).fold(None, |acc, z| {
-        Some(acc.map_or((z, z), |(lo, hi): (u8, u8)| (lo.min(z), hi.max(z))))
-    })
+    ids.into_iter()
+        .filter_map(|id| TileId::new(*id).ok())
+        .map(|t| TileCoord::from(t).z())
+        .fold(None, |acc, z| {
+            Some(acc.map_or((z, z), |(lo, hi): (u8, u8)| (lo.min(z), hi.max(z))))
+        })
 }
 
 /// Header layout, from the v3 specification: 127 bytes, little-endian u64
@@ -101,7 +111,10 @@ const U64_LEN: usize = 8;
 /// produces. Nothing else in the file moves.
 fn fix_empty_leaf_offset(path: &FsPath) -> Result<(), StoreError> {
     use std::io::{Read, Seek, SeekFrom, Write};
-    let mut f = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
     let mut header = [0u8; HEADER_LEN];
     f.read_exact(&mut header)?;
     let field = |at: usize| {
@@ -118,7 +131,10 @@ fn fix_empty_leaf_offset(path: &FsPath) -> Result<(), StoreError> {
 }
 
 /// Opens an archive in the object store.
-pub async fn open_remote(store: Arc<dyn ObjectStore>, key: &str) -> Result<RemoteReader, StoreError> {
+pub async fn open_remote(
+    store: Arc<dyn ObjectStore>,
+    key: &str,
+) -> Result<RemoteReader, StoreError> {
     let backend = ObjectStoreBackend::new(Box::new(store), Path::from(key));
     Ok(AsyncPmTilesReader::try_from_cached_source(backend, HashMapCache::default()).await?)
 }

@@ -52,8 +52,11 @@ pub use layer::{Layer, Zone, DURABLE_EPOCH};
 pub use ledger::Ledger;
 pub use peers::{Announce, Claim, Emitted, FreshTiles, SharedTile, SharedTiles};
 pub use pmtiles::{Compression, TileType};
-pub use service::{etag_of, LayerMeta, ServiceConfig, ServiceError, ServiceStats, Source, TileResponse, TileService};
 pub use projection::{Eye, Footprint, ProjectionReport};
+pub use service::{
+    etag_of, LayerMeta, ServiceConfig, ServiceError, ServiceStats, Source, TileResponse,
+    TileService,
+};
 pub use store::{Census, Clock, Compaction, Fresh, Scrub, StatsSnapshot, StoreConfig, TileStore};
 pub use tiering::Tiering;
 pub use upstream::{TemplateUpstream, Upstream, UpstreamError};

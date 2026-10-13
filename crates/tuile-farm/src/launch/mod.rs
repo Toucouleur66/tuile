@@ -92,8 +92,12 @@ impl CommonArgs {
         self.env
             .iter()
             .map(|pair| match pair.split_once('=') {
-                Some((k, v)) if !k.is_empty() && !v.is_empty() => Ok((k.to_string(), v.to_string())),
-                _ => Err(LaunchError::Refused(format!("--env wants K=V, got: {pair}"))),
+                Some((k, v)) if !k.is_empty() && !v.is_empty() => {
+                    Ok((k.to_string(), v.to_string()))
+                }
+                _ => Err(LaunchError::Refused(format!(
+                    "--env wants K=V, got: {pair}"
+                ))),
             })
             .collect()
     }
@@ -102,13 +106,22 @@ impl CommonArgs {
     /// The defaults that differ by product are passed in.
     pub fn render_env(&self, samples_default: u32, batch_default: u32) -> Vec<(String, String)> {
         let mut env = vec![
-            ("JOB_SAMPLES".into(), self.samples.unwrap_or(samples_default).to_string()),
-            ("JOB_THRESHOLD".into(), fmt_float(self.threshold.unwrap_or(0.05))),
+            (
+                "JOB_SAMPLES".into(),
+                self.samples.unwrap_or(samples_default).to_string(),
+            ),
+            (
+                "JOB_THRESHOLD".into(),
+                fmt_float(self.threshold.unwrap_or(0.05)),
+            ),
             // One task is one GPU, by the service's contract; the job's probe
             // must agree or it bails without rendering a CPU frame.
             ("JOB_GPUS".into(), "1".into()),
             ("JOB_PROCS_PER_GPU".into(), self.procs_per_gpu.to_string()),
-            ("JOB_BATCH_FRAMES".into(), self.batch_frames.unwrap_or(batch_default).to_string()),
+            (
+                "JOB_BATCH_FRAMES".into(),
+                self.batch_frames.unwrap_or(batch_default).to_string(),
+            ),
             ("JOB_EXTRA_ARGS".into(), self.extra.clone()),
             ("JOB_BLENDER_ARGS".into(), self.blender_args.clone()),
         ];
@@ -158,7 +171,11 @@ pub const SECRET_KEYS: [&str; 5] = [
 pub fn redacted(env: &[(String, String)]) -> serde_json::Map<String, serde_json::Value> {
     env.iter()
         .map(|(k, v)| {
-            let v = if SECRET_KEYS.contains(&k.as_str()) { "<redacted>".to_string() } else { v.clone() };
+            let v = if SECRET_KEYS.contains(&k.as_str()) {
+                "<redacted>".to_string()
+            } else {
+                v.clone()
+            };
             (k.clone(), serde_json::Value::String(v))
         })
         .collect()
@@ -175,8 +192,16 @@ impl Farm {
     pub async fn read_text(&self, key: &str) -> Result<Option<String>> {
         // `list` works by directory: the object is found in its parent's listing.
         let parent = key.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
-        match self.store.list(parent).await?.into_iter().find(|e| e.key == key) {
-            Some(e) => Ok(Some(String::from_utf8_lossy(&self.store.get_range(key, 0..e.size).await?).to_string())),
+        match self
+            .store
+            .list(parent)
+            .await?
+            .into_iter()
+            .find(|e| e.key == key)
+        {
+            Some(e) => Ok(Some(
+                String::from_utf8_lossy(&self.store.get_range(key, 0..e.size).await?).to_string(),
+            )),
             None => Ok(None),
         }
     }
@@ -184,23 +209,33 @@ impl Farm {
     /// A small JSON document, written to `key`.
     pub async fn put_json(&self, key: &str, value: &serde_json::Value) -> Result<()> {
         use std::io::Write as _;
-        let mut file = tempfile::NamedTempFile::new().map_err(|e| LaunchError::Refused(e.to_string()))?;
-        file.write_all(serde_json::to_string_pretty(value).unwrap_or_default().as_bytes())
-            .map_err(|e| LaunchError::Refused(e.to_string()))?;
+        let mut file =
+            tempfile::NamedTempFile::new().map_err(|e| LaunchError::Refused(e.to_string()))?;
+        file.write_all(
+            serde_json::to_string_pretty(value)
+                .unwrap_or_default()
+                .as_bytes(),
+        )
+        .map_err(|e| LaunchError::Refused(e.to_string()))?;
         self.store.put(file.path(), key).await?;
         Ok(())
     }
 
     /// Starts the execution. `None` for a validated dry run.
     pub async fn start(&self, launch: &Launch, dry_run: bool) -> Result<Option<String>> {
-        let name = self.jobs.run(&launch.job, &launch.env, launch.tasks, dry_run).await?;
+        let name = self
+            .jobs
+            .run(&launch.job, &launch.env, launch.tasks, dry_run)
+            .await?;
         match &name {
             Some(n) => println!(
                 "execution: {}  {} task(s)",
                 n.rsplit('/').next().unwrap_or(n),
                 launch.tasks
             ),
-            None => println!("validateOnly: the request is accepted; nothing ran and nothing is billed."),
+            None => println!(
+                "validateOnly: the request is accepted; nothing ran and nothing is billed."
+            ),
         }
         Ok(name)
     }
@@ -298,7 +333,10 @@ mod tests {
 
     #[test]
     fn a_malformed_env_pair_is_refused() {
-        let args = CommonArgs { env: vec!["NOVALUE".into()], ..Default::default() };
+        let args = CommonArgs {
+            env: vec!["NOVALUE".into()],
+            ..Default::default()
+        };
         assert!(args.extra_env().is_err());
     }
 }

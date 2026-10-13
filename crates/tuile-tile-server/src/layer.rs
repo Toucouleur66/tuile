@@ -62,7 +62,10 @@ impl Layer {
             return Ok(Zone::Top);
         }
         let shift = level - self.zone_level;
-        Ok(Zone::Cell { x: x >> shift, y: y >> shift })
+        Ok(Zone::Cell {
+            x: x >> shift,
+            y: y >> shift,
+        })
     }
 
     /// The key prefix of a zone: `bing-aerial/zones/z10/522/373`.
@@ -95,9 +98,15 @@ impl Layer {
     /// Is every tile of `epoch` past its expiry at `now`? Measured from the
     /// end of the epoch, so no tile is dropped before its full lifetime.
     pub fn is_expired(&self, epoch: &str, now: SystemTime) -> bool {
-        let Some(expiry) = self.expiry else { return false };
-        let Some(end) = epoch_end(epoch) else { return false };
-        now.duration_since(end).map(|age| age > expiry).unwrap_or(false)
+        let Some(expiry) = self.expiry else {
+            return false;
+        };
+        let Some(end) = epoch_end(epoch) else {
+            return false;
+        };
+        now.duration_since(end)
+            .map(|age| age > expiry)
+            .unwrap_or(false)
     }
 }
 
@@ -113,7 +122,13 @@ fn epoch_end(epoch: &str) -> Option<SystemTime> {
     }
     let year: i32 = epoch.get(..YEAR_DIGITS)?.parse().ok()?;
     let month: u32 = epoch.get(YEAR_DIGITS..)?.parse().ok()?;
-    let (ny, nm) = if month == DECEMBER { (year + 1, 1) } else { (year, month + 1) };
-    let next = NaiveDate::from_ymd_opt(ny, nm, 1)?.and_hms_opt(0, 0, 0)?.and_utc();
+    let (ny, nm) = if month == DECEMBER {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    let next = NaiveDate::from_ymd_opt(ny, nm, 1)?
+        .and_hms_opt(0, 0, 0)?
+        .and_utc();
     Some(next.into())
 }

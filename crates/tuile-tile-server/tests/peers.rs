@@ -19,8 +19,8 @@ use tuile_tile_server::catalog::layers;
 use tuile_tile_server::disk::DiskCacheConfig;
 use tuile_tile_server::peers::InMemory;
 use tuile_tile_server::{
-    Claim, ServiceConfig, SharedTile, SharedTiles, Source, StoreConfig, TileService, TileStore, Upstream,
-    UpstreamError,
+    Claim, ServiceConfig, SharedTile, SharedTiles, Source, StoreConfig, TileService, TileStore,
+    Upstream, UpstreamError,
 };
 
 /// A source that takes its time, has every tile except those with `x == 0`,
@@ -39,12 +39,19 @@ impl Upstream for Slow {
 }
 
 fn source() -> Arc<Slow> {
-    Arc::new(Slow { calls: AtomicUsize::new(0) })
+    Arc::new(Slow {
+        calls: AtomicUsize::new(0),
+    })
 }
 
 /// A store of its own over the bucket every instance shares.
 fn store(objects: &Arc<dyn ObjectStore>, clock: &TestClock, cfg: StoreConfig) -> TileStore {
-    TileStore::with_clock(objects.clone(), layers(&catalog()).expect("layers"), cfg, clock.clock())
+    TileStore::with_clock(
+        objects.clone(),
+        layers(&catalog()).expect("layers"),
+        cfg,
+        clock.clock(),
+    )
 }
 
 /// An instance: its own store and its own memory, the source and the shared
@@ -66,7 +73,10 @@ fn instance(
 }
 
 fn quick() -> ServiceConfig {
-    ServiceConfig { shared_poll: Duration::from_millis(5), ..ServiceConfig::default() }
+    ServiceConfig {
+        shared_poll: Duration::from_millis(5),
+        ..ServiceConfig::default()
+    }
 }
 
 #[tokio::test]
@@ -76,21 +86,46 @@ async fn an_instance_serves_what_another_has_fetched_and_not_yet_flushed() {
     let a = instance(&objects, &clock, &source, Some(shared.clone()), quick());
     let b = instance(&objects, &clock, &source, Some(shared), quick());
 
-    let first = a.tile(IMAGERY, LEVEL, X0, Y0).await.expect("tile").expect("present");
+    let first = a
+        .tile(IMAGERY, LEVEL, X0, Y0)
+        .await
+        .expect("tile")
+        .expect("present");
     assert_eq!((first.source, first.hit), (Source::Upstream, false));
     // The tile is in A's buffer, not in the bucket: B's store has nothing.
-    assert_eq!(b.store().get(IMAGERY, LEVEL, X0, Y0).await.expect("get"), None);
+    assert_eq!(
+        b.store().get(IMAGERY, LEVEL, X0, Y0).await.expect("get"),
+        None
+    );
 
-    let second = b.tile(IMAGERY, LEVEL, X0, Y0).await.expect("tile").expect("present");
+    let second = b
+        .tile(IMAGERY, LEVEL, X0, Y0)
+        .await
+        .expect("tile")
+        .expect("present");
     assert_eq!((second.source, second.hit), (Source::Shared, true));
     assert_eq!(second.bytes, first.bytes);
     assert_eq!(second.etag, first.etag);
-    assert_eq!(source.calls.load(Ordering::SeqCst), 1, "the source was asked once, by A");
+    assert_eq!(
+        source.calls.load(Ordering::SeqCst),
+        1,
+        "the source was asked once, by A"
+    );
     assert_eq!(b.stats().shared, 1);
     // B does not write it: publishing it is A's, who fetched it.
-    assert_eq!(b.store().get(IMAGERY, LEVEL, X0, Y0).await.expect("get"), None);
+    assert_eq!(
+        b.store().get(IMAGERY, LEVEL, X0, Y0).await.expect("get"),
+        None
+    );
     // And B's next answer is from its own memory.
-    assert_eq!(b.tile(IMAGERY, LEVEL, X0, Y0).await.expect("tile").expect("present").source, Source::Memory);
+    assert_eq!(
+        b.tile(IMAGERY, LEVEL, X0, Y0)
+            .await
+            .expect("tile")
+            .expect("present")
+            .source,
+        Source::Memory
+    );
 }
 
 #[tokio::test]
@@ -102,12 +137,23 @@ async fn two_instances_asked_at_once_ask_the_source_once() {
 
     let (x, y) = in_zone(3);
     let (from_a, from_b) = tokio::join!(a.tile(IMAGERY, LEVEL, x, y), b.tile(IMAGERY, LEVEL, x, y));
-    let (from_a, from_b) = (from_a.expect("tile").expect("present"), from_b.expect("tile").expect("present"));
-    assert_eq!(source.calls.load(Ordering::SeqCst), 1, "one fetch for the two of them");
+    let (from_a, from_b) = (
+        from_a.expect("tile").expect("present"),
+        from_b.expect("tile").expect("present"),
+    );
+    assert_eq!(
+        source.calls.load(Ordering::SeqCst),
+        1,
+        "one fetch for the two of them"
+    );
     assert_eq!(from_a.bytes, from_b.bytes);
     let mut sources = [from_a.source, from_b.source];
     sources.sort_by_key(|s| s.as_str());
-    assert_eq!(sources, [Source::Shared, Source::Upstream], "one fetched, the other waited for it");
+    assert_eq!(
+        sources,
+        [Source::Shared, Source::Upstream],
+        "one fetched, the other waited for it"
+    );
 }
 
 #[tokio::test]
@@ -115,16 +161,30 @@ async fn a_claim_never_given_back_does_not_stop_the_others_for_long() {
     let (clock, objects, source) = (TestClock::new(), memory(), source());
     let shared = Arc::new(InMemory::default());
     // An instance claimed the tile and died before fetching it.
-    assert!(matches!(shared.claim(IMAGERY, LEVEL, X0, Y0).await, Claim::Mine(_)));
+    assert!(matches!(
+        shared.claim(IMAGERY, LEVEL, X0, Y0).await,
+        Claim::Mine(_)
+    ));
     assert_eq!(shared.claim(IMAGERY, LEVEL, X0, Y0).await, Claim::Theirs);
 
     let wait = Duration::from_millis(150);
-    let cfg = ServiceConfig { shared_wait: wait, ..quick() };
+    let cfg = ServiceConfig {
+        shared_wait: wait,
+        ..quick()
+    };
     let b = instance(&objects, &clock, &source, Some(shared), cfg);
     let started = Instant::now();
-    let tile = b.tile(IMAGERY, LEVEL, X0, Y0).await.expect("tile").expect("present");
+    let tile = b
+        .tile(IMAGERY, LEVEL, X0, Y0)
+        .await
+        .expect("tile")
+        .expect("present");
     let took = started.elapsed();
-    assert_eq!(tile.source, Source::Upstream, "it went and fetched the tile itself");
+    assert_eq!(
+        tile.source,
+        Source::Upstream,
+        "it went and fetched the tile itself"
+    );
     assert!(took >= wait, "it waited for the other first: {took:?}");
     assert!(took < Duration::from_secs(2), "and not for ever: {took:?}");
     assert_eq!(source.calls.load(Ordering::SeqCst), 1);
@@ -149,20 +209,44 @@ impl SharedTiles for Unreachable {
 #[tokio::test]
 async fn with_nothing_shared_reachable_an_instance_is_as_one_that_shares_nothing() {
     let (clock, objects, source) = (TestClock::new(), memory(), source());
-    let a = instance(&objects, &clock, &source, Some(Arc::new(Unreachable)), quick());
+    let a = instance(
+        &objects,
+        &clock,
+        &source,
+        Some(Arc::new(Unreachable)),
+        quick(),
+    );
     let b = instance(&objects, &clock, &source, None, quick());
 
     let started = Instant::now();
     for service in [&a, &b] {
-        let tile = service.tile(IMAGERY, LEVEL, X0, Y0).await.expect("tile").expect("present");
+        let tile = service
+            .tile(IMAGERY, LEVEL, X0, Y0)
+            .await
+            .expect("tile")
+            .expect("present");
         assert_eq!((tile.source, tile.hit), (Source::Upstream, false));
         assert_eq!(tile.bytes, body(LEVEL, X0, Y0, 0));
         assert_eq!(service.stats().shared, 0);
     }
-    assert_eq!(source.calls.load(Ordering::SeqCst), 2, "each asked the source, as two instances always did");
-    assert!(started.elapsed() < Duration::from_secs(1), "and neither waited on what cannot be reached");
+    assert_eq!(
+        source.calls.load(Ordering::SeqCst),
+        2,
+        "each asked the source, as two instances always did"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "and neither waited on what cannot be reached"
+    );
     // A tile each holds is served from its own store, as ever.
-    assert_eq!(a.tile(IMAGERY, LEVEL, X0, Y0).await.expect("tile").expect("present").source, Source::Memory);
+    assert_eq!(
+        a.tile(IMAGERY, LEVEL, X0, Y0)
+            .await
+            .expect("tile")
+            .expect("present")
+            .source,
+        Source::Memory
+    );
 }
 
 #[tokio::test]
@@ -174,7 +258,11 @@ async fn a_tile_the_source_does_not_have_is_shared_as_a_tile_is() {
 
     assert!(a.tile(IMAGERY, LEVEL, 0, Y0).await.expect("tile").is_none());
     assert!(b.tile(IMAGERY, LEVEL, 0, Y0).await.expect("tile").is_none());
-    assert_eq!(source.calls.load(Ordering::SeqCst), 1, "the hole was asked for once");
+    assert_eq!(
+        source.calls.load(Ordering::SeqCst),
+        1,
+        "the hole was asked for once"
+    );
     assert_eq!(b.stats().shared, 1);
 }
 
@@ -182,7 +270,11 @@ async fn a_tile_the_source_does_not_have_is_shared_as_a_tile_is() {
 async fn a_publication_that_is_announced_is_seen_at_once_and_one_that_is_not_waits() {
     let (clock, objects) = (TestClock::new(), memory());
     // Readers that trust a manifest for an hour.
-    let trusting = StoreConfig { manifest_ttl: Duration::from_secs(3600), manifest_max_stale: Duration::ZERO, ..eager() };
+    let trusting = StoreConfig {
+        manifest_ttl: Duration::from_secs(3600),
+        manifest_max_stale: Duration::ZERO,
+        ..eager()
+    };
     let bus = Arc::new(InMemory::default());
     let told = Arc::new(store(&objects, &clock, trusting.clone()));
     let untold = Arc::new(store(&objects, &clock, trusting));
@@ -194,12 +286,22 @@ async fn a_publication_that_is_announced_is_seen_at_once_and_one_that_is_not_wai
 
     // Another instance publishes a tile of it, and says so.
     let writer = store(&objects, &clock, eager()).with_announcer(bus.clone());
-    writer.put(IMAGERY, LEVEL, X0, Y0, body(LEVEL, X0, Y0, 1)).await.expect("put");
+    writer
+        .put(IMAGERY, LEVEL, X0, Y0, body(LEVEL, X0, Y0, 1))
+        .await
+        .expect("put");
     writer.flush_all().await.expect("flush");
     assert_eq!(bus.announced(), 1);
 
-    assert_eq!(told.get(IMAGERY, LEVEL, X0, Y0).await.expect("get"), Some(body(LEVEL, X0, Y0, 1)));
-    assert_eq!(untold.get(IMAGERY, LEVEL, X0, Y0).await.expect("get"), None, "still trusting what it read");
+    assert_eq!(
+        told.get(IMAGERY, LEVEL, X0, Y0).await.expect("get"),
+        Some(body(LEVEL, X0, Y0, 1))
+    );
+    assert_eq!(
+        untold.get(IMAGERY, LEVEL, X0, Y0).await.expect("get"),
+        None,
+        "still trusting what it read"
+    );
 }
 
 #[tokio::test]
@@ -207,7 +309,10 @@ async fn the_claim_is_given_back_once_the_tile_is_fetched() {
     let (clock, objects, source) = (TestClock::new(), memory(), source());
     let shared = Arc::new(InMemory::default());
     let a = instance(&objects, &clock, &source, Some(shared.clone()), quick());
-    a.tile(IMAGERY, LEVEL, X0, Y0).await.expect("tile").expect("present");
+    a.tile(IMAGERY, LEVEL, X0, Y0)
+        .await
+        .expect("tile")
+        .expect("present");
     assert!(
         matches!(shared.claim(IMAGERY, LEVEL, X0, Y0).await, Claim::Mine(_)),
         "nothing is left claimed behind a fetch"
@@ -237,32 +342,61 @@ async fn a_compaction_pass_elsewhere_is_heard_and_its_merged_archives_leave_the_
     let writer = store(&objects, &clock, eager());
     for i in 0..fanout {
         let (x, y) = in_zone(i);
-        writer.put(IMAGERY, LEVEL, x, y, body(LEVEL, x, y, 1)).await.expect("put");
+        writer
+            .put(IMAGERY, LEVEL, x, y, body(LEVEL, x, y, 1))
+            .await
+            .expect("put");
         writer.flush_all().await.expect("flush");
     }
 
     // A server that trusts a manifest for an hour, with the zone on its disk.
-    let trusting = StoreConfig { manifest_ttl: Duration::from_secs(3600), manifest_max_stale: Duration::ZERO, ..eager() };
+    let trusting = StoreConfig {
+        manifest_ttl: Duration::from_secs(3600),
+        manifest_max_stale: Duration::ZERO,
+        ..eager()
+    };
     let dir = tempfile::tempdir().expect("dir");
-    let server =
-        Arc::new(store(&objects, &clock, trusting).with_disk_cache(DiskCacheConfig::new(dir.path())).await.expect("disk"));
+    let server = Arc::new(
+        store(&objects, &clock, trusting)
+            .with_disk_cache(DiskCacheConfig::new(dir.path()))
+            .await
+            .expect("disk"),
+    );
     let bus = Arc::new(InMemory::default());
     bus.listen(&server);
-    assert_eq!(server.get(IMAGERY, LEVEL, X0, Y0).await.expect("get"), Some(body(LEVEL, X0, Y0, 1)));
+    assert_eq!(
+        server.get(IMAGERY, LEVEL, X0, Y0).await.expect("get"),
+        Some(body(LEVEL, X0, Y0, 1))
+    );
     server.settle().await;
     assert_eq!(archives_on_disk(dir.path()), fanout as usize);
 
     // The pass of another process, on the bucket alone, saying what it did.
     let job = store(&objects, &clock, eager()).with_announcer(bus.clone());
     let done = job.compact_due().await.expect("compact_due");
-    assert!(done.iter().any(|(_, _, c)| matches!(c, tuile_tile_server::Compaction::Merged { .. })), "{done:?}");
+    assert!(
+        done.iter()
+            .any(|(_, _, c)| matches!(c, tuile_tile_server::Compaction::Merged { .. })),
+        "{done:?}"
+    );
     assert!(bus.announced() >= 1);
 
     // The server reads the zone as it now is, at once, and keeps only that.
     let before = server.stats();
     let (x, y) = in_zone(1);
-    assert_eq!(server.get(IMAGERY, LEVEL, x, y).await.expect("get"), Some(body(LEVEL, x, y, 1)));
+    assert_eq!(
+        server.get(IMAGERY, LEVEL, x, y).await.expect("get"),
+        Some(body(LEVEL, x, y, 1))
+    );
     server.settle().await;
-    assert_eq!(archives_on_disk(dir.path()), 1, "the merged archive, and none of what it replaced");
-    assert_eq!(server.stats().disk, before.disk + 1, "read from the copy of the merged archive");
+    assert_eq!(
+        archives_on_disk(dir.path()),
+        1,
+        "the merged archive, and none of what it replaced"
+    );
+    assert_eq!(
+        server.stats().disk,
+        before.disk + 1,
+        "read from the copy of the merged archive"
+    );
 }

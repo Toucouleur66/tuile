@@ -93,7 +93,10 @@ fn flight(a: (f64, f64), b: (f64, f64), r: i64) -> Vec<Tile> {
             let (cx, cy) = tile_of(lon, lat, z);
             for dy in -r..=r {
                 for dx in -r..=r {
-                    push((z, (i64::from(cx) + dx) as u32, (i64::from(cy) + dy) as u32), &mut out);
+                    push(
+                        (z, (i64::from(cx) + dx) as u32, (i64::from(cy) + dy) as u32),
+                        &mut out,
+                    );
                 }
             }
         }
@@ -110,7 +113,8 @@ struct Simulated {
 impl Upstream for Simulated {
     async fn fetch(&self, level: u8, x: u32, y: u32) -> Result<Option<Bytes>, UpstreamError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        let jitter = (u64::from(x) * 31 + u64::from(y) * 17 + u64::from(level)) % UPSTREAM_JITTER_MS;
+        let jitter =
+            (u64::from(x) * 31 + u64::from(y) * 17 + u64::from(level)) % UPSTREAM_JITTER_MS;
         tokio::time::sleep(Duration::from_millis(UPSTREAM_MS + jitter)).await;
         Ok(Some(Bytes::from(format!("simulated {level}/{x}/{y}"))))
     }
@@ -127,7 +131,9 @@ impl std::fmt::Display for ReadOnly {
 }
 
 fn refused() -> object_store::Error {
-    object_store::Error::NotSupported { source: "the benchmark is read-only".into() }
+    object_store::Error::NotSupported {
+        source: "the benchmark is read-only".into(),
+    }
 }
 
 type OsStream<T> = futures_util::stream::BoxStream<'static, object_store::Result<T>>;
@@ -149,10 +155,18 @@ impl ObjectStore for ReadOnly {
     ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
         Err(refused())
     }
-    async fn get_opts(&self, location: &Path, options: object_store::GetOptions) -> object_store::Result<object_store::GetResult> {
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
         self.0.get_opts(location, options).await
     }
-    async fn get_ranges(&self, location: &Path, ranges: &[std::ops::Range<u64>]) -> object_store::Result<Vec<Bytes>> {
+    async fn get_ranges(
+        &self,
+        location: &Path,
+        ranges: &[std::ops::Range<u64>],
+    ) -> object_store::Result<Vec<Bytes>> {
         self.0.get_ranges(location, ranges).await
     }
     fn delete_stream(&self, locations: OsStream<Path>) -> OsStream<Path> {
@@ -161,13 +175,25 @@ impl ObjectStore for ReadOnly {
     fn list(&self, prefix: Option<&Path>) -> OsStream<object_store::ObjectMeta> {
         self.0.list(prefix)
     }
-    fn list_with_offset(&self, prefix: Option<&Path>, offset: &Path) -> OsStream<object_store::ObjectMeta> {
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> OsStream<object_store::ObjectMeta> {
         self.0.list_with_offset(prefix, offset)
     }
-    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<object_store::ListResult> {
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> object_store::Result<object_store::ListResult> {
         self.0.list_with_delimiter(prefix).await
     }
-    async fn copy_opts(&self, _: &Path, _: &Path, _: object_store::CopyOptions) -> object_store::Result<()> {
+    async fn copy_opts(
+        &self,
+        _: &Path,
+        _: &Path,
+        _: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
         Err(refused())
     }
 }
@@ -181,7 +207,10 @@ fn bucket() -> Arc<dyn ObjectStore> {
     };
     let s3 = AmazonS3Builder::new()
         .with_bucket_name(var("TUILE_BENCH_BUCKET"))
-        .with_endpoint(format!("https://{}.r2.cloudflarestorage.com", var("CLOUDFLARE_ACCOUNT_ID")))
+        .with_endpoint(format!(
+            "https://{}.r2.cloudflarestorage.com",
+            var("CLOUDFLARE_ACCOUNT_ID")
+        ))
         .with_region("auto")
         .with_access_key_id(var("R2_ACCESS_KEY_ID"))
         .with_secret_access_key(var("R2_SECRET_ACCESS_KEY"))
@@ -201,8 +230,14 @@ fn read_only_config() -> StoreConfig {
 }
 
 // BEGIN-SERVICE (the one part that differs before and after)
-async fn service(objects: Arc<dyn ObjectStore>, disk: &std::path::Path, up: Arc<Simulated>) -> TileService {
-    let store = TileStore::open(objects, read_only_config()).await.expect("open");
+async fn service(
+    objects: Arc<dyn ObjectStore>,
+    disk: &std::path::Path,
+    up: Arc<Simulated>,
+) -> TileService {
+    let store = TileStore::open(objects, read_only_config())
+        .await
+        .expect("open");
     let mut ups: HashMap<String, Arc<dyn Upstream>> = HashMap::new();
     ups.insert(LAYER.into(), up);
     // TUILE_BENCH_NO_DISK: memory only, to tell the disk cache's share.
@@ -211,7 +246,10 @@ async fn service(objects: Arc<dyn ObjectStore>, disk: &std::path::Path, up: Arc<
     }
     let mut disk_cfg = tuile_tile_server::DiskCacheConfig::new(disk);
     disk_cfg.prefetch_neighbours = std::env::var("TUILE_BENCH_NEIGHBOURS").is_ok();
-    if let Some(b) = std::env::var("TUILE_BENCH_AWAIT_COPY_BYTES").ok().and_then(|v| v.parse().ok()) {
+    if let Some(b) = std::env::var("TUILE_BENCH_AWAIT_COPY_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
         disk_cfg.await_copy_bytes = b;
     }
     let store = store.with_disk_cache(disk_cfg).await.expect("disk cache");
@@ -219,7 +257,12 @@ async fn service(objects: Arc<dyn ObjectStore>, disk: &std::path::Path, up: Arc<
 }
 
 fn describe(svc: &TileService) -> String {
-    format!("{:?} {:?} disk={}MB", svc.stats(), svc.store().stats(), svc.store().disk_bytes() >> 20)
+    format!(
+        "{:?} {:?} disk={}MB",
+        svc.stats(),
+        svc.store().stats(),
+        svc.store().disk_bytes() >> 20
+    )
 }
 
 async fn settle(svc: &TileService) {
@@ -233,7 +276,8 @@ fn row(name: &str, lat: &mut [Duration], upstream: u64, wall: Duration) {
         return;
     }
     lat.sort();
-    let q = |p: f64| lat[((lat.len() as f64 * p) as usize).min(lat.len() - 1)].as_secs_f64() * 1000.0;
+    let q =
+        |p: f64| lat[((lat.len() as f64 * p) as usize).min(lat.len() - 1)].as_secs_f64() * 1000.0;
     println!(
         "| {name} | {} | {:.1} | {:.1} | {:.1} | {:.1} | {} | {:.1} s |",
         lat.len(),
@@ -291,10 +335,17 @@ async fn stored(objects: Arc<dyn ObjectStore>, tiles: &[Tile]) -> HashSet<Tile> 
     }
     let mut out = HashSet::new();
     for prefix in prefixes {
-        let Ok(m) = tuile_tile_server::manifest::read(objects.as_ref(), &prefix).await else { continue };
+        let Ok(m) = tuile_tile_server::manifest::read(objects.as_ref(), &prefix).await else {
+            continue;
+        };
         for a in &m.manifest.archives {
-            let Ok(r) = tuile_tile_server::archive::open_remote(objects.clone(), &a.key).await else { continue };
-            let Ok(ids) = tuile_tile_server::archive::ids(Arc::new(r)).await else { continue };
+            let Ok(r) = tuile_tile_server::archive::open_remote(objects.clone(), &a.key).await
+            else {
+                continue;
+            };
+            let Ok(ids) = tuile_tile_server::archive::ids(Arc::new(r)).await else {
+                continue;
+            };
             for id in ids {
                 if let Ok(t) = pmtiles::TileId::new(id) {
                     let c = pmtiles::TileCoord::from(t);
@@ -320,14 +371,21 @@ async fn main() {
         .unwrap_or_else(|_| std::env::temp_dir().join("tuile-flight-bench"));
     let _ = std::fs::remove_dir_all(&root);
     let objects = bucket();
-    println!("flight A: {} tiles, flight B: {} tiles, stored-only S: {} tiles", a.len(), b.len(), s.len());
+    println!(
+        "flight A: {} tiles, flight B: {} tiles, stored-only S: {} tiles",
+        a.len(),
+        b.len(),
+        s.len()
+    );
     println!("| scenario | requests | p50 ms | p95 ms | p99 ms | max ms | upstream | wall |");
     println!("|---|---|---|---|---|---|---|---|");
 
     // S: hits only, on its own disk. Cold, then a second instance.
     {
         let disk = root.join("s");
-        let up = Arc::new(Simulated { calls: AtomicU64::new(0) });
+        let up = Arc::new(Simulated {
+            calls: AtomicU64::new(0),
+        });
         let svc = service(objects.clone(), &disk, up.clone()).await;
         run("S cold", &svc, &up, &s).await;
         settle(&svc).await;
@@ -337,7 +395,9 @@ async fn main() {
     }
 
     let disk = root.join("a");
-    let up = Arc::new(Simulated { calls: AtomicU64::new(0) });
+    let up = Arc::new(Simulated {
+        calls: AtomicU64::new(0),
+    });
     let svc = service(objects.clone(), &disk, up.clone()).await;
     run("A cold", &svc, &up, &a).await;
     settle(&svc).await;
@@ -346,7 +406,9 @@ async fn main() {
     drop(svc);
 
     // A second instance, or a restart: nothing in memory.
-    let up2 = Arc::new(Simulated { calls: AtomicU64::new(0) });
+    let up2 = Arc::new(Simulated {
+        calls: AtomicU64::new(0),
+    });
     let svc2 = service(objects, &disk, up2.clone()).await;
     run("B, second instance", &svc2, &up2, &b).await;
 }

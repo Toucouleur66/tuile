@@ -42,12 +42,16 @@ fn service(upstream: Arc<Slow>) -> TileService {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fifty_simultaneous_requests_for_a_missing_tile_make_one_upstream_call() {
-    let up = Arc::new(Slow { calls: AtomicUsize::new(0) });
+    let up = Arc::new(Slow {
+        calls: AtomicUsize::new(0),
+    });
     let svc = Arc::new(service(up.clone()));
     let mut tasks = Vec::new();
     for _ in 0..50 {
         let s = svc.clone();
-        tasks.push(tokio::spawn(async move { s.tile(IMAGERY, LEVEL, X0, Y0).await }));
+        tasks.push(tokio::spawn(
+            async move { s.tile(IMAGERY, LEVEL, X0, Y0).await },
+        ));
     }
     for t in tasks {
         let r = t.await.expect("task").expect("tile").expect("present");
@@ -55,20 +59,41 @@ async fn fifty_simultaneous_requests_for_a_missing_tile_make_one_upstream_call()
     }
     assert_eq!(up.calls.load(Ordering::SeqCst), 1);
 
-    let again = svc.tile(IMAGERY, LEVEL, X0, Y0).await.expect("tile").expect("present");
+    let again = svc
+        .tile(IMAGERY, LEVEL, X0, Y0)
+        .await
+        .expect("tile")
+        .expect("present");
     assert!(again.hit, "served from the store the second time");
     assert_eq!(up.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
 async fn a_tile_the_source_does_not_have_is_none_and_the_etag_is_stable() {
-    let up = Arc::new(Slow { calls: AtomicUsize::new(0) });
+    let up = Arc::new(Slow {
+        calls: AtomicUsize::new(0),
+    });
     let svc = service(up);
-    assert!(svc.tile(IMAGERY, LEVEL, 0, Y0).await.expect("tile").is_none());
-    let a = svc.tile(IMAGERY, LEVEL, X0, Y0).await.expect("tile").expect("present");
-    let b = svc.tile(IMAGERY, LEVEL, X0, Y0).await.expect("tile").expect("present");
+    assert!(svc
+        .tile(IMAGERY, LEVEL, 0, Y0)
+        .await
+        .expect("tile")
+        .is_none());
+    let a = svc
+        .tile(IMAGERY, LEVEL, X0, Y0)
+        .await
+        .expect("tile")
+        .expect("present");
+    let b = svc
+        .tile(IMAGERY, LEVEL, X0, Y0)
+        .await
+        .expect("tile")
+        .expect("present");
     assert_eq!(a.etag, b.etag);
     assert_eq!(a.content_type, "image/jpeg");
     assert!(svc.tile("nope", 1, 0, 0).await.is_err());
-    assert!(svc.tile(IMAGERY, 3, 99, 0).await.is_err(), "out of the grid");
+    assert!(
+        svc.tile(IMAGERY, 3, 99, 0).await.is_err(),
+        "out of the grid"
+    );
 }

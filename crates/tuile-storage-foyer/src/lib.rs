@@ -456,9 +456,20 @@ mod tests {
             disk_bytes: 4 << 30,
             default_ttl: None,
         };
-        let first = if keeping { FoyerStore::keeping(cfg()).await } else { FoyerStore::with_config(cfg()).await }.expect("store");
+        let first = if keeping {
+            FoyerStore::keeping(cfg()).await
+        } else {
+            FoyerStore::with_config(cfg()).await
+        }
+        .expect("store");
         for i in 0..count {
-            first.put(&format!("block/{i}"), Bytes::from(vec![i as u8; each]), None).await;
+            first
+                .put(
+                    &format!("block/{i}"),
+                    Bytes::from(vec![i as u8; each]),
+                    None,
+                )
+                .await;
             // As a reader's blocks arrive: one at a time, the runtime free
             // in between to write what it was handed.
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
@@ -468,7 +479,11 @@ mod tests {
         let second = FoyerStore::with_config(cfg()).await.expect("store");
         let mut found = 0;
         for i in 0..count {
-            if second.get(&format!("block/{i}")).await.is_some_and(|b| b.len() == each && b[0] == i as u8) {
+            if second
+                .get(&format!("block/{i}"))
+                .await
+                .is_some_and(|b| b.len() == each && b[0] == i as u8)
+            {
                 found += 1;
             }
         }
@@ -477,7 +492,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_keeping_store_has_every_block_after_it_is_reopened() {
-        assert_eq!(blocks_found_after_reopening(true, 530, 700 << 10).await, 530);
+        assert_eq!(
+            blocks_found_after_reopening(true, 530, 700 << 10).await,
+            530
+        );
     }
 
     /// Measured, not asserted: what the default store keeps of the same.

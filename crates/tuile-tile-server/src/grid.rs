@@ -54,7 +54,12 @@ impl Grid {
 
     /// Checks an address against the grid.
     pub fn check(self, level: u8, x: u32, y: u32) -> Result<(), OutOfGrid> {
-        let out = OutOfGrid { grid: self, level, x, y };
+        let out = OutOfGrid {
+            grid: self,
+            level,
+            x,
+            y,
+        };
         if level > self.max_level() {
             return Err(out);
         }
@@ -72,7 +77,12 @@ impl Grid {
             Grid::WebMercator => level,
             Grid::Geographic => level + 1,
         };
-        TileCoord::new(z, x, y).map_err(|_| OutOfGrid { grid: self, level, x, y })
+        TileCoord::new(z, x, y).map_err(|_| OutOfGrid {
+            grid: self,
+            level,
+            x,
+            y,
+        })
     }
 
     /// The archive tile id a source address is stored at.

@@ -51,10 +51,16 @@ pub struct Stop {
 
 impl Stop {
     pub fn fatal(marker: impl Into<String>) -> Stop {
-        Stop { marker: marker.into(), bail: false }
+        Stop {
+            marker: marker.into(),
+            bail: false,
+        }
     }
     pub fn bail(marker: impl Into<String>) -> Stop {
-        Stop { marker: marker.into(), bail: true }
+        Stop {
+            marker: marker.into(),
+            bail: true,
+        }
     }
 }
 
@@ -100,7 +106,12 @@ pub async fn main(get: &dyn Fn(&str) -> Option<String>) -> u8 {
     };
     let store_ref: Option<&dyn RunStore> = store.as_ref().map(|s| s as &dyn RunStore);
     let shipper = match (store_ref, c.run_prefix.as_deref()) {
-        (Some(store), Some(prefix)) => Some(Shipper { store, prefix, tag: c.task_tag(), dir: outdir.clone() }),
+        (Some(store), Some(prefix)) => Some(Shipper {
+            store,
+            prefix,
+            tag: c.task_tag(),
+            dir: outdir.clone(),
+        }),
         _ => None,
     };
     let render = render_id(get);
@@ -158,7 +169,11 @@ async fn work(
     log: &Log,
     shipper: Option<&Shipper<'_>>,
 ) -> Result<(), Stop> {
-    let batch: Vec<String> = c.batch_env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let batch: Vec<String> = c
+        .batch_env
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
     log.line(format!("batch config: {}", batch.join(" ")));
     let mut child_env = c.batch_env.clone();
     if let Some(tf) = &c.tf_debug {
@@ -180,9 +195,15 @@ async fn work(
 
     let plan = Plan::of(c);
     if c.chunk_given {
-        log.line(format!("task {}/{}: frames {}:{} (chunk given)", c.task_index, c.task_count, plan.first, plan.last));
+        log.line(format!(
+            "task {}/{}: frames {}:{} (chunk given)",
+            c.task_index, c.task_count, plan.first, plan.last
+        ));
     } else if c.task_count > 1 {
-        log.line(format!("task {}/{}: frames {}:{}", c.task_index, c.task_count, plan.first, plan.last));
+        log.line(format!(
+            "task {}/{}: frames {}:{}",
+            c.task_index, c.task_count, plan.first, plan.last
+        ));
     }
     let nominal = c.gpus * c.procs_per_gpu;
     if plan.jobs() < nominal {
@@ -225,8 +246,11 @@ async fn prepare_and_render(
 
     gpu::wake(log).await;
     if gpu::on_path("nvidia-smi") {
-        let (in_proc, in_dev) = gpu::gpu_counts(Path::new("/proc/driver/nvidia/gpus"), Path::new("/dev"));
-        log.line(format!("gpus: {in_proc} advertised in procfs, {in_dev} device nodes"));
+        let (in_proc, in_dev) =
+            gpu::gpu_counts(Path::new("/proc/driver/nvidia/gpus"), Path::new("/dev"));
+        log.line(format!(
+            "gpus: {in_proc} advertised in procfs, {in_dev} device nodes"
+        ));
         if in_proc != in_dev {
             for l in [
                 format!("GPU-PARTIAL-HOST: the driver advertises {in_proc} GPUs and this"),
@@ -239,12 +263,18 @@ async fn prepare_and_render(
             ] {
                 log.line(l);
             }
-            return Err(Stop::bail("  Ask for --gpu-count equal to the host's full complement."));
+            return Err(Stop::bail(
+                "  Ask for --gpu-count equal to the host's full complement.",
+            ));
         }
     }
 
-    let (found, backend) = gpu::probe(&c.blender, &c.engine, &c.delegate, &c.cycles_backends, log).await;
-    log.line(format!("probe: NGPU {found} backend={backend} (attendu: NGPU {})", c.gpus));
+    let (found, backend) =
+        gpu::probe(&c.blender, &c.engine, &c.delegate, &c.cycles_backends, log).await;
+    log.line(format!(
+        "probe: NGPU {found} backend={backend} (attendu: NGPU {})",
+        c.gpus
+    ));
     if found != c.gpus {
         gpu::bail_diagnostics(&c.blender, log).await;
         return Err(Stop::bail("NO-GPU-BAIL"));
@@ -265,7 +295,10 @@ async fn prepare_and_render(
     }
     let stage = inputs::stage(c, store, log).await?;
     inputs::optix_get(c, store, log).await;
-    child_env.push(("OPTIX_CACHE_PATH".into(), c.optix_cache_path.display().to_string()));
+    child_env.push((
+        "OPTIX_CACHE_PATH".into(),
+        c.optix_cache_path.display().to_string(),
+    ));
 
     let t0 = Instant::now();
     let sampler = gpu::Sampler::spawn(c.gpu_sample_s, c.gpus, log.clone());
@@ -287,7 +320,10 @@ async fn prepare_and_render(
         Some(s) => {
             let peak = s.peak.load(std::sync::atomic::Ordering::Relaxed);
             if peak < c.gpus {
-                log.line(format!("GPU-UNDERUSED: au mieux {peak} GPU sur {} ont travaillé", c.gpus));
+                log.line(format!(
+                    "GPU-UNDERUSED: au mieux {peak} GPU sur {} ont travaillé",
+                    c.gpus
+                ));
             } else {
                 log.line(format!("GPU-OK: {peak}/{}", c.gpus));
             }
@@ -298,7 +334,13 @@ async fn prepare_and_render(
 }
 
 /// Segments up, counted, and the film — or the reason there is none.
-async fn deliver(c: &Config, store: Option<&dyn RunStore>, render: &str, plan: &Plan, log: &Log) -> Result<(), Stop> {
+async fn deliver(
+    c: &Config,
+    store: Option<&dyn RunStore>,
+    render: &str,
+    plan: &Plan,
+    log: &Log,
+) -> Result<(), Stop> {
     let outdir = c.outdir();
     let seg = |i: usize| outdir.join(format!("seg{i}.mp4"));
     let size = |i: usize| std::fs::metadata(seg(i)).map_or(0, |m| m.len());
@@ -321,22 +363,39 @@ async fn deliver(c: &Config, store: Option<&dyn RunStore>, render: &str, plan: &
     // Counted by size, not existence: a process that dies leaves a 48-byte
     // container, and a concat once stopped at the first empty file and
     // reported a film four fifths short.
-    let missing: Vec<usize> = (0..plan.jobs() as usize).filter(|&i| size(i) <= 1000).collect();
+    let missing: Vec<usize> = (0..plan.jobs() as usize)
+        .filter(|&i| size(i) <= 1000)
+        .collect();
     let n = plan.jobs() as usize - missing.len();
     if !missing.is_empty() {
         let list: Vec<String> = missing.iter().map(|i| i.to_string()).collect();
         log.line(format!("SEGMENTS-MISSING: {}", list.join(" ")));
-        log.line(format!("TASK-INCOMPLETE {}/{} ({n}/{} segments)", c.task_index, c.task_count, plan.jobs()));
+        log.line(format!(
+            "TASK-INCOMPLETE {}/{} ({n}/{} segments)",
+            c.task_index,
+            c.task_count,
+            plan.jobs()
+        ));
         return Err(Stop::fatal("VIDEO-MISSING"));
     }
     let fps: Option<f64> = c.fps.parse().ok().filter(|f: &f64| *f > 0.0);
     if let (Some(keys), Some(store)) = (&keys, store) {
-        let receipt = Receipt { task: c.task_index, first: plan.first, last: plan.last, segments: plan.segments() };
-        put_receipt(store, keys, &receipt, &outdir).await.map_err(|e| {
-            log.line(format!("  {e}"));
-            Stop::fatal("RECEIPT-FAILED")
-        })?;
-        log.line(format!("RECEIPT {} frames {}:{} segments {:?}", receipt.task, receipt.first, receipt.last, receipt.segments));
+        let receipt = Receipt {
+            task: c.task_index,
+            first: plan.first,
+            last: plan.last,
+            segments: plan.segments(),
+        };
+        put_receipt(store, keys, &receipt, &outdir)
+            .await
+            .map_err(|e| {
+                log.line(format!("  {e}"));
+                Stop::fatal("RECEIPT-FAILED")
+            })?;
+        log.line(format!(
+            "RECEIPT {} frames {}:{} segments {:?}",
+            receipt.task, receipt.first, receipt.last, receipt.segments
+        ));
         if !c.assemble {
             // The orchestrator assembles: this job's part ends with its receipt.
             log.line(format!(
@@ -376,7 +435,10 @@ async fn deliver(c: &Config, store: Option<&dyn RunStore>, render: &str, plan: &
             .map_err(|e| Stop::fatal(format!("FILM-FAILED {e}")))?;
         log.line(format!("FILM {} {frames} frames", c.out.display()));
         if frames != plan.total() {
-            return Err(Stop::fatal(format!("FRAME-COUNT-MISMATCH: {frames} frames dans la vidéo, {} demandées", plan.total())));
+            return Err(Stop::fatal(format!(
+                "FRAME-COUNT-MISMATCH: {frames} frames dans la vidéo, {} demandées",
+                plan.total()
+            )));
         }
         log.line(format!("frames: {frames}/{}", plan.total()));
         log.line("RENDER-DONE");
@@ -395,10 +457,23 @@ fn has_png(outdir: &Path, i: usize) -> bool {
     })
 }
 
-async fn put_receipt(store: &dyn RunStore, keys: &RunKeys, receipt: &Receipt, outdir: &Path) -> Result<(), String> {
+async fn put_receipt(
+    store: &dyn RunStore,
+    keys: &RunKeys,
+    receipt: &Receipt,
+    outdir: &Path,
+) -> Result<(), String> {
     let file = outdir.join(format!("receipt-{}.json", receipt.task));
-    std::fs::write(&file, serde_json::to_vec(receipt).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    store.put(&file, &keys.receipt(receipt.task)).await.map(|_| ()).map_err(|e| e.to_string())
+    std::fs::write(
+        &file,
+        serde_json::to_vec(receipt).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    store
+        .put(&file, &keys.receipt(receipt.task))
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 async fn start_sshd(key: &str, log: &Log) {

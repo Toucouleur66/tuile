@@ -174,14 +174,22 @@ impl SharedTiles for InMemory {
 
     async fn put(&self, layer: &str, level: u8, x: u32, y: u32, tile: &SharedTile) {
         if let Ok(mut tiles) = self.tiles.lock() {
-            tiles.insert((layer.to_string(), level, x, y), (tile.clone(), Instant::now()));
+            tiles.insert(
+                (layer.to_string(), level, x, y),
+                (tile.clone(), Instant::now()),
+            );
         }
     }
 
     async fn claim(&self, layer: &str, level: u8, x: u32, y: u32) -> Claim {
-        let Ok(mut claims) = self.claims.lock() else { return Claim::Unknown };
+        let Ok(mut claims) = self.claims.lock() else {
+            return Claim::Unknown;
+        };
         let key = (layer.to_string(), level, x, y);
-        if claims.get(&key).is_some_and(|(_, at)| at.elapsed() < self.claim_ttl) {
+        if claims
+            .get(&key)
+            .is_some_and(|(_, at)| at.elapsed() < self.claim_ttl)
+        {
             return Claim::Theirs;
         }
         let token = self.tokens.fetch_add(1, Ordering::Relaxed).to_string();
@@ -203,8 +211,11 @@ impl SharedTiles for InMemory {
 impl Announce for InMemory {
     async fn published(&self, layer: &str, zone: Zone, generation: u64) {
         self.announced.fetch_add(1, Ordering::Relaxed);
-        let listeners: Vec<Arc<TileStore>> =
-            self.listeners.lock().map(|l| l.iter().filter_map(Weak::upgrade).collect()).unwrap_or_default();
+        let listeners: Vec<Arc<TileStore>> = self
+            .listeners
+            .lock()
+            .map(|l| l.iter().filter_map(Weak::upgrade).collect())
+            .unwrap_or_default();
         for store in listeners {
             store.forget_zone(layer, zone, generation);
         }

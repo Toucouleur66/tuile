@@ -330,7 +330,12 @@ impl TileStore {
         Self::with_clock(store, layers, cfg, Arc::new(SystemTime::now))
     }
 
-    pub fn with_clock(store: Arc<dyn ObjectStore>, layers: Vec<Layer>, cfg: StoreConfig, clock: Clock) -> Self {
+    pub fn with_clock(
+        store: Arc<dyn ObjectStore>,
+        layers: Vec<Layer>,
+        cfg: StoreConfig,
+        clock: Clock,
+    ) -> Self {
         let reader_cache = cfg.reader_cache as u64;
         Self {
             store,
@@ -353,7 +358,9 @@ impl TileStore {
     }
 
     pub fn layer(&self, name: &str) -> Result<&Layer, StoreError> {
-        self.layers.get(name).ok_or_else(|| StoreError::UnknownLayer(name.to_string()))
+        self.layers
+            .get(name)
+            .ok_or_else(|| StoreError::UnknownLayer(name.to_string()))
     }
 
     pub fn layers(&self) -> impl Iterator<Item = &Layer> {
@@ -413,9 +420,17 @@ impl TileStore {
     }
 
     /// Tells the ledger an archive is about to be written; refused, it is not.
-    async fn record_writing(&self, layer: &str, zone: Zone, object: &str) -> Result<(), StoreError> {
+    async fn record_writing(
+        &self,
+        layer: &str,
+        zone: Zone,
+        object: &str,
+    ) -> Result<(), StoreError> {
         match &self.ledger {
-            Some(ledger) => ledger.writing(layer, zone, object).await.map_err(StoreError::Ledger),
+            Some(ledger) => ledger
+                .writing(layer, zone, object)
+                .await
+                .map_err(StoreError::Ledger),
             None => Ok(()),
         }
     }
@@ -423,11 +438,14 @@ impl TileStore {
     /// Tells the ledger of a publication. A ledger that missed it is put right
     /// by the next one: said, and not an error of the publication.
     async fn record_published(&self, key: &ZoneKey, manifest: &Manifest) {
-        let (Some(ledger), Ok(layer)) = (&self.ledger, self.layer(&key.0)) else { return };
+        let (Some(ledger), Ok(layer)) = (&self.ledger, self.layer(&key.0)) else {
+            return;
+        };
         let due = crate::due::due(layer, manifest, &self.cfg, (self.clock)());
         if let Err(error) = ledger.published(&key.0, key.1, manifest, &due).await {
             tracing::warn!(layer = %key.0, zone = ?key.1, %error, "the ledger missed a publication");
-            metrics::counter!("tuile_tiles_ledger_missed_total", "what" => "published").increment(1);
+            metrics::counter!("tuile_tiles_ledger_missed_total", "what" => "published")
+                .increment(1);
         }
     }
 
@@ -450,7 +468,10 @@ impl TileStore {
     pub fn forget_zone(&self, layer: &str, zone: Zone, generation: u64) {
         let key = (layer.to_string(), zone);
         if let Ok(mut cache) = self.manifests.cache.lock() {
-            if cache.get(&key).is_some_and(|(_, kept)| kept.generation < generation) {
+            if cache
+                .get(&key)
+                .is_some_and(|(_, kept)| kept.generation < generation)
+            {
                 cache.remove(&key);
             }
         }
@@ -469,7 +490,12 @@ impl TileStore {
     }
 
     /// Reads the zone through a local projection from now on.
-    pub(crate) async fn attach_projection(&self, layer: &Layer, zone: Zone, path: &std::path::Path) -> Result<(), StoreError> {
+    pub(crate) async fn attach_projection(
+        &self,
+        layer: &Layer,
+        zone: Zone,
+        path: &std::path::Path,
+    ) -> Result<(), StoreError> {
         let reader = Arc::new(archive::open_local(path).await?);
         if let Ok(mut p) = self.projections.lock() {
             p.insert((layer.name.clone(), zone), reader);
@@ -492,7 +518,13 @@ impl TileStore {
         gate
     }
 
-    fn locate(&self, layer: &str, level: u8, x: u32, y: u32) -> Result<(&Layer, Zone, u64), StoreError> {
+    fn locate(
+        &self,
+        layer: &str,
+        level: u8,
+        x: u32,
+        y: u32,
+    ) -> Result<(&Layer, Zone, u64), StoreError> {
         let l = self.layer(layer)?;
         let zone = l.zone_of(level, x, y)?;
         let id = l.grid.to_id(level, x, y)?;
@@ -502,7 +534,13 @@ impl TileStore {
     // ── Reading ──────────────────────────────────────────────────────────
 
     /// The stored bytes of a tile, exactly as they were put.
-    pub async fn get(&self, layer: &str, level: u8, x: u32, y: u32) -> Result<Option<Bytes>, StoreError> {
+    pub async fn get(
+        &self,
+        layer: &str,
+        level: u8,
+        x: u32,
+        y: u32,
+    ) -> Result<Option<Bytes>, StoreError> {
         let (l, zone, id) = self.locate(layer, level, x, y)?;
         let key = (l.name.clone(), zone);
 
@@ -512,7 +550,11 @@ impl TileStore {
             return Ok(Some(bytes));
         }
 
-        let projection = self.projections.lock().ok().and_then(|p| p.get(&key).cloned());
+        let projection = self
+            .projections
+            .lock()
+            .ok()
+            .and_then(|p| p.get(&key).cloned());
         if let Some(local) = projection {
             if let Some(bytes) = local.get_tile(pmtiles::TileId::new(id)?).await? {
                 self.stats.projection.fetch_add(1, Ordering::Relaxed);
@@ -526,7 +568,12 @@ impl TileStore {
 
         let now = (self.clock)();
         let manifest = self.manifest(&key, l).await?;
-        let live: Vec<&ArchiveRef> = manifest.archives.iter().rev().filter(|a| !l.is_expired(&a.epoch, now)).collect();
+        let live: Vec<&ArchiveRef> = manifest
+            .archives
+            .iter()
+            .rev()
+            .filter(|a| !l.is_expired(&a.epoch, now))
+            .collect();
         if !live.iter().all(|a| self.disk_reader(&a.key).is_some()) {
             // A read of this zone from the bucket: copy it whole, so the next
             // read of any of its tiles is local — and this one too, when the
@@ -545,7 +592,12 @@ impl TileStore {
             results.push(self.read_archive(&newest.key, id).await);
         }
         if !matches!(results.first(), Some(Ok((Some(_), _)))) && live.len() > 1 {
-            results.extend(futures_util::future::join_all(live[1..].iter().map(|a| self.read_archive(&a.key, id))).await);
+            results.extend(
+                futures_util::future::join_all(
+                    live[1..].iter().map(|a| self.read_archive(&a.key, id)),
+                )
+                .await,
+            );
         }
         for (archive, result) in live.iter().zip(results) {
             match result {
@@ -580,7 +632,10 @@ impl TileStore {
     fn buffered(&self, key: &ZoneKey, id: u64) -> Option<Bytes> {
         let buffers = self.buffers.lock().ok()?;
         let b = buffers.get(key)?;
-        b.pending.get(&id).or_else(|| b.flushing.as_ref().and_then(|f| f.get(&id))).map(|p| p.bytes.clone())
+        b.pending
+            .get(&id)
+            .or_else(|| b.flushing.as_ref().and_then(|f| f.get(&id)))
+            .map(|p| p.bytes.clone())
     }
 
     fn disk_reader(&self, archive_key: &str) -> Option<Arc<LocalReader>> {
@@ -589,7 +644,11 @@ impl TileStore {
 
     /// A tile of one archive, from its local copy if there is one. The flag
     /// says whether it was local.
-    async fn read_archive(&self, archive_key: &str, id: u64) -> Result<(Option<Bytes>, bool), StoreError> {
+    async fn read_archive(
+        &self,
+        archive_key: &str,
+        id: u64,
+    ) -> Result<(Option<Bytes>, bool), StoreError> {
         if let Some(local) = self.disk_reader(archive_key) {
             return Ok((local.get_tile(pmtiles::TileId::new(id)?).await?, true));
         }
@@ -598,8 +657,16 @@ impl TileStore {
 
     /// Starts local copies of a zone's archives and, if configured, of the
     /// zones around it. Returns the copies worth waiting for.
-    fn copy_zone(&self, layer: &Layer, zone: Zone, live: &[&ArchiveRef], now: SystemTime) -> Vec<crate::disk::ArchiveCopy> {
-        let Some(disk) = &self.disk else { return Vec::new() };
+    fn copy_zone(
+        &self,
+        layer: &Layer,
+        zone: Zone,
+        live: &[&ArchiveRef],
+        now: SystemTime,
+    ) -> Vec<crate::disk::ArchiveCopy> {
+        let Some(disk) = &self.disk else {
+            return Vec::new();
+        };
         let mut waits = Vec::new();
         for a in live {
             if let Some((copy, started)) = disk.copy(self.store.clone(), &a.key, a.bytes) {
@@ -627,26 +694,48 @@ impl TileStore {
     /// Copies a zone's archives in the background, reading its manifest
     /// first. Nothing waits on it.
     fn prefetch_zone(&self, layer: &Layer, zone: Zone, now: SystemTime) {
-        let Some(disk) = self.disk.clone() else { return };
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else { return };
+        let Some(disk) = self.disk.clone() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
         let objects = self.store.clone();
         let layer = layer.clone();
         runtime.spawn(async move {
-            let Ok(read) = manifest::read(objects.as_ref(), &layer.zone_prefix(zone)).await else { return };
-            for a in read.manifest.archives.iter().rev().filter(|a| !layer.is_expired(&a.epoch, now)) {
+            let Ok(read) = manifest::read(objects.as_ref(), &layer.zone_prefix(zone)).await else {
+                return;
+            };
+            for a in read
+                .manifest
+                .archives
+                .iter()
+                .rev()
+                .filter(|a| !layer.is_expired(&a.epoch, now))
+            {
                 disk.copy(objects.clone(), &a.key, a.bytes);
             }
         });
     }
 
     async fn manifest(&self, key: &ZoneKey, layer: &Layer) -> Result<Arc<Manifest>, StoreError> {
-        let cached = self.manifests.cache.lock().ok().and_then(|c| c.get(key).cloned());
+        let cached = self
+            .manifests
+            .cache
+            .lock()
+            .ok()
+            .and_then(|c| c.get(key).cloned());
         if let Some((at, m)) = cached {
             let age = at.elapsed();
             if age < self.cfg.manifest_ttl {
                 return Ok(m);
             }
-            if age < self.cfg.manifest_ttl.saturating_add(self.cfg.manifest_max_stale) {
+            if age
+                < self
+                    .cfg
+                    .manifest_ttl
+                    .saturating_add(self.cfg.manifest_max_stale)
+            {
                 // Answer with what we have; the fresh copy replaces it for the
                 // next reader.
                 if let Ok(runtime) = tokio::runtime::Handle::try_current() {
@@ -655,7 +744,9 @@ impl TileStore {
                 }
             }
         }
-        self.manifest_flight(key, layer).await.map_err(StoreError::Remote)
+        self.manifest_flight(key, layer)
+            .await
+            .map_err(StoreError::Remote)
     }
 
     /// The one read of a zone's manifest in flight, started if there is none.
@@ -684,7 +775,9 @@ impl TileStore {
         let prefix = layer.zone_prefix(key.1);
         let k = key.clone();
         let flight = async move {
-            let result = manifest::read(objects.as_ref(), &prefix).await.map(|v| Arc::new(v.manifest));
+            let result = manifest::read(objects.as_ref(), &prefix)
+                .await
+                .map(|v| Arc::new(v.manifest));
             if let Ok(m) = &result {
                 if manifests.remember(&k, m.clone()) {
                     drop_unnamed(disk.as_deref(), &prefix, m);
@@ -755,7 +848,14 @@ impl TileStore {
     /// Publication keeps the store free of duplicates: a buffered tile whose
     /// bytes the store already holds, or of which it holds a copy fetched
     /// after it, is dropped rather than published (see [`TileStore::put_fetched`]).
-    pub async fn put(&self, layer: &str, level: u8, x: u32, y: u32, bytes: Bytes) -> Result<(), StoreError> {
+    pub async fn put(
+        &self,
+        layer: &str,
+        level: u8,
+        x: u32,
+        y: u32,
+        bytes: Bytes,
+    ) -> Result<(), StoreError> {
         let now = (self.clock)();
         self.put_fetched(layer, level, x, y, bytes, now).await
     }
@@ -791,8 +891,13 @@ impl TileStore {
             b.since.get_or_insert_with(Instant::now);
             if b.bytes >= self.cfg.flush_bytes {
                 Some(key.clone())
-            } else if buffers.values().map(|b| b.bytes).sum::<usize>() >= self.cfg.max_buffered_bytes {
-                buffers.iter().max_by_key(|(_, b)| b.bytes).map(|(k, _)| k.clone())
+            } else if buffers.values().map(|b| b.bytes).sum::<usize>()
+                >= self.cfg.max_buffered_bytes
+            {
+                buffers
+                    .iter()
+                    .max_by_key(|(_, b)| b.bytes)
+                    .map(|(k, _)| k.clone())
             } else {
                 None
             }
@@ -828,7 +933,11 @@ impl TileStore {
     pub async fn flush_all(&self) -> Result<usize, StoreError> {
         let keys: Vec<ZoneKey> = {
             let buffers = self.buffers.lock().map_err(|_| StoreError::Poisoned)?;
-            buffers.iter().filter(|(_, b)| !b.pending.is_empty()).map(|(k, _)| k.clone()).collect()
+            buffers
+                .iter()
+                .filter(|(_, b)| !b.pending.is_empty())
+                .map(|(k, _)| k.clone())
+                .collect()
         };
         let results: Vec<Result<(), StoreError>> = futures_util::stream::iter(keys.clone())
             .map(|key| async move { self.flush_zone(&key).await })
@@ -854,7 +963,9 @@ impl TileStore {
 
         let frozen = {
             let mut buffers = self.buffers.lock().map_err(|_| StoreError::Poisoned)?;
-            let Some(b) = buffers.get_mut(key) else { return Ok(()) };
+            let Some(b) = buffers.get_mut(key) else {
+                return Ok(());
+            };
             if b.pending.is_empty() {
                 return Ok(());
             }
@@ -896,8 +1007,19 @@ impl TileStore {
     /// Where a fresh tile is stored: its layer and its zone. A source's "no
     /// such tile" (`absent`) goes to the layer's absence sibling, and nowhere
     /// (`None`) when the layer keeps none.
-    pub fn place(&self, layer: &str, level: u8, x: u32, y: u32, absent: bool) -> Result<Option<(String, Zone)>, StoreError> {
-        let name = if absent { format!("{layer}{ABSENT_SUFFIX}") } else { layer.to_string() };
+    pub fn place(
+        &self,
+        layer: &str,
+        level: u8,
+        x: u32,
+        y: u32,
+        absent: bool,
+    ) -> Result<Option<(String, Zone)>, StoreError> {
+        let name = if absent {
+            format!("{layer}{ABSENT_SUFFIX}")
+        } else {
+            layer.to_string()
+        };
         if absent && self.layer(&name).is_err() {
             // Checked against the real layer all the same: a tile nobody
             // could address is an error, not a quiet nothing.
@@ -919,7 +1041,12 @@ impl TileStore {
     /// published by a conditional write of the zone's manifest and announced.
     /// Says how many tiles were written. On an error nothing was published
     /// and the batch is the caller's to offer again.
-    pub async fn publish_batch(&self, layer: &str, zone: Zone, tiles: Vec<Fresh>) -> Result<usize, StoreError> {
+    pub async fn publish_batch(
+        &self,
+        layer: &str,
+        zone: Zone,
+        tiles: Vec<Fresh>,
+    ) -> Result<usize, StoreError> {
         let l = self.layer(layer)?.clone();
         let key = (l.name.clone(), zone);
         let mut batch: BTreeMap<u64, Pending> = BTreeMap::new();
@@ -931,7 +1058,10 @@ impl TileStore {
                     tile.level, tile.x, tile.y
                 )));
             }
-            let pending = Pending { bytes: tile.bytes, fetched_ms: tile.fetched_ms };
+            let pending = Pending {
+                bytes: tile.bytes,
+                fetched_ms: tile.fetched_ms,
+            };
             // The same tile twice in a batch: the later fetch is the tile.
             match batch.get(&id) {
                 Some(kept) if kept.fetched_ms > pending.fetched_ms => {}
@@ -950,7 +1080,12 @@ impl TileStore {
 
     /// Publishes a zone's tiles as a delta; says how many it wrote (the rest
     /// were in the store already).
-    async fn publish_delta(&self, layer: &Layer, key: &ZoneKey, frozen: &BTreeMap<u64, Pending>) -> Result<usize, StoreError> {
+    async fn publish_delta(
+        &self,
+        layer: &Layer,
+        key: &ZoneKey,
+        frozen: &BTreeMap<u64, Pending>,
+    ) -> Result<usize, StoreError> {
         let now = (self.clock)();
         let epoch = layer.epoch(now);
         let prefix = layer.zone_prefix(key.1);
@@ -968,9 +1103,11 @@ impl TileStore {
         let l = layer.clone();
         let (e, list) = (epoch.clone(), tiles.clone());
         let zooms = archive::zoom_range(list.keys());
-        let (file, count) = tokio::task::spawn_blocking(move || archive::write(&l, &e, zooms, list.into_iter().map(Ok)))
-            .await
-            .map_err(|e| StoreError::Corrupt(format!("archive writer: {e}")))??;
+        let (file, count) = tokio::task::spawn_blocking(move || {
+            archive::write(&l, &e, zooms, list.into_iter().map(Ok))
+        })
+        .await
+        .map_err(|e| StoreError::Corrupt(format!("archive writer: {e}")))??;
         self.record_writing(&key.0, key.1, &object).await?;
         upload(self.store.as_ref(), file.path(), &object).await?;
 
@@ -980,14 +1117,25 @@ impl TileStore {
             gate.go.notified().await;
         }
         match self.fault.swap(Fault::None as u8, Ordering::SeqCst) {
-            f if f == Fault::CrashAfterUpload as u8 => return Err(StoreError::Fault("crash after upload")),
-            f if f == Fault::FailAfterUpload as u8 => return Err(StoreError::Contended(format!("{prefix} (injected)"))),
+            f if f == Fault::CrashAfterUpload as u8 => {
+                return Err(StoreError::Fault("crash after upload"))
+            }
+            f if f == Fault::FailAfterUpload as u8 => {
+                return Err(StoreError::Contended(format!("{prefix} (injected)")))
+            }
             _ => {}
         }
 
         let bytes = tiles.values().map(|b| b.len() as u64).sum();
-        let entry =
-            ArchiveRef { key: object, epoch, created: now_secs(now), tiles: count, bytes, oldest_fetch_ms, newest_fetch_ms };
+        let entry = ArchiveRef {
+            key: object,
+            epoch,
+            created: now_secs(now),
+            tiles: count,
+            bytes,
+            oldest_fetch_ms,
+            newest_fetch_ms,
+        };
         let published = self
             .publish(key, &prefix, |m| {
                 let mut next = m.clone();
@@ -1014,10 +1162,17 @@ impl TileStore {
         frozen: &BTreeMap<u64, Pending>,
         now: SystemTime,
     ) -> Result<BTreeMap<u64, Pending>, StoreError> {
-        let current = manifest::read(self.store.as_ref(), &layer.zone_prefix(key.1)).await?.manifest;
+        let current = manifest::read(self.store.as_ref(), &layer.zone_prefix(key.1))
+            .await?
+            .manifest;
         let current = Arc::new(current);
         self.remember_manifest(key, current.clone());
-        let live: Vec<&ArchiveRef> = current.archives.iter().rev().filter(|a| !layer.is_expired(&a.epoch, now)).collect();
+        let live: Vec<&ArchiveRef> = current
+            .archives
+            .iter()
+            .rev()
+            .filter(|a| !layer.is_expired(&a.epoch, now))
+            .collect();
         if live.is_empty() {
             return Ok(frozen.clone());
         }
@@ -1041,7 +1196,9 @@ impl TileStore {
                         self.stats.dedup_identical.fetch_add(1, Ordering::Relaxed);
                         false
                     }
-                    Some((_, archive)) if archive.oldest_fetch_ms.is_some_and(|t| t > p.fetched_ms) => {
+                    Some((_, archive))
+                        if archive.oldest_fetch_ms.is_some_and(|t| t > p.fetched_ms) =>
+                    {
                         self.stats.dedup_newer.fetch_add(1, Ordering::Relaxed);
                         false
                     }
@@ -1054,7 +1211,8 @@ impl TileStore {
             .await;
         let dropped = verdicts.iter().filter(|(_, keep)| !keep).count() as u64;
         if dropped > 0 {
-            metrics::counter!("tuile_tiles_dedup_total", "layer" => layer.name.clone()).increment(dropped);
+            metrics::counter!("tuile_tiles_dedup_total", "layer" => layer.name.clone())
+                .increment(dropped);
         }
         Ok(verdicts
             .into_iter()
@@ -1066,7 +1224,11 @@ impl TileStore {
     /// The copy of a tile a reader would get from these archives (newest
     /// first), and the archive it comes from. `None` when absent, or when it
     /// cannot be read.
-    async fn stored_copy<'a>(&self, live: &[&'a ArchiveRef], id: u64) -> Option<(Bytes, &'a ArchiveRef)> {
+    async fn stored_copy<'a>(
+        &self,
+        live: &[&'a ArchiveRef],
+        id: u64,
+    ) -> Option<(Bytes, &'a ArchiveRef)> {
         for a in live {
             match self.read_archive(&a.key, id).await {
                 Ok((Some(bytes), _)) => return Some((bytes, *a)),
@@ -1079,24 +1241,33 @@ impl TileStore {
 
     /// Derives the next manifest from the current one and publishes it,
     /// retrying on a lost race. `derive` returning `None` abandons.
-    async fn publish<F>(&self, key: &ZoneKey, prefix: &str, derive: F) -> Result<Option<Manifest>, StoreError>
+    async fn publish<F>(
+        &self,
+        key: &ZoneKey,
+        prefix: &str,
+        derive: F,
+    ) -> Result<Option<Manifest>, StoreError>
     where
         F: Fn(&Manifest) -> Option<Manifest>,
     {
         for attempt in 0..self.cfg.publish_attempts {
             let current: Versioned = manifest::read(self.store.as_ref(), prefix).await?;
-            let Some(mut next) = derive(&current.manifest) else { return Ok(None) };
+            let Some(mut next) = derive(&current.manifest) else {
+                return Ok(None);
+            };
             next.generation = current.manifest.generation + 1;
             if manifest::replace(self.store.as_ref(), prefix, &current, &next).await? {
                 self.record_published(key, &next).await;
                 if let Some(announcer) = &self.announcer {
                     announcer.published(&key.0, key.1, next.generation).await;
-                    metrics::counter!("tuile_tiles_announced_total", "layer" => key.0.clone()).increment(1);
+                    metrics::counter!("tuile_tiles_announced_total", "layer" => key.0.clone())
+                        .increment(1);
                 }
                 return Ok(Some(next));
             }
             metrics::counter!("tuile_tiles_publish_conflicts_total").increment(1);
-            let backoff = rand::rng().random_range(0..(BACKOFF_BASE_MS << attempt.min(BACKOFF_MAX_DOUBLINGS)));
+            let backoff = rand::rng()
+                .random_range(0..(BACKOFF_BASE_MS << attempt.min(BACKOFF_MAX_DOUBLINGS)));
             tokio::time::sleep(Duration::from_millis(backoff)).await;
         }
         Err(StoreError::Contended(prefix.to_string()))
@@ -1111,10 +1282,19 @@ impl TileStore {
         let lock = self.zone_lock(&(l.name.clone(), zone));
         let _held = lock.lock().await;
         let epoch = l.epoch((self.clock)());
-        let m = manifest::read(self.store.as_ref(), &l.zone_prefix(zone)).await?.manifest;
+        let m = manifest::read(self.store.as_ref(), &l.zone_prefix(zone))
+            .await?
+            .manifest;
         // The last contiguous run of the current epoch.
-        let end = m.archives.iter().rposition(|a| a.epoch == epoch).map_or(0, |i| i + 1);
-        let start = m.archives[..end].iter().rposition(|a| a.epoch != epoch).map_or(0, |i| i + 1);
+        let end = m
+            .archives
+            .iter()
+            .rposition(|a| a.epoch == epoch)
+            .map_or(0, |i| i + 1);
+        let start = m.archives[..end]
+            .iter()
+            .rposition(|a| a.epoch != epoch)
+            .map_or(0, |i| i + 1);
         self.merge_run(&l, zone, &m.archives[start..end]).await
     }
 
@@ -1124,7 +1304,9 @@ impl TileStore {
         let lock = self.zone_lock(&(l.name.clone(), zone));
         let _held = lock.lock().await;
         let now = (self.clock)();
-        let m = manifest::read(self.store.as_ref(), &l.zone_prefix(zone)).await?.manifest;
+        let m = manifest::read(self.store.as_ref(), &l.zone_prefix(zone))
+            .await?
+            .manifest;
         // The epoch being written first, then those before it that have not
         // expired: the deltas an epoch's last hours left behind would
         // otherwise stay as they are until they expire. Each epoch on its
@@ -1209,13 +1391,20 @@ impl TileStore {
                     tokio::sync::mpsc::channel::<Result<(u64, Bytes), StoreError>>(MERGE_QUEUE);
                 let (layer_of, epoch) = (l.clone(), old.epoch.clone());
                 let writer = tokio::task::spawn_blocking(move || {
-                    archive::write(&layer_of, &epoch, zooms, std::iter::from_fn(move || rx.blocking_recv()))
+                    archive::write(
+                        &layer_of,
+                        &epoch,
+                        zooms,
+                        std::iter::from_fn(move || rx.blocking_recv()),
+                    )
                 });
                 let mut bytes = 0u64;
                 for id in kept {
                     let tile = match reader.get_tile(pmtiles::TileId::new(id)?).await {
                         Ok(Some(body)) => Ok((id, body)),
-                        Ok(None) => Err(StoreError::Corrupt(format!("tile {id} listed but absent"))),
+                        Ok(None) => {
+                            Err(StoreError::Corrupt(format!("tile {id} listed but absent")))
+                        }
                         Err(e) => Err(e.into()),
                     };
                     let failed = tile.is_err();
@@ -1227,8 +1416,9 @@ impl TileStore {
                     }
                 }
                 drop(tx);
-                let (file, count) =
-                    writer.await.map_err(|e| StoreError::Corrupt(format!("archive writer: {e}")))??;
+                let (file, count) = writer
+                    .await
+                    .map_err(|e| StoreError::Corrupt(format!("archive writer: {e}")))??;
                 let object = archive_key(&prefix, &old.epoch, now);
                 self.record_writing(&l.name, zone, &object).await?;
                 upload(self.store.as_ref(), file.path(), &object).await?;
@@ -1250,20 +1440,29 @@ impl TileStore {
                     let at = m.archives.iter().position(|a| a.key == old.key)?;
                     let mut next = m.clone();
                     next.archives.splice(at..at + 1, entry.clone());
-                    next.retired.push(Retired { key: old.key.clone(), retired: now_s });
+                    next.retired.push(Retired {
+                        key: old.key.clone(),
+                        retired: now_s,
+                    });
                     Some(next)
                 })
                 .await?;
             match published {
                 Some(m) => {
                     self.remember_manifest(&key, Arc::new(m));
-                    metrics::counter!("tuile_tiles_scrubbed_total", "layer" => l.name.clone()).increment(gone);
+                    metrics::counter!("tuile_tiles_scrubbed_total", "layer" => l.name.clone())
+                        .increment(gone);
                     removed += gone;
                     rewritten += 1;
                 }
                 None => {
                     if let Some(entry) = entry {
-                        if self.store.delete(&Path::from(entry.key.as_str())).await.is_ok() {
+                        if self
+                            .store
+                            .delete(&Path::from(entry.key.as_str()))
+                            .await
+                            .is_ok()
+                        {
                             self.record_deleted(&l.name, zone, &[entry.key]).await;
                         }
                     }
@@ -1275,13 +1474,21 @@ impl TileStore {
             return Ok(Scrub::Clean);
         }
         self.cleanup(&l, zone).await?;
-        Ok(Scrub::Removed { tiles: removed, archives: rewritten })
+        Ok(Scrub::Removed {
+            tiles: removed,
+            archives: rewritten,
+        })
     }
 
     /// Merges a given run, as a compaction planned on an older manifest would
     /// (tests only).
     #[doc(hidden)]
-    pub async fn merge_run_planned(&self, layer: &str, zone: Zone, run: &[ArchiveRef]) -> Result<Compaction, StoreError> {
+    pub async fn merge_run_planned(
+        &self,
+        layer: &str,
+        zone: Zone,
+        run: &[ArchiveRef],
+    ) -> Result<Compaction, StoreError> {
         let l = self.layer(layer)?.clone();
         self.merge_run(&l, zone, run).await
     }
@@ -1290,8 +1497,11 @@ impl TileStore {
     pub async fn zones(&self) -> Result<Vec<(String, Zone)>, StoreError> {
         let mut out = Vec::new();
         for layer in self.layers.values() {
-            let listed: Vec<object_store::ObjectMeta> =
-                self.store.list(Some(&Path::from(layer.name.as_str()))).try_collect().await?;
+            let listed: Vec<object_store::ObjectMeta> = self
+                .store
+                .list(Some(&Path::from(layer.name.as_str())))
+                .try_collect()
+                .await?;
             for meta in listed {
                 if let Some(zone) = parse_manifest_key(layer, meta.location.as_ref()) {
                     out.push((layer.name.clone(), zone));
@@ -1346,7 +1556,9 @@ impl TileStore {
     pub async fn census(&self, layer: &str, zone: Zone) -> Result<Census, StoreError> {
         let l = self.layer(layer)?.clone();
         let now = (self.clock)();
-        let m = manifest::read(self.store.as_ref(), &l.zone_prefix(zone)).await?.manifest;
+        let m = manifest::read(self.store.as_ref(), &l.zone_prefix(zone))
+            .await?
+            .manifest;
         let mut held: HashMap<u64, u32> = HashMap::new();
         let mut census = Census::default();
         for a in m.archives.iter().filter(|a| !l.is_expired(&a.epoch, now)) {
@@ -1372,9 +1584,16 @@ impl TileStore {
         let now_s = now_secs(now);
         self.publish(&(layer.name.clone(), zone), &prefix, |m| {
             let mut next = m.clone();
-            let (gone, kept): (Vec<_>, Vec<_>) = m.archives.iter().cloned().partition(|a| layer.is_expired(&a.epoch, now));
+            let (gone, kept): (Vec<_>, Vec<_>) = m
+                .archives
+                .iter()
+                .cloned()
+                .partition(|a| layer.is_expired(&a.epoch, now));
             next.archives = kept;
-            next.retired.extend(gone.into_iter().map(|a| Retired { key: a.key, retired: now_s }));
+            next.retired.extend(gone.into_iter().map(|a| Retired {
+                key: a.key,
+                retired: now_s,
+            }));
             Some(next)
         })
         .await?;
@@ -1384,7 +1603,12 @@ impl TileStore {
 
     /// Merges a contiguous run of archives into one and publishes it in the
     /// run's place, provided the run is still there, whole and contiguous.
-    async fn merge_run(&self, layer: &Layer, zone: Zone, run: &[ArchiveRef]) -> Result<Compaction, StoreError> {
+    async fn merge_run(
+        &self,
+        layer: &Layer,
+        zone: Zone,
+        run: &[ArchiveRef],
+    ) -> Result<Compaction, StoreError> {
         if run.len() < 2 {
             return Ok(Compaction::Nothing);
         }
@@ -1414,11 +1638,18 @@ impl TileStore {
         // it through a bounded channel, the only bridge between the two. A
         // failed tile is sent on like any other: the writer stops on it and
         // reports it, so the error surfaces from one place.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<(u64, Bytes), StoreError>>(MERGE_QUEUE);
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<Result<(u64, Bytes), StoreError>>(MERGE_QUEUE);
         let l = layer.clone();
         let e = epoch.clone();
-        let writer =
-            tokio::task::spawn_blocking(move || archive::write(&l, &e, zooms, std::iter::from_fn(move || rx.blocking_recv())));
+        let writer = tokio::task::spawn_blocking(move || {
+            archive::write(
+                &l,
+                &e,
+                zooms,
+                std::iter::from_fn(move || rx.blocking_recv()),
+            )
+        });
         let mut tiles = std::pin::pin!(merged(readers));
         let mut bytes = 0u64;
         while let Some(tile) = futures_util::StreamExt::next(&mut tiles).await {
@@ -1431,17 +1662,25 @@ impl TileStore {
             }
         }
         drop(tx);
-        let (file, count) = writer.await.map_err(|e| StoreError::Corrupt(format!("archive writer: {e}")))??;
+        let (file, count) = writer
+            .await
+            .map_err(|e| StoreError::Corrupt(format!("archive writer: {e}")))??;
 
         let object = archive_key(&prefix, &epoch, now);
         self.record_writing(&layer.name, zone, &object).await?;
         upload(self.store.as_ref(), file.path(), &object).await?;
         // A merged archive's fetch times span its inputs'; unknown if any
         // input's are.
-        let fetch_bounds: Option<Vec<(u64, u64)>> =
-            run.iter().map(|a| Some((a.oldest_fetch_ms?, a.newest_fetch_ms?))).collect();
-        let oldest_fetch_ms = fetch_bounds.as_ref().and_then(|b| b.iter().map(|x| x.0).min());
-        let newest_fetch_ms = fetch_bounds.as_ref().and_then(|b| b.iter().map(|x| x.1).max());
+        let fetch_bounds: Option<Vec<(u64, u64)>> = run
+            .iter()
+            .map(|a| Some((a.oldest_fetch_ms?, a.newest_fetch_ms?)))
+            .collect();
+        let oldest_fetch_ms = fetch_bounds
+            .as_ref()
+            .and_then(|b| b.iter().map(|x| x.0).min());
+        let newest_fetch_ms = fetch_bounds
+            .as_ref()
+            .and_then(|b| b.iter().map(|x| x.1).max());
         let entry = ArchiveRef {
             key: object.clone(),
             epoch,
@@ -1464,8 +1703,12 @@ impl TileStore {
                     return None;
                 }
                 let mut next = m.clone();
-                next.archives.splice(first..first + run_keys.len(), [entry.clone()]);
-                next.retired.extend(run_keys.iter().map(|k| Retired { key: k.clone(), retired: now_s }));
+                next.archives
+                    .splice(first..first + run_keys.len(), [entry.clone()]);
+                next.retired.extend(run_keys.iter().map(|k| Retired {
+                    key: k.clone(),
+                    retired: now_s,
+                }));
                 Some(next)
             })
             .await?;
@@ -1474,13 +1717,22 @@ impl TileStore {
         match published {
             Some(m) => {
                 self.remember_manifest(&key, Arc::new(m));
-                metrics::counter!("tuile_tiles_compactions_total", "layer" => layer.name.clone()).increment(1);
+                metrics::counter!("tuile_tiles_compactions_total", "layer" => layer.name.clone())
+                    .increment(1);
                 metrics::counter!("tuile_tiles_compacted_bytes_total", "layer" => layer.name.clone()).increment(bytes);
                 self.cleanup(layer, zone).await?;
-                Ok(Compaction::Merged { merged: run.len(), tiles: count })
+                Ok(Compaction::Merged {
+                    merged: run.len(),
+                    tiles: count,
+                })
             }
             None => {
-                if self.store.delete(&Path::from(object.as_str())).await.is_ok() {
+                if self
+                    .store
+                    .delete(&Path::from(object.as_str()))
+                    .await
+                    .is_ok()
+                {
                     self.record_deleted(&layer.name, zone, &[object]).await;
                 }
                 Ok(Compaction::Superseded)
@@ -1498,7 +1750,11 @@ impl TileStore {
 
         let expired: Vec<String> = {
             let m = manifest::read(self.store.as_ref(), &prefix).await?.manifest;
-            m.retired.iter().filter(|r| now_s.saturating_sub(r.retired) >= grace).map(|r| r.key.clone()).collect()
+            m.retired
+                .iter()
+                .filter(|r| now_s.saturating_sub(r.retired) >= grace)
+                .map(|r| r.key.clone())
+                .collect()
         };
         if !expired.is_empty() {
             self.publish(&(layer.name.clone(), zone), &prefix, |m| {
@@ -1517,20 +1773,29 @@ impl TileStore {
         }
         self.record_deleted(&layer.name, zone, &expired).await;
 
-
         // Orphans: archives under the zone that no manifest mentions.
         let m = manifest::read(self.store.as_ref(), &prefix).await?.manifest;
-        let known: Vec<&str> =
-            m.archives.iter().map(|a| a.key.as_str()).chain(m.retired.iter().map(|r| r.key.as_str())).collect();
-        let listed: Vec<object_store::ObjectMeta> =
-            self.store.list(Some(&Path::from(prefix.as_str()))).try_collect().await?;
+        let known: Vec<&str> = m
+            .archives
+            .iter()
+            .map(|a| a.key.as_str())
+            .chain(m.retired.iter().map(|r| r.key.as_str()))
+            .collect();
+        let listed: Vec<object_store::ObjectMeta> = self
+            .store
+            .list(Some(&Path::from(prefix.as_str())))
+            .try_collect()
+            .await?;
         for meta in listed {
             let k = meta.location.to_string();
             if !k.ends_with(".pmtiles") || known.contains(&k.as_str()) {
                 continue;
             }
             let modified: SystemTime = meta.last_modified.into();
-            let old = now.duration_since(modified).map(|a| a >= self.cfg.orphan_grace).unwrap_or(false);
+            let old = now
+                .duration_since(modified)
+                .map(|a| a >= self.cfg.orphan_grace)
+                .unwrap_or(false);
             if old {
                 self.store.delete(&meta.location).await?;
                 self.record_deleted(&layer.name, zone, &[k]).await;
@@ -1546,7 +1811,9 @@ impl Manifests {
     /// that started before our own publication must not undo it.
     /// Says whether it was news: no copy was kept, or an older one.
     fn remember(&self, key: &ZoneKey, m: Arc<Manifest>) -> bool {
-        let Ok(mut cache) = self.cache.lock() else { return false };
+        let Ok(mut cache) = self.cache.lock() else {
+            return false;
+        };
         let kept = cache.get(key).map(|(_, kept)| kept.generation);
         if kept.is_some_and(|kept| kept > m.generation) {
             return false;
@@ -1569,7 +1836,9 @@ fn drop_unnamed(disk: Option<&ArchiveCache>, zone_prefix: &str, m: &Manifest) {
 
 /// The zones around a zone at its level, within the grid. `top` has none.
 fn neighbours(layer: &Layer, zone: Zone) -> Vec<Zone> {
-    let Zone::Cell { x, y } = zone else { return Vec::new() };
+    let Zone::Cell { x, y } = zone else {
+        return Vec::new();
+    };
     let (w, h) = layer.grid.size(layer.zone_level);
     let mut out = Vec::with_capacity(8);
     for dy in -1i64..=1 {
@@ -1583,7 +1852,10 @@ fn neighbours(layer: &Layer, zone: Zone) -> Vec<Zone> {
             if ny < 0 || ny >= h as i64 {
                 continue;
             }
-            out.push(Zone::Cell { x: nx as u32, y: ny as u32 });
+            out.push(Zone::Cell {
+                x: nx as u32,
+                y: ny as u32,
+            });
         }
     }
     out.sort();
@@ -1593,7 +1865,10 @@ fn neighbours(layer: &Layer, zone: Zone) -> Vec<Zone> {
 
 /// The zone a `…/manifest.json` key belongs to, if it is one of `layer`'s.
 fn parse_manifest_key(layer: &Layer, key: &str) -> Option<Zone> {
-    let rest = key.strip_prefix(layer.name.as_str())?.strip_prefix('/')?.strip_suffix("/manifest.json")?;
+    let rest = key
+        .strip_prefix(layer.name.as_str())?
+        .strip_prefix('/')?
+        .strip_suffix("/manifest.json")?;
     if rest == "top" {
         return Some(Zone::Top);
     }
@@ -1606,7 +1881,10 @@ fn parse_manifest_key(layer: &Layer, key: &str) -> Option<Zone> {
 
 /// A new archive's key: unique, and sortable by time within the zone.
 fn archive_key(prefix: &str, epoch: &str, now: SystemTime) -> String {
-    let nanos = now.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let nanos = now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     let salt: u64 = rand::rng().random();
     format!("{prefix}/{epoch}-{nanos:024}-{salt:016x}.pmtiles")
 }
@@ -1618,7 +1896,11 @@ fn merged(
 ) -> impl futures_util::Stream<Item = Result<(u64, Bytes), StoreError>> {
     let heads = vec![0usize; inputs.len()];
     futures_util::stream::unfold((inputs, heads), |(inputs, mut heads)| async move {
-        let id = inputs.iter().enumerate().filter_map(|(i, (_, ids))| ids.get(heads[i]).copied()).min()?;
+        let id = inputs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (_, ids))| ids.get(heads[i]).copied())
+            .min()?;
         let mut newest = 0;
         for (i, (_, ids)) in inputs.iter().enumerate() {
             if ids.get(heads[i]) == Some(&id) {
@@ -1639,7 +1921,11 @@ fn merged(
 }
 
 /// Uploads a local file in parts.
-async fn upload(store: &dyn ObjectStore, path: &std::path::Path, key: &str) -> Result<(), StoreError> {
+async fn upload(
+    store: &dyn ObjectStore,
+    path: &std::path::Path,
+    key: &str,
+) -> Result<(), StoreError> {
     let upload = store.put_multipart(&Path::from(key)).await?;
     let mut writer = WriteMultipart::new_with_chunk_size(upload, UPLOAD_PART);
     let mut file = tokio::fs::File::open(path).await?;
@@ -1657,7 +1943,11 @@ async fn upload(store: &dyn ObjectStore, path: &std::path::Path, key: &str) -> R
 }
 
 /// Downloads an object to a local file.
-pub(crate) async fn download(store: &dyn ObjectStore, key: &str, to: &std::path::Path) -> Result<(), StoreError> {
+pub(crate) async fn download(
+    store: &dyn ObjectStore,
+    key: &str,
+    to: &std::path::Path,
+) -> Result<(), StoreError> {
     use tokio::io::AsyncWriteExt;
     let got = store.get(&Path::from(key)).await?;
     let mut stream = got.into_stream();

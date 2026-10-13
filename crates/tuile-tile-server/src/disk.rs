@@ -128,7 +128,10 @@ pub(crate) type ArchiveCopy = Shared<BoxFuture<'static, bool>>;
 /// Is this archive key a plain relative path, safe to join under the cache
 /// directory?
 fn safe_relative(key: &str) -> bool {
-    !key.is_empty() && FsPath::new(key).components().all(|c| matches!(c, Component::Normal(_)))
+    !key.is_empty()
+        && FsPath::new(key)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
 }
 
 impl ArchiveCache {
@@ -149,8 +152,16 @@ impl ArchiveCache {
                     let _ = std::fs::remove_file(&path);
                 } else if path.extension().is_some_and(|e| e == "pmtiles") {
                     if let Ok(rel) = path.strip_prefix(&cfg.dir) {
-                        let key = rel.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/");
-                        found.push((meta.modified().unwrap_or(SystemTime::UNIX_EPOCH), key, meta.len()));
+                        let key = rel
+                            .components()
+                            .map(|c| c.as_os_str().to_string_lossy())
+                            .collect::<Vec<_>>()
+                            .join("/");
+                        found.push((
+                            meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                            key,
+                            meta.len(),
+                        ));
                     }
                 }
             }
@@ -189,7 +200,10 @@ impl ArchiveCache {
     }
 
     pub(crate) fn has(&self, key: &str) -> bool {
-        self.readers.lock().map(|r| r.contains(&key.to_string())).unwrap_or(false)
+        self.readers
+            .lock()
+            .map(|r| r.contains(&key.to_string()))
+            .unwrap_or(false)
     }
 
     /// Bytes on disk.
@@ -201,7 +215,12 @@ impl ArchiveCache {
     /// it is already here or is never copied (too large, odd key, no
     /// runtime). The flag says whether this call started it. The copy runs to
     /// its end whether or not anyone awaits it.
-    pub(crate) fn copy(self: &Arc<Self>, objects: Arc<dyn ObjectStore>, key: &str, bytes: u64) -> Option<(ArchiveCopy, bool)> {
+    pub(crate) fn copy(
+        self: &Arc<Self>,
+        objects: Arc<dyn ObjectStore>,
+        key: &str,
+        bytes: u64,
+    ) -> Option<(ArchiveCopy, bool)> {
         if bytes > self.cfg.max_archive_bytes || !safe_relative(key) || self.has(key) {
             return None;
         }
@@ -236,7 +255,12 @@ impl ArchiveCache {
 
     /// Copies an archive now, and waits for it. `bytes` is the size its
     /// manifest states, which picks the queue.
-    pub(crate) async fn fetch(&self, objects: &dyn ObjectStore, key: &str, bytes: u64) -> Result<Arc<LocalReader>, StoreError> {
+    pub(crate) async fn fetch(
+        &self,
+        objects: &dyn ObjectStore,
+        key: &str,
+        bytes: u64,
+    ) -> Result<Arc<LocalReader>, StoreError> {
         if let Some(r) = self.reader(key) {
             return Ok(r);
         }
@@ -246,13 +270,20 @@ impl ArchiveCache {
         let large = bytes >= LARGE_ARCHIVE_BYTES;
         let _small = (!large).then(|| SmallCopy::new(&self.small));
         let _permit = if large {
-            let permit = self.large_permits.acquire().await.map_err(|_| StoreError::Poisoned)?;
+            let permit = self
+                .large_permits
+                .acquire()
+                .await
+                .map_err(|_| StoreError::Poisoned)?;
             // Behind every small copy: those are what readers wait on.
             let mut quiet = self.small.subscribe();
             let _ = quiet.wait_for(|n| *n == 0).await;
             permit
         } else {
-            self.permits.acquire().await.map_err(|_| StoreError::Poisoned)?
+            self.permits
+                .acquire()
+                .await
+                .map_err(|_| StoreError::Poisoned)?
         };
         // Copied while this one waited its turn.
         if let Some(r) = self.reader(key) {
@@ -275,7 +306,11 @@ impl ArchiveCache {
         let reader = Arc::new(archive::open_local(&path).await?);
         metrics::counter!("tuile_tiles_archive_copies_total").increment(1);
         metrics::counter!("tuile_tiles_archive_copy_bytes_total").increment(len);
-        let evicted = self.readers.lock().map_err(|_| StoreError::Poisoned)?.insert(key.to_string(), reader.clone(), len);
+        let evicted = self
+            .readers
+            .lock()
+            .map_err(|_| StoreError::Poisoned)?
+            .insert(key.to_string(), reader.clone(), len);
         for (gone, _) in evicted {
             // A reader still holding the old mapping keeps it until it is done.
             let _ = std::fs::remove_file(self.cfg.dir.join(gone));
@@ -288,9 +323,14 @@ impl ArchiveCache {
     /// would otherwise sit in the budget until the least recently used of
     /// all. Returns how many were dropped.
     pub(crate) fn keep_only(&self, prefix: &str, named: &[&str]) -> usize {
-        let Ok(mut readers) = self.readers.lock() else { return 0 };
-        let gone: Vec<String> =
-            readers.keys().filter(|k| k.starts_with(prefix) && !named.contains(&k.as_str())).cloned().collect();
+        let Ok(mut readers) = self.readers.lock() else {
+            return 0;
+        };
+        let gone: Vec<String> = readers
+            .keys()
+            .filter(|k| k.starts_with(prefix) && !named.contains(&k.as_str()))
+            .cloned()
+            .collect();
         for key in &gone {
             readers.remove(key);
             // A reader still holding the mapping keeps it until it is done.
@@ -312,7 +352,9 @@ mod tests {
 
     #[test]
     fn only_plain_relative_keys_land_on_disk() {
-        assert!(safe_relative("asset-2/zones/z10/522/373/202609-1-a.pmtiles"));
+        assert!(safe_relative(
+            "asset-2/zones/z10/522/373/202609-1-a.pmtiles"
+        ));
         assert!(!safe_relative("../etc/passwd"));
         assert!(!safe_relative("/abs/path.pmtiles"));
         assert!(!safe_relative(""));

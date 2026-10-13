@@ -145,7 +145,10 @@ pub fn bake_frames(
     source: &mut dyn PoseSource,
 ) -> Result<BakeOutcome, String> {
     if job.first == 0 || job.first > job.last {
-        return Err(format!("frames {}:{} is not a range of frames", job.first, job.last));
+        return Err(format!(
+            "frames {}:{} is not a range of frames",
+            job.first, job.last
+        ));
     }
     let began = Instant::now();
     // Le blob part sur disque au fil de la cuisson, à côté du pack.
@@ -163,7 +166,9 @@ pub fn bake_frames(
     });
 
     for number in job.first..=job.last {
-        let pose = source.pose(number, session).map_err(|e| format!("frame {number}: {e}"))?;
+        let pose = source
+            .pose(number, session)
+            .map_err(|e| format!("frame {number}: {e}"))?;
         let at = Instant::now();
         let frame = session
             .frame_for_pose(&pose, job.viewport)
@@ -186,7 +191,11 @@ pub fn bake_frames(
                 )
                 .map_err(|e| format!("opening {}: {e}", spill.display()))?
                 .culling(job.culling)
-                .with_content(job.content.content, &job.content.terrain_layer, &job.content.imagery_layer),
+                .with_content(
+                    job.content.content,
+                    &job.content.terrain_layer,
+                    &job.content.imagery_layer,
+                ),
             ),
         };
 
@@ -223,10 +232,18 @@ pub fn bake_frames(
         }
         open.end();
         if let Some(herald) = herald.as_mut() {
-            herald.frame_done(number, number == job.last).map_err(|e| format!("frame {number}: announcing its tiles: {e}"))?;
+            herald
+                .frame_done(number, number == job.last)
+                .map_err(|e| format!("frame {number}: announcing its tiles: {e}"))?;
         }
         poses.push(pose);
-        tracing::info!(frame = number, selected, reused, seconds = at.elapsed().as_secs_f64(), "BAKE-FRAME");
+        tracing::info!(
+            frame = number,
+            selected,
+            reused,
+            seconds = at.elapsed().as_secs_f64(),
+            "BAKE-FRAME"
+        );
     }
 
     let scene = match &job.scene {
@@ -246,7 +263,11 @@ pub fn bake_frames(
         seconds = began.elapsed().as_secs_f64(),
         "BAKE-DONE"
     );
-    Ok(BakeOutcome { scene, poses, bytes })
+    Ok(BakeOutcome {
+        scene,
+        poses,
+        bytes,
+    })
 }
 
 /// Tout ce qui décide du contenu d'un pack hors trajectoire, en une chaîne.
@@ -285,7 +306,11 @@ pub fn bake_settings(config: &GlobeConfig, resolved: &tuile_core::traversal::Con
 /// changed — writer version, repeated schemas, `HashMap` order — measured on 16
 /// September 2026, when two bakes of one trajectory landed under
 /// `fb45fe68fb26e559` and `05274f175b83df6a`, and both were right.
-pub fn digest_of_scene(poses: &[tuile_tape::Frame], viewport: (f64, f64), settings: &str) -> String {
+pub fn digest_of_scene(
+    poses: &[tuile_tape::Frame],
+    viewport: (f64, f64),
+    settings: &str,
+) -> String {
     let mut path = Vec::with_capacity(poses.len() * 10 * 8);
     for pose in poses {
         for value in pose
@@ -298,7 +323,12 @@ pub fn digest_of_scene(poses: &[tuile_tape::Frame], viewport: (f64, f64), settin
             path.extend_from_slice(&value.to_le_bytes());
         }
     }
-    tuile_pack::scene_digest(&[&path, &viewport.0.to_le_bytes(), &viewport.1.to_le_bytes(), settings.as_bytes()])
+    tuile_pack::scene_digest(&[
+        &path,
+        &viewport.0.to_le_bytes(),
+        &viewport.1.to_le_bytes(),
+        settings.as_bytes(),
+    ])
 }
 
 /// Vertex data as the pack stores it: little-endian, whatever the host is.
@@ -393,13 +423,21 @@ pub fn packed_tile(
         index_count: shape.index_count,
         base_color_factor: shape.base_color_factor,
         // What the picture would have been encoded as, had it been made.
-        texture_format: if tile.drape() != 0 { TextureFormat::Png } else { TextureFormat::None },
+        texture_format: if tile.drape() != 0 {
+            TextureFormat::Png
+        } else {
+            TextureFormat::None
+        },
         refs: Some(refs),
         texture: None,
     })
 }
 
-pub fn baked_tile(frame: &Frame, index: usize, tile: &Arc<TileGeometry>) -> Result<BakedTile, String> {
+pub fn baked_tile(
+    frame: &Frame,
+    index: usize,
+    tile: &Arc<TileGeometry>,
+) -> Result<BakedTile, String> {
     // One prim per tile, as the consumer expects; terrain produces one mesh.
     let mesh = tile
         .content
@@ -410,13 +448,18 @@ pub fn baked_tile(frame: &Frame, index: usize, tile: &Arc<TileGeometry>) -> Resu
     // Index 0 only: a terrain tile carries one draped mosaic. A tile with
     // several would need the pack to hold several, and nothing produces one —
     // so this fails loudly rather than silently baking the first of many.
-    let texture = frame.texture_png(index, 0).map_err(|e| format!("tile {}: {e}", tile.tile.0))?;
+    let texture = frame
+        .texture_png(index, 0)
+        .map_err(|e| format!("tile {}: {e}", tile.tile.0))?;
     if frame
         .texture_png(index, 1)
         .map_err(|e| format!("tile {}: {e}", tile.tile.0))?
         .is_some()
     {
-        return Err(format!("tile {} carries more than one texture; the pack holds one", tile.tile.0));
+        return Err(format!(
+            "tile {} carries more than one texture; the pack holds one",
+            tile.tile.0
+        ));
     }
 
     // A tile that names a drape and carries no texture is bare ground: the
@@ -437,13 +480,21 @@ pub fn baked_tile(frame: &Frame, index: usize, tile: &Arc<TileGeometry>) -> Resu
         drape: tile.drape(),
         origin_ecef: tile.origin_ecef.to_array(),
         positions: f32x3_le(&mesh.positions),
-        normals: mesh.normals.as_ref().map(|n| f32x3_le(n)).unwrap_or_default(),
+        normals: mesh
+            .normals
+            .as_ref()
+            .map(|n| f32x3_le(n))
+            .unwrap_or_default(),
         uvs: mesh.uvs.as_ref().map(|u| f32x2_le(u)).unwrap_or_default(),
         indices: u32_le(&mesh.indices),
         vertex_count: mesh.positions.len() as u32,
         index_count: mesh.indices.len() as u32,
         base_color_factor: mesh.material.base_color_factor,
-        texture_format: if texture.is_some() { TextureFormat::Png } else { TextureFormat::None },
+        texture_format: if texture.is_some() {
+            TextureFormat::Png
+        } else {
+            TextureFormat::None
+        },
         refs: tile.refs.clone(),
         texture: texture.map(|t| t.png.clone()),
     })
@@ -458,7 +509,10 @@ mod tests {
         assert!(drape_has_its_pixels(0, false), "terrain with no imagery");
         assert!(drape_has_its_pixels(0, true), "a texture the tile owns");
         assert!(drape_has_its_pixels(0xdead, true), "a draped tile");
-        assert!(!drape_has_its_pixels(0xdead, false), "a drape whose pixels are nowhere");
+        assert!(
+            !drape_has_its_pixels(0xdead, false),
+            "a drape whose pixels are nowhere"
+        );
     }
 
     #[test]
@@ -479,7 +533,8 @@ mod tests {
     #[test]
     fn a_scene_named_late_is_the_pack_s_name() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut writer = PackWriter::new(String::new(), [0.0; 3], dir.path().join("blob.part")).expect("writer");
+        let mut writer =
+            PackWriter::new(String::new(), [0.0; 3], dir.path().join("blob.part")).expect("writer");
         writer.frame(
             1,
             tuile_pack::BakedView {
@@ -496,8 +551,12 @@ mod tests {
         writer.finish_to(&path).expect("pack");
 
         let bytes = std::fs::read(&path).expect("read");
-        assert_eq!(tuile_pack::Pack::open(&bytes).expect("open").scene_digest(), "named-after-the-poses");
-        let session = Session::from_pack(&path, Some("named-after-the-poses")).expect("the late name is the one a render checks");
+        assert_eq!(
+            tuile_pack::Pack::open(&bytes).expect("open").scene_digest(),
+            "named-after-the-poses"
+        );
+        let session = Session::from_pack(&path, Some("named-after-the-poses"))
+            .expect("the late name is the one a render checks");
         assert!(session.heights().is_none());
     }
 
@@ -524,14 +583,23 @@ mod tests {
                         tuile_planetary::digest(&id.to_le_bytes()),
                     );
                     noted.fetched_imagery(content.imagery[0].coord, b"imagery bytes");
-                    Arc::new(finish_tile_as(&memo, "t", tile, content, 256, Some(&noted), finish))
+                    Arc::new(finish_tile_as(
+                        &memo,
+                        "t",
+                        tile,
+                        content,
+                        256,
+                        Some(&noted),
+                        finish,
+                    ))
                 })
                 .collect();
             let frame = Frame::with_memo("t", tiles, memo);
             let dir = tempfile::tempdir().expect("tempdir");
-            let mut writer = PackWriter::new("scene".to_string(), [0.0; 3], dir.path().join("blob.part"))
-                .expect("writer")
-                .with_content(tuile_pack::Content::References, "terrain", "imagery");
+            let mut writer =
+                PackWriter::new("scene".to_string(), [0.0; 3], dir.path().join("blob.part"))
+                    .expect("writer")
+                    .with_content(tuile_pack::Content::References, "terrain", "imagery");
             let mut open = writer.begin_frame(
                 1,
                 tuile_pack::BakedView {
@@ -544,7 +612,8 @@ mod tests {
             );
             for (index, tile) in frame.tiles.iter().enumerate() {
                 open.push(
-                    packed_tile(&frame, index, tile, tuile_pack::Content::References).expect("a tile for the pack"),
+                    packed_tile(&frame, index, tile, tuile_pack::Content::References)
+                        .expect("a tile for the pack"),
                 );
             }
             open.end();
@@ -575,7 +644,10 @@ mod tests {
         ));
         let frame = Frame::with_memo("t", vec![Arc::clone(&tile)], memo);
         for content in [tuile_pack::Content::Embedded, tuile_pack::Content::Both] {
-            assert!(packed_tile(&frame, 0, &tile, content).is_err(), "{content:?}");
+            assert!(
+                packed_tile(&frame, 0, &tile, content).is_err(),
+                "{content:?}"
+            );
         }
         // And by reference it needs its references.
         assert!(packed_tile(&frame, 0, &tile, tuile_pack::Content::References).is_err());

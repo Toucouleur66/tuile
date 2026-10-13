@@ -41,7 +41,10 @@ concat <out> <segment>… | render";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("tuile-farm: runtime: {e}");
@@ -81,7 +84,11 @@ async fn run(args: &[String]) -> ExitCode {
     // typo and not as a missing credential.
     let known = matches!(
         a.as_slice(),
-        ["get", _, _] | ["put", _, _] | ["exists", _] | ["list", _] | ["receipt", _, _, _, _, _]
+        ["get", _, _]
+            | ["put", _, _]
+            | ["exists", _]
+            | ["list", _]
+            | ["receipt", _, _, _, _, _]
             | ["assemble", _, _, _]
             | ["assemble", _, _, _, _]
     );
@@ -97,12 +104,21 @@ async fn run(args: &[String]) -> ExitCode {
         }
     };
     let outcome: Result<ExitCode, String> = match a.as_slice() {
-        ["get", key, dest] => store.get(key, Path::new(dest)).await.map(|_| ExitCode::SUCCESS),
-        ["put", src, key] => store.put(Path::new(src), key).await.map(|_| ExitCode::SUCCESS),
-        ["exists", key] => store
-            .exists(key)
+        ["get", key, dest] => store
+            .get(key, Path::new(dest))
             .await
-            .map(|there| if there { ExitCode::SUCCESS } else { ExitCode::from(1) }),
+            .map(|_| ExitCode::SUCCESS),
+        ["put", src, key] => store
+            .put(Path::new(src), key)
+            .await
+            .map(|_| ExitCode::SUCCESS),
+        ["exists", key] => store.exists(key).await.map(|there| {
+            if there {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
+        }),
         ["list", prefix] => store.list(prefix).await.map(|entries| {
             for e in entries {
                 println!("{} {}", e.size, e.key);
@@ -148,7 +164,10 @@ async fn receipt(
             task: task.parse().ok()?,
             first: first.parse().ok()?,
             last: last.parse().ok()?,
-            segments: segs.split(',').map(|s| s.trim().parse().ok()).collect::<Option<_>>()?,
+            segments: segs
+                .split(',')
+                .map(|s| s.trim().parse().ok())
+                .collect::<Option<_>>()?,
         })
     })();
     let Some(receipt) = parsed else {
@@ -161,7 +180,10 @@ async fn receipt(
         let file = dir.path().join("receipt.json");
         let body = serde_json::to_vec(&receipt).map_err(|e| e.to_string())?;
         std::fs::write(&file, body).map_err(|e| e.to_string())?;
-        store.put(&file, &keys.receipt(receipt.task)).await.map_err(|e| e.to_string())
+        store
+            .put(&file, &keys.receipt(receipt.task))
+            .await
+            .map_err(|e| e.to_string())
     }
     .await;
     match result {

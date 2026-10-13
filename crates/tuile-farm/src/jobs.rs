@@ -37,9 +37,18 @@ use tokio::sync::Mutex;
 #[derive(Debug, thiserror::Error)]
 pub enum JobsError {
     #[error("{method} {url} → {status}: {message}")]
-    Http { method: &'static str, url: String, status: u16, message: String },
+    Http {
+        method: &'static str,
+        url: String,
+        status: u16,
+        message: String,
+    },
     #[error("{method} {url}: {message}")]
-    Network { method: &'static str, url: String, message: String },
+    Network {
+        method: &'static str,
+        url: String,
+        message: String,
+    },
     #[error("authentication: {0}")]
     Auth(String),
     #[error("unexpected answer from {url}: {message}")]
@@ -160,17 +169,28 @@ impl ServiceAccountKey {
     pub fn from_file(path: &std::path::Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| JobsError::Auth(format!("{}: {e}", path.display())))?;
-        let key: KeyFile = serde_json::from_str(&text)
-            .map_err(|e| JobsError::Auth(format!("{}: not a service account key: {e}", path.display())))?;
+        let key: KeyFile = serde_json::from_str(&text).map_err(|e| {
+            JobsError::Auth(format!(
+                "{}: not a service account key: {e}",
+                path.display()
+            ))
+        })?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
             .build()
             .map_err(|e| JobsError::Auth(e.to_string()))?;
-        Ok(ServiceAccountKey { key, http, cached: Mutex::new(None) })
+        Ok(ServiceAccountKey {
+            key,
+            http,
+            cached: Mutex::new(None),
+        })
     }
 
     async fn mint(&self) -> Result<Cached> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let claims = Claims {
             iss: &self.key.client_email,
             scope: "https://www.googleapis.com/auth/cloud-platform",
@@ -201,7 +221,9 @@ impl ServiceAccountKey {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(JobsError::Auth(format!("token exchange → {status}: {body}")));
+            return Err(JobsError::Auth(format!(
+                "token exchange → {status}: {body}"
+            )));
         }
         #[derive(Deserialize)]
         struct Answer {
@@ -213,7 +235,10 @@ impl ServiceAccountKey {
         // Five minutes of margin: a token handed out one second before it
         // dies is a 401 waiting to happen.
         let life = Duration::from_secs(answer.expires_in.saturating_sub(300).max(60));
-        Ok(Cached { token: answer.access_token, until: Instant::now() + life })
+        Ok(Cached {
+            token: answer.access_token,
+            until: Instant::now() + life,
+        })
     }
 }
 
@@ -241,7 +266,9 @@ pub struct GcloudToken {
 
 impl GcloudToken {
     pub fn new() -> Self {
-        GcloudToken { cached: Mutex::new(None) }
+        GcloudToken {
+            cached: Mutex::new(None),
+        }
     }
 }
 
@@ -275,7 +302,10 @@ impl TokenSource for GcloudToken {
         let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
         // gcloud does not say when its token dies; 45 minutes is inside the
         // hour it always gives.
-        *cached = Some(Cached { token: token.clone(), until: Instant::now() + Duration::from_secs(45 * 60) });
+        *cached = Some(Cached {
+            token: token.clone(),
+            until: Instant::now() + Duration::from_secs(45 * 60),
+        });
         Ok(token)
     }
 }
@@ -284,9 +314,9 @@ impl TokenSource for GcloudToken {
 /// the `gcloud` login otherwise.
 pub fn default_tokens() -> Result<Arc<dyn TokenSource>> {
     match std::env::var("GOOGLE_APPLICATION_CREDENTIALS") {
-        Ok(path) if !path.is_empty() => {
-            Ok(Arc::new(ServiceAccountKey::from_file(std::path::Path::new(&path))?))
-        }
+        Ok(path) if !path.is_empty() => Ok(Arc::new(ServiceAccountKey::from_file(
+            std::path::Path::new(&path),
+        )?)),
         _ => Ok(Arc::new(GcloudToken::new())),
     }
 }
@@ -381,11 +411,19 @@ impl JobsApi {
     }
 
     pub fn job_path(&self, job: &str) -> String {
-        format!("projects/{}/locations/{}/jobs/{job}", self.project, self.region)
+        format!(
+            "projects/{}/locations/{}/jobs/{job}",
+            self.project, self.region
+        )
     }
 
     /// One call, with the two rules of the module doc.
-    async fn call(&self, method: Method, path: &str, body: Option<serde_json::Value>) -> Result<serde_json::Value> {
+    async fn call(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value> {
         let url = if path.starts_with("http") {
             path.to_string()
         } else {
@@ -399,17 +437,25 @@ impl JobsApi {
             let token = self.tokens.token(fresh).await?;
             fresh = false;
             let retry = |attempt: u32| {
-                self.retry_base.saturating_mul(1 << attempt.min(6)).min(Duration::from_secs(60))
+                self.retry_base
+                    .saturating_mul(1 << attempt.min(6))
+                    .min(Duration::from_secs(60))
             };
-            match self.transport.send(method, &url, &token, body.clone()).await {
+            match self
+                .transport
+                .send(method, &url, &token, body.clone())
+                .await
+            {
                 Ok((status, bytes)) if (200..300).contains(&status) => {
                     // An empty 200 is a success, not a truncated JSON:
                     // `:cancel` sometimes answers with nothing.
                     if bytes.iter().all(u8::is_ascii_whitespace) {
                         return Ok(serde_json::Value::Object(Default::default()));
                     }
-                    return serde_json::from_slice(&bytes)
-                        .map_err(|e| JobsError::Shape { url, message: e.to_string() });
+                    return serde_json::from_slice(&bytes).map_err(|e| JobsError::Shape {
+                        url,
+                        message: e.to_string(),
+                    });
                 }
                 Ok((401, _)) if !refreshed => {
                     // Once, not in a loop: a token just renewed and refused
@@ -417,9 +463,10 @@ impl JobsApi {
                     refreshed = true;
                     fresh = true;
                 }
-                Ok((status, _)) if TRANSIENT.contains(&status)
-                    && method == Method::Get
-                    && attempt < self.retries =>
+                Ok((status, _))
+                    if TRANSIENT.contains(&status)
+                        && method == Method::Get
+                        && attempt < self.retries =>
                 {
                     eprintln!("  (API {status}, retrying)");
                     tokio::time::sleep(retry(attempt)).await;
@@ -431,7 +478,12 @@ impl JobsApi {
                         .ok()
                         .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
                         .unwrap_or(text);
-                    return Err(JobsError::Http { method: method.as_str(), url, status, message });
+                    return Err(JobsError::Http {
+                        method: method.as_str(),
+                        url,
+                        status,
+                        message,
+                    });
                 }
                 Err(message) if method == Method::Get && attempt < self.retries => {
                     eprintln!("  (network: {message}, retrying)");
@@ -439,7 +491,11 @@ impl JobsApi {
                     attempt += 1;
                 }
                 Err(message) => {
-                    return Err(JobsError::Network { method: method.as_str(), url, message });
+                    return Err(JobsError::Network {
+                        method: method.as_str(),
+                        url,
+                        message,
+                    });
                 }
             }
         }
@@ -453,7 +509,10 @@ impl JobsApi {
         v["template"]["template"]["containers"][0]["image"]
             .as_str()
             .map(str::to_string)
-            .ok_or_else(|| JobsError::Shape { url: path, message: "the job declares no image".into() })
+            .ok_or_else(|| JobsError::Shape {
+                url: path,
+                message: "the job declares no image".into(),
+            })
     }
 
     /// Starts an execution of `job` with `env` merged into every task's
@@ -469,7 +528,10 @@ impl JobsApi {
         tasks: u32,
         validate_only: bool,
     ) -> Result<Option<String>> {
-        let env: Vec<_> = env.iter().map(|(k, v)| serde_json::json!({"name": k, "value": v})).collect();
+        let env: Vec<_> = env
+            .iter()
+            .map(|(k, v)| serde_json::json!({"name": k, "value": v}))
+            .collect();
         let mut body = serde_json::json!({
             "overrides": {"containerOverrides": [{"env": env}], "taskCount": tasks}
         });
@@ -488,7 +550,10 @@ impl JobsApi {
             .or_else(|| op["name"].as_str())
             .filter(|s| !s.is_empty())
             .map(|s| Some(s.to_string()))
-            .ok_or_else(|| JobsError::Shape { url: path, message: format!("no execution named in {op}") })
+            .ok_or_else(|| JobsError::Shape {
+                url: path,
+                message: format!("no execution named in {op}"),
+            })
     }
 
     /// The digest behind an image tag in an artifact registry
@@ -496,7 +561,10 @@ impl JobsApi {
     /// registry's API. A tag moves — `5.1-su` named three different binaries
     /// in one week — so a manifest records the digest.
     pub async fn image_digest(&self, image: &str) -> Result<String> {
-        let shape = || JobsError::Shape { url: image.to_string(), message: "not LOCATION-docker.pkg.dev/PROJECT/REPO/IMAGE:TAG".into() };
+        let shape = || JobsError::Shape {
+            url: image.to_string(),
+            message: "not LOCATION-docker.pkg.dev/PROJECT/REPO/IMAGE:TAG".into(),
+        };
         let (host, rest) = image.split_once('/').ok_or_else(shape)?;
         let location = host.strip_suffix("-docker.pkg.dev").ok_or_else(shape)?;
         let (path, tag) = rest.rsplit_once(':').ok_or_else(shape)?;
@@ -514,7 +582,10 @@ impl JobsApi {
             .as_str()
             .and_then(|version| version.rsplit('/').next())
             .map(str::to_string)
-            .ok_or_else(|| JobsError::Shape { url, message: "no version for this tag".into() })
+            .ok_or_else(|| JobsError::Shape {
+                url,
+                message: "no version for this tag".into(),
+            })
     }
 
     /// Cancels execution `name`: its tasks stop and stop billing. For an
@@ -523,13 +594,21 @@ impl JobsApi {
     /// Not retried, like [`JobsApi::run`]: a second cancel of an execution
     /// already stopping is an error the caller should see, not paper over.
     pub async fn cancel(&self, name: &str) -> Result<()> {
-        self.call(Method::Post, &format!("{name}:cancel"), Some(serde_json::json!({}))).await?;
+        self.call(
+            Method::Post,
+            &format!("{name}:cancel"),
+            Some(serde_json::json!({})),
+        )
+        .await?;
         Ok(())
     }
 
     pub async fn execution(&self, name: &str) -> Result<Execution> {
         let v = self.call(Method::Get, name, None).await?;
-        serde_json::from_value(v).map_err(|e| JobsError::Shape { url: name.to_string(), message: e.to_string() })
+        serde_json::from_value(v).map_err(|e| JobsError::Shape {
+            url: name.to_string(),
+            message: e.to_string(),
+        })
     }
 
     /// Follows `name` until the service reports it complete — completion, not
@@ -574,7 +653,10 @@ mod tests {
                 .map(|a| a.map(|(s, b)| (s, b.to_string())).map_err(str::to_string))
                 .collect();
             answers.reverse();
-            Arc::new(Scripted { answers: std::sync::Mutex::new(answers), seen: Default::default() })
+            Arc::new(Scripted {
+                answers: std::sync::Mutex::new(answers),
+                seen: Default::default(),
+            })
         }
         fn calls(&self) -> Vec<(Method, String, String)> {
             self.seen.lock().expect("lock").clone()
@@ -590,8 +672,16 @@ mod tests {
             bearer: &str,
             _body: Option<Vec<u8>>,
         ) -> std::result::Result<(u16, Vec<u8>), String> {
-            self.seen.lock().expect("lock").push((method, url.to_string(), bearer.to_string()));
-            let next = self.answers.lock().expect("lock").pop().expect("script ran out");
+            self.seen
+                .lock()
+                .expect("lock")
+                .push((method, url.to_string(), bearer.to_string()));
+            let next = self
+                .answers
+                .lock()
+                .expect("lock")
+                .pop()
+                .expect("script ran out");
             next.map(|(s, b)| (s, b.into_bytes()))
         }
     }
@@ -610,8 +700,14 @@ mod tests {
     }
 
     fn api(t: &Arc<Scripted>) -> JobsApi {
-        JobsApi::new(t.clone(), Arc::new(Counting(AtomicU32::new(0))), "https://jobs.test/v2", "p", "r")
-            .with_retry(Duration::ZERO, 8)
+        JobsApi::new(
+            t.clone(),
+            Arc::new(Counting(AtomicU32::new(0))),
+            "https://jobs.test/v2",
+            "p",
+            "r",
+        )
+        .with_retry(Duration::ZERO, 8)
     }
 
     const DONE: &str = r#"{"name":"projects/p/locations/r/jobs/j/executions/j-abc","taskCount":3,
@@ -619,8 +715,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_read_survives_hiccups() {
-        let t = Scripted::new(vec![Ok((503, "{}")), Err("connection reset"), Ok((200, DONE))]);
-        let ex = api(&t).execution("projects/p/locations/r/jobs/j/executions/j-abc").await.expect("read");
+        let t = Scripted::new(vec![
+            Ok((503, "{}")),
+            Err("connection reset"),
+            Ok((200, DONE)),
+        ]);
+        let ex = api(&t)
+            .execution("projects/p/locations/r/jobs/j/executions/j-abc")
+            .await
+            .expect("read");
         assert_eq!(ex.succeeded_count, 3);
         assert_eq!(t.calls().len(), 3);
     }
@@ -629,7 +732,10 @@ mod tests {
     async fn a_launch_is_never_retried() {
         // Retrying `:run` could start — and bill — a second execution.
         let t = Scripted::new(vec![Ok((503, r#"{"error":{"message":"unavailable"}}"#))]);
-        let err = api(&t).run("j", &[], 3, false).await.expect_err("must fail");
+        let err = api(&t)
+            .run("j", &[], 3, false)
+            .await
+            .expect_err("must fail");
         assert!(matches!(err, JobsError::Http { status: 503, .. }), "{err}");
         assert_eq!(t.calls().len(), 1);
     }
@@ -648,29 +754,48 @@ mod tests {
 
     #[tokio::test]
     async fn run_names_the_execution_and_sends_the_env() {
-        let t = Scripted::new(vec![Ok((200, r#"{"metadata":{"name":"projects/p/locations/r/jobs/j/executions/j-xyz"}}"#))]);
+        let t = Scripted::new(vec![Ok((
+            200,
+            r#"{"metadata":{"name":"projects/p/locations/r/jobs/j/executions/j-xyz"}}"#,
+        ))]);
         let name = api(&t)
             .run("j", &[("JOB_FRAMES".into(), "1:4".into())], 2, false)
             .await
             .expect("run");
-        assert_eq!(name.as_deref(), Some("projects/p/locations/r/jobs/j/executions/j-xyz"));
-        assert_eq!(t.calls()[0].1, "https://jobs.test/v2/projects/p/locations/r/jobs/j:run");
+        assert_eq!(
+            name.as_deref(),
+            Some("projects/p/locations/r/jobs/j/executions/j-xyz")
+        );
+        assert_eq!(
+            t.calls()[0].1,
+            "https://jobs.test/v2/projects/p/locations/r/jobs/j:run"
+        );
     }
 
     #[tokio::test]
     async fn cancel_posts_to_the_execution_itself() {
         let t = Scripted::new(vec![Ok((200, "{}"))]);
-        api(&t).cancel("projects/p/locations/r/jobs/j/executions/j-xyz").await.expect("cancel");
+        api(&t)
+            .cancel("projects/p/locations/r/jobs/j/executions/j-xyz")
+            .await
+            .expect("cancel");
         let calls = t.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, Method::Post);
-        assert_eq!(calls[0].1, "https://jobs.test/v2/projects/p/locations/r/jobs/j/executions/j-xyz:cancel");
+        assert_eq!(
+            calls[0].1,
+            "https://jobs.test/v2/projects/p/locations/r/jobs/j/executions/j-xyz:cancel"
+        );
     }
 
     #[tokio::test]
     async fn wait_returns_at_completion_not_at_the_first_success() {
         let one_of_three = r#"{"name":"e","taskCount":3,"succeededCount":1,"runningCount":2}"#;
-        let t = Scripted::new(vec![Ok((200, one_of_three)), Ok((200, one_of_three)), Ok((200, DONE))]);
+        let t = Scripted::new(vec![
+            Ok((200, one_of_three)),
+            Ok((200, one_of_three)),
+            Ok((200, DONE)),
+        ]);
         let mut changes = 0;
         let mut polls = 0;
         let ex = api(&t)

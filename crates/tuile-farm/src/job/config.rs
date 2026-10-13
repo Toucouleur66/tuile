@@ -16,7 +16,11 @@ pub enum ConfigError {
     #[error("{0} is required (e.g. JOB_FRAMES=1:1440)")]
     Missing(&'static str),
     #[error("{name}={value:?}: {why}")]
-    Bad { name: &'static str, value: String, why: &'static str },
+    Bad {
+        name: &'static str,
+        value: String,
+        why: &'static str,
+    },
 }
 
 /// The render job's configuration.
@@ -110,10 +114,14 @@ pub const TRACE_BLENDER_ARGS: &str =
 /// external launchers must not drift apart on what decides whether a render
 /// ends at all.
 pub fn batch_env(get: &dyn Fn(&str) -> Option<String>) -> Vec<(String, String)> {
-    [("CYCLES_BACKGROUND", "1"), ("CYCLES_AUTO_TILE", "0"), ("TUILE_WAIT_MODE", "command")]
-        .iter()
-        .map(|(k, d)| (k.to_string(), get(k).unwrap_or_else(|| d.to_string())))
-        .collect()
+    [
+        ("CYCLES_BACKGROUND", "1"),
+        ("CYCLES_AUTO_TILE", "0"),
+        ("TUILE_WAIT_MODE", "command"),
+    ]
+    .iter()
+    .map(|(k, d)| (k.to_string(), get(k).unwrap_or_else(|| d.to_string())))
+    .collect()
 }
 
 /// The cadence: `JOB_FPS` if given, else the trajectory's second field for
@@ -142,13 +150,24 @@ impl Config {
         let number = |name: &'static str, d: u64| -> Result<u64, ConfigError> {
             match var(name) {
                 None => Ok(d),
-                Some(v) => v.trim().parse().map_err(|_| ConfigError::Bad { name, value: v, why: "not a number" }),
+                Some(v) => v.trim().parse().map_err(|_| ConfigError::Bad {
+                    name,
+                    value: v,
+                    why: "not a number",
+                }),
             }
         };
         let frames_s = var("JOB_FRAMES").ok_or(ConfigError::Missing("JOB_FRAMES"))?;
-        let bad_frames = || ConfigError::Bad { name: "JOB_FRAMES", value: frames_s.clone(), why: "expected A:B, A <= B" };
+        let bad_frames = || ConfigError::Bad {
+            name: "JOB_FRAMES",
+            value: frames_s.clone(),
+            why: "expected A:B, A <= B",
+        };
         let (a, b) = frames_s.split_once(':').ok_or_else(bad_frames)?;
-        let frames: (u64, u64) = (a.trim().parse().map_err(|_| bad_frames())?, b.trim().parse().map_err(|_| bad_frames())?);
+        let frames: (u64, u64) = (
+            a.trim().parse().map_err(|_| bad_frames())?,
+            b.trim().parse().map_err(|_| bad_frames())?,
+        );
         if frames.0 > frames.1 {
             return Err(bad_frames());
         }
@@ -184,7 +203,10 @@ impl Config {
             });
         }
         let out = PathBuf::from(or("JOB_OUT", "/out/render.mp4"));
-        let outdir = out.parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+        let outdir = out
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
         Ok(Config {
             frames,
             engine: or("JOB_ENGINE", "native"),
@@ -204,7 +226,9 @@ impl Config {
             task_count,
             chunk_given,
             assemble: var("JOB_ASSEMBLE").is_none_or(|v| v != "0"),
-            run_prefix: var("JOB_RUN_PREFIX").map(|p| p.trim_end_matches('/').to_string()).filter(|p| !p.is_empty()),
+            run_prefix: var("JOB_RUN_PREFIX")
+                .map(|p| p.trim_end_matches('/').to_string())
+                .filter(|p| !p.is_empty()),
             archive_every_s: number("JOB_ARCHIVE_EVERY", 300)?,
             gpu_sample_s: number("JOB_GPU_SAMPLE", 30)?,
             bail_sleep_s: number("JOB_BAIL_SLEEP", 600)?,
@@ -222,7 +246,9 @@ impl Config {
             viewport: or("JOB_VIEWPORT", "1280x960"),
             sse: or("JOB_SSE", "3"),
             optix_cache_key: var("JOB_OPTIX_CACHE_KEY"),
-            optix_cache_path: var("OPTIX_CACHE_PATH").map(PathBuf::from).unwrap_or_else(|| outdir.join("optix-cache")),
+            optix_cache_path: var("OPTIX_CACHE_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| outdir.join("optix-cache")),
             ssh_pubkey: var("JOB_SSH_PUBKEY"),
             cycles_backends: words(&or("JOB_CYCLES_BACKENDS", "OPTIX CUDA")),
             cache_seed: PathBuf::from(or("TUILE_CACHE_DIR", "/tmp/tuile-cache")),
@@ -236,7 +262,10 @@ impl Config {
 
     /// The directory everything local lives in: segments, logs, archives.
     pub fn outdir(&self) -> PathBuf {
-        self.out.parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
+        self.out
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
     }
 
     /// One suffix per task on everything a task archives: N tasks writing one
@@ -252,7 +281,10 @@ impl Config {
 
     /// The pack is the source of the ground, or streaming needs a token.
     pub fn has_source(&self) -> bool {
-        self.engine != "hydra" || self.pack_key.is_some() || self.pack_ready.is_some() || self.ion_token
+        self.engine != "hydra"
+            || self.pack_key.is_some()
+            || self.pack_ready.is_some()
+            || self.ion_token
     }
 }
 
@@ -262,7 +294,10 @@ mod tests {
     use std::collections::HashMap;
 
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let map: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         move |k| map.get(k).cloned()
     }
 
@@ -270,11 +305,21 @@ mod tests {
     fn the_defaults_are_the_scripts_defaults() {
         let c = Config::from_env(&env(&[("JOB_FRAMES", "1:48")])).expect("test");
         assert_eq!(c.frames, (1, 48));
-        assert_eq!((c.engine.as_str(), c.delegate.as_str(), c.tier.as_str()), ("native", "cycles", "cycles"));
-        assert_eq!((c.width.as_str(), c.samples.as_str(), c.threshold.as_str()), ("1920", "128", "0.05"));
+        assert_eq!(
+            (c.engine.as_str(), c.delegate.as_str(), c.tier.as_str()),
+            ("native", "cycles", "cycles")
+        );
+        assert_eq!(
+            (c.width.as_str(), c.samples.as_str(), c.threshold.as_str()),
+            ("1920", "128", "0.05")
+        );
         assert_eq!((c.gpus, c.procs_per_gpu), (1, 4));
         assert_eq!(c.fps, "24");
-        assert_eq!(c.blender_args, words(TRACE_BLENDER_ARGS), "Blender logs by default");
+        assert_eq!(
+            c.blender_args,
+            words(TRACE_BLENDER_ARGS),
+            "Blender logs by default"
+        );
         assert_eq!(c.out, PathBuf::from("/out/render.mp4"));
         assert_eq!((c.task_index, c.task_count, c.chunk_given), (0, 1, false));
         assert_eq!(c.run_prefix, None);
@@ -283,8 +328,12 @@ mod tests {
         assert_eq!(c.task_tag(), "");
         assert_eq!(
             c.batch_env,
-            [("CYCLES_BACKGROUND", "1"), ("CYCLES_AUTO_TILE", "0"), ("TUILE_WAIT_MODE", "command")]
-                .map(|(k, v)| (k.to_string(), v.to_string()))
+            [
+                ("CYCLES_BACKGROUND", "1"),
+                ("CYCLES_AUTO_TILE", "0"),
+                ("TUILE_WAIT_MODE", "command")
+            ]
+            .map(|(k, v)| (k.to_string(), v.to_string()))
         );
     }
 
@@ -303,7 +352,10 @@ mod tests {
 
     #[test]
     fn frames_are_required_and_ordered() {
-        assert_eq!(Config::from_env(&env(&[])), Err(ConfigError::Missing("JOB_FRAMES")));
+        assert_eq!(
+            Config::from_env(&env(&[])),
+            Err(ConfigError::Missing("JOB_FRAMES"))
+        );
         assert!(Config::from_env(&env(&[("JOB_FRAMES", "10:2")])).is_err());
         assert!(Config::from_env(&env(&[("JOB_FRAMES", "x")])).is_err());
     }
@@ -312,7 +364,11 @@ mod tests {
     fn the_cadence_comes_from_job_fps_or_a_pyrenees_trajectory_only() {
         assert_eq!(fps_of(Some("60"), Some("pyrenees:2:30")), "60");
         assert_eq!(fps_of(None, Some("pyrenees:2:30:50000")), "30");
-        assert_eq!(fps_of(None, Some("orbit:1440:2.17:42.52")), "24", "orbit's second field is a longitude");
+        assert_eq!(
+            fps_of(None, Some("orbit:1440:2.17:42.52")),
+            "24",
+            "orbit's second field is a longitude"
+        );
         assert_eq!(fps_of(None, None), "24");
     }
 
@@ -328,9 +384,22 @@ mod tests {
         .expect("test");
         assert_eq!((c.task_index, c.task_count, c.chunk_given), (1, 14, true));
         assert_eq!(c.task_tag(), "-t1");
-        let cr = Config::from_env(&env(&[("JOB_FRAMES", "1:90"), ("CLOUD_RUN_TASK_INDEX", "2"), ("CLOUD_RUN_TASK_COUNT", "3")])).expect("test");
-        assert_eq!((cr.task_index, cr.task_count, cr.chunk_given), (2, 3, false));
-        assert!(Config::from_env(&env(&[("JOB_FRAMES", "1:9"), ("JOB_TASK_INDEX", "3"), ("JOB_TASK_COUNT", "3")])).is_err());
+        let cr = Config::from_env(&env(&[
+            ("JOB_FRAMES", "1:90"),
+            ("CLOUD_RUN_TASK_INDEX", "2"),
+            ("CLOUD_RUN_TASK_COUNT", "3"),
+        ]))
+        .expect("test");
+        assert_eq!(
+            (cr.task_index, cr.task_count, cr.chunk_given),
+            (2, 3, false)
+        );
+        assert!(Config::from_env(&env(&[
+            ("JOB_FRAMES", "1:9"),
+            ("JOB_TASK_INDEX", "3"),
+            ("JOB_TASK_COUNT", "3")
+        ]))
+        .is_err());
     }
 
     #[test]
@@ -354,8 +423,21 @@ mod tests {
     fn hydra_needs_a_pack_or_a_token() {
         let base = [("JOB_FRAMES", "1:2"), ("JOB_ENGINE", "hydra")];
         assert!(!Config::from_env(&env(&base)).expect("test").has_source());
-        assert!(Config::from_env(&env(&[base[0], base[1], ("JOB_PACK_KEY", "p")])).expect("test").has_source());
-        assert!(Config::from_env(&env(&[base[0], base[1], ("TUILE_PACK", "/tmp/p")])).expect("test").has_source());
-        assert!(Config::from_env(&env(&[("JOB_FRAMES", "1:2")])).expect("test").has_source(), "native needs neither");
+        assert!(
+            Config::from_env(&env(&[base[0], base[1], ("JOB_PACK_KEY", "p")]))
+                .expect("test")
+                .has_source()
+        );
+        assert!(
+            Config::from_env(&env(&[base[0], base[1], ("TUILE_PACK", "/tmp/p")]))
+                .expect("test")
+                .has_source()
+        );
+        assert!(
+            Config::from_env(&env(&[("JOB_FRAMES", "1:2")]))
+                .expect("test")
+                .has_source(),
+            "native needs neither"
+        );
     }
 }

@@ -19,12 +19,19 @@ use tuile_farm::{assert_run_store_contract, BucketConfig, ObjectRunStore, Tuning
 #[ignore = "needs TUILE_STORE_* credentials and the network"]
 async fn a_bucket_keeps_the_contract() {
     let config = BucketConfig::from_env().expect("TUILE_STORE_* must be set for this test");
-    let tuning = Tuning { part_bytes: 5 << 20, concurrency: 8 };
+    let tuning = Tuning {
+        part_bytes: 5 << 20,
+        concurrency: 8,
+    };
     let store = ObjectRunStore::bucket(&config, tuning).expect("bucket");
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
         .as_millis();
-    assert_run_store_contract(&store, &format!("tuile-farm-contract/{stamp}"), tuning.part_bytes)
-        .await;
+    assert_run_store_contract(
+        &store,
+        &format!("tuile-farm-contract/{stamp}"),
+        tuning.part_bytes,
+    )
+    .await;
 }

@@ -36,7 +36,10 @@ pub struct Tiles {
 }
 
 fn var(name: &str) -> Result<String, String> {
-    std::env::var(name).ok().filter(|v| !v.is_empty()).ok_or_else(|| format!("{name} is not set"))
+    std::env::var(name)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| format!("{name} is not set"))
 }
 
 impl Tiles {
@@ -50,11 +53,15 @@ impl Tiles {
     /// it has a layer for them. A layer the store already has is left as the
     /// store describes it. Says whether the layer was added.
     pub fn from_env_with(layer: Option<LayerDef>) -> Result<Option<Self>, String> {
-        let Ok(bucket) = var("TUILE_TILES_BUCKET") else { return Ok(None) };
+        let Ok(bucket) = var("TUILE_TILES_BUCKET") else {
+            return Ok(None);
+        };
         let s3 = AmazonS3Builder::new()
             .with_bucket_name(&bucket)
             .with_endpoint(var("TUILE_STORE_ENDPOINT")?)
-            .with_region(std::env::var("TUILE_STORE_REGION").unwrap_or_else(|_| DEFAULT_REGION.into()))
+            .with_region(
+                std::env::var("TUILE_STORE_REGION").unwrap_or_else(|_| DEFAULT_REGION.into()),
+            )
             .with_access_key_id(var("TUILE_STORE_ACCESS_KEY_ID")?)
             .with_secret_access_key(var("TUILE_STORE_SECRET_ACCESS_KEY")?)
             // The store's manifests are replaced by conditional writes only.
@@ -93,11 +100,17 @@ impl Tiles {
         let store = runtime
             .block_on(TileStore::open(
                 s3,
-                StoreConfig { manifest_ttl: BAKE_MANIFEST_TTL, ..StoreConfig::default() },
+                StoreConfig {
+                    manifest_ttl: BAKE_MANIFEST_TTL,
+                    ..StoreConfig::default()
+                },
             ))
             .map_err(|e| format!("tile bucket {bucket}: {e}"))?;
         tracing::info!(bucket, layers = store.layers().count(), "TILES-OPEN");
-        Ok(Some(Self { runtime, store: Arc::new(store) }))
+        Ok(Some(Self {
+            runtime,
+            store: Arc::new(store),
+        }))
     }
 
     /// Says loudly when a source has no layer in the store: its tiles would
@@ -112,12 +125,23 @@ impl Tiles {
 
     /// Projects the part of the store the scene's cameras can use into local
     /// archives, read before the bucket for the rest of the bake.
-    pub fn project(&self, poses: &[tuile_tape::Frame], imagery_layer: Option<&str>) -> Result<(), String> {
+    pub fn project(
+        &self,
+        poses: &[tuile_tape::Frame],
+        imagery_layer: Option<&str>,
+    ) -> Result<(), String> {
         let eyes = poses.iter().map(|p| {
             let g = tuile_core::geo::ecef_to_geodetic(glam::DVec3::from_array(p.position));
-            Eye { lon: g.lon.to_degrees(), lat: g.lat.to_degrees(), height: g.height }
+            Eye {
+                lon: g.lon.to_degrees(),
+                lat: g.lat.to_degrees(),
+                height: g.height,
+            }
         });
-        let factor = std::env::var("TUILE_TILES_FACTOR").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_TILE_FACTOR);
+        let factor = std::env::var("TUILE_TILES_FACTOR")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_TILE_FACTOR);
         let imagery_factor = std::env::var("TUILE_TILES_IMAGERY_FACTOR")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -126,7 +150,8 @@ impl Tiles {
         if let Some(name) = imagery_layer {
             footprint = footprint.with_layer_factor(name, imagery_factor);
         }
-        let dir = std::env::var("TUILE_TILES_DIR").unwrap_or_else(|_| DEFAULT_PROJECTION_DIR.into());
+        let dir =
+            std::env::var("TUILE_TILES_DIR").unwrap_or_else(|_| DEFAULT_PROJECTION_DIR.into());
         let report = self
             .runtime
             .block_on(self.store.project(&footprint, std::path::Path::new(&dir)))
@@ -176,8 +201,15 @@ impl Tiles {
             "TILES-READS"
         );
         let began = std::time::Instant::now();
-        let zones = self.runtime.block_on(self.store.flush_all()).map_err(|e| format!("tile store flush: {e}"))?;
-        tracing::info!(zones, seconds = began.elapsed().as_secs_f64(), "TILES-FLUSHED");
+        let zones = self
+            .runtime
+            .block_on(self.store.flush_all())
+            .map_err(|e| format!("tile store flush: {e}"))?;
+        tracing::info!(
+            zones,
+            seconds = began.elapsed().as_secs_f64(),
+            "TILES-FLUSHED"
+        );
         Ok(())
     }
 }
