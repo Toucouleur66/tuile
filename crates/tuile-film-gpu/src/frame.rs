@@ -124,11 +124,15 @@ impl FrameUniform {
         // right, up and backward axes; the projection's diagonal holds
         // 1/tan(fovy/2), over the aspect for x. A pixel's ray is then
         // `fwd + x·right + y·up` for its NDC x, y.
+        //
+        // A frustum shifted off its axis — each eye of a stereo pair — has
+        // its window's centre off the view axis: the projection's third
+        // column says by how much, and `fwd` is aimed at that centre.
         let v = camera.view;
         let p = camera.projection;
         let right = v.row(0).truncate() / p.x_axis.x;
         let up = v.row(1).truncate() / p.y_axis.y;
-        let fwd = -v.row(2).truncate();
+        let fwd = -v.row(2).truncate() + right * p.z_axis.x + up * p.z_axis.y;
         let air = look.haze.map(|haze| (haze, haze.at(camera.eye)));
         Self {
             view_proj: camera.view_projection().to_cols_array_2d(),
@@ -341,5 +345,37 @@ mod tests {
             + ndc.y * Vec3::from_slice(&u.up);
         let angle = ray.normalize().angle_between(point.normalize());
         assert!(angle < 1e-5, "{angle}");
+    }
+
+    /// The same, for each eye of a stereo pair: its frustum is shifted off
+    /// its axis, and a ray built as if it were not misses its pixel by the
+    /// shift — the resolve would texture the wrong triangle.
+    #[test]
+    fn an_eye_s_pixel_ray_goes_through_what_projects_there() {
+        let view = BakedView {
+            position: [7_000_000.0, 10.0, 20.0],
+            direction: [-1.0, 0.2, 0.1],
+            up: [0.0, 0.0, 1.0],
+            viewport_px: [1920.0, 1080.0],
+            fovy_rad: 0.9,
+        };
+        let centre = FrameCamera::of(&view, 16.0 / 9.0);
+        let pair = tuile_film::Stereo::default().eyes(&centre);
+        for eye in tuile_film::Eye::BOTH {
+            let cam = centre.eye(&pair, eye);
+            let u = FrameUniform::new(&cam, &Look::default(), [1920, 1080, 1, 0]);
+            for point in [
+                Vec3::new(-3000.0, 900.0, -400.0),
+                Vec3::new(-800.0, -300.0, 100.0),
+            ] {
+                let clip = cam.view_projection() * point.extend(1.0);
+                let ndc = clip.xy() / clip.w;
+                let ray = Vec3::from_slice(&u.fwd)
+                    + ndc.x * Vec3::from_slice(&u.right)
+                    + ndc.y * Vec3::from_slice(&u.up);
+                let angle = ray.normalize().angle_between(point.normalize());
+                assert!(angle < 1e-5, "{eye:?}: {angle}");
+            }
+        }
     }
 }
