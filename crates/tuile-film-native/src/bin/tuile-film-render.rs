@@ -53,6 +53,8 @@
 //!   --stereo-convergence <m> the screen's distance from the eyes; else
 //!                         where the camera's axis meets the ground
 //!   --stereo-ground <m>   that ground's height over the ellipsoid (0)
+//!   --stereo-baseline <m> the eyes this far apart, whatever the distance
+//!                         (hyperstereo); else what the divergence gives
 //!   --meter <dir>         measure light going in and coming out; write
 //!                         tiles.csv, frames.csv, tone.json, report.md,
 //!                         and each place's table of grades under the key
@@ -381,6 +383,7 @@ async fn main() -> Result<(), Error> {
                     .map(|m| m.parse())
                     .transpose()?,
                 ground_m: value("--stereo-ground").map_or(Ok(0.0), |m| m.parse())?,
+                baseline_m: value("--stereo-baseline").map(|m| m.parse()).transpose()?,
             }
             .stereo()?,
         );
