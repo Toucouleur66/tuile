@@ -59,8 +59,6 @@ tokio = { workspace = true, features = ["time", "sync"] }
 # bounded at the source rather than behind a semaphore.
 rayon = "1"
 thiserror = { workspace = true }
-# What a bake announces of the store tiles it names, as JSON for a render service.
-serde = { workspace = true }
 tuile-core = { version = "0.5.0", path = "../tuile-core" }
 tuile-pack = { version = "0.5.0", path = "../tuile-pack" }
 tuile-tape = { version = "0.5.0", path = "../tuile-tape" }

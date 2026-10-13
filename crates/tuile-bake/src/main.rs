@@ -1301,7 +1301,6 @@ fn bake_with(args: Args, tiles: Option<&tiles::Tiles>) -> Result<(), String> {
             culling,
             content: &pack_content,
             packed: &packed,
-            announce: None,
         },
         &mut Poses(&poses),
     )?;

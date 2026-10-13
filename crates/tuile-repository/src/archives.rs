@@ -275,6 +275,15 @@ impl ArchivedTiles {
         })
     }
 
+    /// Forgets every zone's manifest read so far: the next read of a zone
+    /// reads it again. For a reader told that tiles were just published —
+    /// its clock may not move, and a manifest held is believed until it does.
+    pub fn forget_manifests(&self) {
+        if let Ok(mut held) = self.manifests.lock() {
+            held.clear();
+        }
+    }
+
     /// A zone's manifest, read again once it is [`MANIFEST_TTL`] old: that
     /// bounds how late a reader sees tiles another process added.
     async fn manifest(&self, zone_prefix: &str) -> Result<Option<Arc<Manifest>>, RepoError> {

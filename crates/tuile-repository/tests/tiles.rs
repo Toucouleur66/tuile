@@ -566,3 +566,82 @@ async fn a_live_object_is_sent_again_only_when_it_was_written_again() {
         .expect("reply");
     assert_eq!((refused.status, refused.cache_control), (400, "no-cache"));
 }
+
+/// Every object of `memory`, written out under `dir` as they are.
+async fn copy_out(memory: &dyn ObjectStore, dir: &std::path::Path) {
+    let listed: Vec<_> = memory.list(None).try_collect().await.expect("list");
+    for meta in listed {
+        let bytes = memory
+            .get(&meta.location)
+            .await
+            .expect("get")
+            .bytes()
+            .await
+            .expect("bytes");
+        let path = dir.join(meta.location.as_ref());
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(path, bytes).expect("write");
+    }
+}
+
+#[tokio::test]
+async fn a_reader_whose_clock_stands_still_sees_new_tiles_once_it_forgets_its_manifests() {
+    let memory: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let written = Catalog {
+        layers: vec![layer("imagery", Grid::WebMercator, None)],
+    };
+    catalog::write(memory.as_ref(), &written)
+        .await
+        .expect("catalog");
+    let store = TileStore::open(memory.clone(), StoreConfig::default())
+        .await
+        .expect("open");
+    store
+        .put(
+            "imagery",
+            7,
+            77,
+            50,
+            Bytes::from(body("imagery", 7, 77, 50)),
+        )
+        .await
+        .expect("put");
+    store.flush_all().await.expect("flush");
+    let dir = tempfile::tempdir().expect("tempdir");
+    copy_out(memory.as_ref(), dir.path()).await;
+    let objects: Arc<dyn Objects> =
+        Arc::new(ObjectRunStore::local(dir.path(), Tuning::default()).expect("store"));
+    // A render's clock: it does not move while the reader lives.
+    let reader = ArchivedTiles::open(objects.clone(), objects, Arc::new(|| 1_800_000_000))
+        .await
+        .expect("open");
+    assert_eq!(answer(&reader, "imagery", 7, 78, 50).await, "absent");
+
+    // A bake publishes a tile of the same zone, then says so.
+    store
+        .put(
+            "imagery",
+            7,
+            78,
+            50,
+            Bytes::from(body("imagery", 7, 78, 50)),
+        )
+        .await
+        .expect("put");
+    store.flush_all().await.expect("flush");
+    copy_out(memory.as_ref(), dir.path()).await;
+    assert_eq!(
+        answer(&reader, "imagery", 7, 78, 50).await,
+        "absent",
+        "the manifest held is believed"
+    );
+    reader.forget_manifests();
+    assert_eq!(
+        answer(&reader, "imagery", 7, 78, 50).await,
+        "image/png imagery/7/78/50"
+    );
+    assert_eq!(
+        answer(&reader, "imagery", 7, 77, 50).await,
+        "image/png imagery/7/77/50"
+    );
+}

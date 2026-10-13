@@ -9,9 +9,8 @@
 //! ```
 //!
 //! `POST /segments` takes a [`SegmentOrder`] and answers when the segment is
-//! in the store, with its [`SegmentDone`]; it may be asked before its pack is
-//! baked, and reads ahead what the bake announces meanwhile. `GET /` says the
-//! service is up.
+//! in the store, with its [`SegmentDone`]; a pack not there yet is waited for
+//! up to `pack_within_seconds`. `GET /` says the service is up.
 //!
 //! The stores are the environment's, as for `tuile-film-produce`:
 //!
@@ -68,8 +67,8 @@ async fn segment(
     match service.segment(&order).await {
         Ok(done) => {
             eprintln!(
-                "segment {} done: {} frames, waited {:.0} s, rendered in {:.0} s, {} tiles read ahead",
-                done.out, done.frames, done.waited_seconds, done.render_seconds, done.announced_tiles
+                "segment {} done: {} frames, waited {:.0} s, rendered in {:.0} s",
+                done.out, done.frames, done.waited_seconds, done.render_seconds
             );
             Ok(Json(done))
         }

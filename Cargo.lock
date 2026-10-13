@@ -6189,7 +6189,6 @@ dependencies = [
  "object_store",
  "pprof",
  "rayon",
- "serde",
  "tempfile",
  "thiserror 2.0.18",
  "tikv-jemallocator",
