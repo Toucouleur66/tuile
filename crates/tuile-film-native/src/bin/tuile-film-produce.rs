@@ -62,8 +62,9 @@ use tuile_film_native::{Error, Tone};
     about = "Bake, render in parts and join a whole film, kept in the run store"
 )]
 struct Args {
-    /// The tape of cameras: one frame a camera.
-    tape: PathBuf,
+    /// The tape of cameras, one frame a camera: a file here, or
+    /// `store:<key>`, an object of the run store.
+    tape: String,
     /// First and last frame, `first:last`. Default: the whole tape.
     #[arg(long, value_parser = stretch)]
     frames: Option<Stretch>,
@@ -98,10 +99,11 @@ struct Args {
     /// Samples a pixel, a side.
     #[arg(long, default_value_t = 2)]
     supersample: u32,
-    /// The encoder: `h264`, `av1`, `nvenc-h264`, `nvenc-av1`. Default: the
-    /// best this build has.
-    #[arg(long)]
-    codec: Option<String>,
+    /// The encoder: `h264` — the machine's own (NVENC on an NVIDIA card,
+    /// VideoToolbox on a Mac) — or `nvenc-h264`. H.264 only: a film is joined
+    /// from its parts, and the join reads H.264.
+    #[arg(long, default_value = "h264", value_parser = ["h264", "nvenc-h264"])]
+    codec: String,
     /// Megabits a second.
     #[arg(long, default_value_t = 12.0)]
     mbps: f64,
@@ -169,6 +171,13 @@ struct Args {
     /// Default: a scratch directory, gone at the end.
     #[arg(long)]
     cache: Option<PathBuf>,
+    /// This process's share of a production several run at once,
+    /// `<index>/<count>`: the packs `index`, `index + count`, … Default: what
+    /// Cloud Run says (`CLOUD_RUN_TASK_INDEX`, `CLOUD_RUN_TASK_COUNT`), else
+    /// every pack. Every task is given the same command; the last to finish
+    /// joins the film.
+    #[arg(long, value_parser = share)]
+    task: Option<(u32, u32)>,
     /// Also bring the film here once it is in the store.
     #[arg(long)]
     download: Option<PathBuf>,
@@ -188,6 +197,34 @@ fn stretch(text: &str) -> Result<Stretch, String> {
         ));
     }
     Ok(frames)
+}
+
+fn share(text: &str) -> Result<(u32, u32), String> {
+    let (index, count) = text.split_once('/').ok_or("expected <index>/<count>")?;
+    let number = |n: &str| n.parse::<u32>().map_err(|e| format!("{n}: {e}"));
+    let (index, count) = (number(index)?, number(count)?);
+    if index >= count {
+        return Err(format!("task {index} of {count}"));
+    }
+    Ok((index, count))
+}
+
+/// This process's share: the one asked for, else the one Cloud Run gives a
+/// task of a job, else none — every pack. A job of one task has no share.
+fn task_of(
+    asked: Option<(u32, u32)>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<Option<(u32, u32)>, String> {
+    if asked.is_some() {
+        return Ok(asked);
+    }
+    match (env("CLOUD_RUN_TASK_INDEX"), env("CLOUD_RUN_TASK_COUNT")) {
+        (Some(index), Some(count)) => {
+            let (index, count) = share(&format!("{index}/{count}"))?;
+            Ok((count > 1).then_some((index, count)))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn resolution(text: &str) -> Result<(u32, u32), String> {
@@ -270,7 +307,7 @@ fn rendering(args: &Args) -> Result<Rendering, Error> {
     }
     Ok(Rendering {
         order,
-        codec: args.codec.clone(),
+        codec: Some(args.codec.clone()),
         bitrate: (args.mbps * 1e6) as u32,
         sun: args.sun,
     })
@@ -282,10 +319,25 @@ enum Ended {
     NoFilm,
     Usage,
     Stopped,
+    /// This task's share is done; another joins the film.
+    Waiting,
 }
 
 async fn run(args: Args) -> Result<Ended, Error> {
-    let poses = TapeBake::poses_of(&args.tape)?;
+    let task = task_of(args.task, |name| std::env::var(name).ok())?;
+    // The run store: a bucket, unless the environment names a directory.
+    let store = Arc::new(ObjectRunStore::from_env()?);
+    // What the render reads is kept here while the film is made.
+    let scratch = tempfile::tempdir()?;
+    let tape = match args.tape.strip_prefix("store:") {
+        Some(key) => {
+            let here = scratch.path().join("tape.mcap");
+            store.get(key, &here).await?;
+            here
+        }
+        None => PathBuf::from(&args.tape),
+    };
+    let poses = TapeBake::poses_of(&tape)?;
     let whole = Stretch {
         first: 1,
         last: poses.len() as u32,
@@ -300,8 +352,9 @@ async fn run(args: Args) -> Result<Ended, Error> {
     }
     let rendering = rendering(&args)?;
     let bake = TapeBake {
-        token: std::env::var("TUILE_ION_TOKEN")
-            .map_err(|_| "TUILE_ION_TOKEN is not set; the bake needs it")?,
+        // Needed only if a pack is to be baked: a production whose packs are
+        // there renders without it, and a bake without it says so.
+        token: std::env::var("TUILE_ION_TOKEN").unwrap_or_default(),
         cache_dir: std::env::var("TUILE_CACHE_DIR").ok().map(Into::into),
         poses,
         viewport: (f64::from(args.resolution.0), f64::from(args.resolution.1)),
@@ -311,10 +364,6 @@ async fn run(args: Args) -> Result<Ended, Error> {
         content: args.content,
     };
 
-    // The run store: a bucket, unless the environment names a directory.
-    let store = Arc::new(ObjectRunStore::from_env()?);
-    // What the render reads is kept here while the film is made.
-    let scratch = tempfile::tempdir()?;
     let cache = args
         .cache
         .clone()
@@ -342,6 +391,7 @@ async fn run(args: Args) -> Result<Ended, Error> {
         fps: Some(f64::from(args.fps.max(1))),
         bake_again: args.bake_again,
         render_again: args.render_again,
+        task,
         ..Order::of(frames)
     };
     let journal = Journal::default();
@@ -362,6 +412,10 @@ async fn run(args: Args) -> Result<Ended, Error> {
         Err(ProduceError::Order(why)) => {
             eprintln!("tuile-film-produce: {why}");
             Ok(Ended::Usage)
+        }
+        Err(e @ ProduceError::Waiting { .. }) => {
+            println!("FILM-WAITING {e}");
+            Ok(Ended::Waiting)
         }
         Err(e @ (ProduceError::Stopped(_) | ProduceError::Stalled { .. })) => {
             println!("FILM-STOPPED {e}");
@@ -392,7 +446,7 @@ fn main() -> ExitCode {
     // not waited for.
     runtime.shutdown_background();
     match ended {
-        Ok(Ended::Film) => ExitCode::SUCCESS,
+        Ok(Ended::Film | Ended::Waiting) => ExitCode::SUCCESS,
         Ok(Ended::NoFilm) => ExitCode::FAILURE,
         Ok(Ended::Usage) => ExitCode::from(2),
         Ok(Ended::Stopped) => ExitCode::from(3),
@@ -435,6 +489,9 @@ mod tests {
         assert_eq!(args.content, tuile_pack::Content::References);
         assert!(!args.bake_again && !args.render_again);
         assert!(args.imagery.is_none() && args.sse.is_none() && args.cache.is_none());
+        // H.264, the one encoding whose parts join: the machine's own encoder
+        // gives it, whichever the machine has.
+        assert_eq!(args.codec, "h264");
         let rendering = rendering(&args).expect("rendering");
         assert_eq!(rendering.bitrate, 12_000_000);
         assert!(rendering.order.look.haze.is_none());
@@ -487,6 +544,39 @@ mod tests {
     }
 
     #[test]
+    fn a_task_s_share_is_the_one_asked_else_cloud_run_s_else_none() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let cloud = env(&[("CLOUD_RUN_TASK_INDEX", "3"), ("CLOUD_RUN_TASK_COUNT", "8")]);
+        assert_eq!(task_of(None, &cloud), Ok(Some((3, 8))));
+        assert_eq!(task_of(Some((1, 2)), &cloud), Ok(Some((1, 2))));
+        assert_eq!(task_of(None, env(&[])), Ok(None));
+        // A job of one task, or half of what Cloud Run says: every pack.
+        let alone = env(&[("CLOUD_RUN_TASK_INDEX", "0"), ("CLOUD_RUN_TASK_COUNT", "1")]);
+        assert_eq!(task_of(None, alone), Ok(None));
+        assert_eq!(
+            task_of(None, env(&[("CLOUD_RUN_TASK_INDEX", "2")])),
+            Ok(None)
+        );
+        // What cannot be a share is refused, not taken for every pack.
+        let wrong = env(&[("CLOUD_RUN_TASK_INDEX", "8"), ("CLOUD_RUN_TASK_COUNT", "8")]);
+        assert!(task_of(None, wrong).is_err());
+        assert_eq!(
+            parsed("tuile-film-produce t.mcap --task 2/5")
+                .expect("parse")
+                .task,
+            Some((2, 5))
+        );
+        assert!(parsed("tuile-film-produce t.mcap --task 5/5").is_err());
+    }
+
+    #[test]
     fn what_cannot_be_a_film_is_refused_at_the_command_line() {
         for line in [
             "tuile-film-produce",
@@ -496,6 +586,9 @@ mod tests {
             "tuile-film-produce t.mcap --resolution 0x1080",
             "tuile-film-produce t.mcap --content pictures",
             "tuile-film-produce t.mcap --sun 255",
+            // Parts that cannot be joined make no film.
+            "tuile-film-produce t.mcap --codec av1",
+            "tuile-film-produce t.mcap --codec nvenc-av1",
         ] {
             assert!(parsed(line).is_err(), "{line}");
         }

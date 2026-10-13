@@ -132,6 +132,11 @@ impl Host for Engine {
     }
 
     fn bake(&self, frames: Stretch, out: &Path) -> Result<(), Failed> {
+        if self.bake.token.is_empty() {
+            return Err(Failed::for_good(
+                "a pack is to be baked and TUILE_ION_TOKEN is not set",
+            ));
+        }
         let baked = self
             .bake
             .bake(frames.first, frames.last, out, self.tiles.as_ref());
