@@ -566,3 +566,161 @@ async fn a_live_object_is_sent_again_only_when_it_was_written_again() {
         .expect("reply");
     assert_eq!((refused.status, refused.cache_control), (400, "no-cache"));
 }
+
+/// Every object of `memory`, written out under `dir` as they are.
+async fn copy_out(memory: &dyn ObjectStore, dir: &std::path::Path) {
+    let listed: Vec<_> = memory.list(None).try_collect().await.expect("list");
+    for meta in listed {
+        let bytes = memory
+            .get(&meta.location)
+            .await
+            .expect("get")
+            .bytes()
+            .await
+            .expect("bytes");
+        let path = dir.join(meta.location.as_ref());
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(path, bytes).expect("write");
+    }
+}
+
+#[tokio::test]
+async fn a_reader_whose_clock_stands_still_sees_new_tiles_once_it_forgets_its_manifests() {
+    let memory: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let written = Catalog {
+        layers: vec![layer("imagery", Grid::WebMercator, None)],
+    };
+    catalog::write(memory.as_ref(), &written)
+        .await
+        .expect("catalog");
+    let store = TileStore::open(memory.clone(), StoreConfig::default())
+        .await
+        .expect("open");
+    store
+        .put(
+            "imagery",
+            7,
+            77,
+            50,
+            Bytes::from(body("imagery", 7, 77, 50)),
+        )
+        .await
+        .expect("put");
+    store.flush_all().await.expect("flush");
+    let dir = tempfile::tempdir().expect("tempdir");
+    copy_out(memory.as_ref(), dir.path()).await;
+    let objects: Arc<dyn Objects> =
+        Arc::new(ObjectRunStore::local(dir.path(), Tuning::default()).expect("store"));
+    // A render's clock: it does not move while the reader lives.
+    let reader = ArchivedTiles::open(objects.clone(), objects, Arc::new(|| 1_800_000_000))
+        .await
+        .expect("open");
+    assert_eq!(answer(&reader, "imagery", 7, 78, 50).await, "absent");
+
+    // A bake publishes a tile of the same zone, then says so.
+    store
+        .put(
+            "imagery",
+            7,
+            78,
+            50,
+            Bytes::from(body("imagery", 7, 78, 50)),
+        )
+        .await
+        .expect("put");
+    store.flush_all().await.expect("flush");
+    copy_out(memory.as_ref(), dir.path()).await;
+    assert_eq!(
+        answer(&reader, "imagery", 7, 78, 50).await,
+        "absent",
+        "the manifest held is believed"
+    );
+    reader.forget_manifests();
+    assert_eq!(
+        answer(&reader, "imagery", 7, 78, 50).await,
+        "image/png imagery/7/78/50"
+    );
+    assert_eq!(
+        answer(&reader, "imagery", 7, 77, 50).await,
+        "image/png imagery/7/77/50"
+    );
+}
+
+#[tokio::test]
+async fn a_zone_read_from_its_extract_answers_with_what_the_extract_holds() {
+    let memory: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let written = Catalog {
+        layers: vec![layer("imagery", Grid::WebMercator, None)],
+    };
+    catalog::write(memory.as_ref(), &written)
+        .await
+        .expect("catalog");
+    let store = TileStore::open(memory.clone(), StoreConfig::default())
+        .await
+        .expect("open");
+    for (x, y) in [(77, 50), (78, 50)] {
+        store
+            .put("imagery", 7, x, y, Bytes::from(body("imagery", 7, x, y)))
+            .await
+            .expect("put");
+    }
+    store.flush_all().await.expect("flush");
+    let dir = tempfile::tempdir().expect("tempdir");
+    copy_out(memory.as_ref(), dir.path()).await;
+    let objects: Arc<dyn Objects> =
+        Arc::new(ObjectRunStore::local(dir.path(), Tuning::default()).expect("store"));
+    let reader = ArchivedTiles::open(objects.clone(), objects, Arc::new(|| 1_800_000_000))
+        .await
+        .expect("open");
+
+    // An extract of one tile of the zone, somewhere else entirely, in the
+    // second band of an extract; the first holds the other tile.
+    let ask = |at| tuile_tile_server::ExtractAsk {
+        layer: "imagery".into(),
+        tiles: vec![at],
+        ..Default::default()
+    };
+    let (file, _) = store
+        .extract(&[ask((7, 78, 50)), ask((7, 77, 50))])
+        .await
+        .expect("extract");
+    let elsewhere = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(elsewhere.path().join("extracts")).expect("mkdir");
+    std::fs::copy(file.path(), elsewhere.path().join("extracts/z.pmtiles")).expect("copy");
+    let local: Arc<dyn Objects> =
+        Arc::new(ObjectRunStore::local(elsewhere.path(), Tuning::default()).expect("store"));
+
+    let zone = reader.zone_of("imagery", 7, 77, 50).expect("a zone");
+    assert_eq!(
+        reader.zone_of("imagery", 7, 78, 50).as_deref(),
+        Some(zone.as_str())
+    );
+    reader.read_zone_from(
+        &zone,
+        local,
+        "extracts/z.pmtiles",
+        tuile_repository::EXTRACT_BANDS[1],
+    );
+    assert_eq!(
+        answer(&reader, "imagery", 7, 77, 50).await,
+        "image/png imagery/7/77/50"
+    );
+    assert_eq!(
+        answer(&reader, "imagery", 7, 78, 50).await,
+        "absent",
+        "not in the extract's band: the zone's manifest is not read"
+    );
+    reader.forget_extracts();
+    assert_eq!(
+        answer(&reader, "imagery", 7, 78, 50).await,
+        "image/png imagery/7/78/50"
+    );
+}
+
+#[test]
+fn the_reader_s_bands_are_the_writer_s() {
+    assert_eq!(
+        tuile_repository::EXTRACT_BANDS,
+        tuile_tile_server::extract::BANDS
+    );
+}

@@ -172,6 +172,24 @@ pub fn referred(
     Ok((terrain, imagery))
 }
 
+/// A layer of the store, and tiles of it.
+pub type LayerTiles = (String, Vec<StoreAt>);
+
+/// The store tiles a whole pack reads, by layer — its terrain layer first,
+/// its imagery layer second — each once: what an extract of the pack's
+/// tiles asks the store for. `None` for a pack that carries its tiles.
+pub fn store_tiles(pack: &Pack<'_>) -> Result<Option<[LayerTiles; 2]>, FilmError> {
+    let Some((terrain_layer, imagery_layer)) = pack.store_layers() else {
+        return Ok(None);
+    };
+    let (first, last) = pack.frame_range();
+    let (terrain, imagery) = referred(pack, first, last)?;
+    Ok(Some([
+        (terrain_layer.to_string(), terrain.into_iter().collect()),
+        (imagery_layer.to_string(), imagery.into_iter().collect()),
+    ]))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -229,6 +247,60 @@ pub(crate) mod tests {
         let path = dir.path().join("film.tuilepack");
         w.finish_to(&path).expect("finish");
         std::fs::read(path).expect("read")
+    }
+
+    #[test]
+    fn a_pack_by_reference_says_every_store_tile_its_frames_read_each_once() {
+        use tuile_pack::{Content, ImageryPlacement, StoreTile, TileRefs};
+        let at = |level, x, y| StoreTile {
+            level,
+            x,
+            y,
+            digest: 0,
+        };
+        let referring = |id, terrain: StoreTile, imagery: &[StoreTile]| BakedTile {
+            refs: Some(TileRefs {
+                terrain,
+                skirt_height: 0.0,
+                imagery: imagery
+                    .iter()
+                    .map(|t| ImageryPlacement {
+                        tile: *t,
+                        coverage: [0.0, 0.0, 1.0, 1.0],
+                        translation: [0.0; 2],
+                        scale: [1.0; 2],
+                    })
+                    .collect(),
+                composed_side: 256,
+            }),
+            ..tile(id, 0)
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut w = PackWriter::new("scene", [6_378_137.0, 0.0, 0.0], dir.path().join("blob"))
+            .expect("writer")
+            .with_content(Content::References, "asset-1", "asset-2");
+        let (a, b) = (
+            referring(1, at(12, 1, 2), &[at(15, 10, 20), at(15, 11, 20)]),
+            referring(2, at(12, 1, 3), &[at(15, 11, 20)]),
+        );
+        w.frame(1, view(6_379_000.0), [a.clone()]);
+        w.frame(2, view(6_378_900.0), [a, b]);
+        let path = dir.path().join("film.tuilepack");
+        w.finish_to(&path).expect("finish");
+        let bytes = std::fs::read(path).expect("read");
+        let pack = Pack::open(&bytes).expect("open");
+        let [terrain, imagery] = store_tiles(&pack).expect("read").expect("by reference");
+        assert_eq!(
+            terrain,
+            ("asset-1".to_string(), vec![(12, 1, 2), (12, 1, 3)])
+        );
+        assert_eq!(
+            imagery,
+            ("asset-2".to_string(), vec![(15, 10, 20), (15, 11, 20)])
+        );
+        assert!(store_tiles(&Pack::open(&three_frames()).expect("open"))
+            .expect("read")
+            .is_none());
     }
 
     fn key(id: u64, drape: u64) -> TileKey {

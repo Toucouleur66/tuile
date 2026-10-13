@@ -1,17 +1,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! The render as a service: a request a segment, from the first word of its
-//! bake to the segment in the store.
+//! The render as a service: a request a segment, answered once the segment is
+//! in the store.
 //!
-//! The bake runs elsewhere. As it goes it announces the tiles of the store its
-//! frames name (`tuile_bake::announce`), as JSON objects under a prefix of the
-//! run store. A request to render a segment arrives as the bake begins: the
-//! instance reads every tile announced, as it is announced, into the blocks it
-//! keeps in memory; and when the pack is there, renders it, puts the segment
-//! and its receipt in the store, and answers. The instance that read the
-//! tiles is the one that renders them: no affinity to ask of anyone, and an
-//! instance kept warm keeps its blocks for the next segment.
+//! The bake runs elsewhere and puts its tiles in the tile store, its pack by
+//! reference in the run store. A request names the pack; the instance fetches
+//! the extracts of the zones the pack's frames read — when the store is a
+//! server's, see [`crate::extract`] — renders from them, puts the segment and
+//! its receipt in the store, and answers. An instance kept warm keeps its GPU
+//! set up for the next segment.
 //!
 //! What it keeps, it keeps in a generation of caches: one directory, the
 //! sources opened over it. Where the disk is memory, as on a serverless
@@ -20,17 +18,15 @@
 //! segment opens a new one, and the old goes with the last segment that
 //! reads it.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures_util::{StreamExt, TryStreamExt};
-use tuile_bake::announce::Announced;
 use tuile_farm::{ObjectRunStore, RunStore};
-use tuile_repository::TileRepository;
 
 use crate::engine::RenderSpec;
+use crate::extract::{local_key, ExtractRef, Fetched};
+use crate::observe::Timings;
 use crate::render::render;
 use crate::setup::{film_sink, sun_at};
 use crate::source::{Film, Sources};
@@ -42,15 +38,17 @@ use crate::Error;
 pub struct SegmentOrder {
     /// The pack's key in the run store; it may not be there yet.
     pub pack: String,
-    /// Where its bake announces the tiles it names, if it does.
-    #[serde(default)]
-    pub announced: Option<String>,
     /// First and last frame.
     pub frames: (u32, u32),
     /// The segment's key in the run store; its receipt beside it, `.json`.
     pub out: String,
     #[serde(default)]
     pub rendering: RenderSpec,
+    /// The film's store tiles for these frames, prepared by the tile
+    /// store's server as the bake ended, one per layer: fetched before the
+    /// first frame and read in place of the store. None: the store is read.
+    #[serde(default)]
+    pub extracts: Vec<ExtractRef>,
     /// The sun's direction, earth-centred, for every segment of a film
     /// alike; else `rendering.sun`, placed at this segment's first frame.
     #[serde(default)]
@@ -60,36 +58,76 @@ pub struct SegmentOrder {
     pub pack_within_seconds: Option<u64>,
 }
 
+/// Where a render's time went, as it measured it.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RenderTimes {
+    /// Opening the adapter and the sink.
+    pub setup_seconds: f64,
+    /// The first frame, which enters every tile it draws…
+    pub opening: Timings,
+    /// …and every frame after it, together.
+    pub frames: Timings,
+    pub tiles_from_store: u64,
+    pub tiles_from_pack: u64,
+}
+
 /// What a segment came to.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SegmentDone {
     pub out: String,
     pub frames: u64,
     pub bytes: u64,
-    /// Store tiles read ahead, from the announcements.
-    pub announced_tiles: u64,
     /// Seconds waiting for the pack, then rendering.
     pub waited_seconds: f64,
     pub render_seconds: f64,
+    /// The extracts fetched before the first frame, if the store is a
+    /// server's.
+    #[serde(default)]
+    pub extract: Option<Fetched>,
+    #[serde(default)]
+    pub render: RenderTimes,
 }
 
-/// Store tiles read at once while reading ahead.
-const AHEAD_AT_ONCE: usize = 48;
-/// Announcements read at once.
-const ANNOUNCEMENTS_AT_ONCE: usize = 4;
-/// How often the announcements and the pack are looked for.
+/// How often the pack is looked for.
 const LOOK_EVERY: Duration = Duration::from_secs(2);
+
+/// A render's phases, the costliest first, in seconds.
+fn phases(t: &Timings) -> String {
+    let mut all = [
+        ("read terrain", t.read_terrain),
+        ("read imagery", t.read_imagery),
+        ("read pack", t.read_pack),
+        ("mesh", t.mesh),
+        ("decode", t.decode),
+        ("upload", t.upload),
+        ("enter", t.enter),
+        ("stitch", t.stitch),
+        ("draw", t.draw),
+        ("readback", t.readback),
+        ("leave", t.leave),
+        ("observe", t.observe),
+        ("sink", t.sink),
+    ];
+    all.sort_by(|a, b| b.1.total_cmp(&a.1));
+    all.iter()
+        .map(|(name, s)| format!("{name} {s:.1}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// What a render service holds for as long as it lives.
 pub struct Service {
     pub runs: Arc<ObjectRunStore>,
+    /// The tile store's server, when it is one: zones are fetched from it
+    /// as extracts before a render.
+    pub remote: Option<Arc<dyn tuile_repository::Get>>,
     /// The tile store, as the bucket or the routes give it.
     pub tiles: Arc<dyn tuile_repository::Objects>,
     /// Where generations of caches are opened.
     pub cache: PathBuf,
     pub limits: Limits,
     kept: tokio::sync::Mutex<Option<Arc<Generation>>>,
-    /// Renders at once on this instance; reading ahead is not counted.
+    /// Renders at once on this instance.
     renders: tokio::sync::Semaphore,
 }
 
@@ -161,6 +199,7 @@ impl Service {
     ) -> Self {
         Self {
             runs,
+            remote: None,
             tiles,
             cache,
             limits,
@@ -190,61 +229,64 @@ impl Service {
 }
 
 impl Service {
-    /// Reads every announcement under `prefix` not read yet, and the store
-    /// tiles each names. Returns how many tiles were read.
-    async fn read_announced(
+    /// The extracts `order` names, fetched under `dir`, and every zone the
+    /// frames of `film` read pointed at its layer's; `None` when it names
+    /// none.
+    async fn fetch_extracts(
         &self,
         sources: &Sources,
-        prefix: &str,
-        read: &mut HashSet<String>,
-    ) -> Result<u64, Error> {
-        let listed = self.runs.list(prefix).await?;
-        let new: Vec<_> = listed
-            .into_iter()
-            .filter(|e| e.key.ends_with(".json") && !read.contains(&e.key))
-            .collect();
-        read.extend(new.iter().map(|e| e.key.clone()));
-        // The announcements, a few at a time; the tiles of each, many.
-        let counts: Vec<u64> = futures_util::stream::iter(new)
-            .map(|entry| async move {
-                let bytes = self.runs.get_range(&entry.key, 0..entry.size).await?;
-                let announced: Announced = serde_json::from_slice(&bytes)?;
-                let store = &sources.store.tiles;
-                let layers = [
-                    (announced.terrain_layer.as_str(), &announced.terrain),
-                    (announced.imagery_layer.as_str(), &announced.imagery),
-                ];
-                futures_util::future::try_join_all(layers.map(|(layer, wanted)| async move {
-                    store.open_zones(layer, wanted.iter().copied()).await?;
-                    futures_util::stream::iter(wanted.iter().copied())
-                        .map(|at| store.tile(layer, at.0, at.1, at.2))
-                        .buffer_unordered(AHEAD_AT_ONCE)
-                        .try_fold(0u64, |n, _| async move { Ok(n + 1) })
-                        .await
-                        .map_err(Error::from)
-                }))
-                .await
-                .map(|both| both.into_iter().sum::<u64>())
-            })
-            .buffer_unordered(ANNOUNCEMENTS_AT_ONCE)
-            .try_collect()
-            .await?;
-        Ok(counts.into_iter().sum())
+        film: &Film,
+        order: &SegmentOrder,
+        dir: &Path,
+    ) -> Result<Option<Fetched>, Error> {
+        if order.extracts.is_empty() {
+            return Ok(None);
+        }
+        let get = self
+            .remote
+            .as_ref()
+            .ok_or("extracts named and no tile store server to fetch them from")?;
+        let fetched = crate::extract::fetch(get.clone(), &order.extracts, dir).await?;
+        let local: Arc<dyn tuile_repository::Objects> =
+            Arc::new(ObjectRunStore::local(dir, tuile_farm::Tuning::default())?);
+        let store = &sources.store.tiles;
+        store.forget_extracts();
+        let frames = order.frames;
+        for file in &film.packs {
+            let (a, b) = (file.first.max(frames.0), file.last.min(frames.1));
+            if a > b {
+                continue;
+            }
+            let pack = tuile_film::Pack::open_table(&file.head)?;
+            let Some((terrain_layer, imagery_layer)) = pack.store_layers() else {
+                continue;
+            };
+            let (terrain, imagery) = tuile_film::referred(&pack, a, b)?;
+            for (layer, tiles) in [(terrain_layer, terrain), (imagery_layer, imagery)] {
+                let (extract, band) = order
+                    .extracts
+                    .iter()
+                    .find_map(|e| Some((e, e.band_of(layer)?)))
+                    .ok_or_else(|| format!("no extract of {layer}"))?;
+                let zones: std::collections::BTreeSet<String> = tiles
+                    .iter()
+                    .filter_map(|at| store.zone_of(layer, at.0, at.1, at.2))
+                    .collect();
+                for zone in zones {
+                    store.read_zone_from(&zone, local.clone(), &local_key(extract), band);
+                }
+            }
+        }
+        Ok(Some(fetched))
     }
 
-    /// Renders `order`: reads ahead what is announced until the pack is
-    /// there, then renders it to the store.
+    /// Renders `order` to the store, once its pack is there.
     pub async fn segment(&self, order: &SegmentOrder) -> Result<SegmentDone, Error> {
         let began = Instant::now();
         let within = Duration::from_secs(order.pack_within_seconds.unwrap_or(3600));
         let generation = self.generation().await?;
         let sources = &generation.sources;
-        let mut read = HashSet::new();
-        let mut announced_tiles = 0;
         loop {
-            if let Some(prefix) = &order.announced {
-                announced_tiles += self.read_announced(sources, prefix, &mut read).await?;
-            }
             if self.runs.exists(&order.pack).await? {
                 break;
             }
@@ -255,10 +297,10 @@ impl Service {
             }
             tokio::time::sleep(LOOK_EVERY).await;
         }
-        // What was announced between the last look and the pack.
-        if let Some(prefix) = &order.announced {
-            announced_tiles += self.read_announced(sources, prefix, &mut read).await?;
-        }
+        // The pack's tiles were published before it: zones read before they
+        // were, by an earlier segment of this generation, are read again —
+        // its clock stands still, and a manifest held is believed.
+        sources.store.tiles.forget_manifests();
         let rendering = order.rendering.rendering()?;
         let film = Film::of(sources.packs.objects.as_ref(), &[order.pack.as_str()]).await?;
         let mut render_order = rendering.order.clone();
@@ -276,8 +318,25 @@ impl Service {
             }
             (None, None) => {}
         }
-        let scratch = tempfile::tempdir()?;
+        // Under the cache: on a serverless container, the disk it was given
+        // rather than a /tmp in memory.
+        std::fs::create_dir_all(&self.cache)?;
+        let scratch = tempfile::tempdir_in(&self.cache)?;
         let local = scratch.path().join("segment.mp4");
+        let extract = self
+            .fetch_extracts(sources, &film, order, &scratch.path().join("store"))
+            .await?;
+        if let Some(fetched) = &extract {
+            eprintln!(
+                "segment {}: {} extracts, {} parts, {:.1} MB in {:.1} s ({:.0} MB/s)",
+                order.out,
+                fetched.extracts,
+                fetched.parts,
+                fetched.bytes as f64 / 1e6,
+                fetched.seconds,
+                fetched.mb_per_second()
+            );
+        }
         let _card = self.renders.acquire().await.map_err(|e| e.to_string())?;
         let waited_seconds = began.elapsed().as_secs_f64();
 
@@ -286,7 +345,7 @@ impl Service {
         let rendered = Instant::now();
         let runtime = tokio::runtime::Handle::current();
         let (to, kept) = (local.clone(), generation.clone());
-        let frames = tokio::task::spawn_blocking(move || -> Result<u32, Error> {
+        let done = tokio::task::spawn_blocking(move || -> Result<crate::render::Done, Error> {
             let mut sink = film_sink(
                 to.to_string_lossy().into_owned(),
                 rendering.bitrate,
@@ -301,21 +360,37 @@ impl Service {
                 &mut (),
             ))?;
             drop(sink);
-            Ok(done.frames)
+            Ok(done)
         })
         .await
         .map_err(|e| e.to_string())??;
         let render_seconds = rendered.elapsed().as_secs_f64();
         drop(_card);
+        let render = RenderTimes {
+            setup_seconds: done.setup_seconds,
+            opening: done.opening,
+            frames: done.timings,
+            tiles_from_store: done.tiles_from_store,
+            tiles_from_pack: done.tiles_from_pack,
+        };
+        eprintln!(
+            "segment {}: {} frames in {render_seconds:.1} s — setup {:.1} s; frames: {}",
+            order.out,
+            done.frames,
+            render.setup_seconds,
+            phases(&render.frames)
+        );
+        let frames = done.frames;
 
         let bytes = self.runs.put(&local, &order.out).await?;
         let receipt = SegmentDone {
             out: order.out.clone(),
             frames: u64::from(frames),
             bytes,
-            announced_tiles,
             waited_seconds,
             render_seconds,
+            extract,
+            render,
         };
         let receipt_path = scratch.path().join("segment.json");
         std::fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt)?)?;
@@ -341,7 +416,7 @@ mod tests {
         .expect("an order");
         assert_eq!(order.frames, (1, 450));
         assert_eq!(order.rendering, RenderSpec::default());
-        assert!(order.announced.is_none() && order.to_sun.is_none());
+        assert!(order.to_sun.is_none());
         // A field nobody knows is refused, not ignored: a typo would render
         // another film.
         assert!(serde_json::from_str::<SegmentOrder>(
@@ -374,10 +449,10 @@ mod tests {
         let service = Service::new(runs, tiles, dir.path().join("cache"), Limits::default());
         let order = SegmentOrder {
             pack: "packs/never.tuilepack".into(),
-            announced: None,
             frames: (1, 2),
             out: "out.mp4".into(),
             rendering: RenderSpec::default(),
+            extracts: Vec::new(),
             to_sun: None,
             pack_within_seconds: Some(0),
         };

@@ -86,6 +86,31 @@ where
     Ok((file, count))
 }
 
+/// Writes `tiles`, ids in increasing order, to a new temporary file, as one
+/// archive of no layer: its type and compression said, its metadata given.
+pub fn write_raw(
+    metadata: &str,
+    tile_type: pmtiles::TileType,
+    compression: pmtiles::Compression,
+    tiles: std::collections::BTreeMap<u64, Bytes>,
+) -> Result<tempfile::NamedTempFile, StoreError> {
+    let file = tempfile::NamedTempFile::new()?;
+    let out = file.reopen()?;
+    let mut builder = PmTilesWriter::new(tile_type)
+        .tile_compression(compression)
+        .metadata(metadata);
+    if let Some((min, max)) = zoom_range(tiles.keys()) {
+        builder = builder.min_zoom(min).max_zoom(max).center_zoom(min);
+    }
+    let mut writer = builder.create(out)?;
+    for (id, bytes) in tiles {
+        writer.add_raw_tile(TileCoord::from(TileId::new(id)?), &bytes)?;
+    }
+    writer.finalize()?;
+    fix_empty_leaf_offset(file.path())?;
+    Ok(file)
+}
+
 /// The lowest and highest archive zoom of a set of tile ids.
 pub fn zoom_range<'a>(ids: impl IntoIterator<Item = &'a u64>) -> Option<(u8, u8)> {
     ids.into_iter()

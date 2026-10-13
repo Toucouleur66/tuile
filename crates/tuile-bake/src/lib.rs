@@ -42,7 +42,6 @@
 //! ([`tuile_core::drive::drive_until_complete`]): the selection is a function of
 //! the camera and the sources, not of the network's mood.
 
-pub mod announce;
 pub mod bake;
 mod globe;
 pub mod memory;
