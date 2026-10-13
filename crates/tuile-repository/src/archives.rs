@@ -217,9 +217,9 @@ pub struct ArchivedTiles {
     /// frame asks for many tiles of one zone at once, and they wait for one
     /// read of its manifest and of each archive's head.
     opening: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
-    /// Zones read from an extract of their own rather than their manifest:
-    /// by zone, where it lies and its key there.
-    extracts: Mutex<HashMap<String, (Arc<dyn Objects>, String)>>,
+    /// Zones read from an extract rather than their manifest: by zone,
+    /// where it lies, its key there, and what is added to a tile's id in it.
+    extracts: Mutex<HashMap<String, (Arc<dyn Objects>, String, u64)>>,
 }
 
 /// A zone's manifest as read, with when: `None` if the zone has none.
@@ -287,12 +287,18 @@ impl ArchivedTiles {
     }
 
     /// Reads the zone `zone_prefix` from the archive `key` of `objects` from
-    /// now on: an extract, holding every tile of the zone a reader will ask
-    /// for. A tile it does not hold is not there; the zone's manifest is no
-    /// longer read.
-    pub fn read_zone_from(&self, zone_prefix: &str, objects: Arc<dyn Objects>, key: &str) {
+    /// now on, a tile at its id plus `band`: an extract, holding every tile
+    /// of the zone a reader will ask for. A tile it does not hold is not
+    /// there; the zone's manifest is no longer read.
+    pub fn read_zone_from(
+        &self,
+        zone_prefix: &str,
+        objects: Arc<dyn Objects>,
+        key: &str,
+        band: u64,
+    ) {
         if let Ok(mut extracts) = self.extracts.lock() {
-            extracts.insert(zone_prefix.to_string(), (objects, key.to_string()));
+            extracts.insert(zone_prefix.to_string(), (objects, key.to_string(), band));
         }
     }
 
@@ -578,9 +584,9 @@ impl TileRepository for ArchivedTiles {
             .lock()
             .ok()
             .and_then(|e| e.get(&zone).cloned());
-        if let Some((objects, key)) = extract {
+        if let Some((objects, key, band)) = extract {
             return Ok(self
-                .read_tile(objects.as_ref(), &key, id)
+                .read_tile(objects.as_ref(), &key, id + band)
                 .await?
                 .map(|bytes| Tile {
                     bytes,

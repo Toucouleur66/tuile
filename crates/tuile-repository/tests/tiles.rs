@@ -673,13 +673,17 @@ async fn a_zone_read_from_its_extract_answers_with_what_the_extract_holds() {
         .await
         .expect("open");
 
-    // An extract of one tile of the zone, somewhere else entirely.
-    let ask = tuile_tile_server::ExtractAsk {
+    // An extract of one tile of the zone, somewhere else entirely, in the
+    // second band of an extract; the first holds the other tile.
+    let ask = |at| tuile_tile_server::ExtractAsk {
         layer: "imagery".into(),
-        tiles: vec![(7, 77, 50)],
+        tiles: vec![at],
         ..Default::default()
     };
-    let (file, _) = store.extract(&ask).await.expect("extract");
+    let (file, _) = store
+        .extract(&[ask((7, 78, 50)), ask((7, 77, 50))])
+        .await
+        .expect("extract");
     let elsewhere = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(elsewhere.path().join("extracts")).expect("mkdir");
     std::fs::copy(file.path(), elsewhere.path().join("extracts/z.pmtiles")).expect("copy");
@@ -691,7 +695,12 @@ async fn a_zone_read_from_its_extract_answers_with_what_the_extract_holds() {
         reader.zone_of("imagery", 7, 78, 50).as_deref(),
         Some(zone.as_str())
     );
-    reader.read_zone_from(&zone, local, "extracts/z.pmtiles");
+    reader.read_zone_from(
+        &zone,
+        local,
+        "extracts/z.pmtiles",
+        tuile_tile_server::extract::BANDS[1],
+    );
     assert_eq!(
         answer(&reader, "imagery", 7, 77, 50).await,
         "image/png imagery/7/77/50"
@@ -699,7 +708,7 @@ async fn a_zone_read_from_its_extract_answers_with_what_the_extract_holds() {
     assert_eq!(
         answer(&reader, "imagery", 7, 78, 50).await,
         "absent",
-        "not in the extract: the zone's manifest is not read"
+        "not in the extract's band: the zone's manifest is not read"
     );
     reader.forget_extracts();
     assert_eq!(
