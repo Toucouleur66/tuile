@@ -340,13 +340,17 @@ fn encode_eyes(
     // encodes plain HEVC (the views as frames one after the other),
     // =nopic passes no per-picture HEVC parameters.
     let probe = std::env::var("TUILE_NVENC_PROBE").unwrap_or_default();
-    let multiview = probe != "plain";
+    let has = |flag: &str| probe.split(',').any(|f| f == flag);
+    let multiview = !has("plain");
     step(&format!("probe {probe:?}"));
     // SAFETY: the preset asked for is HEVC's, so the codec config is.
     unsafe {
         let hevc = &mut config.encodeCodecConfig.hevcConfig;
         hevc.set_enableMVHEVC(u32::from(multiview));
-        hevc.set_outputHevc3DReferenceDisplayInfo(u32::from(multiview));
+        hevc.set_outputHevc3DReferenceDisplayInfo(u32::from(multiview && !has("nosei")));
+        if has("views2") {
+            hevc.numViews = 2;
+        }
         // Nothing MV-HEVC refuses: no temporal filter.
         hevc.tfLevel = NV_ENC_TEMPORAL_FILTER_LEVEL::NV_ENC_TEMPORAL_FILTER_LEVEL_0;
         // What FFmpeg says outright where a preset leaves it unsaid: 4:2:0,
@@ -408,11 +412,11 @@ fn encode_eyes(
                     viewId: view as u32,
                     ..Default::default()
                 };
-                if first {
+                if first && !has("nosei") {
                     hevc.p3DReferenceDisplayInfo = &raw mut displays;
                 }
                 let params = EncodePictureParams {
-                    codec_params: (multiview && probe != "nopic")
+                    codec_params: (multiview && !has("nopic"))
                         .then_some(CodecPictureParams::Hevc(hevc)),
                     ..Default::default()
                 };
