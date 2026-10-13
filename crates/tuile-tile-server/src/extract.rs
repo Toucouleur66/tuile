@@ -14,6 +14,12 @@
 //! What is asked for is tile addresses, and/or levels: an extract of
 //! `tiles` holds those of them the store has; `levels` keeps only those
 //! levels; `whole_zones` takes the zones of the given addresses whole.
+//!
+//! One extract may hold tiles of several layers — a terrain and its imagery,
+//! what one reader draws together. Their grids would give two tiles of two
+//! layers the same id, so each layer of an extract has its band: the
+//! layer's own ids for the first, the same plus [`BANDS`]`[1]` for the
+//! second, in the PMTiles numbering's zoom 30 where no grid tile reaches.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
@@ -28,6 +34,10 @@ use crate::layer::{Layer, Zone};
 use crate::manifest;
 use crate::store::{download, TileStore};
 use crate::StoreError;
+
+/// What is added to the ids of each layer of an extract, in the order they
+/// were asked for.
+pub const BANDS: [u64; 2] = [0, 1 << 60];
 
 /// Zones read at once while extracting.
 const ZONES_AT_ONCE: usize = 16;
@@ -108,40 +118,60 @@ impl Keep {
 }
 
 impl TileStore {
-    /// The tiles `ask` names, as one archive of its layer: a temporary file,
-    /// gone when dropped.
+    /// The tiles `asks` name — one layer each, at most [`BANDS`] of them —
+    /// as one archive: a temporary file, gone when dropped.
     pub async fn extract(
         &self,
-        ask: &ExtractAsk,
+        asks: &[ExtractAsk],
     ) -> Result<(tempfile::NamedTempFile, ExtractReport), StoreError> {
         let began = Instant::now();
-        let layer = self.layer(&ask.layer)?.clone();
-        let (keep, zones) = Keep::of(&layer, ask)?;
-        let (layer, keep) = (Arc::new(layer), Arc::new(keep));
-        let mut report = ExtractReport {
-            zones: zones.len() as u64,
-            ..Default::default()
-        };
-        let read: Vec<(BTreeMap<u64, Bytes>, ExtractReport)> = futures_util::stream::iter(zones)
-            .map(|zone| {
-                let (layer, keep) = (layer.clone(), keep.clone());
-                async move { self.extract_zone(&layer, zone, &keep).await }
-            })
-            .buffer_unordered(ZONES_AT_ONCE)
-            .try_collect()
-            .await?;
-        // Zones do not share tiles: their maps join without a choice to make.
+        if asks.len() > BANDS.len() {
+            return Err(StoreError::Corrupt(format!(
+                "an extract of {} layers: {} at most",
+                asks.len(),
+                BANDS.len()
+            )));
+        }
+        let mut report = ExtractReport::default();
         let mut tiles = BTreeMap::new();
-        for (zone_tiles, zone) in read {
-            report.archives += zone.archives;
-            report.archive_bytes += zone.archive_bytes;
-            tiles.extend(zone_tiles);
+        let mut layers = Vec::with_capacity(asks.len());
+        for (ask, band) in asks.iter().zip(BANDS) {
+            let layer = self.layer(&ask.layer)?.clone();
+            let (keep, zones) = Keep::of(&layer, ask)?;
+            let (layer, keep) = (Arc::new(layer), Arc::new(keep));
+            report.zones += zones.len() as u64;
+            let read: Vec<(BTreeMap<u64, Bytes>, ExtractReport)> =
+                futures_util::stream::iter(zones)
+                    .map(|zone| {
+                        let (layer, keep) = (layer.clone(), keep.clone());
+                        async move { self.extract_zone(&layer, zone, &keep).await }
+                    })
+                    .buffer_unordered(ZONES_AT_ONCE)
+                    .try_collect()
+                    .await?;
+            // Zones do not share tiles, nor bands layers: the maps join
+            // without a choice to make.
+            for (zone_tiles, zone) in read {
+                report.archives += zone.archives;
+                report.archive_bytes += zone.archive_bytes;
+                tiles.extend(zone_tiles.into_iter().map(|(id, b)| (id + band, b)));
+            }
+            layers.push(serde_json::json!({
+                "name": layer.name,
+                "grid": layer.grid,
+                "band": band,
+                "content_type": layer.content_type,
+            }));
         }
         report.tiles = tiles.len() as u64;
-        let zooms = archive::zoom_range(tiles.keys());
-        let epoch = layer.epoch(self.now());
-        let (file, _) = tokio::task::spawn_blocking(move || {
-            archive::write(&layer, &epoch, zooms, tiles.into_iter().map(Ok))
+        let metadata = serde_json::json!({ "tuile:extract": layers }).to_string();
+        let file = tokio::task::spawn_blocking(move || {
+            archive::write_raw(
+                &metadata,
+                pmtiles::TileType::Unknown,
+                pmtiles::Compression::None,
+                tiles,
+            )
         })
         .await
         .map_err(|e| StoreError::Corrupt(format!("extract writer: {e}")))??;
@@ -422,7 +452,7 @@ mod tests {
             tiles: vec![(7, 77, 50), (8, 154, 100), (7, 5, 120), (7, 76, 50)],
             ..Default::default()
         };
-        let (file, report) = store.extract(&ask).await.expect("extract");
+        let (file, report) = store.extract(&[ask]).await.expect("extract");
         assert_eq!(
             held(&file).await,
             BTreeMap::from([
@@ -446,11 +476,81 @@ mod tests {
             levels: Some((7, 7)),
             ..Default::default()
         };
-        let (file, _) = store.extract(&ask).await.expect("extract");
+        let (file, _) = store.extract(&[ask]).await.expect("extract");
         assert_eq!(
             held(&file).await.into_keys().collect::<Vec<_>>(),
             [(7, 77, 50), (7, 78, 50)]
         );
+    }
+
+    #[tokio::test]
+    async fn two_layers_share_one_extract_each_in_its_band() {
+        let memory: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let def = |name: &str, grid| LayerDef {
+            name: name.into(),
+            grid,
+            tile_type: "png".into(),
+            tile_compression: "none".into(),
+            zone_level: 4,
+            expiry_days: None,
+            content_type: "image/png".into(),
+        };
+        catalog::write(
+            memory.as_ref(),
+            &Catalog {
+                layers: vec![
+                    def("imagery", Grid::WebMercator),
+                    def("terrain", Grid::Geographic),
+                ],
+            },
+        )
+        .await
+        .expect("catalog");
+        let store = TileStore::open(memory, StoreConfig::default())
+            .await
+            .expect("open");
+        // The same address in both: two grids, the same numbers.
+        for layer in ["imagery", "terrain"] {
+            store
+                .put(layer, 7, 77, 50, Bytes::from(layer.to_string()))
+                .await
+                .expect("put");
+        }
+        store.flush_all().await.expect("flush");
+        let ask = |layer: &str| ExtractAsk {
+            layer: layer.into(),
+            tiles: vec![(7, 77, 50)],
+            ..Default::default()
+        };
+        let (file, report) = store
+            .extract(&[ask("terrain"), ask("imagery")])
+            .await
+            .expect("extract");
+        assert_eq!((report.tiles, report.zones), (2, 2));
+        let reader = Arc::new(archive::open_local(file.path()).await.expect("open"));
+        let ids = archive::ids(reader.clone()).await.expect("ids");
+        let terrain = Grid::Geographic.to_id(7, 77, 50).expect("id");
+        let imagery = Grid::WebMercator.to_id(7, 77, 50).expect("id");
+        assert_eq!(
+            ids,
+            [terrain, imagery + BANDS[1]],
+            "the first asked at its own ids"
+        );
+        let at = |id| {
+            let reader = reader.clone();
+            async move {
+                let tile = reader
+                    .get_tile(pmtiles::TileId::new(id).expect("id"))
+                    .await
+                    .expect("get")
+                    .expect("a tile");
+                String::from_utf8_lossy(&tile).to_string()
+            }
+        };
+        assert_eq!(at(terrain).await, "terrain");
+        assert_eq!(at(imagery + BANDS[1]).await, "imagery");
+        let three = [ask("terrain"), ask("imagery"), ask("imagery")];
+        assert!(store.extract(&three).await.is_err());
     }
 
     fn file(bytes: &[u8]) -> tempfile::NamedTempFile {
