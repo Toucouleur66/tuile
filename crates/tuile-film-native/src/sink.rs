@@ -69,6 +69,22 @@ pub struct Eyes<'a> {
     pub left_camera: &'a tuile_film::FrameCamera,
 }
 
+/// What a spatial film tells a player of its eyes, from a frame's: their
+/// distance, their horizontal field, no disparity adjustment — the eyes are
+/// drawn converged, what is on the screen has no parallax already.
+pub fn stereo_info(eyes: &Eyes<'_>) -> tuile_mp4::spatial::StereoInfo {
+    let baseline_um = (eyes.pair.baseline_m * 1e6)
+        .round()
+        .clamp(1.0, f64::from(u32::MAX)) as u32;
+    let t = 1.0 / f64::from(eyes.left_camera.projection.x_axis.x);
+    let hfov = (2.0 * t.atan()).to_degrees() * 1000.0;
+    tuile_mp4::spatial::StereoInfo {
+        baseline_um,
+        hfov_millidegrees: hfov.round() as u32,
+        disparity_adjustment: 0,
+    }
+}
+
 /// Keeps nothing: a render made to be measured.
 pub struct Nothing;
 

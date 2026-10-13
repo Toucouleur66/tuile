@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! The film as an mp4, AV1 or H.264 by an NVIDIA card's encoder.
+//! The film as an mp4, AV1, H.264 or — for two eyes — MV-HEVC by an NVIDIA
+//! card's encoder.
 //!
 //! On a machine with an NVIDIA card the render runs on Vulkan and the
 //! pictures are encoded by the card's own encoder (NVENC, reached over
@@ -21,10 +22,14 @@ use std::time::{Duration, Instant};
 
 use cudarc::driver::CudaContext;
 use nvidia_video_codec_sdk::sys::nvEncodeAPI::{
-    NV_ENC_BUFFER_FORMAT, NV_ENC_CODEC_AV1_GUID, NV_ENC_CODEC_H264_GUID, NV_ENC_PARAMS_RC_MODE,
-    NV_ENC_PIC_TYPE, NV_ENC_PRESET_P4_GUID, NV_ENC_TUNING_INFO,
+    NV_ENC_BUFFER_FORMAT, NV_ENC_CAPS, NV_ENC_CODEC_AV1_GUID, NV_ENC_CODEC_H264_GUID,
+    NV_ENC_CODEC_HEVC_GUID, NV_ENC_PARAMS_RC_MODE, NV_ENC_PIC_TYPE, NV_ENC_PRESET_P4_GUID,
+    NV_ENC_TUNING_INFO,
 };
-use nvidia_video_codec_sdk::{EncodeError, Encoder, EncoderInitParams, EncoderInput, ErrorKind};
+use nvidia_video_codec_sdk::{
+    CodecPictureParams, EncodeError, EncodePictureParams, Encoder, EncoderInitParams, EncoderInput,
+    ErrorKind,
+};
 use tuile_mp4::{annex_b_to_avcc, nal_units, Codec, Muxer, ParameterSets};
 
 use crate::av1::{av1c_of, obus};
@@ -36,6 +41,10 @@ use crate::Error;
 pub enum NvencCodec {
     Av1,
     H264,
+    /// The two eyes of a film as the two layers of one HEVC stream, with
+    /// the stereo metadata a headset reads: a spatial film. Blackwell cards
+    /// and later; a film of two eyes only.
+    MvHevc,
 }
 
 /// Pictures waiting for the encoder before the render waits for it.
@@ -49,6 +58,10 @@ pub struct NvencFilm {
     /// The CUDA device the encoder is opened on.
     device: usize,
     pictures: Option<SyncSender<Vec<u8>>>,
+    /// For a spatial film: each frame's two eyes, and its frame rate until
+    /// the first frame opens the encoder.
+    eyes: Option<SyncSender<(Vec<u8>, Vec<u8>)>>,
+    fps: u32,
     encoder: Option<JoinHandle<Result<(Vec<u8>, f64), String>>>,
     size: (usize, usize),
     seconds: f64,
@@ -62,6 +75,8 @@ impl NvencFilm {
             codec,
             device: 0,
             pictures: None,
+            eyes: None,
+            fps: 30,
             encoder: None,
             size: (0, 0),
             seconds: 0.0,
@@ -94,6 +109,7 @@ fn encode(
     let guid = match codec {
         NvencCodec::Av1 => NV_ENC_CODEC_AV1_GUID,
         NvencCodec::H264 => NV_ENC_CODEC_H264_GUID,
+        NvencCodec::MvHevc => return Err("NVENC: MV-HEVC is a film of two eyes".into()),
     };
     if !encoder.get_encode_guids().map_err(told)?.contains(&guid) {
         return Err(format!("NVENC: this card does not encode {codec:?}"));
@@ -199,6 +215,7 @@ fn encode(
                 }
                 data.to_vec()
             }
+            NvencCodec::MvHevc => unreachable!("refused before the session"),
             NvencCodec::H264 => {
                 if muxer.is_none() {
                     let units = nal_units(data);
@@ -231,8 +248,179 @@ fn encode(
     Ok((film, busy))
 }
 
+/// An I420 picture into a buffer whose rows are `pitch` wide.
+fn pitched(i420: Vec<u8>, (width, height): (usize, usize), pitch: usize) -> Vec<u8> {
+    if pitch == width {
+        return i420;
+    }
+    let (luma, chroma) = (width * height, (width / 2) * (height / 2));
+    let mut out = vec![0u8; pitch * height + 2 * (pitch / 2) * (height / 2)];
+    let mut to = 0;
+    for (from, w, h, p) in [
+        (&i420[..luma], width, height, pitch),
+        (&i420[luma..luma + chroma], width / 2, height / 2, pitch / 2),
+        (&i420[luma + chroma..], width / 2, height / 2, pitch / 2),
+    ] {
+        for row in 0..h {
+            out[to + row * p..to + row * p + w].copy_from_slice(&from[row * w..(row + 1) * w]);
+        }
+        to += p * h;
+    }
+    out
+}
+
+/// NAL units of an Annex B stream, parameter sets (VPS, SPS, PPS) apart:
+/// an `hvc1` sample carries none, its entry carries them all.
+fn hevc_units(stream: &[u8]) -> (Vec<&[u8]>, Vec<&[u8]>) {
+    nal_units(stream).into_iter().partition(|u| {
+        u.first()
+            .is_some_and(|b| (32..=34).contains(&((b >> 1) & 0x3f)))
+    })
+}
+
+/// The encoder's thread for a spatial film: each frame's two eyes in, the
+/// finished mp4 out. Each eye is one picture of the session, the left as
+/// view 0 (the base layer), the right as view 1; the access unit is both.
+fn encode_eyes(
+    waiting: std::sync::mpsc::Receiver<(Vec<u8>, Vec<u8>)>,
+    device: usize,
+    (width, height): (usize, usize),
+    fps: u32,
+    bitrate: u32,
+    stereo: tuile_mp4::spatial::StereoInfo,
+) -> Result<(Vec<u8>, f64), String> {
+    let cuda = CudaContext::new(device).map_err(|e| format!("CUDA device {device}: {e:?}"))?;
+    let encoder = Encoder::initialize_with_cuda(cuda).map_err(told)?;
+    let guid = NV_ENC_CODEC_HEVC_GUID;
+    if !encoder.get_encode_guids().map_err(told)?.contains(&guid) {
+        return Err("NVENC: this card does not encode HEVC".into());
+    }
+    let supported = encoder
+        .get_encode_caps(guid, NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_MVHEVC_ENCODE)
+        .map_err(told)?;
+    if supported == 0 {
+        return Err("NVENC: this card does not encode MV-HEVC (Blackwell and later do)".into());
+    }
+    // MV-HEVC wants the high-quality tuning, and nothing that looks ahead
+    // or reorders: pictures out as they went in, a key frame every two
+    // seconds, the bitrate for both eyes.
+    let tuning = NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_HIGH_QUALITY;
+    let mut config = encoder
+        .get_preset_config(guid, NV_ENC_PRESET_P4_GUID, tuning)
+        .map_err(told)?
+        .presetCfg;
+    config.frameIntervalP = 1;
+    config.gopLength = 2 * fps;
+    config.rcParams.set_enableLookahead(0);
+    config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_VBR;
+    config.rcParams.multiPass = Default::default();
+    config.rcParams.averageBitRate = bitrate;
+    config.rcParams.maxBitRate = bitrate.saturating_mul(2);
+    // SAFETY: the preset asked for is HEVC's, so the codec config is.
+    unsafe { config.enable_mv_hevc(2) };
+    let mut init = EncoderInitParams::new(guid, width as u32, height as u32);
+    init.preset_guid(NV_ENC_PRESET_P4_GUID)
+        .tuning_info(tuning)
+        .framerate(fps, 1)
+        .enable_picture_type_decision()
+        .encode_config(&mut config);
+    let session = encoder
+        .start_session(NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_IYUV, init)
+        .map_err(told)?;
+    let mut inputs = [
+        session.create_input_buffer().map_err(told)?,
+        session.create_input_buffer().map_err(told)?,
+    ];
+    let mut outputs = [
+        session.create_output_bitstream().map_err(told)?,
+        session.create_output_bitstream().map_err(told)?,
+    ];
+    drop(inputs[0].lock().map_err(told)?);
+    let pitch = match inputs[0].pitch() as usize {
+        0 => width,
+        pitch => pitch,
+    };
+
+    let mut muxer: Option<tuile_mp4::spatial::SpatialMuxer> = None;
+    let mut busy = 0.0f64;
+    for (left, right) in waiting {
+        let began = Instant::now();
+        for (view, i420) in [left, right].into_iter().enumerate() {
+            {
+                let mut lock = inputs[view].lock().map_err(told)?;
+                // SAFETY: a planar 4:2:0 picture of the session's size at
+                // the buffer's pitch, which the buffer was made to hold.
+                unsafe { lock.write(&pitched(i420, (width, height), pitch)) };
+            }
+            loop {
+                let params = EncodePictureParams {
+                    codec_params: Some(CodecPictureParams::hevc_view(view as u32)),
+                    ..Default::default()
+                };
+                match session.encode_picture(&mut inputs[view], &mut outputs[view], params) {
+                    Ok(()) => break,
+                    Err(e) if e.kind() == ErrorKind::EncoderBusy => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(e) => return Err(told(e)),
+                }
+            }
+        }
+        // The base layer, then the second: one access unit.
+        let mut sample = Vec::new();
+        let mut sets: Vec<Vec<u8>> = Vec::new();
+        let mut key = false;
+        for (view, output) in outputs.iter_mut().enumerate() {
+            let lock = output.lock().map_err(told)?;
+            if view == 0 {
+                key = matches!(
+                    lock.picture_type(),
+                    NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR | NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_I
+                );
+            }
+            let (parameters, units) = hevc_units(lock.data());
+            if muxer.is_none() {
+                sets.extend(parameters.iter().map(|u| u.to_vec()));
+            }
+            for unit in units {
+                sample.extend((unit.len() as u32).to_be_bytes());
+                sample.extend_from_slice(unit);
+            }
+        }
+        if muxer.is_none() {
+            let units: Vec<&[u8]> = sets.iter().map(Vec::as_slice).collect();
+            let (hvcc, lhvc) =
+                tuile_mp4::spatial::hevc_records(&units).map_err(|e| format!("NVENC: {e}"))?;
+            muxer = Some(
+                tuile_mp4::spatial::SpatialMuxer::new(
+                    u16::try_from(width).map_err(|e| e.to_string())?,
+                    u16::try_from(height).map_err(|e| e.to_string())?,
+                    fps,
+                    &hvcc,
+                    &lhvc,
+                    stereo,
+                )
+                .map_err(|e| e.to_string())?,
+            );
+        }
+        if let Some(muxer) = muxer.as_mut() {
+            muxer.push(&sample, key).map_err(|e| e.to_string())?;
+        }
+        busy += began.elapsed().as_secs_f64();
+    }
+    session.end_of_stream().map_err(told)?;
+    let film = muxer
+        .ok_or("a film of no picture")?
+        .finish()
+        .map_err(|e| e.to_string())?;
+    Ok((film, busy))
+}
+
 impl Sink for NvencFilm {
     fn open(&mut self, width: u32, height: u32, fps: u32) -> Result<(), Error> {
+        if self.codec == NvencCodec::MvHevc {
+            return Err("a spatial film has two eyes: render it in stereo".into());
+        }
         let size = (width as usize, height as usize);
         self.size = size;
         let (pictures, waiting) = sync_channel::<Vec<u8>>(WAITING);
@@ -265,8 +453,58 @@ impl Sink for NvencFilm {
         Ok(())
     }
 
+    fn open_stereo(&mut self, picture: (u32, u32), eye: (u32, u32), fps: u32) -> Result<(), Error> {
+        if self.codec != NvencCodec::MvHevc {
+            return self.open(picture.0, picture.1, fps);
+        }
+        // The encoder opens with the first frame, which says the eyes.
+        self.size = (eye.0 as usize, eye.1 as usize);
+        self.fps = fps.max(1);
+        Ok(())
+    }
+
+    fn stereo(
+        &mut self,
+        index: u32,
+        frame: u32,
+        rgba: &[u8],
+        i420: &[u8],
+        eyes: &crate::sink::Eyes<'_>,
+    ) -> Result<(), Error> {
+        if self.codec != NvencCodec::MvHevc {
+            return self.picture(index, frame, rgba, i420);
+        }
+        let (w, h) = self.size;
+        let bytes = w * h + 2 * (w / 2) * (h / 2);
+        if eyes.left.len() != bytes || eyes.right.len() != bytes {
+            return Err(format!("a {w}×{h} eye is not {bytes} bytes of I420").into());
+        }
+        if self.eyes.is_none() {
+            let stereo = crate::sink::stereo_info(eyes);
+            let (sender, waiting) = sync_channel::<(Vec<u8>, Vec<u8>)>(WAITING);
+            let (device, bitrate, size, fps) = (self.device, self.bitrate, self.size, self.fps);
+            self.eyes = Some(sender);
+            self.encoder = Some(std::thread::spawn(move || {
+                encode_eyes(waiting, device, size, fps, bitrate, stereo)
+            }));
+        }
+        let sender = self.eyes.as_ref().ok_or("the film was not opened")?;
+        if sender
+            .send((eyes.left.to_vec(), eyes.right.to_vec()))
+            .is_err()
+        {
+            self.eyes = None;
+            return match self.encoder.take().map(JoinHandle::join) {
+                Some(Ok(Err(why))) => Err(why.into()),
+                _ => Err("the encoder stopped".into()),
+            };
+        }
+        Ok(())
+    }
+
     fn close(&mut self) -> Result<(), Error> {
         self.pictures = None;
+        self.eyes = None;
         let encoder = self.encoder.take().ok_or("the film was not opened")?;
         let (film, seconds) = encoder.join().map_err(|_| "the encoder panicked")??;
         self.seconds = seconds;
