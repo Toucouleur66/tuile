@@ -31,8 +31,6 @@ pub enum DecodeError {
     Truncated(&'static str),
     #[error("index {idx} out of range (vertex_count {count})")]
     BadIndex { idx: u32, count: u32 },
-    #[error("gzip: {0}")]
-    Gzip(String),
 }
 
 /// Header of a quantized-mesh tile (88 bytes).
@@ -139,22 +137,16 @@ fn zigzag(value: u16) -> i32 {
     (v >> 1) ^ (-(v & 1))
 }
 
-/// Decodes a quantized-mesh tile. Transparently gunzips the input when it
-/// is gzip-framed (`.terrain` tiles are gzip on the wire; a transport that
-/// already decoded Content-Encoding passes raw bytes — both work).
+/// Decodes a quantized-mesh tile, as raw bytes.
+///
+/// Never gzip: whoever hands the bytes over knows how they were encoded —
+/// an HTTP transport by `Content-Encoding`, which it undoes (reqwest's
+/// `gzip`, a browser's fetch), a store by its archive's tile compression —
+/// and hands them over decoded ([`crate::TerrainSource`]). The bytes alone
+/// cannot say: a raw tile begins with its centre's X, a little-endian
+/// `f64`, whose first two bytes are gzip's magic once in 65 536 tiles.
+/// Guessing from them refused real tiles as broken gzip streams.
 pub fn decode(bytes: &[u8]) -> Result<QuantizedMesh, DecodeError> {
-    let owned;
-    let bytes = if bytes.starts_with(&[0x1f, 0x8b]) {
-        use std::io::Read;
-        let mut out = Vec::new();
-        flate2::read::GzDecoder::new(bytes)
-            .read_to_end(&mut out)
-            .map_err(|e| DecodeError::Gzip(e.to_string()))?;
-        owned = out;
-        owned.as_slice()
-    } else {
-        bytes
-    };
     let mut r = Reader::new(bytes);
 
     let header = Header {
@@ -519,8 +511,33 @@ mod tests {
         assert!(matches!(decode(&[0u8; 10]), Err(DecodeError::Truncated(_))));
     }
 
+    /// A raw tile can begin with gzip's two magic bytes by chance: its
+    /// first bytes are the centre's X, a little-endian f64. Terrain tile
+    /// 15/32500/26026 (Derbyshire) does — its X, 3 848 271.99 m, is
+    /// `1f 8b 97 fe …` — and was refused as a broken gzip stream, ending
+    /// every bake that met it. It is read as the raw tile it is.
     #[test]
-    fn decodes_gzip_framed_input() {
+    fn a_raw_tile_that_begins_like_gzip_is_read_raw() {
+        let header = Header {
+            center: [3_848_271.988_999_739, -98_700.0, 5_066_000.0],
+            ..test_header()
+        };
+        let u = vec![0.0, 1.0, 0.0, 1.0];
+        let v = vec![0.0, 0.0, 1.0, 1.0];
+        let height = vec![0.0, 0.0, 0.0, 0.0];
+        let indices = vec![0u32, 1, 2, 2, 1, 3];
+        let edges = [vec![0u32, 2], vec![0u32, 1], vec![1u32, 3], vec![2u32, 3]];
+        let raw = encode(&header, &u, &v, &height, &indices, None, &edges);
+        assert_eq!(&raw[0..2], &[0x1f, 0x8b], "the tile looks gzip-framed");
+        let mesh = decode(&raw).expect("read as raw");
+        assert_eq!(mesh.header.center, header.center);
+        assert_eq!(mesh.indices, indices);
+    }
+
+    /// A gzip stream is not a tile: it is the source's to decompress, and
+    /// one that reaches the decoder is refused, never guessed at.
+    #[test]
+    fn a_gzip_stream_is_not_read_as_a_tile() {
         use std::io::Write;
         let u = vec![0.0, 1.0, 0.0, 1.0];
         let v = vec![0.0, 0.0, 1.0, 1.0];
@@ -528,16 +545,9 @@ mod tests {
         let indices = vec![0u32, 1, 2, 2, 1, 3];
         let edges = [vec![0u32, 2], vec![0u32, 1], vec![1u32, 3], vec![2u32, 3]];
         let raw = encode(&test_header(), &u, &v, &height, &indices, None, &edges);
-
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         gz.write_all(&raw).expect("gzip");
         let gzipped = gz.finish().expect("finish");
-        assert_eq!(&gzipped[0..2], &[0x1f, 0x8b], "gzip framed");
-
-        // decode() must transparently gunzip and match the raw decode.
-        let from_gz = decode(&gzipped).expect("decode gzip");
-        let from_raw = decode(&raw).expect("decode raw");
-        assert_eq!(from_gz.vertex_count(), from_raw.vertex_count());
-        assert_eq!(from_gz.indices, from_raw.indices);
+        assert!(decode(&gzipped).is_err());
     }
 }

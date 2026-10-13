@@ -17,9 +17,10 @@ use crate::tiling::TileCoord;
 use tuile_core::fetch::Fetched;
 use tuile_core::storage::ContentStore;
 
-/// Supplies the raw bytes of a quantized-mesh terrain tile. The bytes may be
-/// gzipped — [`crate::decode`](mod@crate::decode) handles that. Transport- and
-/// backend-agnostic:
+/// Supplies the raw bytes of a quantized-mesh terrain tile — decoded of any
+/// transfer or storage encoding, which only the implementor knows of
+/// ([`crate::decode`](mod@crate::decode) reads raw tiles only). Transport-
+/// and backend-agnostic:
 /// the implementor decides HTTP, disk, ion bearer auth, etc.
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
