@@ -126,7 +126,7 @@ pub struct BakeFrames<'a> {
     pub packed: &'a PackedMirror,
     /// Told, as the bake goes, of the store tiles its frames name: see
     /// [`crate::announce`].
-    pub announce: Option<&'a dyn crate::announce::Announce>,
+    pub announce: Option<crate::announce::Announcing<'a>>,
 }
 
 /// What a bake produced.

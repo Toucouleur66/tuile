@@ -7,6 +7,11 @@
 //! The render of a stretch begins by reading every store tile its frames name
 //! — minutes, for a 4K stretch. Told as the bake finds them, a render service
 //! reads them while the bake goes on, and is ready when the pack is.
+//!
+//! A tile is told only once it is in the store: before each announcement the
+//! bake publishes every tile it holds back, its zones' archives and manifests
+//! written. Told sooner, a reader would find the zone without the tile, and a
+//! render would draw a hole where the bake saw ground.
 
 use std::collections::{BTreeSet, HashSet};
 
@@ -34,13 +39,26 @@ pub trait Announce: Send + Sync {
     fn announce(&self, announced: &Announced) -> Result<(), String>;
 }
 
+/// Whoever puts the bake's tiles in the store: what it holds back is
+/// published, every zone of it, before it returns.
+pub trait Publish: Send + Sync {
+    fn publish(&self) -> Result<(), String>;
+}
+
+/// Who is told, and who publishes first: one does not go without the other.
+#[derive(Clone, Copy)]
+pub struct Announcing<'a> {
+    pub to: &'a dyn Announce,
+    pub publish: &'a dyn Publish,
+}
+
 /// Frames gathered before what they name is told.
 pub const ANNOUNCE_EVERY: u32 = 25;
 
 /// Gathers what the tiles of each frame name and tells it every
 /// [`ANNOUNCE_EVERY`] frames, each store tile once.
 pub struct Herald<'a> {
-    to: &'a dyn Announce,
+    to: Announcing<'a>,
     layers: (String, String),
     told: HashSet<(bool, StoreAt)>,
     terrain: BTreeSet<StoreAt>,
@@ -55,7 +73,7 @@ fn at(tile: &StoreTile) -> StoreAt {
 impl<'a> Herald<'a> {
     /// `terrain_layer` and `imagery_layer`: the store's layers the pack
     /// refers to.
-    pub fn new(to: &'a dyn Announce, terrain_layer: &str, imagery_layer: &str) -> Self {
+    pub fn new(to: Announcing<'a>, terrain_layer: &str, imagery_layer: &str) -> Self {
         Self {
             to,
             layers: (terrain_layer.to_string(), imagery_layer.to_string()),
@@ -97,7 +115,8 @@ impl<'a> Herald<'a> {
             terrain: std::mem::take(&mut self.terrain).into_iter().collect(),
             imagery: std::mem::take(&mut self.imagery).into_iter().collect(),
         };
-        self.to.announce(&announced)
+        self.to.publish.publish()?;
+        self.to.to.announce(&announced)
     }
 }
 
@@ -109,6 +128,8 @@ mod tests {
 
     use super::*;
 
+    /// What was told, and each publication as an empty announcement in
+    /// the same list: their order is the point.
     #[derive(Default)]
     struct Heard(Mutex<Vec<Announced>>);
 
@@ -116,6 +137,36 @@ mod tests {
         fn announce(&self, announced: &Announced) -> Result<(), String> {
             self.0.lock().expect("lock").push(announced.clone());
             Ok(())
+        }
+    }
+
+    impl Publish for Heard {
+        fn publish(&self) -> Result<(), String> {
+            self.0.lock().expect("lock").push(Announced::default());
+            Ok(())
+        }
+    }
+
+    impl Heard {
+        fn announcing(&self) -> Announcing<'_> {
+            Announcing {
+                to: self,
+                publish: self,
+            }
+        }
+
+        /// The announcements, each checked to come right after a
+        /// publication.
+        fn told(self) -> Vec<Announced> {
+            let all = self.0.into_inner().expect("lock");
+            assert_eq!(all.len() % 2, 0, "{all:?}");
+            all.chunks(2)
+                .map(|pair| {
+                    assert_eq!(pair[0], Announced::default(), "published before it is told");
+                    assert_ne!(pair[1], Announced::default());
+                    pair[1].clone()
+                })
+                .collect()
         }
     }
 
@@ -162,7 +213,7 @@ mod tests {
     #[test]
     fn each_store_tile_is_told_once_a_stretch_of_frames_at_a_time_and_the_last_stretch_too() {
         let heard = Heard::default();
-        let mut herald = Herald::new(&heard, "asset-1", "asset-2");
+        let mut herald = Herald::new(heard.announcing(), "asset-1", "asset-2");
         let last = ANNOUNCE_EVERY + 10;
         for frame in 1..=last {
             // The same terrain every frame; a new imagery tile every frame,
@@ -173,7 +224,7 @@ mod tests {
             );
             herald.frame_done(frame, frame == last).expect("told");
         }
-        let heard = heard.0.into_inner().expect("lock");
+        let heard = heard.told();
         assert_eq!(heard.len(), 2);
         assert_eq!(heard[0].frames, (1, ANNOUNCE_EVERY));
         assert_eq!(
@@ -198,7 +249,7 @@ mod tests {
     #[test]
     fn a_tile_with_nothing_of_the_store_and_a_stretch_with_nothing_new_tell_nothing() {
         let heard = Heard::default();
-        let mut herald = Herald::new(&heard, "asset-1", "asset-2");
+        let mut herald = Herald::new(heard.announcing(), "asset-1", "asset-2");
         herald.tile(
             1,
             &BakedTile {
@@ -207,6 +258,9 @@ mod tests {
             },
         );
         herald.frame_done(1, true).expect("nothing");
-        assert!(heard.0.lock().expect("lock").is_empty());
+        assert!(
+            heard.0.lock().expect("lock").is_empty(),
+            "nothing told, nothing published"
+        );
     }
 }

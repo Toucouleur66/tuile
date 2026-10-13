@@ -213,3 +213,9 @@ impl Tiles {
         Ok(())
     }
 }
+
+impl crate::announce::Publish for Tiles {
+    fn publish(&self) -> Result<(), String> {
+        self.flush()
+    }
+}

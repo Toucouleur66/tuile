@@ -204,6 +204,12 @@ impl Service {
             .filter(|e| e.key.ends_with(".json") && !read.contains(&e.key))
             .collect();
         read.extend(new.iter().map(|e| e.key.clone()));
+        if new.is_empty() {
+            return Ok(0);
+        }
+        // What is announced was published first: zones read before it are
+        // read again.
+        sources.store.tiles.forget_manifests();
         // The announcements, a few at a time; the tiles of each, many.
         let counts: Vec<u64> = futures_util::stream::iter(new)
             .map(|entry| async move {
@@ -246,6 +252,10 @@ impl Service {
                 announced_tiles += self.read_announced(sources, prefix, &mut read).await?;
             }
             if self.runs.exists(&order.pack).await? {
+                // Its tiles were published before it: zones read before
+                // they were, by this segment or an earlier one, are read
+                // again.
+                sources.store.tiles.forget_manifests();
                 break;
             }
             if began.elapsed() > within {
