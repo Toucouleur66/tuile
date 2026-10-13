@@ -699,7 +699,7 @@ async fn a_zone_read_from_its_extract_answers_with_what_the_extract_holds() {
         &zone,
         local,
         "extracts/z.pmtiles",
-        tuile_tile_server::extract::BANDS[1],
+        tuile_repository::EXTRACT_BANDS[1],
     );
     assert_eq!(
         answer(&reader, "imagery", 7, 77, 50).await,
@@ -714,5 +714,13 @@ async fn a_zone_read_from_its_extract_answers_with_what_the_extract_holds() {
     assert_eq!(
         answer(&reader, "imagery", 7, 78, 50).await,
         "image/png imagery/7/78/50"
+    );
+}
+
+#[test]
+fn the_reader_s_bands_are_the_writer_s() {
+    assert_eq!(
+        tuile_repository::EXTRACT_BANDS,
+        tuile_tile_server::extract::BANDS
     );
 }

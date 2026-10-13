@@ -193,6 +193,12 @@ struct Opened {
     root: Directory,
 }
 
+/// What is added to the ids of each layer of an extract, in the order its
+/// layers were asked for: the first at its own ids, the second in the
+/// PMTiles numbering's zoom 30, where no grid tile reaches. The tile
+/// server's `extract::BANDS`, which writes them.
+pub const EXTRACT_BANDS: [u64; 2] = [0, 1 << 60];
+
 /// The tile store, as a [`TileRepository`] over any [`Objects`].
 ///
 /// It is handed the store twice, because the store holds two kinds of

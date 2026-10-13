@@ -86,7 +86,11 @@ async fn run() -> Result<(), Error> {
         .unwrap_or_else(|_| std::env::temp_dir().join("tuile-film-serve"));
     let tiles = tile_store(&cache).await?;
     let limits = limits()?;
-    let service = Arc::new(Service::new(runs, tiles.objects, cache, limits));
+    let mut service = Service::new(runs, tiles.objects, cache, limits);
+    // The tile store's server, when the store is one: extracts come from it.
+    service.remote = tuile_repository::HttpGet::from_env()?
+        .map(|get| Arc::new(get) as Arc<dyn tuile_repository::Get>);
+    let service = Arc::new(service);
     let app = Router::new()
         .route("/", get(|| async { "tuile-film-serve" }))
         .route("/segments", post(segment))

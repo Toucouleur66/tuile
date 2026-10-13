@@ -46,7 +46,7 @@ pub struct TileIn<'a> {
 }
 
 /// Where time went, in milliseconds, step by step.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Timings {
     /// Reading terrain tiles from the store (cache or network).
     pub read_terrain: f64,
