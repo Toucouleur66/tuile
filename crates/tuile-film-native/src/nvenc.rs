@@ -289,8 +289,17 @@ fn encode_eyes(
     bitrate: u32,
     stereo: tuile_mp4::spatial::StereoInfo,
 ) -> Result<(Vec<u8>, f64), String> {
+    // Each step said on stderr with TUILE_NVENC_TRACE set: the driver may
+    // end the process without a word.
+    let trace = std::env::var_os("TUILE_NVENC_TRACE").is_some();
+    let step = |what: &str| {
+        if trace {
+            eprintln!("nvenc mv-hevc: {what}");
+        }
+    };
     let cuda = CudaContext::new(device).map_err(|e| format!("CUDA device {device}: {e:?}"))?;
     let encoder = Encoder::initialize_with_cuda(cuda).map_err(told)?;
+    step("encoder open");
     let guid = NV_ENC_CODEC_HEVC_GUID;
     if !encoder.get_encode_guids().map_err(told)?.contains(&guid) {
         return Err("NVENC: this card does not encode HEVC".into());
@@ -298,6 +307,7 @@ fn encode_eyes(
     let supported = encoder
         .get_encode_caps(guid, NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_MVHEVC_ENCODE)
         .map_err(told)?;
+    step(&format!("MV-HEVC supported: {supported}"));
     if supported == 0 {
         return Err("NVENC: this card does not encode MV-HEVC (Blackwell and later do)".into());
     }
@@ -309,6 +319,7 @@ fn encode_eyes(
         .get_preset_config(guid, NV_ENC_PRESET_P4_GUID, tuning)
         .map_err(told)?
         .presetCfg;
+    step("preset read");
     config.frameIntervalP = 1;
     config.gopLength = 2 * fps;
     config.rcParams.set_enableLookahead(0);
@@ -327,6 +338,7 @@ fn encode_eyes(
     let session = encoder
         .start_session(NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_IYUV, init)
         .map_err(told)?;
+    step("session started");
     let mut inputs = [
         session.create_input_buffer().map_err(told)?,
         session.create_input_buffer().map_err(told)?,
@@ -352,6 +364,7 @@ fn encode_eyes(
                 // the buffer's pitch, which the buffer was made to hold.
                 unsafe { lock.write(&pitched(i420, (width, height), pitch)) };
             }
+            step(&format!("view {view} written"));
             loop {
                 let params = EncodePictureParams {
                     codec_params: Some(CodecPictureParams::hevc_view(view as u32)),
@@ -370,8 +383,10 @@ fn encode_eyes(
         let mut sample = Vec::new();
         let mut sets: Vec<Vec<u8>> = Vec::new();
         let mut key = false;
+        step("both views submitted");
         for (view, output) in outputs.iter_mut().enumerate() {
             let lock = output.lock().map_err(told)?;
+            step(&format!("view {view}: {} bytes out", lock.data().len()));
             if view == 0 {
                 key = matches!(
                     lock.picture_type(),
@@ -388,6 +403,7 @@ fn encode_eyes(
             }
         }
         if muxer.is_none() {
+            step(&format!("{} parameter sets", sets.len()));
             let units: Vec<&[u8]> = sets.iter().map(Vec::as_slice).collect();
             let (hvcc, lhvc) =
                 tuile_mp4::spatial::hevc_records(&units).map_err(|e| format!("NVENC: {e}"))?;
