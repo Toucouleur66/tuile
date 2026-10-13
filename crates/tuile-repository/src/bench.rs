@@ -40,6 +40,11 @@
 //! many small objects at once, and a list of several hundred keys and their
 //! validators does not fit an address. See [`Bench::post`].
 
+#![allow(
+    clippy::result_large_err,
+    reason = "a route's error is a reply, sent as is: boxing it buys nothing"
+)]
+
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

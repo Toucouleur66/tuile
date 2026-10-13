@@ -108,6 +108,10 @@ fn id(tile: TileCoord) -> TileId {
     TileId::from_terrain(tile.level, tile.x, tile.y)
 }
 
+#[allow(
+    clippy::panic,
+    reason = "test helper: a tile that expands fails the test"
+)]
 fn loaded(loader: &Arc<dyn TileLoader>, tile: TileCoord) -> DecodedTileContent {
     match futures_executor::block_on(loader.load(id(tile))).expect("loads") {
         Loaded::Content(content) => content,

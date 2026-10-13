@@ -95,6 +95,9 @@ unsafe_code = "deny"
 [workspace.lints.clippy]
 unwrap_used = "warn"
 panic = "warn"
+# `#[async_trait]` puts `#[must_use]` on the boxed future it returns, which is
+# must_use already: the expansion's, not ours to remove.
+double_must_use = "allow"
 
 [profile.release]
 lto = "thin"

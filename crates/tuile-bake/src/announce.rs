@@ -148,7 +148,7 @@ mod tests {
                 imagery: imagery
                     .iter()
                     .map(|t| ImageryPlacement {
-                        tile: t.clone(),
+                        tile: *t,
                         coverage: [0.0, 0.0, 1.0, 1.0],
                         translation: [0.0; 2],
                         scale: [1.0; 2],

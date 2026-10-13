@@ -131,7 +131,7 @@ fn light_of(frame: &FrameOut<'_>) -> Light {
     let third = (height / 3).max(1);
     for (row, texels) in frame.rgba.chunks_exact(width * 4).enumerate() {
         let (mut r, mut g, mut b) = (0.0f32, 0.0f32, 0.0f32);
-        for p in texels.chunks_exact(4) {
+        for p in texels.as_chunks::<4>().0 {
             let rgb = [
                 table[p[0] as usize],
                 table[p[1] as usize],
@@ -184,9 +184,17 @@ fn light_of(frame: &FrameOut<'_>) -> Light {
 #[derive(Default)]
 pub struct LightMeter {
     tiles: HashMap<Coord, TileLight>,
-    frames: Vec<(Light, usize, usize, Vec<(u8, u32)>, f64)>,
+    frames: Vec<FrameRecord>,
     undecodable: u32,
 }
+
+/// A frame as measured: its light, tiles drawn, tiles entered, layers by
+/// level, and render time in milliseconds.
+type FrameRecord = (Light, usize, usize, Vec<(u8, u32)>, f64);
+
+/// Columns and rows a mosaic spans: first column, first row, last column,
+/// last row.
+pub type Span = (u32, u32, u32, u32);
 
 impl Observer for LightMeter {
     fn imagery(&mut self, tile: &ImageryIn<'_>) {
@@ -512,7 +520,7 @@ impl LightMeter {
     }
 
     /// The mosaic of one level: every tile of it this render read, where
-    /// it lies, at the full size of what was kept of it ([`KEPT`] texels a
+    /// it lies, at the full size of what was kept of it (`KEPT` texels a
     /// side), lifted by `stops` — with `gains` each tile as a film with
     /// those gains draws it, without them as the store holds it. The two
     /// side by side are the before and after of a film's grade. Returns
@@ -535,7 +543,7 @@ impl LightMeter {
     /// The tiles of a level a mosaic is drawn of, and the columns and rows
     /// it spans: first and last of each. `None` for a level nothing was
     /// read of.
-    pub fn extent(&self, level: u8) -> Option<(Vec<Coord>, (u32, u32, u32, u32))> {
+    pub fn extent(&self, level: u8) -> Option<(Vec<Coord>, Span)> {
         let tiles: Vec<Coord> = self
             .tiles
             .keys()
@@ -731,7 +739,7 @@ impl LightMeter {
 
     /// How much light this render put on ground: its pictures' mean linear
     /// luminance for an imagery luminance of one — lighting and exposure
-    /// together, as [`FilmGrade::fit`] wants it. Read off a render made
+    /// together, as [`FilmGrade::fit`](tuile_radiometry::FilmGrade::fit) wants it. Read off a render made
     /// with no grade. `None` before a picture came out.
     pub fn light(&self) -> Option<f32> {
         let luminance = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
@@ -889,7 +897,9 @@ impl LightMeter {
         writeln!(report, "|---|---|---|---|---|")?;
         let applied: BTreeMap<u8, Grade> = self.tiles.iter().map(|(c, l)| (c.0, l.grade)).collect();
         let applied = |level: u8| applied.get(&level).copied().unwrap_or(Grade::IDENTITY);
-        let mut by_region: BTreeMap<(u32, u32), (usize, [Vec<f32>; 3])> = BTreeMap::new();
+        /// A region's tiles, and the steps seen across them one way each.
+        type Region = (usize, [Vec<f32>; 3]);
+        let mut by_region: BTreeMap<(u32, u32), Region> = BTreeMap::new();
         for (s, region) in self.seen() {
             if solved.of(s.level) == solved.of(s.ancestor) {
                 continue;

@@ -274,7 +274,7 @@ impl std::fmt::Display for MissingCredential {
 
 impl std::error::Error for MissingCredential {}
 
-/// A host's credential, by the rules of [`crate::host`]: the environment
+/// A host's credential, by the rules of `crate::host`: the environment
 /// variable `variable` first and always; otherwise the file `token` in the
 /// application's support directory, which the person creates and owns.
 ///

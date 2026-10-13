@@ -2395,10 +2395,14 @@ pub(crate) mod tests {
         })
     }
 
+    /// A tile handed over: its id, its drape, and digests of its mesh and
+    /// of its encoded picture.
+    type Handed = (u64, u64, u64, u64);
+
     /// What a flight over the quad hands a consumer, frame by frame: which
     /// tiles, under which drape, with which mesh and which encoded picture —
     /// and how many tiles were fetched to get there.
-    fn quad_flight() -> (Vec<Vec<(u64, u64, u64, u64)>>, usize) {
+    fn quad_flight() -> (Vec<Vec<Handed>>, usize) {
         let (frames, loads) = quad_flight_finished(Finish::Pictures);
         let frames = frames
             .into_iter()

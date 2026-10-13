@@ -48,8 +48,11 @@ pub struct Cached {
     store: Box<dyn ChunkStore>,
     /// One lock per chunk: two readers after the same bytes wait for one
     /// fetch rather than starting two.
-    fetching: StdMutex<HashMap<(String, u64), Arc<Mutex<()>>>>,
+    fetching: StdMutex<HashMap<(String, u64), ChunkLock>>,
 }
+
+/// The lock of one chunk being fetched.
+type ChunkLock = Arc<Mutex<()>>;
 
 /// The chunks a byte range touches.
 fn covering(range: &Range<u64>) -> Range<u64> {

@@ -47,6 +47,9 @@ pub struct TerrainOrigin {
     pub skirt_height: f64,
 }
 
+/// A mesh as a key: its tile and the bits of its centre.
+type MeshKey = (TileCoord, [u64; 3]);
+
 /// What a loader noted of its sources. Shared with the loader; see
 /// [`crate::globe_with_provenance`].
 #[derive(Default)]
@@ -56,7 +59,7 @@ pub struct Provenance {
     /// the source's own tile was not known to exist, decoded from that tile
     /// later — and the two meshes are both out there. The centre is the
     /// source tile's own, carried through every cut, so it says which.
-    terrain: Mutex<HashMap<(TileCoord, [u64; 3]), (TileCoord, u64)>>,
+    terrain: Mutex<HashMap<MeshKey, (TileCoord, u64)>>,
     imagery: Mutex<HashMap<ImageryCoord, u64>>,
 }
 

@@ -325,7 +325,7 @@ mod tests {
     /// What holds a runtime of its own, as the shared tile store does: made
     /// and let go on the async runtime that drives a production, either one
     /// panics ("Cannot start a runtime from within a runtime").
-    struct OwnRuntime(tokio::runtime::Runtime);
+    struct OwnRuntime(#[allow(dead_code, reason = "held for its drop")] tokio::runtime::Runtime);
 
     impl OwnRuntime {
         fn open() -> Result<Self, String> {

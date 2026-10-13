@@ -88,8 +88,8 @@ pub fn transfer(child: &BlockStats, parent: &BlockStats, params: &Params) -> Tra
         .collect();
     let mut gain = vec![[0.0f32; 3]; blocks];
     for b in (0..blocks).filter(|b| usable[*b]) {
-        for c in 0..3 {
-            gain[b][c] = (parent.mean[b][c] / child.mean[b][c]).log2();
+        for (c, g) in gain[b].iter_mut().enumerate() {
+            *g = (parent.mean[b][c] / child.mean[b][c]).log2();
         }
     }
     let mut overall = [0.0f32; 3];

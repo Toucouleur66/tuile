@@ -6,7 +6,7 @@
 //!
 //! A host may keep, beside the bucket, a register of every zone and every
 //! archive: what is where, and when each zone next falls due (see
-//! [`crate::due`]). The bucket and the register share no transaction, so the
+//! [`crate::due`](fn@crate::due)). The bucket and the register share no transaction, so the
 //! order in which the register is told is what keeps it right:
 //!
 //! 1. [`Ledger::writing`], **before** an archive is uploaded. If the register

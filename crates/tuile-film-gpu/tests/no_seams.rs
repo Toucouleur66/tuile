@@ -249,7 +249,9 @@ fn magenta(side: f64, walls: bool) -> Option<(u32, u32)> {
         );
     }
     let shows = rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         // The ground is green and nothing else in the frame is: a pixel
         // with more red and more blue than green has the sheet in it, were
         // it one sample of its four.

@@ -166,7 +166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         let entry = clipped.entry(coord.0).or_default();
-        for texel in rgba.chunks_exact(4).step_by(7) {
+        for texel in rgba.as_chunks::<4>().0.iter().step_by(7) {
             entry.1 += 1;
             let over = (0..3).any(|c| {
                 let v = f32::from(texel[c]) / 255.0;

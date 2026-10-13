@@ -62,8 +62,8 @@ impl GainField {
                         continue;
                     }
                     let w = transfer.confidence[bj * BLOCKS + bi];
-                    for c in 0..3 {
-                        sum[c] += transfer.gain[bj * BLOCKS + bi][c] * w;
+                    for (s, g) in sum.iter_mut().zip(transfer.gain[bj * BLOCKS + bi]) {
+                        *s += g * w;
                     }
                     weight += w;
                 }
@@ -185,7 +185,9 @@ impl GainField {
         }
         Some(Self {
             nodes: bytes
-                .chunks_exact(6)
+                .as_chunks::<6>()
+                .0
+                .iter()
                 .map(|n| {
                     [
                         i16::from_le_bytes([n[0], n[1]]),

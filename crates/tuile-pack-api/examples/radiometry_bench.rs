@@ -73,8 +73,8 @@ fn edge_step(a: &Image, b: &Image, horizontal: bool) -> f32 {
                     (along, across)
                 };
                 let i = ((y * image.side + x) * 4) as usize;
-                for c in 0..3 {
-                    sum[c] += f64::from(linear_of(image.rgba[i + c]));
+                for (s, v) in sum.iter_mut().zip(&image.rgba[i..i + 3]) {
+                    *s += f64::from(linear_of(*v));
                 }
                 n += 1;
             }
@@ -127,7 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut images: HashMap<(u8, u32, u32), Option<Image>> = HashMap::new();
     let mut fetch = async |z: u8, x: u32, y: u32| -> Result<bool, Box<dyn std::error::Error>> {
-        if !images.contains_key(&(z, x, y)) {
+        if let std::collections::hash_map::Entry::Vacant(e) = images.entry((z, x, y)) {
             let image = match store.tile(layer, z, x, y).await? {
                 Some(tile) => {
                     let decoded = image::load_from_memory(&tile.bytes)?.to_rgba8();
@@ -138,7 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 None => None,
             };
-            images.insert((z, x, y), image);
+            e.insert(image);
         }
         Ok(images[&(z, x, y)].is_some())
     };

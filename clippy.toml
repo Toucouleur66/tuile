@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# A test says what it expects by panicking: `unwrap_used` and `panic` are for
+# the code a test exercises, not for the test.
+allow-unwrap-in-tests = true
+allow-panic-in-tests = true

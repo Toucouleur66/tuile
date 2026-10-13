@@ -233,8 +233,7 @@ impl MatrixField {
             let Some(line) = tile.paired.as_deref().and_then(Paired::line) else {
                 continue;
             };
-            for band in 0..3 {
-                let of = &mut lines[usize::from(line.water)][band];
+            for (band, of) in lines[usize::from(line.water)].iter_mut().enumerate() {
                 of.0.push(line.gain[band].log2());
                 of.1.push(line.bias[band]);
             }
@@ -291,7 +290,9 @@ impl MatrixField {
         let index: BTreeMap<TileAt, usize> = at.iter().enumerate().map(|(i, a)| (*a, i)).collect();
         // Every such tile's places — its own and those of the finer tiles
         // in it: where, the film's colour, what is wanted.
-        let mut places: Vec<Vec<(f32, f32, [f32; 3], [f32; 3])>> = vec![Vec::new(); n];
+        /// A place: where in the tile (`u`, `v`), the film's colour, what is wanted.
+        type Place = (f32, f32, [f32; 3], [f32; 3]);
+        let mut places: Vec<Vec<Place>> = vec![Vec::new(); n];
         for a in &film {
             let Some(paired) = observed.tiles[a].paired.as_deref() else {
                 continue;
@@ -502,8 +503,8 @@ impl MatrixField {
                 let unknown = |k: usize| node[slot(tile, k / 4)] * 4 + k % 4;
                 if !places[tile].is_empty() {
                     for i in 0..16 {
-                        for j in 0..16 {
-                            normal.push(unknown(i), unknown(j), block[i][j]);
+                        for (j, b) in block[i].iter().enumerate() {
+                            normal.push(unknown(i), unknown(j), *b);
                         }
                         for o in 0..3 {
                             right[(unknown(i), o)] += side[i][o];
@@ -700,9 +701,9 @@ mod tests {
         let observed = seen(4, |_, _, c| through(&CAPTURE, c));
         // Its look is what it makes of the reference: the capture.
         let look = MatrixField::look(&observed);
-        for o in 0..3 {
-            for i in 0..4 {
-                assert!((look.ground[o][i] - CAPTURE[o][i]).abs() < 0.02, "{look:?}");
+        for (got, want) in look.ground.iter().zip(&CAPTURE) {
+            for (g, w) in got.iter().zip(want) {
+                assert!((g - w).abs() < 0.02, "{look:?}");
             }
         }
         // Brought to its own look, nothing is done to it…

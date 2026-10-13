@@ -65,10 +65,12 @@ impl Gauge {
     /// worth a panic. An unbalanced decrement is a bug, but wrapping to
     /// eighteen quintillion turns that bug into a permanently unreadable
     /// number — [`InFlight`] exists so it cannot happen at all.
+    // `fetch_update` is `try_update` since 1.95, above the workspace's MSRV.
+    #[allow(deprecated)]
     pub fn dec(&self) {
         let _ = self
             .0
-            .try_update(ORDER, ORDER, |v| Some(v.saturating_sub(1)));
+            .fetch_update(ORDER, ORDER, |v| Some(v.saturating_sub(1)));
     }
 }
 

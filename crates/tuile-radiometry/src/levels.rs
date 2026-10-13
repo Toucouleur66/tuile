@@ -109,7 +109,7 @@ pub fn apply_multipliers(rgba: &mut [u8], multipliers: [f32; 3]) {
             };
         }
     }
-    for texel in rgba.chunks_exact_mut(4) {
+    for texel in rgba.as_chunks_mut::<4>().0 {
         for c in 0..3 {
             texel[c] = curves[c][texel[c] as usize];
         }
@@ -231,13 +231,13 @@ impl LevelGains {
         let agreed = |of: &[&Observation]| {
             let mut gain = [0.0f32; 3];
             let mut spread = 0.0f32;
-            for c in 0..3 {
+            for (c, agreed) in gain.iter_mut().enumerate() {
                 let mut values: Vec<(f32, f32)> =
                     of.iter().map(|o| (o.gain[c], o.weight)).collect();
-                gain[c] = weighted_median(&mut values);
+                *agreed = weighted_median(&mut values);
                 let mut off: Vec<(f32, f32)> = of
                     .iter()
-                    .map(|o| ((o.gain[c] - gain[c]).abs(), o.weight))
+                    .map(|o| ((o.gain[c] - *agreed).abs(), o.weight))
                     .collect();
                 spread = spread.max(weighted_median(&mut off));
             }
@@ -563,8 +563,8 @@ mod tests {
         let read = LevelGains::from_json(&solved.to_json()).expect("read back");
         assert_eq!(read.anchor, solved.anchor);
         for (level, gain) in &solved.gains {
-            for c in 0..3 {
-                assert!((read.of(*level)[c] - gain[c]).abs() < 1e-3);
+            for (c, g) in gain.iter().enumerate() {
+                assert!((read.of(*level)[c] - g).abs() < 1e-3);
             }
         }
         assert_eq!(LevelGains::from_json("{}"), None);

@@ -338,8 +338,11 @@ pub struct RemoteBlocks<G> {
     held: Mutex<Held>,
     /// One lock per block being fetched: readers after the same block at the
     /// same moment wait for one request rather than each making their own.
-    flights: Mutex<HashMap<(String, u64), Arc<AsyncMutex<()>>>>,
+    flights: Mutex<HashMap<(String, u64), BlockLock>>,
 }
+
+/// The lock of one block being fetched.
+type BlockLock = Arc<AsyncMutex<()>>;
 
 impl<G: Get> RemoteBlocks<G> {
     /// `root` is the route the objects are under: `store`, or `p/<project>`.
@@ -782,6 +785,7 @@ mod tests {
             .collect()
     }
 
+    #[allow(clippy::panic, reason = "test helper: any other error fails the test")]
     fn check(answers: &[Result<Read, RepoError>], n: usize) {
         assert_eq!(answers.len(), n);
         for (zone, answer) in answers.iter().enumerate() {

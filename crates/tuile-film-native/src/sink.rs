@@ -85,10 +85,13 @@ pub struct Av1Film {
     path: PathBuf,
     bitrate: u32,
     pictures: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
-    encoder: Option<std::thread::JoinHandle<Result<(Vec<u8>, f64), String>>>,
+    encoder: Option<EncoderThread>,
     size: (usize, usize),
     encoding_seconds: f64,
 }
+
+/// The encoder's thread: the film's bytes and the seconds spent encoding.
+type EncoderThread = std::thread::JoinHandle<Result<(Vec<u8>, f64), String>>;
 
 /// Pictures waiting for the encoder before the render waits for it.
 const WAITING: usize = 4;

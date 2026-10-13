@@ -545,7 +545,7 @@ async fn a_live_object_is_sent_again_only_when_it_was_written_again() {
 
     // Written again, to the same size.
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-    std::fs::write(&path, b"{\"archives\":[]} ".map(|b| b)[..15].to_vec()).expect("write");
+    std::fs::write(&path, &b"{\"archives\":[]} ".map(|b| b)[..15]).expect("write");
     std::fs::write(&path, b"{\"archivez\":[]}").expect("write");
     let again = bench.get(url, "", asking(&tag)).await.expect("reply");
     assert_eq!(again.status, 200);

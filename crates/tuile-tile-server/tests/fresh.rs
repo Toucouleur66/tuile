@@ -34,9 +34,12 @@ impl Upstream for Counted {
     }
 }
 
+/// A tile emitted: its layer, level, x, y and bytes.
+type Given = (String, u8, u32, u32, SharedTile);
+
 /// A sink that keeps what it is given, or refuses everything.
 struct Sink {
-    emitted: Mutex<Vec<(String, u8, u32, u32, SharedTile)>>,
+    emitted: Mutex<Vec<Given>>,
     keeps: bool,
 }
 

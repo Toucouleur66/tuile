@@ -521,8 +521,8 @@ mod tests {
             }
         };
         let cloud = env(&[("CLOUD_RUN_TASK_INDEX", "3"), ("CLOUD_RUN_TASK_COUNT", "8")]);
-        assert_eq!(task_of(None, &cloud), Ok(Some((3, 8))));
-        assert_eq!(task_of(Some((1, 2)), &cloud), Ok(Some((1, 2))));
+        assert_eq!(task_of(None, cloud), Ok(Some((3, 8))));
+        assert_eq!(task_of(Some((1, 2)), cloud), Ok(Some((1, 2))));
         assert_eq!(task_of(None, env(&[])), Ok(None));
         // A job of one task, or half of what Cloud Run says: every pack.
         let alone = env(&[("CLOUD_RUN_TASK_INDEX", "0"), ("CLOUD_RUN_TASK_COUNT", "1")]);
