@@ -274,12 +274,15 @@ fn nv12(i420: &[u8], (width, height): (usize, usize), pitch: usize) -> Vec<u8> {
     out
 }
 
-/// NAL units of an Annex B stream, parameter sets (VPS, SPS, PPS) apart:
-/// an `hvc1` sample carries none, its entry carries them all.
+/// NAL units of an Annex B stream, what goes in the sample entry apart:
+/// the parameter sets (VPS, SPS, PPS) and the 3D reference displays SEI
+/// (a prefix SEI whose first payload is 176) — an `hvc1` sample carries
+/// neither, its entry carries them.
 fn hevc_units(stream: &[u8]) -> (Vec<&[u8]>, Vec<&[u8]>) {
-    nal_units(stream).into_iter().partition(|u| {
-        u.first()
-            .is_some_and(|b| (32..=34).contains(&((b >> 1) & 0x3f)))
+    nal_units(stream).into_iter().partition(|u| match u {
+        [b, ..] if (32..=34).contains(&((b >> 1) & 0x3f)) => true,
+        [b, _, 176, ..] => (b >> 1) & 0x3f == 39,
+        _ => false,
     })
 }
 
