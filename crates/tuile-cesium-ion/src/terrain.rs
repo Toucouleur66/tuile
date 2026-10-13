@@ -64,9 +64,9 @@ impl<H: IonHttp> IonTerrainSource<H> {
             .clone())
     }
 
-    /// Fetches the raw bytes of a `.terrain` tile (still possibly gzipped;
-    /// `tuile_terrain::decode` handles that). Refreshes the asset token once
-    /// on 401/403.
+    /// Fetches the raw bytes of a `.terrain` tile: ion serves it with
+    /// `Content-Encoding: gzip`, which the transport undoes. Refreshes the
+    /// asset token once on 401/403.
     pub async fn fetch_tile(&self, coord: TileCoord) -> Result<Fetched<Bytes>, IonError> {
         self.ensure().await?;
         let (url, mut token) = {

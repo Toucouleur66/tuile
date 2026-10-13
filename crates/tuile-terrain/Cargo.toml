@@ -16,7 +16,6 @@ workspace = true
 tracing = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
-flate2 = { workspace = true }
 glam = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -24,5 +23,7 @@ thiserror = { workspace = true }
 tuile-core = { version = "0.5.0", path = "../tuile-core" }
 
 [dev-dependencies]
+# A gzip stream, to be refused (`decode`).
+flate2 = { workspace = true }
 futures-executor = { workspace = true }
 glam = { workspace = true }
