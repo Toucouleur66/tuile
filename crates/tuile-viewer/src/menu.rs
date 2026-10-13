@@ -41,6 +41,10 @@ pub(crate) const DIAGNOSTICS: [&str; 4] = ["Normal", "Unlit", "Coverage", "Geome
 /// What a key or a menu item asks for, before it is a command: relative
 /// where a person thinks relatively.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(
+    not(all(target_os = "macos", feature = "application")),
+    allow(dead_code)
+)]
 pub(crate) enum Ask {
     /// Something that is already absolute.
     Do(Command),
@@ -91,6 +95,10 @@ impl Ask {
 
     /// Whether an item asking this shows a check mark in `now`; `None` for
     /// an item that is an action and not a state.
+    #[cfg_attr(
+        not(all(target_os = "macos", feature = "application")),
+        allow(dead_code)
+    )]
     pub(crate) fn checked(self, now: &State) -> Option<bool> {
         match self {
             Self::ToggleWireframe => Some(now.wireframe),
@@ -130,6 +138,10 @@ pub(crate) fn key(c: char) -> Option<Ask> {
 
 /// One line of a menu.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(
+    not(all(target_os = "macos", feature = "application")),
+    allow(dead_code)
+)]
 pub(crate) enum Entry {
     Item {
         title: String,
@@ -143,6 +155,10 @@ pub(crate) enum Entry {
 /// The application's own menus, in the order they sit in the bar. The
 /// application menu, Window and Help are the platform's and are added where
 /// the platform's menu is built.
+#[cfg_attr(
+    not(all(target_os = "macos", feature = "application")),
+    allow(dead_code)
+)]
 pub(crate) fn layout(layers: &[ImageryChoice]) -> Vec<(&'static str, Vec<Entry>)> {
     let item = |title: &str, ask: Ask| Entry::Item {
         title: title.to_owned(),
