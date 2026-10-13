@@ -8,8 +8,8 @@
 //! curl -X POST localhost:8080/segments -d '{"pack": "…", "frames": [1, 450], "out": "…/1-450.mp4"}'
 //! ```
 //!
-//! `POST /segments` takes a [`SegmentOrder`] and answers when the segment is
-//! in the store, with its [`SegmentDone`]; a pack not there yet is waited for
+//! `POST /segments` takes a [`SegmentOrder`](tuile_film_native::serve::SegmentOrder) and answers when the segment is
+//! in the store, with its [`SegmentDone`](tuile_film_native::serve::SegmentDone); a pack not there yet is waited for
 //! up to `pack_within_seconds`. `GET /` says the service is up.
 //!
 //! The stores are the environment's, as for `tuile-film-produce`:
@@ -27,79 +27,14 @@
 
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
 
-use axum::extract::State;
-use axum::http::StatusCode;
-use axum::routing::{get, post};
-use axum::{Json, Router};
-use tuile_farm::ObjectRunStore;
-use tuile_film_native::serve::{Limits, SegmentDone, SegmentOrder, Service};
-use tuile_film_native::setup::tile_store;
+use tuile_film_native::serve;
 use tuile_film_native::Error;
 
-fn number(name: &str) -> Result<Option<u64>, Error> {
-    match std::env::var(name) {
-        Ok(v) if !v.is_empty() => Ok(Some(v.parse().map_err(|e| format!("{name}={v}: {e}"))?)),
-        _ => Ok(None),
-    }
-}
-
-fn limits() -> Result<Limits, Error> {
-    let default = Limits::default();
-    Ok(Limits {
-        cache_bytes: number("TUILE_SERVE_CACHE_GIB")?.map_or(default.cache_bytes, |gib| gib << 30),
-        generation_age: number("TUILE_SERVE_GENERATION_MINUTES")?
-            .map_or(default.generation_age, |m| Duration::from_secs(m * 60)),
-        renders_at_once: number("TUILE_SERVE_RENDERS")?
-            .map_or(default.renders_at_once, |n| n as usize),
-    })
-}
-
-async fn segment(
-    State(service): State<Arc<Service>>,
-    Json(order): Json<SegmentOrder>,
-) -> Result<Json<SegmentDone>, (StatusCode, String)> {
-    eprintln!(
-        "segment {} ← {} {}:{}",
-        order.out, order.pack, order.frames.0, order.frames.1
-    );
-    match service.segment(&order).await {
-        Ok(done) => {
-            eprintln!(
-                "segment {} done: {} frames, waited {:.0} s, rendered in {:.0} s",
-                done.out, done.frames, done.waited_seconds, done.render_seconds
-            );
-            Ok(Json(done))
-        }
-        Err(e) => {
-            eprintln!("segment {} failed: {e}", order.out);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
-        }
-    }
-}
-
 async fn run() -> Result<(), Error> {
-    let runs = Arc::new(ObjectRunStore::from_env()?);
-    let cache = std::env::var("TUILE_SERVE_CACHE")
-        .map(Into::into)
-        .unwrap_or_else(|_| std::env::temp_dir().join("tuile-film-serve"));
-    let tiles = tile_store(&cache).await?;
-    let limits = limits()?;
-    let mut service = Service::new(runs, tiles.objects, cache, limits);
-    // The tile store's server, when the store is one: extracts come from it.
-    service.remote = tuile_repository::HttpGet::from_env()?
-        .map(|get| Arc::new(get) as Arc<dyn tuile_repository::Get>);
-    let service = Arc::new(service);
-    let app = Router::new()
-        .route("/", get(|| async { "tuile-film-serve" }))
-        .route("/segments", post(segment))
-        .with_state(service);
-    let port = number("PORT")?.unwrap_or(8080);
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port as u16)).await?;
-    eprintln!("tuile-film-serve: on :{port}, {limits:?}");
-    axum::serve(listener, app).await?;
-    Ok(())
+    let service = Arc::new(serve::service_from_env().await?);
+    eprintln!("tuile-film-serve: {:?}", service.limits);
+    serve::serve(serve::router(service, None)).await
 }
 
 fn main() -> ExitCode {

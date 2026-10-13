@@ -304,6 +304,7 @@ fn rendering(args: &Args) -> Result<Rendering, Error> {
             convergence_m: args.stereo_convergence,
             ground_m: args.stereo_ground.unwrap_or(0.0),
         }),
+        ..RenderSpec::default()
     }
     .rendering()
 }

@@ -56,6 +56,14 @@ pub struct RenderSpec {
     pub sun_light: Option<String>,
     pub sky_light: Option<String>,
     pub no_tone: bool,
+    /// How the ground is smoothed: `off`, `shading` (normals only) or
+    /// `geometry` (triangles cut and their new vertices lifted onto the
+    /// surface, by `smooth_bound` metres at most).
+    pub smooth: String,
+    pub smooth_bound: f32,
+    pub smooth_strength: f32,
+    /// Neighbouring tiles of different levels sewn together where they meet.
+    pub stitch: bool,
     /// For two eyes, packed into one picture. Absent: one eye, as always.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stereo: Option<StereoSpec>,
@@ -145,6 +153,10 @@ impl Default for RenderSpec {
             sky_light: None,
             no_tone: false,
             stereo: None,
+            smooth: "geometry".into(),
+            smooth_bound: tuile_film::smoothing::DEFAULT_BOUND_M,
+            smooth_strength: 1.0,
+            stitch: true,
         }
     }
 }
@@ -164,6 +176,16 @@ impl RenderSpec {
             order.tone = crate::Tone::Off;
         }
         order.stereo = self.stereo.as_ref().map(StereoSpec::stereo).transpose()?;
+        order.smooth = match self.smooth.as_str() {
+            "off" => tuile_film::smoothing::Smooth::Off,
+            "shading" => tuile_film::smoothing::Smooth::Shading,
+            "geometry" => tuile_film::smoothing::Smooth::Geometry {
+                bound: self.smooth_bound,
+            },
+            other => return Err(format!("smooth is off, shading or geometry, not {other}").into()),
+        };
+        order.smooth_strength = self.smooth_strength;
+        order.stitch = self.stitch;
         let look = &mut order.look;
         if let Some(stops) = self.exposure {
             look.exposure_ev = stops;

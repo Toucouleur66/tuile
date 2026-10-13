@@ -56,6 +56,17 @@ pub struct SegmentOrder {
     /// How long to wait for the pack. Default: an hour.
     #[serde(default)]
     pub pack_within_seconds: Option<u64>,
+    /// The asker's own, handed back with the outcome of a segment accepted
+    /// in the background ([`Notify`]): which film, which chunk.
+    #[serde(default)]
+    pub context: serde_json::Value,
+}
+
+/// Told how a segment accepted in the background ended: the host's way of
+/// hearing of it — a message to whoever waits for the segment.
+#[async_trait::async_trait]
+pub trait Notify: Send + Sync {
+    async fn segment_done(&self, order: &SegmentOrder, outcome: Result<&SegmentDone, String>);
 }
 
 /// Where a render's time went, as it measured it.
@@ -404,6 +415,123 @@ impl Service {
     }
 }
 
+impl Service {
+    /// Accepts `order`, renders it in the background and tells `notify` how
+    /// it ended; returns at once. Renders wait their turn for the card
+    /// ([`Limits::renders_at_once`]).
+    pub fn accept(self: &Arc<Self>, order: SegmentOrder, notify: Arc<dyn Notify>) {
+        let service = self.clone();
+        tokio::spawn(async move {
+            let outcome = service.segment(&order).await;
+            match &outcome {
+                Ok(done) => eprintln!(
+                    "segment {} done: {} frames, waited {:.0} s, rendered in {:.0} s",
+                    done.out, done.frames, done.waited_seconds, done.render_seconds
+                ),
+                Err(e) => eprintln!("segment {} failed: {e}", order.out),
+            }
+            notify
+                .segment_done(&order, outcome.as_ref().map_err(|e| e.to_string()))
+                .await;
+        });
+    }
+}
+
+/// A number from the environment.
+fn number(name: &str) -> Result<Option<u64>, Error> {
+    match std::env::var(name) {
+        Ok(v) if !v.is_empty() => Ok(Some(v.parse().map_err(|e| format!("{name}={v}: {e}"))?)),
+        _ => Ok(None),
+    }
+}
+
+/// The limits the environment says, the defaults otherwise:
+/// `TUILE_SERVE_CACHE_GIB`, `TUILE_SERVE_GENERATION_MINUTES`,
+/// `TUILE_SERVE_RENDERS`.
+pub fn limits_from_env() -> Result<Limits, Error> {
+    let default = Limits::default();
+    Ok(Limits {
+        cache_bytes: number("TUILE_SERVE_CACHE_GIB")?.map_or(default.cache_bytes, |gib| gib << 30),
+        generation_age: number("TUILE_SERVE_GENERATION_MINUTES")?
+            .map_or(default.generation_age, |m| Duration::from_secs(m * 60)),
+        renders_at_once: number("TUILE_SERVE_RENDERS")?
+            .map_or(default.renders_at_once, |n| n as usize),
+    })
+}
+
+/// The service the environment describes: the run store
+/// (`TUILE_STORE_*`), the tile store (`TUILE_TILES_*`), its caches under
+/// `TUILE_SERVE_CACHE`, its limits.
+pub async fn service_from_env() -> Result<Service, Error> {
+    let runs = Arc::new(ObjectRunStore::from_env()?);
+    let cache: PathBuf = std::env::var("TUILE_SERVE_CACHE")
+        .map(Into::into)
+        .unwrap_or_else(|_| std::env::temp_dir().join("tuile-film-serve"));
+    let tiles = crate::setup::tile_store(&cache).await?;
+    let mut service = Service::new(runs, tiles.objects, cache, limits_from_env()?);
+    // The tile store's server, when the store is one: extracts come from it.
+    service.remote = tuile_repository::HttpGet::from_env()?
+        .map(|get| Arc::new(get) as Arc<dyn tuile_repository::Get>);
+    Ok(service)
+}
+
+/// The service's routes: `GET /`, and `POST /segments` — answered once the
+/// segment is in the store, or at once (202) when there is a `notify` to
+/// tell how it ends.
+pub fn router(service: Arc<Service>, notify: Option<Arc<dyn Notify>>) -> axum::Router {
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use axum::Json;
+    type Held = (Arc<Service>, Option<Arc<dyn Notify>>);
+    async fn segment(
+        State((service, notify)): State<Held>,
+        Json(order): Json<SegmentOrder>,
+    ) -> axum::response::Response {
+        eprintln!(
+            "segment {} ← {} {}:{}",
+            order.out, order.pack, order.frames.0, order.frames.1
+        );
+        match notify {
+            Some(notify) => {
+                let out = order.out.clone();
+                service.accept(order, notify);
+                (
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({ "accepted": out })),
+                )
+                    .into_response()
+            }
+            None => match service.segment(&order).await {
+                Ok(done) => {
+                    eprintln!(
+                        "segment {} done: {} frames, waited {:.0} s, rendered in {:.0} s",
+                        done.out, done.frames, done.waited_seconds, done.render_seconds
+                    );
+                    Json(done).into_response()
+                }
+                Err(e) => {
+                    eprintln!("segment {} failed: {e}", order.out);
+                    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                }
+            },
+        }
+    }
+    axum::Router::new()
+        .route("/", axum::routing::get(|| async { "tuile-film-serve" }))
+        .route("/segments", axum::routing::post(segment))
+        .with_state((service, notify))
+}
+
+/// Serves `router` on `PORT` (8080 unless said) until the process ends.
+pub async fn serve(router: axum::Router) -> Result<(), Error> {
+    let port = number("PORT")?.unwrap_or(8080);
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port as u16)).await?;
+    eprintln!("tuile-film-serve: on :{port}");
+    axum::serve(listener, router).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,6 +557,22 @@ mod tests {
         let rendering = spec.rendering().expect("a rendering");
         assert_eq!(rendering.bitrate, 45_000_000);
         assert_eq!(rendering.order.look.exposure_ev, 1.6);
+        // The ground smoothed and sewn unless said: geometry, 2 m at most.
+        let plain = RenderSpec::default().rendering().expect("a rendering");
+        assert_eq!(
+            plain.order.smooth,
+            tuile_film::smoothing::Smooth::Geometry { bound: 2.0 }
+        );
+        assert!(plain.order.stitch);
+        let asked: RenderSpec =
+            serde_json::from_str(r#"{"smooth": "off", "stitch": false}"#).expect("a spec");
+        let asked = asked.rendering().expect("a rendering");
+        assert_eq!(asked.order.smooth, tuile_film::smoothing::Smooth::Off);
+        assert!(!asked.order.stitch);
+        assert!(serde_json::from_str::<RenderSpec>(r#"{"smooth": "bumpy"}"#)
+            .expect("parsed")
+            .rendering()
+            .is_err());
         assert!(
             serde_json::from_str::<RenderSpec>(r#"{"sky_light": "1,2"}"#)
                 .expect("parsed")
@@ -453,6 +597,7 @@ mod tests {
             out: "out.mp4".into(),
             rendering: RenderSpec::default(),
             extracts: Vec::new(),
+            context: serde_json::Value::Null,
             to_sun: None,
             pack_within_seconds: Some(0),
         };
@@ -497,5 +642,48 @@ mod tests {
             generation_age: Duration::ZERO,
             ..limits
         }));
+    }
+
+    struct Heard(tokio::sync::mpsc::UnboundedSender<(serde_json::Value, Result<u64, String>)>);
+
+    #[async_trait::async_trait]
+    impl Notify for Heard {
+        async fn segment_done(&self, order: &SegmentOrder, outcome: Result<&SegmentDone, String>) {
+            let _ = self
+                .0
+                .send((order.context.clone(), outcome.map(|d| d.frames)));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_segment_accepted_in_the_background_says_how_it_ended_with_its_context() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(dir.path().join("catalog.json"), br#"{"layers": []}"#).expect("catalog");
+        let runs = Arc::new(
+            ObjectRunStore::local(dir.path(), tuile_farm::Tuning::default()).expect("store"),
+        );
+        let tiles: Arc<dyn tuile_repository::Objects> = runs.clone();
+        let service = Arc::new(Service::new(
+            runs,
+            tiles,
+            dir.path().join("cache"),
+            Limits::default(),
+        ));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let order: SegmentOrder = serde_json::from_value(serde_json::json!({
+            "pack": "packs/never.tuilepack",
+            "frames": [1, 2],
+            "out": "out.mp4",
+            "pack_within_seconds": 0,
+            "context": {"workflow": "film-1", "chunk": 3},
+        }))
+        .expect("order");
+        service.accept(order, Arc::new(Heard(tx)));
+        let (context, outcome) = rx.recv().await.expect("told");
+        assert_eq!(
+            context,
+            serde_json::json!({"workflow": "film-1", "chunk": 3})
+        );
+        assert!(outcome.expect_err("no pack").contains("did not come"));
     }
 }
