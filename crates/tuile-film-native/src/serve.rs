@@ -246,7 +246,7 @@ impl Service {
             .remote
             .as_ref()
             .ok_or("extracts named and no tile store server to fetch them from")?;
-        let fetched = crate::extract::fetch(get.as_ref(), &order.extracts, dir).await?;
+        let fetched = crate::extract::fetch(get.clone(), &order.extracts, dir).await?;
         let local: Arc<dyn tuile_repository::Objects> =
             Arc::new(ObjectRunStore::local(dir, tuile_farm::Tuning::default())?);
         let store = &sources.store.tiles;

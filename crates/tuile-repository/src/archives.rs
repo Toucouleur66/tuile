@@ -225,8 +225,11 @@ pub struct ArchivedTiles {
     opening: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     /// Zones read from an extract rather than their manifest: by zone,
     /// where it lies, its key there, and what is added to a tile's id in it.
-    extracts: Mutex<HashMap<String, (Arc<dyn Objects>, String, u64)>>,
+    extracts: Mutex<HashMap<String, ZoneExtract>>,
 }
+
+/// Where a zone's extract lies, its key there, and its band.
+type ZoneExtract = (Arc<dyn Objects>, String, u64);
 
 /// A zone's manifest as read, with when: `None` if the zone has none.
 type HeldManifest = (u64, Option<Arc<Manifest>>);

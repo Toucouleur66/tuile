@@ -94,7 +94,11 @@ pub fn parts(bytes: u64) -> u64 {
 
 /// Fetches `extracts` under `dir`, every part of every one of them
 /// [`PARTS_AT_ONCE`] at a time.
-pub async fn fetch(get: &dyn Get, extracts: &[ExtractRef], dir: &Path) -> Result<Fetched, Error> {
+pub async fn fetch(
+    get: Arc<dyn Get>,
+    extracts: &[ExtractRef],
+    dir: &Path,
+) -> Result<Fetched, Error> {
     let began = Instant::now();
     let mut asked = Vec::new();
     for extract in extracts {
@@ -104,33 +108,42 @@ pub async fn fetch(get: &dyn Get, extracts: &[ExtractRef], dir: &Path) -> Result
         }
         let file = Arc::new(std::fs::File::create(&path)?);
         file.set_len(extract.bytes)?;
-        asked.extend((0..parts(extract.bytes)).map(|n| (extract, file.clone(), n)));
+        asked.extend(
+            (0..parts(extract.bytes))
+                .map(|n| (extract.key.clone(), extract.bytes, file.clone(), n)),
+        );
     }
     let count = asked.len() as u64;
     futures_util::stream::iter(asked)
-        .map(|(extract, file, n)| async move {
-            let got = get
-                .get(&format!("store/extract/{}/{PART_MIB}/{n}", extract.key))
-                .await?;
-            let expected = PART_BYTES.min(extract.bytes - n * PART_BYTES);
-            if got.status != 200 || got.body.len() as u64 != expected {
-                return Err::<(), Error>(
-                    format!(
-                        "extract {}, part {n}: HTTP {}, {} bytes of {expected}",
-                        extract.key,
-                        got.status,
-                        got.body.len()
+        .map(|(key, bytes, file, n)| {
+            let get = get.clone();
+            async move {
+                let got = get
+                    .get(&format!("store/extract/{key}/{PART_MIB}/{n}"))
+                    .await?;
+                let expected = PART_BYTES.min(bytes - n * PART_BYTES);
+                if got.status != 200 || got.body.len() as u64 != expected {
+                    return Err::<(), Error>(
+                        format!(
+                            "extract {key}, part {n}: HTTP {}, {} bytes of {expected}",
+                            got.status,
+                            got.body.len()
+                        )
+                        .into(),
+                    );
+                }
+                // Each part at its place in the file, from a thread of its own.
+                tokio::task::spawn_blocking(move || {
+                    std::os::unix::fs::FileExt::write_all_at(
+                        file.as_ref(),
+                        &got.body,
+                        n * PART_BYTES,
                     )
-                    .into(),
-                );
+                })
+                .await
+                .map_err(|e| e.to_string())??;
+                Ok(())
             }
-            // Each part at its place in the file, from a thread of its own.
-            tokio::task::spawn_blocking(move || {
-                std::os::unix::fs::FileExt::write_all_at(file.as_ref(), &got.body, n * PART_BYTES)
-            })
-            .await
-            .map_err(|e| e.to_string())??;
-            Ok(())
         })
         .buffer_unordered(PARTS_AT_ONCE)
         .try_collect::<()>()
@@ -202,7 +215,10 @@ mod tests {
             },
         ];
         let dir = tempfile::tempdir().expect("dir");
-        let fetched = fetch(&server, &refs, dir.path()).await.expect("fetched");
+        let server: Arc<dyn Get> = Arc::new(server);
+        let fetched = fetch(server.clone(), &refs, dir.path())
+            .await
+            .expect("fetched");
         assert_eq!((fetched.extracts, fetched.parts), (2, 3));
         assert_eq!(fetched.bytes, big.len() as u64 + small.len() as u64);
         assert_eq!(
@@ -220,6 +236,6 @@ mod tests {
             bytes: small.len() as u64 + 1,
             ..refs[1].clone()
         }];
-        assert!(fetch(&server, &wrong, dir.path()).await.is_err());
+        assert!(fetch(server, &wrong, dir.path()).await.is_err());
     }
 }

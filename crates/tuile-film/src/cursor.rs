@@ -172,10 +172,13 @@ pub fn referred(
     Ok((terrain, imagery))
 }
 
+/// A layer of the store, and tiles of it.
+pub type LayerTiles = (String, Vec<StoreAt>);
+
 /// The store tiles a whole pack reads, by layer — its terrain layer first,
 /// its imagery layer second — each once: what an extract of the pack's
 /// tiles asks the store for. `None` for a pack that carries its tiles.
-pub fn store_tiles(pack: &Pack<'_>) -> Result<Option<[(String, Vec<StoreAt>); 2]>, FilmError> {
+pub fn store_tiles(pack: &Pack<'_>) -> Result<Option<[LayerTiles; 2]>, FilmError> {
     let Some((terrain_layer, imagery_layer)) = pack.store_layers() else {
         return Ok(None);
     };
