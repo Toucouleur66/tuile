@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use glam::DVec3;
-use tuile_core::content::{DecodedTileContent, TileContent};
+use tuile_core::content::{DecodedMesh, DecodedTileContent, TileContent};
 use tuile_core::drive::SceneState;
 use tuile_core::protocol::{ClientMessage, GeometryStream, ServerMessage, StreamError};
 use tuile_core::runtime::in_process_with;
@@ -578,6 +578,13 @@ pub(crate) struct Live {
     /// selection is known to answer the current camera rather than the
     /// previous one.
     generation: u64,
+    /// The terrain mesh of every resident tile, as it came, when the session
+    /// is asked to keep it ([`Session::keep_ground`]): what
+    /// [`Session::ground`] draws the ground from, whatever `finish` lets go.
+    grounds: Option<HashMap<TileId, (DVec3, Arc<DecodedMesh>)>>,
+    /// The ground last drawn, tile by tile, and how it was prepared: a tile
+    /// selected again is not prepared again.
+    prepared: (Option<tuile_film::ground::Prepare>, HashMap<TileId, tuile_film::Mesh>),
     /// Kept alive for as long as the session: dropping it ends the server.
     _server: std::thread::JoinHandle<()>,
 }
@@ -677,6 +684,72 @@ impl Session {
             Source::Live(live) => live.heights.clone(),
             Source::Packed(_) => None,
         }
+    }
+
+    /// Keeps, from now on, the terrain mesh of every tile that becomes
+    /// resident, for [`Self::ground`] — whatever the session's `finish`
+    /// does with it. Tiles already resident have none. Nothing for a packed
+    /// session.
+    pub fn keep_ground(&mut self) {
+        if let Source::Live(live) = &mut self.0 {
+            live.grounds.get_or_insert_with(HashMap::new);
+        }
+    }
+
+    /// The ground the last frame's selection draws, as a film's renderer
+    /// draws it: each tile's mesh prepared as `how` says (skirts,
+    /// smoothing), then stitched to its neighbours when `stitch` — the
+    /// renderer's own functions (`tuile_film::ground`). A camera placed
+    /// against it is placed against the picture.
+    ///
+    /// `None` for a packed session, and for a live one not asked to
+    /// [keep the ground](Self::keep_ground).
+    pub fn ground(
+        &mut self,
+        how: tuile_film::ground::Prepare,
+        stitch: bool,
+    ) -> Option<tuile_film::ground::Ground> {
+        let Source::Live(live) = &mut self.0 else {
+            return None;
+        };
+        let grounds = live.grounds.as_ref()?;
+        let selected: Vec<TileId> = live
+            .scene
+            .selected()
+            .iter()
+            .map(|(tile, _)| *tile)
+            .filter(|tile| grounds.contains_key(tile))
+            .collect();
+        // What the last ground drew and this one does not, let go; what it
+        // drew too, kept as it was prepared.
+        if live.prepared.0 != Some(how) {
+            live.prepared = (Some(how), HashMap::new());
+        }
+        live.prepared.1.retain(|tile, _| selected.contains(tile));
+        let mut stitching = tuile_film::stitching::Stitching::default();
+        let mut keys = Vec::with_capacity(selected.len());
+        for tile in selected {
+            let mesh = live.prepared.1.entry(tile).or_insert_with(|| {
+                let (origin, mesh) = &grounds[&tile];
+                let mesh = tuile_film::stitching::encoded(mesh, origin.to_array(), [1.0; 4]);
+                tuile_film::ground::prepared(mesh, how).0
+            });
+            let key = tuile_film::TileKey {
+                id: tile.0,
+                drape: 0,
+            };
+            let source = live
+                .resident
+                .get(&tile)
+                .and_then(|g| g.refs.as_ref())
+                .map(|refs| u32::from(refs.terrain.level));
+            stitching.enter(key, source, mesh);
+            keys.push(key);
+        }
+        if stitch {
+            stitching.frame(&keys);
+        }
+        Some(tuile_film::ground::Ground::of(&stitching, &keys))
     }
 
     /// Resolves one frame for the given views.
@@ -834,6 +907,8 @@ impl Live {
             resident: HashMap::new(),
             scene: SceneState::default(),
             generation: 0,
+            grounds: None,
+            prepared: (None, HashMap::new()),
             _server: server_thread,
         })
     }
@@ -918,6 +993,7 @@ impl Live {
             textures,
             resident,
             scene,
+            grounds,
             ..
         } = self;
         let mut errors: Vec<(Option<TileId>, String)> = Vec::new();
@@ -929,6 +1005,7 @@ impl Live {
                     stream,
                     scene,
                     resident,
+                    grounds.as_mut(),
                     Arc::clone(textures),
                     &dataset,
                     bake_max_size,
@@ -1027,6 +1104,7 @@ async fn converge(
     stream: &mut tuile_core::protocol::InProcessStream,
     scene: &mut SceneState,
     resident: &mut HashMap<TileId, Arc<TileGeometry>>,
+    mut grounds: Option<&mut HashMap<TileId, (DVec3, Arc<DecodedMesh>)>>,
     memo: Arc<TextureMemo>,
     dataset: &str,
     bake_max_size: u32,
@@ -1098,6 +1176,25 @@ async fn converge(
                         content: TileContent::Decoded(decoded),
                         ..
                     } => {
+                        // The mesh as it came, before a finish by identity
+                        // lets it go: the ground a camera is kept over.
+                        if let (Some(grounds), Some(mesh)) =
+                            (grounds.as_deref_mut(), decoded.meshes.first())
+                        {
+                            grounds.insert(
+                                tile,
+                                (
+                                    decoded.local_origin_ecef,
+                                    Arc::new(DecodedMesh {
+                                        positions: mesh.positions.clone(),
+                                        normals: None,
+                                        uvs: mesh.uvs.clone(),
+                                        indices: mesh.indices.clone(),
+                                        material: Default::default(),
+                                    }),
+                                ),
+                            );
+                        }
                         next_arrival += 1;
                         arrivals.insert(tile, next_arrival);
                         let arrival = next_arrival;
@@ -1124,6 +1221,9 @@ async fn converge(
                         for tile in tiles {
                             arrivals.remove(&tile);
                             resident.remove(&tile);
+                            if let Some(grounds) = grounds.as_deref_mut() {
+                                grounds.remove(&tile);
+                            }
                         }
                     }
                     ServerMessage::Error { tile, message } => errors.push((tile, message)),
@@ -2282,6 +2382,155 @@ pub(crate) mod tests {
             coarser.baked.expect("keyed"),
             "the bake size is part of what the pixels are"
         );
+    }
+
+    /// Terrain tiles where they are on the Earth: one at level 14 and its four
+    /// children, flat, the parent at 600 m and the children at 640 m — so a
+    /// height read says which of them is drawn.
+    struct GeoQuad;
+
+    const GEO_ROOT: (u32, u64, u64) = (14, 9000, 6200);
+
+    fn geo_height(level: u32) -> f64 {
+        600.0 + 40.0 * f64::from(level - GEO_ROOT.0)
+    }
+
+    fn geo_at(level: u32, x: u64, y: u64, u: f64, north: f64, height: f64) -> DVec3 {
+        use std::f64::consts::PI;
+        let size = PI / 2f64.powi(level as i32);
+        tuile_core::geo::geodetic_to_ecef(tuile_core::geo::Geodetic {
+            lon: -PI + (x as f64 + u) * size,
+            lat: -PI / 2.0 + (y as f64 + north) * size,
+            height,
+        })
+    }
+
+    impl TileTree for GeoQuad {
+        fn roots(&self) -> Vec<TileId> {
+            let (l, x, y) = GEO_ROOT;
+            vec![TileId::from_terrain(l, x, y)]
+        }
+        fn children(&self, id: TileId) -> Vec<TileId> {
+            let (level, x, y) = id.terrain_coord();
+            if level > GEO_ROOT.0 {
+                return Vec::new();
+            }
+            [(0, 0), (1, 0), (0, 1), (1, 1)]
+                .into_iter()
+                .map(|(dx, dy)| TileId::from_terrain(level + 1, 2 * x + dx, 2 * y + dy))
+                .collect()
+        }
+        fn parent(&self, id: TileId) -> Option<TileId> {
+            let (level, x, y) = id.terrain_coord();
+            (level > GEO_ROOT.0).then(|| TileId::from_terrain(level - 1, x / 2, y / 2))
+        }
+        fn properties(&self, id: TileId) -> tuile_core::source::TileProperties {
+            use tuile_core::math::{BoundingVolume, Sphere};
+            let (level, x, y) = id.terrain_coord();
+            let h = geo_height(level);
+            let center = geo_at(level, x, y, 0.5, 0.5, h);
+            let radius = center.distance(geo_at(level, x, y, 0.0, 0.0, h)) + 10.0;
+            tuile_core::source::TileProperties {
+                bounding_volume: BoundingVolume::Sphere(Sphere { center, radius }),
+                geometric_error: if level > GEO_ROOT.0 { 0.0 } else { radius / 8.0 },
+                refine: tuile_core::tileset::Refine::Replace,
+                has_content: true,
+            }
+        }
+    }
+
+    struct GeoLoader;
+
+    #[async_trait::async_trait]
+    impl TileLoader for GeoLoader {
+        async fn load(
+            &self,
+            id: TileId,
+        ) -> Result<tuile_core::source::Loaded, tuile_core::source::LoadError> {
+            let (level, x, y) = id.terrain_coord();
+            let h = geo_height(level);
+            let origin = geo_at(level, x, y, 0.5, 0.5, h);
+            let n = 4u32;
+            let (mut positions, mut uvs, mut indices) = (Vec::new(), Vec::new(), Vec::new());
+            for j in 0..=n {
+                for i in 0..=n {
+                    let (u, north) = (f64::from(i) / f64::from(n), f64::from(j) / f64::from(n));
+                    positions.push((geo_at(level, x, y, u, north, h) - origin).as_vec3().to_array());
+                    uvs.push([u as f32, 1.0 - north as f32]);
+                }
+            }
+            for j in 0..n {
+                for i in 0..n {
+                    let k = j * (n + 1) + i;
+                    indices.extend_from_slice(&[k, k + 1, k + n + 1, k + n + 1, k + 1, k + n + 2]);
+                }
+            }
+            let mut content = draped_content();
+            content.local_origin_ecef = origin;
+            content.meshes[0].positions = positions;
+            content.meshes[0].uvs = Some(uvs);
+            content.meshes[0].indices = indices;
+            content.imagery[0].coord = tuile_core::raster::ImageryCoord { level, x, y };
+            Ok(tuile_core::source::Loaded::Content(content))
+        }
+    }
+
+    fn geo_view(u: f64, north: f64, above: f64) -> ViewStateParams {
+        let (l, x, y) = GEO_ROOT;
+        let ground = geo_at(l, x, y, u, north, 0.0);
+        let up = ground.normalize();
+        ViewStateParams {
+            position: geo_at(l, x, y, u, north, geo_height(l + 1) + above),
+            direction: -up,
+            up: up.cross(DVec3::Z).cross(up).normalize(),
+            viewport_px: glam::DVec2::new(960.0, 720.0),
+            fovy_rad: 45f64.to_radians(),
+        }
+    }
+
+    /// A session that keeps the ground answers the height the frame draws —
+    /// the parent's from high up, a child's from low — even finishing by
+    /// identity, which lets every mesh go; one not asked to keep it answers
+    /// nothing.
+    #[test]
+    fn the_ground_of_a_frame_is_the_ground_it_draws_even_by_identity() {
+        let session = || {
+            Session::new(
+                Box::new(GeoQuad),
+                Arc::new(GeoLoader),
+                SessionConfig {
+                    finish: Finish::Identity,
+                    ..SessionConfig::default()
+                },
+            )
+            .expect("session")
+        };
+        let how = tuile_film::ground::Prepare::default();
+        let (l, x, y) = GEO_ROOT;
+        let place = |u: f64, north: f64| {
+            let g = tuile_core::geo::ecef_to_geodetic(geo_at(l, x, y, u, north, 0.0));
+            (g.lon, g.lat)
+        };
+
+        let mut unkept = session();
+        unkept.frame(vec![geo_view(0.3, 0.3, 200_000.0)]).expect("frame");
+        assert!(unkept.ground(how, true).is_none());
+
+        let mut kept = session();
+        kept.keep_ground();
+        let high = kept.frame(vec![geo_view(0.3, 0.3, 200_000.0)]).expect("frame");
+        assert_eq!(high.tiles.len(), 1, "the parent alone from high up");
+        assert!(high.tiles[0].content.meshes.is_empty(), "finished by identity");
+        let ground = kept.ground(how, true).expect("kept");
+        let (lon, lat) = place(0.3, 0.3);
+        let h = ground.height_at(lon, lat).expect("on the parent");
+        assert!((h - geo_height(l)).abs() < 0.05, "{h}");
+
+        let low = kept.frame(vec![geo_view(0.3, 0.3, 300.0)]).expect("frame");
+        assert!(low.tiles.len() > 1, "children from low down");
+        let ground = kept.ground(how, true).expect("kept");
+        let h = ground.height_at(lon, lat).expect("on a child");
+        assert!((h - geo_height(l + 1)).abs() < 0.05, "{h}");
     }
 
     /// A flat square of ground as a quadtree five levels deep: 341 tiles, each
