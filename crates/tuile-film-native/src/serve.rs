@@ -557,6 +557,22 @@ mod tests {
         let rendering = spec.rendering().expect("a rendering");
         assert_eq!(rendering.bitrate, 45_000_000);
         assert_eq!(rendering.order.look.exposure_ev, 1.6);
+        // The ground smoothed and sewn unless said: geometry, 2 m at most.
+        let plain = RenderSpec::default().rendering().expect("a rendering");
+        assert_eq!(
+            plain.order.smooth,
+            tuile_film::smoothing::Smooth::Geometry { bound: 2.0 }
+        );
+        assert!(plain.order.stitch);
+        let asked: RenderSpec =
+            serde_json::from_str(r#"{"smooth": "off", "stitch": false}"#).expect("a spec");
+        let asked = asked.rendering().expect("a rendering");
+        assert_eq!(asked.order.smooth, tuile_film::smoothing::Smooth::Off);
+        assert!(!asked.order.stitch);
+        assert!(serde_json::from_str::<RenderSpec>(r#"{"smooth": "bumpy"}"#)
+            .expect("parsed")
+            .rendering()
+            .is_err());
         assert!(
             serde_json::from_str::<RenderSpec>(r#"{"sky_light": "1,2"}"#)
                 .expect("parsed")

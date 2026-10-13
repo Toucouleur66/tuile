@@ -351,7 +351,8 @@ async fn main() -> Result<(), Error> {
     order.skirts = !flag("--no-skirts");
     order.holes = flag("--holes");
     order.wire = flag("--wire");
-    let bound: f32 = value("--smooth-bound").map_or(Ok(2.0), |b| b.parse())?;
+    let bound: f32 = value("--smooth-bound")
+        .map_or(Ok(tuile_film::smoothing::DEFAULT_BOUND_M), |b| b.parse())?;
     order.smooth = match value("--smooth").as_deref() {
         None | Some("off") => tuile_film::smoothing::Smooth::Off,
         Some("shading") => tuile_film::smoothing::Smooth::Shading,
