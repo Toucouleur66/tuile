@@ -626,6 +626,17 @@ impl TileStore {
         if let Some(f) = flights.get(key) {
             return f.clone();
         }
+        // A read that ended between this reader's look at the cache and now
+        // has left its manifest there, and its flight gone: that one is the
+        // answer, not a second read.
+        let fresh = self.manifests.cache.lock().ok().and_then(|c| {
+            c.get(key)
+                .filter(|(at, _)| at.elapsed() < self.cfg.manifest_ttl)
+                .map(|(_, m)| m.clone())
+        });
+        if let Some(m) = fresh {
+            return futures_util::future::ready(Ok(m)).boxed().shared();
+        }
         let objects = self.store.clone();
         let manifests = self.manifests.clone();
         let disk = self.disk.clone();
