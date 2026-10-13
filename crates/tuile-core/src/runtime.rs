@@ -391,6 +391,12 @@ impl Session<'_> {
                 }
                 false
             }
+            // The sweep is the next pass's, over that pass's protected set:
+            // the views already sent, so nothing they draw or wait on goes.
+            ClientMessage::Trim { budget_bytes } => {
+                self.cache.trim_once_to(budget_bytes);
+                true
+            }
         }
     }
 

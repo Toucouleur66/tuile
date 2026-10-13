@@ -57,6 +57,14 @@ pub struct SessionConfig {
     pub bake_max_size: u32,
     /// What each tile is finished into. See [`Finish`].
     pub finish: Finish,
+    /// What the geometry server may keep, in bytes, of what frames leave
+    /// behind: once a frame has converged, everything beyond it that the
+    /// frame neither draws nor stands on is let go (`ClientMessage::Trim`).
+    /// A frame still converges with no budget at all — nothing it waits on
+    /// is ever taken — so this bounds a long flight's memory, never a
+    /// frame's. `None` keeps everything, as a session always did.
+    /// `TUILE_BAKE_KEEP_GIB` when the environment says.
+    pub trim_between_frames: Option<usize>,
 }
 
 /// What a session makes of a tile once its content has arrived.
@@ -121,6 +129,10 @@ impl Default for SessionConfig {
             // shots raise it where the RAM is real, a laptop lowers it.
             bake_max_size: env_knob("TUILE_BAKE_MAX", 2048_u32).clamp(64, 8192),
             finish: Finish::Pictures,
+            trim_between_frames: std::env::var("TUILE_BAKE_KEEP_GIB")
+                .ok()
+                .and_then(|gib| gib.parse::<f64>().ok())
+                .map(|gib| (gib * f64::from(1u32 << 30)) as usize),
         }
     }
 }
@@ -1085,6 +1097,18 @@ impl Live {
             "frame resolved (reused = drapes already baked by an earlier frame)"
         );
 
+        // The frame is whole: what earlier frames left behind may go now,
+        // swept on the server's next pass, with this frame's views
+        // protected. Its tiles are held by the frame itself meanwhile.
+        if let Some(budget_bytes) = self.config.trim_between_frames {
+            if self
+                .stream
+                .send(ClientMessage::Trim { budget_bytes })
+                .is_err()
+            {
+                return Err(FrameError::ServerGone);
+            }
+        }
         Ok(Frame::with_memo(
             self.config.dataset.as_str(),
             tiles,
@@ -2720,6 +2744,85 @@ pub(crate) mod tests {
             })
             .collect();
         (frames, loads.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// The quad's flight with `config`: each frame's tiles and drapes, the
+    /// loads, and how many tiles the session held after the last frame.
+    #[allow(clippy::type_complexity)]
+    fn quad_flight_with(config: SessionConfig) -> (Vec<Vec<(u64, u64)>>, usize, usize) {
+        let loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut session = Session::new(
+            Box::new(Quad),
+            Arc::new(QuadLoader(Arc::clone(&loads))),
+            config,
+        )
+        .expect("session");
+        let poses = [
+            (800.0, 800.0, 6000.0),
+            (800.0, 800.0, 1500.0),
+            (500.0, 700.0, 600.0),
+            (1100.0, 300.0, 250.0),
+            (1100.0, 300.0, 2500.0),
+            (300.0, 1200.0, 400.0),
+            (1300.0, 1300.0, 300.0),
+        ];
+        let frames = poses
+            .into_iter()
+            .map(|(x, y, height)| {
+                let frame = session.frame(vec![quad_view(x, y, height)]).expect("a frame");
+                let mut tiles: Vec<(u64, u64)> =
+                    frame.tiles.iter().map(|t| (t.tile.0, t.drape())).collect();
+                tiles.sort_unstable();
+                tiles
+            })
+            .collect();
+        let held = match &session.0 {
+            Source::Live(live) => live.resident.len(),
+            Source::Packed(_) => unreachable!("a live session"),
+        };
+        (frames, loads.load(std::sync::atomic::Ordering::Relaxed), held)
+    }
+
+    /// Letting go between frames bounds what a long flight holds, and keeps
+    /// a bake a function of its flight: two bakes that let go give the same
+    /// frames, tile for tile and drape for drape, each one whole. What was
+    /// let go is fetched again when a frame needs it.
+    ///
+    /// Not the frames of a bake that keeps everything, in general: a frame
+    /// converges over passes, refinement has a dead band against the pass
+    /// before (`Config::refine_hysteresis`), and a zoom-out that has to
+    /// fetch its coarse ground again settles on the other side of it.
+    #[test]
+    fn letting_go_between_frames_bounds_what_is_held_and_is_the_same_twice() {
+        for finish in [Finish::Pictures, Finish::Identity] {
+            // The quad is five levels deep: the default floor of pinned
+            // levels would keep all of it.
+            let config = |trim| SessionConfig {
+                traversal: Config {
+                    pinned_level: None,
+                    ..Config::default()
+                },
+                finish,
+                trim_between_frames: trim,
+                ..SessionConfig::default()
+            };
+            let (kept, kept_loads, kept_held) = quad_flight_with(config(None));
+            let (trimmed, trimmed_loads, trimmed_held) = quad_flight_with(config(Some(1)));
+            let (again, _, _) = quad_flight_with(config(Some(1)));
+            let differ = trimmed.iter().zip(&kept).filter(|(t, k)| t != k).count();
+            println!(
+                "{finish:?}: everything kept, {kept_loads} loads and {kept_held} held; \
+                 let go, {trimmed_loads} loads and {trimmed_held} held; \
+                 {differ} frame(s) of {} drawn otherwise",
+                kept.len()
+            );
+            assert_eq!(trimmed, again, "{finish:?}: the same frames twice");
+            assert!(
+                trimmed_held < kept_held / 2,
+                "{finish:?}: {trimmed_held} held against {kept_held}"
+            );
+            assert!(trimmed_loads > kept_loads, "{finish:?}: what was let go came back");
+        }
     }
 
     /// The behaviour every change to how a frame is resolved must leave alone:
