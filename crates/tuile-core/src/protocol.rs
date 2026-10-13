@@ -43,6 +43,13 @@ pub enum ClientMessage {
     Ack { tile: TileId },
     /// The consumer no longer wants this in-flight tile.
     Cancel { tile: TileId },
+    /// If the residency holds more than `budget_bytes`, let go, once, of all
+    /// of it but what the current views select, their ancestors and what
+    /// they wait on. For a consumer that gathers a frame exactly, with no
+    /// budget while it converges, and bounds what frames leave behind
+    /// between them. The tiles let go are announced with
+    /// [`ServerMessage::Evict`] as any others.
+    Trim { budget_bytes: usize },
 }
 
 /// What the tree knows about a tile, travelling with every message that names

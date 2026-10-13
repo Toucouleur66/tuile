@@ -391,6 +391,24 @@ impl Session<'_> {
                 }
                 false
             }
+            // Swept now, against what the last pass protected — the frame
+            // the consumer just saw converge — and not at the next pass,
+            // whose views depend on whether the next camera has arrived
+            // yet. Forgotten here as the pass forgets what it reclaims;
+            // announced with the next pass's `Evict`.
+            ClientMessage::Trim { budget_bytes } => {
+                let released = self
+                    .cache
+                    .release_beyond(budget_bytes, self.selected)
+                    .to_vec();
+                for tile in &released {
+                    self.residency.remove(*tile);
+                    self.epochs.remove(tile);
+                    self.acked.remove(tile);
+                    self.filled.remove(tile);
+                }
+                false
+            }
         }
     }
 
@@ -624,7 +642,8 @@ impl Session<'_> {
         // camera has left is now the most depletable thing in the cache. Doing
         // this here — and not only when a load lands — is what lets a settled
         // camera give memory back at all.
-        let reclaimed = self.cache.trim(self.selected);
+        let mut reclaimed = self.cache.take_released();
+        reclaimed.extend(self.cache.trim(self.selected));
         for tile in &reclaimed {
             self.residency.remove(*tile);
             self.epochs.remove(tile);

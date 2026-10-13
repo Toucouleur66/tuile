@@ -13,6 +13,7 @@ mod camera;
 mod cursor;
 pub mod drape;
 pub mod from_store;
+pub mod ground;
 mod look;
 mod mesh;
 mod overlay;

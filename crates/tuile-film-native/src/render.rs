@@ -21,7 +21,7 @@ use glam::DVec3;
 use tuile_film::drape::{on_screen_px, spared, sphere};
 use tuile_film::from_store::{compose, imagery_texture, is_baked, terrain_mesh};
 use tuile_film::smoothing::Smooth;
-use tuile_film::stitching::{decoded, encoded, Stitching};
+use tuile_film::stitching::Stitching;
 use tuile_film::{
     refs_of, texture_of_span, Content, Cursor, Eye, FrameCamera, Look, Mesh, OverlayMesh, Overlays,
     Pack, Stereo, TileKey,
@@ -886,35 +886,25 @@ pub async fn render(
                             (mesh, texture, Origin::Pack, Vec::new(), (0, 0))
                         }
                     };
-                    let mesh = if order.skirts {
-                        mesh
-                    } else {
-                        let origin = glam::DVec3::from_array(mesh.origin_ecef);
-                        encoded(
-                            &tuile_core::stitch::without_skirts(&decoded(&mesh), origin),
-                            mesh.origin_ecef,
-                            mesh.base_color_factor,
-                        )
-                    };
                     // PROTOTYPE (terrain smoothing), before anything else sees
                     // the mesh: stitching and the seam log are handed the
-                    // smoothed one.
+                    // smoothed one. The same preparation a camera's ground
+                    // is read from (`tuile_film::ground`).
                     let mesh = {
                         let began = Instant::now();
-                        let origin = glam::DVec3::from_array(mesh.origin_ecef);
-                        let (smoothed, did) =
-                            tuile_film::smoothing::smooth(&decoded(&mesh), origin, order.smooth);
+                        let (out, did) = tuile_film::ground::prepared(
+                            mesh,
+                            tuile_film::ground::Prepare {
+                                skirts: order.skirts,
+                                smooth: order.smooth,
+                            },
+                        );
                         done.with_normals += u64::from(did.had_normals);
                         done.triangles.0 += did.triangles_before as u64;
                         done.triangles.1 += did.triangles_after as u64;
                         done.smooth_furthest = done.smooth_furthest.max(did.furthest);
                         done.smooth_mean_sum += f64::from(did.mean);
                         done.smoothed_tiles += 1;
-                        let out = if order.smooth == Smooth::Off {
-                            mesh
-                        } else {
-                            encoded(&smoothed, mesh.origin_ecef, mesh.base_color_factor)
-                        };
                         done.smooth_ms += ms(began);
                         out
                     };

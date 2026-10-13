@@ -100,6 +100,9 @@ pub struct ResidentCache {
     /// both bounded and true.
     imagery: HashMap<ImageryCoord, ImageryEntry>,
     imagery_used: usize,
+    /// What [`ResidentCache::release_beyond`] let go and nobody has been
+    /// told of yet. See [`ResidentCache::take_released`].
+    released: Vec<TileId>,
 }
 
 impl ResidentCache {
@@ -123,6 +126,7 @@ impl ResidentCache {
             entries: HashMap::new(),
             imagery: HashMap::new(),
             imagery_used: 0,
+            released: Vec::new(),
         }
     }
 
@@ -277,6 +281,56 @@ impl ResidentCache {
     /// set changes, which is once per traversal.
     pub fn trim(&mut self, protected: &HashSet<TileId>) -> Vec<TileId> {
         self.trim_except(protected, None)
+    }
+
+    /// If the residency is over `budget` bytes, lets go at once of every
+    /// tile it may: all but `protected`, what the current pass touched, and
+    /// the pinned levels. The tiles are kept for [`Self::take_released`].
+    ///
+    /// For a consumer whose working set must never be evicted while it is
+    /// being gathered (a batch frame, exact or nothing) but which may let go
+    /// of what the last frame left once that frame is done, `protected`
+    /// being that frame's: what it draws, its ancestors, what it asked for.
+    ///
+    /// All of it rather than the least recently used first: which tiles
+    /// were used last depends on the order loads landed in, which is the
+    /// network's, and a batch frame whose content depended on it would not
+    /// be the same frame twice. What goes is the complement of what the
+    /// frame protects, and whether anything goes depends on bytes alone.
+    pub fn release_beyond(&mut self, budget: usize, protected: &HashSet<TileId>) -> &[TileId] {
+        let from = self.released.len();
+        if self.used_bytes() > budget {
+            let released = self.release_all_but(protected);
+            self.released.extend(released);
+        }
+        &self.released[from..]
+    }
+
+    /// What [`Self::release_beyond`] let go since this was last asked.
+    pub fn take_released(&mut self) -> Vec<TileId> {
+        std::mem::take(&mut self.released)
+    }
+
+    /// Evicts everything but `protected`, what this pass touched, and the
+    /// pinned levels.
+    fn release_all_but(&mut self, protected: &HashSet<TileId>) -> Vec<TileId> {
+        let pass = self.pass;
+        let mut evicted: Vec<TileId> = self
+            .entries
+            .iter()
+            .filter(|(id, e)| {
+                !protected.contains(id) && e.touched_pass != pass && !self.is_pinned(e.level)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        evicted.sort_unstable_by_key(|id| id.0);
+        for id in &evicted {
+            if let Some(e) = self.entries.remove(id) {
+                self.used -= e.size;
+                self.release_imagery(&e.imagery);
+            }
+        }
+        evicted
     }
 
     /// How many tiles are resident.
