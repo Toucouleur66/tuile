@@ -126,6 +126,14 @@ impl<'a> Reader<'a> {
     fn f64x3(&mut self, what: &'static str) -> Result<[f64; 3], DecodeError> {
         Ok([self.f64(what)?, self.f64(what)?, self.f64(what)?])
     }
+    /// `count` values of at least `bytes` each, or as many as are left:
+    /// what may be reserved for a count the tile states, before its bytes
+    /// are read — a count read from bytes that are not a tile can ask for
+    /// tens of gigabytes.
+    fn at_most(&self, count: usize, bytes: usize) -> usize {
+        count.min(self.remaining() / bytes)
+    }
+
     fn remaining(&self) -> usize {
         self.bytes.len() - self.pos
     }
@@ -228,7 +236,7 @@ fn decode_zigzag_delta(
     count: usize,
     what: &'static str,
 ) -> Result<Vec<f64>, DecodeError> {
-    let mut out = Vec::with_capacity(count);
+    let mut out = Vec::with_capacity(r.at_most(count, 2));
     let mut acc: i32 = 0;
     for _ in 0..count {
         acc = acc.wrapping_add(zigzag(r.u16(what)?));
@@ -244,7 +252,7 @@ fn decode_indices_high_water_mark(
     wide: bool,
     vertex_count: u32,
 ) -> Result<Vec<u32>, DecodeError> {
-    let mut out = Vec::with_capacity(count);
+    let mut out = Vec::with_capacity(r.at_most(count, 2));
     let mut highest: u32 = 0;
     for _ in 0..count {
         let code = if wide {
@@ -270,7 +278,7 @@ fn decode_indices_high_water_mark(
 /// Edge indices are direct (not high-water-mark encoded).
 fn read_edge(r: &mut Reader<'_>, wide: bool, what: &'static str) -> Result<Vec<u32>, DecodeError> {
     let count = r.u32(what)? as usize;
-    let mut out = Vec::with_capacity(count);
+    let mut out = Vec::with_capacity(r.at_most(count, 2));
     for _ in 0..count {
         out.push(if wide {
             r.u32(what)?
@@ -532,6 +540,25 @@ mod tests {
         let mesh = decode(&raw).expect("read as raw");
         assert_eq!(mesh.header.center, header.center);
         assert_eq!(mesh.indices, indices);
+    }
+
+    /// A count no tile could hold is a truncated tile, not an allocation:
+    /// four billion vertices stated in a few bytes.
+    #[test]
+    fn a_count_beyond_the_bytes_reserves_nothing() {
+        let mut bytes = encode(
+            &test_header(),
+            &[0.0],
+            &[0.0],
+            &[0.0],
+            &[],
+            None,
+            &[vec![], vec![], vec![], vec![]],
+        );
+        bytes.truncate(88);
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        bytes.extend_from_slice(&[0; 6]);
+        assert!(matches!(decode(&bytes), Err(DecodeError::Truncated(_))));
     }
 
     /// A gzip stream is not a tile: it is the source's to decompress, and
