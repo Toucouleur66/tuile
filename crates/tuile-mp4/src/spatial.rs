@@ -24,8 +24,9 @@ use crate::Mp4Error;
 
 /// The two records of an MV-HEVC stream, from its parameter sets as an
 /// encoder emits them (NAL units without start codes): `hvcC` describes the
-/// base layer — the left eye — from its VPS, SPS and PPS; `lhvC` holds the
-/// second layer's SPS and PPS. Returned as the records' bodies.
+/// base layer — the left eye — from its VPS, SPS and PPS, and carries the
+/// 3D reference displays SEI if given one; `lhvC` holds the second layer's
+/// SPS and PPS. Returned as the records' bodies.
 pub fn hevc_records(units: &[&[u8]]) -> Result<(Vec<u8>, Vec<u8>), Mp4Error> {
     use std::io::Read;
     let bad = |why: &str| Mp4Error::Atom(format!("parameter sets: {why}"));
@@ -73,7 +74,13 @@ pub fn hevc_records(units: &[&[u8]]) -> Result<(Vec<u8>, Vec<u8>), Mp4Error> {
         num_temporal_layers: layers,
         temporal_id_nested: parsed.sps_temporal_id_nesting_flag,
         length_size_minus_one: 3,
-        arrays: vec![array(32, 0), array(33, 0), array(34, 0)],
+        // The parameter sets, and the 3D reference displays SEI (payload
+        // 176) where the stream has one: AVFoundation takes a stream for
+        // stereo multiview by it, in the record.
+        arrays: [array(32, 0), array(33, 0), array(34, 0), array(39, 0)]
+            .into_iter()
+            .filter(|a| a.nal_unit_type != 39 || !a.nalus.is_empty())
+            .collect(),
         ..Hvcc::new()
     };
     let second: Vec<HvcCArray> = [array(33, 1), array(34, 1)]
@@ -467,7 +474,7 @@ mod tests {
                 a.bit_depth_chroma_minus8
             )
         );
-        for t in [32u8, 33, 34] {
+        for t in [32u8, 33, 34, 39] {
             let of = |r: &Hvcc| {
                 r.arrays
                     .iter()
