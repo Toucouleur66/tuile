@@ -51,10 +51,9 @@ use clap::Parser;
 use tuile_bake::tape::TapeBake;
 use tuile_farm::produce::{produce, Host, Journal, Order, ProduceError, Stretch};
 use tuile_farm::{ObjectRunStore, RunStore};
-use tuile_film::Haze;
-use tuile_film_native::engine::{Engine, Rendering};
-use tuile_film_native::setup::{rgb, tile_store};
-use tuile_film_native::{Error, Tone};
+use tuile_film_native::engine::{Engine, RenderSpec, Rendering};
+use tuile_film_native::setup::tile_store;
+use tuile_film_native::Error;
 
 #[derive(Parser)]
 #[command(
@@ -257,60 +256,26 @@ fn content(text: &str) -> Result<tuile_pack::Content, String> {
 
 /// How the film is rendered, as the command line says.
 fn rendering(args: &Args) -> Result<Rendering, Error> {
-    let mut order = tuile_film_native::Order {
+    RenderSpec {
+        fps: args.fps,
         scale: args.scale,
-        supersample: args.supersample.max(1),
-        fps: args.fps.max(1),
-        ..Default::default()
-    };
-    if args.no_tone {
-        order.tone = Tone::Off;
-    }
-    let look = &mut order.look;
-    if let Some(stops) = args.exposure {
-        look.exposure_ev = stops;
-    }
-    if let Some(power) = args.contrast {
-        look.contrast = power;
-    }
-    if let Some(factor) = args.saturation {
-        look.saturation = factor;
-    }
-    if let Some(strength) = args.shadow {
-        look.shadow = strength;
-    }
-    if let Some(colour) = &args.sun_light {
-        look.sun = rgb("--sun-light", colour)?;
-    }
-    if let Some(colour) = &args.sky_light {
-        look.world = rgb("--sky-light", colour)?;
-    }
-    // Naming anything of the air asks for the air.
-    if args.haze_density.is_some()
-        || args.haze_height.is_some()
-        || args.haze_horizon.is_some()
-        || args.haze_zenith.is_some()
-    {
-        let haze = look.haze.get_or_insert_with(Haze::default);
-        if let Some(density) = args.haze_density {
-            haze.density = density;
-        }
-        if let Some(height) = args.haze_height {
-            haze.scale_height = height;
-        }
-        if let Some(colour) = &args.haze_horizon {
-            haze.horizon = rgb("--haze-horizon", colour)?;
-        }
-        if let Some(colour) = &args.haze_zenith {
-            haze.zenith = rgb("--haze-zenith", colour)?;
-        }
-    }
-    Ok(Rendering {
-        order,
-        codec: Some(args.codec.clone()),
-        bitrate: (args.mbps * 1e6) as u32,
+        supersample: args.supersample,
+        codec: args.codec.clone(),
+        mbps: args.mbps,
         sun: args.sun,
-    })
+        exposure: args.exposure,
+        contrast: args.contrast,
+        saturation: args.saturation,
+        shadow: args.shadow,
+        haze_density: args.haze_density,
+        haze_height: args.haze_height,
+        haze_horizon: args.haze_horizon.clone(),
+        haze_zenith: args.haze_zenith.clone(),
+        sun_light: args.sun_light.clone(),
+        sky_light: args.sky_light.clone(),
+        no_tone: args.no_tone,
+    }
+    .rendering()
 }
 
 /// What it came to, as an exit code.
@@ -461,6 +426,8 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    use tuile_film::Haze;
+    use tuile_film_native::Tone;
 
     fn parsed(line: &str) -> Result<Args, clap::Error> {
         Args::try_parse_from(line.split_whitespace())

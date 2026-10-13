@@ -33,6 +33,7 @@ pub mod observe;
 pub mod reference;
 pub mod render;
 pub mod seams;
+pub mod serve;
 pub mod setup;
 pub mod sink;
 pub mod source;
