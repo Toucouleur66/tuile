@@ -426,6 +426,9 @@ fn encode_eyes(
                 };
                 match session.encode_picture(&mut inputs[view], &mut outputs[view], params) {
                     Ok(()) => break,
+                    // The base layer waits for its second view: both come
+                    // out once the right eye is in.
+                    Err(e) if view == 0 && e.kind() == ErrorKind::NeedMoreInput => break,
                     Err(e) if e.kind() == ErrorKind::EncoderBusy => {
                         std::thread::sleep(Duration::from_millis(2));
                     }
