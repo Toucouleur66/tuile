@@ -22,10 +22,11 @@ use std::time::{Duration, Instant};
 
 use cudarc::driver::CudaContext;
 use nvidia_video_codec_sdk::sys::nvEncodeAPI::{
-    HEVC_3D_REFERENCE_DISPLAY_INFO, NV_ENC_BUFFER_FORMAT, NV_ENC_CAPS, NV_ENC_CODEC_AV1_GUID,
-    NV_ENC_CODEC_H264_GUID, NV_ENC_CODEC_HEVC_GUID, NV_ENC_HEVC_PROFILE_MAIN_GUID,
-    NV_ENC_MULTI_PASS, NV_ENC_PARAMS_RC_MODE, NV_ENC_PIC_PARAMS_HEVC, NV_ENC_PIC_TYPE,
-    NV_ENC_PRESET_P4_GUID, NV_ENC_TEMPORAL_FILTER_LEVEL, NV_ENC_TUNING_INFO,
+    HEVC_3D_REFERENCE_DISPLAY_INFO, NV_ENC_BIT_DEPTH, NV_ENC_BUFFER_FORMAT, NV_ENC_CAPS,
+    NV_ENC_CODEC_AV1_GUID, NV_ENC_CODEC_H264_GUID, NV_ENC_CODEC_HEVC_GUID,
+    NV_ENC_HEVC_PROFILE_MAIN_GUID, NV_ENC_MULTI_PASS, NV_ENC_PARAMS_RC_MODE,
+    NV_ENC_PIC_PARAMS_HEVC, NV_ENC_PIC_TYPE, NV_ENC_PRESET_P4_GUID, NV_ENC_TEMPORAL_FILTER_LEVEL,
+    NV_ENC_TUNING_INFO,
 };
 use nvidia_video_codec_sdk::{
     CodecPictureParams, EncodeError, EncodePictureParams, Encoder, EncoderInitParams, EncoderInput,
@@ -348,6 +349,14 @@ fn encode_eyes(
         hevc.set_outputHevc3DReferenceDisplayInfo(u32::from(multiview));
         // Nothing MV-HEVC refuses: no temporal filter.
         hevc.tfLevel = NV_ENC_TEMPORAL_FILTER_LEVEL::NV_ENC_TEMPORAL_FILTER_LEVEL_0;
+        // What FFmpeg says outright where a preset leaves it unsaid: 4:2:0,
+        // eight bits in and out, one slice a picture, an IDR a GOP.
+        hevc.set_chromaFormatIDC(1);
+        hevc.inputBitDepth = NV_ENC_BIT_DEPTH::NV_ENC_BIT_DEPTH_8;
+        hevc.outputBitDepth = NV_ENC_BIT_DEPTH::NV_ENC_BIT_DEPTH_8;
+        hevc.sliceMode = 3;
+        hevc.sliceModeData = 1;
+        hevc.idrPeriod = config.gopLength;
     }
     let mut init = EncoderInitParams::new(guid, width as u32, height as u32);
     init.preset_guid(NV_ENC_PRESET_P4_GUID)
