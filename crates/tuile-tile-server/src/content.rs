@@ -33,14 +33,20 @@ pub struct StoreContent {
 
 impl StoreContent {
     pub fn new(store: Arc<TileStore>) -> Self {
-        Self { store, read_only: false }
+        Self {
+            store,
+            read_only: false,
+        }
     }
 
     /// The same store, read and never written: for an engine whose tiles
     /// are stored by someone else — a tile server it fetches them from, which
     /// keeps what it serves. Whatever is offered is declined.
     pub fn read_only(store: Arc<TileStore>) -> Self {
-        Self { store, read_only: true }
+        Self {
+            store,
+            read_only: true,
+        }
     }
 }
 
@@ -83,10 +89,14 @@ impl ContentStore for StoreContent {
         if self.read_only {
             return;
         }
-        let Some((layer, z, x, y)) = parse(key) else { return };
+        let Some((layer, z, x, y)) = parse(key) else {
+            return;
+        };
         let result = if is_absent(&value) {
             let absent = format!("{layer}{ABSENT_SUFFIX}");
-            self.store.put(&absent, z, x, y, Bytes::from_static(ABSENT_MARKER)).await
+            self.store
+                .put(&absent, z, x, y, Bytes::from_static(ABSENT_MARKER))
+                .await
         } else {
             self.store.put(layer, z, x, y, value).await
         };
@@ -102,8 +112,14 @@ mod tests {
 
     #[test]
     fn keys_are_the_engine_s_own() {
-        assert_eq!(parse("mesh/asset-1/12/4100/2900"), Some(("asset-1", 12, 4100, 2900)));
-        assert_eq!(parse("img/asset-2/14/8352/5968"), Some(("asset-2", 14, 8352, 5968)));
+        assert_eq!(
+            parse("mesh/asset-1/12/4100/2900"),
+            Some(("asset-1", 12, 4100, 2900))
+        );
+        assert_eq!(
+            parse("img/asset-2/14/8352/5968"),
+            Some(("asset-2", 14, 8352, 5968))
+        );
         assert_eq!(parse("other/asset-2/14/1/1"), None);
         assert_eq!(parse("img/asset-2/14/1"), None);
         assert_eq!(parse("img/asset-2/14/1/1/extra"), None);

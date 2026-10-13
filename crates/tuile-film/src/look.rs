@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-use glam::{DVec3, EulerRot, Quat, Vec3};
+use glam::{DVec3, Vec3};
 
 /// How imagery's stored values are read before they are lit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,8 +215,9 @@ impl Look {
 ///
 /// Blender's default order is XYZ, applied X first; a lamp shines along its
 /// local −Z, so the light comes from its local +Z.
+#[cfg(test)]
 pub fn blender_sun(euler_xyz: Vec3) -> Vec3 {
-    let r = Quat::from_euler(EulerRot::ZYX, euler_xyz.z, euler_xyz.y, euler_xyz.x);
+    let r = glam::Quat::from_euler(glam::EulerRot::ZYX, euler_xyz.z, euler_xyz.y, euler_xyz.x);
     (r * Vec3::Z).normalize()
 }
 

@@ -108,8 +108,8 @@ fn a_capture_with_another_exposure_and_white_balance_is_brought_back() {
         &params,
     );
     assert!(!found.same_source);
-    for k in 0..3 {
-        let wanted = (1.0 / fault[k]).log2();
+    for (k, f) in fault.iter().enumerate() {
+        let wanted = (1.0 / f).log2();
         assert!(
             (found.overall[k] - wanted).abs() < 0.03,
             "channel {k}: {} stops found, {wanted} applied",

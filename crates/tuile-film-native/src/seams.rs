@@ -277,21 +277,27 @@ fn content_of(tile: &TileIn<'_>) -> DecodedTileContent {
             positions: tile
                 .mesh
                 .positions
-                .chunks_exact(12)
+                .as_chunks::<12>()
+                .0
+                .iter()
                 .map(|b| [f(&b[0..4]), f(&b[4..8]), f(&b[8..12])])
                 .collect(),
             normals: None,
             uvs: (!tile.mesh.uvs.is_empty()).then(|| {
                 tile.mesh
                     .uvs
-                    .chunks_exact(8)
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
                     .map(|b| [f(&b[0..4]), f(&b[4..8])])
                     .collect()
             }),
             indices: tile
                 .mesh
                 .indices
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .take(tile.mesh.index_count as usize)
                 .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                 .collect(),

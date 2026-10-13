@@ -56,8 +56,14 @@ struct Format {
 }
 
 fn open(path: &Path) -> Result<(Mp4Reader<BufReader<File>>, u32, Format), ConcatError> {
-    let io = |source| ConcatError::Io { path: path.to_path_buf(), source };
-    let mp4 = |source| ConcatError::Mp4 { path: path.to_path_buf(), source };
+    let io = |source| ConcatError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let mp4 = |source| ConcatError::Mp4 {
+        path: path.to_path_buf(),
+        source,
+    };
     let file = File::open(path).map_err(io)?;
     let size = file.metadata().map_err(io)?.len();
     let reader = Mp4Reader::read_header(BufReader::new(file), size).map_err(mp4)?;
@@ -66,7 +72,9 @@ fn open(path: &Path) -> Result<(Mp4Reader<BufReader<File>>, u32, Format), Concat
         .iter()
         .find(|(_, t)| {
             matches!(t.track_type(), Ok(TrackType::Video))
-                && t.box_type().map(|b| b.to_string() == "avc1").unwrap_or(false)
+                && t.box_type()
+                    .map(|b| b.to_string() == "avc1")
+                    .unwrap_or(false)
         })
         .ok_or_else(|| ConcatError::NoVideo(path.to_path_buf()))?;
     let format = Format {
@@ -91,7 +99,10 @@ pub struct Probe {
 /// Frames and duration of a film's video track.
 pub fn probe(path: &Path) -> Result<Probe, ConcatError> {
     let (mut reader, id, format) = open(path)?;
-    let mp4 = |source| ConcatError::Mp4 { path: path.to_path_buf(), source };
+    let mp4 = |source| ConcatError::Mp4 {
+        path: path.to_path_buf(),
+        source,
+    };
     let count = reader.sample_count(id).map_err(mp4)?;
     let mut end = 0u64;
     // The track's end is its last sample's end in decode order; the header's
@@ -101,7 +112,10 @@ pub fn probe(path: &Path) -> Result<Probe, ConcatError> {
             end = last.start_time + u64::from(last.duration);
         }
     }
-    Ok(Probe { frames: u64::from(count), seconds: end as f64 / f64::from(format.timescale.max(1)) })
+    Ok(Probe {
+        frames: u64::from(count),
+        seconds: end as f64 / f64::from(format.timescale.max(1)),
+    })
 }
 
 /// Frames in a film: the sample count of its video track.
@@ -137,14 +151,25 @@ pub fn concat(segments: &[PathBuf], out: &Path) -> Result<u64, ConcatError> {
     let first = segments.first().ok_or(ConcatError::Empty)?;
     let (_, _, format) = open(first)?;
 
-    let out_io = |source| ConcatError::Io { path: out.to_path_buf(), source };
-    let out_mp4 = |source| ConcatError::Mp4 { path: out.to_path_buf(), source };
+    let out_io = |source| ConcatError::Io {
+        path: out.to_path_buf(),
+        source,
+    };
+    let out_mp4 = |source| ConcatError::Mp4 {
+        path: out.to_path_buf(),
+        source,
+    };
     let file = File::create(out).map_err(out_io)?;
     let brand = |s: &str| s.parse().map_err(out_mp4);
     let config = Mp4Config {
         major_brand: brand("isom")?,
         minor_version: 512,
-        compatible_brands: vec![brand("isom")?, brand("iso2")?, brand("avc1")?, brand("mp41")?],
+        compatible_brands: vec![
+            brand("isom")?,
+            brand("iso2")?,
+            brand("avc1")?,
+            brand("mp41")?,
+        ],
         timescale: 1000,
     };
     let mut writer = Mp4Writer::write_start(BufWriter::new(file), &config).map_err(out_mp4)?;
@@ -167,7 +192,10 @@ pub fn concat(segments: &[PathBuf], out: &Path) -> Result<u64, ConcatError> {
     let mut frames = 0u64;
     for path in segments {
         let (mut reader, id, this) = open(path)?;
-        let mismatch = |what| ConcatError::Mismatch { path: path.clone(), what };
+        let mismatch = |what| ConcatError::Mismatch {
+            path: path.clone(),
+            what,
+        };
         if (this.width, this.height) != (format.width, format.height) {
             return Err(mismatch("picture size"));
         }
@@ -180,7 +208,10 @@ pub fn concat(segments: &[PathBuf], out: &Path) -> Result<u64, ConcatError> {
         if this.pps != format.pps {
             return Err(mismatch("picture parameter set"));
         }
-        let mp4 = |source| ConcatError::Mp4 { path: path.clone(), source };
+        let mp4 = |source| ConcatError::Mp4 {
+            path: path.clone(),
+            source,
+        };
         let count = reader.sample_count(id).map_err(mp4)?;
         let mut end = 0u64;
         // Sample ids are 1-based in the format.
@@ -218,8 +249,14 @@ pub fn write_test_segment(
     sps: &[u8],
     tag: u8,
 ) -> Result<(), ConcatError> {
-    let io = |source| ConcatError::Io { path: path.to_path_buf(), source };
-    let mp4 = |source| ConcatError::Mp4 { path: path.to_path_buf(), source };
+    let io = |source| ConcatError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let mp4 = |source| ConcatError::Mp4 {
+        path: path.to_path_buf(),
+        source,
+    };
     let file = File::create(path).map_err(io)?;
     let brand = |s: &str| s.parse().map_err(mp4);
     let config = Mp4Config {
@@ -286,7 +323,11 @@ mod tests {
             assert_eq!(&s.bytes[5..], &[tag, index as u8], "sample {n} payload");
             assert_eq!(s.start_time, previous_end, "sample {n} is not contiguous");
             assert_eq!(s.is_sync, index % 10 == 0, "sample {n} sync flag");
-            assert_eq!(s.rendering_offset, if index % 3 == 1 { 512 } else { 0 }, "sample {n} cts");
+            assert_eq!(
+                s.rendering_offset,
+                if index % 3 == 1 { 512 } else { 0 },
+                "sample {n} cts"
+            );
             previous_end = s.start_time + u64::from(s.duration);
         }
     }
@@ -312,6 +353,15 @@ mod tests {
         write_test_segment(&a, 3, SPS, 1).expect("a");
         write_test_segment(&b, 3, &[0x67, 0x42, 0x00, 0x1e], 2).expect("b");
         let err = concat(&[a, b], &dir.path().join("f.mp4")).expect_err("must refuse");
-        assert!(matches!(err, ConcatError::Mismatch { what: "sequence parameter set", .. }), "{err}");
+        assert!(
+            matches!(
+                err,
+                ConcatError::Mismatch {
+                    what: "sequence parameter set",
+                    ..
+                }
+            ),
+            "{err}"
+        );
     }
 }

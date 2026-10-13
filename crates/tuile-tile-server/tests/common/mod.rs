@@ -30,7 +30,10 @@ pub const X0: u32 = ZONE_X * ZONE_SIDE;
 pub const Y0: u32 = ZONE_Y * ZONE_SIDE;
 
 pub fn zone() -> tuile_tile_server::Zone {
-    tuile_tile_server::Zone::Cell { x: ZONE_X, y: ZONE_Y }
+    tuile_tile_server::Zone::Cell {
+        x: ZONE_X,
+        y: ZONE_Y,
+    }
 }
 
 /// The `i`-th tile of the test zone at [`LEVEL`], row by row, wrapping.
@@ -123,17 +126,26 @@ pub fn body(level: u8, x: u32, y: u32, version: u32) -> Bytes {
     let mut v = format!("tile {level}/{x}/{y} v{version} ").into_bytes();
     // Vary the length, so no two tiles are accidentally the same size.
     const LENGTH_SPREAD: u32 = 97;
-    v.extend(std::iter::repeat_n(b'.', ((x ^ y) % LENGTH_SPREAD) as usize));
+    v.extend(std::iter::repeat_n(
+        b'.',
+        ((x ^ y) % LENGTH_SPREAD) as usize,
+    ));
     Bytes::from(v)
 }
 
 /// Every archive object under a prefix.
 pub async fn archives(objects: &dyn ObjectStore, prefix: &str) -> Vec<String> {
     use futures_util::TryStreamExt;
-    let listed: Vec<object_store::ObjectMeta> =
-        objects.list(Some(&object_store::path::Path::from(prefix))).try_collect().await.expect("list");
-    let mut keys: Vec<String> =
-        listed.into_iter().map(|m| m.location.to_string()).filter(|k| k.ends_with(".pmtiles")).collect();
+    let listed: Vec<object_store::ObjectMeta> = objects
+        .list(Some(&object_store::path::Path::from(prefix)))
+        .try_collect()
+        .await
+        .expect("list");
+    let mut keys: Vec<String> = listed
+        .into_iter()
+        .map(|m| m.location.to_string())
+        .filter(|k| k.ends_with(".pmtiles"))
+        .collect();
     keys.sort();
     keys
 }
@@ -149,7 +161,11 @@ pub struct Counting {
 
 impl Counting {
     pub fn over(inner: Arc<dyn ObjectStore>) -> Arc<Self> {
-        Arc::new(Self { inner, gets: AtomicU64::new(0), manifest_gets: AtomicU64::new(0) })
+        Arc::new(Self {
+            inner,
+            gets: AtomicU64::new(0),
+            manifest_gets: AtomicU64::new(0),
+        })
     }
     pub fn gets(&self) -> u64 {
         self.gets.load(Ordering::SeqCst)
@@ -199,7 +215,11 @@ impl ObjectStore for Counting {
         self.inner.get_opts(location, options).await
     }
 
-    async fn get_ranges(&self, location: &OsPath, ranges: &[std::ops::Range<u64>]) -> object_store::Result<Vec<Bytes>> {
+    async fn get_ranges(
+        &self,
+        location: &OsPath,
+        ranges: &[std::ops::Range<u64>],
+    ) -> object_store::Result<Vec<Bytes>> {
         self.gets.fetch_add(1, Ordering::SeqCst);
         self.inner.get_ranges(location, ranges).await
     }
@@ -212,15 +232,27 @@ impl ObjectStore for Counting {
         self.inner.list(prefix)
     }
 
-    fn list_with_offset(&self, prefix: Option<&OsPath>, offset: &OsPath) -> OsStream<object_store::ObjectMeta> {
+    fn list_with_offset(
+        &self,
+        prefix: Option<&OsPath>,
+        offset: &OsPath,
+    ) -> OsStream<object_store::ObjectMeta> {
         self.inner.list_with_offset(prefix, offset)
     }
 
-    async fn list_with_delimiter(&self, prefix: Option<&OsPath>) -> object_store::Result<object_store::ListResult> {
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&OsPath>,
+    ) -> object_store::Result<object_store::ListResult> {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy_opts(&self, from: &OsPath, to: &OsPath, options: object_store::CopyOptions) -> object_store::Result<()> {
+    async fn copy_opts(
+        &self,
+        from: &OsPath,
+        to: &OsPath,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
         self.inner.copy_opts(from, to, options).await
     }
 }

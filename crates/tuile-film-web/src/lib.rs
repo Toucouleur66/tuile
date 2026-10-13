@@ -4,11 +4,11 @@
 //! A pre-baked film, rendered in a browser — the page and its workers, in
 //! Rust.
 //!
-//! [`start_page`] is the page: it lists what the buckets hold, shows a pack's
+//! `start_page` is the page: it lists what the buckets hold, shows a pack's
 //! camera and tiles, and renders a scene by handing contiguous slices of its
 //! frames to workers and joining what they send back into one mp4.
 //!
-//! [`start_slice`] is a worker: its own WebGPU device and an
+//! `start_slice` is a worker: its own WebGPU device and an
 //! `OffscreenCanvas` it presents every frame to, and an encoder.
 //!
 //! Encoding is progressive: the browser's H.264 encoder (WebCodecs) when it

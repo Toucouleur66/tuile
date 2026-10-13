@@ -211,7 +211,11 @@ impl TileService {
         Self::with_config(store, upstreams, ServiceConfig::default())
     }
 
-    pub fn with_config(store: Arc<TileStore>, upstreams: HashMap<String, Arc<dyn Upstream>>, cfg: ServiceConfig) -> Self {
+    pub fn with_config(
+        store: Arc<TileStore>,
+        upstreams: HashMap<String, Arc<dyn Upstream>>,
+        cfg: ServiceConfig,
+    ) -> Self {
         Self {
             store,
             upstreams,
@@ -245,10 +249,13 @@ impl TileService {
     /// is written, and nothing is asked of a source.
     pub fn learn(&self, layer: &str, level: u8, x: u32, y: u32, tile: SharedTile) {
         let key = (layer.to_string(), level, x, y);
-        self.hot_put(key, tile.bytes.map(|bytes| {
-            let etag = etag_of(&bytes);
-            (bytes, etag)
-        }));
+        self.hot_put(
+            key,
+            tile.bytes.map(|bytes| {
+                let etag = etag_of(&bytes);
+                (bytes, etag)
+            }),
+        );
         self.counters.learned.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -279,17 +286,31 @@ impl TileService {
     }
 
     /// A tile, or `None` when neither the store nor the source has it.
-    pub async fn tile(&self, layer: &str, level: u8, x: u32, y: u32) -> Result<Option<TileResponse>, ServiceError> {
+    pub async fn tile(
+        &self,
+        layer: &str,
+        level: u8,
+        x: u32,
+        y: u32,
+    ) -> Result<Option<TileResponse>, ServiceError> {
         let l = self.store.layer(layer)?;
         let content_type = l.content_type.clone();
-        l.grid.check(level, x, y).map_err(|e| ServiceError::OutOfGrid(e.to_string()))?;
+        l.grid
+            .check(level, x, y)
+            .map_err(|e| ServiceError::OutOfGrid(e.to_string()))?;
         let key: Key = (layer.to_string(), level, x, y);
 
         if let Some(hot) = self.hot_get(&key) {
             return Ok(match hot {
                 Some((bytes, etag)) => {
                     self.counters.memory.fetch_add(1, Ordering::Relaxed);
-                    Some(TileResponse { bytes, content_type, etag, hit: true, source: Source::Memory })
+                    Some(TileResponse {
+                        bytes,
+                        content_type,
+                        etag,
+                        hit: true,
+                        source: Source::Memory,
+                    })
                 }
                 None => {
                     self.counters.absent.fetch_add(1, Ordering::Relaxed);
@@ -302,7 +323,10 @@ impl TileService {
         // second lookup costs no extra wait.
         let absence = format!("{layer}{ABSENT_SUFFIX}");
         let (stored, absent) = if self.store.layer(&absence).is_ok() {
-            let (t, a) = futures_util::join!(self.store.get(layer, level, x, y), self.store.get(&absence, level, x, y));
+            let (t, a) = futures_util::join!(
+                self.store.get(layer, level, x, y),
+                self.store.get(&absence, level, x, y)
+            );
             // A failed absence lookup is only a lost shortcut.
             (t?, a.ok().flatten().is_some())
         } else {
@@ -312,7 +336,13 @@ impl TileService {
             self.counters.store.fetch_add(1, Ordering::Relaxed);
             let etag = etag_of(&bytes);
             self.hot_put(key, Some((bytes.clone(), etag.clone())));
-            return Ok(Some(TileResponse { bytes, content_type, etag, hit: true, source: Source::Store }));
+            return Ok(Some(TileResponse {
+                bytes,
+                content_type,
+                etag,
+                hit: true,
+                source: Source::Store,
+            }));
         }
         if absent {
             self.counters.absent.fetch_add(1, Ordering::Relaxed);
@@ -324,13 +354,23 @@ impl TileService {
         // A tile another instance fetched is one the source was not asked
         // for: a hit, from here.
         let hit = source == Source::Shared;
-        let counter = if hit { &self.counters.shared } else { &self.counters.upstream };
+        let counter = if hit {
+            &self.counters.shared
+        } else {
+            &self.counters.upstream
+        };
         counter.fetch_add(1, Ordering::Relaxed);
         match fetched {
             Some(bytes) => {
                 let etag = etag_of(&bytes);
                 self.hot_put(key, Some((bytes.clone(), etag.clone())));
-                Ok(Some(TileResponse { bytes, content_type, etag, hit, source }))
+                Ok(Some(TileResponse {
+                    bytes,
+                    content_type,
+                    etag,
+                    hit,
+                    source,
+                }))
             }
             None => {
                 self.hot_put(key, None);
@@ -359,9 +399,18 @@ impl TileService {
         if self.cfg.hot_bytes == 0 {
             return;
         }
-        let weight = tile.as_ref().map_or(ABSENCE_WEIGHT, |(b, _)| b.len() as u64 + ABSENCE_WEIGHT);
+        let weight = tile
+            .as_ref()
+            .map_or(ABSENCE_WEIGHT, |(b, _)| b.len() as u64 + ABSENCE_WEIGHT);
         if let Ok(mut hot) = self.hot.lock() {
-            hot.insert(key, Hot { tile, at: Instant::now() }, weight);
+            hot.insert(
+                key,
+                Hot {
+                    tile,
+                    at: Instant::now(),
+                },
+                weight,
+            );
         }
     }
 
@@ -457,13 +506,30 @@ async fn fetch(
     k: &Key,
 ) -> Result<Fetched, ServiceError> {
     metrics::counter!("tuile_tiles_upstream_total", "layer" => k.0.clone()).increment(1);
-    let got = upstream.fetch(k.1, k.2, k.3).await.map_err(|e| ServiceError::Upstream(e.0))?;
+    let got = upstream
+        .fetch(k.1, k.2, k.3)
+        .await
+        .map_err(|e| ServiceError::Upstream(e.0))?;
     let fetched = store.now();
-    let fetched_ms = fetched.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    let fetched_ms = fetched
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
     if let Some(sink) = sink {
         // Emitted, and no more: the tile is the sink's to share and to store.
         // Not kept is not an error — the tile was fetched and is served.
-        let emitted = sink.emit(&k.0, k.1, k.2, k.3, &SharedTile { bytes: got.clone(), fetched_ms }).await;
+        let emitted = sink
+            .emit(
+                &k.0,
+                k.1,
+                k.2,
+                k.3,
+                &SharedTile {
+                    bytes: got.clone(),
+                    fetched_ms,
+                },
+            )
+            .await;
         let outcome = match emitted {
             Emitted::Kept => "kept",
             Emitted::NotKept => "not_kept",
@@ -474,16 +540,40 @@ async fn fetch(
     // Shared first: whoever waits for it is waiting now, and the store's own
     // write may take an upload.
     if let Some(shared) = shared {
-        shared.put(&k.0, k.1, k.2, k.3, &SharedTile { bytes: got.clone(), fetched_ms }).await;
+        shared
+            .put(
+                &k.0,
+                k.1,
+                k.2,
+                k.3,
+                &SharedTile {
+                    bytes: got.clone(),
+                    fetched_ms,
+                },
+            )
+            .await;
     }
     match &got {
-        Some(bytes) => store.put_fetched(&k.0, k.1, k.2, k.3, bytes.clone(), fetched).await?,
+        Some(bytes) => {
+            store
+                .put_fetched(&k.0, k.1, k.2, k.3, bytes.clone(), fetched)
+                .await?
+        }
         None => {
             // The source's own "no such tile" is data: remembered in the
             // absence sibling when the layer has one.
             let absence = format!("{}{ABSENT_SUFFIX}", k.0);
             if store.layer(&absence).is_ok() {
-                store.put_fetched(&absence, k.1, k.2, k.3, Bytes::from_static(ABSENT_MARKER), fetched).await?;
+                store
+                    .put_fetched(
+                        &absence,
+                        k.1,
+                        k.2,
+                        k.3,
+                        Bytes::from_static(ABSENT_MARKER),
+                        fetched,
+                    )
+                    .await?;
             }
         }
     }

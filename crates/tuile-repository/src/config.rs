@@ -238,7 +238,8 @@ mod tests {
     #[test]
     fn a_tile_store_served_by_someone_else_is_named_by_its_address() {
         let project = "[[project]]\nname = \"p\"\nbucket = \"b\"\nscenes = [\"packs\"]\n";
-        let tiles = |body: &str| Config::parse(&format!("{project}[tiles]\n{body}")).map(|c| c.tiles);
+        let tiles =
+            |body: &str| Config::parse(&format!("{project}[tiles]\n{body}")).map(|c| c.tiles);
         assert_eq!(
             tiles("remote = \"https://tiles.example/root/\"\nheader = \"X-Token\""),
             Ok(Some(Place::Remote {

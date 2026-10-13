@@ -167,7 +167,7 @@ impl Grade {
             return;
         }
         let table: [f32; 256] = std::array::from_fn(|v| linear_of_stored(v as f32));
-        for texel in rgba.chunks_exact_mut(4) {
+        for texel in rgba.as_chunks_mut::<4>().0 {
             let graded = self.apply([
                 table[texel[0] as usize],
                 table[texel[1] as usize],
@@ -305,6 +305,10 @@ fn shown(steps: &[f32]) -> (f32, f32) {
 }
 
 /// Solves `a · x = b` for eight unknowns, in place. `None` if it cannot.
+#[allow(
+    clippy::needless_range_loop,
+    reason = "row operations read best indexed"
+)]
 fn solved(mut a: [[f32; 8]; 8], mut b: [f32; 8]) -> Option<[f32; 8]> {
     for col in 0..8 {
         let pivot = (col..8).max_by(|x, y| a[*x][col].abs().total_cmp(&a[*y][col].abs()))?;
@@ -614,7 +618,9 @@ impl LevelGrades {
                 let mut at = Vec::new();
                 steps(&grade, &cells, &mut at);
                 let worst: Vec<f32> = at
-                    .chunks_exact(3)
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
                     .map(|c| c.iter().fold(0.0f32, |m, r| m.max(r.abs())))
                     .collect();
                 let mut sorted = worst.clone();

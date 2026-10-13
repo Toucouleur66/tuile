@@ -81,7 +81,11 @@ pub fn tape_digest(path: Option<&Path>) -> std::io::Result<Option<String>> {
 }
 
 fn hex16(digest: &[u8]) -> String {
-    digest.iter().map(|b| format!("{b:02x}")).collect::<String>()[..16].to_string()
+    digest
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()[..16]
+        .to_string()
 }
 
 /// Where the pack will be filed, computed BEFORE anything is launched, from
@@ -106,7 +110,10 @@ pub fn pack_key(scene: &SceneArgs, frames: &str) -> std::io::Result<String> {
     if let Some(tape) = tape_digest(scene.tape.as_deref())? {
         canonical.push_str(&format!("\ntape={tape}"));
     }
-    Ok(format!("packs/{}/{first}-{last}.tuilepack", hex16(&Sha256::digest(canonical.as_bytes()))))
+    Ok(format!(
+        "packs/{}/{first}-{last}.tuilepack",
+        hex16(&Sha256::digest(canonical.as_bytes()))
+    ))
 }
 
 /// The cadence a trajectory describes: `pyrenees` carries it second, the
@@ -145,9 +152,13 @@ pub fn frames_of(trajectory: &str) -> Option<u64> {
 /// tape has no such poses), short is legitimate but said — it is the only
 /// difference between a slice on purpose and an amputated film.
 pub fn check_frames(trajectory: &str, frames: &str) -> Result<Option<String>> {
-    let Some(expected) = frames_of(trajectory) else { return Ok(None) };
+    let Some(expected) = frames_of(trajectory) else {
+        return Ok(None);
+    };
     let last = frames.split_once(':').map(|(_, b)| b).unwrap_or(frames);
-    let Ok(last) = last.parse::<u64>() else { return Ok(None) };
+    let Ok(last) = last.parse::<u64>() else {
+        return Ok(None);
+    };
     if last > expected {
         return Err(LaunchError::Refused(format!(
             "--frames goes to {last} and the trajectory only describes {expected}: the tape has no such poses"
@@ -176,14 +187,19 @@ pub fn ion_token() -> Result<String> {
     while let Some(d) = dir {
         let dotenv = d.join(".env");
         if let Ok(text) = std::fs::read_to_string(&dotenv) {
-            if let Some(t) = text.lines().find_map(|l| l.strip_prefix("CESIUM_ION_TOKEN=")) {
+            if let Some(t) = text
+                .lines()
+                .find_map(|l| l.strip_prefix("CESIUM_ION_TOKEN="))
+            {
                 return Ok(t.trim().to_string());
             }
             break;
         }
         dir = d.parent().map(Path::to_path_buf);
     }
-    Err(LaunchError::Refused("CESIUM_ION_TOKEN not found (env or .env) — hydra does not bake without it".into()))
+    Err(LaunchError::Refused(
+        "CESIUM_ION_TOKEN not found (env or .env) — hydra does not bake without it".into(),
+    ))
 }
 
 /// The engine checkout's commit, and whether it was dirty — without which a
@@ -209,8 +225,15 @@ pub fn git_state() -> serde_json::Value {
 /// random suffix separating two runs of the same second.
 pub fn run_id(git: &serde_json::Value) -> String {
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
-    let sha = git["short"].as_str().filter(|s| !s.is_empty()).unwrap_or("nogit");
-    let dirty = if git["dirty"].as_bool() == Some(true) { "-dirty" } else { "" };
+    let sha = git["short"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("nogit");
+    let dirty = if git["dirty"].as_bool() == Some(true) {
+        "-dirty"
+    } else {
+        ""
+    };
     format!("{stamp}-{sha}{dirty}-{:04x}", rand::random::<u16>())
 }
 
@@ -230,8 +253,22 @@ pub fn bake_env(
         (s("JOB_VIEWPORT"), scene.viewport.clone()),
         (s("JOB_SSE"), fmt_float(scene.sse)),
         (s("TUILE_IMAGERY_BOOST"), scene.imagery_boost.to_string()),
-        (s("JOB_IMAGERY_ASSET"), if scene.imagery != 0 { scene.imagery.to_string() } else { String::new() }),
-        (s("JOB_TERRAIN_ASSET"), if scene.terrain != 0 { scene.terrain.to_string() } else { String::new() }),
+        (
+            s("JOB_IMAGERY_ASSET"),
+            if scene.imagery != 0 {
+                scene.imagery.to_string()
+            } else {
+                String::new()
+            },
+        ),
+        (
+            s("JOB_TERRAIN_ASSET"),
+            if scene.terrain != 0 {
+                scene.terrain.to_string()
+            } else {
+                String::new()
+            },
+        ),
         // The pack, its tape (.mcap) and its scene digest (.scene) go under
         // this key; the job puts them there.
         (s("JOB_PACK_KEY"), s(pack_key)),
@@ -248,7 +285,12 @@ pub fn bake_env(
 /// The OptiX cache key: the card AND the image digest, so changed kernels or
 /// another card never reuse a stale cache.
 pub fn optix_key(digest: Option<&str>) -> String {
-    let d: String = digest.unwrap_or("nodigest").replace(':', "-").chars().take(19).collect();
+    let d: String = digest
+        .unwrap_or("nodigest")
+        .replace(':', "-")
+        .chars()
+        .take(19)
+        .collect();
     format!("cache/optix/nvidia-l4-{d}.tar.gz")
 }
 
@@ -276,9 +318,14 @@ fn manifest(
 /// Job A: bake `--trajectory` into a pack, deposited by the job itself.
 pub async fn bake(farm: &Farm, scene: &SceneArgs, common: &CommonArgs) -> Result<String> {
     if scene.trajectory.is_empty() {
-        return Err(LaunchError::Refused("bake wants --trajectory (e.g. orbit:1440:2.17:42.52:8000:5000)".into()));
+        return Err(LaunchError::Refused(
+            "bake wants --trajectory (e.g. orbit:1440:2.17:42.52:8000:5000)".into(),
+        ));
     }
-    let frames = common.frames.clone().ok_or_else(|| LaunchError::Refused("--frames A:B is required".into()))?;
+    let frames = common
+        .frames
+        .clone()
+        .ok_or_else(|| LaunchError::Refused("--frames A:B is required".into()))?;
     if let Some(note) = check_frames(&scene.trajectory, &frames)? {
         println!("{note}");
     }
@@ -298,18 +345,40 @@ pub async fn bake(farm: &Farm, scene: &SceneArgs, common: &CommonArgs) -> Result
     }
     let mut env = bake_env(scene, &frames, &ion, &key, &prefix, tape_key.as_deref());
     env.extend(common.extra_env()?);
-    farm.put_json(&format!("{prefix}/config.json"), &manifest(&run, &git, "bake", &env, serde_json::json!({"pack_key": key}))).await?;
+    farm.put_json(
+        &format!("{prefix}/config.json"),
+        &manifest(
+            &run,
+            &git,
+            "bake",
+            &env,
+            serde_json::json!({"pack_key": key}),
+        ),
+    )
+    .await?;
     println!("archive: {prefix}/");
     println!("pack:    {key}");
-    let launch = Launch { job: BAKE_JOB.into(), env, tasks: 1 };
+    let launch = Launch {
+        job: BAKE_JOB.into(),
+        env,
+        tasks: 1,
+    };
     farm.launch_and_follow(&launch, common, None).await?;
     println!("render with: --pack {key}");
     Ok(key)
 }
 
 /// Job B, baking first when a hydra render has no pack.
-pub async fn render(farm: &Farm, scene: &SceneArgs, common: &CommonArgs, videos: &Path) -> Result<()> {
-    let frames = common.frames.clone().ok_or_else(|| LaunchError::Refused("--frames A:B is required".into()))?;
+pub async fn render(
+    farm: &Farm,
+    scene: &SceneArgs,
+    common: &CommonArgs,
+    videos: &Path,
+) -> Result<()> {
+    let frames = common
+        .frames
+        .clone()
+        .ok_or_else(|| LaunchError::Refused("--frames A:B is required".into()))?;
     if !scene.trajectory.is_empty() {
         if let Some(note) = check_frames(&scene.trajectory, &frames)? {
             println!("{note}");
@@ -318,23 +387,37 @@ pub async fn render(farm: &Farm, scene: &SceneArgs, common: &CommonArgs, videos:
     let mut scene = scene.clone();
     if scene.engine == "hydra" && scene.pack.is_empty() {
         if scene.trajectory.is_empty() {
-            return Err(LaunchError::Refused("a hydra render wants --trajectory (the scene) or --pack (a baked one)".into()));
+            return Err(LaunchError::Refused(
+                "a hydra render wants --trajectory (the scene) or --pack (a baked one)".into(),
+            ));
         }
         let key = pack_key(&scene, &frames).map_err(|e| LaunchError::Refused(e.to_string()))?;
         if farm.store.exists(&key).await? {
             println!("pack already baked: {key}");
         } else {
             println!("no pack, baking first: {key}");
-            let bake_common = CommonArgs { attach: None, no_watch: false, dry_run: false, ..common.clone() };
+            let bake_common = CommonArgs {
+                attach: None,
+                no_watch: false,
+                dry_run: false,
+                ..common.clone()
+            };
             bake(farm, &scene, &bake_common).await?;
         }
         scene.pack = key;
     }
     if scene.engine == "hydra" && scene.scene.is_empty() && !scene.pack.is_empty() {
-        scene.scene = farm.read_text(&format!("{}.scene", scene.pack)).await?.unwrap_or_default().trim().to_string();
+        scene.scene = farm
+            .read_text(&format!("{}.scene", scene.pack))
+            .await?
+            .unwrap_or_default()
+            .trim()
+            .to_string();
     }
     if scene.stage.is_none() && scene.stage_key.is_empty() && scene.trajectory.is_empty() {
-        return Err(LaunchError::Refused("--stage, --stage-key or --trajectory is required".into()));
+        return Err(LaunchError::Refused(
+            "--stage, --stage-key or --trajectory is required".into(),
+        ));
     }
 
     let s = |v: &str| v.to_string();
@@ -348,10 +431,15 @@ pub async fn render(farm: &Farm, scene: &SceneArgs, common: &CommonArgs, videos:
     ];
     env.extend(common.render_env(128, 60));
     if let Some(stage) = &scene.stage {
-        let raw = std::fs::read(stage).map_err(|e| LaunchError::Refused(format!("{}: {e}", stage.display())))?;
+        let raw = std::fs::read(stage)
+            .map_err(|e| LaunchError::Refused(format!("{}: {e}", stage.display())))?;
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        gz.write_all(&raw).map_err(|e| LaunchError::Refused(e.to_string()))?;
-        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, gz.finish().unwrap_or_default());
+        gz.write_all(&raw)
+            .map_err(|e| LaunchError::Refused(e.to_string()))?;
+        let b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            gz.finish().unwrap_or_default(),
+        );
         if b64.len() > 48_000 {
             return Err(LaunchError::Refused(format!(
                 "stage too large for an environment ({} bytes in base64) — deposit it and pass --stage-key",
@@ -404,21 +492,35 @@ pub async fn render(farm: &Farm, scene: &SceneArgs, common: &CommonArgs, videos:
     let tasks = common.tasks.unwrap_or(1);
     farm.put_json(
         &format!("{prefix}/config.json"),
-        &manifest(&run, &git, "render", &env, serde_json::json!({
-            "image": image,
-            "image_digest": digest,
-            "backend": {"job": RENDER_JOB, "tasks": tasks},
-        })),
+        &manifest(
+            &run,
+            &git,
+            "render",
+            &env,
+            serde_json::json!({
+                "image": image,
+                "image_digest": digest,
+                "backend": {"job": RENDER_JOB, "tasks": tasks},
+            }),
+        ),
     )
     .await?;
     println!("archive: {prefix}/");
-    let out = common.out.clone().unwrap_or_else(|| videos.join(format!("{run}.mp4")));
+    let out = common
+        .out
+        .clone()
+        .unwrap_or_else(|| videos.join(format!("{run}.mp4")));
     if let Some(parent) = out.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let film = format!("{prefix}/render.mp4");
-    let launch = Launch { job: RENDER_JOB.into(), env, tasks };
-    farm.launch_and_follow(&launch, common, Some((&film, &out))).await
+    let launch = Launch {
+        job: RENDER_JOB.into(),
+        env,
+        tasks,
+    };
+    farm.launch_and_follow(&launch, common, Some((&film, &out)))
+        .await
 }
 
 #[cfg(test)]
@@ -441,24 +543,51 @@ mod tests {
         // Baked on 23 September 2026 by the Python launcher, then rendered:
         // `packs/226d226cfaad2acb/1-4.tuilepack` is in the bucket. A key that
         // drifts by one character makes every baked pack unreachable.
-        let s = scene(&["--trajectory", "orbit:4:2.17:42.52:8000:5000", "--viewport", "960x540", "--sse", "16"]);
-        assert_eq!(pack_key(&s, "1:4").expect("key"), "packs/226d226cfaad2acb/1-4.tuilepack");
+        let s = scene(&[
+            "--trajectory",
+            "orbit:4:2.17:42.52:8000:5000",
+            "--viewport",
+            "960x540",
+            "--sse",
+            "16",
+        ]);
+        assert_eq!(
+            pack_key(&s, "1:4").expect("key"),
+            "packs/226d226cfaad2acb/1-4.tuilepack"
+        );
     }
 
     #[test]
     fn a_supplied_tape_renames_the_pack_and_only_then() {
-        let plain = scene(&["--trajectory", "orbit:4:2.17:42.52:8000:5000", "--viewport", "960x540", "--sse", "16"]);
+        let plain = scene(&[
+            "--trajectory",
+            "orbit:4:2.17:42.52:8000:5000",
+            "--viewport",
+            "960x540",
+            "--sse",
+            "16",
+        ]);
         let dir = tempfile::tempdir().expect("tempdir");
         let tape = dir.path().join("t.mcap");
         std::fs::write(&tape, b"poses").expect("write");
         let mut taped = plain.clone();
         taped.tape = Some(tape);
-        assert_ne!(pack_key(&plain, "1:4").expect("a"), pack_key(&taped, "1:4").expect("b"));
+        assert_ne!(
+            pack_key(&plain, "1:4").expect("a"),
+            pack_key(&taped, "1:4").expect("b")
+        );
     }
 
     #[test]
     fn every_baking_parameter_changes_the_key_and_nothing_else_does() {
-        let base = scene(&["--trajectory", "orbit:4:2.17:42.52:8000:5000", "--viewport", "960x540", "--sse", "16"]);
+        let base = scene(&[
+            "--trajectory",
+            "orbit:4:2.17:42.52:8000:5000",
+            "--viewport",
+            "960x540",
+            "--sse",
+            "16",
+        ]);
         let key = |s: &SceneArgs| pack_key(s, "1:4").expect("key");
         let reference = key(&base);
         // The same parameters always give the same key.
@@ -474,7 +603,11 @@ mod tests {
         for (i, change) in changes.iter().enumerate() {
             let mut s = base.clone();
             change(&mut s);
-            assert_ne!(reference, key(&s), "bake parameter #{i} did not change the key");
+            assert_ne!(
+                reference,
+                key(&s),
+                "bake parameter #{i} did not change the key"
+            );
         }
         // Render-only settings are not bake parameters.
         let mut render_only = base.clone();
@@ -490,13 +623,21 @@ mod tests {
         let a = pack_key(&s, "1:4").expect("a");
         let b = pack_key(&s, "1:2").expect("b");
         assert!(a.ends_with("/1-4.tuilepack") && b.ends_with("/1-2.tuilepack"));
-        assert_ne!(a.split('/').nth(1), b.split('/').nth(1), "a slice is a different bake");
+        assert_ne!(
+            a.split('/').nth(1),
+            b.split('/').nth(1),
+            "a slice is a different bake"
+        );
     }
 
     #[test]
     fn two_identical_tapes_are_one_bake() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (t1, t2, t3) = (dir.path().join("a.mcap"), dir.path().join("b.mcap"), dir.path().join("c.mcap"));
+        let (t1, t2, t3) = (
+            dir.path().join("a.mcap"),
+            dir.path().join("b.mcap"),
+            dir.path().join("c.mcap"),
+        );
         std::fs::write(&t1, b"poses").expect("w");
         std::fs::write(&t2, b"poses").expect("w");
         std::fs::write(&t3, b"other").expect("w");
@@ -515,7 +656,10 @@ mod tests {
         let dirty = serde_json::json!({"short": "af536a2", "dirty": true});
         let none = serde_json::json!({});
         let id = run_id(&clean);
-        assert!(id.len() > 16 && id.as_bytes()[8] == b'T' && id.contains("Z-af536a2-"), "{id}");
+        assert!(
+            id.len() > 16 && id.as_bytes()[8] == b'T' && id.contains("Z-af536a2-"),
+            "{id}"
+        );
         assert!(run_id(&dirty).contains("-af536a2-dirty-"));
         assert!(run_id(&none).contains("-nogit-"));
     }
@@ -532,14 +676,25 @@ mod tests {
     #[test]
     fn frames_past_the_tape_are_refused_and_a_slice_is_said() {
         assert!(check_frames("orbit:4:2.17:42.52:8000:5000", "1:5").is_err());
-        assert!(check_frames("orbit:4:2.17:42.52:8000:5000", "1:2").expect("ok").is_some());
-        assert!(check_frames("orbit:4:2.17:42.52:8000:5000", "1:4").expect("ok").is_none());
+        assert!(check_frames("orbit:4:2.17:42.52:8000:5000", "1:2")
+            .expect("ok")
+            .is_some());
+        assert!(check_frames("orbit:4:2.17:42.52:8000:5000", "1:4")
+            .expect("ok")
+            .is_none());
     }
 
     #[test]
     fn the_bake_is_told_where_to_put_everything() {
         let s = scene(&["--trajectory", "pyrenees:2:60:50000:0.40"]);
-        let env = bake_env(&s, "1:7200", "tok", "packs/k/1-7200.tuilepack", "renders/r1", None);
+        let env = bake_env(
+            &s,
+            "1:7200",
+            "tok",
+            "packs/k/1-7200.tuilepack",
+            "renders/r1",
+            None,
+        );
         let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
         assert_eq!(get("JOB_PACK_KEY"), Some("packs/k/1-7200.tuilepack"));
         assert_eq!(get("JOB_RUN_PREFIX"), Some("renders/r1"));
@@ -550,7 +705,13 @@ mod tests {
 
     #[test]
     fn the_optix_key_follows_the_image() {
-        assert_ne!(optix_key(Some("sha256:aaaa")), optix_key(Some("sha256:bbbb")));
-        assert_eq!(optix_key(Some("sha256:5e8edf878e6a708330f5")), "cache/optix/nvidia-l4-sha256-5e8edf878e6a.tar.gz");
+        assert_ne!(
+            optix_key(Some("sha256:aaaa")),
+            optix_key(Some("sha256:bbbb"))
+        );
+        assert_eq!(
+            optix_key(Some("sha256:5e8edf878e6a708330f5")),
+            "cache/optix/nvidia-l4-sha256-5e8edf878e6a.tar.gz"
+        );
     }
 }

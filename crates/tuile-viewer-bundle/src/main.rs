@@ -265,12 +265,9 @@ fn sign_and_verify(bundle: &Bundle, app: &Path) -> anyhow::Result<()> {
 
 fn build_the_viewer(package: &str) -> anyhow::Result<PathBuf> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    run(Command::new(cargo).current_dir(workspace()).args([
-        "build",
-        "--release",
-        "-p",
-        package,
-    ]))?;
+    run(Command::new(cargo)
+        .current_dir(workspace())
+        .args(["build", "--release", "-p", package]))?;
     let target = std::env::var_os("CARGO_TARGET_DIR")
         .map_or_else(|| workspace().join("target"), PathBuf::from);
     Ok(target.join("release").join(package))
@@ -467,7 +464,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let binary = dir.path().join("viewer");
         std::fs::write(&binary, b"not really an executable").expect("a stand-in binary");
-        let app = assemble(&Bundle::default(), &binary, &icon::draw(64), dir.path()).expect("the bundle");
+        let app =
+            assemble(&Bundle::default(), &binary, &icon::draw(64), dir.path()).expect("the bundle");
 
         assert_eq!(app, dir.path().join("Tuile.app"));
         let contents = app.join("Contents");

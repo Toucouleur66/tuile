@@ -444,10 +444,10 @@ mod tests {
             }),
         };
         let line = uncertain.line().expect("a line");
-        for band in 0..3 {
+        for (band, wanted) in GAIN.iter().enumerate() {
             assert!(line.agreement[band] < 0.95, "{line:?}");
             assert!(
-                (line.gain[band] / GAIN[band]).log2().abs() < 0.12,
+                (line.gain[band] / wanted).log2().abs() < 0.12,
                 "band {band}: {line:?}"
             );
         }

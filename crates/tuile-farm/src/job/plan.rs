@@ -30,7 +30,11 @@ pub fn process_ranges(first: u64, last: u64, jobs: u32) -> Vec<(u64, u64)> {
     (0..jobs)
         .map(|i| {
             let a = first + i * span;
-            let b = if i == jobs - 1 { last } else { first + (i + 1) * span - 1 };
+            let b = if i == jobs - 1 {
+                last
+            } else {
+                first + (i + 1) * span - 1
+            };
             (a, b)
         })
         .collect()
@@ -90,7 +94,9 @@ impl Plan {
 
     /// The global numbers of this task's segments, in frame order.
     pub fn segments(&self) -> Vec<u64> {
-        (0..u64::from(self.jobs())).map(|i| self.seg_base + i).collect()
+        (0..u64::from(self.jobs()))
+            .map(|i| self.seg_base + i)
+            .collect()
     }
 }
 
@@ -102,8 +108,15 @@ mod tests {
     fn tasks_share_the_range_without_gap_or_repeat() {
         let slices: Vec<_> = (0..5).map(|t| task_slice(1, 48, t, 5)).collect();
         assert_eq!(slices, [(1, 10), (11, 20), (21, 30), (31, 39), (40, 48)]);
-        for (count, first, last) in [(3u32, 1u64, 8094u64), (9, 1, 8094), (7, 100, 105), (1, 5, 5)] {
-            let s: Vec<_> = (0..count).map(|t| task_slice(first, last, t, count)).collect();
+        for (count, first, last) in [
+            (3u32, 1u64, 8094u64),
+            (9, 1, 8094),
+            (7, 100, 105),
+            (1, 5, 5),
+        ] {
+            let s: Vec<_> = (0..count)
+                .map(|t| task_slice(first, last, t, count))
+                .collect();
             assert_eq!(s[0].0, first);
             assert_eq!(s.last().expect("test").1, last);
             assert!(s.windows(2).all(|w| w[1].0 == w[0].1 + 1), "{s:?}");
@@ -135,7 +148,11 @@ mod tests {
         let p = Plan::of(&config((1, 48), 3, 5, false));
         assert_eq!((p.first, p.last), (31, 39));
         let q = Plan::of(&config((601, 1200), 1, 14, true));
-        assert_eq!((q.first, q.last), (601, 1200), "the orchestrator cut it already");
+        assert_eq!(
+            (q.first, q.last),
+            (601, 1200),
+            "the orchestrator cut it already"
+        );
         assert_eq!(q.segments(), [1000, 1001, 1002, 1003]);
     }
 

@@ -17,7 +17,9 @@ use tuile_film_gpu::{FilmGpu, Settings, TileMesh};
 
 fn f32s(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
@@ -96,7 +98,7 @@ fn main() {
         if mesh.normals.is_empty() {
             bare += 1;
         }
-        for n in f32s(&mesh.normals).chunks_exact(3) {
+        for n in f32s(&mesh.normals).as_chunks::<3>().0 {
             let n = Vec3::new(n[0], n[1], n[2]);
             n_up += f64::from(n.dot(up));
             n_z += f64::from(n.z);
@@ -169,7 +171,12 @@ fn main() {
     }
     let mean: Vec<f64> = (0..3)
         .map(|c| {
-            rgba.chunks_exact(4).map(|p| f64::from(p[c])).sum::<f64>() / f64::from(width * height)
+            rgba.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|p| f64::from(p[c]))
+                .sum::<f64>()
+                / f64::from(width * height)
         })
         .collect();
     image::save_buffer(&out, &rgba, width, height, image::ColorType::Rgba8).expect("save");

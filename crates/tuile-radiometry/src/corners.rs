@@ -633,8 +633,8 @@ impl CornerField {
         report.seam_before = shown(&mut seam_before);
         report.seam_after = shown(&mut seam_after);
         let (mut before, mut after) = (Vec::new(), Vec::new());
-        for tile in 0..n {
-            if let Some(w) = &wanted[tile] {
+        for (tile, w) in wanted.iter().enumerate().take(n) {
+            if let Some(w) = w {
                 let got = mean_of(&value, tile);
                 before.push(tone_of(w).abs());
                 after.push(light_of([0, 1, 2].map(|c| got[c] - w[c])).abs());
@@ -928,7 +928,7 @@ mod tests {
         for (k, c) in seen.cells.iter_mut().enumerate() {
             // Whole 2 × 2 blocks swing together, so that a level up shows
             // the same swing.
-            let up = ((k % GRID) / 2 + (k / GRID) / 2) % 2 == 0;
+            let up = ((k % GRID) / 2 + (k / GRID) / 2).is_multiple_of(2);
             let y = tone * (if up { swing } else { -swing }).exp2();
             *c = [
                 y * (1.0 + colour) + veil,

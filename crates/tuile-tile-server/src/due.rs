@@ -42,7 +42,12 @@ pub fn due(layer: &Layer, manifest: &Manifest, config: &StoreConfig, now: System
     let mut why = Vec::new();
     for retired in &manifest.retired {
         let at = UNIX_EPOCH + Duration::from_secs(retired.retired) + config.retire_grace;
-        why.push((at, Why::Retired { key: retired.key.clone() }));
+        why.push((
+            at,
+            Why::Retired {
+                key: retired.key.clone(),
+            },
+        ));
     }
     let mut epochs: Vec<&str> = Vec::new();
     for archive in &manifest.archives {
@@ -52,10 +57,22 @@ pub fn due(layer: &Layer, manifest: &Manifest, config: &StoreConfig, now: System
     }
     for epoch in epochs {
         if let Some(at) = layer.expires_at(epoch) {
-            why.push((at, Why::Expires { epoch: epoch.to_string() }));
+            why.push((
+                at,
+                Why::Expires {
+                    epoch: epoch.to_string(),
+                },
+            ));
         }
-        if !layer.is_expired(epoch, now) && tiering::select(&manifest.archives, epoch, config.tiering).is_some() {
-            why.push((now, Why::Merge { epoch: epoch.to_string() }));
+        if !layer.is_expired(epoch, now)
+            && tiering::select(&manifest.archives, epoch, config.tiering).is_some()
+        {
+            why.push((
+                now,
+                Why::Merge {
+                    epoch: epoch.to_string(),
+                },
+            ));
         }
     }
     let at = why.iter().map(|(at, _)| *at).min().map(|at| at.max(now));
@@ -101,8 +118,15 @@ mod tests {
 
     #[test]
     fn a_zone_with_one_archive_of_a_durable_layer_has_nothing_ever_due() {
-        let m = Manifest { generation: 1, archives: vec![archive("a", "durable", 1000)], retired: vec![] };
-        assert_eq!(due(&layer(None), &m, &StoreConfig::default(), now()), Due::default());
+        let m = Manifest {
+            generation: 1,
+            archives: vec![archive("a", "durable", 1000)],
+            retired: vec![],
+        };
+        assert_eq!(
+            due(&layer(None), &m, &StoreConfig::default(), now()),
+            Due::default()
+        );
     }
 
     #[test]
@@ -112,13 +136,25 @@ mod tests {
         let m = Manifest {
             generation: 3,
             archives: vec![archive("b", "durable", 1000)],
-            retired: vec![Retired { key: "a".into(), retired: retired_at.duration_since(UNIX_EPOCH).unwrap().as_secs() }],
+            retired: vec![Retired {
+                key: "a".into(),
+                retired: retired_at.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            }],
         };
         let d = due(&layer(None), &m, &config, now());
         assert_eq!(d.at, Some(retired_at + config.retire_grace));
-        assert_eq!(d.why, [(retired_at + config.retire_grace, Why::Retired { key: "a".into() })]);
+        assert_eq!(
+            d.why,
+            [(
+                retired_at + config.retire_grace,
+                Why::Retired { key: "a".into() }
+            )]
+        );
         // With an epoch that expires months later, the earliest is the grace.
-        let expiring = Manifest { archives: vec![archive("b", "202610", 1000)], ..m.clone() };
+        let expiring = Manifest {
+            archives: vec![archive("b", "202610", 1000)],
+            ..m.clone()
+        };
         let d = due(&layer(Some(152 * DAY)), &expiring, &config, now());
         assert_eq!(d.at, Some(retired_at + config.retire_grace));
         assert_eq!(d.why.len(), 2);
@@ -130,31 +166,63 @@ mod tests {
     #[test]
     fn an_epoch_is_due_when_it_has_outlived_the_layer_s_expiry_from_its_end() {
         let expiry = 152 * DAY;
-        let m = Manifest { generation: 1, archives: vec![archive("a", "202610", 1000)], retired: vec![] };
+        let m = Manifest {
+            generation: 1,
+            archives: vec![archive("a", "202610", 1000)],
+            retired: vec![],
+        };
         let d = due(&layer(Some(expiry)), &m, &StoreConfig::default(), now());
         // October 2026 ends on 1 November 2026 00:00 UTC.
         let end = UNIX_EPOCH + Duration::from_secs(1_793_491_200);
         assert_eq!(d.at, Some(end + expiry));
-        assert_eq!(d.why, [(end + expiry, Why::Expires { epoch: "202610".into() })]);
+        assert_eq!(
+            d.why,
+            [(
+                end + expiry,
+                Why::Expires {
+                    epoch: "202610".into()
+                }
+            )]
+        );
     }
 
     #[test]
     fn a_run_the_tiering_would_merge_is_due_now_and_the_earliest_wins() {
         let config = StoreConfig::default();
         let fanout = config.tiering.fanout.max(2);
-        let archives = (0..fanout).map(|i| archive(&format!("d{i}"), "durable", 1000)).collect();
-        let m = Manifest { generation: 9, archives, retired: vec![] };
+        let archives = (0..fanout)
+            .map(|i| archive(&format!("d{i}"), "durable", 1000))
+            .collect();
+        let m = Manifest {
+            generation: 9,
+            archives,
+            retired: vec![],
+        };
         let d = due(&layer(None), &m, &config, now());
         assert_eq!(d.at, Some(now()));
-        assert_eq!(d.why, [(now(), Why::Merge { epoch: "durable".into() })]);
+        assert_eq!(
+            d.why,
+            [(
+                now(),
+                Why::Merge {
+                    epoch: "durable".into()
+                }
+            )]
+        );
         // An epoch already expired is dropped, not merged.
         let old = Manifest {
             generation: 9,
-            archives: (0..fanout).map(|i| archive(&format!("d{i}"), "202501", 1000)).collect(),
+            archives: (0..fanout)
+                .map(|i| archive(&format!("d{i}"), "202501", 1000))
+                .collect(),
             retired: vec![],
         };
         let d = due(&layer(Some(DAY)), &old, &config, now());
-        assert!(d.why.iter().all(|(_, w)| !matches!(w, Why::Merge { .. })), "{:?}", d.why);
+        assert!(
+            d.why.iter().all(|(_, w)| !matches!(w, Why::Merge { .. })),
+            "{:?}",
+            d.why
+        );
         assert_eq!(d.at, Some(now()), "expired long ago: due now");
     }
 }

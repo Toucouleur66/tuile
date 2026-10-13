@@ -148,7 +148,7 @@ mod tests {
                 imagery: imagery
                     .iter()
                     .map(|t| ImageryPlacement {
-                        tile: t.clone(),
+                        tile: *t,
                         coverage: [0.0, 0.0, 1.0, 1.0],
                         translation: [0.0; 2],
                         scale: [1.0; 2],
@@ -177,7 +177,10 @@ mod tests {
         assert_eq!(heard.len(), 2);
         assert_eq!(heard[0].frames, (1, ANNOUNCE_EVERY));
         assert_eq!(
-            (heard[0].terrain_layer.as_str(), heard[0].imagery_layer.as_str()),
+            (
+                heard[0].terrain_layer.as_str(),
+                heard[0].imagery_layer.as_str()
+            ),
             ("asset-1", "asset-2")
         );
         assert_eq!(heard[0].terrain, [(12, 1, 2)]);

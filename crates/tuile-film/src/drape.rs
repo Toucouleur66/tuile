@@ -19,7 +19,7 @@ pub const SMALLEST_SIDE: u32 = 4;
 /// relative to `origin_ecef`.
 pub fn sphere(origin_ecef: [f64; 3], positions: &[u8]) -> (DVec3, f64) {
     let (mut low, mut high) = (DVec3::INFINITY, DVec3::NEG_INFINITY);
-    for vertex in positions.chunks_exact(12) {
+    for vertex in positions.as_chunks::<12>().0 {
         let at = DVec3::from_array(std::array::from_fn(|axis| {
             f64::from(f32::from_le_bytes(std::array::from_fn(|byte| {
                 vertex[4 * axis + byte]

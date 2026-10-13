@@ -64,10 +64,22 @@ mod tests {
     use super::*;
 
     fn a(bytes: u64) -> ArchiveRef {
-        ArchiveRef { key: format!("k{bytes}"), epoch: "e".into(), created: 0, tiles: 1, bytes, oldest_fetch_ms: None, newest_fetch_ms: None }
+        ArchiveRef {
+            key: format!("k{bytes}"),
+            epoch: "e".into(),
+            created: 0,
+            tiles: 1,
+            bytes,
+            oldest_fetch_ms: None,
+            newest_fetch_ms: None,
+        }
     }
 
-    const POLICY: Tiering = Tiering { fanout: 4, ratio: 4, max_archives: 12 };
+    const POLICY: Tiering = Tiering {
+        fanout: 4,
+        ratio: 4,
+        max_archives: 12,
+    };
 
     #[test]
     fn four_similar_small_deltas_after_a_large_base_are_merged_without_it() {
@@ -91,8 +103,16 @@ mod tests {
     fn past_the_archive_cap_a_dissimilar_run_is_forced() {
         // Sizes doubling: no four within a factor 4, so nothing is similar.
         let zone: Vec<_> = (0..13).map(|i| a(1 << (2 * i))).collect();
-        assert_eq!(select(&zone[..12], "e", POLICY), None, "at the cap: still nothing");
-        assert_eq!(select(&zone, "e", POLICY), Some(0..4), "past it: the cheapest run");
+        assert_eq!(
+            select(&zone[..12], "e", POLICY),
+            None,
+            "at the cap: still nothing"
+        );
+        assert_eq!(
+            select(&zone, "e", POLICY),
+            Some(0..4),
+            "past it: the cheapest run"
+        );
     }
 
     #[test]

@@ -394,12 +394,12 @@ impl LayerField {
         if let Some(matrices) = &self.matrices {
             // The same nine vectors a corner; a matrix takes the first
             // three, a row each.
-            for (matrix, at) in matrices.iter().zip(out.chunks_exact_mut(9)) {
+            for (matrix, at) in matrices.iter().zip(out.as_chunks_mut::<9>().0) {
                 at[..3].copy_from_slice(matrix);
             }
             return out;
         }
-        for (corner, at) in self.corners.iter().zip(out.chunks_exact_mut(9)) {
+        for (corner, at) in self.corners.iter().zip(out.as_chunks_mut::<9>().0) {
             let (g, b) = (corner.gain_stops, corner.black);
             at[0] = [g[0], g[1], g[2], corner.contrast_stops];
             at[1] = [b[0], b[1], b[2], corner.saturation_stops];
@@ -1465,7 +1465,7 @@ impl FilmGpu {
         };
         // A sphere around the mesh, from the box its vertices fill.
         let (mut low, mut high) = (Vec3::INFINITY, Vec3::NEG_INFINITY);
-        for vertex in mesh.positions.chunks_exact(12) {
+        for vertex in mesh.positions.as_chunks::<12>().0 {
             let at = Vec3::from_array(std::array::from_fn(|axis| {
                 f32::from_le_bytes(std::array::from_fn(|byte| vertex[4 * axis + byte]))
             }));

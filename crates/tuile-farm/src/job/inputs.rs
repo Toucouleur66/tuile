@@ -22,17 +22,27 @@ fn size(path: &Path) -> String {
 /// The pack, downloaded ONCE for the whole pod: every process then reads the
 /// same file the page cache already holds — against sixteen cold globes of
 /// ~500 s each. A pack already on disk (`TUILE_PACK`) is used as it is.
-pub async fn pack(c: &Config, store: Option<&dyn RunStore>, log: &Log) -> Result<Option<PathBuf>, Stop> {
+pub async fn pack(
+    c: &Config,
+    store: Option<&dyn RunStore>,
+    log: &Log,
+) -> Result<Option<PathBuf>, Stop> {
     if let Some(ready) = &c.pack_ready {
         return Ok(Some(ready.clone()));
     }
-    let Some(key) = &c.pack_key else { return Ok(None) };
+    let Some(key) = &c.pack_key else {
+        return Ok(None);
+    };
     let store = store.ok_or_else(|| Stop::fatal("PACK-FETCH-FAILED (no store configured)"))?;
     if let Err(e) = store.get(key, &c.pack_path).await {
         log.line(format!("  {e}"));
         return Err(Stop::fatal("PACK-FETCH-FAILED"));
     }
-    log.line(format!("pack: {} -> {}", size(&c.pack_path), c.pack_path.display()));
+    log.line(format!(
+        "pack: {} -> {}",
+        size(&c.pack_path),
+        c.pack_path.display()
+    ));
     Ok(Some(c.pack_path.clone()))
 }
 
@@ -63,20 +73,35 @@ pub async fn stage(c: &Config, store: Option<&dyn RunStore>, log: &Log) -> Resul
     } else if c.tape_key.is_some() || c.trajectory.is_some() {
         let tape = PathBuf::from("/tmp/traj.mcap");
         if let Some(key) = &c.tape_key {
-            let store = store.ok_or_else(|| Stop::fatal("TAPE-DOWNLOAD-FAILED (no store configured)"))?;
+            let store =
+                store.ok_or_else(|| Stop::fatal("TAPE-DOWNLOAD-FAILED (no store configured)"))?;
             store.get(key, &tape).await.map_err(|e| {
                 log.line(format!("  {e}"));
                 Stop::fatal("TAPE-DOWNLOAD-FAILED")
             })?;
-            log.line(format!("bande: fournie ({}), trajectoire ignorée", size(&tape)));
+            log.line(format!(
+                "bande: fournie ({}), trajectoire ignorée",
+                size(&tape)
+            ));
         } else {
             let t = c.trajectory.as_deref().unwrap_or("");
             let (subcommand, args) = generator(t, &c.fps).ok_or_else(|| {
-                Stop::fatal(format!("TRAJECTORY-UNKNOWN: {}", t.split(':').next().unwrap_or("")))
+                Stop::fatal(format!(
+                    "TRAJECTORY-UNKNOWN: {}",
+                    t.split(':').next().unwrap_or("")
+                ))
             })?;
-            run(&c.tools.join("tuile-tape"), &[&[subcommand.to_string(), tape.display().to_string()][..], &args].concat(), log)
-                .await
-                .map_err(|_| Stop::fatal("TAPE-GEN-FAILED"))?;
+            run(
+                &c.tools.join("tuile-tape"),
+                &[
+                    &[subcommand.to_string(), tape.display().to_string()][..],
+                    &args,
+                ]
+                .concat(),
+                log,
+            )
+            .await
+            .map_err(|_| Stop::fatal("TAPE-GEN-FAILED"))?;
         }
         let args = [
             tape.display().to_string(),
@@ -88,7 +113,9 @@ pub async fn stage(c: &Config, store: Option<&dyn RunStore>, log: &Log) -> Resul
             "--fps".into(),
             c.fps.clone(),
         ];
-        run(&c.tools.join("tuile-tape-to-usd-stage"), &args, log).await.map_err(|_| Stop::fatal("MANIFEST-GEN-FAILED"))?;
+        run(&c.tools.join("tuile-tape-to-usd-stage"), &args, log)
+            .await
+            .map_err(|_| Stop::fatal("MANIFEST-GEN-FAILED"))?;
     }
     if std::fs::metadata(&out).map_or(true, |m| m.len() == 0) {
         return Err(Stop::fatal(format!("stage absente: {}", out.display())));
@@ -102,10 +129,26 @@ pub async fn stage(c: &Config, store: Option<&dyn RunStore>, log: &Log) -> Resul
 /// that writes the tape, and the arguments that follow the tape's path.
 pub fn generator(trajectory: &str, fps: &str) -> Option<(&'static str, Vec<String>)> {
     let p: Vec<&str> = trajectory.split(':').collect();
-    let at = |i: usize, d: &str| p.get(i).filter(|s| !s.is_empty()).map_or(d.to_string(), |s| s.to_string());
+    let at = |i: usize, d: &str| {
+        p.get(i)
+            .filter(|s| !s.is_empty())
+            .map_or(d.to_string(), |s| s.to_string())
+    };
     match p.first().copied() {
-        Some("orbit") => Some(("orbit", vec![at(1, "1440"), at(2, "2.17"), at(3, "42.52"), at(4, "8000"), at(5, "5000")])),
-        Some("pyrenees") => Some(("pyrenees", vec![at(1, "2"), fps.to_string(), at(3, "50000"), at(4, "0.40")])),
+        Some("orbit") => Some((
+            "orbit",
+            vec![
+                at(1, "1440"),
+                at(2, "2.17"),
+                at(3, "42.52"),
+                at(4, "8000"),
+                at(5, "5000"),
+            ],
+        )),
+        Some("pyrenees") => Some((
+            "pyrenees",
+            vec![at(1, "2"), fps.to_string(), at(3, "50000"), at(4, "0.40")],
+        )),
         Some("zoom") => Some(("zoom", vec![at(1, "64")])),
         _ => None,
     }
@@ -115,7 +158,11 @@ async fn run(program: &Path, args: &[String], log: &Log) -> Result<(), ()> {
     match Command::new(program).args(args).output().await {
         Ok(out) if out.status.success() => Ok(()),
         Ok(out) => {
-            String::from_utf8_lossy(&out.stderr).lines().rev().take(5).for_each(|l| log.line(format!("  {l}")));
+            String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .rev()
+                .take(5)
+                .for_each(|l| log.line(format!("  {l}")));
             Err(())
         }
         Err(e) => {
@@ -132,16 +179,23 @@ async fn run(program: &Path, args: &[String], log: &Log) -> Result<(), ()> {
 /// empty one; neither fails a render.
 pub async fn optix_get(c: &Config, store: Option<&dyn RunStore>, log: &Log) {
     let _ = std::fs::create_dir_all(&c.optix_cache_path);
-    let (Some(key), Some(store)) = (&c.optix_cache_key, store) else { return };
+    let (Some(key), Some(store)) = (&c.optix_cache_key, store) else {
+        return;
+    };
     let archive = c.outdir().join("optix-cache.tar.gz");
     let unpacked = async {
         store.get(key, &archive).await.ok()?;
         let file = std::fs::File::open(&archive).ok()?;
-        tar::Archive::new(flate2::read::GzDecoder::new(file)).unpack(&c.optix_cache_path).ok()
+        tar::Archive::new(flate2::read::GzDecoder::new(file))
+            .unpack(&c.optix_cache_path)
+            .ok()
     }
     .await;
     match unpacked {
-        Some(()) => log.line(format!("OPTIX-CACHE-HIT ({})", human(dir_size(&c.optix_cache_path)))),
+        Some(()) => log.line(format!(
+            "OPTIX-CACHE-HIT ({})",
+            human(dir_size(&c.optix_cache_path))
+        )),
         None => log.line("OPTIX-CACHE-MISS — la première frame paiera la compilation"),
     }
 }
@@ -150,14 +204,18 @@ pub async fn optix_get(c: &Config, store: Option<&dyn RunStore>, log: &Log) {
 /// same driver, same kernels, so writing from several would buy nothing and
 /// make the result depend on arrival order.
 pub async fn optix_put(c: &Config, store: Option<&dyn RunStore>, log: &Log) {
-    let (Some(key), Some(store)) = (&c.optix_cache_key, store) else { return };
+    let (Some(key), Some(store)) = (&c.optix_cache_key, store) else {
+        return;
+    };
     if c.task_index != 0 || !c.optix_cache_path.is_dir() {
         return;
     }
     let archive = c.outdir().join("optix-cache-out.tar.gz");
-    let entries: Vec<PathBuf> = std::fs::read_dir(&c.optix_cache_path)
-        .map_or(Vec::new(), |d| d.flatten().map(|e| PathBuf::from(e.file_name())).collect());
-    let ok = tarball(&c.optix_cache_path, &entries, &archive).is_ok() && store.put(&archive, key).await.is_ok();
+    let entries: Vec<PathBuf> = std::fs::read_dir(&c.optix_cache_path).map_or(Vec::new(), |d| {
+        d.flatten().map(|e| PathBuf::from(e.file_name())).collect()
+    });
+    let ok = tarball(&c.optix_cache_path, &entries, &archive).is_ok()
+        && store.put(&archive, key).await.is_ok();
     if ok {
         log.line(format!("OPTIX-CACHE-UP ({})", size(&archive)));
     } else {
@@ -193,9 +251,27 @@ mod tests {
 
     #[test]
     fn the_generators_keep_their_defaults() {
-        assert_eq!(generator("orbit", "24").expect("test"), ("orbit", vec!["1440".into(), "2.17".into(), "42.52".into(), "8000".into(), "5000".into()]));
-        assert_eq!(generator("pyrenees:3::60000", "30").expect("test").1, ["3", "30", "60000", "0.40"]);
-        assert_eq!(generator("zoom:10", "24").expect("test"), ("zoom", vec!["10".into()]));
+        assert_eq!(
+            generator("orbit", "24").expect("test"),
+            (
+                "orbit",
+                vec![
+                    "1440".into(),
+                    "2.17".into(),
+                    "42.52".into(),
+                    "8000".into(),
+                    "5000".into()
+                ]
+            )
+        );
+        assert_eq!(
+            generator("pyrenees:3::60000", "30").expect("test").1,
+            ["3", "30", "60000", "0.40"]
+        );
+        assert_eq!(
+            generator("zoom:10", "24").expect("test"),
+            ("zoom", vec!["10".into()])
+        );
         assert!(generator("spiral", "24").is_none());
     }
 
@@ -206,10 +282,20 @@ mod tests {
         gz.write_all(b"#usda 1.0\n").expect("test");
         let b64 = base64::engine::general_purpose::STANDARD.encode(gz.finish().expect("test"));
         let path = dir.path().join("stage.usda");
-        let c = config(vec![("JOB_FRAMES", "1:2".into()), ("JOB_STAGE_B64_GZ", b64), ("JOB_STAGE", path.display().to_string())]);
+        let c = config(vec![
+            ("JOB_FRAMES", "1:2".into()),
+            ("JOB_STAGE_B64_GZ", b64),
+            ("JOB_STAGE", path.display().to_string()),
+        ]);
         let got = stage(&c, None, &Log::stdout_only()).await.expect("test");
         assert_eq!(std::fs::read_to_string(got).expect("test"), "#usda 1.0\n");
-        let missing = config(vec![("JOB_FRAMES", "1:2".into()), ("JOB_STAGE", dir.path().join("none.usda").display().to_string())]);
+        let missing = config(vec![
+            ("JOB_FRAMES", "1:2".into()),
+            (
+                "JOB_STAGE",
+                dir.path().join("none.usda").display().to_string(),
+            ),
+        ]);
         assert!(stage(&missing, None, &Log::stdout_only()).await.is_err());
     }
 
@@ -226,14 +312,27 @@ mod tests {
             ("JOB_PACK_KEY", "runs/r1/scene.tuilepack".into()),
             ("JOB_PACK", work.path().join("p").display().to_string()),
             ("JOB_STAGE_KEY", "runs/r1/manifest.usda".into()),
-            ("JOB_STAGE", work.path().join("s.usda").display().to_string()),
+            (
+                "JOB_STAGE",
+                work.path().join("s.usda").display().to_string(),
+            ),
         ]);
         let log = Log::stdout_only();
-        let p = pack(&c, Some(&store), &log).await.expect("test").expect("test");
+        let p = pack(&c, Some(&store), &log)
+            .await
+            .expect("test")
+            .expect("test");
         assert_eq!(std::fs::read(p).expect("test"), b"PACK");
         assert!(stage(&c, Some(&store), &log).await.is_ok());
-        let bad = config(vec![("JOB_FRAMES", "1:2".into()), ("JOB_PACK_KEY", "runs/r1/none".into()), ("JOB_PACK", work.path().join("q").display().to_string())]);
-        assert!(pack(&bad, Some(&store), &log).await.is_err(), "PACK-FETCH-FAILED");
+        let bad = config(vec![
+            ("JOB_FRAMES", "1:2".into()),
+            ("JOB_PACK_KEY", "runs/r1/none".into()),
+            ("JOB_PACK", work.path().join("q").display().to_string()),
+        ]);
+        assert!(
+            pack(&bad, Some(&store), &log).await.is_err(),
+            "PACK-FETCH-FAILED"
+        );
     }
 
     #[tokio::test]
@@ -246,7 +345,10 @@ mod tests {
         std::fs::write(cache.join("sub/kernel.bin"), b"K").expect("test");
         let c = config(vec![
             ("JOB_FRAMES", "1:2".into()),
-            ("JOB_OUT", out.path().join("render.mp4").display().to_string()),
+            (
+                "JOB_OUT",
+                out.path().join("render.mp4").display().to_string(),
+            ),
             ("JOB_OPTIX_CACHE_KEY", "optix-cache.tar.gz".into()),
         ]);
         let log = Log::stdout_only();
@@ -254,6 +356,9 @@ mod tests {
         assert!(bucket.path().join("optix-cache.tar.gz").exists());
         std::fs::remove_dir_all(&cache).expect("test");
         optix_get(&c, Some(&store), &log).await;
-        assert_eq!(std::fs::read(cache.join("sub/kernel.bin")).expect("test"), b"K");
+        assert_eq!(
+            std::fs::read(cache.join("sub/kernel.bin")).expect("test"),
+            b"K"
+        );
     }
 }

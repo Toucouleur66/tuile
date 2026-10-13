@@ -47,19 +47,25 @@ fn built(tile: TileCoord, from: TileCoord, bytes: &[u8]) -> DecodedTileContent {
         meshes: vec![DecodedMesh {
             positions: mesh
                 .positions
-                .chunks_exact(12)
+                .as_chunks::<12>()
+                .0
+                .iter()
                 .map(|b| [f(&b[0..4]), f(&b[4..8]), f(&b[8..12])])
                 .collect(),
             normals: None,
             uvs: Some(
                 mesh.uvs
-                    .chunks_exact(8)
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
                     .map(|b| [f(&b[0..4]), f(&b[4..8])])
                     .collect(),
             ),
             indices: mesh
                 .indices
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                 .collect(),
             material: MaterialDesc::default(),

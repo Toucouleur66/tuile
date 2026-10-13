@@ -29,7 +29,7 @@
 //!    fixed step ([`Measure::keep`]) so that it is the same wherever it
 //!    was found.
 
-use crate::tiles::{light_of, luma, Observed, TileAt, FLOOR};
+use crate::tiles::{light_of, luma, Observed, TileAt};
 
 /// What a correction may not go past, whatever is measured.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -486,9 +486,10 @@ fn transfer(observed: &Observed, at: TileAt, reference_level: u8) -> Option<Curv
 }
 
 /// A tile's own tone, as its stops under white.
+#[cfg(test)]
 pub(crate) fn own_tone(observed: &Observed, at: TileAt) -> Option<f32> {
     let tile = observed.tiles.get(&at)?;
-    Some((luma(tile.mean()) + FLOOR).log2())
+    Some((luma(tile.mean()) + crate::tiles::FLOOR).log2())
 }
 
 #[cfg(test)]

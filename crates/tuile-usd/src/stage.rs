@@ -516,8 +516,15 @@ mod tests {
     /// it is given, so its render is numbered — and placed — as the shot is.
     #[test]
     fn a_stretch_keeps_the_shot_s_numbers_and_the_given_origin() {
-        let frames = [looking_down_x([200.0, 0.0, 0.0]), looking_down_x([100.0, 0.0, 0.0])];
-        let config = ManifestConfig { first_frame: 1351, origin: Some([180.0, 0.0, 0.0]), ..ManifestConfig::default() };
+        let frames = [
+            looking_down_x([200.0, 0.0, 0.0]),
+            looking_down_x([100.0, 0.0, 0.0]),
+        ];
+        let config = ManifestConfig {
+            first_frame: 1351,
+            origin: Some([180.0, 0.0, 0.0]),
+            ..ManifestConfig::default()
+        };
         let mut out = Vec::new();
         write_manifest(&frames, &config, &mut out).expect("writing");
         let text = String::from_utf8(out).expect("utf-8");
@@ -530,7 +537,10 @@ mod tests {
         ] {
             assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
         }
-        assert!(!text.contains("\n            1: "), "no sample at the shot's frame 1");
+        assert!(
+            !text.contains("\n            1: "),
+            "no sample at the shot's frame 1"
+        );
     }
 
     /// La caméra est nommée par un ATTRIBUT, jamais par une relation.

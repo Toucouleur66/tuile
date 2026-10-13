@@ -28,7 +28,9 @@ pub fn matching(dir: &Path, patterns: &[&str]) -> Vec<PathBuf> {
     for pat in patterns {
         let full = dir.join(pat);
         let Some(full) = full.to_str() else { continue };
-        let Ok(paths) = glob::glob(full) else { continue };
+        let Ok(paths) = glob::glob(full) else {
+            continue;
+        };
         for p in paths.flatten() {
             if let Ok(rel) = p.strip_prefix(dir) {
                 if !out.iter().any(|q: &PathBuf| q == rel) {
@@ -57,11 +59,17 @@ pub fn tarball(dir: &Path, files: &[PathBuf], dest: &Path) -> std::io::Result<()
             }
             continue;
         }
-        let Ok(data) = std::fs::read(&path) else { continue };
+        let Ok(data) = std::fs::read(&path) else {
+            continue;
+        };
         let mut header = tar::Header::new_gnu();
         header.set_size(data.len() as u64);
         header.set_mode(0o644);
-        header.set_mtime(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()));
+        header.set_mtime(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+        );
         header.set_cksum();
         tar.append_data(&mut header, &rel, data.as_slice())?;
     }
@@ -80,12 +88,23 @@ pub struct Shipper<'a> {
 impl Shipper<'_> {
     /// The key of `name` for this task: `logs.tar.gz` → `<run>/logs-t3.tar.gz`.
     pub fn key(&self, name: &str) -> String {
-        format!("{}/{}{}.tar.gz", self.prefix, name.trim_end_matches(".tar.gz"), self.tag)
+        format!(
+            "{}/{}{}.tar.gz",
+            self.prefix,
+            name.trim_end_matches(".tar.gz"),
+            self.tag
+        )
     }
 
     /// Ships one tarball. Nothing to ship is not a failure; a failure is said
     /// aloud unless `quiet`, and returned.
-    pub async fn ship(&self, name: &str, patterns: &[&str], log: &Log, quiet: bool) -> Result<(), String> {
+    pub async fn ship(
+        &self,
+        name: &str,
+        patterns: &[&str],
+        log: &Log,
+        quiet: bool,
+    ) -> Result<(), String> {
         let files = matching(&self.dir, patterns);
         if files.is_empty() {
             return Ok(());
@@ -131,8 +150,17 @@ mod tests {
     fn names(tgz: &Path) -> Vec<String> {
         let file = std::fs::File::open(tgz).expect("test");
         let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(file));
-        let mut v: Vec<String> =
-            ar.entries().expect("test").map(|e| e.expect("test").path().expect("test").to_string_lossy().into_owned()).collect();
+        let mut v: Vec<String> = ar
+            .entries()
+            .expect("test")
+            .map(|e| {
+                e.expect("test")
+                    .path()
+                    .expect("test")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
         v.sort();
         v
     }
@@ -147,13 +175,28 @@ mod tests {
         std::fs::create_dir(d.join("tmp-s1")).expect("test");
         std::fs::write(d.join("tmp-s1/blender.crash.txt"), "# backtrace\n").expect("test");
         std::fs::write(d.join("trace-s0.jsonl"), "{}\n").expect("test");
-        let store = ObjectRunStore::local(store_dir.path(), crate::Tuning::default()).expect("test");
-        let shipper = Shipper { store: &store, prefix: "renders/r1", tag: "-t3".into(), dir: d.to_path_buf() };
+        let store =
+            ObjectRunStore::local(store_dir.path(), crate::Tuning::default()).expect("test");
+        let shipper = Shipper {
+            store: &store,
+            prefix: "renders/r1",
+            tag: "-t3".into(),
+            dir: d.to_path_buf(),
+        };
         shipper.ship_all(&Log::stdout_only()).await;
         let landed = store_dir.path().join("renders/r1/logs-t3.tar.gz");
-        assert_eq!(names(&landed), ["job.log", "log-s0.txt", "tmp-s1/blender.crash.txt"]);
+        assert_eq!(
+            names(&landed),
+            ["job.log", "log-s0.txt", "tmp-s1/blender.crash.txt"]
+        );
         assert!(store_dir.path().join("renders/r1/trace-t3.tar.gz").exists());
-        assert!(!store_dir.path().join("renders/r1/profile-t3.tar.gz").exists(), "nothing to ship is not a file");
+        assert!(
+            !store_dir
+                .path()
+                .join("renders/r1/profile-t3.tar.gz")
+                .exists(),
+            "nothing to ship is not a file"
+        );
     }
 
     #[test]
@@ -165,7 +208,10 @@ mod tests {
             let d = d.clone();
             std::thread::spawn(move || {
                 use std::io::Write;
-                let mut f = std::fs::OpenOptions::new().append(true).open(d.join("job.log")).expect("test");
+                let mut f = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(d.join("job.log"))
+                    .expect("test");
                 for _ in 0..2000 {
                     let _ = f.write_all(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
                 }
@@ -184,8 +230,15 @@ mod tests {
         std::fs::write(d.join("log-s0.txt"), "").expect("test");
         std::fs::write(d.join("log-s12.txt"), "").expect("test");
         std::fs::write(d.join("other.txt"), "").expect("test");
-        let mut got: Vec<_> = matching(d, &["log-s*.txt", "log-s0.txt"]).into_iter().map(|p| p.display().to_string()).collect();
+        let mut got: Vec<_> = matching(d, &["log-s*.txt", "log-s0.txt"])
+            .into_iter()
+            .map(|p| p.display().to_string())
+            .collect();
         got.sort();
-        assert_eq!(got, ["log-s0.txt", "log-s12.txt"], "each once, nothing else");
+        assert_eq!(
+            got,
+            ["log-s0.txt", "log-s12.txt"],
+            "each once, nothing else"
+        );
     }
 }

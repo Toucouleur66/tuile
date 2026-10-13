@@ -378,15 +378,19 @@ fn render(scene: &Scene) -> Option<Vec<u8>> {
 /// frame is, so a pixel with more red and more blue than green has the
 /// sheet in it, were it one sample of its four.
 fn through(rgba: &[u8]) -> usize {
-    rgba.chunks_exact(4)
+    rgba.as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| p[0] > p[1] && p[2] > p[1])
         .count()
 }
 
 /// Pixels of two pictures that differ by more than `by` in a channel.
 fn apart(a: &[u8], b: &[u8], by: u8) -> usize {
-    a.chunks_exact(4)
-        .zip(b.chunks_exact(4))
+    a.as_chunks::<4>()
+        .0
+        .iter()
+        .zip(b.as_chunks::<4>().0)
         .filter(|(p, q)| p.iter().zip(q.iter()).any(|(x, y)| x.abs_diff(*y) > by))
         .count()
 }
@@ -648,7 +652,7 @@ fn the_pass_puts_every_vertex_where_the_engine_does() {
             .1
             .meshes[0]
             .positions;
-        for (n, (p, q)) in cpu.iter().zip(gpu.chunks_exact(3)).enumerate() {
+        for (n, (p, q)) in cpu.iter().zip(gpu.as_chunks::<3>().0).enumerate() {
             let apart = (glam::Vec3::from(*p) - glam::Vec3::from_slice(q)).length();
             worst = worst.max(apart);
             vertices += 1;

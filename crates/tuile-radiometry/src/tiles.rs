@@ -229,7 +229,9 @@ impl TileSeen {
             }
         });
         let opaque = rgba[..w * h * 4]
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[3] >= 128)
             .count();
         if opaque * 2 < w * h {
@@ -391,8 +393,8 @@ impl TileSeen {
         let mut sum = [0.0f32; 3];
         for j in j0..j0 + side {
             for i in i0..i0 + side {
-                for k in 0..3 {
-                    sum[k] += self.cells[j * GRID + i][k];
+                for (s, v) in sum.iter_mut().zip(self.cells[j * GRID + i]) {
+                    *s += v;
                 }
             }
         }
@@ -501,16 +503,18 @@ impl Observed {
             return None;
         }
         let mut tiles = BTreeMap::new();
-        for kept in body.chunks_exact(KEPT) {
+        for kept in body.as_chunks::<KEPT>().0 {
             let four = |at: usize| [kept[at], kept[at + 1], kept[at + 2], kept[at + 3]];
             let seen = (GRID * GRID + 4 * GRID) * 3 * 2;
             let mut values = kept[13..13 + seen]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|b| unpacked(u16::from_le_bytes([b[0], b[1]])));
             let (spread, places) = kept[13 + seen..].split_at(KEPT - PLACES - 13 - seen);
             let paired = (places[0] == 1).then(|| {
                 let mut paired = Paired::alone([[f32::NAN; 3]; PAIRS * PAIRS]);
-                for (i, b) in places[1..].chunks_exact(2).enumerate() {
+                for (i, b) in places[1..].as_chunks::<2>().0.iter().enumerate() {
                     let kept = u16::from_le_bytes([b[0], b[1]]);
                     let of = if i < PAIRS * PAIRS * 3 {
                         &mut paired.tile
@@ -529,7 +533,7 @@ impl Observed {
                 let mut tones = Tones {
                     spread: [[[0; BINS]; 3]; 5],
                 };
-                for (i, b) in spread[1..].chunks_exact(2).enumerate() {
+                for (i, b) in spread[1..].as_chunks::<2>().0.iter().enumerate() {
                     tones.spread[i / (3 * BINS)][i / BINS % 3][i % BINS] =
                         u16::from_le_bytes([b[0], b[1]]);
                 }
@@ -1316,8 +1320,8 @@ impl TileGains {
                 let entry = region.entry(root[i]).or_insert((0.0, [0.0; 3]));
                 if let Some(o) = offset[i] {
                     entry.0 += 1.0;
-                    for c in 0..3 {
-                        entry.1[c] += o[c];
+                    for (e, v) in entry.1.iter_mut().zip(o) {
+                        *e += v;
                     }
                 }
             }

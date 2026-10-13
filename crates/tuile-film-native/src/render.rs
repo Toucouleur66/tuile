@@ -46,7 +46,7 @@ pub enum Tone {
     /// none.
     OfTheFilm,
     /// This grade.
-    Grade(FilmGrade),
+    Grade(Box<FilmGrade>),
 }
 
 /// What to render.
@@ -297,7 +297,7 @@ pub async fn render(
     // frame to its last, and part of it is how the picture is exposed.
     let film_grade = match &order.tone {
         Tone::Off => None,
-        Tone::Grade(grade) => Some(grade.clone()),
+        Tone::Grade(grade) => Some(FilmGrade::clone(grade)),
         Tone::OfTheFilm => sources.film_grade(film).await?,
     };
     let strength = order.tone_strength.clamp(0.0, 1.0);
@@ -445,7 +445,7 @@ pub async fn render(
                 let field = MatrixField {
                     given: [(at, four)].into(),
                 };
-                for (n, texel) in rgba8.chunks_exact_mut(4).enumerate() {
+                for (n, texel) in rgba8.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                     let (x, y) = (n as u32 % width, n as u32 / width);
                     let matrix = field.at(
                         at,
@@ -488,7 +488,7 @@ pub async fn render(
                     curve: k.curve,
                 }
             });
-            for (n, texel) in rgba8.chunks_exact_mut(4).enumerate() {
+            for (n, texel) in rgba8.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let (x, y) = (n as u32 % width, n as u32 / width);
                 let local: Local = Blended::mix(
                     &blended,
@@ -664,7 +664,9 @@ pub async fn render(
                             let mut translucent = false;
                             for placed in &refs.imagery {
                                 let at = (placed.tile.level, placed.tile.x, placed.tile.y);
-                                if !textures.contains_key(&at) {
+                                if let std::collections::hash_map::Entry::Vacant(e) =
+                                    textures.entry(at)
+                                {
                                     let found = imagery_read.get(&at).ok_or_else(|| {
                                     format!(
                                         "imagery {}/{}/{} of layer {imagery_layer} is no longer in the tile store",
@@ -685,13 +687,18 @@ pub async fn render(
                                     timings.observe += ms(t);
                                     let t = Instant::now();
                                     let decoded = imagery_texture(&placed.tile, scheme, found)?;
-                                    let opaque = decoded.rgba8.chunks_exact(4).all(|p| p[3] == 255);
+                                    let opaque = decoded
+                                        .rgba8
+                                        .as_chunks::<4>()
+                                        .0
+                                        .iter()
+                                        .all(|p| p[3] == 255);
                                     timings.decode += ms(t);
                                     let t = Instant::now();
                                     let texture = gpu.create_imagery(decoded.width, decoded.height);
                                     gpu.write_rgba(&texture, &decoded.rgba8);
                                     timings.upload += ms(t);
-                                    textures.insert(at, (texture, opaque));
+                                    e.insert((texture, opaque));
                                 }
                                 let (texture, opaque) = &textures[&at];
                                 translucent |= !opaque;
@@ -749,11 +756,8 @@ pub async fn render(
                                         scale: placed.scale,
                                         grade: LayerGrade::IDENTITY,
                                         field: {
-                                            let at = (
-                                                placed.tile.level as u8,
-                                                placed.tile.x,
-                                                placed.tile.y,
-                                            );
+                                            let at =
+                                                (placed.tile.level, placed.tile.x, placed.tile.y);
                                             matrices(at).or_else(|| {
                                                 corners(at).map(|c| layer_field(&c, strength))
                                             })
@@ -967,7 +971,9 @@ pub async fn render(
                 // The probe's magenta, or a part of it under the
                 // supersampling filter.
                 done.hole_pixels += rgba
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .filter(|p| {
                         let (r, g, b) = (i32::from(p[0]), i32::from(p[1]), i32::from(p[2]));
                         r > g + 60 && b > g + 60
@@ -1023,7 +1029,7 @@ pub async fn render(
                 done.timings.add(&timings);
             }
             index += 1;
-            if index % 200 == 0 {
+            if index.is_multiple_of(200) {
                 let so_far = began.elapsed().as_secs_f64();
                 eprintln!(
                     "  frame {} — {index} rendered in {so_far:.0} s ({:.1} frames/s)",

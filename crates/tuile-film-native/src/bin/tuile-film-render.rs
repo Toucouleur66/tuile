@@ -144,7 +144,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use glam::{DVec3, Vec3};
+use glam::DVec3;
 use tuile_core::geo::{enu_frame, geodetic_to_ecef, Geodetic};
 use tuile_film::{BakedView, OverlayDepth, OverlayMesh, Overlays};
 
@@ -373,7 +373,7 @@ async fn main() -> Result<(), Error> {
         let text = std::fs::read_to_string(&path)?;
         let grade =
             FilmGrade::from_json(&text).ok_or_else(|| format!("{path} is not a film's grade"))?;
-        order.tone = Tone::Grade(grade);
+        order.tone = Tone::Grade(Box::new(grade));
     }
     match value("--imagery").as_deref() {
         Some("stored") => order.look = tuile_film::Look::cycles_film(),

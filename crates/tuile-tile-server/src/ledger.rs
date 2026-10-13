@@ -6,7 +6,7 @@
 //!
 //! A host may keep, beside the bucket, a register of every zone and every
 //! archive: what is where, and when each zone next falls due (see
-//! [`crate::due`]). The bucket and the register share no transaction, so the
+//! [`crate::due`](fn@crate::due)). The bucket and the register share no transaction, so the
 //! order in which the register is told is what keeps it right:
 //!
 //! 1. [`Ledger::writing`], **before** an archive is uploaded. If the register
@@ -37,7 +37,13 @@ pub trait Ledger: Send + Sync {
     async fn writing(&self, layer: &str, zone: Zone, key: &str) -> Result<(), String>;
     /// `manifest` was published for `layer`'s `zone`, and `due` is when the
     /// zone next has something to be done.
-    async fn published(&self, layer: &str, zone: Zone, manifest: &Manifest, due: &Due) -> Result<(), String>;
+    async fn published(
+        &self,
+        layer: &str,
+        zone: Zone,
+        manifest: &Manifest,
+        due: &Due,
+    ) -> Result<(), String>;
     /// `keys`, archives of `layer`'s `zone`, were deleted.
     async fn deleted(&self, layer: &str, zone: Zone, keys: &[String]) -> Result<(), String>;
 }

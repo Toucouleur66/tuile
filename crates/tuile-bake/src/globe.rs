@@ -288,38 +288,44 @@ enum Cached<T, C> {
     Through(C),
 }
 
-impl<T: tuile_terrain::TerrainSource>
-    Cached<T, tuile_terrain::CachedTerrain<T>>
-{
+impl<T: tuile_terrain::TerrainSource> Cached<T, tuile_terrain::CachedTerrain<T>> {
     fn wrap_terrain(
         inner: T,
         cache: Option<Arc<dyn tuile_core::storage::ContentStore>>,
         asset: i64,
     ) -> Self {
         match cache {
-            Some(c) => Cached::Through(tuile_terrain::CachedTerrain::new(inner, c, source_namespace(asset))),
+            Some(c) => Cached::Through(tuile_terrain::CachedTerrain::new(
+                inner,
+                c,
+                source_namespace(asset),
+            )),
             None => Cached::Direct(inner),
         }
     }
 }
 
-impl<P: tuile_core::raster::ImageryProvider>
-    Cached<P, tuile_core::raster::CachedImagery<P>>
-{
+impl<P: tuile_core::raster::ImageryProvider> Cached<P, tuile_core::raster::CachedImagery<P>> {
     fn wrap_imagery(
         inner: P,
         cache: Option<Arc<dyn tuile_core::storage::ContentStore>>,
         asset: i64,
     ) -> Self {
         match cache {
-            Some(c) => Cached::Through(tuile_core::raster::CachedImagery::new(inner, c, source_namespace(asset))),
+            Some(c) => Cached::Through(tuile_core::raster::CachedImagery::new(
+                inner,
+                c,
+                source_namespace(asset),
+            )),
             None => Cached::Direct(inner),
         }
     }
 }
 
 #[async_trait::async_trait]
-impl<T: tuile_terrain::TerrainSource, C: tuile_terrain::TerrainSource> tuile_terrain::TerrainSource for Cached<T, C> {
+impl<T: tuile_terrain::TerrainSource, C: tuile_terrain::TerrainSource> tuile_terrain::TerrainSource
+    for Cached<T, C>
+{
     async fn fetch_tile(
         &self,
         coord: tuile_terrain::TileCoord,
@@ -332,8 +338,8 @@ impl<T: tuile_terrain::TerrainSource, C: tuile_terrain::TerrainSource> tuile_ter
 }
 
 #[async_trait::async_trait]
-impl<P: tuile_core::raster::ImageryProvider, C: tuile_core::raster::ImageryProvider> tuile_core::raster::ImageryProvider
-    for Cached<P, C>
+impl<P: tuile_core::raster::ImageryProvider, C: tuile_core::raster::ImageryProvider>
+    tuile_core::raster::ImageryProvider for Cached<P, C>
 {
     fn tiling_scheme(&self) -> tuile_core::raster::TilingScheme {
         match self {
@@ -391,7 +397,11 @@ async fn resolve(
     // cache in front — and nothing resolved here.
     if let Some(sources) = &config.sources {
         let cache = || config.tile_cache.clone().map(|c| c.0);
-        let (layer, terrain) = sources.0.terrain(config.terrain_asset_id).await.map_err(GlobeError::Sources)?;
+        let (layer, terrain) = sources
+            .0
+            .terrain(config.terrain_asset_id)
+            .await
+            .map_err(GlobeError::Sources)?;
         let terrain = Cached::wrap_terrain(Held(terrain), cache(), config.terrain_asset_id);
         let options = |no_imagery| GlobeOptions {
             no_imagery,
@@ -403,9 +413,19 @@ async fn resolve(
             composed_at: config.session.bake_max_size,
         };
         return Ok(match config.imagery_asset_id {
-            None => globe_with_provenance(terrain, NoImagery, layer, options(true), offload::threaded()),
+            None => globe_with_provenance(
+                terrain,
+                NoImagery,
+                layer,
+                options(true),
+                offload::threaded(),
+            ),
             Some(asset) => {
-                let imagery = sources.0.imagery(asset).await.map_err(GlobeError::Sources)?;
+                let imagery = sources
+                    .0
+                    .imagery(asset)
+                    .await
+                    .map_err(GlobeError::Sources)?;
                 let imagery = Cached::wrap_imagery(Held(imagery), cache(), asset);
                 globe_with_provenance(terrain, imagery, layer, options(false), offload::threaded())
             }
@@ -435,7 +455,11 @@ async fn resolve(
         .map_err(|e| GlobeError::Ion(e.to_string()))?;
     // Through the tile cache when there is one: a tile any earlier run fetched
     // is read from it, and every tile fetched now is offered to it.
-    let terrain = Cached::wrap_terrain(terrain, config.tile_cache.clone().map(|c| c.0), config.terrain_asset_id);
+    let terrain = Cached::wrap_terrain(
+        terrain,
+        config.tile_cache.clone().map(|c| c.0),
+        config.terrain_asset_id,
+    );
 
     // Terrain only: a valid mode, and the one to reach for when the geometry
     // looks wrong and a texture is the last thing you want on top of it.
@@ -502,7 +526,11 @@ async fn resolve(
             let tms = TmsImagery::from_endpoint(ion, imagery_asset_id as u64, endpoint)
                 .await
                 .map_err(|e| GlobeError::Imagery(e.to_string()))?;
-            let tms = Cached::wrap_imagery(tms, config.tile_cache.clone().map(|c| c.0), imagery_asset_id);
+            let tms = Cached::wrap_imagery(
+                tms,
+                config.tile_cache.clone().map(|c| c.0),
+                imagery_asset_id,
+            );
             globe_with_provenance(terrain, tms, layer, options, offload::threaded())
         }
         Some("BING") => {
@@ -519,7 +547,11 @@ async fn resolve(
             let bing = BingImageryProvider::from_metadata_url(Arc::clone(&http), &metadata_url)
                 .await
                 .map_err(|e| GlobeError::Bing(e.to_string()))?;
-            let bing = Cached::wrap_imagery(bing, config.tile_cache.clone().map(|c| c.0), imagery_asset_id);
+            let bing = Cached::wrap_imagery(
+                bing,
+                config.tile_cache.clone().map(|c| c.0),
+                imagery_asset_id,
+            );
             globe_with_provenance(terrain, bing, layer, options, offload::threaded())
         }
         Some(kind) => {
@@ -570,8 +602,17 @@ impl ReferenceImagery {
         use tuile_core::raster::ImageryProvider as _;
         // The host's own sources, as for a globe: nothing resolved here.
         if let Some(sources) = &config.sources {
-            let provider = sources.0.imagery(asset).await.map_err(GlobeError::Sources)?;
-            return Ok(Self { scheme: provider.tiling_scheme(), extension: String::new(), provider, asset });
+            let provider = sources
+                .0
+                .imagery(asset)
+                .await
+                .map_err(GlobeError::Sources)?;
+            return Ok(Self {
+                scheme: provider.tiling_scheme(),
+                extension: String::new(),
+                provider,
+                asset,
+            });
         }
         let transport = TransportConfig {
             retry: RetryConfig::patient(),
@@ -586,7 +627,9 @@ impl ReferenceImagery {
                 .map_err(|e| GlobeError::Transport(e.to_string()))?,
         );
         let ion = IonClient::new(http, config.ion_token.clone());
-        let tms = TmsImagery::open(ion, asset as u64).await.map_err(|e| GlobeError::Ion(e.to_string()))?;
+        let tms = TmsImagery::open(ion, asset as u64)
+            .await
+            .map_err(|e| GlobeError::Ion(e.to_string()))?;
         Ok(Self {
             scheme: tms.tiling_scheme(),
             extension: tms.extension().unwrap_or_default(),
@@ -606,23 +649,37 @@ impl ReferenceImagery {
     ) -> Result<ReferenceFetched, GlobeError> {
         use tuile_core::raster::ImageryProvider as _;
         let asset = self.asset;
-        let tms = tuile_core::raster::CachedImagery::new(Held(self.provider), cache.0, source_namespace(asset));
-        let mut done = ReferenceFetched { asked: wanted.len(), ..ReferenceFetched::default() };
+        let tms = tuile_core::raster::CachedImagery::new(
+            Held(self.provider),
+            cache.0,
+            source_namespace(asset),
+        );
+        let mut done = ReferenceFetched {
+            asked: wanted.len(),
+            ..ReferenceFetched::default()
+        };
         for some in wanted.chunks(REFERENCE_AT_ONCE) {
-            let got = futures_util::future::join_all(some.iter().map(|c| tms.fetch_tile_bytes(*c))).await;
+            let got =
+                futures_util::future::join_all(some.iter().map(|c| tms.fetch_tile_bytes(*c))).await;
             for (coord, tile) in some.iter().zip(got) {
                 match tile {
                     Ok(fetched) => {
                         done.there += 1;
                         done.bytes += fetched.value.len() as u64;
                     }
-                    Err(tuile_core::raster::RasterError::Fetch(tuile_core::fetch::FetchError::NotFound(_))) => {
+                    Err(tuile_core::raster::RasterError::Fetch(
+                        tuile_core::fetch::FetchError::NotFound(_),
+                    )) => {
                         done.absent += 1;
                     }
                     // Anything else is a tile the reference should have and
                     // does not: a measure taken without it would be a
                     // measure against a hole.
-                    Err(e) => return Err(GlobeError::Imagery(format!("reference {asset} tile {coord:?}: {e}"))),
+                    Err(e) => {
+                        return Err(GlobeError::Imagery(format!(
+                            "reference {asset} tile {coord:?}: {e}"
+                        )))
+                    }
                 }
             }
         }
@@ -659,12 +716,27 @@ mod tests {
         async fn terrain(
             &self,
             asset: i64,
-        ) -> Result<(tuile_terrain::LayerJson, Arc<dyn tuile_terrain::TerrainSource>), String> {
-            self.0.lock().expect("lock").push(format!("terrain {asset}"));
+        ) -> Result<
+            (
+                tuile_terrain::LayerJson,
+                Arc<dyn tuile_terrain::TerrainSource>,
+            ),
+            String,
+        > {
+            self.0
+                .lock()
+                .expect("lock")
+                .push(format!("terrain {asset}"));
             Err("no terrain here".into())
         }
-        async fn imagery(&self, asset: i64) -> Result<Arc<dyn tuile_core::raster::ImageryProvider>, String> {
-            self.0.lock().expect("lock").push(format!("imagery {asset}"));
+        async fn imagery(
+            &self,
+            asset: i64,
+        ) -> Result<Arc<dyn tuile_core::raster::ImageryProvider>, String> {
+            self.0
+                .lock()
+                .expect("lock")
+                .push(format!("imagery {asset}"));
             Err("no imagery here".into())
         }
     }
@@ -682,7 +754,10 @@ mod tests {
             Err(other) => panic!("wrong error: {other:?}"),
             Ok(_) => panic!("a globe out of sources that have nothing"),
         }
-        assert_eq!(*asked.0.lock().expect("lock"), [format!("terrain {CESIUM_WORLD_TERRAIN}")]);
+        assert_eq!(
+            *asked.0.lock().expect("lock"),
+            [format!("terrain {CESIUM_WORLD_TERRAIN}")]
+        );
     }
 
     /// A reference imagery is asked of the host's sources too, by its asset.

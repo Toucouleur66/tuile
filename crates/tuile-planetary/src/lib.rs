@@ -1605,6 +1605,16 @@ where
     (tree, loader, detail, heights)
 }
 
+/// What [`globe_with_provenance`] hands back: [`globe_on`]'s four, and the
+/// provenance record the loader fills.
+pub type GlobeWithProvenance = (
+    Box<dyn TileTree>,
+    Arc<dyn TileLoader>,
+    ImageryDetail,
+    Arc<TerrainHeights>,
+    Arc<Provenance>,
+);
+
 /// [`globe_on`], with the record of what each tile is made from: for a
 /// consumer that will want to build the same tiles again from the same
 /// source tiles, and so has to know which they were.
@@ -1614,13 +1624,7 @@ pub fn globe_with_provenance<T, I>(
     layer: LayerJson,
     opts: GlobeOptions,
     offload: Arc<dyn Offload>,
-) -> (
-    Box<dyn TileTree>,
-    Arc<dyn TileLoader>,
-    ImageryDetail,
-    Arc<TerrainHeights>,
-    Arc<Provenance>,
-)
+) -> GlobeWithProvenance
 where
     T: TerrainSource + 'static,
     I: ImageryProvider + 'static,

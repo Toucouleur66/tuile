@@ -86,8 +86,18 @@ pub fn bounds(grid: Grid, level: u8, x: u32, y: u32) -> [f64; 4] {
         Grid::WebMercator => {
             let n = f64::from(1u32 << level.min(31));
             let lon = |x: f64| x / n * 360.0 - 180.0;
-            let lat = |y: f64| (std::f64::consts::PI * (1.0 - 2.0 * y / n)).sinh().atan().to_degrees();
-            [lon(f64::from(x)), lat(f64::from(y) + 1.0), lon(f64::from(x) + 1.0), lat(f64::from(y))]
+            let lat = |y: f64| {
+                (std::f64::consts::PI * (1.0 - 2.0 * y / n))
+                    .sinh()
+                    .atan()
+                    .to_degrees()
+            };
+            [
+                lon(f64::from(x)),
+                lat(f64::from(y) + 1.0),
+                lon(f64::from(x) + 1.0),
+                lat(f64::from(y)),
+            ]
         }
         // Geographic tiles count from the south-west, 2 × 1 at level 0.
         Grid::Geographic => {
@@ -113,13 +123,18 @@ impl Footprint {
         let mut kept: Vec<Eye> = Vec::new();
         for e in eyes {
             let near = kept.iter().any(|k| {
-                (k.height - e.height).abs() < EYE_SPACING_M && distance(k.lon, k.lat, e.lon, e.lat) < EYE_SPACING_M
+                (k.height - e.height).abs() < EYE_SPACING_M
+                    && distance(k.lon, k.lat, e.lon, e.lat) < EYE_SPACING_M
             });
             if !near {
                 kept.push(e);
             }
         }
-        Self { eyes: kept, tile_factor, layer_factors: Vec::new() }
+        Self {
+            eyes: kept,
+            tile_factor,
+            layer_factors: Vec::new(),
+        }
     }
 
     /// Uses `factor` for the layer `name` (and its absence sibling).
@@ -130,8 +145,13 @@ impl Footprint {
 
     /// The factor a layer is filtered with.
     pub fn factor_for(&self, layer: &str) -> f64 {
-        let base = layer.strip_suffix(crate::catalog::ABSENT_SUFFIX).unwrap_or(layer);
-        self.layer_factors.iter().find(|(n, _)| n == base).map_or(self.tile_factor, |(_, f)| *f)
+        let base = layer
+            .strip_suffix(crate::catalog::ABSENT_SUFFIX)
+            .unwrap_or(layer);
+        self.layer_factors
+            .iter()
+            .find(|(n, _)| n == base)
+            .map_or(self.tile_factor, |(_, f)| *f)
     }
 
     pub fn eyes(&self) -> &[Eye] {
@@ -164,7 +184,9 @@ impl Footprint {
     /// Whether some tile of the zone could be kept: the zone's own extent
     /// within the horizon of an eye.
     fn reaches(&self, layer: &Layer, zone: Zone) -> bool {
-        let Zone::Cell { x, y } = zone else { return true };
+        let Zone::Cell { x, y } = zone else {
+            return true;
+        };
         let [w, s, e, n] = bounds(layer.grid, layer.zone_level, x, y);
         self.eyes.iter().any(|eye| {
             let ground = distance(eye.lon, eye.lat, eye.lon.clamp(w, e), eye.lat.clamp(s, n));
@@ -198,13 +220,21 @@ pub fn projection_path(dir: &FsPath, layer: &Layer, zone: Zone) -> PathBuf {
 impl TileStore {
     /// Projects every remote zone the footprint reaches into `dir`, and reads
     /// through those projections from now on.
-    pub async fn project(&self, footprint: &Footprint, dir: &FsPath) -> Result<ProjectionReport, StoreError> {
+    pub async fn project(
+        &self,
+        footprint: &Footprint,
+        dir: &FsPath,
+    ) -> Result<ProjectionReport, StoreError> {
         let began = Instant::now();
         let zones: Vec<(String, Zone)> = self
             .zones()
             .await?
             .into_iter()
-            .filter(|(l, z)| self.layer(l).map(|l| footprint.reaches(l, *z)).unwrap_or(false))
+            .filter(|(l, z)| {
+                self.layer(l)
+                    .map(|l| footprint.reaches(l, *z))
+                    .unwrap_or(false)
+            })
             .collect();
         let results: Vec<Result<ProjectionReport, StoreError>> = futures_util::stream::iter(zones)
             .map(|(layer, zone)| async move { self.project_zone(dir, &layer, zone).await })
@@ -232,10 +262,20 @@ impl TileStore {
         zone: Zone,
     ) -> Result<ProjectionReport, StoreError> {
         let layer = self.layer(layer_name)?.clone();
-        let mut report = ProjectionReport { zones_seen: 1, ..Default::default() };
+        let mut report = ProjectionReport {
+            zones_seen: 1,
+            ..Default::default()
+        };
         let now = self.now();
-        let m = manifest::read(self.object_store().as_ref(), &layer.zone_prefix(zone)).await?.manifest;
-        let archives: Vec<_> = m.archives.iter().filter(|a| !layer.is_expired(&a.epoch, now)).cloned().collect();
+        let m = manifest::read(self.object_store().as_ref(), &layer.zone_prefix(zone))
+            .await?
+            .manifest;
+        let archives: Vec<_> = m
+            .archives
+            .iter()
+            .filter(|a| !layer.is_expired(&a.epoch, now))
+            .cloned()
+            .collect();
 
         // Newest first: the first archive to hold a tile wins it. Each archive
         // comes down in one request, then is read locally.
@@ -285,10 +325,12 @@ impl TileStore {
         let epoch = archives.last().map(|a| a.epoch.clone()).unwrap_or_default();
         let zooms = archive::zoom_range(tiles.keys());
         let l = layer.clone();
-        let file = tokio::task::spawn_blocking(move || archive::write(&l, &epoch, zooms, tiles.into_iter().map(Ok)))
-            .await
-            .map_err(|e| StoreError::Corrupt(format!("projection writer: {e}")))??
-            .0;
+        let file = tokio::task::spawn_blocking(move || {
+            archive::write(&l, &epoch, zooms, tiles.into_iter().map(Ok))
+        })
+        .await
+        .map_err(|e| StoreError::Corrupt(format!("projection writer: {e}")))??
+        .0;
         file.persist(&path).map_err(|e| StoreError::Io(e.error))?;
         self.attach_projection(&layer, zone, &path).await?;
         Ok(report)
@@ -311,32 +353,65 @@ mod tests {
     #[test]
     fn geographic_bounds_count_from_the_south_west() {
         assert_eq!(bounds(Grid::Geographic, 0, 1, 0), [0.0, -90.0, 180.0, 90.0]);
-        assert_eq!(bounds(Grid::Geographic, 1, 0, 1), [-180.0, 0.0, -90.0, 90.0]);
+        assert_eq!(
+            bounds(Grid::Geographic, 1, 0, 1),
+            [-180.0, 0.0, -90.0, 90.0]
+        );
     }
 
     #[test]
     fn fine_tiles_are_kept_only_near_the_eye() {
         // An eye 1 km above the Pyrenees near Luchon.
-        let fp = Footprint::from_eyes([Eye { lon: 0.6, lat: 42.8, height: 5_800.0 }], DEFAULT_TILE_FACTOR);
+        let fp = Footprint::from_eyes(
+            [Eye {
+                lon: 0.6,
+                lat: 42.8,
+                height: 5_800.0,
+            }],
+            DEFAULT_TILE_FACTOR,
+        );
         let tile = |z: u8, lon: f64, lat: f64| {
             let n = f64::from(1u32 << z);
             let x = ((lon + 180.0) / 360.0 * n) as u32;
-            let y = ((1.0 - (lat.to_radians().tan() + 1.0 / lat.to_radians().cos()).ln() / std::f64::consts::PI) / 2.0 * n) as u32;
+            let y = ((1.0
+                - (lat.to_radians().tan() + 1.0 / lat.to_radians().cos()).ln()
+                    / std::f64::consts::PI)
+                / 2.0
+                * n) as u32;
             (x, y)
         };
         let (x, y) = tile(17, 0.6, 42.8);
-        assert!(fp.keeps(Grid::WebMercator, 17, x, y), "the tile under the eye");
+        assert!(
+            fp.keeps(Grid::WebMercator, 17, x, y),
+            "the tile under the eye"
+        );
         let (x, y) = tile(17, 1.6, 42.8);
-        assert!(!fp.keeps(Grid::WebMercator, 17, x, y), "a z17 tile 80 km away");
+        assert!(
+            !fp.keeps(Grid::WebMercator, 17, x, y),
+            "a z17 tile 80 km away"
+        );
         let (x, y) = tile(10, 1.6, 42.8);
-        assert!(fp.keeps(Grid::WebMercator, 10, x, y), "a z10 tile 80 km away");
-        assert!(fp.keeps(Grid::WebMercator, 0, 0, 0), "the whole world at z0");
+        assert!(
+            fp.keeps(Grid::WebMercator, 10, x, y),
+            "a z10 tile 80 km away"
+        );
+        assert!(
+            fp.keeps(Grid::WebMercator, 0, 0, 0),
+            "the whole world at z0"
+        );
     }
 
     #[test]
     fn a_layer_can_have_its_own_factor_and_its_absences_follow_it() {
-        let fp = Footprint::from_eyes([Eye { lon: 0.6, lat: 42.8, height: 5_800.0 }], 12.0)
-            .with_layer_factor("imagery", 96.0);
+        let fp = Footprint::from_eyes(
+            [Eye {
+                lon: 0.6,
+                lat: 42.8,
+                height: 5_800.0,
+            }],
+            12.0,
+        )
+        .with_layer_factor("imagery", 96.0);
         assert_eq!(fp.factor_for("terrain"), 12.0);
         assert_eq!(fp.factor_for("imagery"), 96.0);
         assert_eq!(fp.factor_for("imagery.absent"), 96.0);
@@ -344,18 +419,30 @@ mod tests {
         let n = f64::from(1u32 << 17);
         let lat = 42.8f64.to_radians();
         let x = ((0.85 + 180.0) / 360.0 * n) as u32;
-        let y = ((1.0 - (lat.tan() + 1.0 / lat.cos()).ln() / std::f64::consts::PI) / 2.0 * n) as u32;
+        let y =
+            ((1.0 - (lat.tan() + 1.0 / lat.cos()).ln() / std::f64::consts::PI) / 2.0 * n) as u32;
         assert!(!fp.keeps_with(fp.factor_for("terrain"), Grid::WebMercator, 17, x, y));
         assert!(fp.keeps_with(fp.factor_for("imagery"), Grid::WebMercator, 17, x, y));
     }
 
     #[test]
     fn a_high_eye_does_not_keep_the_finest_tiles_under_it() {
-        let fp = Footprint::from_eyes([Eye { lon: 0.6, lat: 42.8, height: 50_000.0 }], DEFAULT_TILE_FACTOR);
+        let fp = Footprint::from_eyes(
+            [Eye {
+                lon: 0.6,
+                lat: 42.8,
+                height: 50_000.0,
+            }],
+            DEFAULT_TILE_FACTOR,
+        );
         let n = f64::from(1u32 << 19);
         let x = ((0.6 + 180.0) / 360.0 * n) as u32;
         let lat = 42.8f64.to_radians();
-        let y = ((1.0 - (lat.tan() + 1.0 / lat.cos()).ln() / std::f64::consts::PI) / 2.0 * n) as u32;
-        assert!(!fp.keeps(Grid::WebMercator, 19, x, y), "a z19 tile is 45 km below the eye");
+        let y =
+            ((1.0 - (lat.tan() + 1.0 / lat.cos()).ln() / std::f64::consts::PI) / 2.0 * n) as u32;
+        assert!(
+            !fp.keeps(Grid::WebMercator, 19, x, y),
+            "a z19 tile is 45 km below the eye"
+        );
     }
 }

@@ -27,7 +27,10 @@ use tuile_farm::launch::{tuile, CommonArgs, Farm};
 use tuile_farm::ObjectRunStore;
 
 #[derive(Parser)]
-#[command(name = "tuile-launch-job", about = "Bake and render the engine's scenes on the farm")]
+#[command(
+    name = "tuile-launch-job",
+    about = "Bake and render the engine's scenes on the farm"
+)]
 struct Cli {
     #[command(subcommand)]
     verb: Verb,
@@ -53,14 +56,24 @@ enum Verb {
 
 fn farm() -> Result<Farm, String> {
     let project = std::env::var("TUILE_GCP_PROJECT").map_err(|_| {
-        "TUILE_GCP_PROJECT is not set: the Google Cloud project that runs the render jobs".to_string()
+        "TUILE_GCP_PROJECT is not set: the Google Cloud project that runs the render jobs"
+            .to_string()
     })?;
     let region = std::env::var("TUILE_GCP_REGION").unwrap_or_else(|_| "europe-west1".into());
     let transport = Arc::new(HttpTransport::new().map_err(|e| e.to_string())?);
     let tokens = default_tokens().map_err(|e| e.to_string())?;
-    let jobs = JobsApi::new(transport, tokens, "https://run.googleapis.com/v2", &project, &region);
+    let jobs = JobsApi::new(
+        transport,
+        tokens,
+        "https://run.googleapis.com/v2",
+        &project,
+        &region,
+    );
     let store = ObjectRunStore::from_env().map_err(|e| e.to_string())?;
-    Ok(Farm { jobs, store: Arc::new(store) })
+    Ok(Farm {
+        jobs,
+        store: Arc::new(store),
+    })
 }
 
 /// `videos/` at the root of the checkout: a film that only lives in `/tmp` is

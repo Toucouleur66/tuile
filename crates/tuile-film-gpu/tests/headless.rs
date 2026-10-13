@@ -396,7 +396,9 @@ fn a_drape_composed_on_the_gpu_is_the_bakes() {
     // quarters, with a quarter the floor alone covers; placements that land
     // between texels, so the filtering is exercised and not only the masks.
     let side = 96u32;
-    let stack: [(u32, u32, [f32; 4], [f32; 2], [f32; 2]); 4] = [
+    /// A layer: texels a side, noise seed, coverage, translation, scale.
+    type Layer = (u32, u32, [f32; 4], [f32; 2], [f32; 2]);
+    let stack: [Layer; 4] = [
         (16, 1, [0.0, 0.0, 1.0, 1.0], [0.21, 0.37], [0.4, 0.33]),
         (32, 2, [0.0, 0.0, 0.5, 0.5], [0.0, 0.0], [2.0, 2.0]),
         (32, 3, [0.5, 0.0, 1.0, 0.5], [-1.0, 0.0], [2.0, 2.0]),
@@ -660,10 +662,8 @@ fn a_layer_is_composed_through_a_field_carried_by_its_corners() {
     let grey = 60u8;
     let came = linear(f32::from(grey)).log2();
     let mut lifted = [[0.0f32; 8]; 3];
-    for curve in &mut lifted {
-        // The same lift at every point: whatever the light, a stop.
-        *curve = [1.0; 8];
-    }
+    // The same lift at every point: whatever the light, a stop.
+    lifted.fill([1.0; 8]);
     assert!(
         (-8.0..=-1.0).contains(&came),
         "the grey is within the curve"

@@ -90,7 +90,11 @@ pub(crate) enum Command {
     CopyLink,
     /// Go where the link on the clipboard says, if it holds one.
     PasteLink,
-    /// Show the keys and the flags, in a window.
+    /// Show the keys and the flags, in a window: from the menu bar.
+    #[cfg_attr(
+        not(all(target_os = "macos", feature = "application")),
+        allow(dead_code)
+    )]
     ShowKeys,
 }
 

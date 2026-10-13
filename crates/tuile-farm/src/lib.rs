@@ -59,7 +59,11 @@ pub enum StoreError {
     /// The bytes that arrived are not the bytes that were promised: a short
     /// read, a size that changed underneath a download.
     #[error("{key}: expected {expected} bytes, got {got}")]
-    Truncated { key: String, expected: u64, got: u64 },
+    Truncated {
+        key: String,
+        expected: u64,
+        got: u64,
+    },
     #[error("configuration: {0}")]
     Config(String),
     #[error("{key}: {source}")]
@@ -80,12 +84,18 @@ impl StoreError {
     fn store(key: &str, source: object_store::Error) -> Self {
         match source {
             object_store::Error::NotFound { .. } => StoreError::NotFound(key.to_string()),
-            source => StoreError::Store { key: key.to_string(), source },
+            source => StoreError::Store {
+                key: key.to_string(),
+                source,
+            },
         }
     }
 
     fn io(path: &Path, source: std::io::Error) -> Self {
-        StoreError::Io { path: path.to_path_buf(), source }
+        StoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
     }
 }
 
@@ -142,7 +152,10 @@ pub struct Tuning {
 
 impl Default for Tuning {
     fn default() -> Self {
-        Tuning { part_bytes: 16 << 20, concurrency: 16 }
+        Tuning {
+            part_bytes: 16 << 20,
+            concurrency: 16,
+        }
     }
 }
 
@@ -225,8 +238,8 @@ impl ObjectRunStore {
     /// A directory, created if absent.
     pub fn local(root: &Path, tuning: Tuning) -> Result<Self> {
         std::fs::create_dir_all(root).map_err(|e| StoreError::io(root, e))?;
-        let store =
-            LocalFileSystem::new_with_prefix(root).map_err(|e| StoreError::Config(e.to_string()))?;
+        let store = LocalFileSystem::new_with_prefix(root)
+            .map_err(|e| StoreError::Config(e.to_string()))?;
         Ok(ObjectRunStore {
             store: Arc::new(store),
             tuning,
@@ -275,17 +288,28 @@ impl ObjectRunStore {
     /// walks everything below a prefix, which on a large bucket is millions.
     pub async fn browse(&self, prefix: &str) -> Result<(Vec<String>, Vec<Entry>)> {
         let prefix = prefix.trim_matches('/');
-        let path = if prefix.is_empty() { None } else { Some(key_path(prefix)?) };
+        let path = if prefix.is_empty() {
+            None
+        } else {
+            Some(key_path(prefix)?)
+        };
         let listed = self
             .store
             .list_with_delimiter(path.as_ref())
             .await
             .map_err(|e| StoreError::store(prefix, e))?;
-        let mut dirs: Vec<String> = listed.common_prefixes.iter().map(|p| p.to_string()).collect();
+        let mut dirs: Vec<String> = listed
+            .common_prefixes
+            .iter()
+            .map(|p| p.to_string())
+            .collect();
         let mut files: Vec<Entry> = listed
             .objects
             .into_iter()
-            .map(|meta| Entry { key: meta.location.to_string(), size: meta.size })
+            .map(|meta| Entry {
+                key: meta.location.to_string(),
+                size: meta.size,
+            })
             .collect();
         dirs.sort();
         files.sort_by(|a, b| a.key.cmp(&b.key));
@@ -342,14 +366,18 @@ impl ObjectRunStore {
     ) -> Result<()> {
         let size = meta.size;
         let part = self.tuning.part_bytes as u64;
-        let mut file = tokio::fs::File::create(tmp).await.map_err(|e| StoreError::io(tmp, e))?;
+        let mut file = tokio::fs::File::create(tmp)
+            .await
+            .map_err(|e| StoreError::io(tmp, e))?;
 
         // Every range is read against the ETag the HEAD returned. An object
         // replaced halfway through a download would otherwise stitch the first
         // half of one pack onto the second half of another, both the right
         // size — a corruption nothing downstream could see.
-        let ranges: Vec<Range<u64>> =
-            (0..size).step_by(part.max(1) as usize).map(|s| s..(s + part).min(size)).collect();
+        let ranges: Vec<Range<u64>> = (0..size)
+            .step_by(part.max(1) as usize)
+            .map(|s| s..(s + part).min(size))
+            .collect();
         let e_tag = meta.e_tag.clone();
         // `buffered`, not `buffer_unordered`: parts arrive in order, so the
         // file is written front to back with at most `concurrency` parts in
@@ -382,13 +410,19 @@ impl ObjectRunStore {
                     got: written + bytes.len() as u64,
                 });
             }
-            file.write_all(&bytes).await.map_err(|e| StoreError::io(tmp, e))?;
+            file.write_all(&bytes)
+                .await
+                .map_err(|e| StoreError::io(tmp, e))?;
             written += bytes.len() as u64;
         }
         file.flush().await.map_err(|e| StoreError::io(tmp, e))?;
         file.sync_all().await.map_err(|e| StoreError::io(tmp, e))?;
         if written != size {
-            return Err(StoreError::Truncated { key: key.to_string(), expected: size, got: written });
+            return Err(StoreError::Truncated {
+                key: key.to_string(),
+                expected: size,
+                got: written,
+            });
         }
         Ok(())
     }
@@ -401,14 +435,21 @@ fn key_path(key: &str) -> Result<ObjectPath> {
 /// `dest` with `.part` appended, in the same directory so the rename is
 /// atomic.
 fn partial_path(dest: &Path) -> PathBuf {
-    let mut name = dest.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    let mut name = dest
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
     name.push(".part");
     dest.with_file_name(name)
 }
 
 fn rate(bytes: u64, started: Instant) -> String {
     let secs = started.elapsed().as_secs_f64().max(1e-3);
-    format!("{:.1} MB in {secs:.1} s ({:.0} MB/s)", bytes as f64 / 1e6, bytes as f64 / 1e6 / secs)
+    format!(
+        "{:.1} MB in {secs:.1} s ({:.0} MB/s)",
+        bytes as f64 / 1e6,
+        bytes as f64 / 1e6 / secs
+    )
 }
 
 #[async_trait]
@@ -416,10 +457,16 @@ impl RunStore for ObjectRunStore {
     async fn get(&self, key: &str, dest: &Path) -> Result<u64> {
         let started = Instant::now();
         let path = key_path(key)?;
-        let meta = self.store.head(&path).await.map_err(|e| StoreError::store(key, e))?;
+        let meta = self
+            .store
+            .head(&path)
+            .await
+            .map_err(|e| StoreError::store(key, e))?;
         let tmp = partial_path(dest);
         if let Some(dir) = dest.parent().filter(|d| !d.as_os_str().is_empty()) {
-            tokio::fs::create_dir_all(dir).await.map_err(|e| StoreError::io(dir, e))?;
+            tokio::fs::create_dir_all(dir)
+                .await
+                .map_err(|e| StoreError::io(dir, e))?;
         }
         let result = self.download(key, &path, &meta, &tmp).await;
         if result.is_err() {
@@ -427,38 +474,55 @@ impl RunStore for ObjectRunStore {
             let _ = tokio::fs::remove_file(&tmp).await;
         }
         result?;
-        tokio::fs::rename(&tmp, dest).await.map_err(|e| StoreError::io(dest, e))?;
+        tokio::fs::rename(&tmp, dest)
+            .await
+            .map_err(|e| StoreError::io(dest, e))?;
         eprintln!("GET {key} ← {}: {}", self.label, rate(meta.size, started));
         Ok(meta.size)
     }
 
     async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Bytes> {
-        self.store.get_range(&key_path(key)?, range).await.map_err(|e| StoreError::store(key, e))
+        self.store
+            .get_range(&key_path(key)?, range)
+            .await
+            .map_err(|e| StoreError::store(key, e))
     }
 
     async fn put(&self, src: &Path, key: &str) -> Result<u64> {
         let started = Instant::now();
         let path = key_path(key)?;
-        let size = tokio::fs::metadata(src).await.map_err(|e| StoreError::io(src, e))?.len();
+        let size = tokio::fs::metadata(src)
+            .await
+            .map_err(|e| StoreError::io(src, e))?
+            .len();
         let part = self.tuning.part_bytes;
-        let mut file = tokio::fs::File::open(src).await.map_err(|e| StoreError::io(src, e))?;
+        let mut file = tokio::fs::File::open(src)
+            .await
+            .map_err(|e| StoreError::io(src, e))?;
 
         if size <= part as u64 {
             // One request is one request: multipart for a log tarball would
             // be three round trips to say the same thing.
             let mut data = Vec::with_capacity(size as usize);
-            file.read_to_end(&mut data).await.map_err(|e| StoreError::io(src, e))?;
+            file.read_to_end(&mut data)
+                .await
+                .map_err(|e| StoreError::io(src, e))?;
             self.store
                 .put(&path, PutPayload::from(data))
                 .await
                 .map_err(|e| StoreError::store(key, e))?;
         } else {
-            let upload =
-                self.store.put_multipart(&path).await.map_err(|e| StoreError::store(key, e))?;
+            let upload = self
+                .store
+                .put_multipart(&path)
+                .await
+                .map_err(|e| StoreError::store(key, e))?;
             let mut writer = WriteMultipart::new_with_chunk_size(upload, part);
             let mut buf = vec![0u8; part];
             loop {
-                let n = read_full(&mut file, &mut buf).await.map_err(|e| StoreError::io(src, e))?;
+                let n = read_full(&mut file, &mut buf)
+                    .await
+                    .map_err(|e| StoreError::io(src, e))?;
                 if n == 0 {
                     break;
                 }
@@ -470,7 +534,10 @@ impl RunStore for ObjectRunStore {
                 }
                 writer.write(&buf[..n]);
             }
-            writer.finish().await.map_err(|e| StoreError::store(key, e))?;
+            writer
+                .finish()
+                .await
+                .map_err(|e| StoreError::store(key, e))?;
         }
         eprintln!("PUT {key} → {}: {}", self.label, rate(size, started));
         Ok(size)
@@ -481,7 +548,10 @@ impl RunStore for ObjectRunStore {
         let mut entries: Vec<Entry> = self
             .store
             .list(Some(&path))
-            .map_ok(|meta| Entry { key: meta.location.to_string(), size: meta.size })
+            .map_ok(|meta| Entry {
+                key: meta.location.to_string(),
+                size: meta.size,
+            })
             .try_collect()
             .await
             .map_err(|e| StoreError::store(prefix, e))?;
@@ -525,7 +595,9 @@ pub async fn assert_run_store_contract(store: &dyn RunStore, prefix: &str, part_
     let make = |name: &str, len: usize| {
         // Not a repeating pattern: a part written at the wrong offset must
         // change the bytes, not just move identical ones around.
-        let data: Vec<u8> = (0..len).map(|i| ((i * 2_654_435_761) >> 13) as u8).collect();
+        let data: Vec<u8> = (0..len)
+            .map(|i| ((i * 2_654_435_761) >> 13) as u8)
+            .collect();
         let path = work.path().join(name);
         std::fs::write(&path, &data).expect("write fixture");
         (path, data)
@@ -533,48 +605,109 @@ pub async fn assert_run_store_contract(store: &dyn RunStore, prefix: &str, part_
 
     // Sizes around the part boundary, including the empty file and a last
     // part shorter than the others.
-    let sizes = [0, 1, part_bytes - 1, part_bytes, part_bytes + 1, 3 * part_bytes + 7];
+    let sizes = [
+        0,
+        1,
+        part_bytes - 1,
+        part_bytes,
+        part_bytes + 1,
+        3 * part_bytes + 7,
+    ];
     for (i, len) in sizes.iter().enumerate() {
         let (src, data) = make(&format!("in{i}"), *len);
         let key = format!("{prefix}/obj{i}.bin");
-        assert_eq!(store.put(&src, &key).await.expect("put"), *len as u64, "put size of {len}");
+        assert_eq!(
+            store.put(&src, &key).await.expect("put"),
+            *len as u64,
+            "put size of {len}"
+        );
         let dest = work.path().join(format!("out{i}"));
-        assert_eq!(store.get(&key, &dest).await.expect("get"), *len as u64, "get size of {len}");
+        assert_eq!(
+            store.get(&key, &dest).await.expect("get"),
+            *len as u64,
+            "get size of {len}"
+        );
         let back = std::fs::read(&dest).expect("read back");
-        assert!(back == data, "round trip of {len} bytes changed the content");
-        assert!(!partial_path(&dest).exists(), "a completed get left its .part behind");
+        assert!(
+            back == data,
+            "round trip of {len} bytes changed the content"
+        );
+        assert!(
+            !partial_path(&dest).exists(),
+            "a completed get left its .part behind"
+        );
     }
 
     // A range inside, and a range across a part boundary.
     let big = format!("{prefix}/obj5.bin");
     let (_, data) = make("again", 3 * part_bytes + 7);
     let across = (part_bytes as u64 - 3)..(part_bytes as u64 + 5);
-    let got = store.get_range(&big, across.clone()).await.expect("get_range");
-    assert_eq!(&got[..], &data[across.start as usize..across.end as usize], "get_range bytes");
+    let got = store
+        .get_range(&big, across.clone())
+        .await
+        .expect("get_range");
+    assert_eq!(
+        &got[..],
+        &data[across.start as usize..across.end as usize],
+        "get_range bytes"
+    );
 
     // Replacing an object replaces it — a shorter one included.
     let (short, short_data) = make("short", 3);
     store.put(&short, &big).await.expect("overwrite");
     let dest = work.path().join("short-back");
     store.get(&big, &dest).await.expect("get overwritten");
-    assert_eq!(std::fs::read(&dest).expect("read"), short_data, "overwrite kept old bytes");
+    assert_eq!(
+        std::fs::read(&dest).expect("read"),
+        short_data,
+        "overwrite kept old bytes"
+    );
 
     // Listing: everything under the prefix, sorted, with sizes; nothing from a
     // sibling that merely shares the prefix's first characters.
     let (_, _) = make("sibling", 1);
-    store.put(&work.path().join("sibling"), &format!("{prefix}x/stray.bin")).await.expect("put");
+    store
+        .put(
+            &work.path().join("sibling"),
+            &format!("{prefix}x/stray.bin"),
+        )
+        .await
+        .expect("put");
     let listed = store.list(prefix).await.expect("list");
     let keys: Vec<&str> = listed.iter().map(|e| e.key.as_str()).collect();
-    let expected: Vec<String> = (0..sizes.len()).map(|i| format!("{prefix}/obj{i}.bin")).collect();
-    assert_eq!(keys, expected.iter().map(String::as_str).collect::<Vec<_>>(), "list keys");
+    let expected: Vec<String> = (0..sizes.len())
+        .map(|i| format!("{prefix}/obj{i}.bin"))
+        .collect();
+    assert_eq!(
+        keys,
+        expected.iter().map(String::as_str).collect::<Vec<_>>(),
+        "list keys"
+    );
     assert_eq!(listed[1].size, 1, "list size");
     assert_eq!(listed[5].size, 3, "list size after overwrite");
 
-    assert!(store.exists(&big).await.expect("exists"), "exists on a present key");
-    assert!(!store.exists(&format!("{prefix}/absent")).await.expect("exists"), "exists on absent");
-    let missing = store.get(&format!("{prefix}/absent"), &work.path().join("never")).await;
-    assert!(matches!(missing, Err(StoreError::NotFound(_))), "get of absent key: {missing:?}");
-    assert!(!work.path().join("never").exists(), "a failed get left a file at dest");
+    assert!(
+        store.exists(&big).await.expect("exists"),
+        "exists on a present key"
+    );
+    assert!(
+        !store
+            .exists(&format!("{prefix}/absent"))
+            .await
+            .expect("exists"),
+        "exists on absent"
+    );
+    let missing = store
+        .get(&format!("{prefix}/absent"), &work.path().join("never"))
+        .await;
+    assert!(
+        matches!(missing, Err(StoreError::NotFound(_))),
+        "get of absent key: {missing:?}"
+    );
+    assert!(
+        !work.path().join("never").exists(),
+        "a failed get left a file at dest"
+    );
 }
 
 #[cfg(test)]
@@ -591,24 +724,44 @@ mod tests {
         std::fs::write(&src, b"a pack").expect("write");
         store.put(&src, "packs/a/1-9.tuilepack").await.expect("put");
         // On disk: under the prefix, and nowhere else.
-        assert!(root.path().join("_tests/trial/packs/a/1-9.tuilepack").is_file());
+        assert!(root
+            .path()
+            .join("_tests/trial/packs/a/1-9.tuilepack")
+            .is_file());
         assert!(!root.path().join("packs").exists());
         // Through the store: by its own key, the prefix unseen.
         assert!(store.exists("packs/a/1-9.tuilepack").await.expect("exists"));
-        let listed: Vec<String> =
-            store.list("packs").await.expect("list").into_iter().map(|e| e.key).collect();
+        let listed: Vec<String> = store
+            .list("packs")
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
         assert_eq!(listed, ["packs/a/1-9.tuilepack"]);
-        assert!(store.label().ends_with("under _tests/trial"), "{}", store.label());
+        assert!(
+            store.label().ends_with("under _tests/trial"),
+            "{}",
+            store.label()
+        );
         // No prefix, no change.
-        let same = ObjectRunStore::local(root.path(), Tuning::default()).expect("local").under("");
-        assert!(same.exists("_tests/trial/packs/a/1-9.tuilepack").await.expect("exists"));
+        let same = ObjectRunStore::local(root.path(), Tuning::default())
+            .expect("local")
+            .under("");
+        assert!(same
+            .exists("_tests/trial/packs/a/1-9.tuilepack")
+            .await
+            .expect("exists"));
     }
 
     #[tokio::test]
     async fn a_directory_keeps_the_contract() {
         let root = tempfile::tempdir().expect("tempdir");
         // Tiny parts, so the multipart and ranged paths run on small files.
-        let tuning = Tuning { part_bytes: 4096, concurrency: 3 };
+        let tuning = Tuning {
+            part_bytes: 4096,
+            concurrency: 3,
+        };
         let store = ObjectRunStore::local(root.path(), tuning).expect("local store");
         assert_run_store_contract(&store, "runs/r1", tuning.part_bytes).await;
     }

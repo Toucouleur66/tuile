@@ -212,12 +212,15 @@ pub struct ArchivedTiles {
     leaves: Mutex<HashMap<(String, u64), Arc<Directory>>>,
     /// Manifests read lately, by zone, with when: a film asks for thousands
     /// of tiles of a handful of zones.
-    manifests: Mutex<HashMap<String, (u64, Option<Arc<Manifest>>)>>,
+    manifests: Mutex<HashMap<String, HeldManifest>>,
     /// One lock per zone and per archive being read for the first time: a
     /// frame asks for many tiles of one zone at once, and they wait for one
     /// read of its manifest and of each archive's head.
     opening: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
 }
+
+/// A zone's manifest as read, with when: `None` if the zone has none.
+type HeldManifest = (u64, Option<Arc<Manifest>>);
 
 fn malformed(key: &str, what: impl std::fmt::Display) -> RepoError {
     RepoError::Malformed {

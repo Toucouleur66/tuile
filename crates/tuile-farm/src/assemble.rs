@@ -88,7 +88,11 @@ pub enum Outcome {
     /// Not every task has deposited its receipt yet.
     Waiting { done: usize, of: u32 },
     /// The film is up.
-    Assembled { key: String, frames: u64, bytes: u64 },
+    Assembled {
+        key: String,
+        frames: u64,
+        bytes: u64,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -137,7 +141,10 @@ pub async fn assemble(
 ) -> Result<Outcome, AssembleError> {
     let receipts = read_receipts(store, run).await?;
     if receipts.len() < task_count as usize {
-        return Ok(Outcome::Waiting { done: receipts.len(), of: task_count });
+        return Ok(Outcome::Waiting {
+            done: receipts.len(),
+            of: task_count,
+        });
     }
     let segments = check_receipts(&receipts, task_count)?;
     let expected: u64 = receipts.iter().map(Receipt::frames).sum();
@@ -158,7 +165,10 @@ pub async fn assemble(
 
     tokio::fs::create_dir_all(work)
         .await
-        .map_err(|source| AssembleError::Io { path: work.to_path_buf(), source })?;
+        .map_err(|source| AssembleError::Io {
+            path: work.to_path_buf(),
+            source,
+        })?;
     // Segments in parallel, each itself in parallel ranges: the store's own
     // concurrency bounds the parts in flight per segment, four segments at a
     // time bound the whole.
@@ -184,16 +194,22 @@ pub async fn assemble(
         crate::concat::check_cadence(probe, fps).map_err(AssembleError::Cadence)?;
     }
     let bytes = store.put(&film, &run.film()).await?;
-    Ok(Outcome::Assembled { key: run.film(), frames: got, bytes })
+    Ok(Outcome::Assembled {
+        key: run.film(),
+        frames: got,
+        bytes,
+    })
 }
 
 async fn read_receipts(store: &dyn RunStore, run: &RunKeys) -> Result<Vec<Receipt>, AssembleError> {
     let mut receipts = Vec::new();
     for entry in store.list(&run.receipts()).await? {
         let bytes = store.get_range(&entry.key, 0..entry.size).await?;
-        let receipt: Receipt = serde_json::from_slice(&bytes).map_err(|e| {
-            AssembleError::BadReceipt { key: entry.key.clone(), reason: e.to_string() }
-        })?;
+        let receipt: Receipt =
+            serde_json::from_slice(&bytes).map_err(|e| AssembleError::BadReceipt {
+                key: entry.key.clone(),
+                reason: e.to_string(),
+            })?;
         receipts.push(receipt);
     }
     receipts.sort_by_key(|r| r.task);
@@ -222,7 +238,12 @@ fn check_receipts(receipts: &[Receipt], task_count: u32) -> Result<Vec<u64>, Ass
         if r.last < r.first || r.segments.is_empty() {
             return Err(AssembleError::BadReceipt {
                 key: format!("tasks/{}.json", r.task),
-                reason: format!("frames {}:{} over {} segments", r.first, r.last, r.segments.len()),
+                reason: format!(
+                    "frames {}:{} over {} segments",
+                    r.first,
+                    r.last,
+                    r.segments.len()
+                ),
             });
         }
         if Some(r.first) != next {
@@ -253,7 +274,12 @@ mod tests {
     use super::*;
 
     fn receipt(task: u32, first: u64, last: u64, segments: &[u64]) -> Receipt {
-        Receipt { task, first, last, segments: segments.to_vec() }
+        Receipt {
+            task,
+            first,
+            last,
+            segments: segments.to_vec(),
+        }
     }
 
     #[test]
@@ -267,68 +293,95 @@ mod tests {
     #[test]
     fn a_gap_between_tasks_is_refused() {
         let r = [receipt(0, 1, 50, &[0]), receipt(1, 52, 100, &[1])];
-        assert!(matches!(check_receipts(&r, 2), Err(AssembleError::Discontinuous(52))));
+        assert!(matches!(
+            check_receipts(&r, 2),
+            Err(AssembleError::Discontinuous(52))
+        ));
     }
 
     #[test]
     fn a_missing_or_foreign_task_is_refused() {
         let r = [receipt(0, 1, 50, &[0]), receipt(2, 51, 100, &[1])];
-        assert!(matches!(check_receipts(&r, 2), Err(AssembleError::BadReceipt { .. })));
+        assert!(matches!(
+            check_receipts(&r, 2),
+            Err(AssembleError::BadReceipt { .. })
+        ));
     }
 
     #[tokio::test]
     async fn waits_until_every_receipt_is_in() {
         let root = tempfile::tempdir().expect("tempdir");
-        let store = crate::ObjectRunStore::local(root.path(), crate::Tuning::default())
-            .expect("store");
+        let store =
+            crate::ObjectRunStore::local(root.path(), crate::Tuning::default()).expect("store");
         let run = RunKeys::new("renders/r", "e1");
         let src = root.path().join("r0.json");
-        std::fs::write(&src, serde_json::to_vec(&receipt(0, 1, 5, &[0])).expect("json"))
-            .expect("write");
+        std::fs::write(
+            &src,
+            serde_json::to_vec(&receipt(0, 1, 5, &[0])).expect("json"),
+        )
+        .expect("write");
         store.put(&src, &run.receipt(0)).await.expect("put");
         let work = tempfile::tempdir().expect("tempdir");
-        let outcome = assemble(&store, &run, 2, work.path(), None).await.expect("assemble");
+        let outcome = assemble(&store, &run, 2, work.path(), None)
+            .await
+            .expect("assemble");
         assert_eq!(outcome, Outcome::Waiting { done: 1, of: 2 });
     }
 
     #[tokio::test]
     async fn another_renders_receipts_do_not_count() {
         let root = tempfile::tempdir().expect("tempdir");
-        let store = crate::ObjectRunStore::local(root.path(), crate::Tuning::default())
-            .expect("store");
+        let store =
+            crate::ObjectRunStore::local(root.path(), crate::Tuning::default()).expect("store");
         // An earlier render of the same run left receipts for tasks 0 and 1.
         let old = RunKeys::new("renders/r", "e0");
         let src = root.path().join("r.json");
         for t in 0..2 {
-            std::fs::write(&src, serde_json::to_vec(&receipt(t, 1, 5, &[0])).expect("json"))
-                .expect("write");
+            std::fs::write(
+                &src,
+                serde_json::to_vec(&receipt(t, 1, 5, &[0])).expect("json"),
+            )
+            .expect("write");
             store.put(&src, &old.receipt(t)).await.expect("put");
         }
         // This render has only task 1 in: it must wait, not assemble.
         let run = RunKeys::new("renders/r", "e1");
-        std::fs::write(&src, serde_json::to_vec(&receipt(1, 6, 9, &[1])).expect("json"))
-            .expect("write");
+        std::fs::write(
+            &src,
+            serde_json::to_vec(&receipt(1, 6, 9, &[1])).expect("json"),
+        )
+        .expect("write");
         store.put(&src, &run.receipt(1)).await.expect("put");
         let work = tempfile::tempdir().expect("tempdir");
-        let outcome = assemble(&store, &run, 2, work.path(), None).await.expect("assemble");
+        let outcome = assemble(&store, &run, 2, work.path(), None)
+            .await
+            .expect("assemble");
         assert_eq!(outcome, Outcome::Waiting { done: 1, of: 2 });
     }
 
     #[tokio::test]
     async fn an_empty_segment_is_refused_before_any_download() {
         let root = tempfile::tempdir().expect("tempdir");
-        let store = crate::ObjectRunStore::local(root.path(), crate::Tuning::default())
-            .expect("store");
+        let store =
+            crate::ObjectRunStore::local(root.path(), crate::Tuning::default()).expect("store");
         let run = RunKeys::new("renders/r", "e1");
         let src = root.path().join("r0.json");
-        std::fs::write(&src, serde_json::to_vec(&receipt(0, 1, 5, &[0])).expect("json"))
-            .expect("write");
+        std::fs::write(
+            &src,
+            serde_json::to_vec(&receipt(0, 1, 5, &[0])).expect("json"),
+        )
+        .expect("write");
         store.put(&src, &run.receipt(0)).await.expect("put");
         let seg = root.path().join("dead.mp4");
         std::fs::write(&seg, [0u8; 48]).expect("write");
         store.put(&seg, &run.segment(0)).await.expect("put");
         let work = tempfile::tempdir().expect("tempdir");
-        let err = assemble(&store, &run, 1, work.path(), None).await.expect_err("must refuse");
-        assert!(matches!(err, AssembleError::EmptySegment { size: 48, .. }), "{err}");
+        let err = assemble(&store, &run, 1, work.path(), None)
+            .await
+            .expect_err("must refuse");
+        assert!(
+            matches!(err, AssembleError::EmptySegment { size: 48, .. }),
+            "{err}"
+        );
     }
 }

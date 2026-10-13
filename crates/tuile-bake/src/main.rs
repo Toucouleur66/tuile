@@ -32,8 +32,10 @@
 //! blind to ground nobody selected. That is why the cull setting is written
 //! into the pack rather than merely applied: see `PackWriter::culling`.
 
-
-use tuile_bake::bake::{bake_frames, bake_settings, baked_tile, digest_of_scene, BakeFrames, PackedMirror, Poses, SceneName};
+use tuile_bake::bake::{
+    bake_frames, bake_settings, baked_tile, digest_of_scene, BakeFrames, PackedMirror, Poses,
+    SceneName,
+};
 use tuile_bake::tiles;
 use tuile_pack::BakedTile;
 
@@ -416,9 +418,15 @@ fn parse_args() -> Result<Job, String> {
             "--accept-drift" => accept_drift = true,
             "--reference" => reference = Some(std::path::PathBuf::from(value()?)),
             "--reference-asset" => {
-                reference_asset = value()?.parse().map_err(|_| "--reference-asset wants an ion asset id")?
+                reference_asset = value()?
+                    .parse()
+                    .map_err(|_| "--reference-asset wants an ion asset id")?
             }
-            "--reference-cap" => reference_cap = value()?.parse().map_err(|_| "--reference-cap wants a level")?,
+            "--reference-cap" => {
+                reference_cap = value()?
+                    .parse()
+                    .map_err(|_| "--reference-cap wants a level")?
+            }
             "--sse" => {
                 let v: f64 = value()?.parse().map_err(|_| "--sse wants a number")?;
                 // Fini ET positif : `NaN` passerait un simple `<= 0.0`, et un
@@ -445,7 +453,11 @@ fn parse_args() -> Result<Job, String> {
         return Ok(Job::Dump { pack, frame });
     }
     if let Some(pack) = reference {
-        return Ok(Job::Reference { pack, asset: reference_asset, cap: reference_cap });
+        return Ok(Job::Reference {
+            pack,
+            asset: reference_asset,
+            cap: reference_cap,
+        });
     }
     if let Some(pack) = verify {
         return Ok(Job::Verify {
@@ -569,19 +581,29 @@ fn reference(path: &std::path::Path, asset: i64, cap: u32) -> Result<(), String>
         use std::io::Read;
         let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut head = vec![0u8; tuile_pack::PREAMBLE];
-        file.read_exact(&mut head).map_err(|e| format!("{}: {e}", path.display()))?;
-        let start = tuile_pack::blob_start(&head).map_err(|e| format!("{}: {e}", path.display()))?;
+        file.read_exact(&mut head)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let start =
+            tuile_pack::blob_start(&head).map_err(|e| format!("{}: {e}", path.display()))?;
         head.resize(start as usize, 0);
-        file.read_exact(&mut head[tuile_pack::PREAMBLE..]).map_err(|e| format!("{}: {e}", path.display()))?;
+        file.read_exact(&mut head[tuile_pack::PREAMBLE..])
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         head
     };
-    let pack = tuile_pack::Pack::open_table(&head).map_err(|e| format!("{}: {e}", path.display()))?;
-    let (_, imagery_layer) = pack
-        .store_layers()
-        .ok_or_else(|| format!("{}: a pack of no reference names no imagery to bring a reference under", path.display()))?;
+    let pack =
+        tuile_pack::Pack::open_table(&head).map_err(|e| format!("{}: {e}", path.display()))?;
+    let (_, imagery_layer) = pack.store_layers().ok_or_else(|| {
+        format!(
+            "{}: a pack of no reference names no imagery to bring a reference under",
+            path.display()
+        )
+    })?;
     let film = pack.imagery_tiles();
     if film.is_empty() {
-        return Err(format!("{}: the pack refers to no imagery tile", path.display()));
+        return Err(format!(
+            "{}: the pack refers to no imagery tile",
+            path.display()
+        ));
     }
     let layer = tuile_bake::source_namespace(asset);
 
@@ -606,7 +628,11 @@ fn reference(path: &std::path::Path, asset: i64, cap: u32) -> Result<(), String>
     let (tile_type, content_type) = match reference.extension.as_str() {
         "jpg" | "jpeg" => ("jpeg", "image/jpeg"),
         "png" => ("png", "image/png"),
-        other => return Err(format!("the reference serves .{other} tiles, which the store has no name for")),
+        other => {
+            return Err(format!(
+                "the reference serves .{other} tiles, which the store has no name for"
+            ))
+        }
     };
     let store = tiles::Tiles::from_env_with(Some(tuile_tile_server::LayerDef {
         name: layer.clone(),
@@ -633,16 +659,43 @@ fn reference(path: &std::path::Path, asset: i64, cap: u32) -> Result<(), String>
     let scheme = reference.scheme;
     let mut wanted = std::collections::BTreeSet::new();
     for (level, x, y) in film.keys() {
-        let coord = ImageryCoord { level: u32::from(*level), x: u64::from(*x), y: u64::from(*y) };
+        let coord = ImageryCoord {
+            level: u32::from(*level),
+            x: u64::from(*x),
+            y: u64::from(*y),
+        };
         let rect = own.tile_rect(coord);
-        let as_wide = own.tile_rect(ImageryCoord { level: coord.level.min(cap), x: 0, y: 0 }).width();
+        let as_wide = own
+            .tile_rect(ImageryCoord {
+                level: coord.level.min(cap),
+                x: 0,
+                y: 0,
+            })
+            .width();
         let at = (scheme.minimum_level..=scheme.maximum_level)
             .rev()
-            .find(|l| scheme.tile_rect(ImageryCoord { level: *l, x: 0, y: 0 }).width() >= as_wide * 0.999)
+            .find(|l| {
+                scheme
+                    .tile_rect(ImageryCoord {
+                        level: *l,
+                        x: 0,
+                        y: 0,
+                    })
+                    .width()
+                    >= as_wide * 0.999
+            })
             .unwrap_or(scheme.minimum_level);
-        wanted.extend(scheme.tiles_in_rectangle(&rect, at).into_iter().map(|c| (c.level, c.x, c.y)));
+        wanted.extend(
+            scheme
+                .tiles_in_rectangle(&rect, at)
+                .into_iter()
+                .map(|c| (c.level, c.x, c.y)),
+        );
     }
-    let wanted: Vec<ImageryCoord> = wanted.into_iter().map(|(level, x, y)| ImageryCoord { level, x, y }).collect();
+    let wanted: Vec<ImageryCoord> = wanted
+        .into_iter()
+        .map(|(level, x, y)| ImageryCoord { level, x, y })
+        .collect();
     let fetched = runtime.block_on(reference.fetch(&wanted, store.cache()));
     // Flushed whether or not every tile came: what was fetched is worth
     // keeping.
@@ -733,7 +786,9 @@ fn inspect(path: &std::path::Path) -> Result<(), String> {
             "sources  terrain {terrain}, imagery {}",
             if imagery.is_empty() { "none" } else { imagery }
         ),
-        None => println!("sources  not recorded: an embedded pack does not say what it was baked from"),
+        None => {
+            println!("sources  not recorded: an embedded pack does not say what it was baked from")
+        }
     }
     if let Some((terrain, imagery)) = pack.store_layers() {
         // What the references are into, and how much of the store they name.
@@ -755,7 +810,12 @@ fn inspect(path: &std::path::Path) -> Result<(), String> {
                 referring += 1;
                 let (level, x, y) = tuile_core::source::TileId(tile.id()).terrain_coord();
                 let source = refs.terrain;
-                if (u32::from(source.level), u64::from(source.x), u64::from(source.y)) != (level, x, y) {
+                if (
+                    u32::from(source.level),
+                    u64::from(source.x),
+                    u64::from(source.y),
+                ) != (level, x, y)
+                {
                     cut_from_an_ancestor += 1;
                 }
                 terrain_tiles.insert((source.level, source.x, source.y));
@@ -876,12 +936,14 @@ fn plan_of(path: &std::path::Path) -> Result<Plan, String> {
     use std::io::Read;
     let mut file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut head = vec![0u8; tuile_pack::PREAMBLE];
-    file.read_exact(&mut head).map_err(|e| format!("{}: {e}", path.display()))?;
+    file.read_exact(&mut head)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     let start = tuile_pack::blob_start(&head).map_err(|e| format!("{}: {e}", path.display()))?;
     head.resize(start as usize, 0);
     file.read_exact(&mut head[tuile_pack::PREAMBLE..])
         .map_err(|e| format!("{}: {e}", path.display()))?;
-    let pack = tuile_pack::Pack::open_table(&head).map_err(|e| format!("{}: {e}", path.display()))?;
+    let pack =
+        tuile_pack::Pack::open_table(&head).map_err(|e| format!("{}: {e}", path.display()))?;
     let (first, last) = pack.frame_range();
     let mut plan = Plan {
         first,
@@ -898,10 +960,14 @@ fn plan_of(path: &std::path::Path) -> Result<Plan, String> {
         }),
     };
     for number in first..=last {
-        let view = pack.view_of(number).map_err(|e| format!("frame {number}: {e}"))?;
+        let view = pack
+            .view_of(number)
+            .map_err(|e| format!("frame {number}: {e}"))?;
         let viewport = (view.viewport_px[0], view.viewport_px[1]);
         if number > first && viewport != plan.viewport {
-            return Err(format!("frame {number} was baked at another viewport: not one shot"));
+            return Err(format!(
+                "frame {number} was baked at another viewport: not one shot"
+            ));
         }
         plan.viewport = viewport;
         plan.poses.push(tuile_tape::Frame {
@@ -910,8 +976,11 @@ fn plan_of(path: &std::path::Path) -> Result<Plan, String> {
             up: view.up,
             fovy: view.fovy_rad,
         });
-        let tiles = pack.frame(number).map_err(|e| format!("frame {number}: {e}"))?;
-        plan.selection.push(tiles.iter().map(|t| (t.id(), t.drape())).collect());
+        let tiles = pack
+            .frame(number)
+            .map_err(|e| format!("frame {number}: {e}"))?;
+        plan.selection
+            .push(tiles.iter().map(|t| (t.id(), t.drape())).collect());
     }
     Ok(plan)
 }
@@ -942,13 +1011,20 @@ fn same_plan(old: &Plan, new: &std::path::Path) -> Result<(), String> {
         }
     }
     if differing.is_empty() {
-        println!("REBAKE-SAME frames={} tiles and drapes, frame for frame", new.selection.len());
+        println!(
+            "REBAKE-SAME frames={} tiles and drapes, frame for frame",
+            new.selection.len()
+        );
         return Ok(());
     }
     for (frame, was, is, same_ground) in differing.iter().take(8) {
         println!(
             "  frame {frame}: {was} tiles then, {is} now — {}",
-            if *same_ground { "same ground, draped differently" } else { "another selection" }
+            if *same_ground {
+                "same ground, draped differently"
+            } else {
+                "another selection"
+            }
         );
     }
     // How far apart, in tiles: what tells a wrong setting from a drift.
@@ -986,16 +1062,25 @@ fn bake_tape(token: String, args: &Args, tiles: Option<&tiles::Tiles>) -> Result
         "BAKE-SOURCES terrain={} imagery={} ({})",
         layers.0,
         layers.1.as_deref().unwrap_or("none"),
-        if args.terrain.is_some() || args.imagery.is_some() { "as asked" } else { "the defaults" }
+        if args.terrain.is_some() || args.imagery.is_some() {
+            "as asked"
+        } else {
+            "the defaults"
+        }
     );
     // The memory line, on a beat, from here to the end of the process: a
     // bake that dies of memory dies without saying so.
     tuile_bake::memory::watch(
         std::time::Duration::from_secs(
-            std::env::var("TUILE_MEMORY_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(15),
+            std::env::var("TUILE_MEMORY_EVERY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(15),
         ),
         [
-            std::env::var("TUILE_CACHE_DIR").ok().map(std::path::PathBuf::from),
+            std::env::var("TUILE_CACHE_DIR")
+                .ok()
+                .map(std::path::PathBuf::from),
             args.out.parent().map(std::path::Path::to_path_buf),
         ]
         .into_iter()
@@ -1006,7 +1091,11 @@ fn bake_tape(token: String, args: &Args, tiles: Option<&tiles::Tiles>) -> Result
     bake.bake(args.first, args.last, &args.out, tiles)?;
     // On stdout, and parseable, because the launcher turns it into an object
     // key.
-    println!("BAKE-KEY {}/{}-{wanted}.tuilepack", bake.packs(), args.first);
+    println!(
+        "BAKE-KEY {}/{}-{wanted}.tuilepack",
+        bake.packs(),
+        args.first
+    );
     Ok(())
 }
 
@@ -1034,7 +1123,11 @@ fn bake_with(args: Args, tiles: Option<&tiles::Tiles>) -> Result<(), String> {
         Some(old) => {
             // Frame n is pose n − 1; a shard that begins at frame 1351 is
             // padded in front with poses nothing will ask for.
-            let first = old.poses.first().copied().ok_or("the old pack holds no frame")?;
+            let first = old
+                .poses
+                .first()
+                .copied()
+                .ok_or("the old pack holds no frame")?;
             poses.resize(old.first as usize - 1, first);
             poses.extend(old.poses.iter().copied());
             // All of the old pack's frames, or the part of them asked for.
@@ -1107,7 +1200,10 @@ fn bake_with(args: Args, tiles: Option<&tiles::Tiles>) -> Result<(), String> {
         tiles.check(&namespaces);
         // The scene's slice of the store, local before the first frame.
         let imagery_layer = config.imagery_asset_id.map(tuile_bake::source_namespace);
-        tiles.project(&poses[args.first.max(1) as usize - 1..wanted], imagery_layer.as_deref())?;
+        tiles.project(
+            &poses[args.first.max(1) as usize - 1..wanted],
+            imagery_layer.as_deref(),
+        )?;
         config.tile_cache = Some(tiles.cache());
     }
     // What the pack already holds, mirrored for the loader so it never fetches
@@ -1125,10 +1221,15 @@ fn bake_with(args: Args, tiles: Option<&tiles::Tiles>) -> Result<(), String> {
         "BAKE-SOURCES terrain={} imagery={} ({})",
         store_layers.0,
         store_layers.1.as_deref().unwrap_or("none"),
-        match (args.terrain.is_some() || args.imagery.is_some(), from_old.is_some(), old.is_some()) {
+        match (
+            args.terrain.is_some() || args.imagery.is_some(),
+            from_old.is_some(),
+            old.is_some()
+        ) {
             (true, ..) => "as asked",
             (false, true, _) => "the old pack's own",
-            (false, false, true) => "the defaults: the old pack does not say what it was baked from",
+            (false, false, true) =>
+                "the defaults: the old pack does not say what it was baked from",
             (false, false, false) => "the defaults",
         }
     );
@@ -1216,7 +1317,10 @@ fn bake_with(args: Args, tiles: Option<&tiles::Tiles>) -> Result<(), String> {
         tuile_pack::Content::Both => ".both",
         _ => "",
     };
-    println!("BAKE-KEY packs/{scene}{kind}/{}-{wanted}.tuilepack", args.first);
+    println!(
+        "BAKE-KEY packs/{scene}{kind}/{}-{wanted}.tuilepack",
+        args.first
+    );
     // A re-bake answers for the pack it replaces only if it is the same plan.
     if let Some(old) = &old {
         match same_plan(old, &args.out) {

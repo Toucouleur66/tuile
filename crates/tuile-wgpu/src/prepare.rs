@@ -19,7 +19,7 @@ const BYTES_PER_TEXEL: u32 = 4;
 /// `Stitch::packed`'s ten, and up to 246 knots — more than twice what the
 /// fullest tile of the films measured carried (105). A tile whose plan asks
 /// for more is drawn as its mesh has it, its skirts under it; see
-/// [`PreparedTile::restitch`].
+/// `PreparedTile::restitch`.
 pub const STITCH_ROWS: usize = 256;
 
 /// Bytes of a tile's uniform: its model matrix, a row for the stitching's

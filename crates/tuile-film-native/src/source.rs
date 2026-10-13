@@ -118,13 +118,16 @@ impl Objects for Counting {
 /// than it uses means reading each from disk, whole, again and again.
 const HELD_BYTES: usize = 1 << 30;
 
+/// A chunk kept in memory, by object key and chunk index.
+type HeldChunk = ((String, u64), Arc<Vec<u8>>);
+
 /// `Objects` with the chunks last read kept in memory, and ranges cut out
 /// of them. A tile is a few kilobytes of a chunk of megabytes: asked of the
 /// disk cache each time, every tile costs a chunk read and copied whole,
 /// which is most of what reading from a warm cache would otherwise cost.
 struct Held {
     behind: Arc<dyn Objects>,
-    chunks: std::sync::Mutex<std::collections::VecDeque<((String, u64), Arc<Vec<u8>>)>>,
+    chunks: std::sync::Mutex<std::collections::VecDeque<HeldChunk>>,
     /// Sizes, believed for as long as this lives: one render.
     sizes: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
