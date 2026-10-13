@@ -1260,7 +1260,7 @@ version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
 dependencies = [
- "libloading 0.8.9",
+ "libloading 0.7.4",
 ]
 
 [[package]]
@@ -3666,7 +3666,7 @@ dependencies = [
 [[package]]
 name = "nvidia-video-codec-sdk"
 version = "0.5.0-lapoule.1"
-source = "git+https://github.com/lapoule-dev/nvidia-video-codec-sdk?branch=feat%2Fsdk-13#cf3ecd848448429898b012423ebb070c0788f76f"
+source = "git+https://github.com/lapoule-dev/nvidia-video-codec-sdk?branch=feat%2Fsdk-13#647c790dcf9b61cb9254849e3453009c6b5e2724"
 dependencies = [
  "cudarc",
  "lazy_static",

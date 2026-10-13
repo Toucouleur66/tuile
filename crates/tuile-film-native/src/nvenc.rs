@@ -25,7 +25,7 @@ use nvidia_video_codec_sdk::sys::nvEncodeAPI::{
     HEVC_3D_REFERENCE_DISPLAY_INFO, NV_ENC_BUFFER_FORMAT, NV_ENC_CAPS, NV_ENC_CODEC_AV1_GUID,
     NV_ENC_CODEC_H264_GUID, NV_ENC_CODEC_HEVC_GUID, NV_ENC_HEVC_PROFILE_MAIN_GUID,
     NV_ENC_MULTI_PASS, NV_ENC_PARAMS_RC_MODE, NV_ENC_PIC_PARAMS_HEVC, NV_ENC_PIC_TYPE,
-    NV_ENC_PRESET_P4_GUID, NV_ENC_TUNING_INFO,
+    NV_ENC_PRESET_P4_GUID, NV_ENC_TEMPORAL_FILTER_LEVEL, NV_ENC_TUNING_INFO,
 };
 use nvidia_video_codec_sdk::{
     CodecPictureParams, EncodeError, EncodePictureParams, Encoder, EncoderInitParams, EncoderInput,
@@ -249,23 +249,26 @@ fn encode(
     Ok((film, busy))
 }
 
-/// An I420 picture into a buffer whose rows are `pitch` wide.
-fn pitched(i420: Vec<u8>, (width, height): (usize, usize), pitch: usize) -> Vec<u8> {
-    if pitch == width {
-        return i420;
-    }
+/// An I420 picture as NV12 in a buffer whose rows are `pitch` wide: the
+/// luma, then the two chromas interleaved, as the MV-HEVC session takes it.
+fn nv12(i420: &[u8], (width, height): (usize, usize), pitch: usize) -> Vec<u8> {
     let (luma, chroma) = (width * height, (width / 2) * (height / 2));
-    let mut out = vec![0u8; pitch * height + 2 * (pitch / 2) * (height / 2)];
-    let mut to = 0;
-    for (from, w, h, p) in [
-        (&i420[..luma], width, height, pitch),
-        (&i420[luma..luma + chroma], width / 2, height / 2, pitch / 2),
-        (&i420[luma + chroma..], width / 2, height / 2, pitch / 2),
-    ] {
-        for row in 0..h {
-            out[to + row * p..to + row * p + w].copy_from_slice(&from[row * w..(row + 1) * w]);
+    let (y, u, v) = (
+        &i420[..luma],
+        &i420[luma..luma + chroma],
+        &i420[luma + chroma..],
+    );
+    let mut out = vec![0u8; pitch * height + pitch * (height / 2)];
+    for row in 0..height {
+        out[row * pitch..row * pitch + width].copy_from_slice(&y[row * width..(row + 1) * width]);
+    }
+    let base = pitch * height;
+    for row in 0..height / 2 {
+        let line = &mut out[base + row * pitch..base + row * pitch + width];
+        for x in 0..width / 2 {
+            line[2 * x] = u[row * (width / 2) + x];
+            line[2 * x + 1] = v[row * (width / 2) + x];
         }
-        to += p * h;
     }
     out
 }
@@ -337,15 +340,18 @@ fn encode_eyes(
         let hevc = &mut config.encodeCodecConfig.hevcConfig;
         hevc.set_enableMVHEVC(1);
         hevc.set_outputHevc3DReferenceDisplayInfo(1);
+        // Nothing MV-HEVC refuses: no temporal filter.
+        hevc.tfLevel = NV_ENC_TEMPORAL_FILTER_LEVEL::NV_ENC_TEMPORAL_FILTER_LEVEL_0;
     }
     let mut init = EncoderInitParams::new(guid, width as u32, height as u32);
     init.preset_guid(NV_ENC_PRESET_P4_GUID)
         .tuning_info(tuning)
         .framerate(fps, 1)
         .enable_picture_type_decision()
+        .disable_split_encode()
         .encode_config(&mut config);
     let session = encoder
-        .start_session(NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_IYUV, init)
+        .start_session(NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12, init)
         .map_err(told)?;
     step("session started");
     let mut inputs = [
@@ -379,7 +385,7 @@ fn encode_eyes(
                 let mut lock = inputs[view].lock().map_err(told)?;
                 // SAFETY: a planar 4:2:0 picture of the session's size at
                 // the buffer's pitch, which the buffer was made to hold.
-                unsafe { lock.write(&pitched(i420, (width, height), pitch)) };
+                unsafe { lock.write(&nv12(&i420, (width, height), pitch)) };
             }
             step(&format!("view {view} written"));
             loop {
