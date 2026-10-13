@@ -274,18 +274,6 @@ fn nv12(i420: &[u8], (width, height): (usize, usize), pitch: usize) -> Vec<u8> {
     out
 }
 
-/// NAL units of an Annex B stream, what goes in the sample entry apart:
-/// the parameter sets (VPS, SPS, PPS) and the 3D reference displays SEI
-/// (a prefix SEI whose first payload is 176) — an `hvc1` sample carries
-/// neither, its entry carries them.
-fn hevc_units(stream: &[u8]) -> (Vec<&[u8]>, Vec<&[u8]>) {
-    nal_units(stream).into_iter().partition(|u| match u {
-        [b, ..] if (32..=34).contains(&((b >> 1) & 0x3f)) => true,
-        [b, _, 176, ..] => (b >> 1) & 0x3f == 39,
-        _ => false,
-    })
-}
-
 /// The encoder's thread for a spatial film: each frame's two eyes in, the
 /// finished mp4 out. Each eye is one picture of the session, the left as
 /// view 0 (the base layer), the right as view 1; the access unit is both.
@@ -343,21 +331,11 @@ fn encode_eyes(
     // profile, MV-HEVC on, and the 3D reference displays SEI, whose info
     // goes with the first picture.
     config.profileGUID = NV_ENC_HEVC_PROFILE_MAIN_GUID;
-    // Probes, while MV-HEVC is brought up on a card: TUILE_NVENC_PROBE=plain
-    // encodes plain HEVC (the views as frames one after the other),
-    // =nopic passes no per-picture HEVC parameters.
-    let probe = std::env::var("TUILE_NVENC_PROBE").unwrap_or_default();
-    let has = |flag: &str| probe.split(',').any(|f| f == flag);
-    let multiview = !has("plain");
-    step(&format!("probe {probe:?}"));
     // SAFETY: the preset asked for is HEVC's, so the codec config is.
     unsafe {
         let hevc = &mut config.encodeCodecConfig.hevcConfig;
-        hevc.set_enableMVHEVC(u32::from(multiview));
-        hevc.set_outputHevc3DReferenceDisplayInfo(u32::from(multiview && !has("nosei")));
-        if has("views2") {
-            hevc.numViews = 2;
-        }
+        hevc.set_enableMVHEVC(1);
+        hevc.set_outputHevc3DReferenceDisplayInfo(1);
         // Nothing MV-HEVC refuses: no temporal filter.
         hevc.tfLevel = NV_ENC_TEMPORAL_FILTER_LEVEL::NV_ENC_TEMPORAL_FILTER_LEVEL_0;
         // What FFmpeg says outright where a preset leaves it unsaid: 4:2:0,
@@ -419,12 +397,11 @@ fn encode_eyes(
                     viewId: view as u32,
                     ..Default::default()
                 };
-                if first && !has("nosei") {
+                if first {
                     hevc.p3DReferenceDisplayInfo = &raw mut displays;
                 }
                 let params = EncodePictureParams {
-                    codec_params: (multiview && !has("nopic"))
-                        .then_some(CodecPictureParams::Hevc(hevc)),
+                    codec_params: Some(CodecPictureParams::Hevc(hevc)),
                     ..Default::default()
                 };
                 match session.encode_picture(&mut inputs[view], &mut outputs[view], params) {
@@ -459,7 +436,7 @@ fn encode_eyes(
                     NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR | NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_I
                 );
             }
-            let (parameters, units) = hevc_units(lock.data());
+            let (parameters, units) = tuile_mp4::spatial::entry_units(lock.data());
             if muxer.is_none() {
                 sets.extend(parameters.iter().map(|u| u.to_vec()));
             }

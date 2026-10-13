@@ -106,6 +106,18 @@ pub fn hevc_records(units: &[&[u8]]) -> Result<(Vec<u8>, Vec<u8>), Mp4Error> {
     Ok((body(&|b| hvcc.encode(b))?, body(&|b| lhvc.encode(b))?))
 }
 
+/// An access unit in Annex B, split between what goes in the sample entry
+/// and what goes in the sample: the parameter sets (VPS, SPS, PPS) and the
+/// 3D reference displays SEI (a prefix SEI whose first payload is 176) go
+/// to the records ([`hevc_records`]); an `hvc1` sample carries neither.
+pub fn entry_units(stream: &[u8]) -> (Vec<&[u8]>, Vec<&[u8]>) {
+    crate::nal_units(stream).into_iter().partition(|u| match u {
+        [b, ..] if (32..=34).contains(&((b >> 1) & 0x3f)) => true,
+        [b, _, 176, ..] => (b >> 1) & 0x3f == 39,
+        _ => false,
+    })
+}
+
 /// What a player is told of the eyes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StereoInfo {
@@ -502,6 +514,44 @@ mod tests {
             .flat_map(|a| a.nalus.iter().map(Vec::as_slice))
             .collect();
         assert!(hevc_records(&base).is_err(), "one layer is no MV-HEVC");
+    }
+
+    #[test]
+    fn parameter_sets_and_the_displays_sei_go_to_the_entry_and_the_rest_to_the_sample() {
+        let nal = |kind: u8, layer: u8, body: &[u8]| {
+            let mut u = vec![
+                0,
+                0,
+                0,
+                1,
+                (kind << 1) | (layer >> 5),
+                ((layer & 0x1f) << 3) | 1,
+            ];
+            u.extend_from_slice(body);
+            u
+        };
+        let stream = [
+            nal(32, 0, &[1]),
+            nal(33, 0, &[2]),
+            nal(34, 0, &[3]),
+            nal(39, 0, &[176, 4]),
+            nal(39, 0, &[5, 4]),
+            nal(19, 0, &[6]),
+            nal(33, 1, &[7]),
+            nal(1, 1, &[8]),
+        ]
+        .concat();
+        let (entry, sample) = entry_units(&stream);
+        let kinds = |units: &[&[u8]]| units.iter().map(|u| (u[0] >> 1, u[2])).collect::<Vec<_>>();
+        assert_eq!(
+            kinds(&entry),
+            [(32, 1), (33, 2), (34, 3), (39, 176), (33, 7)]
+        );
+        assert_eq!(
+            kinds(&sample),
+            [(39, 5), (19, 6), (1, 8)],
+            "another SEI stays with its picture"
+        );
     }
 
     /// Frames decoded I P B, shown I B P: the first shown at zero, each
