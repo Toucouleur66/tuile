@@ -51,7 +51,7 @@ where
     write_in(&std::env::temp_dir(), layer, epoch, zooms, tiles)
 }
 
-/// [`write`], the temporary file in `dir`: on the file system of where it
+/// [`write`](fn@write), the temporary file in `dir`: on the file system of where it
 /// will be persisted, which a rename cannot leave.
 pub fn write_in<I>(
     dir: &FsPath,
