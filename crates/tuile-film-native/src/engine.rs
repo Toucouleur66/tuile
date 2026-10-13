@@ -45,11 +45,44 @@ pub fn film_prefix(packs: &str, rendering: &Rendering) -> String {
     )
 }
 
+/// What owns a tokio runtime of its own — the shared tile store does, to
+/// flush from a bake's thread — made and let go off the runtime a production
+/// runs on: a runtime may be neither started nor dropped from within another.
+pub struct OffRuntime<T: Send + 'static> {
+    inner: Option<T>,
+}
+
+impl<T: Send + 'static> OffRuntime<T> {
+    /// `open` run on a thread of the blocking pool.
+    pub async fn open(
+        open: impl FnOnce() -> Result<T, String> + Send + 'static,
+    ) -> Result<Self, String> {
+        let inner = tokio::task::spawn_blocking(open)
+            .await
+            .map_err(|e| e.to_string())??;
+        Ok(Self { inner: Some(inner) })
+    }
+
+    pub fn get(&self) -> Option<&T> {
+        self.inner.as_ref()
+    }
+}
+
+impl<T: Send + 'static> Drop for OffRuntime<T> {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            // On a thread of its own, waited for: whatever it flushes on its
+            // way out is done before this returns.
+            let _ = std::thread::spawn(move || drop(inner)).join();
+        }
+    }
+}
+
 /// The engine, set for one film.
 pub struct Engine {
     bake: TapeBake,
     /// The shared tile store a bake reads and fills, when there is one.
-    tiles: Option<Tiles>,
+    tiles: OffRuntime<Option<Tiles>>,
     sources: Sources,
     rendering: Rendering,
     /// The names its parameters give, taken once.
@@ -90,7 +123,7 @@ impl Engine {
         let packs = bake.packs();
         let film = film_prefix(&packs, &rendering);
         Ok(Self {
-            tiles: Tiles::from_env()?,
+            tiles: OffRuntime::open(Tiles::from_env).await?,
             sources: Sources::open(runs, tiles, cache).await?,
             bake,
             rendering,
@@ -98,6 +131,10 @@ impl Engine {
             film,
             runtime: tokio::runtime::Handle::current(),
         })
+    }
+
+    fn tiles(&self) -> Option<&Tiles> {
+        self.tiles.get().and_then(Option::as_ref)
     }
 
     async fn rendered(&self, frames: Stretch, pack: &str, out: &Path) -> Result<(), Error> {
@@ -137,11 +174,9 @@ impl Host for Engine {
                 "a pack is to be baked and TUILE_ION_TOKEN is not set",
             ));
         }
-        let baked = self
-            .bake
-            .bake(frames.first, frames.last, out, self.tiles.as_ref());
+        let baked = self.bake.bake(frames.first, frames.last, out, self.tiles());
         // Whatever the bake fetched is published, even if it failed.
-        let flushed = self.tiles.as_ref().map(Tiles::flush).transpose();
+        let flushed = self.tiles().map(Tiles::flush).transpose();
         baked.map_err(Failed::once)?;
         flushed.map_err(Failed::once)?;
         Ok(())
@@ -173,6 +208,31 @@ mod tests {
             bitrate: 12_000_000,
             sun: None,
         }
+    }
+
+    /// What holds a runtime of its own, as the shared tile store does: made
+    /// and let go on the async runtime that drives a production, either one
+    /// panics ("Cannot start a runtime from within a runtime").
+    struct OwnRuntime(tokio::runtime::Runtime);
+
+    impl OwnRuntime {
+        fn open() -> Result<Self, String> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .map_err(|e| e.to_string())?;
+            runtime.block_on(async {});
+            Ok(Self(runtime))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn what_owns_a_runtime_is_made_and_let_go_off_the_production_s_own() {
+        let held = OffRuntime::open(OwnRuntime::open).await.expect("opened");
+        assert!(held.get().is_some());
+        drop(held);
+        // Nothing to hold is nothing.
+        let none = OffRuntime::<OwnRuntime>::open(|| Err("not configured".into())).await;
+        assert!(none.is_err());
     }
 
     #[test]
