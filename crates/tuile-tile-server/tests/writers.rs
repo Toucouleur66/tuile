@@ -436,6 +436,48 @@ async fn a_write_during_a_failing_publication_survives_the_put_back() {
     );
 }
 
+/// A write whose zone is full flushes it on the writer's own path. An engine
+/// drops a load the view no longer wants — the future, mid-flush — and the
+/// tiles frozen for that flush must still reach the store: left in memory
+/// only, they stay readable to the writer, which goes on to use them, and
+/// no other reader ever finds them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flush_dropped_on_the_writer_s_path_loses_no_tile() {
+    let clock = TestClock::new();
+    let objects = memory();
+    let mut cfg = eager();
+    // Any tile fills the zone: its put flushes, there and then.
+    cfg.flush_bytes = 1;
+    let s = Arc::new(store_on(objects.clone(), &clock, cfg));
+    let gate = s.pause_next_publication();
+    let writing = {
+        let s = s.clone();
+        tokio::spawn(async move {
+            s.put(IMAGERY, LEVEL, X0, Y0, body(LEVEL, X0, Y0, 1))
+                .await
+                .expect("put")
+        })
+    };
+    gate.reached.notified().await;
+    // The load is let go while its flush waits on the network.
+    writing.abort();
+    assert!(writing.await.expect_err("aborted").is_cancelled());
+    assert_eq!(
+        s.get(IMAGERY, LEVEL, X0, Y0).await.expect("get"),
+        Some(body(LEVEL, X0, Y0, 1)),
+        "the writer still reads it"
+    );
+    // The writer's last flush publishes it…
+    s.flush_all().await.expect("flush");
+    // …so that a reader that is not the writer finds it.
+    let fresh = store_on(objects, &clock, eager());
+    assert_eq!(
+        fresh.get(IMAGERY, LEVEL, X0, Y0).await.expect("get"),
+        Some(body(LEVEL, X0, Y0, 1)),
+        "a tile the writer used never reached the store"
+    );
+}
+
 #[tokio::test]
 async fn retired_archives_stay_through_their_grace_then_go() {
     let clock = TestClock::new();

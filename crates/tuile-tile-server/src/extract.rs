@@ -81,6 +81,30 @@ pub struct ExtractReport {
     /// Putting it in the bucket, when it went there.
     #[serde(default)]
     pub put_millis: u64,
+    /// Tiles named in an ask's `tiles` (within its levels) that no live
+    /// archive of the store holds, and the first [`ABSENT_NAMED`] of them,
+    /// each as its layer, level, x and y.
+    #[serde(default)]
+    pub absent: u64,
+    #[serde(default)]
+    pub absent_first: Vec<(String, u8, u32, u32)>,
+}
+
+/// Absent tiles an [`ExtractReport`] names, at most.
+pub const ABSENT_NAMED: usize = 16;
+
+impl ExtractReport {
+    /// Says what is missing, if anything is: how many tiles, and the first.
+    pub fn incomplete(&self) -> Option<String> {
+        if self.absent == 0 {
+            return None;
+        }
+        let mut said = format!("{} tiles asked for are not in the store", self.absent);
+        if let Some((layer, level, x, y)) = self.absent_first.first() {
+            said.push_str(&format!(", {layer} {level}/{x}/{y} the first of them"));
+        }
+        Some(said)
+    }
 }
 
 /// Which tiles of a zone are kept.
@@ -181,6 +205,24 @@ impl TileStore {
                 report.archive_bytes += zone.archive_bytes;
                 tiles.extend(zone_tiles.into_iter().map(|(id, b)| (id + band, b)));
             }
+            // Every tile named, found or said absent: an extract is read by
+            // a renderer that draws nothing it lacks.
+            let mut named = HashSet::with_capacity(ask.tiles.len());
+            for &(level, x, y) in &ask.tiles {
+                if ask
+                    .levels
+                    .is_some_and(|(low, high)| level < low || level > high)
+                {
+                    continue;
+                }
+                let id = layer.grid.to_id(level, x, y)?;
+                if named.insert(id) && !tiles.contains_key(&(id + band)) {
+                    report.absent += 1;
+                    if report.absent_first.len() < ABSENT_NAMED {
+                        report.absent_first.push((layer.name.clone(), level, x, y));
+                    }
+                }
+            }
             layers.push(serde_json::json!({
                 "name": layer.name,
                 "grid": layer.grid,
@@ -213,6 +255,29 @@ impl TileStore {
         key: &str,
     ) -> Result<ExtractReport, StoreError> {
         let (file, mut report) = self.extract(asks).await?;
+        let began = Instant::now();
+        put_file(self.object_store().as_ref(), file.path(), key).await?;
+        report.put_millis = began.elapsed().as_millis() as u64;
+        Ok(report)
+    }
+
+    /// [`TileStore::extract_into`], only if the store holds every tile the
+    /// asks name: otherwise nothing is put under `key` and the error says
+    /// what is missing ([`StoreError::Incomplete`]). For a reader that is
+    /// to draw every tile it names — a render — an extract with holes is no
+    /// extract, and one left under `key` from before is not replaced.
+    pub async fn extract_whole_into(
+        &self,
+        asks: &[ExtractAsk],
+        key: &str,
+    ) -> Result<ExtractReport, StoreError> {
+        let (file, mut report) = self.extract(asks).await?;
+        if let Some(said) = report.incomplete() {
+            return Err(StoreError::Incomplete {
+                absent: report.absent,
+                said,
+            });
+        }
         let began = Instant::now();
         put_file(self.object_store().as_ref(), file.path(), key).await?;
         report.put_millis = began.elapsed().as_millis() as u64;
@@ -735,6 +800,53 @@ mod tests {
             .expect("bytes");
         assert_eq!(got.to_vec(), std::fs::read(built.path()).expect("read"));
         assert_eq!(report.bytes, got.len() as u64);
+    }
+
+    /// A tile named and not stored is counted and named; an extract for a
+    /// reader that draws every tile it names is then not put at all.
+    #[tokio::test]
+    async fn an_extract_lacking_a_named_tile_says_so_and_is_not_put_whole() {
+        use object_store::ObjectStoreExt;
+        let store = store().await;
+        put(&store, (7, 77, 50), "a").await;
+        store.flush_all().await.expect("flush");
+        let ask = ExtractAsk {
+            layer: "imagery".into(),
+            // The second was never stored; the third is out of the levels.
+            tiles: vec![(7, 77, 50), (7, 78, 50), (9, 1, 1)],
+            levels: Some((7, 8)),
+            ..Default::default()
+        };
+        let (_, report) = store
+            .extract(std::slice::from_ref(&ask))
+            .await
+            .expect("extract");
+        assert_eq!((report.tiles, report.absent), (1, 1));
+        assert_eq!(report.absent_first, [("imagery".to_string(), 7, 78, 50)]);
+        let key = "_extracts/run/c0002.pmtiles";
+        match store
+            .extract_whole_into(std::slice::from_ref(&ask), key)
+            .await
+        {
+            Err(StoreError::Incomplete { absent, said }) => {
+                assert_eq!(absent, 1);
+                assert!(said.contains("imagery 7/78/50"), "{said}");
+            }
+            other => panic!("expected an incomplete extract, got {other:?}"),
+        }
+        assert!(
+            store
+                .object_store()
+                .head(&object_store::path::Path::from(key))
+                .await
+                .is_err(),
+            "nothing put"
+        );
+        // Once stored, the same ask goes up whole.
+        put(&store, (7, 78, 50), "b").await;
+        store.flush_all().await.expect("flush");
+        let report = store.extract_whole_into(&[ask], key).await.expect("whole");
+        assert_eq!((report.tiles, report.absent), (2, 0));
     }
 
     #[tokio::test]

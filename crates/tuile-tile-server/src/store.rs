@@ -253,6 +253,31 @@ struct Buffer {
     flushing: Option<Arc<BTreeMap<u64, Pending>>>,
 }
 
+/// A zone's frozen tiles while they are being published: unless told they
+/// were, they go back into the buffer when this is dropped — at the end of
+/// a failed publication, or with the future of one that was let go.
+struct PutBack<'a> {
+    store: &'a TileStore,
+    key: &'a ZoneKey,
+    frozen: Option<Arc<BTreeMap<u64, Pending>>>,
+}
+
+impl PutBack<'_> {
+    fn published(&mut self) {
+        if let Some(frozen) = self.frozen.take() {
+            self.store.end_flush(self.key, &frozen, true);
+        }
+    }
+}
+
+impl Drop for PutBack<'_> {
+    fn drop(&mut self) {
+        if let Some(frozen) = self.frozen.take() {
+            self.store.end_flush(self.key, &frozen, false);
+        }
+    }
+}
+
 type ManifestFlight = Shared<BoxFuture<'static, Result<Arc<Manifest>, String>>>;
 
 /// Manifests as last read, and the reads in flight: one per zone however
@@ -976,32 +1001,54 @@ impl TileStore {
             frozen
         };
 
+        // A flush runs on a writer's path, and a writer's future may be
+        // dropped at any of the awaits below — an engine lets go of a load
+        // the view no longer wants. The frozen tiles then go back into the
+        // buffer, for the next flush: dropped with the future, they would
+        // stay readable here, from `flushing`, and reach no other reader.
+        let mut unpublished = PutBack {
+            store: self,
+            key,
+            frozen: Some(frozen.clone()),
+        };
         let result = self.publish_delta(&layer, key, &frozen).await.map(|_| ());
-        {
-            let mut buffers = self.buffers.lock().map_err(|_| StoreError::Poisoned)?;
-            let b = buffers.entry(key.clone()).or_default();
-            b.flushing = None;
-            match &result {
-                Ok(()) => {}
-                Err(StoreError::Fault(_)) => {} // the simulated crash lost them
-                Err(_) => {
-                    // Put back what was not published, never over a newer write.
-                    for (id, p) in frozen.iter() {
-                        if !b.pending.contains_key(id) {
-                            b.bytes += p.bytes.len();
-                            b.pending.insert(*id, p.clone());
-                        }
-                    }
-                    if !b.pending.is_empty() {
-                        b.since.get_or_insert_with(Instant::now);
-                    }
-                }
-            }
+        match &result {
+            // Published, or lost on purpose by the simulated crash.
+            Ok(()) | Err(StoreError::Fault(_)) => unpublished.published(),
+            // Dropping the guard puts them back.
+            Err(_) => {}
         }
+        drop(unpublished);
         // No compaction here: a flush runs on a writer's path (a request, a
         // bake), and merging is the business of a long-lived process calling
         // [`TileStore::compact_due`].
         result
+    }
+
+    /// Ends the publication of `frozen`: no longer read from `flushing`,
+    /// and, unless `published`, back in the buffer — never over a newer
+    /// write.
+    fn end_flush(&self, key: &ZoneKey, frozen: &Arc<BTreeMap<u64, Pending>>, published: bool) {
+        let mut buffers = match self.buffers.lock() {
+            Ok(b) => b,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let b = buffers.entry(key.clone()).or_default();
+        if b.flushing.as_ref().is_some_and(|f| Arc::ptr_eq(f, frozen)) {
+            b.flushing = None;
+        }
+        if published {
+            return;
+        }
+        for (id, p) in frozen.iter() {
+            if !b.pending.contains_key(id) {
+                b.bytes += p.bytes.len();
+                b.pending.insert(*id, p.clone());
+            }
+        }
+        if !b.pending.is_empty() {
+            b.since.get_or_insert_with(Instant::now);
+        }
     }
 
     /// Where a fresh tile is stored: its layer and its zone. A source's "no
