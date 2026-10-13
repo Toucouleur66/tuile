@@ -308,8 +308,16 @@ pub async fn render(
         look.saturation *= grade.saturation.powf(strength);
     }
 
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-    let adapter = instance.request_adapter(&Default::default()).await?;
+    // The environment may say which: `WGPU_BACKEND=vulkan` on a card that
+    // offers several, `WGPU_ADAPTER_NAME` on a machine with several cards.
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let adapter = wgpu::util::initialize_adapter_from_env_or_default(&instance, None).await?;
+    let info = adapter.get_info();
+    println!(
+        "adapter: {} ({:?}, driver {} {})",
+        info.name, info.backend, info.driver, info.driver_info
+    );
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             required_limits: adapter.limits(),

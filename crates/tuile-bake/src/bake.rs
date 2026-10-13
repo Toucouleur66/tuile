@@ -124,6 +124,9 @@ pub struct BakeFrames<'a> {
     /// references are into.
     pub content: &'a PackContent,
     pub packed: &'a PackedMirror,
+    /// Told, as the bake goes, of the store tiles its frames name: see
+    /// [`crate::announce`].
+    pub announce: Option<&'a dyn crate::announce::Announce>,
 }
 
 /// What a bake produced.
@@ -155,6 +158,9 @@ pub fn bake_frames(
     let spill = job.out.with_extension("blob.part");
     let mut writer: Option<PackWriter> = None;
     let mut poses = Vec::with_capacity((job.last - job.first + 1) as usize);
+    let mut herald = job.announce.map(|to| {
+        crate::announce::Herald::new(to, &job.content.terrain_layer, &job.content.imagery_layer)
+    });
 
     for number in job.first..=job.last {
         let pose = source.pose(number, session).map_err(|e| format!("frame {number}: {e}"))?;
@@ -208,10 +214,17 @@ pub fn bake_frames(
                 reused += 1;
                 continue;
             }
-            open.push(packed_tile(&frame, index, tile, job.content.content)?);
+            let packed = packed_tile(&frame, index, tile, job.content.content)?;
+            if let Some(herald) = herald.as_mut() {
+                herald.tile(number, &packed);
+            }
+            open.push(packed);
             job.packed.insert(tile.tile.0, tile.drape());
         }
         open.end();
+        if let Some(herald) = herald.as_mut() {
+            herald.frame_done(number, number == job.last).map_err(|e| format!("frame {number}: announcing its tiles: {e}"))?;
+        }
         poses.push(pose);
         tracing::info!(frame = number, selected, reused, seconds = at.elapsed().as_secs_f64(), "BAKE-FRAME");
     }

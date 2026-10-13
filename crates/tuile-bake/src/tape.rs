@@ -172,6 +172,7 @@ impl TapeBake {
                 culling,
                 content: &content,
                 packed: &packed,
+                announce: None,
             },
             &mut Poses(&self.poses),
         )

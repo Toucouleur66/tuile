@@ -98,6 +98,10 @@ pub struct Order {
     pub bake_again: bool,
     /// Renders every part even where it is rendered already.
     pub render_again: bool,
+    /// This process's share of a production several run at once: task
+    /// `index` of `count` takes the packs `index`, `index + count`, … in
+    /// order. `None`: every pack.
+    pub task: Option<(u32, u32)>,
 }
 
 impl Order {
@@ -114,6 +118,7 @@ impl Order {
             fps: None,
             bake_again: false,
             render_again: false,
+            task: None,
         }
     }
 }
@@ -149,6 +154,10 @@ pub enum ProduceError {
     },
     #[error("the film: {0}")]
     Film(String),
+    /// This task's packs are done and others' are not yet: the last of the
+    /// tasks to finish joins the film.
+    #[error("this task's share is done; {done} of {of} parts are, and the last task to finish joins the film")]
+    Waiting { done: usize, of: usize },
 }
 
 fn named(stretches: &[Stretch]) -> String {
@@ -161,6 +170,11 @@ fn named(stretches: &[Stretch]) -> String {
 
 /// The lanes of an order: its packs in order, each with its parts in order.
 pub fn plan(order: &Order) -> Result<Vec<Lane>, ProduceError> {
+    if let Some((index, count)) = order.task {
+        if index >= count {
+            return Err(ProduceError::Order(format!("task {index} of {count}")));
+        }
+    }
     let Stretch { first, last } = order.frames;
     if first > last {
         return Err(ProduceError::Order(format!("frames {first}-{last}")));
@@ -322,8 +336,11 @@ impl Keys {
     fn stop(&self) -> String {
         format!("{}/STOP", self.film)
     }
-    fn journal(&self) -> String {
-        format!("{}/journal.log", self.film)
+    fn journal(&self, task: Option<(u32, u32)>) -> String {
+        match task {
+            Some((index, _)) => format!("{}/journal-t{index}.log", self.film),
+            None => format!("{}/journal.log", self.film),
+        }
     }
     fn film(&self) -> String {
         format!("{}/film.mp4", self.film)
@@ -637,7 +654,7 @@ pub async fn produce(
         scratch.path(),
         "journal.log",
         said.as_bytes(),
-        &keys.journal(),
+        &keys.journal(order.task),
     )
     .await
     {
@@ -669,7 +686,12 @@ async fn lanes_then_film(
         done,
         scratch,
     };
-    let mut running = futures_util::stream::iter(lanes)
+    // This task's share, in order; every lane when it is the only task.
+    let mine = lanes.iter().enumerate().filter(|(at, _)| match order.task {
+        Some((index, count)) => *at as u32 % count == index,
+        None => true,
+    });
+    let mut running = futures_util::stream::iter(mine.map(|(_, lane)| lane))
         .map(|lane| work(&run, lane))
         .buffer_unordered(order.at_once.max(1));
     while let Some(ended) = running.next().await {
@@ -693,6 +715,19 @@ async fn lanes_then_film(
         };
         journal.say(&e.to_string());
         return Err(e);
+    }
+    // One task of several: the film is joined by whichever finds every part
+    // there — the parts' receipts, read again now, not what this task did.
+    if order.task.is_some() {
+        let now = self::done(store, keys, &parts).await?;
+        if now.len() < parts.len() {
+            let e = ProduceError::Waiting {
+                done: now.len(),
+                of: parts.len(),
+            };
+            journal.say(&e.to_string());
+            return Err(e);
+        }
     }
 
     // Every part is in the store: brought here, joined, and the film put.
@@ -1310,6 +1345,91 @@ mod tests {
         // What was done before it is kept.
         assert!(world.at("films/scene-a/look-1/parts/1-10.json").exists());
         assert!(!world.at("films/scene-a/look-1/film.mp4").exists());
+    }
+
+    #[tokio::test]
+    async fn tasks_of_one_production_share_its_packs_and_the_last_to_finish_joins() {
+        let world = World::new();
+        // 90 frames: three packs of 30, parts of 10; two tasks.
+        let whole = order((1, 90));
+        let first = Arc::new(Told::new());
+        let second = Arc::new(Told::new());
+
+        // Task 0 takes packs 0 and 2, task 1 pack 1.
+        let waiting = world
+            .made(
+                &Order {
+                    task: Some((0, 2)),
+                    ..whole.clone()
+                },
+                &first,
+            )
+            .await
+            .expect_err("not all parts are there yet");
+        assert!(
+            matches!(waiting, ProduceError::Waiting { done: 6, of: 9 }),
+            "{waiting}"
+        );
+        assert_eq!(first.asked("bake "), ["1-30", "61-90"]);
+        assert!(!world.at("films/scene-a/look-1/film.mp4").exists());
+
+        let film = world
+            .made(
+                &Order {
+                    task: Some((1, 2)),
+                    ..whole.clone()
+                },
+                &second,
+            )
+            .await
+            .expect("the last joins");
+        assert_eq!((film.frames, film.parts), (90, 9));
+        assert_eq!(second.asked("bake "), ["31-60"]);
+        assert_eq!(second.asked("render ").len(), 3);
+        // Each task said what it did in a journal of its own.
+        for t in 0..2 {
+            assert!(world
+                .at(&format!("films/scene-a/look-1/journal-t{t}.log"))
+                .exists());
+        }
+
+        // Whichever order they finish in: the first to end joins nothing.
+        let other = World::new();
+        other
+            .made(
+                &Order {
+                    task: Some((1, 2)),
+                    ..whole.clone()
+                },
+                &Arc::new(Told::new()),
+            )
+            .await
+            .expect_err("waiting");
+        let film = other
+            .made(
+                &Order {
+                    task: Some((0, 2)),
+                    ..whole.clone()
+                },
+                &Arc::new(Told::new()),
+            )
+            .await
+            .expect("joined");
+        assert_eq!(film.frames, 90);
+        // More tasks than packs: those with none join if they find it all done.
+        let idle = Arc::new(Told::new());
+        let film = other
+            .made(
+                &Order {
+                    task: Some((5, 6)),
+                    ..whole
+                },
+                &idle,
+            )
+            .await
+            .expect("all done already");
+        assert_eq!(film.frames, 90);
+        assert!(idle.asked("").is_empty());
     }
 
     #[tokio::test]

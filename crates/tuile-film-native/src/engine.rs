@@ -32,6 +32,118 @@ pub struct Rendering {
     pub sun: Option<(f64, f64)>,
 }
 
+/// How a film is to be rendered, as a caller writes it — the command line of
+/// `tuile-film-produce`, or the body of a request to `tuile-film-serve`.
+/// Colours are `r,g,b` linear; what is absent is the engine's own.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RenderSpec {
+    pub fps: u32,
+    pub scale: f32,
+    pub supersample: u32,
+    pub codec: String,
+    pub mbps: f64,
+    /// The sun's azimuth and elevation, in degrees, where the film begins.
+    pub sun: Option<(f64, f64)>,
+    pub exposure: Option<f32>,
+    pub contrast: Option<f32>,
+    pub saturation: Option<f32>,
+    pub shadow: Option<f32>,
+    pub haze_density: Option<f32>,
+    pub haze_height: Option<f32>,
+    pub haze_horizon: Option<String>,
+    pub haze_zenith: Option<String>,
+    pub sun_light: Option<String>,
+    pub sky_light: Option<String>,
+    pub no_tone: bool,
+}
+
+impl Default for RenderSpec {
+    fn default() -> Self {
+        Self {
+            fps: 30,
+            scale: 1.0,
+            supersample: 2,
+            codec: "h264".into(),
+            mbps: 12.0,
+            sun: None,
+            exposure: None,
+            contrast: None,
+            saturation: None,
+            shadow: None,
+            haze_density: None,
+            haze_height: None,
+            haze_horizon: None,
+            haze_zenith: None,
+            sun_light: None,
+            sky_light: None,
+            no_tone: false,
+        }
+    }
+}
+
+impl RenderSpec {
+    /// The rendering it asks for. A colour that is not three values, none
+    /// below zero, is refused.
+    pub fn rendering(&self) -> Result<Rendering, Error> {
+        use crate::setup::rgb;
+        let mut order = Order {
+            scale: self.scale,
+            supersample: self.supersample.max(1),
+            fps: self.fps.max(1),
+            ..Default::default()
+        };
+        if self.no_tone {
+            order.tone = crate::Tone::Off;
+        }
+        let look = &mut order.look;
+        if let Some(stops) = self.exposure {
+            look.exposure_ev = stops;
+        }
+        if let Some(power) = self.contrast {
+            look.contrast = power;
+        }
+        if let Some(factor) = self.saturation {
+            look.saturation = factor;
+        }
+        if let Some(strength) = self.shadow {
+            look.shadow = strength;
+        }
+        if let Some(colour) = &self.sun_light {
+            look.sun = rgb("sun-light", colour)?;
+        }
+        if let Some(colour) = &self.sky_light {
+            look.world = rgb("sky-light", colour)?;
+        }
+        // Naming anything of the air asks for the air.
+        if self.haze_density.is_some()
+            || self.haze_height.is_some()
+            || self.haze_horizon.is_some()
+            || self.haze_zenith.is_some()
+        {
+            let haze = look.haze.get_or_insert_with(tuile_film::Haze::default);
+            if let Some(density) = self.haze_density {
+                haze.density = density;
+            }
+            if let Some(height) = self.haze_height {
+                haze.scale_height = height;
+            }
+            if let Some(colour) = &self.haze_horizon {
+                haze.horizon = rgb("haze-horizon", colour)?;
+            }
+            if let Some(colour) = &self.haze_zenith {
+                haze.zenith = rgb("haze-zenith", colour)?;
+            }
+        }
+        Ok(Rendering {
+            order,
+            codec: Some(self.codec.clone()),
+            bitrate: (self.mbps * 1e6) as u32,
+            sun: self.sun,
+        })
+    }
+}
+
 /// The prefix of a film's keys: `films/<its packs' name>/<look>`, the look
 /// naming everything a rendered picture depends on beside its pack — and
 /// not which frames are rendered, so that every part of a film agrees.
@@ -45,11 +157,44 @@ pub fn film_prefix(packs: &str, rendering: &Rendering) -> String {
     )
 }
 
+/// What owns a tokio runtime of its own — the shared tile store does, to
+/// flush from a bake's thread — made and let go off the runtime a production
+/// runs on: a runtime may be neither started nor dropped from within another.
+pub struct OffRuntime<T: Send + 'static> {
+    inner: Option<T>,
+}
+
+impl<T: Send + 'static> OffRuntime<T> {
+    /// `open` run on a thread of the blocking pool.
+    pub async fn open(
+        open: impl FnOnce() -> Result<T, String> + Send + 'static,
+    ) -> Result<Self, String> {
+        let inner = tokio::task::spawn_blocking(open)
+            .await
+            .map_err(|e| e.to_string())??;
+        Ok(Self { inner: Some(inner) })
+    }
+
+    pub fn get(&self) -> Option<&T> {
+        self.inner.as_ref()
+    }
+}
+
+impl<T: Send + 'static> Drop for OffRuntime<T> {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            // On a thread of its own, waited for: whatever it flushes on its
+            // way out is done before this returns.
+            let _ = std::thread::spawn(move || drop(inner)).join();
+        }
+    }
+}
+
 /// The engine, set for one film.
 pub struct Engine {
     bake: TapeBake,
     /// The shared tile store a bake reads and fills, when there is one.
-    tiles: Option<Tiles>,
+    tiles: OffRuntime<Option<Tiles>>,
     sources: Sources,
     rendering: Rendering,
     /// The names its parameters give, taken once.
@@ -90,7 +235,7 @@ impl Engine {
         let packs = bake.packs();
         let film = film_prefix(&packs, &rendering);
         Ok(Self {
-            tiles: Tiles::from_env()?,
+            tiles: OffRuntime::open(Tiles::from_env).await?,
             sources: Sources::open(runs, tiles, cache).await?,
             bake,
             rendering,
@@ -98,6 +243,10 @@ impl Engine {
             film,
             runtime: tokio::runtime::Handle::current(),
         })
+    }
+
+    fn tiles(&self) -> Option<&Tiles> {
+        self.tiles.get().and_then(Option::as_ref)
     }
 
     async fn rendered(&self, frames: Stretch, pack: &str, out: &Path) -> Result<(), Error> {
@@ -132,11 +281,14 @@ impl Host for Engine {
     }
 
     fn bake(&self, frames: Stretch, out: &Path) -> Result<(), Failed> {
-        let baked = self
-            .bake
-            .bake(frames.first, frames.last, out, self.tiles.as_ref());
+        if self.bake.token.is_empty() {
+            return Err(Failed::for_good(
+                "a pack is to be baked and TUILE_ION_TOKEN is not set",
+            ));
+        }
+        let baked = self.bake.bake(frames.first, frames.last, out, self.tiles());
         // Whatever the bake fetched is published, even if it failed.
-        let flushed = self.tiles.as_ref().map(Tiles::flush).transpose();
+        let flushed = self.tiles().map(Tiles::flush).transpose();
         baked.map_err(Failed::once)?;
         flushed.map_err(Failed::once)?;
         Ok(())
@@ -168,6 +320,31 @@ mod tests {
             bitrate: 12_000_000,
             sun: None,
         }
+    }
+
+    /// What holds a runtime of its own, as the shared tile store does: made
+    /// and let go on the async runtime that drives a production, either one
+    /// panics ("Cannot start a runtime from within a runtime").
+    struct OwnRuntime(tokio::runtime::Runtime);
+
+    impl OwnRuntime {
+        fn open() -> Result<Self, String> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .map_err(|e| e.to_string())?;
+            runtime.block_on(async {});
+            Ok(Self(runtime))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn what_owns_a_runtime_is_made_and_let_go_off_the_production_s_own() {
+        let held = OffRuntime::open(OwnRuntime::open).await.expect("opened");
+        assert!(held.get().is_some());
+        drop(held);
+        // Nothing to hold is nothing.
+        let none = OffRuntime::<OwnRuntime>::open(|| Err("not configured".into())).await;
+        assert!(none.is_err());
     }
 
     #[test]

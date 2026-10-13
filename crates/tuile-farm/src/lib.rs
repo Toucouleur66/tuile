@@ -234,12 +234,29 @@ impl ObjectRunStore {
         })
     }
 
-    /// `TUILE_STORE_DIR` if set, the bucket from the environment otherwise.
+    /// `TUILE_STORE_DIR` if set, the bucket from the environment otherwise;
+    /// under `TUILE_STORE_PREFIX` when it is set.
     pub fn from_env() -> Result<Self> {
         let tuning = Tuning::from_env();
-        match std::env::var("TUILE_STORE_DIR") {
-            Ok(dir) if !dir.is_empty() => Self::local(Path::new(&dir), tuning),
-            _ => Self::bucket(&BucketConfig::from_env()?, tuning),
+        let store = match std::env::var("TUILE_STORE_DIR") {
+            Ok(dir) if !dir.is_empty() => Self::local(Path::new(&dir), tuning)?,
+            _ => Self::bucket(&BucketConfig::from_env()?, tuning)?,
+        };
+        Ok(store.under(&std::env::var("TUILE_STORE_PREFIX").unwrap_or_default()))
+    }
+
+    /// The same store, every key under `prefix`: a trial's objects kept
+    /// apart from a production's in one bucket. An empty prefix changes
+    /// nothing.
+    pub fn under(self, prefix: &str) -> Self {
+        let prefix = prefix.trim_matches('/');
+        if prefix.is_empty() {
+            return self;
+        }
+        ObjectRunStore {
+            store: Arc::new(object_store::prefix::PrefixStore::new(self.store, prefix)),
+            tuning: self.tuning,
+            label: format!("{} under {prefix}", self.label),
         }
     }
 
@@ -563,6 +580,29 @@ pub async fn assert_run_store_contract(store: &dyn RunStore, prefix: &str, part_
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_store_under_a_prefix_keeps_everything_under_it_and_reads_its_own() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = ObjectRunStore::local(root.path(), Tuning::default())
+            .expect("local store")
+            .under("_tests/trial/");
+        let src = root.path().join("src.bin");
+        std::fs::write(&src, b"a pack").expect("write");
+        store.put(&src, "packs/a/1-9.tuilepack").await.expect("put");
+        // On disk: under the prefix, and nowhere else.
+        assert!(root.path().join("_tests/trial/packs/a/1-9.tuilepack").is_file());
+        assert!(!root.path().join("packs").exists());
+        // Through the store: by its own key, the prefix unseen.
+        assert!(store.exists("packs/a/1-9.tuilepack").await.expect("exists"));
+        let listed: Vec<String> =
+            store.list("packs").await.expect("list").into_iter().map(|e| e.key).collect();
+        assert_eq!(listed, ["packs/a/1-9.tuilepack"]);
+        assert!(store.label().ends_with("under _tests/trial"), "{}", store.label());
+        // No prefix, no change.
+        let same = ObjectRunStore::local(root.path(), Tuning::default()).expect("local").under("");
+        assert!(same.exists("_tests/trial/packs/a/1-9.tuilepack").await.expect("exists"));
+    }
 
     #[tokio::test]
     async fn a_directory_keeps_the_contract() {
