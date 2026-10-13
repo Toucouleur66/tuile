@@ -649,7 +649,11 @@ fn the_pass_puts_every_vertex_where_the_engine_does() {
         // from the film's own bookkeeping: the same vertices, where the pass
         // put them.
         let (_, drawn) = stitching.drawn(key).expect("held");
-        assert_eq!(drawn.positions.len(), cpu.len(), "the same mesh for the camera");
+        assert_eq!(
+            drawn.positions.len(),
+            cpu.len(),
+            "the same mesh for the camera"
+        );
         for (p, q) in drawn.positions.iter().zip(gpu.as_chunks::<3>().0) {
             let apart = (glam::Vec3::from(*p) - glam::Vec3::from_slice(q)).length();
             drawn_worst = drawn_worst.max(apart);

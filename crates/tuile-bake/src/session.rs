@@ -596,7 +596,10 @@ pub(crate) struct Live {
     grounds: Option<HashMap<TileId, (DVec3, Arc<DecodedMesh>)>>,
     /// The ground last drawn, tile by tile, and how it was prepared: a tile
     /// selected again is not prepared again.
-    prepared: (Option<tuile_film::ground::Prepare>, HashMap<TileId, tuile_film::Mesh>),
+    prepared: (
+        Option<tuile_film::ground::Prepare>,
+        HashMap<TileId, tuile_film::Mesh>,
+    ),
     /// Kept alive for as long as the session: dropping it ends the server.
     _server: std::thread::JoinHandle<()>,
 }
@@ -2456,7 +2459,11 @@ pub(crate) mod tests {
             let radius = center.distance(geo_at(level, x, y, 0.0, 0.0, h)) + 10.0;
             tuile_core::source::TileProperties {
                 bounding_volume: BoundingVolume::Sphere(Sphere { center, radius }),
-                geometric_error: if level > GEO_ROOT.0 { 0.0 } else { radius / 8.0 },
+                geometric_error: if level > GEO_ROOT.0 {
+                    0.0
+                } else {
+                    radius / 8.0
+                },
                 refine: tuile_core::tileset::Refine::Replace,
                 has_content: true,
             }
@@ -2479,7 +2486,11 @@ pub(crate) mod tests {
             for j in 0..=n {
                 for i in 0..=n {
                     let (u, north) = (f64::from(i) / f64::from(n), f64::from(j) / f64::from(n));
-                    positions.push((geo_at(level, x, y, u, north, h) - origin).as_vec3().to_array());
+                    positions.push(
+                        (geo_at(level, x, y, u, north, h) - origin)
+                            .as_vec3()
+                            .to_array(),
+                    );
                     uvs.push([u as f32, 1.0 - north as f32]);
                 }
             }
@@ -2537,14 +2548,21 @@ pub(crate) mod tests {
         };
 
         let mut unkept = session();
-        unkept.frame(vec![geo_view(0.3, 0.3, 200_000.0)]).expect("frame");
+        unkept
+            .frame(vec![geo_view(0.3, 0.3, 200_000.0)])
+            .expect("frame");
         assert!(unkept.ground(how, true).is_none());
 
         let mut kept = session();
         kept.keep_ground();
-        let high = kept.frame(vec![geo_view(0.3, 0.3, 200_000.0)]).expect("frame");
+        let high = kept
+            .frame(vec![geo_view(0.3, 0.3, 200_000.0)])
+            .expect("frame");
         assert_eq!(high.tiles.len(), 1, "the parent alone from high up");
-        assert!(high.tiles[0].content.meshes.is_empty(), "finished by identity");
+        assert!(
+            high.tiles[0].content.meshes.is_empty(),
+            "finished by identity"
+        );
         let ground = kept.ground(how, true).expect("kept");
         let (lon, lat) = place(0.3, 0.3);
         let h = ground.height_at(lon, lat).expect("on the parent");
@@ -2769,7 +2787,9 @@ pub(crate) mod tests {
         let frames = poses
             .into_iter()
             .map(|(x, y, height)| {
-                let frame = session.frame(vec![quad_view(x, y, height)]).expect("a frame");
+                let frame = session
+                    .frame(vec![quad_view(x, y, height)])
+                    .expect("a frame");
                 let mut tiles: Vec<(u64, u64)> =
                     frame.tiles.iter().map(|t| (t.tile.0, t.drape())).collect();
                 tiles.sort_unstable();
@@ -2780,7 +2800,11 @@ pub(crate) mod tests {
             Source::Live(live) => live.resident.len(),
             Source::Packed(_) => unreachable!("a live session"),
         };
-        (frames, loads.load(std::sync::atomic::Ordering::Relaxed), held)
+        (
+            frames,
+            loads.load(std::sync::atomic::Ordering::Relaxed),
+            held,
+        )
     }
 
     /// Letting go between frames bounds what a long flight holds, and keeps
@@ -2821,7 +2845,10 @@ pub(crate) mod tests {
                 trimmed_held < kept_held / 2,
                 "{finish:?}: {trimmed_held} held against {kept_held}"
             );
-            assert!(trimmed_loads > kept_loads, "{finish:?}: what was let go came back");
+            assert!(
+                trimmed_loads > kept_loads,
+                "{finish:?}: what was let go came back"
+            );
         }
     }
 

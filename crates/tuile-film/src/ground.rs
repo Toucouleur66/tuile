@@ -10,7 +10,7 @@
 //! renderer itself calls:
 //!
 //! - [`prepared`] is what a renderer does to a tile's mesh before anything
-//!   else sees it (skirts, [`smoothing`](crate::smoothing));
+//!   else sees it (skirts, [`crate::smoothing`]);
 //! - [`Stitching::drawn`] is the mesh after the stitch pass, the shader's
 //!   arithmetic on the CPU (`tuile_core::stitch::Stitch::offset`);
 //! - [`Ground`] holds those meshes for a frame's selection and answers the
@@ -170,7 +170,13 @@ mod tests {
 
     /// Tile `level/x/y` as a grid of `n` spacings a side, `height(u, north)`
     /// metres over the ellipsoid at each vertex.
-    fn tile(level: u32, x: u64, y: u64, n: u32, height: impl Fn(f64, f64) -> f64) -> (TileKey, Mesh) {
+    fn tile(
+        level: u32,
+        x: u64,
+        y: u64,
+        n: u32,
+        height: impl Fn(f64, f64) -> f64,
+    ) -> (TileKey, Mesh) {
         let size = PI / 2f64.powi(level as i32);
         let at = |u: f64, north: f64| {
             geodetic_to_ecef(Geodetic {
@@ -214,7 +220,10 @@ mod tests {
 
     fn place(level: u32, x: u64, y: u64, u: f64, north: f64) -> (f64, f64) {
         let size = PI / 2f64.powi(level as i32);
-        (-PI + (x as f64 + u) * size, -PI / 2.0 + (y as f64 + north) * size)
+        (
+            -PI + (x as f64 + u) * size,
+            -PI / 2.0 + (y as f64 + north) * size,
+        )
     }
 
     fn ground_of(tiles: &[(TileKey, Mesh)], how: Prepare) -> Ground {
@@ -284,7 +293,10 @@ mod tests {
         assert!((unsewn - 105.0).abs() < 0.05, "{unsewn}");
         let sewn = ground_of(&[coarse, south, north], Prepare::default());
         let at_seam = sewn.height_at(lon + 1.0e-9, lat).expect("ground");
-        assert!(at_seam < 101.0, "the fine edge brought down to the coarse ground: {at_seam}");
+        assert!(
+            at_seam < 101.0,
+            "the fine edge brought down to the coarse ground: {at_seam}"
+        );
         // Inside the fine tile, past the stitching band: its own height.
         let (lon, lat) = place(15, 18002, 12400, 0.6, 0.5);
         let inside = sewn.height_at(lon, lat).expect("ground");
