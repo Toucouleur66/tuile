@@ -96,6 +96,7 @@ mod tests {
             zone_level: 10,
             expiry,
             content_type: "image/jpeg".into(),
+            index: false,
         }
     }
 

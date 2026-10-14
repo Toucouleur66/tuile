@@ -54,6 +54,42 @@ pub trait ContentStore: Send + Sync {
     /// Expiry is the store's business, not the core's: reading a clock needs a
     /// platform, and this crate compiles to wasm.
     async fn put(&self, key: &str, value: Bytes, ttl: Option<Duration>);
+
+    /// What the store can say of a value **without reading it**: whether it
+    /// holds one, a digest of its bytes and, for an image, its size.
+    ///
+    /// For a caller that names values and uses none of their bytes — a bake
+    /// that records which tiles a frame drapes, and composes nothing. The
+    /// default knows nothing ([`Stamp::Unknown`]), and a caller told that
+    /// reads the value as it always has: a store that answers is an
+    /// optimisation, never a different result.
+    async fn stamp(&self, key: &str) -> Stamp {
+        let _ = key;
+        Stamp::Unknown
+    }
+}
+
+/// What a store knows of a value it was not asked to read: see
+/// [`ContentStore::stamp`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stamp {
+    /// Nothing: read the value.
+    Unknown,
+    /// The store remembers the origin's "there is nothing here" — what
+    /// [`ABSENT`] stands for in a `get`.
+    Absent,
+    /// The store holds the value.
+    Present(ValueStamp),
+}
+
+/// A stored value, described: see [`ContentStore::stamp`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValueStamp {
+    /// FNV-1a, 64 bits, over the bytes a `get` would return.
+    pub digest: u64,
+    /// The image's size in pixels, as its header states.
+    pub width: u32,
+    pub height: u32,
 }
 
 /// How long an origin's "there is nothing here" is believed.

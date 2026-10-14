@@ -614,6 +614,7 @@ mod tests {
             zone_level: 4,
             expiry_days: None,
             content_type: "image/png".into(),
+            index: false,
         };
         catalog::write(memory.as_ref(), &Catalog { layers: vec![def] })
             .await
@@ -710,6 +711,7 @@ mod tests {
             zone_level: 4,
             expiry_days: None,
             content_type: "image/png".into(),
+            index: false,
         };
         catalog::write(
             memory.as_ref(),

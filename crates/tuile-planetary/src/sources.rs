@@ -70,6 +70,13 @@ impl ImageryProvider for Held<dyn ImageryProvider> {
         self.0.tiling_scheme()
     }
 
+    async fn fetch_tile_stamp(
+        &self,
+        coord: tuile_core::raster::ImageryCoord,
+    ) -> tuile_core::storage::Stamp {
+        self.0.fetch_tile_stamp(coord).await
+    }
+
     fn generation(&self) -> u64 {
         self.0.generation()
     }

@@ -20,6 +20,11 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 futures-util = { workspace = true }
+# Archive indexes (`schema/tile_index.fbs`), the same format and version as
+# the pack's.
+flatbuffers = "25"
+# An index records each image tile's size, read from its header alone.
+image = { workspace = true }
 metrics = "0.24"
 rand = "0.9"
 serde = { workspace = true }

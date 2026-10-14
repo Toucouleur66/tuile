@@ -357,6 +357,23 @@ impl<P: tuile_core::raster::ImageryProvider, C: tuile_core::raster::ImageryProvi
             Cached::Through(p) => p.fetch_tile_bytes(coord).await,
         }
     }
+
+    async fn fetch_tile_stamp(
+        &self,
+        coord: tuile_core::raster::ImageryCoord,
+    ) -> tuile_core::storage::Stamp {
+        match self {
+            Cached::Direct(p) => p.fetch_tile_stamp(coord).await,
+            Cached::Through(p) => p.fetch_tile_stamp(coord).await,
+        }
+    }
+}
+
+/// Whether this globe's imagery is named and never drawn: a session that
+/// finishes its tiles by identity composes no drape, so a tile the store can
+/// describe need not be downloaded (see `GlobeOptions::imagery_by_stamp`).
+fn names_only(config: &GlobeConfig) -> bool {
+    config.session.finish == crate::session::Finish::Identity
 }
 
 /// Resolves terrain and imagery into the two seams the core consumes.
@@ -411,6 +428,7 @@ async fn resolve(
             deterministic_floor: true,
             held_drape: config.held_drape.clone(),
             composed_at: config.session.bake_max_size,
+            imagery_by_stamp: names_only(config),
         };
         return Ok(match config.imagery_asset_id {
             None => globe_with_provenance(
@@ -480,6 +498,7 @@ async fn resolve(
                 deterministic_floor: true,
                 held_drape: config.held_drape.clone(),
                 composed_at: config.session.bake_max_size,
+                imagery_by_stamp: names_only(config),
             },
             offload::threaded(),
         );
@@ -511,6 +530,7 @@ async fn resolve(
         deterministic_floor: true,
         held_drape: config.held_drape.clone(),
         composed_at: config.session.bake_max_size,
+        imagery_by_stamp: names_only(config),
     };
 
     // Ce que l'endpoint est, et non ce qu'on espère qu'il soit.

@@ -1,0 +1,42 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) lapoule.dev
+//
+// The index of one archive: which tiles it holds, and a digest of each
+// tile's bytes, without the bytes. One immutable object beside each archive,
+// `<archive key>.index`, written before the manifest that publishes the
+// archive and deleted with it.
+//
+// Regenerate the Rust with:
+//
+//     flatc --rust --gen-all -o crates/tuile-tile-server/src crates/tuile-tile-server/schema/tile_index.fbs
+//
+// and commit the result. `flatc` is deliberately NOT a build dependency, as
+// for the pack: `the_generated_index_code_matches_the_schema` keeps the two
+// in step where `flatc` exists.
+
+namespace tuile.tiles;
+
+/// One archive's tiles, in increasing tile id. The vectors run in parallel:
+/// entry `i` of each is about `ids[i]`.
+table TileIndex {
+  /// Bumped when an old reader would misread a new index.
+  version: uint;
+  /// The layer the archive belongs to.
+  layer: string;
+  /// The archive's own object key.
+  archive: string;
+  /// How many tiles the archive holds: the length of every vector below.
+  tiles: ulong;
+  /// The archive's tile ids, strictly increasing: a binary search finds one.
+  ids: [ulong];
+  /// FNV-1a, 64 bits, over each tile's bytes exactly as the store returns
+  /// them to a reader.
+  digests: [ulong];
+  /// Each tile's image width and height in pixels, as its header states;
+  /// 0 when the tile is not an image the index could read.
+  widths: [ushort];
+  heights: [ushort];
+}
+
+root_type TileIndex;
+file_identifier "TIDX";

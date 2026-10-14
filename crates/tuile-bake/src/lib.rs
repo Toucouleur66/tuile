@@ -43,6 +43,8 @@
 //! the camera and the sources, not of the network's mood.
 
 pub mod bake;
+#[cfg(test)]
+mod by_index_tests;
 mod globe;
 pub mod memory;
 pub mod packed;

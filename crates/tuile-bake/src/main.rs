@@ -646,6 +646,8 @@ fn reference(path: &std::path::Path, asset: i64, cap: u32) -> Result<(), String>
         },
         expiry_days: Some(REFERENCE_EXPIRY_DAYS),
         content_type: content_type.into(),
+        // Measured against, never named by a pack: no index.
+        index: false,
     }))?
     .ok_or("TUILE_TILES_BUCKET is not set: there is no store to bring the reference into")?;
     // The grid the film's own imagery is addressed on, from the store.
@@ -1200,10 +1202,14 @@ fn bake_with(args: Args, tiles: Option<&tiles::Tiles>) -> Result<(), String> {
         tiles.check(&namespaces);
         // The scene's slice of the store, local before the first frame.
         let imagery_layer = config.imagery_asset_id.map(tuile_bake::source_namespace);
-        tiles.project(
-            &poses[args.first.max(1) as usize - 1..wanted],
-            imagery_layer.as_deref(),
-        )?;
+        let scene_poses = &poses[args.first.max(1) as usize - 1..wanted];
+        // A pack of references draws no imagery: its imagery is projected by
+        // the archives' indexes, not their bytes.
+        if args.content == tuile_pack::Content::References {
+            tiles.project_by_reference(scene_poses, imagery_layer.as_deref())?;
+        } else {
+            tiles.project(scene_poses, imagery_layer.as_deref())?;
+        }
         config.tile_cache = Some(tiles.cache());
     }
     // What the pack already holds, mirrored for the loader so it never fetches

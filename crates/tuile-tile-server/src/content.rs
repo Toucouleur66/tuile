@@ -20,9 +20,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use tuile_core::storage::{is_absent, ContentStore, ABSENT};
+use tuile_core::storage::{is_absent, ContentStore, Stamp, ValueStamp, ABSENT};
 
 use crate::catalog::{ABSENT_MARKER, ABSENT_SUFFIX};
+use crate::index::Lookup;
 use crate::store::TileStore;
 
 /// A [`ContentStore`] over a [`TileStore`].
@@ -80,6 +81,36 @@ impl ContentStore for StoreContent {
         match self.store.get(&absent, z, x, y).await {
             Ok(Some(_)) => Some(ABSENT),
             _ => None,
+        }
+    }
+
+    /// From the zones projected by their indexes: the layer first, then its
+    /// absence sibling — the order of [`ContentStore::get`] here, so a stamp
+    /// answers what a `get` would have. Anything the indexes cannot settle
+    /// is [`Stamp::Unknown`], and the caller reads the tile as before.
+    async fn stamp(&self, key: &str) -> Stamp {
+        let Some((layer, z, x, y)) = parse(key) else {
+            return Stamp::Unknown;
+        };
+        match self.store.indexed(layer, z, x, y) {
+            Ok(Lookup::Held(stamp)) if stamp.has_size() => {
+                return Stamp::Present(ValueStamp {
+                    digest: stamp.digest,
+                    width: u32::from(stamp.width),
+                    height: u32::from(stamp.height),
+                })
+            }
+            Ok(Lookup::NotHeld) => {}
+            // Held without a size (not an image the index could read), or
+            // not known: the bytes say.
+            _ => return Stamp::Unknown,
+        }
+        let absent = format!("{layer}{ABSENT_SUFFIX}");
+        match self.store.indexed(&absent, z, x, y) {
+            Ok(Lookup::Held(_)) => Stamp::Absent,
+            // Held by neither: the store does not have it, and a `get` would
+            // go on to the bucket and the source. So does the caller.
+            _ => Stamp::Unknown,
         }
     }
 

@@ -108,6 +108,14 @@ impl Provenance {
             imagery.insert(tile, digest(bytes));
         }
     }
+
+    /// `tile`'s bytes were not fetched, and digest to `digest`, as whoever
+    /// stores them says.
+    pub fn stamped_imagery(&self, tile: ImageryCoord, digest: u64) {
+        if let Ok(mut imagery) = self.imagery.lock() {
+            imagery.insert(tile, digest);
+        }
+    }
 }
 
 #[cfg(test)]

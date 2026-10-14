@@ -6205,6 +6205,7 @@ dependencies = [
  "tuile-tape",
  "tuile-terrain",
  "tuile-tile-server",
+ "url",
 ]
 
 [[package]]
@@ -6643,7 +6644,9 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
+ "flatbuffers",
  "futures-util",
+ "image",
  "metrics",
  "object_store",
  "pmtiles",

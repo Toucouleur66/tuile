@@ -570,6 +570,19 @@ pub struct GlobeOptions {
     /// but it cannot ask [`GlobeOptions::held_drape`] about an identity without
     /// it. Ignored when `held_drape` is `None`.
     pub composed_at: u32,
+    /// Whether the imagery's pixels go unused: the consumer names each
+    /// drape's tiles — their coords, placements and digests — and composes
+    /// nothing. A bake by reference.
+    ///
+    /// Then a tile the provider can describe without its bytes
+    /// ([`ImageryProvider::fetch_tile_stamp`]) is neither downloaded nor
+    /// decoded: it is placed from its coord and the image size the provider
+    /// states, and its digest noted from the provider's word. The layer
+    /// carries a texture of that size **and no pixels** — nothing may read
+    /// them, which is what this option promises. Every drape comes out with
+    /// the same layers, placements, digests and composed size as from the
+    /// bytes; a tile the provider cannot describe is fetched as always.
+    pub imagery_by_stamp: bool,
 }
 
 /// The consumer's answer to "do you already hold this drape?".
@@ -608,6 +621,7 @@ impl Default for GlobeOptions {
             deterministic_floor: false,
             held_drape: None,
             composed_at: 0,
+            imagery_by_stamp: false,
         }
     }
 }
@@ -712,6 +726,37 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
             return Ok((c, tex));
         }
         let scheme = self.imagery.tiling_scheme();
+        if self.opts.imagery_by_stamp {
+            match self.imagery.fetch_tile_stamp(c).await {
+                tuile_core::storage::Stamp::Present(stamp) => {
+                    self.provenance.stamped_imagery(c, stamp.digest);
+                    // The size the bytes would have decoded to — reprojection
+                    // keeps it — and no pixels: nothing composes this drape.
+                    let tex = Arc::new(DecodedTexture {
+                        width: stamp.width,
+                        height: stamp.height,
+                        rgba8: Vec::new(),
+                    });
+                    let mut cache = self.decoded();
+                    if cache.generation == generation {
+                        cache.put(c, Arc::clone(&tex));
+                    }
+                    return Ok((c, tex));
+                }
+                // Remembered as absent: stand on the parent, exactly as the
+                // `NotFound` below would. At the coarsest level the bytes
+                // path says what it says.
+                tuile_core::storage::Stamp::Absent if c.level > scheme.minimum_level => {
+                    let parent = ImageryCoord {
+                        level: c.level - 1,
+                        x: c.x / 2,
+                        y: c.y / 2,
+                    };
+                    return Box::pin(self.fetch_imagery(parent)).await;
+                }
+                _ => {}
+            }
+        }
         // As above: the cache hit is already gone, and the recursion onto the
         // parent below counts itself when it reaches this line.
         let m = tuile_core::metrics::metrics();

@@ -18,6 +18,8 @@
 //!   streaming compaction, and cleanup — safe with any number of writers.
 //! - [`disk`] keeps whole archives on local disk, so a zone's second tile is
 //!   local.
+//! - [`index`] says what an archive holds without its bytes: its tile ids
+//!   and a digest of each, beside it in the bucket.
 //! - [`lru`] is the budgeted least-recently-used map the caches share.
 //! - [`projection`] takes a scene's slice of the store to local archives.
 //! - [`tiering`] picks what a compaction merges: similar sizes, contiguous.
@@ -33,6 +35,7 @@ pub mod disk;
 pub mod due;
 pub mod extract;
 pub mod grid;
+pub mod index;
 pub mod layer;
 pub mod ledger;
 pub mod lru;
