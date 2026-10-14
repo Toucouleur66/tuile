@@ -184,6 +184,118 @@ pub async fn open_local(path: &FsPath) -> Result<LocalReader, StoreError> {
     Ok(AsyncPmTilesReader::new_with_cached_path(HashMapCache::default(), path).await?)
 }
 
+/// What an archive's header asks for first: the header and, within these
+/// bytes, the root directory (the specification's own bound).
+const HEAD_BYTES: u64 = 16_384;
+
+/// Where every tile of a remote archive lies, read from its directories
+/// alone: the header and root directory in one request, every leaf
+/// directory in one more when the archive has any.
+#[derive(Debug, Clone, Default)]
+pub struct Listing {
+    /// Each tile id with the bytes of the archive that hold it, in the order
+    /// of the directories (increasing id). Identical tiles share a range.
+    pub tiles: Vec<(u64, std::ops::Range<u64>)>,
+    /// Requests made, and bytes read, to list it.
+    pub requests: u64,
+    pub bytes: u64,
+}
+
+/// An archive's directories, served from the sections read up front: the
+/// reader walks them without a request of its own.
+struct Sections(Vec<(u64, Bytes)>);
+
+impl pmtiles::AsyncBackend for Sections {
+    async fn read(
+        &self,
+        offset: usize,
+        length: usize,
+    ) -> pmtiles::PmtResult<pmtiles::BackendResponse> {
+        let offset = offset as u64;
+        for (start, bytes) in &self.0 {
+            let end = start + bytes.len() as u64;
+            if offset >= *start && offset < end {
+                let from = (offset - start) as usize;
+                let to = (from + length).min(bytes.len());
+                return Ok(pmtiles::BackendResponse::new(bytes.slice(from..to)));
+            }
+        }
+        // A directory outside the sections read: not a valid archive.
+        Err(pmtiles::PmtError::InvalidEntry)
+    }
+}
+
+/// Lists the tiles of the archive at `key` and where each lies, without
+/// reading any of them. `None` when the archive is gone (expired, merged).
+pub async fn list_remote(
+    store: &dyn ObjectStore,
+    key: &str,
+) -> Result<Option<Listing>, StoreError> {
+    use object_store::{GetOptions, GetRange};
+    let path = Path::from(key);
+    let head = match store
+        .get_opts(
+            &path,
+            GetOptions {
+                range: Some(GetRange::Bounded(0..HEAD_BYTES)),
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(got) => got.bytes().await?,
+        Err(object_store::Error::NotFound { .. }) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let mut listing = Listing {
+        requests: 1,
+        bytes: head.len() as u64,
+        ..Default::default()
+    };
+    if head.len() < HEADER_LEN {
+        return Err(StoreError::Corrupt(format!(
+            "{key}: a header of {} bytes",
+            head.len()
+        )));
+    }
+    let field = |at: usize| {
+        let mut b = [0u8; U64_LEN];
+        b.copy_from_slice(&head[at..at + U64_LEN]);
+        u64::from_le_bytes(b)
+    };
+    let (leaf_offset, leaf_length) = (field(LEAF_OFFSET), field(LEAF_LENGTH));
+    let mut sections = vec![(0, head.clone())];
+    if leaf_length > 0 {
+        let leaves = match object_store::ObjectStoreExt::get_range(
+            store,
+            &path,
+            leaf_offset..leaf_offset + leaf_length,
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        listing.requests += 1;
+        listing.bytes += leaves.len() as u64;
+        sections.push((leaf_offset, leaves));
+    }
+    let reader = Arc::new(
+        AsyncPmTilesReader::try_from_cached_source(Sections(sections), pmtiles::NoCache).await?,
+    );
+    let data_offset = reader.get_header().data_offset();
+    let mut entries = reader.entries();
+    while let Some(entry) = entries.try_next().await? {
+        let start = data_offset + entry.offset();
+        let range = start..start + u64::from(entry.length());
+        listing
+            .tiles
+            .extend(entry.iter_coords().map(|t| (t.value(), range.clone())));
+    }
+    Ok(Some(listing))
+}
+
 /// Every tile id an archive holds, in increasing order, runs of identical
 /// tiles expanded.
 pub async fn ids<B, C>(reader: Arc<AsyncPmTilesReader<B, C>>) -> Result<Vec<u64>, StoreError>

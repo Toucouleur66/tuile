@@ -658,6 +658,7 @@ impl TileStore {
             // Not in the projection: the footprint left it out, or it is
             // truly absent. The bucket decides.
             self.stats.projection_misses.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(layer, level, x, y, "TILES-PROJECTION-MISS");
         }
 
         let now = (self.clock)();
@@ -701,6 +702,7 @@ impl TileStore {
                         "disk"
                     } else {
                         self.stats.remote.fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!(layer, level, x, y, "TILES-REMOTE");
                         "archive"
                     };
                     metrics::counter!("tuile_tiles_hits_total", "layer" => l.name.clone(), "from" => from).increment(1);

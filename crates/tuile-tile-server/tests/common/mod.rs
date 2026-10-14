@@ -159,8 +159,10 @@ pub struct Counting {
     pub inner: Arc<dyn ObjectStore>,
     pub gets: AtomicU64,
     pub manifest_gets: AtomicU64,
-    /// Reads of archives (`.pmtiles`), whole or ranged.
+    /// Reads of archives (`.pmtiles`), whole or ranged, and the bytes the
+    /// successful ones returned.
     pub archive_gets: AtomicU64,
+    pub archive_bytes: AtomicU64,
 }
 
 impl Counting {
@@ -170,16 +172,20 @@ impl Counting {
             gets: AtomicU64::new(0),
             manifest_gets: AtomicU64::new(0),
             archive_gets: AtomicU64::new(0),
+            archive_bytes: AtomicU64::new(0),
         })
+    }
+    pub fn archive_gets(&self) -> u64 {
+        self.archive_gets.load(Ordering::SeqCst)
+    }
+    pub fn archive_bytes(&self) -> u64 {
+        self.archive_bytes.load(Ordering::SeqCst)
     }
     pub fn gets(&self) -> u64 {
         self.gets.load(Ordering::SeqCst)
     }
     pub fn manifest_gets(&self) -> u64 {
         self.manifest_gets.load(Ordering::SeqCst)
-    }
-    pub fn archive_gets(&self) -> u64 {
-        self.archive_gets.load(Ordering::SeqCst)
     }
 }
 
@@ -220,10 +226,16 @@ impl ObjectStore for Counting {
         if location.as_ref().ends_with("manifest.json") {
             self.manifest_gets.fetch_add(1, Ordering::SeqCst);
         }
+        let head = options.head;
         if location.as_ref().ends_with(".pmtiles") {
             self.archive_gets.fetch_add(1, Ordering::SeqCst);
         }
-        self.inner.get_opts(location, options).await
+        let got = self.inner.get_opts(location, options).await?;
+        if location.as_ref().ends_with(".pmtiles") && !head {
+            self.archive_bytes
+                .fetch_add(got.range.end - got.range.start, Ordering::SeqCst);
+        }
+        Ok(got)
     }
 
     async fn get_ranges(
