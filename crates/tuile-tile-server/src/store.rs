@@ -1625,15 +1625,25 @@ impl TileStore {
     pub async fn zones_of(&self, layer: &Layer) -> Result<Vec<Zone>, StoreError> {
         // By path segment: a listing of `asset-2` does not reach
         // `asset-2.absent`, and the key's parse checks the layer anyway.
-        let listed: Vec<object_store::ObjectMeta> = self
-            .store
-            .list(Some(&Path::from(layer.name.as_str())))
-            .try_collect()
-            .await?;
-        Ok(listed
-            .into_iter()
-            .filter_map(|meta| parse_manifest_key(layer, meta.location.as_ref()))
-            .collect())
+        // A layer is hundreds of thousands of objects: the listing says how
+        // far it has gone as it goes.
+        let began = std::time::Instant::now();
+        let mut listed = self.store.list(Some(&Path::from(layer.name.as_str())));
+        let (mut objects, mut zones) = (0u64, Vec::new());
+        while let Some(meta) = listed.try_next().await? {
+            objects += 1;
+            zones.extend(parse_manifest_key(layer, meta.location.as_ref()));
+            if objects % 50_000 == 0 {
+                tracing::info!(
+                    layer = %layer.name,
+                    objects,
+                    zones = zones.len(),
+                    seconds = began.elapsed().as_secs_f64(),
+                    "STORE-LISTING"
+                );
+            }
+        }
+        Ok(zones)
     }
 
     /// One pass over the whole store: in every zone, drops expired archives,
