@@ -299,8 +299,27 @@ fn a_terrain_projected_tile_by_tile_bakes_the_pack_a_whole_one_does() {
     let a = dir.path().join("whole.tuilepack");
     bake(&whole, &a);
 
+    // The imagery's register, rebuilt from the bucket: what a host keeps.
+    let register = Arc::new(tuile_tile_server::MemoryRegister::new());
+    tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(async {
+            let store = TileStore::open(objects.clone(), StoreConfig::default()).await?;
+            for layer in store.layers().filter(|l| l.index) {
+                for zone in store.zones_of(layer).await? {
+                    let read = store.zone_tiles(&layer.name, zone, 4).await?;
+                    register.rebuild_zone(layer, zone, &read.manifest, &read.archives);
+                }
+            }
+            Ok::<_, tuile_tile_server::StoreError>(())
+        })
+        .expect("register");
+
     // The terrain cut to what this bake can read.
-    let targeted = Tiles::over(objects).expect("store");
+    let targeted = Tiles::over(objects)
+        .expect("store")
+        .with_index_reader(register)
+        .expect("reader");
     let traversal = {
         let mut config = GlobeConfig::new("");
         config.session.traversal.maximum_screen_space_error = SSE;
@@ -318,8 +337,8 @@ fn a_terrain_projected_tile_by_tile_bakes_the_pack_a_whole_one_does() {
     assert!(cut.targeted, "{report:?}");
     let indexed = &report.layers[&imagery];
     assert!(
-        indexed.zones_indexed > 0 && indexed.bytes < indexed.whole_bytes,
-        "the imagery known by its indexes: {indexed:?}"
+        indexed.zones_registered > 0 && indexed.bytes == 0,
+        "the imagery known by the register: {indexed:?}"
     );
     assert!(
         cut.tiles_kept < cut.tiles_listed,

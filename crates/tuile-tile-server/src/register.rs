@@ -99,6 +99,9 @@ pub struct Book {
     pub archives: HashMap<String, ArchiveEntry>,
     /// `(layer, tile id)`.
     pub tiles: BTreeMap<(String, u64), TileEntry>,
+    /// The layers it was told of: of any other it knows nothing, and says
+    /// so (the bucket is then listed).
+    pub layers: std::collections::BTreeSet<String>,
 }
 
 /// The layer a layer's tiles are kept under, and whether it is an absence
@@ -194,6 +197,7 @@ impl MemoryRegister {
             return;
         }
         let mut b = self.lock();
+        b.layers.insert(base.to_string());
         let g = manifest.generation;
         let named: Vec<&str> = manifest.archives.iter().map(|a| a.key.as_str()).collect();
         for (i, a) in manifest.archives.iter().enumerate() {
@@ -298,6 +302,7 @@ impl Ledger for MemoryRegister {
     async fn writing(&self, layer: &str, zone: Zone, key: &str) -> Result<(), String> {
         let (base, _) = base_of(layer);
         let mut b = self.lock();
+        b.layers.insert(base.to_string());
         b.zones.entry((base.into(), zone)).or_default();
         b.archives.entry(key.into()).or_insert(ArchiveEntry {
             layer: base.into(),
@@ -317,6 +322,7 @@ impl Ledger for MemoryRegister {
             return Ok(());
         }
         let mut b = self.lock();
+        b.layers.insert(p.layer.to_string());
         let g = p.manifest.generation;
         for a in &p.manifest.archives {
             let entry = b.archives.entry(a.key.clone()).or_insert(ArchiveEntry {
@@ -407,6 +413,9 @@ impl Absences for MemoryRegister {
 impl IndexReader for MemoryRegister {
     async fn zones(&self, layer: &str) -> Result<Option<Vec<KnownZone>>, String> {
         let b = self.lock();
+        if !b.layers.contains(layer) {
+            return Ok(None);
+        }
         Ok(Some(
             b.zones
                 .iter()
