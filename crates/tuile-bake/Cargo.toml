@@ -87,3 +87,5 @@ jemalloc_pprof = { version = "0.9", features = ["flamegraph"], optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# An origin's "no such tile" names its URL.
+url = { workspace = true }

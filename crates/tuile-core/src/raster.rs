@@ -1354,6 +1354,22 @@ pub trait ImageryProvider: Send + Sync {
     /// faster to save a decode that costs microseconds.
     async fn fetch_tile_bytes(&self, coord: ImageryCoord) -> Result<Fetched<Bytes>, RasterError>;
 
+    /// What the tile is, **without its bytes**, when the provider can tell:
+    /// a stored tile's digest and image size, or a remembered absence. For a
+    /// consumer that names tiles and composes none (see
+    /// [`crate::storage::ContentStore::stamp`]).
+    ///
+    /// The default knows nothing, and a consumer told
+    /// [`Stamp::Unknown`](crate::storage::Stamp::Unknown) fetches the bytes
+    /// as it always has. A provider that answers must answer what
+    /// [`fetch_tile_bytes`](ImageryProvider::fetch_tile_bytes) would have:
+    /// the digest of the very bytes it would return, and an absence exactly
+    /// where it would have said `NotFound`.
+    async fn fetch_tile_stamp(&self, coord: ImageryCoord) -> crate::storage::Stamp {
+        let _ = coord;
+        crate::storage::Stamp::Unknown
+    }
+
     /// The decoded tile. Provided: every provider decodes the same way.
     async fn fetch_tile(
         &self,
@@ -1443,6 +1459,12 @@ impl<P: ImageryProvider> CachedImagery<P> {
 impl<P: ImageryProvider> ImageryProvider for CachedImagery<P> {
     fn tiling_scheme(&self) -> TilingScheme {
         self.inner.tiling_scheme()
+    }
+
+    /// The store's word, when it has one; the provider behind it is never
+    /// asked — it would have to fetch the bytes to say anything.
+    async fn fetch_tile_stamp(&self, coord: ImageryCoord) -> crate::storage::Stamp {
+        self.store.stamp(&self.key(coord)).await
     }
 
     async fn fetch_tile_bytes(&self, coord: ImageryCoord) -> Result<Fetched<Bytes>, RasterError> {

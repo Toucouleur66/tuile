@@ -43,6 +43,10 @@ pub struct Layer {
     pub expiry: Option<Duration>,
     /// The media type a server answers with.
     pub content_type: String,
+    /// Whether each archive of the layer gets an index beside it: its tile
+    /// ids and a digest of each tile, for a reader that names tiles without
+    /// reading them (see [`crate::index`]). Its absence sibling follows it.
+    pub index: bool,
 }
 
 /// Where a tile lives within its layer.

@@ -58,6 +58,7 @@ pub fn imagery() -> Layer {
         zone_level: ZONE_LEVEL,
         expiry: Some(IMAGERY_EXPIRY),
         content_type: "image/jpeg".into(),
+        index: false,
     }
 }
 
@@ -71,6 +72,7 @@ pub fn terrain() -> Layer {
         zone_level: TERRAIN_ZONE_LEVEL,
         expiry: None,
         content_type: "application/vnd.quantized-mesh".into(),
+        index: false,
     }
 }
 
@@ -157,6 +159,8 @@ pub struct Counting {
     pub inner: Arc<dyn ObjectStore>,
     pub gets: AtomicU64,
     pub manifest_gets: AtomicU64,
+    /// Reads of archives (`.pmtiles`), whole or ranged.
+    pub archive_gets: AtomicU64,
 }
 
 impl Counting {
@@ -165,6 +169,7 @@ impl Counting {
             inner,
             gets: AtomicU64::new(0),
             manifest_gets: AtomicU64::new(0),
+            archive_gets: AtomicU64::new(0),
         })
     }
     pub fn gets(&self) -> u64 {
@@ -172,6 +177,9 @@ impl Counting {
     }
     pub fn manifest_gets(&self) -> u64 {
         self.manifest_gets.load(Ordering::SeqCst)
+    }
+    pub fn archive_gets(&self) -> u64 {
+        self.archive_gets.load(Ordering::SeqCst)
     }
 }
 
@@ -212,6 +220,9 @@ impl ObjectStore for Counting {
         if location.as_ref().ends_with("manifest.json") {
             self.manifest_gets.fetch_add(1, Ordering::SeqCst);
         }
+        if location.as_ref().ends_with(".pmtiles") {
+            self.archive_gets.fetch_add(1, Ordering::SeqCst);
+        }
         self.inner.get_opts(location, options).await
     }
 
@@ -221,6 +232,9 @@ impl ObjectStore for Counting {
         ranges: &[std::ops::Range<u64>],
     ) -> object_store::Result<Vec<Bytes>> {
         self.gets.fetch_add(1, Ordering::SeqCst);
+        if location.as_ref().ends_with(".pmtiles") {
+            self.archive_gets.fetch_add(1, Ordering::SeqCst);
+        }
         self.inner.get_ranges(location, ranges).await
     }
 
@@ -270,6 +284,7 @@ pub fn catalog() -> tuile_tile_server::Catalog {
                 zone_level: ZONE_LEVEL,
                 expiry_days: Some(IMAGERY_EXPIRY.as_secs() / 86_400),
                 content_type: "image/jpeg".into(),
+                index: false,
             },
             LayerDef {
                 name: TERRAIN.into(),
@@ -279,6 +294,7 @@ pub fn catalog() -> tuile_tile_server::Catalog {
                 zone_level: TERRAIN_ZONE_LEVEL,
                 expiry_days: None,
                 content_type: "application/vnd.quantized-mesh".into(),
+                index: false,
             },
         ],
     }

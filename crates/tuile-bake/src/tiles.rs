@@ -178,6 +178,27 @@ impl Tiles {
         poses: &[tuile_tape::Frame],
         imagery_layer: Option<&str>,
     ) -> Result<(), String> {
+        self.project_as(poses, imagery_layer, false)
+    }
+
+    /// The same, for a bake by reference: its imagery is named and never
+    /// drawn, so the imagery layer is projected by its archives' indexes —
+    /// which tiles each zone holds, and a digest of each — and not a byte of
+    /// imagery comes down where every archive of a zone has its index.
+    pub fn project_by_reference(
+        &self,
+        poses: &[tuile_tape::Frame],
+        imagery_layer: Option<&str>,
+    ) -> Result<(), String> {
+        self.project_as(poses, imagery_layer, true)
+    }
+
+    fn project_as(
+        &self,
+        poses: &[tuile_tape::Frame],
+        imagery_layer: Option<&str>,
+        imagery_by_index: bool,
+    ) -> Result<(), String> {
         let eyes = poses.iter().map(|p| {
             let g = tuile_core::geo::ecef_to_geodetic(glam::DVec3::from_array(p.position));
             Eye {
@@ -197,6 +218,9 @@ impl Tiles {
         let mut footprint = Footprint::from_eyes(eyes, factor);
         if let Some(name) = imagery_layer {
             footprint = footprint.with_layer_factor(name, imagery_factor);
+            if imagery_by_index {
+                footprint = footprint.with_layer_by_index(name);
+            }
         }
         let dir =
             std::env::var("TUILE_TILES_DIR").unwrap_or_else(|_| DEFAULT_PROJECTION_DIR.into());
@@ -230,6 +254,9 @@ impl Tiles {
             tiles = report.tiles_kept,
             mb = report.bytes as f64 / 1e6,
             requests = report.requests,
+            zones_indexed = report.zones_indexed,
+            tiles_indexed = report.tiles_indexed,
+            index_mb = report.index_bytes as f64 / 1e6,
             seconds = report.millis as f64 / 1e3,
             "TILES-PROJECTED"
         );

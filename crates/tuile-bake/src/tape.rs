@@ -133,7 +133,14 @@ impl TapeBake {
             namespaces.extend(layers.1.clone());
             tiles.check(&namespaces);
             // The scene's slice of the store, local before the first frame.
-            tiles.project(&self.poses[first as usize - 1..wanted], layers.1.as_deref())?;
+            let poses = &self.poses[first as usize - 1..wanted];
+            // A pack of references draws no imagery: its imagery is projected
+            // by the archives' indexes, not their bytes.
+            if config.session.finish == Finish::Identity {
+                tiles.project_by_reference(poses, layers.1.as_deref())?;
+            } else {
+                tiles.project(poses, layers.1.as_deref())?;
+            }
             config.tile_cache = Some(tiles.cache());
         }
         // What the pack already holds, mirrored for the loader so it never

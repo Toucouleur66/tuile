@@ -44,6 +44,7 @@ use tokio::io::AsyncReadExt;
 use crate::archive::{self, LocalReader, RemoteReader};
 use crate::catalog::ABSENT_SUFFIX;
 use crate::disk::{ArchiveCache, DiskCacheConfig};
+use crate::index::{self, ZoneIndex};
 use crate::layer::{Layer, Zone};
 use crate::lru::Lru;
 use crate::manifest::{self, now_secs, ArchiveRef, Manifest, Retired, Versioned};
@@ -311,6 +312,9 @@ pub struct TileStore {
     gate: Mutex<Option<Arc<Gate>>>,
     /// Local projections of remote zones, read before the bucket.
     projections: Mutex<HashMap<ZoneKey, Arc<archive::LocalReader>>>,
+    /// Zones known by their archives' indexes alone: which tiles they hold
+    /// and a digest of each, nothing downloaded (see [`crate::index`]).
+    indexes: Mutex<HashMap<ZoneKey, Arc<ZoneIndex>>>,
     /// Told of every manifest this store publishes, if anyone is to be.
     announcer: Option<Arc<dyn Announce>>,
     ledger: Option<Arc<dyn crate::Ledger>>,
@@ -376,6 +380,7 @@ impl TileStore {
             fault: AtomicU8::new(Fault::None as u8),
             gate: Mutex::default(),
             projections: Mutex::default(),
+            indexes: Mutex::default(),
             announcer: None,
             ledger: None,
             stats: Stats::default(),
@@ -526,6 +531,70 @@ impl TileStore {
             p.insert((layer.name.clone(), zone), reader);
         }
         Ok(())
+    }
+
+    /// Knows the zone by its index from now on: see [`TileStore::indexed`].
+    pub(crate) fn attach_index(&self, layer: &Layer, zone: Zone, index: Arc<ZoneIndex>) {
+        if let Ok(mut i) = self.indexes.lock() {
+            i.insert((layer.name.clone(), zone), index);
+        }
+    }
+
+    /// What the zone's index says of a tile, without reading it: held, with
+    /// the stamp of the copy a reader would get; not held; or unknown — the
+    /// zone was not projected by its index, or the tile is in this store's
+    /// buffer, whose bytes a reader gets before any archive's.
+    ///
+    /// Answers from what the projection read and nothing else: never a
+    /// request.
+    pub fn indexed(
+        &self,
+        layer: &str,
+        level: u8,
+        x: u32,
+        y: u32,
+    ) -> Result<index::Lookup, StoreError> {
+        let (l, zone, id) = self.locate(layer, level, x, y)?;
+        let key = (l.name.clone(), zone);
+        if self.buffered(&key, id).is_some() {
+            return Ok(index::Lookup::Unknown);
+        }
+        let zone_index = self.indexes.lock().ok().and_then(|i| i.get(&key).cloned());
+        Ok(match zone_index {
+            None => index::Lookup::Unknown,
+            Some(z) => match z.get(id) {
+                Some(stamp) => index::Lookup::Held(stamp),
+                None => index::Lookup::NotHeld,
+            },
+        })
+    }
+
+    /// Writes the index of the archive at `local`, to be published as
+    /// `object`, when the layer keeps indexes. Called after the archive's
+    /// upload and before the manifest that publishes it.
+    async fn write_index(
+        &self,
+        layer: &Layer,
+        local: &std::path::Path,
+        object: &str,
+    ) -> Result<(), StoreError> {
+        if !layer.index {
+            return Ok(());
+        }
+        let built = index::of_local_archive(local, layer, object).await?;
+        index::put(self.store.as_ref(), &built).await?;
+        metrics::counter!("tuile_tiles_indexes_written_total", "layer" => layer.name.clone())
+            .increment(1);
+        Ok(())
+    }
+
+    /// Deletes an archive and its index, if it has one.
+    async fn delete_archive(&self, key: &str) -> Result<(), StoreError> {
+        match self.store.delete(&Path::from(key)).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+            Err(e) => return Err(e.into()),
+        }
+        index::delete(self.store.as_ref(), key).await
     }
 
     #[doc(hidden)]
@@ -1157,6 +1226,9 @@ impl TileStore {
         .map_err(|e| StoreError::Corrupt(format!("archive writer: {e}")))??;
         self.record_writing(&key.0, key.1, &object).await?;
         upload(self.store.as_ref(), file.path(), &object).await?;
+        // Before the manifest names the archive: a published archive has its
+        // index, whoever reads it.
+        self.write_index(layer, file.path(), &object).await?;
 
         let gate = self.gate.lock().ok().and_then(|mut g| g.take());
         if let Some(gate) = gate {
@@ -1469,6 +1541,7 @@ impl TileStore {
                 let object = archive_key(&prefix, &old.epoch, now);
                 self.record_writing(&l.name, zone, &object).await?;
                 upload(self.store.as_ref(), file.path(), &object).await?;
+                self.write_index(&l, file.path(), &object).await?;
                 Some(ArchiveRef {
                     key: object,
                     epoch: old.epoch.clone(),
@@ -1504,12 +1577,7 @@ impl TileStore {
                 }
                 None => {
                     if let Some(entry) = entry {
-                        if self
-                            .store
-                            .delete(&Path::from(entry.key.as_str()))
-                            .await
-                            .is_ok()
-                        {
+                        if self.delete_archive(&entry.key).await.is_ok() {
                             self.record_deleted(&l.name, zone, &[entry.key]).await;
                         }
                     }
@@ -1544,18 +1612,26 @@ impl TileStore {
     pub async fn zones(&self) -> Result<Vec<(String, Zone)>, StoreError> {
         let mut out = Vec::new();
         for layer in self.layers.values() {
-            let listed: Vec<object_store::ObjectMeta> = self
-                .store
-                .list(Some(&Path::from(layer.name.as_str())))
-                .try_collect()
-                .await?;
-            for meta in listed {
-                if let Some(zone) = parse_manifest_key(layer, meta.location.as_ref()) {
-                    out.push((layer.name.clone(), zone));
-                }
+            for zone in self.zones_of(layer).await? {
+                out.push((layer.name.clone(), zone));
             }
         }
         Ok(out)
+    }
+
+    /// Every zone of one layer that has a manifest, found by listing.
+    pub async fn zones_of(&self, layer: &Layer) -> Result<Vec<Zone>, StoreError> {
+        // By path segment: a listing of `asset-2` does not reach
+        // `asset-2.absent`, and the key's parse checks the layer anyway.
+        let listed: Vec<object_store::ObjectMeta> = self
+            .store
+            .list(Some(&Path::from(layer.name.as_str())))
+            .try_collect()
+            .await?;
+        Ok(listed
+            .into_iter()
+            .filter_map(|meta| parse_manifest_key(layer, meta.location.as_ref()))
+            .collect())
     }
 
     /// One pass over the whole store: in every zone, drops expired archives,
@@ -1716,6 +1792,7 @@ impl TileStore {
         let object = archive_key(&prefix, &epoch, now);
         self.record_writing(&layer.name, zone, &object).await?;
         upload(self.store.as_ref(), file.path(), &object).await?;
+        self.write_index(layer, file.path(), &object).await?;
         // A merged archive's fetch times span its inputs'; unknown if any
         // input's are.
         let fetch_bounds: Option<Vec<(u64, u64)>> = run
@@ -1774,12 +1851,7 @@ impl TileStore {
                 })
             }
             None => {
-                if self
-                    .store
-                    .delete(&Path::from(object.as_str()))
-                    .await
-                    .is_ok()
-                {
+                if self.delete_archive(&object).await.is_ok() {
                     self.record_deleted(&layer.name, zone, &[object]).await;
                 }
                 Ok(Compaction::Superseded)
@@ -1813,10 +1885,8 @@ impl TileStore {
         }
         let mut removed = 0;
         for k in &expired {
-            match self.store.delete(&Path::from(k.as_str())).await {
-                Ok(()) | Err(object_store::Error::NotFound { .. }) => removed += 1,
-                Err(e) => return Err(e.into()),
-            }
+            self.delete_archive(k).await?;
+            removed += 1;
         }
         self.record_deleted(&layer.name, zone, &expired).await;
 
@@ -1835,16 +1905,25 @@ impl TileStore {
             .await?;
         for meta in listed {
             let k = meta.location.to_string();
-            if !k.ends_with(".pmtiles") || known.contains(&k.as_str()) {
-                continue;
-            }
             let modified: SystemTime = meta.last_modified.into();
             let old = now
                 .duration_since(modified)
                 .map(|a| a >= self.cfg.orphan_grace)
                 .unwrap_or(false);
+            // An index whose archive no manifest names: its archive's upload
+            // failed after it, or its archive was deleted before it.
+            if let Some(archive) = index::archive_of_index(&k) {
+                if old && !known.contains(&archive) {
+                    index::delete(self.store.as_ref(), archive).await?;
+                    removed += 1;
+                }
+                continue;
+            }
+            if !k.ends_with(".pmtiles") || known.contains(&k.as_str()) {
+                continue;
+            }
             if old {
-                self.store.delete(&meta.location).await?;
+                self.delete_archive(&k).await?;
                 self.record_deleted(&layer.name, zone, &[k]).await;
                 removed += 1;
             }

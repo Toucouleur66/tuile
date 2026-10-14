@@ -50,6 +50,11 @@ pub struct LayerDef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expiry_days: Option<u64>,
     pub content_type: String,
+    /// Whether its archives are written with an index beside them (see
+    /// [`crate::index`]). Absent means no: a catalog written before indexes
+    /// reads as it did.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub index: bool,
 }
 
 /// A bucket's layers.
@@ -100,6 +105,7 @@ impl LayerDef {
                 .expiry_days
                 .map(|d| Duration::from_secs(d * SECONDS_PER_DAY)),
             content_type: self.content_type.clone(),
+            index: self.index,
         })
     }
 }

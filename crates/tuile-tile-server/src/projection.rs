@@ -78,6 +78,9 @@ pub struct Footprint {
     /// composes imagery tiles several levels finer than the terrain tile it
     /// covers, so at a given distance the imagery in use is much smaller.
     layer_factors: Vec<(String, f64)>,
+    /// Layers projected by their archives' indexes rather than their
+    /// archives (by name; a layer's absence sibling follows its layer).
+    by_index: Vec<String>,
 }
 
 /// A tile's extent in degrees: west, south, east, north.
@@ -134,7 +137,25 @@ impl Footprint {
             eyes: kept,
             tile_factor,
             layer_factors: Vec::new(),
+            by_index: Vec::new(),
         }
+    }
+
+    /// Projects the layer `name` (and its absence sibling) by its archives'
+    /// indexes: which tiles each zone holds and a digest of each, and not a
+    /// byte of the tiles — for a consumer that names tiles and draws none.
+    /// A zone with an archive that has no index is projected as before.
+    pub fn with_layer_by_index(mut self, name: impl Into<String>) -> Self {
+        self.by_index.push(name.into());
+        self
+    }
+
+    /// Whether a layer is projected by its indexes.
+    pub fn by_index(&self, layer: &str) -> bool {
+        let base = layer
+            .strip_suffix(crate::catalog::ABSENT_SUFFIX)
+            .unwrap_or(layer);
+        self.by_index.iter().any(|n| n == base)
     }
 
     /// Uses `factor` for the layer `name` (and its absence sibling).
@@ -210,6 +231,13 @@ pub struct ProjectionReport {
     pub bytes: u64,
     pub requests: u64,
     pub millis: u64,
+    /// Zones known by their archives' indexes alone, the tiles those
+    /// indexes name, and the bytes and requests the indexes cost (counted
+    /// in `bytes` and `requests` too).
+    pub zones_indexed: usize,
+    pub tiles_indexed: u64,
+    pub index_bytes: u64,
+    pub index_requests: u64,
 }
 
 /// Where a zone's projection lives under `dir`.
@@ -237,7 +265,14 @@ impl TileStore {
             })
             .collect();
         let results: Vec<Result<ProjectionReport, StoreError>> = futures_util::stream::iter(zones)
-            .map(|(layer, zone)| async move { self.project_zone(dir, &layer, zone).await })
+            .map(|(layer, zone)| async move {
+                if footprint.by_index(&layer) {
+                    if let Some(report) = self.index_zone(&layer, zone).await? {
+                        return Ok(report);
+                    }
+                }
+                self.project_zone(dir, &layer, zone).await
+            })
             .buffer_unordered(ZONES_IN_FLIGHT)
             .collect()
             .await;
@@ -250,9 +285,60 @@ impl TileStore {
             total.tiles_kept += r.tiles_kept;
             total.bytes += r.bytes;
             total.requests += r.requests;
+            total.zones_indexed += r.zones_indexed;
+            total.tiles_indexed += r.tiles_indexed;
+            total.index_bytes += r.index_bytes;
+            total.index_requests += r.index_requests;
         }
         total.millis = began.elapsed().as_millis() as u64;
         Ok(total)
+    }
+
+    /// Knows a zone by its live archives' indexes, nothing of the archives
+    /// downloaded. `None` when one of them has no index: the zone is then
+    /// projected from its archives, as before.
+    async fn index_zone(
+        &self,
+        layer_name: &str,
+        zone: Zone,
+    ) -> Result<Option<ProjectionReport>, StoreError> {
+        let layer = self.layer(layer_name)?.clone();
+        let now = self.now();
+        let m = manifest::read(self.object_store().as_ref(), &layer.zone_prefix(zone))
+            .await?
+            .manifest;
+        let mut report = ProjectionReport {
+            zones_seen: 1,
+            ..Default::default()
+        };
+        // Oldest first, as the manifest lists them: the last to hold a tile
+        // wins it, which is the store's own rule.
+        let mut indexes = Vec::new();
+        for a in m
+            .archives
+            .iter()
+            .filter(|a| !layer.is_expired(&a.epoch, now))
+        {
+            report.requests += 1;
+            report.index_requests += 1;
+            match crate::index::read(self.object_store().as_ref(), &a.key).await? {
+                Some((index, bytes)) => {
+                    report.bytes += bytes;
+                    report.index_bytes += bytes;
+                    report.tiles_listed += index.len() as u64;
+                    indexes.push(index);
+                }
+                None => {
+                    tracing::debug!(archive = a.key, "no index: the zone is projected whole");
+                    return Ok(None);
+                }
+            }
+        }
+        let zone_index = crate::index::ZoneIndex::from_archives(&indexes);
+        report.tiles_indexed = zone_index.len() as u64;
+        report.zones_indexed = 1;
+        self.attach_index(&layer, zone, Arc::new(zone_index));
+        Ok(Some(report))
     }
 
     async fn project_zone(
