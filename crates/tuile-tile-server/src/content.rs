@@ -92,25 +92,43 @@ impl ContentStore for StoreContent {
         let Some((layer, z, x, y)) = parse(key) else {
             return Stamp::Unknown;
         };
+        let outcome = |what: &'static str| {
+            metrics::counter!("tuile_tiles_index_lookups_total", "layer" => layer.to_string(), "outcome" => what)
+                .increment(1);
+        };
         match self.store.indexed(layer, z, x, y) {
             Ok(Lookup::Held(stamp)) if stamp.has_size() => {
+                outcome("present");
                 return Stamp::Present(ValueStamp {
                     digest: stamp.digest,
                     width: u32::from(stamp.width),
                     height: u32::from(stamp.height),
-                })
+                });
             }
             Ok(Lookup::NotHeld) => {}
             // Held without a size (not an image the index could read), or
             // not known: the bytes say.
-            _ => return Stamp::Unknown,
+            Ok(Lookup::Held(_)) => {
+                outcome("no_size");
+                return Stamp::Unknown;
+            }
+            _ => {
+                outcome("unknown");
+                return Stamp::Unknown;
+            }
         }
         let absent = format!("{layer}{ABSENT_SUFFIX}");
         match self.store.indexed(&absent, z, x, y) {
-            Ok(Lookup::Held(_)) => Stamp::Absent,
+            Ok(Lookup::Held(_)) => {
+                outcome("absent");
+                Stamp::Absent
+            }
             // Held by neither: the store does not have it, and a `get` would
             // go on to the bucket and the source. So does the caller.
-            _ => Stamp::Unknown,
+            _ => {
+                outcome("not_held");
+                Stamp::Unknown
+            }
         }
     }
 

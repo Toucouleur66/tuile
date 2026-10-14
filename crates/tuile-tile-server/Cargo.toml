@@ -37,6 +37,8 @@ tuile-core = { version = "0.5.0", path = "../tuile-core" }
 url = { workspace = true }
 
 [dev-dependencies]
+# Counters read back in the tests, from a recorder of the test's own thread.
+metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
 # The integration test talks to a real S3-compatible bucket (R2).
 object_store = { version = "0.14.2", default-features = false, features = ["aws"] }
 tokio = { workspace = true, features = ["sync", "fs", "io-util", "time", "rt", "rt-multi-thread", "macros"] }

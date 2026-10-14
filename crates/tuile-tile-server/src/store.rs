@@ -1927,6 +1927,8 @@ impl TileStore {
             if let Some(archive) = index::archive_of_index(&k) {
                 if old && !known.contains(&archive) {
                     index::delete(self.store.as_ref(), archive).await?;
+                    metrics::counter!("tuile_tiles_index_orphans_deleted_total", "layer" => layer.name.clone())
+                        .increment(1);
                     removed += 1;
                 }
                 continue;

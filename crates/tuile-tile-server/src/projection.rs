@@ -444,11 +444,18 @@ impl TileStore {
                     let targeted = footprint.targets(&layer) && zone != Zone::Top;
                     if footprint.by_index(&layer) {
                         match self.index_zone(&layer, zone).await {
-                            Ok(Some(r)) => return (layer, zone, false, Ok(r)),
-                            Ok(None) => {}
+                            Ok(Some(r)) => {
+                                metrics::counter!("tuile_tiles_zones_projected_total", "layer" => layer.clone(), "by" => "index").increment(1);
+                                metrics::counter!("tuile_tiles_index_bytes_read_total", "layer" => layer.clone()).increment(r.index_bytes);
+                                return (layer, zone, false, Ok(r));
+                            }
+                            Ok(None) => {
+                                metrics::counter!("tuile_tiles_index_fallbacks_total", "layer" => layer.clone()).increment(1);
+                            }
                             Err(e) => return (layer, zone, false, Err(e)),
                         }
                     }
+                    metrics::counter!("tuile_tiles_zones_projected_total", "layer" => layer.clone(), "by" => "archives").increment(1);
                     let r = if targeted {
                         self.project_zone_targeted(footprint, dir, &layer, zone)
                             .await
@@ -532,7 +539,13 @@ impl TileStore {
                     indexes.push(index);
                 }
                 None => {
-                    tracing::debug!(archive = a.key, "no index: the zone is projected whole");
+                    // The whole zone is then read from its archives: the
+                    // cost the index is there to spare, so said aloud.
+                    tracing::info!(
+                        layer = layer.name,
+                        archive = a.key,
+                        "INDEX-MISSING: the zone is projected from its archives"
+                    );
                     return Ok(None);
                 }
             }

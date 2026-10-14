@@ -345,3 +345,49 @@ pub fn catalog() -> tuile_tile_server::Catalog {
         ],
     }
 }
+
+/// The metrics a test records: a recorder of its own, set for the test's
+/// thread for as long as this lives (a `#[tokio::test]` runs on one thread).
+pub struct Recorded {
+    snapshotter: metrics_util::debugging::Snapshotter,
+    /// Counters as read so far: a snapshot hands a counter's increments
+    /// since the last one, so they are added up here.
+    seen: std::sync::Mutex<Vec<(metrics::Key, u64)>>,
+    _set: metrics::LocalRecorderGuard<'static>,
+}
+
+impl Recorded {
+    pub fn start() -> Self {
+        let recorder: &'static _ =
+            Box::leak(Box::new(metrics_util::debugging::DebuggingRecorder::new()));
+        Self {
+            snapshotter: recorder.snapshotter(),
+            seen: Default::default(),
+            _set: metrics::set_default_local_recorder(recorder),
+        }
+    }
+
+    /// The value of counter `name` among those carrying `labels`, summed.
+    pub fn counter(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
+        use metrics_util::debugging::DebugValue;
+        let mut seen = self.seen.lock().expect("seen");
+        for (key, _, _, value) in self.snapshotter.snapshot().into_vec() {
+            if let DebugValue::Counter(n) = value {
+                let key = key.key().clone();
+                match seen.iter_mut().find(|(k, _)| *k == key) {
+                    Some((_, total)) => *total += n,
+                    None => seen.push((key, n)),
+                }
+            }
+        }
+        seen.iter()
+            .filter(|(key, _)| key.name() == name)
+            .filter(|(key, _)| {
+                labels
+                    .iter()
+                    .all(|(k, v)| key.labels().any(|l| l.key() == *k && l.value() == *v))
+            })
+            .map(|(_, n)| n)
+            .sum()
+    }
+}
