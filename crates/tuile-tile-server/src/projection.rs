@@ -104,6 +104,8 @@ pub struct Footprint {
     /// Layers projected by their archives' indexes rather than their
     /// archives (by name; a layer's absence sibling follows its layer).
     by_index: Vec<String>,
+    /// The layers projected, when not every layer of the store.
+    only: Option<Vec<String>>,
 }
 
 /// A tile's extent in degrees: west, south, east, north.
@@ -170,7 +172,25 @@ impl Footprint {
             layer_factors: Vec::new(),
             targeted: Vec::new(),
             by_index: Vec::new(),
+            only: None,
         }
+    }
+
+    /// Projects these layers (and their absence siblings) and no other: the
+    /// layers a consumer reads, not every layer the store's catalog holds.
+    pub fn with_only_layers<S: Into<String>>(mut self, names: impl IntoIterator<Item = S>) -> Self {
+        self.only = Some(names.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Whether the layer `name` is projected at all.
+    pub fn projects(&self, layer: &str) -> bool {
+        let base = layer
+            .strip_suffix(crate::catalog::ABSENT_SUFFIX)
+            .unwrap_or(layer);
+        self.only
+            .as_ref()
+            .is_none_or(|only| only.iter().any(|n| n == base))
     }
 
     /// Projects the layer `name` (and its absence sibling) by its archives'
@@ -411,9 +431,11 @@ impl TileStore {
             .await?
             .into_iter()
             .filter(|(l, z)| {
-                self.layer(l)
-                    .map(|l| footprint.reaches(l, *z))
-                    .unwrap_or(false)
+                footprint.projects(l)
+                    && self
+                        .layer(l)
+                        .map(|l| footprint.reaches(l, *z))
+                        .unwrap_or(false)
             })
             .collect();
         let results: Vec<(String, Zone, bool, Result<ProjectionReport, StoreError>)> =

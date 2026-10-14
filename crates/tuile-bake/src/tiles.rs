@@ -299,8 +299,11 @@ impl Tiles {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(factor * IMAGERY_OVER_TERRAIN);
-        let mut footprint =
-            Footprint::from_eyes(eyes, factor).with_targeted_layer(sight.terrain_layer);
+        // The layers this bake reads, and no other the catalog holds (a
+        // reference imagery is read by a render, never by a bake).
+        let mut footprint = Footprint::from_eyes(eyes, factor)
+            .with_targeted_layer(sight.terrain_layer)
+            .with_only_layers(std::iter::once(sight.terrain_layer).chain(sight.imagery_layer));
         if let Some(name) = sight.imagery_layer {
             footprint = footprint.with_layer_factor(name, imagery_factor);
             if imagery_by_index {

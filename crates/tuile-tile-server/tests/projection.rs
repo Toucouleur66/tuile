@@ -432,3 +432,24 @@ async fn a_targeted_projection_is_the_whole_one_where_both_keep_a_tile() {
     assert_eq!(w.projection, u64::from(T_SIDE * T_SIDE), "{w:?}");
     assert!(t.projection > 0 && t.projection < w.projection, "{t:?}");
 }
+
+#[tokio::test]
+async fn only_the_layers_a_footprint_names_are_projected() {
+    let (objects, clock) = published().await;
+    let s = store_on(objects, &clock, eager());
+    let dir = tempfile::tempdir().expect("dir");
+    // Imagery is in the bucket, but this footprint reads the terrain only.
+    let fp = Footprint::from_eyes([eye_over(LEVEL, X0, Y0, 5_800.0)], DEFAULT_TILE_FACTOR)
+        .with_only_layers([TERRAIN]);
+    assert!(fp.projects(TERRAIN) && fp.projects("terrain.absent"));
+    assert!(!fp.projects(IMAGERY));
+    let report = s.project(&fp, dir.path()).await.expect("project");
+    assert_eq!(report.zones_seen, 0, "{report:?}");
+    assert!(!report.layers.contains_key(IMAGERY), "{report:?}");
+    // Read, it comes from the bucket as it would without a projection.
+    assert_eq!(
+        s.get(IMAGERY, LEVEL, X0, Y0).await.expect("get"),
+        Some(body(LEVEL, X0, Y0, 0))
+    );
+    assert_eq!(s.stats().projection, 0);
+}
