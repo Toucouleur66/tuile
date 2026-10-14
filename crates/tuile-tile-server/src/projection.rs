@@ -444,11 +444,18 @@ impl TileStore {
                     let targeted = footprint.targets(&layer) && zone != Zone::Top;
                     if footprint.by_index(&layer) {
                         match self.index_zone(&layer, zone).await {
-                            Ok(Some(r)) => return (layer, zone, false, Ok(r)),
-                            Ok(None) => {}
+                            Ok(Some(r)) => {
+                                metrics::counter!("tuile_tiles_zones_projected_total", "layer" => layer.clone(), "by" => "index").increment(1);
+                                metrics::counter!("tuile_tiles_index_bytes_read_total", "layer" => layer.clone()).increment(r.index_bytes);
+                                return (layer, zone, false, Ok(r));
+                            }
+                            Ok(None) => {
+                                metrics::counter!("tuile_tiles_index_fallbacks_total", "layer" => layer.clone()).increment(1);
+                            }
                             Err(e) => return (layer, zone, false, Err(e)),
                         }
                     }
+                    metrics::counter!("tuile_tiles_zones_projected_total", "layer" => layer.clone(), "by" => "archives").increment(1);
                     let r = if targeted {
                         self.project_zone_targeted(footprint, dir, &layer, zone)
                             .await
@@ -508,15 +515,23 @@ impl TileStore {
         };
         // Oldest first, as the manifest lists them: the last to hold a tile
         // wins it, which is the store's own rule.
-        let mut indexes = Vec::new();
-        for a in m
+        // All asked at once — a round trip for the zone, not one an archive
+        // — and `join_all` gives them back in the manifest's order.
+        let live: Vec<_> = m
             .archives
             .iter()
             .filter(|a| !layer.is_expired(&a.epoch, now))
-        {
+            .collect();
+        let read = futures_util::future::join_all(
+            live.iter()
+                .map(|a| crate::index::read(self.object_store().as_ref(), &a.key)),
+        )
+        .await;
+        let mut indexes = Vec::with_capacity(live.len());
+        for (a, read) in live.iter().zip(read) {
             report.requests += 1;
             report.index_requests += 1;
-            match crate::index::read(self.object_store().as_ref(), &a.key).await? {
+            match read? {
                 Some((index, bytes)) => {
                     report.bytes += bytes;
                     report.index_bytes += bytes;
@@ -524,7 +539,13 @@ impl TileStore {
                     indexes.push(index);
                 }
                 None => {
-                    tracing::debug!(archive = a.key, "no index: the zone is projected whole");
+                    // The whole zone is then read from its archives: the
+                    // cost the index is there to spare, so said aloud.
+                    tracing::info!(
+                        layer = layer.name,
+                        archive = a.key,
+                        "INDEX-MISSING: the zone is projected from its archives"
+                    );
                     return Ok(None);
                 }
             }

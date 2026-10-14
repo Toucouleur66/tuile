@@ -163,6 +163,12 @@ pub struct Counting {
     /// successful ones returned.
     pub archive_gets: AtomicU64,
     pub archive_bytes: AtomicU64,
+    /// Reads of archive indexes (`.index`) under way in each zone (by the
+    /// directory of the archive), and the most one zone ever had at once:
+    /// each is held a few milliseconds, so reads made together are seen
+    /// together.
+    pub index_reads: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    pub most_index_reads: AtomicU64,
 }
 
 impl Counting {
@@ -173,7 +179,12 @@ impl Counting {
             manifest_gets: AtomicU64::new(0),
             archive_gets: AtomicU64::new(0),
             archive_bytes: AtomicU64::new(0),
+            index_reads: Default::default(),
+            most_index_reads: AtomicU64::new(0),
         })
+    }
+    pub fn most_index_reads(&self) -> u64 {
+        self.most_index_reads.load(Ordering::SeqCst)
     }
     pub fn archive_gets(&self) -> u64 {
         self.archive_gets.load(Ordering::SeqCst)
@@ -225,6 +236,29 @@ impl ObjectStore for Counting {
         self.gets.fetch_add(1, Ordering::SeqCst);
         if location.as_ref().ends_with("manifest.json") {
             self.manifest_gets.fetch_add(1, Ordering::SeqCst);
+        }
+        if location.as_ref().ends_with(".index") {
+            let zone = location
+                .as_ref()
+                .rsplit_once('/')
+                .map_or("", |(dir, _)| dir)
+                .to_string();
+            let now = {
+                let mut reads = self.index_reads.lock().expect("reads");
+                let n = reads.entry(zone.clone()).or_default();
+                *n += 1;
+                *n
+            };
+            self.most_index_reads.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let got = self.inner.get_opts(location, options).await;
+            *self
+                .index_reads
+                .lock()
+                .expect("reads")
+                .entry(zone)
+                .or_default() -= 1;
+            return got;
         }
         let head = options.head;
         if location.as_ref().ends_with(".pmtiles") {
@@ -309,5 +343,51 @@ pub fn catalog() -> tuile_tile_server::Catalog {
                 index: false,
             },
         ],
+    }
+}
+
+/// The metrics a test records: a recorder of its own, set for the test's
+/// thread for as long as this lives (a `#[tokio::test]` runs on one thread).
+pub struct Recorded {
+    snapshotter: metrics_util::debugging::Snapshotter,
+    /// Counters as read so far: a snapshot hands a counter's increments
+    /// since the last one, so they are added up here.
+    seen: std::sync::Mutex<Vec<(metrics::Key, u64)>>,
+    _set: metrics::LocalRecorderGuard<'static>,
+}
+
+impl Recorded {
+    pub fn start() -> Self {
+        let recorder: &'static _ =
+            Box::leak(Box::new(metrics_util::debugging::DebuggingRecorder::new()));
+        Self {
+            snapshotter: recorder.snapshotter(),
+            seen: Default::default(),
+            _set: metrics::set_default_local_recorder(recorder),
+        }
+    }
+
+    /// The value of counter `name` among those carrying `labels`, summed.
+    pub fn counter(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
+        use metrics_util::debugging::DebugValue;
+        let mut seen = self.seen.lock().expect("seen");
+        for (key, _, _, value) in self.snapshotter.snapshot().into_vec() {
+            if let DebugValue::Counter(n) = value {
+                let key = key.key().clone();
+                match seen.iter_mut().find(|(k, _)| *k == key) {
+                    Some((_, total)) => *total += n,
+                    None => seen.push((key, n)),
+                }
+            }
+        }
+        seen.iter()
+            .filter(|(key, _)| key.name() == name)
+            .filter(|(key, _)| {
+                labels
+                    .iter()
+                    .all(|(k, v)| key.labels().any(|l| l.key() == *k && l.value() == *v))
+            })
+            .map(|(_, n)| n)
+            .sum()
     }
 }

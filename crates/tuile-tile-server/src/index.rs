@@ -575,6 +575,16 @@ impl TileStore {
             seconds = began.elapsed().as_secs_f64(),
             "INDEX-BACKFILL-LAYER-DONE"
         );
+        // Zero when every live archive of the layer has its index: a dry
+        // run counts the archives without one, a real run the zones it
+        // could not finish (each to be run again).
+        let missing = if how.dry_run {
+            total.written
+        } else {
+            total.failed.len() as u64
+        };
+        metrics::gauge!("tuile_tiles_index_missing_archives", "layer" => layer.to_string())
+            .set(missing as f64);
         Ok(total)
     }
 
@@ -622,6 +632,8 @@ impl TileStore {
             let index_bytes = put(self.object_store().as_ref(), &built).await?;
             report.index_bytes += index_bytes;
             report.written += 1;
+            metrics::counter!("tuile_tiles_indexes_backfilled_total", "layer" => layer.name.clone())
+                .increment(1);
             tracing::info!(
                 archive = %a.key,
                 tiles,

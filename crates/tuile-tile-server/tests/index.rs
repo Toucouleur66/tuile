@@ -338,17 +338,36 @@ async fn a_zone_projected_by_its_indexes_downloads_no_archive_and_the_newest_win
     let objects = memory();
     two_deltas(objects.clone(), &clock, indexed()).await;
 
+    let recorded = Recorded::start();
     let counting = Counting::over(objects.clone());
     let s = Arc::new(store_with(counting.clone(), &clock, indexed()));
     let dir = tempfile::tempdir().expect("dir");
     let report = s.project(&by_index(), dir.path()).await.expect("project");
     assert_eq!(counting.archive_gets(), 0, "no archive read: {report:?}");
     assert_eq!(
+        recorded.counter("tuile_tiles_zones_projected_total", &[("by", "index")]),
+        2,
+        "the layer and its absences, counted by index"
+    );
+    assert_eq!(
+        recorded.counter("tuile_tiles_zones_projected_total", &[("by", "archives")]),
+        0
+    );
+    assert_eq!(
+        recorded.counter("tuile_tiles_index_bytes_read_total", &[]),
+        report.index_bytes
+    );
+    assert_eq!(
         report.zones_indexed, 2,
         "the layer and its absences: {report:?}"
     );
     assert_eq!(report.zones_projected, 0, "nothing projected from bytes");
     assert_eq!(report.bytes, report.index_bytes);
+    assert!(
+        counting.most_index_reads() >= 2,
+        "one zone's indexes read together, not one after the other: {}",
+        counting.most_index_reads()
+    );
 
     let id = |i| {
         let (x, y) = in_zone(i);
@@ -394,6 +413,17 @@ async fn a_zone_projected_by_its_indexes_downloads_no_archive_and_the_newest_win
         Stamp::Unknown,
         "neither holds it"
     );
+    let looked = |outcome| {
+        recorded.counter(
+            "tuile_tiles_index_lookups_total",
+            &[("layer", IMAGERY), ("outcome", outcome)],
+        )
+    };
+    assert_eq!(
+        (looked("present"), looked("absent"), looked("not_held")),
+        (1, 1, 1),
+        "each stamp counted by what the index said"
+    );
     assert!(counting.archive_gets() > 0, "the get above read it");
 
     // A tile in this store's own buffer is the buffer's: unknown to the index.
@@ -421,9 +451,19 @@ async fn a_zone_with_an_archive_without_index_is_projected_from_its_archives() {
     let counting = Counting::over(objects.clone());
     let s = store_with(counting.clone(), &clock, indexed());
     let dir = tempfile::tempdir().expect("dir");
+    let recorded = Recorded::start();
     let report = s.project(&by_index(), dir.path()).await.expect("project");
     assert_eq!(report.zones_indexed, 0, "{report:?}");
     assert_eq!(report.zones_projected, 2, "{report:?}");
+    assert_eq!(
+        recorded.counter("tuile_tiles_index_fallbacks_total", &[]),
+        2,
+        "each zone that fell back to its archives, counted"
+    );
+    assert_eq!(
+        recorded.counter("tuile_tiles_zones_projected_total", &[("by", "archives")]),
+        2
+    );
     assert!(counting.archive_gets() > 0);
     let (x, y) = in_zone(0);
     assert_eq!(
