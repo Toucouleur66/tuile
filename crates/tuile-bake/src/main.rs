@@ -1200,15 +1200,23 @@ fn bake_with(args: Args, tiles: Option<&tiles::Tiles>) -> Result<(), String> {
         let mut namespaces = vec![tuile_bake::source_namespace(config.terrain_asset_id)];
         namespaces.extend(config.imagery_asset_id.map(tuile_bake::source_namespace));
         tiles.check(&namespaces);
-        // The scene's slice of the store, local before the first frame.
+        // The scene's slice of the store, local before the first frame, as
+        // far as this traversal reads at this picture's height.
         let imagery_layer = config.imagery_asset_id.map(tuile_bake::source_namespace);
+        let traversal = tuile_bake::exact_traversal(config.session.traversal.clone());
         let scene_poses = &poses[args.first.max(1) as usize - 1..wanted];
+        let sight = tiles::Sight {
+            terrain_layer: &namespaces[0],
+            imagery_layer: imagery_layer.as_deref(),
+            traversal: &traversal,
+            viewport_height_px: args.viewport.1,
+        };
         // A pack of references draws no imagery: its imagery is projected by
         // the archives' indexes, not their bytes.
         if args.content == tuile_pack::Content::References {
-            tiles.project_by_reference(scene_poses, imagery_layer.as_deref())?;
+            tiles.project_by_reference(scene_poses, &sight)?;
         } else {
-            tiles.project(scene_poses, imagery_layer.as_deref())?;
+            tiles.project(scene_poses, &sight)?;
         }
         config.tile_cache = Some(tiles.cache());
     }

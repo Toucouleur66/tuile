@@ -132,14 +132,22 @@ impl TapeBake {
             let mut namespaces = vec![layers.0.clone()];
             namespaces.extend(layers.1.clone());
             tiles.check(&namespaces);
-            // The scene's slice of the store, local before the first frame.
+            // The scene's slice of the store, local before the first frame,
+            // as far as this traversal reads at this picture's height.
             let poses = &self.poses[first as usize - 1..wanted];
+            let traversal = exact_traversal(config.session.traversal.clone());
+            let sight = crate::tiles::Sight {
+                terrain_layer: &layers.0,
+                imagery_layer: layers.1.as_deref(),
+                traversal: &traversal,
+                viewport_height_px: self.viewport.1,
+            };
             // A pack of references draws no imagery: its imagery is projected
             // by the archives' indexes, not their bytes.
             if config.session.finish == Finish::Identity {
-                tiles.project_by_reference(poses, layers.1.as_deref())?;
+                tiles.project_by_reference(poses, &sight)?;
             } else {
-                tiles.project(poses, layers.1.as_deref())?;
+                tiles.project(poses, &sight)?;
             }
             config.tile_cache = Some(tiles.cache());
         }

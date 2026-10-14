@@ -101,4 +101,9 @@ impl Grid {
         self.check(level, x, y).ok()?;
         Some((level, x, y))
     }
+
+    /// The source address an archive tile id holds: [`Grid::to_id`] undone.
+    pub fn from_id(self, id: u64) -> Option<(u8, u32, u32)> {
+        self.from_archive(TileCoord::from(pmtiles::TileId::new(id).ok()?))
+    }
 }
