@@ -228,6 +228,26 @@ async fn history(s: &TileStore) {
     .await
     .expect("put");
     s.flush_all().await.expect("flush");
+    // A merge published after a later delta: the delta's copy of tile 1
+    // still wins over the merge's.
+    let (x, y) = in_zone(1);
+    s.put(IMAGERY, LEVEL, x, y, png(1, 8)).await.expect("put");
+    s.flush_all().await.expect("flush");
+    let m = tuile_tile_server::manifest::read(
+        s.object_store().as_ref(),
+        &indexed().zone_prefix(zone()),
+    )
+    .await
+    .expect("manifest")
+    .manifest;
+    let run = &m.archives[..m.archives.len() - 1];
+    assert_eq!(run.len(), 2);
+    assert!(matches!(
+        s.merge_run_planned(IMAGERY, zone(), run)
+            .await
+            .expect("merge"),
+        Compaction::Merged { merged: 2, .. }
+    ));
 }
 
 #[tokio::test]
@@ -259,6 +279,9 @@ async fn a_publication_tells_the_tiles_it_adds_and_the_archives_it_replaces() {
             // The merge: one archive of every tile, three replaced.
             "published g4 added=9 replaced=3 uncovering=false",
             "published g5 added=3 replaced=0 uncovering=false",
+            "published g6 added=1 replaced=0 uncovering=false",
+            // The planned merge, the delta after it.
+            "published g7 added=10 replaced=2 uncovering=false",
         ],
         "{said:#?}"
     );
@@ -492,19 +515,19 @@ async fn a_register_that_keeps_an_archive_keeps_it_from_being_deleted() {
         .await
         .expect("manifest")
         .manifest;
-    assert_eq!(m.retired.len(), 3, "still retired, for the next upkeep");
+    assert_eq!(m.retired.len(), 5, "still retired, for the next upkeep");
     mem.refuse_deleting
         .store(false, std::sync::atomic::Ordering::SeqCst);
     s.maintain(IMAGERY, zone()).await.expect("maintain");
-    assert_eq!(archives(objects.as_ref(), &prefix).await.len(), before - 3);
+    assert_eq!(archives(objects.as_ref(), &prefix).await.len(), before - 5);
     let said = mem.said();
     let deleting = said
         .iter()
-        .rposition(|l| l == "deleting 3")
+        .rposition(|l| l == "deleting 5")
         .expect("deleting");
     let deleted = said
         .iter()
-        .rposition(|l| l == "deleted 3")
+        .rposition(|l| l == "deleted 5")
         .expect("deleted");
     assert!(deleting < deleted, "{said:#?}");
 }
