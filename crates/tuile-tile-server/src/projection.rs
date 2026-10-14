@@ -508,15 +508,23 @@ impl TileStore {
         };
         // Oldest first, as the manifest lists them: the last to hold a tile
         // wins it, which is the store's own rule.
-        let mut indexes = Vec::new();
-        for a in m
+        // All asked at once — a round trip for the zone, not one an archive
+        // — and `join_all` gives them back in the manifest's order.
+        let live: Vec<_> = m
             .archives
             .iter()
             .filter(|a| !layer.is_expired(&a.epoch, now))
-        {
+            .collect();
+        let read = futures_util::future::join_all(
+            live.iter()
+                .map(|a| crate::index::read(self.object_store().as_ref(), &a.key)),
+        )
+        .await;
+        let mut indexes = Vec::with_capacity(live.len());
+        for (a, read) in live.iter().zip(read) {
             report.requests += 1;
             report.index_requests += 1;
-            match crate::index::read(self.object_store().as_ref(), &a.key).await? {
+            match read? {
                 Some((index, bytes)) => {
                     report.bytes += bytes;
                     report.index_bytes += bytes;

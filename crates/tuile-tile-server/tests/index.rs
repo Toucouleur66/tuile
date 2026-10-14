@@ -349,6 +349,11 @@ async fn a_zone_projected_by_its_indexes_downloads_no_archive_and_the_newest_win
     );
     assert_eq!(report.zones_projected, 0, "nothing projected from bytes");
     assert_eq!(report.bytes, report.index_bytes);
+    assert!(
+        counting.most_index_reads() >= 2,
+        "one zone's indexes read together, not one after the other: {}",
+        counting.most_index_reads()
+    );
 
     let id = |i| {
         let (x, y) = in_zone(i);
