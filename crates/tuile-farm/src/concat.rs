@@ -43,6 +43,20 @@ pub enum ConcatError {
     Mismatch { path: PathBuf, what: &'static str },
     #[error("nothing to join")]
     Empty,
+    #[error("{path}: spatial film: {why}")]
+    Spatial { path: PathBuf, why: String },
+}
+
+/// The film at `path` as a spatial film (one `hvc1` track of two layers),
+/// or `None`.
+fn spatial(path: &Path) -> Result<Option<tuile_mp4::spatial::SpatialTrack>, ConcatError> {
+    let mut file = File::open(path).map_err(|source| ConcatError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    // A film this cannot read as spatial is left to the H.264 reader, which
+    // says what it is not.
+    Ok(tuile_mp4::spatial::read_track(&mut file).ok().flatten())
 }
 
 /// What a film's single video track is made of.
@@ -98,6 +112,12 @@ pub struct Probe {
 
 /// Frames and duration of a film's video track.
 pub fn probe(path: &Path) -> Result<Probe, ConcatError> {
+    if let Some(track) = spatial(path)? {
+        return Ok(Probe {
+            frames: track.samples.len() as u64,
+            seconds: track.seconds(),
+        });
+    }
     let (mut reader, id, format) = open(path)?;
     let mp4 = |source| ConcatError::Mp4 {
         path: path.to_path_buf(),
@@ -149,6 +169,13 @@ pub fn check_cadence(probe: Probe, fps: f64) -> Result<(), String> {
 /// Joins `segments`, in the order given, into `out`. Returns the frame count.
 pub fn concat(segments: &[PathBuf], out: &Path) -> Result<u64, ConcatError> {
     let first = segments.first().ok_or(ConcatError::Empty)?;
+    // A spatial film (MV-HEVC, two eyes): joined as one.
+    if spatial(first)?.is_some() {
+        return tuile_mp4::spatial::join(segments, out).map_err(|e| ConcatError::Spatial {
+            path: out.to_path_buf(),
+            why: e.to_string(),
+        });
+    }
     let (_, _, format) = open(first)?;
 
     let out_io = |source| ConcatError::Io {
@@ -303,6 +330,40 @@ mod tests {
     use super::*;
 
     const SPS: &[u8] = &[0x67, 0x64, 0x00, 0x0c, 0xac, 0xd9, 0x42];
+
+    /// Segments of a spatial film (MV-HEVC) are joined as one, and probed
+    /// as one: the render service's segments of a film for a headset.
+    #[test]
+    fn spatial_segments_are_joined_as_a_spatial_film() {
+        use tuile_mp4::spatial::{SpatialMuxer, StereoInfo};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hvcc = vec![
+            1, 1, 0x60, 0, 0, 0, 0xb0, 0, 0, 0, 0, 0, 0x99, 0xf0, 0, 0xfc, 0xfd, 0xf8, 0xf8, 0, 0,
+            0x0f, 0,
+        ];
+        let lhvc = vec![1, 0xf0, 0, 0xfc, 0xcb, 0];
+        let stereo = StereoInfo {
+            baseline_um: 10_000_000,
+            hfov_millidegrees: 72_489,
+            disparity_adjustment: 0,
+        };
+        let mut paths = Vec::new();
+        for (tag, frames) in [(1u8, 4u8), (2, 3)] {
+            let mut m = SpatialMuxer::new(64, 64, 30, &hvcc, &lhvc, stereo).expect("muxer");
+            for i in 0..frames {
+                m.push(&[0, 0, 0, 2, tag, i], i == 0).expect("frame");
+            }
+            let path = dir.path().join(format!("s{tag}.mp4"));
+            std::fs::write(&path, m.finish().expect("film")).expect("written");
+            paths.push(path);
+        }
+        let out = dir.path().join("film.mp4");
+        assert_eq!(concat(&paths, &out).expect("joined"), 7);
+        let p = probe(&out).expect("probe");
+        assert_eq!(p.frames, 7);
+        assert!(check_cadence(p, 30.0).is_ok());
+        assert_eq!(probe(&paths[0]).expect("probe").frames, 4);
+    }
 
     #[test]
     fn samples_keep_their_order_flags_and_offsets() {

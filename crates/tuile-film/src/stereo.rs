@@ -91,7 +91,18 @@ pub struct Stereo {
     /// picture width: how far behind the screen the furthest ground goes.
     pub divergence: f64,
     pub convergence: Convergence,
+    /// The eyes this many metres apart whatever the distance looked at —
+    /// hyperstereo by the metre — in place of the baseline the divergence
+    /// gives; the divergence is then what follows from it.
+    pub baseline_m: Option<f64>,
 }
+
+/// The widest baseline a spec may ask for, metres.
+pub const MAX_BASELINE_M: f64 = 10_000.0;
+
+/// The most of its field an eye gives up to a baseline that is given: past
+/// it the baseline is shortened rather than the picture narrowed further.
+const MOST_NARROWED: f64 = 0.25;
 
 /// The most behind-the-screen parallax a spec may ask for: past a few
 /// percent of the width, eyes on a large screen must diverge.
@@ -111,6 +122,7 @@ impl Default for Stereo {
             half: false,
             divergence: DEFAULT_DIVERGENCE,
             convergence: Convergence::Ground { height_m: 0.0 },
+            baseline_m: None,
         }
     }
 }
@@ -124,6 +136,8 @@ pub enum StereoError {
     Convergence(f64),
     #[error("stereo ground height is {0} m, and must be finite")]
     GroundHeight(f64),
+    #[error("stereo baseline is {0} m, and must be above 0 and at most {MAX_BASELINE_M} m")]
+    Baseline(f64),
 }
 
 /// One frame's pair of eyes, as the frame's camera gives them.
@@ -145,6 +159,11 @@ impl Stereo {
         let d = self.divergence;
         if !(d.is_finite() && d > 0.0 && d <= MAX_DIVERGENCE) {
             return Err(StereoError::Divergence(d));
+        }
+        if let Some(b) = self.baseline_m {
+            if !(b.is_finite() && b > 0.0 && b <= MAX_BASELINE_M) {
+                return Err(StereoError::Baseline(b));
+            }
         }
         match self.convergence {
             Convergence::Distance(m) if !(m.is_finite() && m > 0.0) => {
@@ -179,13 +198,20 @@ impl Stereo {
 
     /// The pair of eyes for the frame whose camera is `centre`.
     pub fn eyes(&self, centre: &FrameCamera) -> EyePair {
-        let d = self.divergence;
-        let u = d / (1.0 + d);
         // The projection's x scale is 1 / tan(half the horizontal field).
         let t = 1.0 / f64::from(centre.projection.x_axis.x);
         let convergence_m = self
             .convergence_of(centre)
             .max(NEAREST_CONVERGENCE_IN_NEARS * f64::from(centre.near));
+        // `u` is half the baseline against the window's half-width at the
+        // convergence; the divergence is `u / (1 − u)` either way.
+        let (u, d) = match self.baseline_m {
+            None => (self.divergence / (1.0 + self.divergence), self.divergence),
+            Some(b) => {
+                let u = (b / (2.0 * convergence_m * t)).min(MOST_NARROWED);
+                (u, u / (1.0 - u))
+            }
+        };
         EyePair {
             baseline_m: 2.0 * u * convergence_m * t,
             convergence_m,
@@ -439,6 +465,46 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Hyperstereo by the metre: the eyes as far apart as asked, whatever
+    /// the distance; the screen still where it converges, and still nothing
+    /// unselected seen.
+    #[test]
+    fn a_baseline_given_in_metres_is_the_baseline() {
+        let centre = FrameCamera::of(&looking_down(1500.0), ASPECT);
+        for convergence in [800.0, 2000.0, 6000.0] {
+            let stereo = Stereo {
+                convergence: Convergence::Distance(convergence),
+                baseline_m: Some(10.0),
+                ..Stereo::default()
+            };
+            stereo.check().expect("a baseline");
+            let pair = stereo.eyes(&centre);
+            let (l, r) = (centre.eye(&pair, Eye::Left), centre.eye(&pair, Eye::Right));
+            assert!(
+                ((r.eye - l.eye).length() - 10.0).abs() < 1e-6,
+                "{convergence}"
+            );
+            let p = centre.eye + forward(&centre) * convergence;
+            assert!((ndc(&l, p) - ndc(&r, p)).length() < 1e-4, "on the screen");
+            // The furthest ground: as deep as the divergence it implies.
+            let far = centre.eye + forward(&centre) * 1e9;
+            let parallax = (ndc(&r, far).x - ndc(&l, far).x) / 2.0;
+            assert!((f64::from(parallax) - pair.shift_ndc).abs() < 1e-4);
+            let inv = l.view_projection().inverse();
+            let corner = inv * glam::Vec4::new(1.0, 1.0, 1e-7, 1.0);
+            let dir = (corner.xyz() / corner.w).as_dvec3().normalize();
+            let seen = ndc(&centre, l.eye + dir * (1e6 / dir.dot(forward(&centre))));
+            assert!(seen.x.abs() <= 1.0 + 1e-5, "{seen}");
+        }
+        for wild in [0.0, -1.0, f64::NAN, 2e4] {
+            let s = Stereo {
+                baseline_m: Some(wild),
+                ..Stereo::default()
+            };
+            assert!(matches!(s.check(), Err(StereoError::Baseline(_))), "{wild}");
         }
     }
 

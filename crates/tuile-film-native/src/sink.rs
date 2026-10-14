@@ -23,6 +23,31 @@ pub trait Sink {
     /// One picture: `rgba` tightly packed, `i420` planar BT.709 limited
     /// range (empty unless asked for). `index` counts from 0.
     fn picture(&mut self, index: u32, frame: u32, rgba: &[u8], i420: &[u8]) -> Result<(), Error>;
+    /// For a film of two eyes, in place of [`Self::open`]: the packed
+    /// picture's size, and one eye's. A sink that takes the eyes apart —
+    /// a spatial (MV-HEVC) film — opens at an eye's size; any other at the
+    /// packed picture's, which is what it is then handed.
+    fn open_stereo(
+        &mut self,
+        picture: (u32, u32),
+        _eye: (u32, u32),
+        fps: u32,
+    ) -> Result<(), Error> {
+        self.open(picture.0, picture.1, fps)
+    }
+    /// For a film of two eyes, in place of [`Self::picture`]: the packed
+    /// picture, and each eye apart. Any sink but one of eyes takes the
+    /// packed picture.
+    fn stereo(
+        &mut self,
+        index: u32,
+        frame: u32,
+        rgba: &[u8],
+        i420: &[u8],
+        _eyes: &Eyes<'_>,
+    ) -> Result<(), Error> {
+        self.picture(index, frame, rgba, i420)
+    }
     /// No more pictures.
     fn close(&mut self) -> Result<(), Error> {
         Ok(())
@@ -31,6 +56,32 @@ pub trait Sink {
     /// the render's own timings cannot see.
     fn spent(&self) -> Vec<(String, f64)> {
         Vec::new()
+    }
+}
+
+/// One frame's two eyes, apart: each one's I420 picture (empty unless the
+/// sink asked for I420), the pair they were drawn from, and the left eye's
+/// camera.
+pub struct Eyes<'a> {
+    pub left: &'a [u8],
+    pub right: &'a [u8],
+    pub pair: &'a tuile_film::EyePair,
+    pub left_camera: &'a tuile_film::FrameCamera,
+}
+
+/// What a spatial film tells a player of its eyes, from a frame's: their
+/// distance, their horizontal field, no disparity adjustment — the eyes are
+/// drawn converged, what is on the screen has no parallax already.
+pub fn stereo_info(eyes: &Eyes<'_>) -> tuile_mp4::spatial::StereoInfo {
+    let baseline_um = (eyes.pair.baseline_m * 1e6)
+        .round()
+        .clamp(1.0, f64::from(u32::MAX)) as u32;
+    let t = 1.0 / f64::from(eyes.left_camera.projection.x_axis.x);
+    let hfov = (2.0 * t.atan()).to_degrees() * 1000.0;
+    tuile_mp4::spatial::StereoInfo {
+        baseline_um,
+        hfov_millidegrees: hfov.round() as u32,
+        disparity_adjustment: 0,
     }
 }
 

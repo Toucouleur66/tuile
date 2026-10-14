@@ -87,6 +87,10 @@ pub struct StereoSpec {
     /// The ground's height over the ellipsoid, in metres, where the screen
     /// is put on it.
     pub ground_m: f64,
+    /// The eyes this many metres apart, in place of what the divergence
+    /// gives: hyperstereo by the metre.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_m: Option<f64>,
 }
 
 /// How two eyes share a picture.
@@ -106,6 +110,7 @@ impl Default for StereoSpec {
             divergence: tuile_film::DEFAULT_DIVERGENCE,
             convergence_m: None,
             ground_m: 0.0,
+            baseline_m: None,
         }
     }
 }
@@ -120,6 +125,7 @@ impl StereoSpec {
             },
             half: self.half,
             divergence: self.divergence,
+            baseline_m: self.baseline_m,
             convergence: match self.convergence_m {
                 Some(metres) => tuile_film::Convergence::Distance(metres),
                 None => tuile_film::Convergence::Ground {
@@ -437,6 +443,23 @@ mod tests {
                 .stereo
                 .map(|s| s.convergence),
             Some(tuile_film::Convergence::Ground { height_m: 1200.0 })
+        );
+        let hyper: RenderSpec =
+            serde_json::from_str(r#"{"stereo": {"baseline_m": 10}}"#).expect("a spec");
+        assert_eq!(
+            hyper
+                .rendering()
+                .expect("rendering")
+                .order
+                .stereo
+                .and_then(|s| s.baseline_m),
+            Some(10.0)
+        );
+        assert!(
+            serde_json::from_str::<RenderSpec>(r#"{"stereo": {"baseline_m": -3}}"#)
+                .expect("parsed")
+                .rendering()
+                .is_err()
         );
         // Out of bounds, or a field nobody knows: refused.
         let wild: RenderSpec =

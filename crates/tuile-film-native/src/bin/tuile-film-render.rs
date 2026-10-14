@@ -53,6 +53,10 @@
 //!   --stereo-convergence <m> the screen's distance from the eyes; else
 //!                         where the camera's axis meets the ground
 //!   --stereo-ground <m>   that ground's height over the ellipsoid (0)
+//!   --put-film <key>      once rendered, the --out film into the run store
+//!                         (TUILE_STORE_BUCKET) at this key
+//!   --stereo-baseline <m> the eyes this far apart, whatever the distance
+//!                         (hyperstereo); else what the divergence gives
 //!   --meter <dir>         measure light going in and coming out; write
 //!                         tiles.csv, frames.csv, tone.json, report.md,
 //!                         and each place's table of grades under the key
@@ -320,6 +324,23 @@ impl Sink for Both {
             .iter_mut()
             .try_for_each(|s| s.picture(index, frame, rgba, i420))
     }
+    fn open_stereo(&mut self, picture: (u32, u32), eye: (u32, u32), fps: u32) -> Result<(), Error> {
+        self.0
+            .iter_mut()
+            .try_for_each(|s| s.open_stereo(picture, eye, fps))
+    }
+    fn stereo(
+        &mut self,
+        index: u32,
+        frame: u32,
+        rgba: &[u8],
+        i420: &[u8],
+        eyes: &tuile_film_native::sink::Eyes<'_>,
+    ) -> Result<(), Error> {
+        self.0
+            .iter_mut()
+            .try_for_each(|s| s.stereo(index, frame, rgba, i420, eyes))
+    }
     fn close(&mut self) -> Result<(), Error> {
         self.0.iter_mut().try_for_each(|s| s.close())
     }
@@ -381,6 +402,7 @@ async fn main() -> Result<(), Error> {
                     .map(|m| m.parse())
                     .transpose()?,
                 ground_m: value("--stereo-ground").map_or(Ok(0.0), |m| m.parse())?,
+                baseline_m: value("--stereo-baseline").map(|m| m.parse()).transpose()?,
             }
             .stereo()?,
         );
@@ -566,6 +588,17 @@ async fn main() -> Result<(), Error> {
             return Err(e);
         }
     };
+    // The film, into the run store: what a render on a machine of no disk
+    // of its own leaves behind.
+    if let (Some(key), Some(out)) = (value("--put-film"), value("--out")) {
+        let config = BucketConfig {
+            bucket: std::env::var("TUILE_STORE_BUCKET")?,
+            ..BucketConfig::from_env()?
+        };
+        let store = ObjectRunStore::bucket(&config, Tuning::from_env())?;
+        let bytes = store.put(std::path::Path::new(&out), &key).await?;
+        println!("film written to the bucket: {key} ({bytes} bytes)");
+    }
     if let Some(seams) = &seams {
         println!("{}", seams.summary());
         if let Some(why) = seams.failure() {

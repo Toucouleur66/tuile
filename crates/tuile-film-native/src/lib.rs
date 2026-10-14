@@ -52,6 +52,10 @@ pub use sink::{Av1Film, Nothing, Pictures, Sink};
 pub use source::{Counting, Film, Reads, Sources};
 #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
 pub use videotoolbox::H264Film;
+#[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+pub mod spatial;
+#[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+pub use spatial::SpatialFilm;
 
 /// What goes wrong here is told to a person, not matched on.
 pub type Error = Box<dyn std::error::Error + Send + Sync>;

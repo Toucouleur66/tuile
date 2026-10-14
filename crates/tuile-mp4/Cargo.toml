@@ -9,7 +9,16 @@ authors.workspace = true
 
 [dependencies]
 mp4 = "0.14.0"
+# The boxes of a spatial (MV-HEVC) film, Apple's stereo boxes included:
+# lapoule-dev's fork, until they are released upstream.
+mp4-atom = { git = "https://github.com/lapoule-dev/mp4-atom", rev = "b491c22cb68cf6f8384acddc20d0ce44f2e597c8" }
+# The HEVC sequence parameter set, read to describe a stream in its record.
+scuffle-h265 = "0.2.2"
+scuffle-bytes-util = "0.1.3"
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
