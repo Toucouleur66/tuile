@@ -3301,7 +3301,7 @@ dependencies = [
 [[package]]
 name = "mp4-atom"
 version = "0.16.2"
-source = "git+https://github.com/lapoule-dev/mp4-atom?branch=feat%2Fstereo-video-boxes#b491c22cb68cf6f8384acddc20d0ce44f2e597c8"
+source = "git+https://github.com/lapoule-dev/mp4-atom?rev=b491c22cb68cf6f8384acddc20d0ce44f2e597c8#b491c22cb68cf6f8384acddc20d0ce44f2e597c8"
 dependencies = [
  "derive_more",
  "num",
@@ -3666,7 +3666,7 @@ dependencies = [
 [[package]]
 name = "nvidia-video-codec-sdk"
 version = "0.5.0-lapoule.1"
-source = "git+https://github.com/lapoule-dev/nvidia-video-codec-sdk?branch=feat%2Fsdk-13#647c790dcf9b61cb9254849e3453009c6b5e2724"
+source = "git+https://github.com/lapoule-dev/nvidia-video-codec-sdk?rev=647c790dcf9b61cb9254849e3453009c6b5e2724#647c790dcf9b61cb9254849e3453009c6b5e2724"
 dependencies = [
  "cudarc",
  "lazy_static",
@@ -6465,6 +6465,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tuile-mp4",
  "tuile-pack",
  "url",
 ]
@@ -6615,6 +6616,7 @@ dependencies = [
  "mp4-atom",
  "scuffle-bytes-util",
  "scuffle-h265",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 

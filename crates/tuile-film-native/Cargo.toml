@@ -53,7 +53,7 @@ block2 = { version = "0.6.2", optional = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 # lapoule-dev's fork on NVENC API 13 (driver 570 and later): MV-HEVC, the
 # two eyes of a spatial film, on the cards that encode it (Blackwell).
-nvidia-video-codec-sdk = { git = "https://github.com/lapoule-dev/nvidia-video-codec-sdk", branch = "feat/sdk-13", optional = true }
+nvidia-video-codec-sdk = { git = "https://github.com/lapoule-dev/nvidia-video-codec-sdk", rev = "647c790dcf9b61cb9254849e3453009c6b5e2724", optional = true }
 # The same cudarc the encoder's bindings are built on, for its context. The
 # bindings take it with its default features, and features are unified: its
 # default `dynamic-loading` is therefore the only linking mode there is to
