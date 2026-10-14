@@ -558,8 +558,9 @@ pub fn read_track<R: std::io::Read + std::io::Seek>(
 }
 
 /// Spatial films one after the other into one, streamed from file to file:
-/// the same stream description in each (records, stereo boxes, timescale),
-/// or the join is refused. Returns the frames written.
+/// the same stream description in each (records, stereo boxes, timescale —
+/// the field of view aside, the first segment's kept), or the join is
+/// refused. Returns the frames written.
 pub fn join(segments: &[std::path::PathBuf], out: &std::path::Path) -> Result<u64, Mp4Error> {
     use std::io::{Read, Seek, SeekFrom, Write};
     let io = |e: std::io::Error| Mp4Error::Atom(e.to_string());
@@ -575,8 +576,15 @@ pub fn join(segments: &[std::path::PathBuf], out: &std::path::Path) -> Result<u6
         return Err(Mp4Error::Atom("nothing to join".into()));
     };
     let (entry, timescale) = (first.entry.clone(), first.timescale);
+    // The field of view is what a segment's first camera had, and a
+    // camera's field moves during a film: it says nothing of the encode,
+    // so the film says the first segment's.
+    let with_first_field = |e: &Hvc1| Hvc1 {
+        hfov: entry.hfov.clone(),
+        ..e.clone()
+    };
     for ((_, t), path) in tracks.iter().zip(segments) {
-        if t.entry != entry {
+        if with_first_field(&t.entry) != entry {
             return Err(Mp4Error::Mismatch("spatial stream description"));
         }
         if t.timescale != timescale {
@@ -814,11 +822,11 @@ mod tests {
         );
     }
 
-    fn segment(path: &std::path::Path, tag: u8, frames: u8, baseline_um: u32) {
+    fn segment(path: &std::path::Path, tag: u8, frames: u8, baseline_um: u32, hfov: u32) {
         let (hvcc, lhvc) = records();
         let stereo = StereoInfo {
             baseline_um,
-            hfov_millidegrees: 72_489,
+            hfov_millidegrees: hfov,
             disparity_adjustment: 0,
         };
         let mut m = SpatialMuxer::new(64, 64, 30, &hvcc, &lhvc, stereo).expect("muxer");
@@ -842,8 +850,10 @@ mod tests {
             dir.path().join("b.mp4"),
             dir.path().join("c.mp4"),
         );
-        segment(&a, 0xa, 6, 10_000_000);
-        segment(&b, 0xb, 5, 10_000_000);
+        segment(&a, 0xa, 6, 10_000_000, 72_489);
+        // The field of its first frame's camera: a camera's field moves
+        // during a film, so each segment says a little another.
+        segment(&b, 0xb, 5, 10_000_000, 72_269);
         let out = dir.path().join("film.mp4");
         assert_eq!(join(&[a.clone(), b.clone()], &out).expect("joined"), 11);
 
@@ -894,10 +904,10 @@ mod tests {
         );
         assert_eq!(
             track.entry, alone.entry,
-            "the stream described as each segment does"
+            "the stream described as the first segment does, its field too"
         );
 
-        segment(&c, 0xc, 3, 20_000_000);
+        segment(&c, 0xc, 3, 20_000_000, 72_489);
         assert!(
             join(&[a, c], &out).is_err(),
             "another baseline is another stream"
