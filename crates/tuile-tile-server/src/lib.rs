@@ -19,7 +19,9 @@
 //! - [`disk`] keeps whole archives on local disk, so a zone's second tile is
 //!   local.
 //! - [`index`] says what an archive holds without its bytes: its tile ids
-//!   and a digest of each, beside it in the bucket.
+//!   and a stamp of each, told to the host's register as it is published.
+//! - [`ledger`] is what a register is told, and what it tells a reader back;
+//!   [`register`] is one in memory, and the reference of what one does.
 //! - [`lru`] is the budgeted least-recently-used map the caches share.
 //! - [`projection`] takes a scene's slice of the store to local archives.
 //! - [`tiering`] picks what a compaction merges: similar sizes, contiguous.
@@ -42,6 +44,7 @@ pub mod lru;
 pub mod manifest;
 pub mod peers;
 pub mod projection;
+pub mod register;
 pub mod service;
 pub mod store;
 pub mod tiering;
@@ -54,9 +57,10 @@ pub use due::{due, Due, Why};
 pub use extract::{ExtractAsk, ExtractReport, Extracts};
 pub use grid::{Grid, OutOfGrid};
 pub use layer::{Layer, Zone, DURABLE_EPOCH};
-pub use ledger::Ledger;
+pub use ledger::{IndexReader, KnownZone, Ledger, Publication, RegisteredTile, TileBatches};
 pub use peers::{Announce, Claim, Emitted, FreshTiles, SharedTile, SharedTiles};
 pub use pmtiles::{Compression, TileType};
+pub use register::MemoryRegister;
 pub use projection::{Eye, Footprint, LayerProjection, ProjectionReport, ZoneListing};
 pub use service::{
     etag_of, LayerMeta, ServiceConfig, ServiceError, ServiceStats, Source, TileResponse,

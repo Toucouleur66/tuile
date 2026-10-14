@@ -50,9 +50,9 @@ pub struct LayerDef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expiry_days: Option<u64>,
     pub content_type: String,
-    /// Whether its archives are written with an index beside them (see
-    /// [`crate::index`]). Absent means no: a catalog written before indexes
-    /// reads as it did.
+    /// Whether each archive's tiles are stamped and told to the store's
+    /// ledger with its publication, for a register to keep the copy a
+    /// reader gets of each (see [`crate::index`]). Absent means no.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub index: bool,
 }

@@ -16,6 +16,7 @@
 //! archives by age — a lifecycle rule on the bucket does it — without rewriting
 //! anything. A durable layer has a single epoch.
 
+use std::ops::RangeInclusive;
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
@@ -43,9 +44,10 @@ pub struct Layer {
     pub expiry: Option<Duration>,
     /// The media type a server answers with.
     pub content_type: String,
-    /// Whether each archive of the layer gets an index beside it: its tile
-    /// ids and a digest of each tile, for a reader that names tiles without
-    /// reading them (see [`crate::index`]). Its absence sibling follows it.
+    /// Whether each archive of the layer is indexed for the ledger as it is
+    /// written: its tile ids and a stamp of each tile, for a register that a
+    /// reader naming tiles without reading them asks (see [`crate::index`]).
+    /// Its absence sibling follows it.
     pub index: bool,
 }
 
@@ -77,6 +79,44 @@ impl Layer {
         match zone {
             Zone::Top => format!("{}/top", self.name),
             Zone::Cell { x, y } => format!("{}/zones/z{}/{x}/{y}", self.name, self.zone_level),
+        }
+    }
+
+    /// Every archive tile id a tile of `zone` can have: one range per
+    /// archive level, coarsest first.
+    ///
+    /// An archive numbers its tiles level by level along a Hilbert curve,
+    /// which visits every square of the quadtree whole before the next: the
+    /// tiles under one zone tile are, at each finer level, one run of ids.
+    /// `top` holds every level coarser than the zone level: one run.
+    pub fn zone_id_ranges(&self, zone: Zone) -> Vec<RangeInclusive<u64>> {
+        // The archive level a source level is stored at.
+        let offset = match self.grid {
+            Grid::WebMercator => 0u8,
+            Grid::Geographic => 1,
+        };
+        let deepest = self.grid.max_level() + offset;
+        let zone_z = self.zone_level + offset;
+        match zone {
+            Zone::Top => {
+                if self.zone_level == 0 {
+                    return Vec::new();
+                }
+                std::iter::once(level_base(offset)..=level_base(zone_z) - 1).collect()
+            }
+            Zone::Cell { x, y } => {
+                let Ok(first) = self.grid.to_id(self.zone_level, x, y) else {
+                    return Vec::new();
+                };
+                let along = first - level_base(zone_z);
+                (zone_z..=deepest)
+                    .map(|z| {
+                        let span = 1u64 << (2 * u32::from(z - zone_z));
+                        let start = level_base(z) + along * span;
+                        start..=start + span - 1
+                    })
+                    .collect()
+            }
         }
     }
 
@@ -114,6 +154,12 @@ impl Layer {
     }
 }
 
+/// The first archive tile id of level `z`: the tiles of every coarser level
+/// come before, `(4^z − 1) / 3` of them.
+pub fn level_base(z: u8) -> u64 {
+    ((1u64 << (2 * u32::from(z))) - 1) / 3
+}
+
 /// A monthly epoch is `YYYYMM`.
 const YEAR_DIGITS: usize = 4;
 const EPOCH_DIGITS: usize = YEAR_DIGITS + 2;
@@ -135,4 +181,101 @@ fn epoch_end(epoch: &str) -> Option<SystemTime> {
         .and_hms_opt(0, 0, 0)?
         .and_utc();
     Some(next.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layer(grid: Grid, zone_level: u8) -> Layer {
+        Layer {
+            name: "l".into(),
+            grid,
+            tile_type: TileType::Png,
+            tile_compression: Compression::None,
+            zone_level,
+            expiry: None,
+            content_type: "image/png".into(),
+            index: true,
+        }
+    }
+
+    #[test]
+    fn a_level_s_ids_start_where_the_archive_says() {
+        for z in 0..=12u8 {
+            let n = 1u32 << z;
+            let ids: Vec<u64> = (0..n)
+                .flat_map(|x| (0..n).map(move |y| (x, y)))
+                .map(|(x, y)| {
+                    pmtiles::TileId::from(pmtiles::TileCoord::new(z, x, y).expect("coord")).value()
+                })
+                .collect();
+            assert_eq!(ids.iter().min(), Some(&level_base(z)), "z{z}");
+            if z < 12 {
+                assert_eq!(ids.iter().max(), Some(&(level_base(z + 1) - 1)), "z{z}");
+            }
+        }
+    }
+
+    /// Every tile of every zone falls within the zone's ranges, and every
+    /// id of a zone's ranges (down to where it is checked) is a tile of
+    /// that zone: on both grids.
+    #[test]
+    fn a_zone_s_tiles_are_exactly_its_id_ranges() {
+        for grid in [Grid::WebMercator, Grid::Geographic] {
+            let l = layer(grid, 3);
+            let mut zones: Vec<Zone> = vec![Zone::Top];
+            let (w, h) = grid.size(3);
+            for x in 0..w as u32 {
+                for y in 0..h as u32 {
+                    zones.push(Zone::Cell { x, y });
+                }
+            }
+            let deepest = 7u8;
+            for level in 0..=deepest {
+                let (w, h) = grid.size(level);
+                for x in 0..w as u32 {
+                    for y in 0..h as u32 {
+                        let id = grid.to_id(level, x, y).expect("id");
+                        let zone = l.zone_of(level, x, y).expect("zone");
+                        for z in &zones {
+                            let inside = l.zone_id_ranges(*z).iter().any(|r| r.contains(&id));
+                            assert_eq!(inside, *z == zone, "{grid:?} {level}/{x}/{y} in {z:?}");
+                        }
+                    }
+                }
+            }
+            // And the other way round: an id a zone's range holds is that
+            // zone's tile, wherever the grid can hold it.
+            for z in &zones {
+                for r in l.zone_id_ranges(*z) {
+                    for id in r.clone().take(4096) {
+                        if let Some((level, x, y)) = grid.from_id(id) {
+                            if level <= deepest {
+                                assert_eq!(
+                                    l.zone_of(level, x, y).expect("zone"),
+                                    *z,
+                                    "{grid:?} id {id}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_zone_s_ranges_reach_the_deepest_level() {
+        let l = layer(Grid::WebMercator, 10);
+        let ranges = l.zone_id_ranges(Zone::Cell { x: 511, y: 377 });
+        assert_eq!(ranges.len(), usize::from(pmtiles::MAX_ZOOM - 10 + 1));
+        let deepest = Grid::WebMercator
+            .to_id(31, 511 << 21, 377 << 21)
+            .expect("id");
+        assert!(ranges.last().expect("last").contains(&deepest));
+        let top = l.zone_id_ranges(Zone::Top);
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0], 0..=level_base(10) - 1);
+    }
 }

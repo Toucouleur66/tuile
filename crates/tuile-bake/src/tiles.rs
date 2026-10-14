@@ -226,6 +226,20 @@ impl Tiles {
         })
     }
 
+    /// From now on a projection by reference asks `reader` — the host's
+    /// register — which zones a layer has and the copy a reader gets of each
+    /// tile, rather than listing the bucket and reading archives: see
+    /// [`tuile_tile_server::IndexReader`]. Set before the store is shared.
+    pub fn with_index_reader(
+        mut self,
+        reader: Arc<dyn tuile_tile_server::IndexReader>,
+    ) -> Result<Self, String> {
+        Arc::get_mut(&mut self.store)
+            .ok_or("the tile store is already shared: set its index reader first")?
+            .set_index_reader(reader);
+        Ok(self)
+    }
+
     /// Where the store's reads came from so far.
     pub fn stats(&self) -> tuile_tile_server::StatsSnapshot {
         self.store.stats()
@@ -254,10 +268,12 @@ impl Tiles {
     }
 
     /// The same, for a bake by reference: its imagery is named and never
-    /// drawn, so the imagery layer is projected by its archives' indexes —
-    /// which tiles each zone holds, and a digest of each — and not a byte of
-    /// imagery comes down where every archive of a zone has its index. The
-    /// terrain is projected tile by tile all the same.
+    /// drawn, so the imagery layer is projected by index — which tiles each
+    /// zone holds, and a stamp of each, from the register
+    /// ([`Self::with_index_reader`]) — and not a byte of imagery comes down
+    /// for a zone the register knows whole. Without a register, or for a
+    /// zone it does not know, the imagery is projected from its archives.
+    /// The terrain is projected tile by tile all the same.
     pub fn project_by_reference(
         &self,
         poses: &[tuile_tape::Frame],
@@ -329,7 +345,12 @@ impl Tiles {
             requests = report.requests,
             zones_indexed = report.zones_indexed,
             tiles_indexed = report.tiles_indexed,
-            index_mb = report.index_bytes as f64 / 1e6,
+            zones_registered = report.zones_registered,
+            tiles_registered = report.tiles_registered,
+            register_batches = report.register_batches,
+            register_s = report.register_millis as f64 / 1e3,
+            layers_listed = report.layers_listed,
+            layers_from_register = report.layers_from_register,
             seconds = report.millis as f64 / 1e3,
             "TILES-PROJECTED"
         );

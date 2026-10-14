@@ -101,7 +101,7 @@ pub struct Footprint {
     layer_factors: Vec<(String, f64)>,
     /// Layers whose cell zones are cut tile by tile, fetched by ranges.
     targeted: Vec<String>,
-    /// Layers projected by their archives' indexes rather than their
+    /// Layers projected by the register's index rather than their
     /// archives (by name; a layer's absence sibling follows its layer).
     by_index: Vec<String>,
     /// The layers projected, when not every layer of the store.
@@ -193,10 +193,12 @@ impl Footprint {
             .is_none_or(|only| only.iter().any(|n| n == base))
     }
 
-    /// Projects the layer `name` (and its absence sibling) by its archives'
-    /// indexes: which tiles each zone holds and a digest of each, and not a
-    /// byte of the tiles — for a consumer that names tiles and draws none.
-    /// A zone with an archive that has no index is projected as before.
+    /// Projects the layer `name` (and its absence sibling) by index: which
+    /// tiles each zone holds and a stamp of each, read from the store's
+    /// register ([`TileStore::with_index_reader`]), and not a byte of the
+    /// tiles — for a consumer that names tiles and draws none. A zone the
+    /// register does not know whole, or a store without one, is projected
+    /// from its archives, as before.
     pub fn with_layer_by_index(mut self, name: impl Into<String>) -> Self {
         self.by_index.push(name.into());
         self
@@ -311,13 +313,19 @@ pub struct ProjectionReport {
     pub whole_bytes: u64,
     /// The same, layer by layer (`top` apart).
     pub layers: BTreeMap<String, LayerProjection>,
-    /// Zones known by their archives' indexes alone, the tiles those
-    /// indexes name, and the bytes and requests the indexes cost (counted
-    /// in `bytes` and `requests` too).
+    /// Zones known by index alone, and the tiles their index names.
     pub zones_indexed: usize,
     pub tiles_indexed: u64,
-    pub index_bytes: u64,
-    pub index_requests: u64,
+    /// Zones known by the register ([`crate::IndexReader`]) alone — not one
+    /// index read, nothing listed — the tiles it gave, in how many batches,
+    /// and how long reading it took.
+    pub zones_registered: usize,
+    pub tiles_registered: u64,
+    pub register_batches: u64,
+    pub register_millis: u64,
+    /// Layers whose zones were listed from the bucket, and from the register.
+    pub layers_listed: usize,
+    pub layers_from_register: usize,
 }
 
 /// What a projection did of one layer: its cell zones, and its `top`.
@@ -334,6 +342,9 @@ pub struct LayerProjection {
     /// Zones known by their indexes alone, and the tiles they name.
     pub zones_indexed: usize,
     pub tiles_indexed: u64,
+    /// Of which known by the register alone, and the tiles it gave.
+    pub zones_registered: usize,
+    pub tiles_registered: u64,
     /// Of which the `top` zone's.
     pub top_tiles: u64,
     pub top_bytes: u64,
@@ -352,8 +363,10 @@ impl ProjectionReport {
         self.whole_bytes += r.whole_bytes;
         self.zones_indexed += r.zones_indexed;
         self.tiles_indexed += r.tiles_indexed;
-        self.index_bytes += r.index_bytes;
-        self.index_requests += r.index_requests;
+        self.zones_registered += r.zones_registered;
+        self.tiles_registered += r.tiles_registered;
+        self.register_batches += r.register_batches;
+        self.register_millis += r.register_millis;
         let l = self.layers.entry(layer.to_string()).or_default();
         l.targeted |= targeted;
         l.zones_seen += r.zones_seen;
@@ -365,6 +378,8 @@ impl ProjectionReport {
         l.whole_bytes += r.whole_bytes;
         l.zones_indexed += r.zones_indexed;
         l.tiles_indexed += r.tiles_indexed;
+        l.zones_registered += r.zones_registered;
+        l.tiles_registered += r.tiles_registered;
         if zone == Zone::Top {
             l.top_tiles += r.tiles_kept;
             l.top_bytes += r.bytes;
@@ -412,6 +427,23 @@ pub struct ZoneListing {
     pub whole_bytes: u64,
 }
 
+/// Sorted ranges, those that overlap or touch made one.
+pub fn merge_ranges(
+    sorted: Vec<std::ops::RangeInclusive<u64>>,
+) -> Vec<std::ops::RangeInclusive<u64>> {
+    let mut out: Vec<std::ops::RangeInclusive<u64>> = Vec::with_capacity(sorted.len());
+    for r in sorted {
+        match out.last_mut() {
+            Some(last) if *r.start() <= last.end().saturating_add(1) => {
+                let end = (*last.end()).max(*r.end());
+                *last = *last.start()..=end;
+            }
+            _ => out.push(r),
+        }
+    }
+    out
+}
+
 /// Where a zone's projection lives under `dir`.
 pub fn projection_path(dir: &FsPath, layer: &Layer, zone: Zone) -> PathBuf {
     dir.join(format!("{}.pmtiles", layer.zone_prefix(zone)))
@@ -420,41 +452,67 @@ pub fn projection_path(dir: &FsPath, layer: &Layer, zone: Zone) -> PathBuf {
 impl TileStore {
     /// Projects every remote zone the footprint reaches into `dir`, and reads
     /// through those projections from now on.
+    ///
+    /// The zones of a layer come from the register when the store has one
+    /// that knows the layer ([`TileStore::with_index_reader`]), from a
+    /// listing of the bucket otherwise; a layer the footprint does not
+    /// project is not listed at all. A zone of a layer projected by index
+    /// that the register knows whole is known from it alone, its tiles
+    /// streamed by ranges of ids: no index read. Whatever the register
+    /// cannot answer goes the way it went without one.
     pub async fn project(
         &self,
         footprint: &Footprint,
         dir: &FsPath,
     ) -> Result<ProjectionReport, StoreError> {
         let began = Instant::now();
-        let zones: Vec<(String, Zone)> = self
-            .zones()
-            .await?
-            .into_iter()
-            .filter(|(l, z)| {
-                footprint.projects(l)
-                    && self
-                        .layer(l)
-                        .map(|l| footprint.reaches(l, *z))
-                        .unwrap_or(false)
-            })
-            .collect();
+        let mut total = ProjectionReport::default();
+        let mut zones: Vec<(String, Zone)> = Vec::new();
+        let mut names: Vec<String> = self.layers().map(|l| l.name.clone()).collect();
+        names.sort();
+        for name in &names {
+            if !footprint.projects(name) {
+                continue;
+            }
+            let layer = self.layer(name)?;
+            let (listed, registered) = self.zones_for_projection(layer).await?;
+            if registered {
+                total.layers_from_register += 1;
+            } else {
+                total.layers_listed += 1;
+            }
+            let mut from_register = Vec::new();
+            for (zone, indexed) in listed {
+                if !footprint.reaches(layer, zone) {
+                    continue;
+                }
+                if indexed && footprint.by_index(name) {
+                    from_register.push(zone);
+                } else {
+                    zones.push((name.clone(), zone));
+                }
+            }
+            if from_register.is_empty() {
+                continue;
+            }
+            match self.index_from_register(layer, &from_register).await {
+                Ok(reports) => {
+                    for (zone, r) in reports {
+                        total.add(name, zone, false, &r);
+                    }
+                }
+                Err(error) => {
+                    // Read as without a register: slower, and as right.
+                    tracing::warn!(layer = %name, %error, zones = from_register.len(), "REGISTER-READ-FAILED: the zones are read by their indexes");
+                    metrics::counter!("tuile_tiles_register_failures_total", "layer" => name.clone(), "what" => "tiles").increment(1);
+                    zones.extend(from_register.into_iter().map(|z| (name.clone(), z)));
+                }
+            }
+        }
         let results: Vec<(String, Zone, bool, Result<ProjectionReport, StoreError>)> =
             futures_util::stream::iter(zones)
                 .map(|(layer, zone)| async move {
                     let targeted = footprint.targets(&layer) && zone != Zone::Top;
-                    if footprint.by_index(&layer) {
-                        match self.index_zone(&layer, zone).await {
-                            Ok(Some(r)) => {
-                                metrics::counter!("tuile_tiles_zones_projected_total", "layer" => layer.clone(), "by" => "index").increment(1);
-                                metrics::counter!("tuile_tiles_index_bytes_read_total", "layer" => layer.clone()).increment(r.index_bytes);
-                                return (layer, zone, false, Ok(r));
-                            }
-                            Ok(None) => {
-                                metrics::counter!("tuile_tiles_index_fallbacks_total", "layer" => layer.clone()).increment(1);
-                            }
-                            Err(e) => return (layer, zone, false, Err(e)),
-                        }
-                    }
                     metrics::counter!("tuile_tiles_zones_projected_total", "layer" => layer.clone(), "by" => "archives").increment(1);
                     let r = if targeted {
                         self.project_zone_targeted(footprint, dir, &layer, zone)
@@ -470,7 +528,6 @@ impl TileStore {
                 .buffer_unordered(ZONES_IN_FLIGHT)
                 .collect()
                 .await;
-        let mut total = ProjectionReport::default();
         for (layer, zone, targeted, r) in results {
             let r = r?;
             tracing::debug!(
@@ -490,71 +547,142 @@ impl TileStore {
         Ok(total)
     }
 
-    /// Knows a zone by its live archives' indexes, nothing of the archives
-    /// downloaded. `None` when one of them has no index: the zone is then
-    /// projected from its archives, as before.
-    async fn index_zone(
+    /// A layer's zones, and whether they come from the register: each with
+    /// whether the register knows its tiles whole. Listed from the bucket
+    /// when there is no register, it does not know the layer, or it failed.
+    async fn zones_for_projection(
         &self,
-        layer_name: &str,
-        zone: Zone,
-    ) -> Result<Option<ProjectionReport>, StoreError> {
-        let layer = self.layer(layer_name)?.clone();
-        let now = self.now();
-        let m = manifest::read(self.object_store().as_ref(), &layer.zone_prefix(zone))
-            .await?
-            .manifest;
-        let mut report = ProjectionReport {
-            zones_seen: 1,
-            whole_bytes: m
-                .archives
-                .iter()
-                .filter(|a| !layer.is_expired(&a.epoch, now))
-                .map(|a| a.bytes)
-                .sum(),
-            ..Default::default()
-        };
-        // Oldest first, as the manifest lists them: the last to hold a tile
-        // wins it, which is the store's own rule.
-        // All asked at once — a round trip for the zone, not one an archive
-        // — and `join_all` gives them back in the manifest's order.
-        let live: Vec<_> = m
-            .archives
-            .iter()
-            .filter(|a| !layer.is_expired(&a.epoch, now))
-            .collect();
-        let read = futures_util::future::join_all(
-            live.iter()
-                .map(|a| crate::index::read(self.object_store().as_ref(), &a.key)),
-        )
-        .await;
-        let mut indexes = Vec::with_capacity(live.len());
-        for (a, read) in live.iter().zip(read) {
-            report.requests += 1;
-            report.index_requests += 1;
-            match read? {
-                Some((index, bytes)) => {
-                    report.bytes += bytes;
-                    report.index_bytes += bytes;
-                    report.tiles_listed += index.len() as u64;
-                    indexes.push(index);
-                }
-                None => {
-                    // The whole zone is then read from its archives: the
-                    // cost the index is there to spare, so said aloud.
+        layer: &Layer,
+    ) -> Result<(Vec<(Zone, bool)>, bool), StoreError> {
+        if let Some(reader) = self.index_reader() {
+            let began = Instant::now();
+            match reader.zones(&layer.name).await {
+                Ok(Some(known)) => {
                     tracing::info!(
-                        layer = layer.name,
-                        archive = a.key,
-                        "INDEX-MISSING: the zone is projected from its archives"
+                        layer = %layer.name,
+                        zones = known.len(),
+                        indexed = known.iter().filter(|z| z.indexed).count(),
+                        seconds = began.elapsed().as_secs_f64(),
+                        "REGISTER-ZONES"
                     );
-                    return Ok(None);
+                    return Ok((
+                        known.into_iter().map(|z| (z.zone, z.indexed)).collect(),
+                        true,
+                    ));
+                }
+                Ok(None) => {
+                    tracing::info!(layer = %layer.name, "REGISTER-LAYER-UNKNOWN: the bucket is listed");
+                }
+                Err(error) => {
+                    tracing::warn!(layer = %layer.name, %error, "REGISTER-ZONES-FAILED: the bucket is listed");
+                    metrics::counter!("tuile_tiles_register_failures_total", "layer" => layer.name.clone(), "what" => "zones").increment(1);
                 }
             }
         }
-        let zone_index = crate::index::ZoneIndex::from_archives(&indexes);
-        report.tiles_indexed = zone_index.len() as u64;
-        report.zones_indexed = 1;
-        self.attach_index(&layer, zone, Arc::new(zone_index));
-        Ok(Some(report))
+        let began = Instant::now();
+        let listed = self.zones_of(layer).await?;
+        metrics::histogram!("tuile_tiles_zone_listing_seconds", "layer" => layer.name.clone())
+            .record(began.elapsed().as_secs_f64());
+        Ok((listed.into_iter().map(|z| (z, false)).collect(), false))
+    }
+
+    /// Knows `zones` of `layer` by the register alone: their tiles streamed
+    /// by ranges of ids, in batches, and each zone attached as if its
+    /// archives' indexes had been read. A tile whose winning copy is in an
+    /// expired archive is not held, as the store would not read it.
+    async fn index_from_register(
+        &self,
+        layer: &Layer,
+        zones: &[Zone],
+    ) -> Result<Vec<(Zone, ProjectionReport)>, String> {
+        let Some(reader) = self.index_reader() else {
+            return Err("no register".into());
+        };
+        let began = Instant::now();
+        let now = self.now();
+        let mut ranges: Vec<std::ops::RangeInclusive<u64>> = zones
+            .iter()
+            .flat_map(|z| layer.zone_id_ranges(*z))
+            .collect();
+        ranges.sort_by_key(|r| *r.start());
+        let ranges = merge_ranges(ranges);
+        let mut tiles: HashMap<Zone, HashMap<u64, crate::index::Stamp>> =
+            zones.iter().map(|z| (*z, HashMap::new())).collect();
+        let mut expired: HashMap<String, bool> = HashMap::new();
+        let (mut rows, mut batches, mut skipped) = (0u64, 0u64, 0u64);
+        let mut stream = reader.tiles(&layer.name, &ranges);
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            batches += 1;
+            rows += batch.len() as u64;
+            for t in batch {
+                let gone = match expired.get(&t.epoch) {
+                    Some(gone) => *gone,
+                    None => {
+                        let gone = layer.is_expired(&t.epoch, now);
+                        expired.insert(t.epoch.clone(), gone);
+                        gone
+                    }
+                };
+                if gone {
+                    skipped += 1;
+                    continue;
+                }
+                let Some(zone) = layer
+                    .grid
+                    .from_id(t.id)
+                    .and_then(|(level, x, y)| layer.zone_of(level, x, y).ok())
+                else {
+                    continue;
+                };
+                if let Some(held) = tiles.get_mut(&zone) {
+                    held.insert(t.id, t.stamp);
+                }
+            }
+        }
+        drop(stream);
+        let millis = began.elapsed().as_millis() as u64;
+        metrics::counter!("tuile_tiles_register_rows_total", "layer" => layer.name.clone())
+            .increment(rows);
+        metrics::histogram!("tuile_tiles_register_read_seconds", "layer" => layer.name.clone())
+            .record(began.elapsed().as_secs_f64());
+        tracing::info!(
+            layer = %layer.name,
+            zones = zones.len(),
+            ranges = ranges.len(),
+            rows,
+            batches,
+            expired = skipped,
+            seconds = millis as f64 / 1e3,
+            "REGISTER-TILES"
+        );
+        let mut out = Vec::with_capacity(zones.len());
+        for (i, (zone, held)) in tiles.into_iter().enumerate() {
+            let n = held.len() as u64;
+            self.attach_index(
+                layer,
+                zone,
+                Arc::new(crate::index::ZoneIndex::from_tiles(held)),
+            );
+            metrics::counter!("tuile_tiles_zones_projected_total", "layer" => layer.name.clone(), "by" => "register").increment(1);
+            out.push((
+                zone,
+                ProjectionReport {
+                    zones_seen: 1,
+                    zones_indexed: 1,
+                    tiles_indexed: n,
+                    tiles_listed: n,
+                    zones_registered: 1,
+                    tiles_registered: n,
+                    // Said once, on the first zone, so that the sum is the
+                    // layer's.
+                    register_batches: if i == 0 { batches } else { 0 },
+                    register_millis: if i == 0 { millis } else { 0 },
+                    ..Default::default()
+                },
+            ));
+        }
+        Ok(out)
     }
 
     /// Where every tile of a zone lies, newest archive first: each live

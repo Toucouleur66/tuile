@@ -12,8 +12,7 @@ use bytes::Bytes;
 use common::*;
 use object_store::ObjectStoreExt;
 use std::sync::Arc;
-use tuile_tile_server::manifest::Manifest;
-use tuile_tile_server::{Compaction, Due, Ledger, Scrub, Zone};
+use tuile_tile_server::{Compaction, Ledger, Publication, Scrub, Zone};
 
 #[tokio::test]
 async fn a_tile_is_readable_the_moment_it_is_put() {
@@ -611,15 +610,11 @@ impl Ledger for Told {
         }
         Ok(())
     }
-    async fn published(
-        &self,
-        layer: &str,
-        _zone: Zone,
-        manifest: &Manifest,
-        due: &Due,
-    ) -> Result<(), String> {
+    async fn published(&self, p: &Publication<'_>) -> Result<(), String> {
+        let (manifest, due) = (p.manifest, p.due);
         self.said.lock().expect("lock").push(format!(
-            "published {layer} g{} archives={} retired={} due={}",
+            "published {} g{} archives={} retired={} due={}",
+            p.layer,
             manifest.generation,
             manifest.archives.len(),
             manifest.retired.len(),
