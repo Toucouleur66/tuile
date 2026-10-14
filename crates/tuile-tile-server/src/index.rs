@@ -496,12 +496,25 @@ impl TileStore {
                 "layer {layer} keeps no index: set `index` in its catalog entry first"
             )));
         }
+        let began = std::time::Instant::now();
+        tracing::info!(layer, dry_run = how.dry_run, "INDEX-BACKFILL-LISTING");
         let zones = self.zones_of(&l).await?;
-        let reports: Vec<BackfillReport> = futures_util::stream::iter(zones)
+        let of = zones.len() as u64;
+        tracing::info!(
+            layer,
+            zones = of,
+            seconds = began.elapsed().as_secs_f64(),
+            "INDEX-BACKFILL-LISTED"
+        );
+        // Folded as each zone ends, so that every zone's line says where the
+        // whole backfill is.
+        let total = std::sync::Mutex::new(BackfillReport::default());
+        futures_util::stream::iter(zones)
             .map(|zone| {
                 let l = &l;
                 async move {
-                    match self.backfill_zone(l, zone, how.dry_run).await {
+                    let started = std::time::Instant::now();
+                    let r = match self.backfill_zone(l, zone, how.dry_run).await {
                         Ok(r) => r,
                         Err(e) => {
                             let why = format!("{}: {e}", l.zone_prefix(zone));
@@ -512,16 +525,56 @@ impl TileStore {
                                 ..BackfillReport::default()
                             }
                         }
-                    }
+                    };
+                    (zone, started.elapsed(), r)
                 }
             })
             .buffer_unordered(how.zones_in_flight.max(1))
-            .collect()
+            .for_each(|(zone, took, r)| {
+                let mut t = total.lock().expect("backfill totals");
+                let z = r.clone();
+                t.add(r);
+                let elapsed = began.elapsed().as_secs_f64();
+                let rate = t.zones as f64 / elapsed.max(1e-9);
+                let left = of.saturating_sub(t.zones) as f64 / rate.max(1e-9);
+                tracing::info!(
+                    layer,
+                    zone = %l.zone_prefix(zone),
+                    archives = z.archives,
+                    already = z.already,
+                    written = z.written,
+                    vanished = z.vanished,
+                    archive_mb = z.archive_bytes as f64 / 1e6,
+                    index_kb = z.index_bytes as f64 / 1e3,
+                    seconds = took.as_secs_f64(),
+                    done = t.zones,
+                    of,
+                    total_written = t.written,
+                    total_already = t.already,
+                    total_archive_mb = t.archive_bytes as f64 / 1e6,
+                    failed = t.failed.len(),
+                    zones_per_s = rate,
+                    eta_s = left,
+                    "INDEX-BACKFILL-ZONE"
+                );
+                std::future::ready(())
+            })
             .await;
-        let mut total = BackfillReport::default();
-        for r in reports {
-            total.add(r);
-        }
+        let total = total.into_inner().expect("backfill totals");
+        tracing::info!(
+            layer,
+            dry_run = how.dry_run,
+            zones = total.zones,
+            archives = total.archives,
+            already = total.already,
+            written = total.written,
+            vanished = total.vanished,
+            archive_mb = total.archive_bytes as f64 / 1e6,
+            index_mb = total.index_bytes as f64 / 1e6,
+            failed = total.failed.len(),
+            seconds = began.elapsed().as_secs_f64(),
+            "INDEX-BACKFILL-LAYER-DONE"
+        );
         Ok(total)
     }
 
@@ -549,20 +602,35 @@ impl TileStore {
                 report.archive_bytes += a.bytes;
                 continue;
             }
+            let started = std::time::Instant::now();
             let dir = tempfile::tempdir()?;
             let local = dir.path().join("archive.pmtiles");
             match crate::store::download(self.object_store().as_ref(), &a.key, &local).await {
                 Ok(()) => {}
                 Err(StoreError::ObjectStore(object_store::Error::NotFound { .. })) => {
+                    tracing::info!(archive = %a.key, "INDEX-BACKFILL-VANISHED");
                     report.vanished += 1;
                     continue;
                 }
                 Err(e) => return Err(e),
             }
-            report.archive_bytes += std::fs::metadata(&local)?.len();
+            let downloaded = std::fs::metadata(&local)?.len();
+            let fetched = started.elapsed();
+            report.archive_bytes += downloaded;
             let built = of_local_archive(&local, layer, &a.key).await?;
-            report.index_bytes += put(self.object_store().as_ref(), &built).await?;
+            let tiles = built.ids.len();
+            let index_bytes = put(self.object_store().as_ref(), &built).await?;
+            report.index_bytes += index_bytes;
             report.written += 1;
+            tracing::info!(
+                archive = %a.key,
+                tiles,
+                archive_mb = downloaded as f64 / 1e6,
+                index_kb = index_bytes as f64 / 1e3,
+                download_s = fetched.as_secs_f64(),
+                seconds = started.elapsed().as_secs_f64(),
+                "INDEX-BACKFILL-ARCHIVE"
+            );
         }
         Ok(report)
     }
