@@ -113,6 +113,26 @@ impl Ledger for Mem {
 }
 
 #[async_trait::async_trait]
+impl tuile_tile_server::Absences for Mem {
+    async fn record(
+        &self,
+        layer: &str,
+        absences: &[tuile_tile_server::Absence],
+    ) -> Result<(), String> {
+        self.say(format!("absent {layer} {}", absences.len()));
+        self.inner.record(layer, absences).await
+    }
+    async fn absent(
+        &self,
+        layer: &str,
+        id: u64,
+        now: std::time::SystemTime,
+    ) -> Result<bool, String> {
+        self.inner.absent(layer, id, now).await
+    }
+}
+
+#[async_trait::async_trait]
 impl IndexReader for Mem {
     async fn zones(&self, layer: &str) -> Result<Option<Vec<KnownZone>>, String> {
         if self.fail_reads.load(std::sync::atomic::Ordering::SeqCst) {
@@ -140,8 +160,14 @@ fn lookups(s: &TileStore, n: u32) -> Vec<(Lookup, Lookup)> {
 }
 
 /// The same, as the archives say it: what a reader of the store gets.
-async fn truth(objects: Arc<dyn ObjectStore>, clock: &TestClock, n: u32) -> Vec<(Lookup, Lookup)> {
-    let s = TileStore::with_clock(objects, layers(), eager(), clock.clock());
+async fn truth(
+    objects: Arc<dyn ObjectStore>,
+    clock: &TestClock,
+    mem: &Arc<Mem>,
+    n: u32,
+) -> Vec<(Lookup, Lookup)> {
+    let s =
+        TileStore::with_clock(objects, layers(), eager(), clock.clock()).with_absences(mem.clone());
     got(&s, n).await
 }
 
@@ -153,8 +179,18 @@ async fn got(s: &TileStore, n: u32) -> Vec<(Lookup, Lookup)> {
         let mut pair = [Lookup::NotHeld, Lookup::NotHeld];
         for (k, layer) in layers().iter().enumerate() {
             if let Some(bytes) = s.get(&layer.name, LEVEL, x, y).await.expect("get") {
-                pair[k] = Lookup::Held(Stamp::of(&bytes, index::holds_images(layer)));
+                // An absence carries no stamp.
+                pair[k] = Lookup::Held(if k == 1 {
+                    Stamp::default()
+                } else {
+                    Stamp::of(&bytes, index::holds_images(layer))
+                });
             }
+        }
+        // With an absence store, an absence hides an older copy, as `get`
+        // reads it.
+        if s.absences_first() && matches!(pair[1], Lookup::Held(_)) {
+            pair[0] = Lookup::NotHeld;
         }
         out.push((pair[0], pair[1]));
     }
@@ -202,8 +238,9 @@ async fn a_publication_tells_the_tiles_it_adds_and_the_archives_it_replaces() {
         inner: MemoryRegister::new().with_batch(3),
         ..Mem::default()
     });
-    let s =
-        TileStore::with_clock(objects, layers(), eager(), clock.clock()).with_ledger(mem.clone());
+    let s = TileStore::with_clock(objects, layers(), eager(), clock.clock())
+        .with_ledger(mem.clone())
+        .with_absences(mem.clone());
     history(&s).await;
     let said = mem.said();
     // Zones flush concurrently: the order across zones is not the point.
@@ -216,8 +253,6 @@ async fn a_publication_tells_the_tiles_it_adds_and_the_archives_it_replaces() {
     assert_eq!(
         published,
         [
-            // The absences' zone.
-            "published g1 added=1 replaced=0 uncovering=false",
             "published g1 added=6 replaced=0 uncovering=false",
             "published g2 added=6 replaced=0 uncovering=false",
             "published g3 added=2 replaced=0 uncovering=false",
@@ -254,10 +289,11 @@ async fn both_ways_store(
     Arc<Counting>,
     TileStore,
 ) {
-    let truth = truth(objects.clone(), clock, n).await;
+    let truth = truth(objects.clone(), clock, &mem, n).await;
     let counting = Counting::over(objects);
     let registered = TileStore::with_clock(counting.clone(), layers(), eager(), clock.clock())
-        .with_index_reader(mem);
+        .with_index_reader(mem.clone())
+        .with_absences(mem);
     let dir = tempfile::tempdir().expect("dir");
     registered
         .project(&by_index(), dir.path())
@@ -275,7 +311,8 @@ async fn a_register_kept_by_publications_answers_as_the_indexes_do() {
         ..Mem::default()
     });
     let s = TileStore::with_clock(objects.clone(), layers(), eager(), clock.clock())
-        .with_ledger(mem.clone());
+        .with_ledger(mem.clone())
+        .with_absences(mem.clone());
     history(&s).await;
 
     let (plain, registered, counting) = both_ways(objects, &clock, mem.clone(), 24).await;
@@ -313,7 +350,8 @@ async fn a_replayed_or_older_publication_changes_nothing() {
         ..Mem::default()
     });
     let s = TileStore::with_clock(objects.clone(), layers(), eager(), clock.clock())
-        .with_ledger(mem.clone());
+        .with_ledger(mem.clone())
+        .with_absences(mem.clone());
     history(&s).await;
     let before: Vec<(u64, u64, String)> = mem
         .inner
@@ -376,7 +414,8 @@ async fn a_scrub_that_uncovers_an_older_copy_leaves_the_zone_to_its_archives() {
         ..Mem::default()
     });
     let s = TileStore::with_clock(objects.clone(), layers(), eager(), clock.clock())
-        .with_ledger(mem.clone());
+        .with_ledger(mem.clone())
+        .with_absences(mem.clone());
     // Tile 0 twice: an old copy, then the unwanted one over it.
     let (x, y) = in_zone(0);
     s.put(IMAGERY, LEVEL, x, y, png(0, 0)).await.expect("put");
@@ -435,7 +474,8 @@ async fn a_register_that_keeps_an_archive_keeps_it_from_being_deleted() {
         ..Mem::default()
     });
     let s = TileStore::with_clock(objects.clone(), layers(), eager(), clock.clock())
-        .with_ledger(mem.clone());
+        .with_ledger(mem.clone())
+        .with_absences(mem.clone());
     history(&s).await;
     let prefix = indexed().zone_prefix(zone());
     let before = archives(objects.as_ref(), &prefix).await.len();
@@ -478,7 +518,8 @@ async fn a_register_that_fails_is_read_around() {
         ..Mem::default()
     });
     let s = TileStore::with_clock(objects.clone(), layers(), eager(), clock.clock())
-        .with_ledger(mem.clone());
+        .with_ledger(mem.clone())
+        .with_absences(mem.clone());
     history(&s).await;
     mem.fail_reads
         .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -515,19 +556,21 @@ async fn a_rebuild_gives_what_the_publications_gave_and_again_the_same() {
         ..Mem::default()
     });
     let s = TileStore::with_clock(objects.clone(), layers(), eager(), clock.clock())
-        .with_ledger(mem.clone());
+        .with_ledger(mem.clone())
+        .with_absences(mem.clone());
     history(&s).await;
     let rebuilt = MemoryRegister::new();
     for _ in 0..2 {
-        for layer in layers() {
-            let read = s.zone_tiles(&layer.name, zone(), 2).await.expect("read");
-            assert!(read.vanished.is_empty());
-            assert!(read.bytes > 0);
-            rebuilt.rebuild_zone(&layer.name, zone(), &read.manifest, &read.archives);
-        }
+        // The copies: the absences are in the absence store, not the bucket.
+        let layer = indexed();
+        let read = s.zone_tiles(&layer.name, zone(), 2).await.expect("read");
+        assert!(read.vanished.is_empty());
+        assert!(read.bytes > 0);
+        rebuilt.rebuild_zone(&layer, zone(), &read.manifest, &read.archives);
         let tiles = |b: tuile_tile_server::register::Book| {
             b.tiles
                 .into_iter()
+                .filter(|(_, t)| !t.absent)
                 .map(|(k, t)| (k, t.stamp.digest, t.archive))
                 .collect::<Vec<_>>()
         };
@@ -543,12 +586,14 @@ async fn a_stamp_from_the_register_is_the_digest_of_what_get_returns() {
     let objects = memory();
     let mem = Arc::new(Mem::default());
     let s = TileStore::with_clock(objects.clone(), layers(), eager(), clock.clock())
-        .with_ledger(mem.clone());
+        .with_ledger(mem.clone())
+        .with_absences(mem.clone());
     history(&s).await;
     let counting = Counting::over(objects);
     let registered = Arc::new(
         TileStore::with_clock(counting.clone(), layers(), eager(), clock.clock())
-            .with_index_reader(mem),
+            .with_index_reader(mem.clone())
+            .with_absences(mem),
     );
     let dir = tempfile::tempdir().expect("dir");
     registered
@@ -592,7 +637,8 @@ async fn a_copy_in_an_expired_archive_is_not_held() {
     let objects = memory();
     let mem = Arc::new(Mem::default());
     let s = TileStore::with_clock(objects.clone(), layers(), eager(), clock.clock())
-        .with_ledger(mem.clone());
+        .with_ledger(mem.clone())
+        .with_absences(mem.clone());
     let (x, y) = in_zone(0);
     s.put(IMAGERY, LEVEL, x, y, png(0, 0)).await.expect("put");
     s.flush_all().await.expect("flush");
@@ -609,4 +655,109 @@ async fn a_copy_in_an_expired_archive_is_not_held() {
     let layer = |v: &[(Lookup, Lookup)]| v.iter().map(|p| p.0).collect::<Vec<_>>();
     assert_eq!(layer(&registered), layer(&truth));
     assert_eq!(counting.archive_gets(), 0);
+}
+
+/// Between a copy and an absence, the newer wins — either way — and an
+/// expired absence is no absence, then forgotten.
+#[tokio::test]
+async fn the_newer_of_a_copy_and_an_absence_wins_and_an_absence_expires() {
+    use tuile_core::storage::{ContentStore, ABSENT};
+    let clock = TestClock::new();
+    let objects = memory();
+    let mem = Arc::new(Mem::default());
+    let s = Arc::new(
+        TileStore::with_clock(objects.clone(), layers(), eager(), clock.clock())
+            .with_ledger(mem.clone())
+            .with_absences(mem.clone()),
+    );
+    let content = tuile_tile_server::StoreContent::new(s.clone());
+    let key = |i| {
+        let (x, y) = in_zone(i);
+        format!("img/{IMAGERY}/{LEVEL}/{x}/{y}")
+    };
+    // Absent, then delivered: present.
+    content.put(&key(0), ABSENT, None).await;
+    clock.advance(std::time::Duration::from_secs(60));
+    content.put(&key(0), png(0, 0), None).await;
+    // Present, then said absent: absent.
+    content.put(&key(1), png(1, 0), None).await;
+    s.flush_all().await.expect("flush");
+    clock.advance(std::time::Duration::from_secs(60));
+    content.put(&key(1), ABSENT, None).await;
+    s.flush_all().await.expect("flush");
+    assert_eq!(content.get(&key(0)).await, Some(png(0, 0)));
+    assert_eq!(content.get(&key(1)).await, Some(ABSENT));
+    // No absence in the bucket.
+    let absent_prefix = format!("{IMAGERY}.absent");
+    assert!(archives(objects.as_ref(), &absent_prefix).await.is_empty());
+    // The register says the same, by index.
+    let (truth, registered, counting) = both_ways(objects.clone(), &clock, mem.clone(), 2).await;
+    assert_eq!(registered, truth);
+    assert!(matches!(registered[0], (Lookup::Held(_), Lookup::NotHeld)));
+    assert!(matches!(registered[1], (Lookup::NotHeld, Lookup::Held(_))));
+    assert_eq!(counting.archive_gets(), 0);
+    // Told late, the older loses: an absence fetched before a copy the
+    // register holds, and a copy fetched before an absence it holds.
+    let t = clock.now();
+    let (x2, y2) = in_zone(2);
+    s.put_fetched(IMAGERY, LEVEL, x2, y2, png(2, 0), t)
+        .await
+        .expect("put");
+    s.flush_all().await.expect("flush");
+    s.put_fetched(
+        &format!("{IMAGERY}.absent"),
+        LEVEL,
+        x2,
+        y2,
+        Bytes::from_static(b"\0"),
+        t - std::time::Duration::from_secs(30),
+    )
+    .await
+    .expect("late absence");
+    let (x3, y3) = in_zone(3);
+    s.put_fetched(
+        IMAGERY,
+        LEVEL,
+        x3,
+        y3,
+        png(3, 0),
+        t - std::time::Duration::from_secs(30),
+    )
+    .await
+    .expect("put");
+    s.put_fetched(
+        &format!("{IMAGERY}.absent"),
+        LEVEL,
+        x3,
+        y3,
+        Bytes::from_static(b"\0"),
+        t,
+    )
+    .await
+    .expect("absence");
+    s.flush_all().await.expect("late copy");
+    let book = mem.inner.book();
+    let row = |i| {
+        let (x, y) = in_zone(i);
+        let id = Grid::WebMercator.to_id(LEVEL, x, y).expect("id");
+        book.tiles.get(&(IMAGERY.to_string(), id)).map(|t| t.absent)
+    };
+    assert_eq!(
+        row(2),
+        Some(false),
+        "the copy, newer than the absence told after it"
+    );
+    assert_eq!(
+        row(3),
+        Some(true),
+        "the absence, newer than the copy published after it"
+    );
+    // An absence past its layer's expiry is no absence, and is forgotten.
+    clock.advance(IMAGERY_EXPIRY + std::time::Duration::from_secs(60));
+    assert_eq!(
+        content.get(&key(1)).await,
+        Some(png(1, 0)),
+        "expired: the older copy, still in the bucket, is read again"
+    );
+    assert_eq!(mem.inner.expire(clock.now()), 2, "tiles 1 and 3");
 }

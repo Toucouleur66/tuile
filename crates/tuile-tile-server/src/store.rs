@@ -321,6 +321,8 @@ pub struct TileStore {
     /// A register that knows the zones and the copy a reader gets of each
     /// tile: a projection by index reads it rather than the bucket.
     index_reader: Option<Arc<dyn crate::IndexReader>>,
+    /// Where absences are kept instead of the absence siblings' archives.
+    absences: Option<Arc<dyn crate::Absences>>,
     stats: Stats,
 }
 
@@ -387,6 +389,7 @@ impl TileStore {
             announcer: None,
             ledger: None,
             index_reader: None,
+            absences: None,
             stats: Stats::default(),
         }
     }
@@ -464,6 +467,36 @@ impl TileStore {
     /// The same, on a store already built.
     pub fn set_index_reader(&mut self, reader: Arc<dyn crate::IndexReader>) {
         self.index_reader = Some(reader);
+    }
+
+    /// From now on every write to an absence sibling is recorded in
+    /// `absences`, and every read of one asks it: the bucket holds no
+    /// absence. See [`crate::absences`].
+    pub fn with_absences(mut self, absences: Arc<dyn crate::Absences>) -> Self {
+        self.absences = Some(absences);
+        self
+    }
+
+    /// The same, on a store already built.
+    pub fn set_absences(&mut self, absences: Arc<dyn crate::Absences>) {
+        self.absences = Some(absences);
+    }
+
+    /// Whether absences are kept by an absence store, which answers only
+    /// those newer than any copy: a reader then asks it first.
+    pub fn absences_first(&self) -> bool {
+        self.absences.is_some()
+    }
+
+    /// The absence store and the base layer, when `layer` is an absence
+    /// sibling and the store keeps absences elsewhere.
+    fn absences_of<'a>(
+        &'a self,
+        layer: &'a str,
+    ) -> Option<(&'a Arc<dyn crate::Absences>, &'a str)> {
+        let absences = self.absences.as_ref()?;
+        let base = layer.strip_suffix(ABSENT_SUFFIX)?;
+        Some((absences, base))
     }
 
     pub(crate) fn index_reader(&self) -> Option<&Arc<dyn crate::IndexReader>> {
@@ -711,6 +744,18 @@ impl TileStore {
     ) -> Result<Option<Bytes>, StoreError> {
         let (l, zone, id) = self.locate(layer, level, x, y)?;
         let key = (l.name.clone(), zone);
+
+        if let Some((absences, base)) = self.absences_of(layer) {
+            let absent = absences
+                .absent(base, id, (self.clock)())
+                .await
+                .map_err(StoreError::Remote)?;
+            if absent {
+                self.stats.absent.fetch_add(1, Ordering::Relaxed);
+                metrics::counter!("tuile_tiles_hits_total", "layer" => l.name.clone(), "from" => "absences").increment(1);
+            }
+            return Ok(absent.then(|| Bytes::from_static(crate::catalog::ABSENT_MARKER)));
+        }
 
         if let Some(bytes) = self.buffered(&key, id) {
             self.stats.buffer.fetch_add(1, Ordering::Relaxed);
@@ -1051,6 +1096,17 @@ impl TileStore {
         let (l, zone, id) = self.locate(layer, level, x, y)?;
         let key = (l.name.clone(), zone);
         let fetched_ms = manifest::now_ms(fetched);
+        if let Some((absences, base)) = self.absences_of(layer) {
+            let absence = crate::Absence {
+                id,
+                fetched_ms,
+                expires_at: l.expiry.map(|e| fetched + e),
+            };
+            return absences
+                .record(base, &[absence])
+                .await
+                .map_err(StoreError::Ledger);
+        }
         let to_flush = {
             let mut buffers = self.buffers.lock().map_err(|_| StoreError::Poisoned)?;
             let b = buffers.entry(key.clone()).or_default();
@@ -1264,6 +1320,23 @@ impl TileStore {
         }
         if batch.is_empty() {
             return Ok(0);
+        }
+        if let Some((absences, base)) = self.absences_of(layer) {
+            let recorded: Vec<crate::Absence> = batch
+                .iter()
+                .map(|(id, p)| crate::Absence {
+                    id: *id,
+                    fetched_ms: p.fetched_ms,
+                    expires_at: l
+                        .expiry
+                        .map(|e| std::time::UNIX_EPOCH + Duration::from_millis(p.fetched_ms) + e),
+                })
+                .collect();
+            absences
+                .record(base, &recorded)
+                .await
+                .map_err(StoreError::Ledger)?;
+            return Ok(recorded.len());
         }
         let lock = self.zone_lock(&key);
         let _held = lock.lock().await;

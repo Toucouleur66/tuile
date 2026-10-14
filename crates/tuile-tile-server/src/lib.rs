@@ -20,6 +20,7 @@
 //!   local.
 //! - [`index`] says what an archive holds without its bytes: its tile ids
 //!   and a stamp of each, told to the host's register as it is published.
+//! - [`absences`] is where what a source does not have is kept.
 //! - [`ledger`] is what a register is told, and what it tells a reader back;
 //!   [`register`] is one in memory, and the reference of what one does.
 //! - [`lru`] is the budgeted least-recently-used map the caches share.
@@ -30,6 +31,7 @@
 //!
 //! No router and no authentication here: those belong to whoever deploys it.
 
+pub mod absences;
 pub mod archive;
 pub mod catalog;
 pub mod content;
@@ -50,6 +52,7 @@ pub mod store;
 pub mod tiering;
 pub mod upstream;
 
+pub use absences::{Absence, Absences};
 pub use catalog::{Catalog, LayerDef};
 pub use content::StoreContent;
 pub use disk::DiskCacheConfig;

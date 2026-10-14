@@ -45,7 +45,7 @@ pub fn digest(bytes: &[u8]) -> u64 {
 }
 
 /// What an index says of one tile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct Stamp {
     /// [`digest`] of the tile's bytes.
     pub digest: u64,

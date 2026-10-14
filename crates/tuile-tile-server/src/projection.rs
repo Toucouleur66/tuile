@@ -474,6 +474,10 @@ impl TileStore {
             if !footprint.projects(name) {
                 continue;
             }
+            // Kept by an absence store: read with their layer, never listed.
+            if self.absences_first() && name.ends_with(crate::catalog::ABSENT_SUFFIX) {
+                continue;
+            }
             let layer = self.layer(name)?;
             let (listed, registered) = self.zones_for_projection(layer).await?;
             if registered {
@@ -608,6 +612,15 @@ impl TileStore {
         let ranges = merge_ranges(ranges);
         let mut tiles: HashMap<Zone, HashMap<u64, crate::index::Stamp>> =
             zones.iter().map(|z| (*z, HashMap::new())).collect();
+        // The layer's absences, when an absence store keeps them: the same
+        // rows, flagged, for the absence sibling's index.
+        let absent_layer = format!("{}{}", layer.name, crate::catalog::ABSENT_SUFFIX);
+        let absences_here = self.absences_first() && self.layer(&absent_layer).is_ok();
+        let mut absent: HashMap<Zone, HashMap<u64, crate::index::Stamp>> = if absences_here {
+            zones.iter().map(|z| (*z, HashMap::new())).collect()
+        } else {
+            HashMap::new()
+        };
         let mut expired: HashMap<String, bool> = HashMap::new();
         let (mut rows, mut batches, mut skipped) = (0u64, 0u64, 0u64);
         let mut stream = reader.tiles(&layer.name, &ranges);
@@ -616,6 +629,20 @@ impl TileStore {
             batches += 1;
             rows += batch.len() as u64;
             for t in batch {
+                if t.absent {
+                    if !absences_here || t.expires_at.is_some_and(|at| at <= now) {
+                        skipped += 1;
+                        continue;
+                    }
+                    let zone = layer
+                        .grid
+                        .from_id(t.id)
+                        .and_then(|(level, x, y)| layer.zone_of(level, x, y).ok());
+                    if let Some(held) = zone.and_then(|z| absent.get_mut(&z)) {
+                        held.insert(t.id, t.stamp);
+                    }
+                    continue;
+                }
                 let gone = match expired.get(&t.epoch) {
                     Some(gone) => *gone,
                     None => {
@@ -656,6 +683,19 @@ impl TileStore {
             seconds = millis as f64 / 1e3,
             "REGISTER-TILES"
         );
+        if absences_here {
+            let absent_layer = self
+                .layer(&absent_layer)
+                .map_err(|e| e.to_string())?
+                .clone();
+            for (zone, held) in absent {
+                self.attach_index(
+                    &absent_layer,
+                    zone,
+                    Arc::new(crate::index::ZoneIndex::from_tiles(held)),
+                );
+            }
+        }
         let mut out = Vec::with_capacity(zones.len());
         for (i, (zone, held)) in tiles.into_iter().enumerate() {
             let n = held.len() as u64;

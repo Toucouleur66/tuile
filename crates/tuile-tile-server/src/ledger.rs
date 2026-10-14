@@ -104,11 +104,19 @@ pub struct KnownZone {
 /// One tile as a register gives it back: its id, the stamp of the copy a
 /// reader gets, and the epoch of the archive that holds that copy — an
 /// expired one is not read, as the store would not read it.
+///
+/// A layer's absences — what its source said it does not have (see
+/// [`crate::absences`]) — are given with the layer's own tiles, one row a
+/// tile, flagged `absent`, with no stamp and their expiry: one read answers
+/// present, absent, or not held.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredTile {
     pub id: u64,
+    pub absent: bool,
     pub stamp: Stamp,
     pub epoch: String,
+    /// An absence's expiry; an expired one is not absent.
+    pub expires_at: Option<std::time::SystemTime>,
 }
 
 /// Batches of tiles, as a register streams them.
@@ -122,7 +130,8 @@ pub trait IndexReader: Send + Sync {
     /// Every zone of `layer` the register knows; `None` when it does not
     /// know the layer whole, and the bucket is listed instead.
     async fn zones(&self, layer: &str) -> Result<Option<Vec<KnownZone>>, String>;
-    /// The tiles of `layer` whose ids fall within `ranges` (sorted,
-    /// disjoint), in batches as they are read: never all at once.
+    /// The tiles of `layer` (a base layer, never an absence sibling) whose
+    /// ids fall within `ranges` (sorted, disjoint), present or absent, in
+    /// batches as they are read: never all at once.
     fn tiles<'a>(&'a self, layer: &'a str, ranges: &'a [RangeInclusive<u64>]) -> TileBatches<'a>;
 }

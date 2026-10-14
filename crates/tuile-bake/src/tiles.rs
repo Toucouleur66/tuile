@@ -240,6 +240,19 @@ impl Tiles {
         Ok(self)
     }
 
+    /// From now on the store's absences are kept, and read, by `absences`
+    /// rather than the bucket: see [`tuile_tile_server::absences`]. Set
+    /// before the store is shared.
+    pub fn with_absences(
+        mut self,
+        absences: Arc<dyn tuile_tile_server::Absences>,
+    ) -> Result<Self, String> {
+        Arc::get_mut(&mut self.store)
+            .ok_or("the tile store is already shared: set its absence store first")?
+            .set_absences(absences);
+        Ok(self)
+    }
+
     /// Where the store's reads came from so far.
     pub fn stats(&self) -> tuile_tile_server::StatsSnapshot {
         self.store.stats()

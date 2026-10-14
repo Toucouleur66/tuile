@@ -324,7 +324,9 @@ fn a_pack_over_indexed_imagery_reads_no_imagery_archive_and_is_the_same_pack() {
         let origin = Arc::new(Origin(AtomicU64::new(0)));
         let register = Arc::new(tuile_tile_server::MemoryRegister::new());
         let warm = Arc::new(
-            TileStore::new(objects.clone(), layers(), cfg.clone()).with_ledger(register.clone()),
+            TileStore::new(objects.clone(), layers(), cfg.clone())
+                .with_ledger(register.clone())
+                .with_absences(register.clone()),
         );
         let from_origin = pack_of(
             CachedImagery::new(
@@ -345,7 +347,9 @@ fn a_pack_over_indexed_imagery_reads_no_imagery_archive_and_is_the_same_pack() {
             archive_gets: AtomicU64::new(0),
         });
         let by_index = Arc::new(
-            TileStore::new(counting.clone(), layers(), cfg.clone()).with_index_reader(register),
+            TileStore::new(counting.clone(), layers(), cfg.clone())
+                .with_index_reader(register.clone())
+                .with_absences(register.clone()),
         );
         let dir = tempfile::tempdir().expect("dir");
         let report = by_index
@@ -378,7 +382,8 @@ fn a_pack_over_indexed_imagery_reads_no_imagery_archive_and_is_the_same_pack() {
         );
 
         // Projected from the archives and read by bytes: the bake as it was.
-        let whole = Arc::new(TileStore::new(objects.clone(), layers(), cfg));
+        let whole =
+            Arc::new(TileStore::new(objects.clone(), layers(), cfg).with_absences(register));
         let dir = tempfile::tempdir().expect("dir");
         let report = whole
             .project(&footprint(), dir.path())

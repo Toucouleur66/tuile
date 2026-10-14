@@ -69,6 +69,14 @@ fn parse(key: &str) -> Option<(&str, u8, u32, u32)> {
 impl ContentStore for StoreContent {
     async fn get(&self, key: &str) -> Option<Bytes> {
         let (layer, z, x, y) = parse(key)?;
+        let absent = format!("{layer}{ABSENT_SUFFIX}");
+        // An absence store answers only absences newer than any copy: asked
+        // first, it is the newer of the two.
+        if self.store.absences_first() {
+            if let Ok(Some(_)) = self.store.get(&absent, z, x, y).await {
+                return Some(ABSENT);
+            }
+        }
         match self.store.get(layer, z, x, y).await {
             Ok(Some(bytes)) => return Some(bytes),
             Ok(None) => {}
@@ -77,7 +85,9 @@ impl ContentStore for StoreContent {
                 return None;
             }
         }
-        let absent = format!("{layer}{ABSENT_SUFFIX}");
+        if self.store.absences_first() {
+            return None;
+        }
         match self.store.get(&absent, z, x, y).await {
             Ok(Some(_)) => Some(ABSENT),
             _ => None,
