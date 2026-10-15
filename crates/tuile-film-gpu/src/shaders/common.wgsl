@@ -38,6 +38,9 @@ struct Frame {
     horizon: vec4f,
     // xyz: the sky straight up.
     zenith: vec4f,
+    // xyz: the white balance, gains on the picture's light with the
+    // exposure — never on the overlays.
+    white_balance: vec4f,
 }
 
 // One resident tile, as this frame places it.

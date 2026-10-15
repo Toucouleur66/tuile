@@ -13,7 +13,7 @@ use tuile_farm::produce::{Failed, Host, Stretch};
 use tuile_repository::Objects;
 
 use crate::render::{render, AbsentTiles, Order};
-use crate::setup::{film_sink, sun_at};
+use crate::setup::{film_sink, placed_sun};
 use crate::source::{Film, Sources};
 use crate::Error;
 
@@ -314,19 +314,22 @@ impl Engine {
         cache: &Path,
     ) -> Result<Self, Error> {
         // One sun for the whole film: placed anew at each part's first
-        // frame, it would step between two parts.
-        if let Some((azimuth, elevation)) = rendering.sun {
-            let eye = first
-                .checked_sub(1)
-                .and_then(|i| bake.poses.get(i as usize))
-                .ok_or_else(|| {
-                    format!(
-                        "frame {first} is not one of the tape's {}",
-                        bake.poses.len()
-                    )
-                })?
-                .position;
-            rendering.order.look.to_sun = sun_at(eye, azimuth, elevation);
+        // frame, it would step between two parts. Placed even when none is
+        // asked for: the look's own is unoriented ([`placed_sun`]).
+        let eye = first
+            .checked_sub(1)
+            .and_then(|i| bake.poses.get(i as usize))
+            .map(|pose| pose.position);
+        match (eye, rendering.sun) {
+            (Some(eye), sun) => rendering.order.look.to_sun = placed_sun(eye, sun),
+            (None, Some(_)) => {
+                return Err(format!(
+                    "frame {first} is not one of the tape's {}",
+                    bake.poses.len()
+                )
+                .into())
+            }
+            (None, None) => {}
         }
         let packs = bake.packs();
         let film = film_prefix(&packs, &rendering);

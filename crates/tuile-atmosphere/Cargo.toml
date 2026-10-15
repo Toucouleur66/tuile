@@ -14,3 +14,4 @@ glam.workspace = true
 # to prevent. bytemuck is plain-data plumbing, not a renderer.
 bytemuck.workspace = true
 tuile-core = { path = "../tuile-core" }
+solar-positioning.workspace = true

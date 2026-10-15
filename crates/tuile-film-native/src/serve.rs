@@ -37,7 +37,7 @@ use crate::engine::RenderSpec;
 use crate::extract::{local_key, ExtractRef, Fetched};
 use crate::observe::Timings;
 use crate::render::render;
-use crate::setup::{film_sink, sun_at};
+use crate::setup::{film_sink, placed_sun};
 use crate::source::{Film, Sources};
 use crate::Error;
 
@@ -429,14 +429,15 @@ impl<F: OverlayFactory> Service<F> {
             (Some(to_sun), _) => {
                 render_order.look.to_sun = glam::Vec3::from_array(to_sun).normalize()
             }
-            (None, Some((azimuth, elevation))) => {
+            // Placed where the segment begins: the one asked for, or the
+            // default sun — never the look's unoriented one.
+            (None, sun) => {
                 let head = &film.packs.first().ok_or("a film of no pack")?.head;
                 let eye = tuile_film::Pack::open_table(head)?
                     .view_of(order.frames.0)?
                     .position;
-                render_order.look.to_sun = sun_at(eye, azimuth, elevation);
+                render_order.look.to_sun = placed_sun(eye, sun);
             }
-            (None, None) => {}
         }
         // Under the cache: on a serverless container, the disk it was given
         // rather than a /tmp in memory.

@@ -188,11 +188,10 @@ async fn a_hosts_light_lights_its_frames_and_only_those() {
     })
     .normalize()
     .as_vec3();
-    let dim = FrameLight {
-        to_sun: -up,
-        sun: glam::Vec3::splat(3.0),
-        world: glam::Vec3::splat(0.05),
-    };
+    let mut dim = FrameLight::of(&Look::default());
+    dim.illumination.to_sun_ecef = -up.as_dvec3();
+    dim.illumination.sun_rgb = [3.0; 3];
+    dim.illumination.sky_sh[0] = [0.05; 3];
     let top_bottom = Stereo {
         packing: tuile_film::Packing::TopBottom,
         ..Stereo::default()
@@ -335,10 +334,8 @@ async fn the_suns_map_follows_the_frames_sun() {
         },
         ..Order::default()
     };
-    let low = FrameLight {
-        to_sun: (up * 0.15 + enu.x_axis.as_vec3()).normalize(),
-        ..FrameLight::of(&order.look)
-    };
+    let mut low = FrameLight::of(&order.look);
+    low.illumination.to_sun_ecef = (up * 0.15 + enu.x_axis.as_vec3()).normalize().as_dvec3();
     let mut host = Lit {
         lights: vec![(2, low)],
         ..Lit::default()
@@ -352,4 +349,92 @@ async fn the_suns_map_follows_the_frames_sun() {
     let high = texels[0];
     assert!((texels[2] - high).abs() < 0.01 * high, "{texels:?}");
     assert!((texels[1] - high).abs() > 0.05 * high, "{texels:?}");
+}
+
+/// A host that places one frame's light and draws one opaque square the
+/// whole picture's centre, as given, over everything.
+struct Balanced(FrameLight);
+
+impl Overlays for Balanced {
+    fn frame(&mut self, _: u32, camera: &OverlayCamera, out: &mut Vec<OverlayMesh>) {
+        // 100 m ahead, 10 m a side: the middle of the picture.
+        let c = &camera.camera;
+        let ahead = -c.view.row(2).truncate() * 100.0;
+        let (r, u) = (
+            c.view.row(0).truncate() * 5.0,
+            c.view.row(1).truncate() * 5.0,
+        );
+        out.push(OverlayMesh {
+            origin_ecef: c.eye.to_array(),
+            positions: vec![
+                (ahead - r - u).to_array(),
+                (ahead + r - u).to_array(),
+                (ahead + r + u).to_array(),
+                (ahead - r + u).to_array(),
+            ],
+            colors: vec![[0.2, 0.4, 0.6, 1.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            depth: tuile_film::OverlayDepth::Always,
+            blend: tuile_film::OverlayBlend::Opaque,
+            ..OverlayMesh::default()
+        });
+    }
+
+    fn light(&mut self, frame: u32) -> Option<FrameLight> {
+        (frame == 2).then_some(self.0)
+    }
+}
+
+/// A frame's white balance and exposure move the ground's colour, and
+/// leave the overlays' as the host gave them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_frames_white_balance_and_exposure_are_the_grounds_not_the_overlays() {
+    if !has_adapter() {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("dir");
+    let (sources, film) = test_film(dir.path()).await;
+    let order = Order {
+        supersample: 1,
+        tone: Tone::Off,
+        ..Order::default()
+    };
+    // A light half a stop brighter than daylight, its white cool and the
+    // camera adapted half way to it: the picture comes out warmer.
+    let mut warm = FrameLight::of(&order.look);
+    warm.illumination.ev100 += 0.5;
+    warm.illumination.white = [0.8, 1.0, 1.6];
+    warm.illumination.adaptation = 0.5;
+    let mut kept = Kept::default();
+    render(
+        &sources,
+        &film,
+        &order,
+        &mut Balanced(warm),
+        &mut kept,
+        &mut (),
+    )
+    .await
+    .expect("render");
+    let (width, height) = (64usize, 48usize);
+    let at = |picture: &[u8], x: usize, y: usize| {
+        let i = (y * width + x) * 4;
+        [picture[i], picture[i + 1], picture[i + 2]]
+    };
+    // The centre is the overlay's; a corner is the ground's.
+    let (centre, corner) = ((width / 2, height / 2), (3, 3));
+    let (plain, balanced) = (&kept.0[0], &kept.0[1]);
+    assert_eq!(
+        at(plain, centre.0, centre.1),
+        at(balanced, centre.0, centre.1),
+        "the overlay as given"
+    );
+    let (a, b) = (
+        at(plain, corner.0, corner.1),
+        at(balanced, corner.0, corner.1),
+    );
+    let ratio = |p: [u8; 3]| f64::from(p[0]) / f64::from(p[2].max(1));
+    assert!(ratio(b) > ratio(a) * 1.1, "warmer: {a:?} then {b:?}");
+    assert!(b[0] < a[0], "darker: {a:?} then {b:?}");
 }
