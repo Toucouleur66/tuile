@@ -12,14 +12,14 @@ bytemuck = { workspace = true }
 glam = { workspace = true }
 thiserror = { workspace = true }
 # The stitching's band and the strips of a tile that has none.
-tuile-core = { version = "0.5.0", path = "../tuile-core" }
-tuile-film = { version = "0.5.0", path = "../tuile-film" }
+tuile-core = { version = "0.6.0", path = "../tuile-core" }
+tuile-film = { version = "0.6.0", path = "../tuile-film" }
 wgpu = { workspace = true }
 
 [dev-dependencies]
 image = { workspace = true }
 # The made-up terrain of tests/no_seams.rs.
-tuile-terrain = { version = "0.5.0", path = "../tuile-terrain" }
+tuile-terrain = { version = "0.6.0", path = "../tuile-terrain" }
 pollster = { workspace = true }
 tempfile = { workspace = true }
 
