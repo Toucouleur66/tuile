@@ -332,6 +332,12 @@ impl TileService {
         } else {
             (self.store.get(layer, level, x, y).await?, false)
         };
+        // An absence store answers only absences newer than any copy.
+        if absent && self.store.absences_first() {
+            self.counters.absent.fetch_add(1, Ordering::Relaxed);
+            self.hot_put(key, None);
+            return Ok(None);
+        }
         if let Some(bytes) = stored {
             self.counters.store.fetch_add(1, Ordering::Relaxed);
             let etag = etag_of(&bytes);

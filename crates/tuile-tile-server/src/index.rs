@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! Archive indexes: what an archive holds, without its bytes.
+//! What an archive holds, without its bytes: its tile ids and a stamp of each.
 //!
 //! A consumer that only **names** tiles — a bake by reference, which records
 //! which tiles a frame drapes and a digest of each, and composes nothing —
@@ -10,82 +10,27 @@
 //! to learn that costs the archives: measured on one chunk of a film, fifteen
 //! gigabytes of imagery downloaded to name three thousand tiles.
 //!
-//! So beside each archive of a layer that asks for it
-//! ([`Layer::index`](crate::Layer::index)) lies one small immutable object,
-//! `<archive key>.index` ([`index_key`]): the archive's tile ids, sorted, and
-//! for each the [`digest`] of its bytes exactly as the store returns them,
-//! and its image size when it is an image. It is a FlatBuffer
-//! (`schema/tile_index.fbs`), about twenty bytes a tile, uncompressed like the
-//! archives themselves.
+//! So whatever writes an archive of a layer that asks for it
+//! ([`Layer::index`](crate::Layer::index)) — a delta, a compaction, a scrub —
+//! reads it back once, while it is still on local disk, into an
+//! [`ArchiveIndex`]: its tile ids, sorted, and for each the [`digest`] of its
+//! bytes exactly as the store returns them, and its image size when it is an
+//! image. That index is handed to the host's register with the publication
+//! that brings the archive in ([`crate::Publication::added`]); the register
+//! keeps, for every tile, the copy a reader gets, and gives it back to a
+//! projection ([`crate::IndexReader`]). Nothing of it is kept in the bucket.
 //!
-//! # Its life is the archive's
-//!
-//! - **Written** by whatever writes the archive — a delta, a compaction, a
-//!   scrub — after the archive and **before the manifest that publishes it**:
-//!   a reader that sees the archive in a manifest finds its index, or the
-//!   archive was published before indexes existed. An index uploaded for an
-//!   archive that is then never published is an orphan, removed by the
-//!   cleanup like an orphaned archive.
-//! - **Deleted** with the archive, by every path that deletes one.
-//! - **Never rewritten**: an archive's key is unique, and so is its index's.
-//!
-//! An archive without an index is not an error: a reader falls back to the
-//! archive itself. [`TileStore::backfill_indexes`](crate::TileStore::backfill_indexes)
-//! writes the indexes of the archives published before.
-//!
-//! # A zone, from its indexes
-//!
-//! [`ZoneIndex`] folds a zone's live archives the way a reader of the store
-//! does: newest first, the first archive that holds a tile wins it.
+//! [`ZoneIndex`] is what a projection attaches to a zone it knows that way.
 
 use std::collections::HashMap;
 use std::path::Path as FsPath;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use futures_util::TryStreamExt;
-use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
 use crate::archive;
 use crate::layer::Layer;
-use crate::store::TileStore;
 use crate::StoreError;
-
-#[allow(
-    clippy::all,
-    clippy::pedantic,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::needless_lifetimes,
-    dead_code,
-    unused_imports,
-    unsafe_code,
-    non_snake_case,
-    non_camel_case_types,
-    reason = "flatc output, committed verbatim"
-)]
-mod generated {
-    include!("tile_index_generated.rs");
-}
-
-use generated::tuile::tiles as fb;
-
-/// The index layout written. Bumped when an old reader would misread a new
-/// index; a reader refuses any other.
-pub const INDEX_VERSION: u32 = 1;
-/// What an index's key adds to its archive's.
-pub const INDEX_SUFFIX: &str = ".index";
-
-/// Where the index of the archive at `archive_key` lives.
-pub fn index_key(archive_key: &str) -> String {
-    format!("{archive_key}{INDEX_SUFFIX}")
-}
-
-/// The archive an index key belongs to, if it is one.
-pub fn archive_of_index(key: &str) -> Option<&str> {
-    key.strip_suffix(INDEX_SUFFIX)
-}
 
 /// FNV-1a, 64 bits, over a tile's bytes as the store returns them.
 ///
@@ -100,7 +45,7 @@ pub fn digest(bytes: &[u8]) -> u64 {
 }
 
 /// What an index says of one tile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct Stamp {
     /// [`digest`] of the tile's bytes.
     pub digest: u64,
@@ -178,98 +123,6 @@ impl ArchiveIndex {
     pub fn is_empty(&self) -> bool {
         self.ids.is_empty()
     }
-
-    /// The FlatBuffer.
-    pub fn encode(&self) -> Vec<u8> {
-        let mut b = flatbuffers::FlatBufferBuilder::with_capacity(64 + self.ids.len() * 20);
-        let layer = b.create_string(&self.layer);
-        let archive = b.create_string(&self.archive);
-        let ids = b.create_vector(&self.ids);
-        let digests: Vec<u64> = self.stamps.iter().map(|s| s.digest).collect();
-        let digests = b.create_vector(&digests);
-        let widths: Vec<u16> = self.stamps.iter().map(|s| s.width).collect();
-        let widths = b.create_vector(&widths);
-        let heights: Vec<u16> = self.stamps.iter().map(|s| s.height).collect();
-        let heights = b.create_vector(&heights);
-        let root = fb::TileIndex::create(
-            &mut b,
-            &fb::TileIndexArgs {
-                version: INDEX_VERSION,
-                layer: Some(layer),
-                archive: Some(archive),
-                tiles: self.ids.len() as u64,
-                ids: Some(ids),
-                digests: Some(digests),
-                widths: Some(widths),
-                heights: Some(heights),
-            },
-        );
-        fb::finish_tile_index_buffer(&mut b, root);
-        b.finished_data().to_vec()
-    }
-
-    /// Reads a FlatBuffer, checking everything a reader relies on: the
-    /// identifier, the version, the lengths, the order of the ids.
-    pub fn decode(bytes: &[u8]) -> Result<Self, StoreError> {
-        let corrupt = |why: String| StoreError::Corrupt(format!("archive index: {why}"));
-        // The identifier check asserts on a buffer too short to hold one.
-        const ROOT_AND_IDENTIFIER: usize = 8;
-        if bytes.len() < ROOT_AND_IDENTIFIER || !fb::tile_index_buffer_has_identifier(bytes) {
-            return Err(corrupt("not an index".into()));
-        }
-        // An index of a few hundred thousand tiles is a few megabytes of
-        // scalar vectors: within the verifier's default bounds.
-        let root = fb::root_as_tile_index(bytes).map_err(|e| corrupt(e.to_string()))?;
-        if root.version() != INDEX_VERSION {
-            return Err(corrupt(format!(
-                "version {} (this reader knows {INDEX_VERSION})",
-                root.version()
-            )));
-        }
-        let ids: Vec<u64> = root.ids().map(|v| v.iter().collect()).unwrap_or_default();
-        let digests: Vec<u64> = root
-            .digests()
-            .map(|v| v.iter().collect())
-            .unwrap_or_default();
-        let widths: Vec<u16> = root
-            .widths()
-            .map(|v| v.iter().collect())
-            .unwrap_or_default();
-        let heights: Vec<u16> = root
-            .heights()
-            .map(|v| v.iter().collect())
-            .unwrap_or_default();
-        let n = ids.len();
-        if root.tiles() != n as u64 || digests.len() != n || widths.len() != n || heights.len() != n
-        {
-            return Err(corrupt(format!(
-                "{} tiles said, vectors of {n}, {}, {}, {}",
-                root.tiles(),
-                digests.len(),
-                widths.len(),
-                heights.len()
-            )));
-        }
-        if ids.windows(2).any(|w| w[0] >= w[1]) {
-            return Err(corrupt("tile ids out of order".into()));
-        }
-        let stamps = digests
-            .into_iter()
-            .zip(widths)
-            .zip(heights)
-            .map(|((digest, width), height)| Stamp {
-                digest,
-                width,
-                height,
-            })
-            .collect();
-        Ok(Self {
-            layer: root.layer().unwrap_or_default().to_string(),
-            archive: root.archive().unwrap_or_default().to_string(),
-            ids,
-            stamps,
-        })
-    }
 }
 
 /// The index of the archive file at `path`, to be stored as `archive_key`'s:
@@ -322,62 +175,7 @@ where
     Ok(out)
 }
 
-/// Writes an index beside its archive. Says how many bytes it is.
-pub async fn put(store: &dyn ObjectStore, index: &ArchiveIndex) -> Result<u64, StoreError> {
-    let body = index.encode();
-    let len = body.len() as u64;
-    store
-        .put(
-            &Path::from(index_key(&index.archive)),
-            PutPayload::from(Bytes::from(body)),
-        )
-        .await?;
-    Ok(len)
-}
-
-/// The index of the archive at `archive_key`, and its size in bytes; `None`
-/// when it has none.
-pub async fn read(
-    store: &dyn ObjectStore,
-    archive_key: &str,
-) -> Result<Option<(ArchiveIndex, u64)>, StoreError> {
-    match store.get(&Path::from(index_key(archive_key))).await {
-        Ok(got) => {
-            let bytes = got.bytes().await?;
-            let index = ArchiveIndex::decode(&bytes)?;
-            if index.archive != archive_key {
-                return Err(StoreError::Corrupt(format!(
-                    "{}: the index of {}",
-                    index_key(archive_key),
-                    index.archive
-                )));
-            }
-            Ok(Some((index, bytes.len() as u64)))
-        }
-        Err(object_store::Error::NotFound { .. }) => Ok(None),
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// Whether the archive at `archive_key` has an index, without reading it.
-pub async fn exists(store: &dyn ObjectStore, archive_key: &str) -> Result<bool, StoreError> {
-    match store.head(&Path::from(index_key(archive_key))).await {
-        Ok(_) => Ok(true),
-        Err(object_store::Error::NotFound { .. }) => Ok(false),
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// Deletes the index of the archive at `archive_key`; one that is not there
-/// is already deleted.
-pub async fn delete(store: &dyn ObjectStore, archive_key: &str) -> Result<(), StoreError> {
-    match store.delete(&Path::from(index_key(archive_key))).await {
-        Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// What a zone's index says of one tile: see [`TileStore::indexed`].
+/// What a zone's index says of one tile: see [`crate::TileStore::indexed`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lookup {
     /// The zone holds it; the stamp of the copy a reader would get.
@@ -408,6 +206,12 @@ impl ZoneIndex {
         Self { tiles }
     }
 
+    /// From every tile of a zone and the stamp of the copy a reader gets,
+    /// as a register keeps them.
+    pub fn from_tiles(tiles: HashMap<u64, Stamp>) -> Self {
+        Self { tiles }
+    }
+
     /// The stamp of the copy of tile `id` a reader would get, if the zone
     /// holds it.
     pub fn get(&self, id: u64) -> Option<Stamp> {
@@ -423,317 +227,81 @@ impl ZoneIndex {
     }
 }
 
-/// How [`TileStore::backfill_indexes`] goes about it.
-#[derive(Debug, Clone, Copy)]
-pub struct Backfill {
-    /// Zones worked on at once.
-    pub zones_in_flight: usize,
-    /// Count what would be written, write nothing.
-    pub dry_run: bool,
+/// A zone read whole from its archives: its manifest, and the index of
+/// each archive it names, in the manifest's order (oldest first). What a
+/// register is rebuilt from.
+#[derive(Debug, Clone, Default)]
+pub struct ZoneTiles {
+    pub manifest: crate::manifest::Manifest,
+    /// One per archive of `manifest.archives` that could be read.
+    pub archives: Vec<ArchiveIndex>,
+    /// Archives the manifest names that were gone when read (compacted or
+    /// expired since): the zone changed under the read, and is to be read
+    /// again.
+    pub vanished: Vec<String>,
+    /// Archive bytes downloaded.
+    pub bytes: u64,
 }
 
-impl Default for Backfill {
-    fn default() -> Self {
-        Self {
-            zones_in_flight: 8,
-            dry_run: false,
-        }
-    }
-}
-
-/// What a backfill did, or would do.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct BackfillReport {
-    pub zones: u64,
-    /// Archives the zones' manifests list.
-    pub archives: u64,
-    /// …of which already had an index, and were left alone.
-    pub already: u64,
-    /// …of which got one (or, dry, would have).
-    pub written: u64,
-    /// …of which vanished before they could be read (compacted, expired).
-    pub vanished: u64,
-    /// Archive bytes downloaded to index them (dry: that would be).
-    pub archive_bytes: u64,
-    /// Index bytes written.
-    pub index_bytes: u64,
-    /// Zones that failed, with why; the rest went on.
-    pub failed: Vec<String>,
-}
-
-impl BackfillReport {
-    fn add(&mut self, other: BackfillReport) {
-        self.zones += other.zones;
-        self.archives += other.archives;
-        self.already += other.already;
-        self.written += other.written;
-        self.vanished += other.vanished;
-        self.archive_bytes += other.archive_bytes;
-        self.index_bytes += other.index_bytes;
-        self.failed.extend(other.failed);
-    }
-}
-
-impl TileStore {
-    /// Writes the index of every archive of `layer` that has none: the
-    /// archives published before the layer kept indexes. Idempotent — an
-    /// archive with an index is left alone — so an interrupted backfill is
-    /// resumed by running it again. Retired archives are not indexed: they
-    /// are on their way out.
-    ///
-    /// Refused for a layer whose catalog entry does not keep indexes: its
-    /// next archives would come without one, and the work would never be
-    /// done.
-    pub async fn backfill_indexes(
+impl crate::TileStore {
+    /// Reads `layer`'s `zone` whole from its archives — each downloaded once
+    /// to local disk, `in_flight` at a time, every tile digested and its
+    /// image size read — into what a register keeps of it. Nothing is
+    /// written anywhere.
+    pub async fn zone_tiles(
         &self,
         layer: &str,
-        how: Backfill,
-    ) -> Result<BackfillReport, StoreError> {
+        zone: crate::Zone,
+        in_flight: usize,
+    ) -> Result<ZoneTiles, StoreError> {
         use futures_util::StreamExt;
         let l = self.layer(layer)?.clone();
-        if !l.index {
-            return Err(StoreError::Corrupt(format!(
-                "layer {layer} keeps no index: set `index` in its catalog entry first"
-            )));
-        }
-        let began = std::time::Instant::now();
-        tracing::info!(layer, dry_run = how.dry_run, "INDEX-BACKFILL-LISTING");
-        let zones = self.zones_of(&l).await?;
-        let of = zones.len() as u64;
-        tracing::info!(
-            layer,
-            zones = of,
-            seconds = began.elapsed().as_secs_f64(),
-            "INDEX-BACKFILL-LISTED"
-        );
-        // Folded as each zone ends, so that every zone's line says where the
-        // whole backfill is.
-        let total = std::sync::Mutex::new(BackfillReport::default());
-        futures_util::stream::iter(zones)
-            .map(|zone| {
-                let l = &l;
-                async move {
-                    let started = std::time::Instant::now();
-                    let r = match self.backfill_zone(l, zone, how.dry_run).await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            let why = format!("{}: {e}", l.zone_prefix(zone));
-                            tracing::warn!(%why, "INDEX-BACKFILL-FAILED");
-                            BackfillReport {
-                                zones: 1,
-                                failed: vec![why],
-                                ..BackfillReport::default()
-                            }
-                        }
-                    };
-                    (zone, started.elapsed(), r)
-                }
-            })
-            .buffer_unordered(how.zones_in_flight.max(1))
-            .for_each(|(zone, took, r)| {
-                let mut t = total.lock().expect("backfill totals");
-                let z = r.clone();
-                t.add(r);
-                let elapsed = began.elapsed().as_secs_f64();
-                let rate = t.zones as f64 / elapsed.max(1e-9);
-                let left = of.saturating_sub(t.zones) as f64 / rate.max(1e-9);
-                tracing::info!(
-                    layer,
-                    zone = %l.zone_prefix(zone),
-                    archives = z.archives,
-                    already = z.already,
-                    written = z.written,
-                    vanished = z.vanished,
-                    archive_mb = z.archive_bytes as f64 / 1e6,
-                    index_kb = z.index_bytes as f64 / 1e3,
-                    seconds = took.as_secs_f64(),
-                    done = t.zones,
-                    of,
-                    total_written = t.written,
-                    total_already = t.already,
-                    total_archive_mb = t.archive_bytes as f64 / 1e6,
-                    failed = t.failed.len(),
-                    zones_per_s = rate,
-                    eta_s = left,
-                    "INDEX-BACKFILL-ZONE"
-                );
-                std::future::ready(())
-            })
-            .await;
-        let total = total.into_inner().expect("backfill totals");
-        tracing::info!(
-            layer,
-            dry_run = how.dry_run,
-            zones = total.zones,
-            archives = total.archives,
-            already = total.already,
-            written = total.written,
-            vanished = total.vanished,
-            archive_mb = total.archive_bytes as f64 / 1e6,
-            index_mb = total.index_bytes as f64 / 1e6,
-            failed = total.failed.len(),
-            seconds = began.elapsed().as_secs_f64(),
-            "INDEX-BACKFILL-LAYER-DONE"
-        );
-        // Zero when every live archive of the layer has its index: a dry
-        // run counts the archives without one, a real run the zones it
-        // could not finish (each to be run again).
-        let missing = if how.dry_run {
-            total.written
-        } else {
-            total.failed.len() as u64
-        };
-        metrics::gauge!("tuile_tiles_index_missing_archives", "layer" => layer.to_string())
-            .set(missing as f64);
-        Ok(total)
-    }
-
-    async fn backfill_zone(
-        &self,
-        layer: &Layer,
-        zone: crate::layer::Zone,
-        dry_run: bool,
-    ) -> Result<BackfillReport, StoreError> {
-        let m = crate::manifest::read(self.object_store().as_ref(), &layer.zone_prefix(zone))
+        let manifest = crate::manifest::read(self.object_store().as_ref(), &l.zone_prefix(zone))
             .await?
             .manifest;
-        let mut report = BackfillReport {
-            zones: 1,
-            ..BackfillReport::default()
+        let read: Vec<Result<Option<(ArchiveIndex, u64)>, StoreError>> =
+            futures_util::stream::iter(manifest.archives.iter())
+                .map(|a| {
+                    let l = &l;
+                    async move {
+                        let dir = tempfile::tempdir()?;
+                        let local = dir.path().join("archive.pmtiles");
+                        match crate::store::download(self.object_store().as_ref(), &a.key, &local)
+                            .await
+                        {
+                            Ok(()) => {}
+                            Err(StoreError::ObjectStore(object_store::Error::NotFound {
+                                ..
+                            })) => return Ok(None),
+                            Err(e) => return Err(e),
+                        }
+                        let bytes = std::fs::metadata(&local)?.len();
+                        Ok(Some((of_local_archive(&local, l, &a.key).await?, bytes)))
+                    }
+                })
+                .buffered(in_flight.max(1))
+                .collect()
+                .await;
+        let mut out = ZoneTiles {
+            manifest: manifest.clone(),
+            ..ZoneTiles::default()
         };
-        for a in &m.archives {
-            report.archives += 1;
-            if exists(self.object_store().as_ref(), &a.key).await? {
-                report.already += 1;
-                continue;
-            }
-            if dry_run {
-                report.written += 1;
-                report.archive_bytes += a.bytes;
-                continue;
-            }
-            let started = std::time::Instant::now();
-            let dir = tempfile::tempdir()?;
-            let local = dir.path().join("archive.pmtiles");
-            match crate::store::download(self.object_store().as_ref(), &a.key, &local).await {
-                Ok(()) => {}
-                Err(StoreError::ObjectStore(object_store::Error::NotFound { .. })) => {
-                    tracing::info!(archive = %a.key, "INDEX-BACKFILL-VANISHED");
-                    report.vanished += 1;
-                    continue;
+        for (a, r) in manifest.archives.iter().zip(read) {
+            match r? {
+                Some((index, bytes)) => {
+                    out.bytes += bytes;
+                    out.archives.push(index);
                 }
-                Err(e) => return Err(e),
+                None => out.vanished.push(a.key.clone()),
             }
-            let downloaded = std::fs::metadata(&local)?.len();
-            let fetched = started.elapsed();
-            report.archive_bytes += downloaded;
-            let built = of_local_archive(&local, layer, &a.key).await?;
-            let tiles = built.ids.len();
-            let index_bytes = put(self.object_store().as_ref(), &built).await?;
-            report.index_bytes += index_bytes;
-            report.written += 1;
-            metrics::counter!("tuile_tiles_indexes_backfilled_total", "layer" => layer.name.clone())
-                .increment(1);
-            tracing::info!(
-                archive = %a.key,
-                tiles,
-                archive_mb = downloaded as f64 / 1e6,
-                index_kb = index_bytes as f64 / 1e3,
-                download_s = fetched.as_secs_f64(),
-                seconds = started.elapsed().as_secs_f64(),
-                "INDEX-BACKFILL-ARCHIVE"
-            );
         }
-        Ok(report)
+        Ok(out)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn sample() -> ArchiveIndex {
-        ArchiveIndex {
-            layer: "imagery".into(),
-            archive: "imagery/zones/z10/1/2/d-000-abc.pmtiles".into(),
-            ids: vec![3, 7, 1_000_000_000_000],
-            stamps: vec![
-                Stamp {
-                    digest: 1,
-                    width: 256,
-                    height: 256,
-                },
-                Stamp {
-                    digest: u64::MAX,
-                    width: 512,
-                    height: 256,
-                },
-                Stamp {
-                    digest: 42,
-                    width: 0,
-                    height: 0,
-                },
-            ],
-        }
-    }
-
-    #[test]
-    fn an_index_round_trips() {
-        let index = sample();
-        let bytes = index.encode();
-        assert_eq!(&bytes[4..8], b"TIDX", "the file identifier");
-        let back = ArchiveIndex::decode(&bytes).expect("decode");
-        assert_eq!(back, index);
-        assert_eq!(back.get(7).map(|s| s.digest), Some(u64::MAX));
-        assert_eq!(back.get(8), None);
-        assert_eq!(back.get(1_000_000_000_000).map(|s| s.digest), Some(42));
-        // Twenty bytes a tile, give or take the header.
-        let many = ArchiveIndex {
-            ids: (0..10_000).collect(),
-            stamps: vec![
-                Stamp {
-                    digest: 9,
-                    width: 256,
-                    height: 256
-                };
-                10_000
-            ],
-            ..sample()
-        };
-        let len = many.encode().len();
-        assert!((200_000..200_400).contains(&len), "{len} bytes");
-    }
-
-    #[test]
-    fn an_index_that_is_not_one_is_refused() {
-        assert!(ArchiveIndex::decode(b"").is_err());
-        assert!(ArchiveIndex::decode(&[0u8; 64]).is_err());
-        let mut out_of_order = sample();
-        out_of_order.ids.swap(0, 1);
-        assert!(ArchiveIndex::decode(&out_of_order.encode()).is_err());
-        let mut short = sample();
-        short.stamps.pop();
-        // `encode` writes what it is given; `decode` refuses vectors that
-        // disagree.
-        let bytes = {
-            let mut b = flatbuffers::FlatBufferBuilder::new();
-            let ids = b.create_vector(&short.ids);
-            let digests = b.create_vector(&[1u64, 2]);
-            let root = fb::TileIndex::create(
-                &mut b,
-                &fb::TileIndexArgs {
-                    version: INDEX_VERSION,
-                    tiles: 3,
-                    ids: Some(ids),
-                    digests: Some(digests),
-                    ..Default::default()
-                },
-            );
-            fb::finish_tile_index_buffer(&mut b, root);
-            b.finished_data().to_vec()
-        };
-        assert!(ArchiveIndex::decode(&bytes).is_err());
-    }
 
     #[test]
     fn the_digest_is_fnv_1a() {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! A pack by reference over imagery projected by its archives' indexes: not
+//! A pack by reference over imagery projected by the store's register: not
 //! one imagery archive read, and the same pack, byte for byte, as over
 //! imagery projected from its archives — and as straight from the source.
 //!
@@ -319,9 +319,15 @@ fn a_pack_over_indexed_imagery_reads_no_imagery_archive_and_is_the_same_pack() {
         };
 
         // From the origin, through the store: the tiles are stored, the
-        // absences remembered, every archive indexed as it is published.
+        // absences remembered, every archive told to the register as it is
+        // published.
         let origin = Arc::new(Origin(AtomicU64::new(0)));
-        let warm = Arc::new(TileStore::new(objects.clone(), layers(), cfg.clone()));
+        let register = Arc::new(tuile_tile_server::MemoryRegister::new());
+        let warm = Arc::new(
+            TileStore::new(objects.clone(), layers(), cfg.clone())
+                .with_ledger(register.clone())
+                .with_absences(register.clone()),
+        );
         let from_origin = pack_of(
             CachedImagery::new(
                 tuile_planetary::Held(origin.clone() as Arc<dyn ImageryProvider>),
@@ -335,12 +341,16 @@ fn a_pack_over_indexed_imagery_reads_no_imagery_archive_and_is_the_same_pack() {
         let asked = origin.0.load(Ordering::SeqCst);
         assert!(asked > 10, "the drapes asked the origin {asked} tiles");
 
-        // Projected by the indexes, named by stamp.
+        // Projected by the register, named by stamp.
         let counting = Arc::new(Counting {
             inner: objects.clone(),
             archive_gets: AtomicU64::new(0),
         });
-        let by_index = Arc::new(TileStore::new(counting.clone(), layers(), cfg.clone()));
+        let by_index = Arc::new(
+            TileStore::new(counting.clone(), layers(), cfg.clone())
+                .with_index_reader(register.clone())
+                .with_absences(register.clone()),
+        );
         let dir = tempfile::tempdir().expect("dir");
         let report = by_index
             .project(&footprint().with_layer_by_index(LAYER), dir.path())
@@ -372,7 +382,8 @@ fn a_pack_over_indexed_imagery_reads_no_imagery_archive_and_is_the_same_pack() {
         );
 
         // Projected from the archives and read by bytes: the bake as it was.
-        let whole = Arc::new(TileStore::new(objects.clone(), layers(), cfg));
+        let whole =
+            Arc::new(TileStore::new(objects.clone(), layers(), cfg).with_absences(register));
         let dir = tempfile::tempdir().expect("dir");
         let report = whole
             .project(&footprint(), dir.path())

@@ -44,7 +44,7 @@ use tokio::io::AsyncReadExt;
 use crate::archive::{self, LocalReader, RemoteReader};
 use crate::catalog::ABSENT_SUFFIX;
 use crate::disk::{ArchiveCache, DiskCacheConfig};
-use crate::index::{self, ZoneIndex};
+use crate::index::{self, ArchiveIndex, ZoneIndex};
 use crate::layer::{Layer, Zone};
 use crate::lru::Lru;
 use crate::manifest::{self, now_secs, ArchiveRef, Manifest, Retired, Versioned};
@@ -318,6 +318,11 @@ pub struct TileStore {
     /// Told of every manifest this store publishes, if anyone is to be.
     announcer: Option<Arc<dyn Announce>>,
     ledger: Option<Arc<dyn crate::Ledger>>,
+    /// A register that knows the zones and the copy a reader gets of each
+    /// tile: a projection by index reads it rather than the bucket.
+    index_reader: Option<Arc<dyn crate::IndexReader>>,
+    /// Where absences are kept instead of the absence siblings' archives.
+    absences: Option<Arc<dyn crate::Absences>>,
     stats: Stats,
 }
 
@@ -383,6 +388,8 @@ impl TileStore {
             indexes: Mutex::default(),
             announcer: None,
             ledger: None,
+            index_reader: None,
+            absences: None,
             stats: Stats::default(),
         }
     }
@@ -449,6 +456,58 @@ impl TileStore {
         self
     }
 
+    /// The same, on a store already built.
+    pub fn set_ledger(&mut self, ledger: Arc<dyn crate::Ledger>) {
+        self.ledger = Some(ledger);
+    }
+
+    /// From now on a projection by index asks `reader` which zones a layer
+    /// has and the copy a reader gets of each tile, and lists no bucket and
+    /// reads no archive index for what it knows: see [`crate::ledger`].
+    pub fn with_index_reader(mut self, reader: Arc<dyn crate::IndexReader>) -> Self {
+        self.index_reader = Some(reader);
+        self
+    }
+
+    /// The same, on a store already built.
+    pub fn set_index_reader(&mut self, reader: Arc<dyn crate::IndexReader>) {
+        self.index_reader = Some(reader);
+    }
+
+    /// From now on every write to an absence sibling is recorded in
+    /// `absences`, and every read of one asks it: the bucket holds no
+    /// absence. See [`crate::absences`].
+    pub fn with_absences(mut self, absences: Arc<dyn crate::Absences>) -> Self {
+        self.absences = Some(absences);
+        self
+    }
+
+    /// The same, on a store already built.
+    pub fn set_absences(&mut self, absences: Arc<dyn crate::Absences>) {
+        self.absences = Some(absences);
+    }
+
+    /// Whether absences are kept by an absence store, which answers only
+    /// those newer than any copy: a reader then asks it first.
+    pub fn absences_first(&self) -> bool {
+        self.absences.is_some()
+    }
+
+    /// The absence store and the base layer, when `layer` is an absence
+    /// sibling and the store keeps absences elsewhere.
+    fn absences_of<'a>(
+        &'a self,
+        layer: &'a str,
+    ) -> Option<(&'a Arc<dyn crate::Absences>, &'a str)> {
+        let absences = self.absences.as_ref()?;
+        let base = layer.strip_suffix(ABSENT_SUFFIX)?;
+        Some((absences, base))
+    }
+
+    pub(crate) fn index_reader(&self) -> Option<&Arc<dyn crate::IndexReader>> {
+        self.index_reader.as_ref()
+    }
+
     /// Tells the ledger an archive is about to be written; refused, it is not.
     async fn record_writing(
         &self,
@@ -467,16 +526,70 @@ impl TileStore {
 
     /// Tells the ledger of a publication. A ledger that missed it is put right
     /// by the next one: said, and not an error of the publication.
-    async fn record_published(&self, key: &ZoneKey, manifest: &Manifest) {
+    async fn record_published(
+        &self,
+        key: &ZoneKey,
+        manifest: &Manifest,
+        added: Option<&ArchiveIndex>,
+        replaced: &[String],
+        uncovering: bool,
+    ) {
         let (Some(ledger), Ok(layer)) = (&self.ledger, self.layer(&key.0)) else {
             return;
         };
         let due = crate::due::due(layer, manifest, &self.cfg, (self.clock)());
-        if let Err(error) = ledger.published(&key.0, key.1, manifest, &due).await {
+        let publication = crate::ledger::Publication {
+            layer: &key.0,
+            zone: key.1,
+            manifest,
+            due: &due,
+            added,
+            replaced,
+            uncovering,
+        };
+        if let Err(error) = ledger.published(&publication).await {
             tracing::warn!(layer = %key.0, zone = ?key.1, %error, "the ledger missed a publication");
             metrics::counter!("tuile_tiles_ledger_missed_total", "what" => "published")
                 .increment(1);
         }
+    }
+
+    /// Asks the ledger to let go of archives about to be deleted; refused,
+    /// they are not deleted.
+    async fn record_deleting(&self, layer: &str, zone: Zone, keys: &[String]) -> bool {
+        let Some(ledger) = &self.ledger else {
+            return true;
+        };
+        if keys.is_empty() {
+            return true;
+        }
+        match ledger.deleting(layer, zone, keys).await {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(layer, ?zone, %error, "the ledger kept archives from being deleted");
+                metrics::counter!("tuile_tiles_ledger_missed_total", "what" => "deleting")
+                    .increment(1);
+                false
+            }
+        }
+    }
+
+    /// Deletes archives a ledger first lets go of, then tells it; says how
+    /// many were deleted. Without a ledger, deletes them.
+    async fn delete_archives(
+        &self,
+        layer: &str,
+        zone: Zone,
+        keys: &[String],
+    ) -> Result<usize, StoreError> {
+        if keys.is_empty() || !self.record_deleting(layer, zone, keys).await {
+            return Ok(0);
+        }
+        for k in keys {
+            self.delete_archive(k).await?;
+        }
+        self.record_deleted(layer, zone, keys).await;
+        Ok(keys.len())
     }
 
     /// Tells the ledger of archives deleted.
@@ -569,32 +682,31 @@ impl TileStore {
         })
     }
 
-    /// Writes the index of the archive at `local`, to be published as
-    /// `object`, when the layer keeps indexes. Called after the archive's
-    /// upload and before the manifest that publishes it.
-    async fn write_index(
+    /// The index of the archive at `local`, to be published as `object`,
+    /// for the ledger: when there is one, and the layer's tiles are
+    /// registered. Read while the archive is still on local disk, before the
+    /// manifest that publishes it.
+    async fn index_for_ledger(
         &self,
         layer: &Layer,
         local: &std::path::Path,
         object: &str,
-    ) -> Result<(), StoreError> {
-        if !layer.index {
-            return Ok(());
+    ) -> Result<Option<ArchiveIndex>, StoreError> {
+        if !layer.index || self.ledger.is_none() {
+            return Ok(None);
         }
         let built = index::of_local_archive(local, layer, object).await?;
-        index::put(self.store.as_ref(), &built).await?;
-        metrics::counter!("tuile_tiles_indexes_written_total", "layer" => layer.name.clone())
+        metrics::counter!("tuile_tiles_archives_indexed_total", "layer" => layer.name.clone())
             .increment(1);
-        Ok(())
+        Ok(Some(built))
     }
 
-    /// Deletes an archive and its index, if it has one.
+    /// Deletes an archive; one that is not there is already deleted.
     async fn delete_archive(&self, key: &str) -> Result<(), StoreError> {
         match self.store.delete(&Path::from(key)).await {
-            Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
-            Err(e) => return Err(e.into()),
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(e.into()),
         }
-        index::delete(self.store.as_ref(), key).await
     }
 
     #[doc(hidden)]
@@ -637,6 +749,18 @@ impl TileStore {
     ) -> Result<Option<Bytes>, StoreError> {
         let (l, zone, id) = self.locate(layer, level, x, y)?;
         let key = (l.name.clone(), zone);
+
+        if let Some((absences, base)) = self.absences_of(layer) {
+            let absent = absences
+                .absent(base, id, (self.clock)())
+                .await
+                .map_err(StoreError::Remote)?;
+            if absent {
+                self.stats.absent.fetch_add(1, Ordering::Relaxed);
+                metrics::counter!("tuile_tiles_hits_total", "layer" => l.name.clone(), "from" => "absences").increment(1);
+            }
+            return Ok(absent.then(|| Bytes::from_static(crate::catalog::ABSENT_MARKER)));
+        }
 
         if let Some(bytes) = self.buffered(&key, id) {
             self.stats.buffer.fetch_add(1, Ordering::Relaxed);
@@ -977,6 +1101,17 @@ impl TileStore {
         let (l, zone, id) = self.locate(layer, level, x, y)?;
         let key = (l.name.clone(), zone);
         let fetched_ms = manifest::now_ms(fetched);
+        if let Some((absences, base)) = self.absences_of(layer) {
+            let absence = crate::Absence {
+                id,
+                fetched_ms,
+                expires_at: l.expiry.map(|e| fetched + e),
+            };
+            return absences
+                .record(base, &[absence])
+                .await
+                .map_err(StoreError::Ledger);
+        }
         let to_flush = {
             let mut buffers = self.buffers.lock().map_err(|_| StoreError::Poisoned)?;
             let b = buffers.entry(key.clone()).or_default();
@@ -1191,6 +1326,23 @@ impl TileStore {
         if batch.is_empty() {
             return Ok(0);
         }
+        if let Some((absences, base)) = self.absences_of(layer) {
+            let recorded: Vec<crate::Absence> = batch
+                .iter()
+                .map(|(id, p)| crate::Absence {
+                    id: *id,
+                    fetched_ms: p.fetched_ms,
+                    expires_at: l
+                        .expiry
+                        .map(|e| std::time::UNIX_EPOCH + Duration::from_millis(p.fetched_ms) + e),
+                })
+                .collect();
+            absences
+                .record(base, &recorded)
+                .await
+                .map_err(StoreError::Ledger)?;
+            return Ok(recorded.len());
+        }
         let lock = self.zone_lock(&key);
         let _held = lock.lock().await;
         self.publish_delta(&l, &key, &batch).await
@@ -1228,9 +1380,8 @@ impl TileStore {
         .map_err(|e| StoreError::Corrupt(format!("archive writer: {e}")))??;
         self.record_writing(&key.0, key.1, &object).await?;
         upload(self.store.as_ref(), file.path(), &object).await?;
-        // Before the manifest names the archive: a published archive has its
-        // index, whoever reads it.
-        self.write_index(layer, file.path(), &object).await?;
+        // Before the manifest names the archive, for the ledger told of it.
+        let indexed = self.index_for_ledger(layer, file.path(), &object).await?;
 
         let gate = self.gate.lock().ok().and_then(|mut g| g.take());
         if let Some(gate) = gate {
@@ -1258,7 +1409,7 @@ impl TileStore {
             newest_fetch_ms,
         };
         let published = self
-            .publish(key, &prefix, |m| {
+            .publish(key, &prefix, indexed.as_ref(), false, |m| {
                 let mut next = m.clone();
                 next.archives.push(entry.clone());
                 Some(next)
@@ -1362,10 +1513,14 @@ impl TileStore {
 
     /// Derives the next manifest from the current one and publishes it,
     /// retrying on a lost race. `derive` returning `None` abandons.
+    /// `added`, the index of the archive the derivation brings in, if any,
+    /// and `uncovering` are for the ledger: see [`crate::Publication`].
     async fn publish<F>(
         &self,
         key: &ZoneKey,
         prefix: &str,
+        added: Option<&ArchiveIndex>,
+        uncovering: bool,
         derive: F,
     ) -> Result<Option<Manifest>, StoreError>
     where
@@ -1378,7 +1533,16 @@ impl TileStore {
             };
             next.generation = current.manifest.generation + 1;
             if manifest::replace(self.store.as_ref(), prefix, &current, &next).await? {
-                self.record_published(key, &next).await;
+                // What left the live list: merged, scrubbed, expired.
+                let replaced: Vec<String> = current
+                    .manifest
+                    .archives
+                    .iter()
+                    .filter(|a| !next.archives.iter().any(|n| n.key == a.key))
+                    .map(|a| a.key.clone())
+                    .collect();
+                self.record_published(key, &next, added, &replaced, uncovering)
+                    .await;
                 if let Some(announcer) = &self.announcer {
                     announcer.published(&key.0, key.1, next.generation).await;
                     metrics::counter!("tuile_tiles_announced_total", "layer" => key.0.clone())
@@ -1477,7 +1641,9 @@ impl TileStore {
         let m = manifest::read(self.store.as_ref(), &prefix).await?.manifest;
         let (mut removed, mut rewritten) = (0u64, 0usize);
 
-        for old in &m.archives {
+        for (at, old) in m.archives.iter().enumerate() {
+            // A tile taken out of it uncovers an older archive's copy.
+            let older = at > 0;
             // One archive on disk at a time.
             let dir = tempfile::tempdir()?;
             let local = dir.path().join("archive.pmtiles");
@@ -1503,7 +1669,7 @@ impl TileStore {
 
             // What is left, written as the archive it was: same epoch, same
             // fetch times — or nothing at all, if nothing is left.
-            let entry = if kept.is_empty() {
+            let written = if kept.is_empty() {
                 None
             } else {
                 let header = reader.get_header();
@@ -1543,20 +1709,27 @@ impl TileStore {
                 let object = archive_key(&prefix, &old.epoch, now);
                 self.record_writing(&l.name, zone, &object).await?;
                 upload(self.store.as_ref(), file.path(), &object).await?;
-                self.write_index(&l, file.path(), &object).await?;
-                Some(ArchiveRef {
-                    key: object,
-                    epoch: old.epoch.clone(),
-                    created: now_s,
-                    tiles: count,
-                    bytes,
-                    oldest_fetch_ms: old.oldest_fetch_ms,
-                    newest_fetch_ms: old.newest_fetch_ms,
-                })
+                let indexed = self.index_for_ledger(&l, file.path(), &object).await?;
+                Some((
+                    ArchiveRef {
+                        key: object,
+                        epoch: old.epoch.clone(),
+                        created: now_s,
+                        tiles: count,
+                        bytes,
+                        oldest_fetch_ms: old.oldest_fetch_ms,
+                        newest_fetch_ms: old.newest_fetch_ms,
+                    },
+                    indexed,
+                ))
+            };
+            let (entry, indexed) = match written {
+                Some((entry, indexed)) => (Some(entry), indexed),
+                None => (None, None),
             };
 
             let published = self
-                .publish(&key, &prefix, |m| {
+                .publish(&key, &prefix, indexed.as_ref(), older, |m| {
                     // The archive must still be there: otherwise a
                     // compaction merged it into another first.
                     let at = m.archives.iter().position(|a| a.key == old.key)?;
@@ -1579,9 +1752,8 @@ impl TileStore {
                 }
                 None => {
                     if let Some(entry) = entry {
-                        if self.delete_archive(&entry.key).await.is_ok() {
-                            self.record_deleted(&l.name, zone, &[entry.key]).await;
-                        }
+                        // Never published: an orphan if it stays.
+                        let _ = self.delete_archives(&l.name, zone, &[entry.key]).await;
                     }
                     return Ok(Scrub::Superseded);
                 }
@@ -1717,7 +1889,7 @@ impl TileStore {
             return Ok(());
         }
         let now_s = now_secs(now);
-        self.publish(&(layer.name.clone(), zone), &prefix, |m| {
+        self.publish(&(layer.name.clone(), zone), &prefix, None, false, |m| {
             let mut next = m.clone();
             let (gone, kept): (Vec<_>, Vec<_>) = m
                 .archives
@@ -1804,7 +1976,7 @@ impl TileStore {
         let object = archive_key(&prefix, &epoch, now);
         self.record_writing(&layer.name, zone, &object).await?;
         upload(self.store.as_ref(), file.path(), &object).await?;
-        self.write_index(layer, file.path(), &object).await?;
+        let indexed = self.index_for_ledger(layer, file.path(), &object).await?;
         // A merged archive's fetch times span its inputs'; unknown if any
         // input's are.
         let fetch_bounds: Option<Vec<(u64, u64)>> = run
@@ -1830,23 +2002,29 @@ impl TileStore {
         let now_s = now_secs(now);
 
         let published = self
-            .publish(&(layer.name.clone(), zone), &prefix, |m| {
-                // The run must still be there, whole, contiguous, in order;
-                // otherwise someone else compacted part of it first.
-                let first = m.archives.iter().position(|a| a.key == run_keys[0])?;
-                let here = m.archives.get(first..first + run_keys.len())?;
-                if here.iter().map(|a| &a.key).ne(run_keys.iter()) {
-                    return None;
-                }
-                let mut next = m.clone();
-                next.archives
-                    .splice(first..first + run_keys.len(), [entry.clone()]);
-                next.retired.extend(run_keys.iter().map(|k| Retired {
-                    key: k.clone(),
-                    retired: now_s,
-                }));
-                Some(next)
-            })
+            .publish(
+                &(layer.name.clone(), zone),
+                &prefix,
+                indexed.as_ref(),
+                false,
+                |m| {
+                    // The run must still be there, whole, contiguous, in order;
+                    // otherwise someone else compacted part of it first.
+                    let first = m.archives.iter().position(|a| a.key == run_keys[0])?;
+                    let here = m.archives.get(first..first + run_keys.len())?;
+                    if here.iter().map(|a| &a.key).ne(run_keys.iter()) {
+                        return None;
+                    }
+                    let mut next = m.clone();
+                    next.archives
+                        .splice(first..first + run_keys.len(), [entry.clone()]);
+                    next.retired.extend(run_keys.iter().map(|k| Retired {
+                        key: k.clone(),
+                        retired: now_s,
+                    }));
+                    Some(next)
+                },
+            )
             .await?;
 
         let key = (layer.name.clone(), zone);
@@ -1863,9 +2041,8 @@ impl TileStore {
                 })
             }
             None => {
-                if self.delete_archive(&object).await.is_ok() {
-                    self.record_deleted(&layer.name, zone, &[object]).await;
-                }
+                // Never published: an orphan if it stays.
+                let _ = self.delete_archives(&layer.name, zone, &[object]).await;
                 Ok(Compaction::Superseded)
             }
         }
@@ -1887,8 +2064,15 @@ impl TileStore {
                 .map(|r| r.key.clone())
                 .collect()
         };
+        // The ledger lets go of them first: refused, they stay retired, in
+        // the manifest, for the next upkeep.
+        let expired = if self.record_deleting(&layer.name, zone, &expired).await {
+            expired
+        } else {
+            Vec::new()
+        };
         if !expired.is_empty() {
-            self.publish(&(layer.name.clone(), zone), &prefix, |m| {
+            self.publish(&(layer.name.clone(), zone), &prefix, None, false, |m| {
                 let mut next = m.clone();
                 next.retired.retain(|r| !expired.contains(&r.key));
                 Some(next)
@@ -1922,24 +2106,11 @@ impl TileStore {
                 .duration_since(modified)
                 .map(|a| a >= self.cfg.orphan_grace)
                 .unwrap_or(false);
-            // An index whose archive no manifest names: its archive's upload
-            // failed after it, or its archive was deleted before it.
-            if let Some(archive) = index::archive_of_index(&k) {
-                if old && !known.contains(&archive) {
-                    index::delete(self.store.as_ref(), archive).await?;
-                    metrics::counter!("tuile_tiles_index_orphans_deleted_total", "layer" => layer.name.clone())
-                        .increment(1);
-                    removed += 1;
-                }
-                continue;
-            }
             if !k.ends_with(".pmtiles") || known.contains(&k.as_str()) {
                 continue;
             }
             if old {
-                self.delete_archive(&k).await?;
-                self.record_deleted(&layer.name, zone, &[k]).await;
-                removed += 1;
+                removed += self.delete_archives(&layer.name, zone, &[k]).await?;
             }
         }
         Ok(removed)
