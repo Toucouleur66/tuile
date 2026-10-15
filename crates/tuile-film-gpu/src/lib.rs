@@ -26,10 +26,18 @@
 //! horizon's colour to the zenith's in `present`.
 //!
 //! A frame may also carry a host's **overlays** ([`tuile_film::OverlayMesh`]):
-//! coloured triangles placed in the world. They are the one thing rastered
-//! besides visibility — after it, into a target of their own, against the
-//! depth the ground left — and `present` lays them over the picture once
-//! its tone is done. A frame without any costs nothing more than before.
+//! coloured triangles placed in the world, lit when they have normals. They
+//! are the one thing rastered besides visibility — after it, into a target
+//! of their own with a depth of their own, opaque ones first, each tested
+//! against the ground's depth, the overlays' or nothing as it asks — and
+//! `present` lays them over the picture once its tone is done. Those that
+//! cast are drawn into the sun's map with the ground; those that receive
+//! read it as the ground does. A frame without any costs nothing more than
+//! before.
+//!
+//! A stereo frame is drawn once an eye ([`Shot`]): the sun's map is fitted
+//! to the frame's own camera, so both eyes are shaded by the same map, and
+//! an overlay meant for one eye is left out of the other's picture.
 //!
 //! Binning is what makes this portable: WebGPU has no bindless textures, so
 //! the resolve cannot pick a tile's texture per pixel — but it can run once
@@ -43,7 +51,9 @@ mod frame;
 use std::collections::HashMap;
 
 use glam::{DVec3, Vec3};
-use tuile_film::{FrameCamera, Look, OverlayDepth, OverlayMesh, TileKey};
+use tuile_film::{
+    Eye, EyePair, FrameCamera, Look, OverlayBlend, OverlayDepth, OverlayMesh, TileKey,
+};
 use wgpu::util::DeviceExt;
 
 pub use frame::{shadow_reach, FrameUniform, SunView, TileFrame};
@@ -82,13 +92,29 @@ pub enum FilmGpuError {
     Overlay(&'static str),
 }
 
-/// `overlay.wgsl`'s vertex: where it is from the eye, and its colour.
+/// `overlay.wgsl`'s vertex: where it is from the eye, its colour, its
+/// normal (zero for none), and what its mesh asks for.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct OverlayVertex {
     position: [f32; 3],
     color: [f32; 4],
+    normal: [f32; 3],
+    flags: u32,
+    /// How far a caster's edges are pushed away from the sun in its map,
+    /// in metres: see `OverlayPipelines::cast_edges`.
+    sunk: f32,
 }
+
+/// The steepest slope to the sun a caster's edges are pushed back for, as
+/// a tangent: past it, a face all but edge-on to the sun is pushed back no
+/// further.
+const EDGE_SLOPE_MAX: f32 = 8.0;
+
+/// `OverlayVertex::flags`, as `overlay.wgsl` reads them.
+const OVERLAY_LIT: u32 = 1;
+const OVERLAY_RECEIVES: u32 = 2;
+const OVERLAY_BEHIND_GROUND: u32 = 4;
 
 /// A buffer that is only ever made larger: overlays change every frame,
 /// and their size hardly does.
@@ -127,6 +153,41 @@ pub struct Settings {
     /// Samples per pixel along each axis: 2 renders 4 samples per pixel.
     pub supersample: u32,
     pub look: Look,
+}
+
+/// One picture of a frame: the camera it is drawn through, the frame's own
+/// camera, and which eye it is, for a stereo film.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Shot {
+    /// What the picture is drawn through: the frame's camera, or an eye's.
+    pub camera: FrameCamera,
+    /// The frame's own camera, between the eyes: what the sun's map is
+    /// fitted to, so that both eyes are shaded by the same map.
+    pub frame: FrameCamera,
+    /// The eye drawn, for a stereo film; `None` for a film of one eye. An
+    /// overlay meant for one eye only ([`tuile_film::OverlayEyes`]) is left
+    /// out of the other's picture.
+    pub eye: Option<Eye>,
+}
+
+impl Shot {
+    /// The one picture of a film of one eye.
+    pub fn mono(camera: FrameCamera) -> Self {
+        Self {
+            camera,
+            frame: camera,
+            eye: None,
+        }
+    }
+
+    /// `eye`'s picture of the frame whose camera is `frame`.
+    pub fn eye(frame: FrameCamera, pair: &EyePair, eye: Eye) -> Self {
+        Self {
+            camera: frame.eye(pair, eye),
+            frame,
+            eye: Some(eye),
+        }
+    }
 }
 
 /// One tile's mesh, as the pack stores it: little-endian bytes, uploaded
@@ -172,7 +233,7 @@ struct Targets {
     hdr: wgpu::TextureView,
     /// Made when a frame first carries an overlay: a film that never does
     /// never pays for it.
-    overlay: Option<wgpu::TextureView>,
+    overlay: Option<OverlayTargets>,
     out: wgpu::Texture,
     out_view: wgpu::TextureView,
     list: wgpu::Buffer,
@@ -186,15 +247,53 @@ struct Targets {
     uv_bg: wgpu::BindGroup,
 }
 
+/// What overlays are drawn into: their colour, their own depth — what
+/// opaque overlays wrote, and nothing of the ground — and what they read.
+struct OverlayTargets {
+    color: wgpu::TextureView,
+    depth: wgpu::TextureView,
+    bind: wgpu::BindGroup,
+}
+
+/// An overlay pipeline for each way a mesh may be tested and blended.
+struct OverlayPipelines {
+    /// Tested against nearer overlays — and, in the shader, the ground —
+    /// opaque, then translucent.
+    tested: wgpu::RenderPipeline,
+    tested_translucent: wgpu::RenderPipeline,
+    /// Tested against nothing.
+    always: wgpu::RenderPipeline,
+    always_translucent: wgpu::RenderPipeline,
+    /// Into the sun's map: a caster's triangles, and its edges, so that a
+    /// caster thinner than a texel still leaves a line of shadow.
+    ///
+    /// No depth bias can be asked of lines, and an edge lies on its own
+    /// faces: drawn as it is, it would shade them, a band along each of
+    /// their diagonals. Each edge is therefore pushed away from the sun by
+    /// what its faces' slope to the sun asks for — the bias the faces get
+    /// from the raster, worked out by hand.
+    cast: wgpu::RenderPipeline,
+    cast_edges: wgpu::RenderPipeline,
+}
+
+impl OverlayPipelines {
+    fn of(&self, depth: OverlayDepth, blend: OverlayBlend) -> &wgpu::RenderPipeline {
+        match (depth, blend) {
+            (OverlayDepth::Always, OverlayBlend::Opaque) => &self.always,
+            (OverlayDepth::Always, OverlayBlend::Translucent) => &self.always_translucent,
+            (_, OverlayBlend::Opaque) => &self.tested,
+            (_, OverlayBlend::Translucent) => &self.tested_translucent,
+        }
+    }
+}
+
 struct Pipelines {
     raster: wgpu::RenderPipeline,
     /// The same tiles, depth alone, as the sun sees them.
     shadow: wgpu::RenderPipeline,
     /// A tile's vertices, moved by its strips: see `stitch.wgsl`.
     displace: wgpu::ComputePipeline,
-    /// Overlays hidden by nearer ground, and overlays never hidden.
-    overlay_terrain: wgpu::RenderPipeline,
-    overlay_always: wgpu::RenderPipeline,
+    overlay: OverlayPipelines,
     count: wgpu::ComputePipeline,
     scan: wgpu::ComputePipeline,
     scatter: wgpu::ComputePipeline,
@@ -214,11 +313,18 @@ pub struct FilmGpu {
     pipelines: Pipelines,
     tile_bgl: wgpu::BindGroupLayout,
     raster_bg: wgpu::BindGroup,
-    overlay_bg: wgpu::BindGroup,
+    overlay_bgl: wgpu::BindGroupLayout,
+    /// The frame alone, for overlays drawn into the sun's map.
+    overlay_cast_bg: wgpu::BindGroup,
     overlay_vertices: Growing,
     overlay_indices: Growing,
+    overlay_edges: Growing,
     /// The sun's map and its side, for a look that has shadows.
     shadow_map: Option<(wgpu::TextureView, u32)>,
+    /// The map — a texel that shades nothing without shadows — and how it
+    /// is read, for overlays that receive.
+    shadow_view: wgpu::TextureView,
+    shadow_sampler: wgpu::Sampler,
     /// A texel of that map on the ground, in the frame last recorded.
     shadow_texel: Option<f32>,
     slot_bg: wgpu::BindGroup,
@@ -642,21 +748,57 @@ impl FilmGpu {
             cache: None,
         });
 
+        let fragment_only = wgpu::ShaderStages::FRAGMENT;
         let overlay_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("film overlay"),
+            entries: &[
+                uniform(0, wgpu::ShaderStages::VERTEX_FRAGMENT, false),
+                wgpu::BindGroupLayoutEntry {
+                    visibility: fragment_only,
+                    ..texture(1, wgpu::TextureSampleType::Depth)
+                },
+                wgpu::BindGroupLayoutEntry {
+                    visibility: fragment_only,
+                    ..texture(2, wgpu::TextureSampleType::Depth)
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: fragment_only,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
+            ],
+        });
+        let overlay_cast_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("film overlay cast"),
             entries: &[uniform(0, wgpu::ShaderStages::VERTEX, false)],
         });
         let overlay_module = shader(
             &device,
             "film overlay",
-            include_str!("shaders/overlay.wgsl"),
+            concat!(
+                include_str!("shaders/sunlit.wgsl"),
+                include_str!("shaders/overlay.wgsl")
+            ),
         );
         let overlay_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("film overlay"),
             bind_group_layouts: &[Some(&overlay_bgl)],
             immediate_size: 0,
         });
-        let overlay = |label, depth_compare| {
+        let overlay_cast_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("film overlay cast"),
+            bind_group_layouts: &[Some(&overlay_cast_bgl)],
+            immediate_size: 0,
+        });
+        let overlay_attributes =
+            wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32x3, 3 => Uint32];
+        let overlay_buffers = [wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<OverlayVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &overlay_attributes,
+        }];
+        let overlay = |label, depth_compare, write: bool| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&overlay_layout),
@@ -664,22 +806,19 @@ impl FilmGpu {
                     module: &overlay_module,
                     entry_point: Some("vs"),
                     compilation_options: Default::default(),
-                    buffers: &[wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<OverlayVertex>() as u64,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4],
-                    }],
+                    buffers: &overlay_buffers,
                 },
                 primitive: wgpu::PrimitiveState {
                     // A ribbon is seen from both sides.
                     cull_mode: None,
                     ..Default::default()
                 },
-                // The ground's depth is read and never written: an overlay
-                // is tested against the ground, not against another.
+                // The overlays' own depth: written by opaque meshes, read by
+                // every mesh tested against overlays. The ground's is read
+                // in the shader, by a mesh tested against it.
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(false),
+                    depth_write_enabled: Some(write),
                     depth_compare: Some(depth_compare),
                     stencil: Default::default(),
                     bias: Default::default(),
@@ -699,10 +838,84 @@ impl FilmGpu {
                 cache: None,
             })
         };
-        // Reverse-Z: an overlay shows where it is nearer than the ground,
-        // and nearer is greater.
-        let overlay_terrain = overlay("film overlay", wgpu::CompareFunction::Greater);
-        let overlay_always = overlay("film overlay, never hidden", wgpu::CompareFunction::Always);
+        let cast_attributes = wgpu::vertex_attr_array![0 => Float32x3];
+        let cast_buffers = [wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<OverlayVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &cast_attributes,
+        }];
+        let edge_attributes = [
+            cast_attributes[0],
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32,
+                offset: std::mem::offset_of!(OverlayVertex, sunk) as u64,
+                shader_location: 4,
+            },
+        ];
+        let edge_buffers = [wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<OverlayVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &edge_attributes,
+        }];
+        let cast = |label, topology, entry_point, buffers: &[wgpu::VertexBufferLayout], bias| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&overlay_cast_layout),
+                vertex: wgpu::VertexState {
+                    module: &overlay_module,
+                    entry_point: Some(entry_point),
+                    compilation_options: Default::default(),
+                    buffers,
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                // As the ground is drawn into the map.
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: Default::default(),
+                    bias,
+                }),
+                multisample: Default::default(),
+                fragment: None,
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        // Reverse-Z: an overlay shows where it is nearer than the overlays
+        // before it, and nearer is greater.
+        let tested = wgpu::CompareFunction::Greater;
+        let never = wgpu::CompareFunction::Always;
+        let overlay = OverlayPipelines {
+            tested: overlay("film overlay", tested, true),
+            tested_translucent: overlay("film overlay, translucent", tested, false),
+            always: overlay("film overlay, never hidden", never, true),
+            always_translucent: overlay("film overlay, never hidden, translucent", never, false),
+            // The ground's own bias for a caster's faces; its edges are
+            // pushed back in the shader.
+            cast: cast(
+                "film overlay cast",
+                wgpu::PrimitiveTopology::TriangleList,
+                "into_sun_map",
+                &cast_buffers,
+                wgpu::DepthBiasState {
+                    constant: 2,
+                    slope_scale: 2.0,
+                    clamp: 0.0,
+                },
+            ),
+            cast_edges: cast(
+                "film overlay cast edges",
+                wgpu::PrimitiveTopology::LineList,
+                "edge_into_sun_map",
+                &edge_buffers,
+                Default::default(),
+            ),
+        };
 
         let displace = compute(
             &device,
@@ -719,6 +932,7 @@ impl FilmGpu {
             "film resolve",
             concat!(
                 include_str!("shaders/air.wgsl"),
+                include_str!("shaders/sunlit.wgsl"),
                 include_str!("shaders/resolve.wgsl")
             ),
         );
@@ -746,8 +960,7 @@ impl FilmGpu {
             raster,
             shadow,
             displace,
-            overlay_terrain,
-            overlay_always,
+            overlay,
             count: compute(&device, &bin, "count", None),
             scan: compute(&device, &bin, "scan", None),
             scatter: compute(&device, &bin, "scatter", None),
@@ -817,9 +1030,9 @@ impl FilmGpu {
             ],
         });
 
-        let overlay_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("film overlay"),
-            layout: &overlay_bgl,
+        let overlay_cast_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("film overlay cast"),
+            layout: &overlay_cast_bgl,
             entries: &[entry(0, frame_buf.as_entire_binding())],
         });
         // What `present` is bound in an overlay's place until there is one.
@@ -937,10 +1150,14 @@ impl FilmGpu {
             pipelines,
             tile_bgl,
             raster_bg,
-            overlay_bg,
+            overlay_bgl,
+            overlay_cast_bg,
             overlay_vertices: Growing::default(),
             overlay_indices: Growing::default(),
-            shadow_map: (settings.look.shadow > 0.0).then_some((shadow_view, shadow_side)),
+            overlay_edges: Growing::default(),
+            shadow_map: (settings.look.shadow > 0.0).then(|| (shadow_view.clone(), shadow_side)),
+            shadow_view,
+            shadow_sampler,
             shadow_texel: None,
             slot_bg,
             frame_buf,
@@ -1008,8 +1225,15 @@ impl FilmGpu {
             h,
         )
         .create_view(&Default::default());
-        let depth = make("film depth", DEPTH_FORMAT, U::RENDER_ATTACHMENT, w, h)
-            .create_view(&Default::default());
+        // Read by overlays tested against the ground.
+        let depth = make(
+            "film depth",
+            DEPTH_FORMAT,
+            U::RENDER_ATTACHMENT | U::TEXTURE_BINDING,
+            w,
+            h,
+        )
+        .create_view(&Default::default());
         let hdr = make(
             "film hdr",
             HDR_FORMAT,
@@ -1140,31 +1364,44 @@ impl FilmGpu {
         })
     }
 
-    /// The target overlays are drawn into, at the supersampled size, made
-    /// the first time a frame carries one and bound to `present` from then.
-    fn overlay_target(&mut self) -> wgpu::TextureView {
-        if let Some(view) = &self.targets.overlay {
-            return view.clone();
+    /// What overlays are drawn into, at the supersampled size, made the
+    /// first time a frame carries one and bound to `present` from then.
+    fn overlay_targets(&mut self) -> (wgpu::TextureView, wgpu::TextureView, wgpu::BindGroup) {
+        if let Some(t) = &self.targets.overlay {
+            return (t.color.clone(), t.depth.clone(), t.bind.clone());
         }
         let k = self.settings.supersample.max(1);
-        let view = self
-            .device
-            .create_texture(&wgpu::TextureDescriptor {
-                label: Some("film overlay"),
-                size: wgpu::Extent3d {
-                    width: self.settings.width * k,
-                    height: self.settings.height * k,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: OVERLAY_FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            })
-            .create_view(&Default::default());
+        let make = |label, format| {
+            self.device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width: self.settings.width * k,
+                        height: self.settings.height * k,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default())
+        };
+        let color = make("film overlay", OVERLAY_FORMAT);
+        let depth = make("film overlay depth", DEPTH_FORMAT);
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("film overlay"),
+            layout: &self.overlay_bgl,
+            entries: &[
+                entry(0, self.frame_buf.as_entire_binding()),
+                entry(1, wgpu::BindingResource::TextureView(&self.targets.depth)),
+                entry(2, wgpu::BindingResource::TextureView(&self.shadow_view)),
+                entry(3, wgpu::BindingResource::Sampler(&self.shadow_sampler)),
+            ],
+        });
         self.targets.present_bg = Self::present_bg(
             &self.device,
             &self.pipelines,
@@ -1172,10 +1409,14 @@ impl FilmGpu {
             &self.targets.hdr,
             &self.targets.vis,
             &self.targets.out_view,
-            &view,
+            &color,
         );
-        self.targets.overlay = Some(view.clone());
-        view
+        self.targets.overlay = Some(OverlayTargets {
+            color: color.clone(),
+            depth: depth.clone(),
+            bind: bind.clone(),
+        });
+        (color, depth, bind)
     }
 
     pub fn device(&self) -> &wgpu::Device {
@@ -1713,49 +1954,194 @@ impl FilmGpu {
     }
 
     /// [`Self::render`], with a host's overlays drawn in the same scene:
-    /// through the same camera, each mesh tested against the ground as its
-    /// [`OverlayDepth`] says, in the order given. They are laid over the
-    /// picture once its tone is done and before its output curve, through
-    /// the supersampling filter — so their edges are smoothed as the
-    /// ground's are, and their colours are the ones given whatever the
-    /// look.
+    /// through the same camera, each mesh tested and blended as it says, in
+    /// the order given. They are laid over the picture once its tone is
+    /// done and before its output curve, through the supersampling filter —
+    /// so their edges are smoothed as the ground's are, and their colours
+    /// are the ones given whatever the look.
     pub fn render_with(
         &mut self,
         camera: &FrameCamera,
         selection: &[TileKey],
         overlays: &[OverlayMesh],
     ) -> Result<wgpu::CommandEncoder, FilmGpuError> {
+        self.render_shot(&Shot::mono(*camera), selection, overlays)
+    }
+
+    /// The sun's view of what `camera` would draw of `selection`, fitted as
+    /// a frame fits it, eye-relative to `camera`: `None` without shadows or
+    /// with nothing to cast one.
+    fn sun_of(
+        &self,
+        camera: &FrameCamera,
+        selection: &[TileKey],
+    ) -> Result<Option<(SunView, u32)>, FilmGpuError> {
+        let Some((_, side)) = &self.shadow_map else {
+            return Ok(None);
+        };
+        let mut spheres = Vec::with_capacity(selection.len());
+        for key in selection {
+            let r = self
+                .resident
+                .get(key)
+                .ok_or(FilmGpuError::NotResident(*key))?;
+            if r.index_count > 0 {
+                let centre = DVec3::from_array(r.origin_ecef) - camera.eye + r.centre.as_dvec3();
+                // Stitching moves a vertex by no more than twice its reach.
+                spheres.push((centre, f64::from(r.radius + 2.0 * r.reach)));
+            }
+        }
+        let k = self.settings.supersample.max(1);
+        let size = [self.settings.width * k, self.settings.height * k, k, 0];
+        let rays = FrameUniform::new(camera, &self.settings.look, size).bounding_rays();
+        Ok(SunView::fitted(
+            self.settings.look.to_sun,
+            camera.eye,
+            spheres.into_iter(),
+            &rays,
+            shadow_reach(camera.height()),
+            *side,
+        )
+        .map(|view| (view, *side)))
+    }
+
+    /// How wide a texel of the sun's map will be, in metres, for a frame
+    /// drawn through `camera` — the frame's own, between the eyes of a
+    /// stereo film — out of `selection`, all of it resident: what a host
+    /// widens a thin caster by ([`tuile_film::OverlayShadow`]). `None`
+    /// without shadows.
+    pub fn shadow_texel_for(
+        &self,
+        camera: &FrameCamera,
+        selection: &[TileKey],
+    ) -> Result<Option<f32>, FilmGpuError> {
+        Ok(self.sun_of(camera, selection)?.map(|(view, _)| view.texel))
+    }
+
+    /// [`Self::render_with`] for one picture of a frame: through
+    /// `shot.camera`, the sun's map fitted to `shot.frame` — so that both
+    /// eyes of a stereo frame are shaded by one map — and only the overlays
+    /// `shot.eye` shows.
+    pub fn render_shot(
+        &mut self,
+        shot: &Shot,
+        selection: &[TileKey],
+        overlays: &[OverlayMesh],
+    ) -> Result<wgpu::CommandEncoder, FilmGpuError> {
+        let camera = &shot.camera;
+        // The sun's view, fitted to the frame's own camera and placed for
+        // this one: the same map, ground for ground, in either eye.
+        let sun = self
+            .sun_of(&shot.frame, selection)?
+            .map(|(mut view, side)| {
+                let apart = (camera.eye - shot.frame.eye).as_vec3();
+                view.view_proj *= glam::Mat4::from_translation(apart);
+                (view, side)
+            });
+        let to_sun = self.settings.look.to_sun.normalize_or_zero();
         // Everything of the overlays that can fail does before anything is
         // recorded: one vertex buffer for the frame, eye-relative — each
         // origin meets the eye in f64, and only the difference is narrowed.
         let mut vertices: Vec<OverlayVertex> = Vec::new();
         let mut indices: Vec<u32> = Vec::new();
-        // Of each mesh: its indices, its first vertex, how it is tested.
+        // The edges of the meshes that cast, two indices each.
+        let mut edges: Vec<u32> = Vec::new();
+        // Of each mesh drawn: its indices, its first vertex, how it is drawn.
         let mut drawn_over = Vec::new();
+        // Of each mesh that casts: its triangles, its edges, its first
+        // vertex.
+        let mut cast_triangles = Vec::new();
+        let mut cast_edges = Vec::new();
         for mesh in overlays {
             if let Some(fault) = mesh.fault() {
                 return Err(FilmGpuError::Overlay(fault));
             }
-            if mesh.indices.is_empty() {
+            if mesh.indices.is_empty() || !mesh.eyes.shows(shot.eye) {
                 continue;
             }
             let from_eye = DVec3::from_array(mesh.origin_ecef) - camera.eye;
             let base = i32::try_from(vertices.len())
                 .map_err(|_| FilmGpuError::Overlay("a frame's overlays have too many vertices"))?;
-            vertices.extend(mesh.positions.iter().zip(&mesh.colors).map(|(p, c)| {
-                OverlayVertex {
-                    position: (from_eye + DVec3::new(p[0].into(), p[1].into(), p[2].into()))
-                        .as_vec3()
-                        .to_array(),
-                    color: *c,
+            let lit = !mesh.normals.is_empty();
+            // How far each vertex's edges are pushed back from the sun: two
+            // texels, and three more for each unit of the steepest slope
+            // to the sun of the faces it is on — as far, across the 3×3
+            // texels a receiver reads, as the face falls away.
+            let mut sunk = vec![0.0f32; mesh.positions.len()];
+            if let (true, Some((view, _))) = (mesh.shadow.casts(), &sun) {
+                let at = |i: u32| Vec3::from_array(mesh.positions[i as usize]);
+                for [a, b, c] in mesh.indices.as_chunks::<3>().0 {
+                    let n = (at(*b) - at(*a)).cross(at(*c) - at(*a)).normalize_or_zero();
+                    let cos = n.dot(to_sun).abs();
+                    let slope = if cos * EDGE_SLOPE_MAX > (1.0 - cos * cos).max(0.0).sqrt() {
+                        (1.0 - cos * cos).max(0.0).sqrt() / cos
+                    } else {
+                        EDGE_SLOPE_MAX
+                    };
+                    let push = view.texel * (2.0 + 3.0 * slope);
+                    for i in [a, b, c] {
+                        sunk[*i as usize] = sunk[*i as usize].max(push);
+                    }
                 }
-            }));
+            }
+            let flags = u32::from(lit) * OVERLAY_LIT
+                + u32::from(mesh.shadow.receives()) * OVERLAY_RECEIVES
+                + u32::from(mesh.depth == OverlayDepth::Terrain) * OVERLAY_BEHIND_GROUND;
+            vertices.extend(mesh.positions.iter().zip(&mesh.colors).enumerate().map(
+                |(i, (p, c))| {
+                    OverlayVertex {
+                        position: (from_eye + DVec3::new(p[0].into(), p[1].into(), p[2].into()))
+                            .as_vec3()
+                            .to_array(),
+                        color: *c,
+                        normal: if lit { mesh.normals[i] } else { [0.0; 3] },
+                        flags,
+                        sunk: sunk[i],
+                    }
+                },
+            ));
             let first = indices.len() as u32;
             indices.extend_from_slice(&mesh.indices);
-            drawn_over.push((first..indices.len() as u32, base, mesh.depth));
+            let triangles = first..indices.len() as u32;
+            drawn_over.push((triangles.clone(), base, mesh.depth, mesh.blend));
+            if mesh.shadow.casts() {
+                let first = edges.len() as u32;
+                for [a, b, c] in mesh.indices.as_chunks::<3>().0 {
+                    edges.extend_from_slice(&[*a, *b, *b, *c, *c, *a]);
+                }
+                cast_triangles.push((triangles, base));
+                cast_edges.push((first..edges.len() as u32, base));
+            }
         }
+        // Opaque meshes first, each kind in the order given.
+        drawn_over.sort_by_key(|(_, _, _, blend)| *blend == OverlayBlend::Translucent);
         let overlaid = !drawn_over.is_empty();
-        let overlay_target = overlaid.then(|| self.overlay_target());
+        let overlay_targets = overlaid.then(|| self.overlay_targets());
+        if overlaid {
+            self.overlay_vertices.holding(
+                &self.device,
+                &self.queue,
+                "film overlay vertices",
+                wgpu::BufferUsages::VERTEX,
+                bytemuck::cast_slice(&vertices),
+            );
+            self.overlay_indices.holding(
+                &self.device,
+                &self.queue,
+                "film overlay indices",
+                wgpu::BufferUsages::INDEX,
+                bytemuck::cast_slice(&indices),
+            );
+            if !edges.is_empty() {
+                self.overlay_edges.holding(
+                    &self.device,
+                    &self.queue,
+                    "film overlay edges",
+                    wgpu::BufferUsages::INDEX,
+                    bytemuck::cast_slice(&edges),
+                );
+            }
+        }
 
         // What was queued since the last frame comes first: the drapes, then
         // the mips made from them, before anything samples either.
@@ -1785,25 +2171,7 @@ impl FilmGpu {
         let (w, h) = (self.settings.width * k, self.settings.height * k);
         let mut uniform =
             FrameUniform::new(camera, &self.settings.look, [w, h, k, u32::from(overlaid)]);
-        // The sun's view of what this frame draws, when the look has
-        // shadows and there is anything to cast one.
-        let sun = self.shadow_map.as_ref().and_then(|(map, side)| {
-            let spheres = drawn.iter().filter(|r| r.index_count > 0).map(|r| {
-                let centre = DVec3::from_array(r.origin_ecef) - camera.eye + r.centre.as_dvec3();
-                // Stitching moves a vertex by no more than twice its reach.
-                (centre, f64::from(r.radius + 2.0 * r.reach))
-            });
-            SunView::fitted(
-                self.settings.look.to_sun,
-                camera.eye,
-                spheres,
-                &uniform.bounding_rays(),
-                shadow_reach(camera.height()),
-                *side,
-            )
-            .map(|view| (view, map, *side))
-        });
-        if let Some((view, _, side)) = &sun {
+        if let Some((view, side)) = &sun {
             uniform = uniform.shadowed(view, self.settings.look.shadow, *side);
         }
         uniform.zenith[3] = self.normal_strength;
@@ -1818,7 +2186,7 @@ impl FilmGpu {
                 uniform.haze[2] = (0.5 / camera.eye.length()) as f32;
             }
         }
-        self.shadow_texel = sun.as_ref().map(|(view, _, _)| view.texel);
+        self.shadow_texel = sun.as_ref().map(|(view, _)| view.texel);
         self.queue
             .write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&uniform));
         if top > 0 {
@@ -1828,7 +2196,7 @@ impl FilmGpu {
 
         encoder.clear_buffer(&self.counts, 0, None);
 
-        if let Some((_, map, _)) = &sun {
+        if let (Some(_), Some((map, _))) = (&sun, &self.shadow_map) {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("film shadow"),
                 color_attachments: &[],
@@ -1849,6 +2217,28 @@ impl FilmGpu {
             for r in &drawn {
                 pass.set_bind_group(1, &r.bind, &[]);
                 pass.draw(0..r.index_count, r.slot..r.slot + 1);
+            }
+            // Overlays that cast, into the same map: the ground under them
+            // reads it as it reads the ground's own.
+            if let (false, Some(vertices), Some(indices)) = (
+                cast_triangles.is_empty(),
+                &self.overlay_vertices.0,
+                &self.overlay_indices.0,
+            ) {
+                pass.set_bind_group(0, &self.overlay_cast_bg, &[]);
+                pass.set_vertex_buffer(0, vertices.slice(..));
+                pass.set_pipeline(&self.pipelines.overlay.cast);
+                pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                for (range, base) in &cast_triangles {
+                    pass.draw_indexed(range.clone(), *base, 0..1);
+                }
+                if let Some(edges) = &self.overlay_edges.0 {
+                    pass.set_pipeline(&self.pipelines.overlay.cast_edges);
+                    pass.set_index_buffer(edges.slice(..), wgpu::IndexFormat::Uint32);
+                    for (range, base) in &cast_edges {
+                        pass.draw_indexed(range.clone(), *base, 0..1);
+                    }
+                }
             }
         }
 
@@ -1889,21 +2279,11 @@ impl FilmGpu {
             }
         }
 
-        if let Some(target) = &overlay_target {
-            let vertices = self.overlay_vertices.holding(
-                &self.device,
-                &self.queue,
-                "film overlay vertices",
-                wgpu::BufferUsages::VERTEX,
-                bytemuck::cast_slice(&vertices),
-            );
-            let indices = self.overlay_indices.holding(
-                &self.device,
-                &self.queue,
-                "film overlay indices",
-                wgpu::BufferUsages::INDEX,
-                bytemuck::cast_slice(&indices),
-            );
+        if let (Some((target, depth, bind)), Some(vertices), Some(indices)) = (
+            &overlay_targets,
+            &self.overlay_vertices.0,
+            &self.overlay_indices.0,
+        ) {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("film overlay"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1915,24 +2295,25 @@ impl FilmGpu {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                // No operations: the ground's depth is read, never written.
+                // The overlays' own depth, from nothing: the ground's is
+                // read in the shader.
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.targets.depth,
-                    depth_ops: None,
+                    view: depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
                     stencil_ops: None,
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_bind_group(0, &self.overlay_bg, &[]);
+            pass.set_bind_group(0, bind, &[]);
             pass.set_vertex_buffer(0, vertices.slice(..));
             pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-            for (range, base, depth) in drawn_over {
-                pass.set_pipeline(match depth {
-                    OverlayDepth::Terrain => &self.pipelines.overlay_terrain,
-                    OverlayDepth::Always => &self.pipelines.overlay_always,
-                });
+            for (range, base, depth, blend) in drawn_over {
+                pass.set_pipeline(self.pipelines.overlay.of(depth, blend));
                 pass.draw_indexed(range, base, 0..1);
             }
         }

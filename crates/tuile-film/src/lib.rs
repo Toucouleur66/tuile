@@ -30,7 +30,10 @@ pub use cursor::{
 };
 pub use look::{Haze, HazeAt, Imagery, Look};
 pub use mesh::{texture, texture_of_span, Mesh};
-pub use overlay::{OverlayDepth, OverlayMesh, Overlays};
+pub use overlay::{
+    OverlayBlend, OverlayCamera, OverlayDepth, OverlayEyes, OverlayMesh, OverlayShadow, Overlays,
+    MIN_SHADOW_TEXELS,
+};
 pub use ranges::{block_plan, coalesce, file_reads, Fetch};
 pub use slice::slice;
 pub use stereo::{

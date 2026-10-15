@@ -17,12 +17,21 @@
 //! directory is past its budget, or the generation past its age, the next
 //! segment opens a new one, and the old goes with the last segment that
 //! reads it.
+//!
+//! A host draws its own overlays on the service's films by giving it an
+//! [`OverlayFactory`]: the factory's typed order travels in the segment's
+//! order ([`SegmentOrder::overlay`]), read straight from the request into
+//! the host's own type — fields it does not know refused — and the factory
+//! turns it into the segment's [`Overlays`]. The stock service has
+//! [`NoOverlays`], whose order says nothing.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use serde::de::DeserializeOwned;
 use tuile_farm::{ObjectRunStore, RunStore};
+use tuile_film::Overlays;
 
 use crate::engine::RenderSpec;
 use crate::extract::{local_key, ExtractRef, Fetched};
@@ -32,10 +41,11 @@ use crate::setup::{film_sink, sun_at};
 use crate::source::{Film, Sources};
 use crate::Error;
 
-/// A segment to render.
+/// A segment to render, and `O`, what the host's overlays are to be made
+/// of ([`OverlayFactory::Order`]).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SegmentOrder {
+#[serde(deny_unknown_fields, bound(deserialize = "O: DeserializeOwned"))]
+pub struct SegmentOrder<O = NoOrder> {
     /// The pack's key in the run store; it may not be there yet.
     pub pack: String,
     /// First and last frame.
@@ -60,13 +70,73 @@ pub struct SegmentOrder {
     /// in the background ([`Notify`]): which film, which chunk.
     #[serde(default)]
     pub context: serde_json::Value,
+    /// The host's overlays for the segment, in the host's own type: handed
+    /// to its [`OverlayFactory`]. None: the segment has none.
+    #[serde(default = "none", skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<O>,
+}
+
+fn none<O>() -> Option<O> {
+    None
+}
+
+/// What a segment's overlays are made for: the segment as its order says.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SegmentContext<'a> {
+    pub pack: &'a str,
+    pub frames: (u32, u32),
+    pub out: &'a str,
+    pub rendering: &'a RenderSpec,
+    pub to_sun: Option<[f32; 3]>,
+}
+
+/// What makes a segment's overlays, from the host's order for them.
+///
+/// Called once a segment, before its pack is waited for: an order the host
+/// cannot make overlays of fails the segment before anything is rendered.
+/// The overlays it makes are then asked for frame by frame on the render's
+/// own thread.
+#[async_trait::async_trait]
+pub trait OverlayFactory: Send + Sync + 'static {
+    /// The host's order, read from the request as it stands — a field the
+    /// type does not know is refused, as it is in the rest of the order.
+    type Order: DeserializeOwned + serde::Serialize + std::fmt::Debug + Clone + Send + Sync;
+
+    async fn overlays(
+        &self,
+        order: &Self::Order,
+        segment: &SegmentContext<'_>,
+    ) -> Result<Box<dyn Overlays + Send>, Error>;
+}
+
+/// The order of a service that draws no overlays: it says nothing, and
+/// anything said in it is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NoOrder {}
+
+/// A service that draws no overlays: what `tuile-film-serve` is.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoOverlays;
+
+#[async_trait::async_trait]
+impl OverlayFactory for NoOverlays {
+    type Order = NoOrder;
+
+    async fn overlays(
+        &self,
+        _: &NoOrder,
+        _: &SegmentContext<'_>,
+    ) -> Result<Box<dyn Overlays + Send>, Error> {
+        Ok(Box::new(()))
+    }
 }
 
 /// Told how a segment accepted in the background ended: the host's way of
 /// hearing of it — a message to whoever waits for the segment.
 #[async_trait::async_trait]
-pub trait Notify: Send + Sync {
-    async fn segment_done(&self, order: &SegmentOrder, outcome: Result<&SegmentDone, String>);
+pub trait Notify<O = NoOrder>: Send + Sync {
+    async fn segment_done(&self, order: &SegmentOrder<O>, outcome: Result<&SegmentDone, String>);
 }
 
 /// Where a render's time went, as it measured it.
@@ -126,8 +196,9 @@ fn phases(t: &Timings) -> String {
         .join(", ")
 }
 
-/// What a render service holds for as long as it lives.
-pub struct Service {
+/// What a render service holds for as long as it lives, and `F`, what
+/// makes the host's overlays.
+pub struct Service<F: OverlayFactory = NoOverlays> {
     pub runs: Arc<ObjectRunStore>,
     /// The tile store's server, when it is one: zones are fetched from it
     /// as extracts before a render.
@@ -140,6 +211,7 @@ pub struct Service {
     kept: tokio::sync::Mutex<Option<Arc<Generation>>>,
     /// Renders at once on this instance.
     renders: tokio::sync::Semaphore,
+    overlays: F,
 }
 
 /// When a generation of caches is let go, and how many renders share the
@@ -202,11 +274,25 @@ fn held(file: &std::fs::Metadata) -> u64 {
 }
 
 impl Service {
+    /// A service that draws no overlays.
     pub fn new(
         runs: Arc<ObjectRunStore>,
         tiles: Arc<dyn tuile_repository::Objects>,
         cache: PathBuf,
         limits: Limits,
+    ) -> Self {
+        Self::with_overlays(runs, tiles, cache, limits, NoOverlays)
+    }
+}
+
+impl<F: OverlayFactory> Service<F> {
+    /// A service whose segments' overlays `overlays` makes.
+    pub fn with_overlays(
+        runs: Arc<ObjectRunStore>,
+        tiles: Arc<dyn tuile_repository::Objects>,
+        cache: PathBuf,
+        limits: Limits,
+        overlays: F,
     ) -> Self {
         Self {
             runs,
@@ -216,6 +302,7 @@ impl Service {
             limits,
             kept: tokio::sync::Mutex::new(None),
             renders: tokio::sync::Semaphore::new(limits.renders_at_once.max(1)),
+            overlays,
         }
     }
 
@@ -239,7 +326,7 @@ impl Service {
     }
 }
 
-impl Service {
+impl<F: OverlayFactory> Service<F> {
     /// The extracts `order` names, fetched under `dir`, and every zone the
     /// frames of `film` read pointed at its layer's; `None` when it names
     /// none.
@@ -247,7 +334,7 @@ impl Service {
         &self,
         sources: &Sources,
         film: &Film,
-        order: &SegmentOrder,
+        order: &SegmentOrder<F::Order>,
         dir: &Path,
     ) -> Result<Option<Fetched>, Error> {
         if order.extracts.is_empty() {
@@ -291,9 +378,31 @@ impl Service {
         Ok(Some(fetched))
     }
 
+    /// The overlays `order` asks for, made by the host's factory; none if
+    /// it asks for none.
+    async fn overlays_of(
+        &self,
+        order: &SegmentOrder<F::Order>,
+    ) -> Result<Box<dyn Overlays + Send>, Error> {
+        let Some(overlay) = &order.overlay else {
+            return Ok(Box::new(()));
+        };
+        let segment = SegmentContext {
+            pack: &order.pack,
+            frames: order.frames,
+            out: &order.out,
+            rendering: &order.rendering,
+            to_sun: order.to_sun,
+        };
+        self.overlays.overlays(overlay, &segment).await
+    }
+
     /// Renders `order` to the store, once its pack is there.
-    pub async fn segment(&self, order: &SegmentOrder) -> Result<SegmentDone, Error> {
+    pub async fn segment(&self, order: &SegmentOrder<F::Order>) -> Result<SegmentDone, Error> {
         let began = Instant::now();
+        // Before anything is waited for: an order the host cannot draw
+        // fails now, not an hour on.
+        let mut overlays = self.overlays_of(order).await?;
         let within = Duration::from_secs(order.pack_within_seconds.unwrap_or(3600));
         let generation = self.generation().await?;
         let sources = &generation.sources;
@@ -366,7 +475,7 @@ impl Service {
                 &kept.sources,
                 &film,
                 &render_order,
-                &mut (),
+                overlays.as_mut(),
                 sink.as_mut(),
                 &mut (),
             ))?;
@@ -415,11 +524,15 @@ impl Service {
     }
 }
 
-impl Service {
+impl<F: OverlayFactory> Service<F> {
     /// Accepts `order`, renders it in the background and tells `notify` how
     /// it ended; returns at once. Renders wait their turn for the card
     /// ([`Limits::renders_at_once`]).
-    pub fn accept(self: &Arc<Self>, order: SegmentOrder, notify: Arc<dyn Notify>) {
+    pub fn accept(
+        self: &Arc<Self>,
+        order: SegmentOrder<F::Order>,
+        notify: Arc<dyn Notify<F::Order>>,
+    ) {
         let service = self.clone();
         tokio::spawn(async move {
             let outcome = service.segment(&order).await;
@@ -463,12 +576,18 @@ pub fn limits_from_env() -> Result<Limits, Error> {
 /// (`TUILE_STORE_*`), the tile store (`TUILE_TILES_*`), its caches under
 /// `TUILE_SERVE_CACHE`, its limits.
 pub async fn service_from_env() -> Result<Service, Error> {
+    service_from_env_with(NoOverlays).await
+}
+
+/// [`service_from_env`], its segments' overlays made by `overlays`.
+pub async fn service_from_env_with<F: OverlayFactory>(overlays: F) -> Result<Service<F>, Error> {
     let runs = Arc::new(ObjectRunStore::from_env()?);
     let cache: PathBuf = std::env::var("TUILE_SERVE_CACHE")
         .map(Into::into)
         .unwrap_or_else(|_| std::env::temp_dir().join("tuile-film-serve"));
     let tiles = crate::setup::tile_store(&cache).await?;
-    let mut service = Service::new(runs, tiles.objects, cache, limits_from_env()?);
+    let mut service =
+        Service::with_overlays(runs, tiles.objects, cache, limits_from_env()?, overlays);
     // The tile store's server, when the store is one: extracts come from it.
     service.remote = tuile_repository::HttpGet::from_env()?
         .map(|get| Arc::new(get) as Arc<dyn tuile_repository::Get>);
@@ -478,15 +597,21 @@ pub async fn service_from_env() -> Result<Service, Error> {
 /// The service's routes: `GET /`, and `POST /segments` — answered once the
 /// segment is in the store, or at once (202) when there is a `notify` to
 /// tell how it ends.
-pub fn router(service: Arc<Service>, notify: Option<Arc<dyn Notify>>) -> axum::Router {
+pub fn router<F: OverlayFactory>(
+    service: Arc<Service<F>>,
+    notify: Option<Arc<dyn Notify<F::Order>>>,
+) -> axum::Router {
     use axum::extract::State;
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     use axum::Json;
-    type Held = (Arc<Service>, Option<Arc<dyn Notify>>);
-    async fn segment(
-        State((service, notify)): State<Held>,
-        Json(order): Json<SegmentOrder>,
+    type Held<F> = (
+        Arc<Service<F>>,
+        Option<Arc<dyn Notify<<F as OverlayFactory>::Order>>>,
+    );
+    async fn segment<F: OverlayFactory>(
+        State((service, notify)): State<Held<F>>,
+        Json(order): Json<SegmentOrder<F::Order>>,
     ) -> axum::response::Response {
         eprintln!(
             "segment {} ← {} {}:{}",
@@ -519,7 +644,7 @@ pub fn router(service: Arc<Service>, notify: Option<Arc<dyn Notify>>) -> axum::R
     }
     axum::Router::new()
         .route("/", axum::routing::get(|| async { "tuile-film-serve" }))
-        .route("/segments", axum::routing::post(segment))
+        .route("/segments", axum::routing::post(segment::<F>))
         .with_state((service, notify))
 }
 
@@ -600,6 +725,7 @@ mod tests {
             context: serde_json::Value::Null,
             to_sun: None,
             pack_within_seconds: Some(0),
+            overlay: None,
         };
         let refused = service.segment(&order).await.expect_err("no pack");
         assert!(refused.to_string().contains("did not come"), "{refused}");
@@ -642,6 +768,127 @@ mod tests {
             generation_age: Duration::ZERO,
             ..limits
         }));
+    }
+
+    /// A host's order for its overlays: its own type, its own fields.
+    #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Trail {
+        run: String,
+        chunk: u32,
+    }
+
+    /// Remembers every order it is handed; refuses the chunk numbered 0.
+    #[derive(Default)]
+    struct Trails(std::sync::Mutex<Vec<(Trail, (u32, u32))>>);
+
+    #[async_trait::async_trait]
+    impl OverlayFactory for Arc<Trails> {
+        type Order = Trail;
+
+        async fn overlays(
+            &self,
+            order: &Trail,
+            segment: &SegmentContext<'_>,
+        ) -> Result<Box<dyn Overlays + Send>, Error> {
+            self.0
+                .lock()
+                .expect("lock")
+                .push((order.clone(), segment.frames));
+            if order.chunk == 0 {
+                return Err("no chunk 0".into());
+            }
+            Ok(Box::new(()))
+        }
+    }
+
+    #[test]
+    fn a_hosts_overlay_order_is_read_into_its_own_type_and_nothing_else() {
+        let order: SegmentOrder<Trail> = serde_json::from_str(
+            r#"{"pack": "p", "frames": [1, 2], "out": "o",
+                "overlay": {"run": "r/1", "chunk": 3}}"#,
+        )
+        .expect("an order");
+        assert_eq!(
+            order.overlay,
+            Some(Trail {
+                run: "r/1".into(),
+                chunk: 3
+            })
+        );
+        // A field the host's type does not know is refused, inside its
+        // order as beside it…
+        for refused in [
+            r#"{"pack": "p", "frames": [1, 2], "out": "o", "overlay": {"run": "r", "chunk": 3, "chunck": 4}}"#,
+            r#"{"pack": "p", "frames": [1, 2], "out": "o", "overlay": {"run": "r"}}"#,
+            r#"{"pack": "p", "frames": [1, 2], "out": "o", "overlay": {"run": "r", "chunk": 3}, "overlays": 1}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<SegmentOrder<Trail>>(refused).is_err(),
+                "{refused}"
+            );
+        }
+        // …and an order with none has none.
+        let bare: SegmentOrder<Trail> =
+            serde_json::from_str(r#"{"pack": "p", "frames": [1, 2], "out": "o"}"#).expect("bare");
+        assert_eq!(bare.overlay, None);
+        // The stock service's order says nothing, and takes nothing.
+        let stock: SegmentOrder =
+            serde_json::from_str(r#"{"pack": "p", "frames": [1, 2], "out": "o", "overlay": {}}"#)
+                .expect("stock");
+        assert_eq!(stock.overlay, Some(NoOrder {}));
+        assert!(serde_json::from_str::<SegmentOrder>(
+            r#"{"pack": "p", "frames": [1, 2], "out": "o", "overlay": {"run": "r"}}"#
+        )
+        .is_err());
+        // What goes out comes back.
+        let again: SegmentOrder<Trail> =
+            serde_json::from_str(&serde_json::to_string(&order).expect("json")).expect("again");
+        assert_eq!(again, order);
+    }
+
+    #[tokio::test]
+    async fn a_segment_hands_its_overlay_order_to_the_hosts_factory_before_it_waits() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(dir.path().join("catalog.json"), br#"{"layers": []}"#).expect("catalog");
+        let runs = Arc::new(
+            ObjectRunStore::local(dir.path(), tuile_farm::Tuning::default()).expect("store"),
+        );
+        let tiles: Arc<dyn tuile_repository::Objects> = runs.clone();
+        let trails = Arc::new(Trails::default());
+        let service = Service::with_overlays(
+            runs,
+            tiles,
+            dir.path().join("cache"),
+            Limits::default(),
+            trails.clone(),
+        );
+        let order = |chunk| -> SegmentOrder<Trail> {
+            serde_json::from_value(serde_json::json!({
+                "pack": "packs/never.tuilepack",
+                "frames": [31, 60],
+                "out": "out.mp4",
+                "pack_within_seconds": 0,
+                "overlay": {"run": "r/1", "chunk": chunk},
+            }))
+            .expect("order")
+        };
+        // Made, then the pack waited for.
+        let late = service.segment(&order(2)).await.expect_err("no pack");
+        assert!(late.to_string().contains("did not come"), "{late}");
+        // An order the host cannot draw fails the segment, by the host's word.
+        let refused = service.segment(&order(0)).await.expect_err("refused");
+        assert!(refused.to_string().contains("no chunk 0"), "{refused}");
+        // A segment with no overlay order does not call the factory.
+        let mut none = order(5);
+        none.overlay = None;
+        service.segment(&none).await.expect_err("no pack");
+        let asked = trails.0.lock().expect("lock").clone();
+        let trail = |chunk| Trail {
+            run: "r/1".into(),
+            chunk,
+        };
+        assert_eq!(asked, vec![(trail(2), (31, 60)), (trail(0), (31, 60))]);
     }
 
     struct Heard(tokio::sync::mpsc::UnboundedSender<(serde_json::Value, Result<u64, String>)>);

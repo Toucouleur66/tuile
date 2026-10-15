@@ -62,6 +62,7 @@ nvidia-video-codec-sdk = { git = "https://github.com/lapoule-dev/nvidia-video-co
 cudarc = { version = "0.16.4", optional = true, features = ["cuda-version-from-build-system"] }
 
 [dev-dependencies]
+pollster = { workspace = true }
 
 [features]
 # rav1e's own assembly: several times faster, and no longer Rust alone.
