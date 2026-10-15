@@ -316,9 +316,10 @@ fn a_terrain_projected_tile_by_tile_bakes_the_pack_a_whole_one_does() {
         .expect("register");
 
     // The terrain cut to what this bake can read.
+    // Set up as a host does: on the store itself, before it is shared.
     let targeted = Tiles::over(objects)
         .expect("store")
-        .with_index_reader(register)
+        .with_store(|store| store.set_index_reader(register))
         .expect("reader");
     let traversal = {
         let mut config = GlobeConfig::new("");

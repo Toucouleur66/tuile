@@ -253,6 +253,20 @@ impl Tiles {
         Ok(self)
     }
 
+    /// `with` given the store before it is shared, to set what its host
+    /// keeps beside it — a ledger told of what the bake writes, an index
+    /// reader, an absence store — from the store's own layers.
+    pub fn with_store(
+        mut self,
+        with: impl FnOnce(&mut tuile_tile_server::TileStore),
+    ) -> Result<Self, String> {
+        with(
+            Arc::get_mut(&mut self.store)
+                .ok_or("the tile store is already shared: set it up first")?,
+        );
+        Ok(self)
+    }
+
     /// Where the store's reads came from so far.
     pub fn stats(&self) -> tuile_tile_server::StatsSnapshot {
         self.store.stats()

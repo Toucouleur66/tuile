@@ -456,6 +456,11 @@ impl TileStore {
         self
     }
 
+    /// The same, on a store already built.
+    pub fn set_ledger(&mut self, ledger: Arc<dyn crate::Ledger>) {
+        self.ledger = Some(ledger);
+    }
+
     /// From now on a projection by index asks `reader` which zones a layer
     /// has and the copy a reader gets of each tile, and lists no bucket and
     /// reads no archive index for what it knows: see [`crate::ledger`].
