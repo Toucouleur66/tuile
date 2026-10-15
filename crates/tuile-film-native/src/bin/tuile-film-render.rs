@@ -148,6 +148,15 @@
 //!   --marker <point>      another: a marker standing at this point, never
 //!                         hidden
 //!   --marker-size <m>     its height (default 80)
+//!   --marker-eyes <both|left|right>
+//!                         in a stereo film, the eyes that see the marker
+//!                         (default both)
+//!   --relief <point>      another: a lit block in relief standing at this
+//!                         point — a slab with bevelled sides, its faces
+//!                         lit by a light that goes with the camera — which
+//!                         casts shadows and receives them when the look
+//!                         has any (--shadow), as the ribbon does
+//!   --relief-size <m>     its width (default 120)
 //! ```
 //!
 //! A first argument ending in `.tuilepack` is one pack, opened alone: a
@@ -161,7 +170,9 @@ use std::sync::Arc;
 
 use glam::DVec3;
 use tuile_core::geo::{enu_frame, geodetic_to_ecef, Geodetic};
-use tuile_film::{BakedView, OverlayDepth, OverlayMesh, Overlays};
+use tuile_film::{
+    OverlayBlend, OverlayCamera, OverlayDepth, OverlayEyes, OverlayMesh, OverlayShadow, Overlays,
+};
 
 use tuile_farm::{BucketConfig, ObjectRunStore, RunStore, Tuning};
 use tuile_film_native::setup::{bucket, film_sink, rgb, sun_at};
@@ -235,6 +246,10 @@ fn ribbon(points: &str, width: f64, depth: OverlayDepth) -> Result<OverlayMesh, 
     let mut mesh = OverlayMesh {
         origin_ecef: origin.to_array(),
         depth,
+        // Opaque, in the sun's map and shaded by it: a path that casts its
+        // shadow on the ground and on itself, when the look has shadows.
+        blend: OverlayBlend::Opaque,
+        shadow: OverlayShadow::CastAndReceive,
         ..OverlayMesh::default()
     };
     // Display-linear, opaque: an orange no ground is, one edge deeper than
@@ -258,7 +273,7 @@ fn ribbon(points: &str, width: f64, depth: OverlayDepth) -> Result<OverlayMesh, 
 
 /// A marker `size` metres tall standing on its point at `point`, tested
 /// against nothing: it shows through whatever stands before it.
-fn marker(point: &str, size: f64) -> Result<OverlayMesh, Error> {
+fn marker(point: &str, size: f64, eyes: OverlayEyes) -> Result<OverlayMesh, Error> {
     let (at, up) = place(point)?;
     let east = DVec3::Z.cross(up).normalize_or_zero();
     let north = up.cross(east);
@@ -269,6 +284,7 @@ fn marker(point: &str, size: f64) -> Result<OverlayMesh, Error> {
         // Its point deep, its top white, its waist between.
         colors: vec![[0.0, 0.1, 0.5, 1.0], [1.0, 1.0, 1.0, 1.0]],
         depth: OverlayDepth::Always,
+        eyes,
         ..OverlayMesh::default()
     };
     for corner in [east, north, -east, -north] {
@@ -283,8 +299,54 @@ fn marker(point: &str, size: f64) -> Result<OverlayMesh, Error> {
     Ok(mesh)
 }
 
+/// A slab `size` metres across standing at `point`: a square top, four
+/// bevelled sides down to a wider foot, each face with its own normal so
+/// that the light that goes with the camera shows the relief. It is lifted
+/// a metre off its point, casts shadows and receives them.
+fn relief(point: &str, size: f64) -> Result<OverlayMesh, Error> {
+    let (at, up) = place(point)?;
+    let east = DVec3::Z.cross(up).normalize_or_zero();
+    let north = up.cross(east);
+    let (foot, top, height) = (size / 2.0, size * 0.3, size * 0.35);
+    let corner = |half: f64, x: f64, y: f64, z: f64| up * z + (east * x + north * y) * half;
+    let mut mesh = OverlayMesh {
+        origin_ecef: at.to_array(),
+        blend: OverlayBlend::Opaque,
+        shadow: OverlayShadow::CastAndReceive,
+        ..OverlayMesh::default()
+    };
+    // Display-linear amber.
+    let amber = [0.85, 0.42, 0.05, 1.0];
+    let mut face = |corners: [DVec3; 4]| {
+        let normal = (corners[1] - corners[0])
+            .cross(corners[2] - corners[0])
+            .normalize_or_zero();
+        let base = mesh.positions.len() as u32;
+        for c in corners {
+            mesh.positions.push(c.as_vec3().to_array());
+            mesh.normals.push(normal.as_vec3().to_array());
+            mesh.colors.push(amber);
+        }
+        mesh.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    };
+    let ring = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
+    let lift = 1.0;
+    face(ring.map(|(x, y)| corner(top, x, y, lift + height)));
+    for side in 0..4 {
+        let (a, b) = (ring[side], ring[(side + 1) % 4]);
+        face([
+            corner(foot, a.0, a.1, lift),
+            corner(foot, b.0, b.1, lift),
+            corner(top, b.0, b.1, lift + height),
+            corner(top, a.0, a.1, lift + height),
+        ]);
+    }
+    Ok(mesh)
+}
+
 impl Overlays for Shapes {
-    fn frame(&mut self, _: u32, _: &BakedView, out: &mut Vec<OverlayMesh>) {
+    fn frame(&mut self, _: u32, _: &OverlayCamera, out: &mut Vec<OverlayMesh>) {
         out.extend(self.0.iter().cloned());
     }
 }
@@ -573,7 +635,19 @@ async fn main() -> Result<(), Error> {
     }
     if let Some(point) = value("--marker") {
         let size = value("--marker-size").map_or(Ok(80.0), |s| s.parse())?;
-        shapes.0.push(marker(&point, size)?);
+        let eyes = match value("--marker-eyes").as_deref() {
+            Some("both") | None => OverlayEyes::Both,
+            Some("left") => OverlayEyes::Left,
+            Some("right") => OverlayEyes::Right,
+            Some(other) => {
+                return Err(format!("a marker is seen by both, left or right, not {other}").into())
+            }
+        };
+        shapes.0.push(marker(&point, size, eyes)?);
+    }
+    if let Some(point) = value("--relief") {
+        let size = value("--relief-size").map_or(Ok(120.0), |s| s.parse())?;
+        shapes.0.push(relief(&point, size)?);
     }
 
     let done = match render(&sources, &film, &order, &mut shapes, &mut sink, observer).await {

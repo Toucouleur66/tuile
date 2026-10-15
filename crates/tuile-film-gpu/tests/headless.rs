@@ -8,8 +8,11 @@
 //! pixel off it as the sky. Skipped when the machine has no adapter.
 
 use glam::Vec3;
-use tuile_film::{BakedView, FrameCamera, Haze, Imagery, Look, OverlayDepth, OverlayMesh, TileKey};
-use tuile_film_gpu::{FilmGpu, Settings, TileMesh};
+use tuile_film::{
+    BakedView, Eye, FrameCamera, Haze, Imagery, Look, OverlayBlend, OverlayDepth, OverlayEyes,
+    OverlayMesh, OverlayShadow, Stereo, TileKey,
+};
+use tuile_film_gpu::{FilmGpu, Settings, Shot, TileMesh};
 
 /// The WGS84 equatorial radius: the square sits on the ground at null island.
 const A: f64 = 6_378_137.0;
@@ -923,6 +926,7 @@ impl Panel {
             colors: vec![color; 4],
             indices: vec![0, 1, 2, 0, 2, 3],
             depth,
+            ..OverlayMesh::default()
         }
     }
 }
@@ -956,6 +960,19 @@ fn band_behind(north: f64) -> Panel {
 /// The ground and the ridge, then one frame after the other on the same
 /// renderer, each with its overlays: the picture of each.
 fn frames(look: Look, supersample: u32, frames: &[&[OverlayMesh]]) -> Option<Vec<Rendered>> {
+    let shots: Vec<_> = frames.iter().map(|o| (None, *o)).collect();
+    pictures(look, supersample, view(), &shots)
+}
+
+/// The ground and the ridge seen from `seen_from`, then one picture after
+/// the other: of the film's only eye, or of one eye of a stereo pair, each
+/// with its overlays.
+fn pictures(
+    look: Look,
+    supersample: u32,
+    seen_from: BakedView,
+    shots: &[(Option<Eye>, &[OverlayMesh])],
+) -> Option<Vec<Rendered>> {
     let (device, queue) = device()?;
     let (width, height) = (64, 48);
     let mut film = FilmGpu::new(
@@ -995,10 +1012,15 @@ fn frames(look: Look, supersample: u32, frames: &[&[OverlayMesh]]) -> Option<Vec
         .expect("enter");
         keys.push(key);
     }
-    let camera = FrameCamera::of(&view(), width as f32 / height as f32);
+    let camera = FrameCamera::of(&seen_from, width as f32 / height as f32);
+    let pair = Stereo::default().eyes(&camera);
     let mut out = Vec::new();
-    for overlays in frames {
-        let encoder = film.render_with(&camera, &keys, overlays).expect("render");
+    for (eye, overlays) in shots {
+        let shot = match eye {
+            None => Shot::mono(camera),
+            Some(eye) => Shot::eye(camera, &pair, *eye),
+        };
+        let encoder = film.render_shot(&shot, &keys, overlays).expect("render");
         film.queue().submit([encoder.finish()]);
         out.push(Rendered {
             rgba: picture(&film),
@@ -1524,4 +1546,415 @@ fn the_tail_of_a_drape_is_the_end_of_its_mip_chain() {
         .any(|p| p[..3] != [0, 0, 0]));
     // A level past the chain is its last.
     assert_eq!(film.tail(&whole, 40).width(), 1);
+}
+
+/// Where a point `height` metres over the ground at null island, `east` and
+/// `north` of the nadir, lands in the picture `seen_from` makes: its pixel.
+fn pixel_of(seen_from: &BakedView, height: f64, east: f64, north: f64) -> (u32, u32) {
+    let camera = FrameCamera::of(seen_from, 64.0 / 48.0);
+    let at = camera.offset([A + height, east, north]);
+    let clip = camera.view_projection() * at.extend(1.0);
+    let (x, y) = (clip.x / clip.w, clip.y / clip.w);
+    (
+        ((x + 1.0) / 2.0 * 64.0).floor() as u32,
+        ((1.0 - y) / 2.0 * 48.0).floor() as u32,
+    )
+}
+
+fn at(r: &Rendered, (x, y): (u32, u32)) -> [u8; 3] {
+    pixel(r, x, y)
+}
+
+/// A level plate `height` metres up, `half` metres a side, centred `east`
+/// and `north` of the nadir, in one colour: in the scene above the ridge's
+/// 500 m it hides nothing of the ground the tests look at.
+fn plate(height: f64, east: f64, north: f64, half: f32, color: [f32; 4]) -> OverlayMesh {
+    Panel {
+        height,
+        at: [east, north],
+        half: [half, half],
+    }
+    .overlay(color, OverlayDepth::Terrain)
+}
+
+const GREY: [f32; 4] = [0.6, 0.6, 0.6, 1.0];
+
+/// A shape with normals is lit by a light that goes with the camera — a
+/// face turned to it brighter than one turned away, a highlight on the
+/// first — so that relief shows; a shape without is drawn in its colour.
+#[test]
+fn a_shape_with_normals_is_lit_and_one_without_is_flat() {
+    let flat = plate(700.0, -150.0, 0.0, 25.0, GREY);
+    // Facing the camera, which looks straight down: its normal is up.
+    let facing = OverlayMesh {
+        normals: vec![[1.0, 0.0, 0.0]; 4],
+        ..plate(700.0, 0.0, 0.0, 25.0, GREY)
+    };
+    // Turned south and a little up: towards the eye, away from a light
+    // that comes from the north.
+    let turned = OverlayMesh {
+        normals: vec![[0.3, 0.0, -1.0]; 4],
+        ..plate(700.0, 150.0, 0.0, 25.0, GREY)
+    };
+    let Some(r) = frames(look(), 1, &[&[flat, facing, turned]]) else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let seen = view();
+    let (flat, facing, turned) = (
+        at(&r[0], pixel_of(&seen, 700.0, -150.0, 0.0)),
+        at(&r[0], pixel_of(&seen, 700.0, 0.0, 0.0)),
+        at(&r[0], pixel_of(&seen, 700.0, 150.0, 0.0)),
+    );
+    assert!(close(flat, [oetf(0.6); 3]), "flat {flat:?}");
+    // The light's share a face takes: its ambient and its diffuse, then
+    // the highlight, worked out from the shader's light for the nadir.
+    let light = Vec3::new(0.75, 0.35, 0.55).normalize();
+    let diffuse = light.x;
+    let half_way = (light + Vec3::X).normalize();
+    let shine = 0.2 * half_way.x.powf(24.0);
+    let wanted = oetf(0.6 * (0.45 + 0.55 * diffuse) + shine);
+    assert!(
+        close(facing, [wanted; 3]),
+        "facing {facing:?}, wanted {}",
+        wanted * 255.0
+    );
+    assert!(close(turned, [oetf(0.6 * 0.45); 3]), "turned {turned:?}");
+}
+
+/// An opaque shape hides the overlays behind it, whatever their order; a
+/// translucent one hides nothing, and what is drawn after it is laid over
+/// it.
+#[test]
+fn an_opaque_overlay_writes_its_depth_and_a_translucent_one_does_not() {
+    let near = |blend| OverlayMesh {
+        blend,
+        ..plate(800.0, 0.0, 0.0, 20.0, MAGENTA)
+    };
+    let far = |blend| OverlayMesh {
+        blend,
+        ..plate(700.0, 0.0, 0.0, 60.0, CYAN)
+    };
+    let opaque = [near(OverlayBlend::Opaque), far(OverlayBlend::Opaque)];
+    let translucent = [
+        near(OverlayBlend::Translucent),
+        far(OverlayBlend::Translucent),
+    ];
+    // Opaque meshes come first: a translucent one given before an opaque
+    // one is still laid over it.
+    let mixed = [near(OverlayBlend::Translucent), far(OverlayBlend::Opaque)];
+    let Some(r) = frames(look(), 1, &[&opaque, &translucent, &mixed]) else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let seen = view();
+    let (middle, rim) = (
+        pixel_of(&seen, 800.0, 0.0, 0.0),
+        pixel_of(&seen, 700.0, 50.0, 0.0),
+    );
+    assert_eq!(
+        at(&r[0], middle),
+        [255, 0, 255],
+        "the far shape was drawn over the near"
+    );
+    assert_eq!(
+        at(&r[1], middle),
+        [0, 255, 255],
+        "a translucent shape hid what came after it"
+    );
+    assert_eq!(
+        at(&r[2], middle),
+        [255, 0, 255],
+        "translucent before opaque"
+    );
+    for picture in &r {
+        assert_eq!(at(picture, rim), [0, 255, 255]);
+    }
+}
+
+/// A shape tested against overlays only crosses the ridge that would hide a
+/// shape in the landscape, and is hidden by an opaque overlay nearer than
+/// it.
+#[test]
+fn a_shape_tested_against_overlays_only_ignores_the_ground_and_not_overlays() {
+    let band = OverlayMesh {
+        blend: OverlayBlend::Opaque,
+        ..band_behind(0.0).overlay(MAGENTA, OverlayDepth::OverlaysOnly)
+    };
+    // Behind the ridge too, nearer than the band, west of the ridge.
+    let card = OverlayMesh {
+        blend: OverlayBlend::Opaque,
+        ..Panel {
+            height: 400.0,
+            at: [-150.0, 0.0],
+            half: [20.0, 40.0],
+        }
+        .overlay(CYAN, OverlayDepth::OverlaysOnly)
+    };
+    let Some(r) = frames(look(), 1, &[&[], &[card, band]]) else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let (bare, r) = (&r[0], &r[1]);
+    assert_ne!(pixel(bare, 32, 24), [255, 0, 255]);
+    for column in [10, 32, 34, 50] {
+        assert_eq!(pixel(r, column, 24), [255, 0, 255], "column {column}");
+    }
+    let card = pixel_of(&view(), 400.0, -150.0, 0.0);
+    assert_eq!(
+        at(r, card),
+        [0, 255, 255],
+        "the band crossed the nearer card"
+    );
+}
+
+/// A shape for the left eye is drawn in the left eye's picture and not in
+/// the right's, which is the right eye's picture without it.
+#[test]
+fn a_shape_for_the_left_eye_is_absent_from_the_right_eye() {
+    let left = OverlayMesh {
+        eyes: OverlayEyes::Left,
+        ..plate(700.0, 0.0, 0.0, 60.0, MAGENTA)
+    };
+    let shapes = [left];
+    let Some(r) = pictures(
+        look(),
+        1,
+        view(),
+        &[
+            (Some(Eye::Left), &[]),
+            (Some(Eye::Right), &[]),
+            (Some(Eye::Left), &shapes),
+            (Some(Eye::Right), &shapes),
+        ],
+    ) else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    assert_ne!(r[2].rgba, r[0].rgba, "the left eye drew nothing");
+    assert_eq!(pixel(&r[2], 32, 24), [255, 0, 255]);
+    assert_eq!(
+        r[3].rgba, r[1].rgba,
+        "the right eye drew the left eye's shape"
+    );
+}
+
+/// The sun low in the east, out of the camera's line of sight: what stands
+/// `h` metres over something shades it 0.6·h metres west of it.
+fn eastern_sun() -> Look {
+    Look {
+        to_sun: Vec3::new(1.0, 0.6, 0.0).normalize(),
+        shadow: 1.0,
+        ..look()
+    }
+}
+
+/// A casting shape is in the sun's map with the ground: the ground under it
+/// along the sun loses the sun, as it does under the ridge — while one that
+/// does not cast leaves the ground as it was.
+#[test]
+fn a_casting_shape_shades_the_ground_along_the_sun_and_one_that_does_not_never() {
+    // 250 m up, under the ridge: its shadow 150 m west, on open ground.
+    let caster = |shadow| OverlayMesh {
+        shadow,
+        ..plate(250.0, 0.0, 100.0, 20.0, YELLOW)
+    };
+    let Some(r) = frames(
+        eastern_sun(),
+        2,
+        &[
+            &[],
+            &[caster(OverlayShadow::Cast)],
+            &[caster(OverlayShadow::None)],
+            &[caster(OverlayShadow::Receive)],
+            &[caster(OverlayShadow::CastAndReceive)],
+        ],
+    ) else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let look = eastern_sun();
+    let ground = albedo(GROUND_SRGB);
+    let by_the_dome = shown(&look, ground * look.world);
+    let seen = view();
+    let shaded = pixel_of(&seen, 0.0, -150.0, 100.0);
+    // As far from the plate, across the sun rather than along it.
+    let beside = pixel_of(&seen, 0.0, -150.0, -60.0);
+    let bare = &r[0];
+    for (cast, picture) in [(true, &r[1]), (false, &r[2]), (false, &r[3]), (true, &r[4])] {
+        if cast {
+            assert!(
+                close(at(picture, shaded), by_the_dome),
+                "{:?}, wanted the dome's {:?}",
+                at(picture, shaded),
+                by_the_dome.map(|c| c * 255.0)
+            );
+        } else {
+            assert_eq!(
+                at(picture, shaded),
+                at(bare, shaded),
+                "a shape out of the map shaded the ground"
+            );
+        }
+        assert_eq!(at(picture, beside), at(bare, beside));
+    }
+    assert_ne!(at(bare, shaded), at(&r[1], shaded));
+}
+
+/// A receiving shape loses the sun where a casting one stands between it
+/// and the sun — to the dome's share of the light, as ground does — and
+/// keeps it whole once the caster is gone, or casts nothing.
+#[test]
+fn a_receiving_shape_is_shaded_by_a_caster_between_it_and_the_sun() {
+    let receiver = OverlayMesh {
+        shadow: OverlayShadow::Receive,
+        ..plate(250.0, 100.0, -100.0, 30.0, GREY)
+    };
+    // 150 m over it, towards the sun: 90 m east.
+    let caster = |shadow| OverlayMesh {
+        shadow,
+        ..plate(400.0, 190.0, -100.0, 20.0, YELLOW)
+    };
+    let Some(r) = frames(
+        eastern_sun(),
+        2,
+        &[
+            &[receiver.clone(), caster(OverlayShadow::Cast)],
+            std::slice::from_ref(&receiver),
+            &[receiver.clone(), caster(OverlayShadow::None)],
+        ],
+    ) else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let look = eastern_sun();
+    let luma = Vec3::new(0.2126, 0.7152, 0.0722);
+    let left = look.world.dot(luma) / (look.world + look.sun).dot(luma);
+    let middle = pixel_of(&view(), 250.0, 100.0, -100.0);
+    assert!(
+        close(at(&r[0], middle), [oetf(0.6 * left); 3]),
+        "{:?}",
+        at(&r[0], middle)
+    );
+    for (picture, why) in [(&r[1], "no caster"), (&r[2], "a caster out of the map")] {
+        assert!(
+            close(at(picture, middle), [oetf(0.6); 3]),
+            "{why}: {:?}",
+            at(picture, middle)
+        );
+    }
+}
+
+/// A caster far thinner than a texel of the sun's map still leaves an
+/// unbroken line of shadow: its edges are drawn into the map as well as its
+/// triangles, which cover the centre of almost no texel.
+#[test]
+fn a_caster_thinner_than_a_texel_leaves_an_unbroken_line_of_shadow() {
+    // Close in on the ground west of the ridge: 0.4 m a pixel.
+    let close_in = BakedView {
+        fovy_rad: 0.02,
+        position: [A + 1000.0, -150.0, 0.0],
+        ..view()
+    };
+    // A thread 2 cm wide running north, 250 m up and 150 m east of where
+    // its shadow falls, diagonal to anything.
+    let thread = OverlayMesh {
+        shadow: OverlayShadow::Cast,
+        ..Panel {
+            height: 250.0,
+            at: [0.0, 0.0],
+            half: [0.01, 300.0],
+        }
+        .overlay(YELLOW, OverlayDepth::Terrain)
+    };
+    let Some(r) = pictures(
+        eastern_sun(),
+        2,
+        close_in,
+        &[(None, &[]), (None, &[thread])],
+    ) else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let (bare, threaded) = (&r[0], &r[1]);
+    // Along the line, down the picture: every row darker somewhere.
+    let mut rows = 0;
+    for y in 4..44 {
+        let darkest = (0..64)
+            .map(|x| {
+                let (b, t) = (pixel(bare, x, y), pixel(threaded, x, y));
+                i32::from(b[1]) - i32::from(t[1])
+            })
+            .max()
+            .unwrap_or(0);
+        rows += u32::from(darkest >= 3);
+    }
+    assert_eq!(rows, 40, "only {rows} of 40 rows show the thread's shadow");
+}
+
+/// A shape that casts and receives does not shade itself, even with the sun
+/// grazing it: its faces and its edges go into the sun's map pushed back by
+/// their slope to the sun, and it comes out as one that only receives.
+#[test]
+fn a_shape_that_casts_does_not_shade_itself_under_a_grazing_sun() {
+    // Ten degrees over the eastern horizon: the level plate below is seen
+    // by the sun at a slope of nearly six.
+    let grazing = Look {
+        to_sun: Vec3::new(0.17, 0.985, 0.0).normalize(),
+        shadow: 1.0,
+        ..look()
+    };
+    // Level, 700 m up, cut in an 8 × 8 grid: diagonals all across it.
+    let grid = |shadow| {
+        let mut mesh = OverlayMesh {
+            origin_ecef: [A + 700.0, 0.0, 0.0],
+            blend: OverlayBlend::Opaque,
+            shadow,
+            ..OverlayMesh::default()
+        };
+        let (n, half) = (8u32, 120.0f32);
+        for j in 0..=n {
+            for i in 0..=n {
+                let (y, z) = (
+                    -half + 2.0 * half * i as f32 / n as f32,
+                    -half + 2.0 * half * j as f32 / n as f32,
+                );
+                mesh.positions.push([0.0, y, z]);
+                mesh.colors.push(GREY);
+            }
+        }
+        for j in 0..n {
+            for i in 0..n {
+                let k = j * (n + 1) + i;
+                mesh.indices
+                    .extend_from_slice(&[k, k + 1, k + n + 2, k, k + n + 2, k + n + 1]);
+            }
+        }
+        mesh
+    };
+    let Some(r) = frames(
+        grazing,
+        2,
+        &[
+            &[grid(OverlayShadow::Receive)],
+            &[grid(OverlayShadow::CastAndReceive)],
+        ],
+    ) else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let seen = view();
+    let (low, high) = (
+        pixel_of(&seen, 700.0, -100.0, 100.0),
+        pixel_of(&seen, 700.0, 100.0, -100.0),
+    );
+    let mut worst = 0;
+    for y in low.1..=high.1 {
+        for x in low.0..=high.0 {
+            let (a, b) = (pixel(&r[0], x, y), pixel(&r[1], x, y));
+            worst = worst.max(i32::from(a[1]).abs_diff(i32::from(b[1])));
+        }
+    }
+    assert!(close(pixel(&r[0], 32, 24), [oetf(0.6); 3]));
+    assert!(worst <= 2, "the plate shaded itself by {worst} levels");
 }

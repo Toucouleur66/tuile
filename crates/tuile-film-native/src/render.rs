@@ -23,11 +23,11 @@ use tuile_film::from_store::{compose, imagery_texture, is_baked, terrain_mesh};
 use tuile_film::smoothing::Smooth;
 use tuile_film::stitching::Stitching;
 use tuile_film::{
-    refs_of, texture_of_span, Content, Cursor, Eye, FrameCamera, Look, Mesh, OverlayMesh, Overlays,
-    Pack, Stereo, TileKey,
+    refs_of, texture_of_span, Content, Cursor, Eye, FrameCamera, Look, Mesh, OverlayCamera,
+    OverlayMesh, Overlays, Pack, Stereo, TileKey,
 };
 use tuile_film_gpu::{
-    DrapeLayer, FilmGpu, LayerCorner, LayerField, LayerGrade, Settings, TileMesh,
+    DrapeLayer, FilmGpu, LayerCorner, LayerField, LayerGrade, Settings, Shot, TileMesh,
 };
 use tuile_radiometry::{linear_of, through, Affine, Blended, FilmGrade, Local, MatrixField, SAME};
 use tuile_repository::TileRepository;
@@ -265,11 +265,11 @@ struct Readback {
     padded: u32,
 }
 
-/// The frame through `camera`, drawn and read back: its RGBA, and its I420
+/// One picture of the frame, drawn and read back: its RGBA, and its I420
 /// when the sink takes it.
 async fn shoot(
     gpu: &mut FilmGpu,
-    camera: &FrameCamera,
+    shot: &Shot,
     selection: &[TileKey],
     shapes: &[OverlayMesh],
     back: &Readback,
@@ -277,7 +277,7 @@ async fn shoot(
     shadow_texel: &mut Option<(f32, f32)>,
 ) -> Result<(Vec<u8>, Vec<u8>), Error> {
     let t = Instant::now();
-    let mut encoder = gpu.render_with(camera, selection, shapes)?;
+    let mut encoder = gpu.render_shot(shot, selection, shapes)?;
     encoder.copy_texture_to_buffer(
         gpu.output().as_image_copy(),
         wgpu::TexelCopyBufferInfo {
@@ -327,8 +327,9 @@ async fn read_back(film: &FilmGpu, buffer: &wgpu::Buffer) -> Result<Vec<u8>, Err
 }
 
 /// Renders `film` as `order` says, each picture to `sink`, `observer` told
-/// of everything. `overlays` is asked, frame by frame, for what the frame
-/// shows beside the ground; `&mut ()` has nothing to show.
+/// of everything. `overlays` is asked, once a frame — for both eyes of a
+/// stereo film — for what the frame shows beside the ground; `&mut ()` has
+/// nothing to show.
 pub async fn render(
     sources: &Sources,
     film: &Film,
@@ -1003,15 +1004,24 @@ pub async fn render(
             }
             timings.stitch += ms(t);
             let camera = FrameCamera::of(&diff.view, aspect);
+            let pair = stereo.as_ref().map(|stereo| stereo.eyes(&camera));
+            // The frame's overlays, once for every picture of it: made for
+            // the frame's own camera, drawn into each eye through its own.
             shapes.clear();
-            overlays.frame(diff.frame, &diff.view, &mut shapes);
+            let seen = OverlayCamera {
+                view: diff.view,
+                camera,
+                eyes: pair,
+                shadow_texel: gpu.shadow_texel_for(&camera, &diff.selection)?,
+            };
+            overlays.frame(diff.frame, &seen, &mut shapes);
             // For two eyes: each eye apart, the pair, the left eye's camera.
             let mut apart = None;
-            let (rgba, i420) = match &stereo {
-                None => {
+            let (rgba, i420) = match (&stereo, &pair) {
+                (None, _) | (_, None) => {
                     shoot(
                         &mut gpu,
-                        &camera,
+                        &Shot::mono(camera),
                         &diff.selection,
                         &shapes,
                         &back,
@@ -1022,14 +1032,13 @@ pub async fn render(
                 }
                 // Both eyes from the same resident tiles, one after the
                 // other through the same target, then packed.
-                Some(stereo) => {
-                    let pair = stereo.eyes(&camera);
+                (Some(stereo), Some(pair)) => {
                     let mut eyes = Vec::with_capacity(2);
                     for eye in Eye::BOTH {
                         eyes.push(
                             shoot(
                                 &mut gpu,
-                                &camera.eye(&pair, eye),
+                                &Shot::eye(camera, pair, eye),
                                 &diff.selection,
                                 &shapes,
                                 &back,
@@ -1049,7 +1058,7 @@ pub async fn render(
                         tuile_film::pack_rgba(stereo.packing, &left.0, &right.0, width, height),
                         i420,
                     );
-                    apart = Some((eyes, pair, camera.eye(&pair, Eye::Left)));
+                    apart = Some((eyes, *pair, camera.eye(pair, Eye::Left)));
                     packed
                 }
             };

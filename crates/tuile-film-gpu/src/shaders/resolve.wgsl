@@ -50,34 +50,6 @@ fn bary(d: vec3f, a: vec3f, e1: vec3f, e2: vec3f) -> vec2f {
     return vec2f(dot(t, p), dot(d, q)) * inv;
 }
 
-// How much of the sun reaches `p` (eye-relative, its normal `n`): 1 where
-// nothing in the sun's map is nearer the sun, over 3×3 texels each read
-// through the comparison's own bilinear filter.
-//
-// The point is moved off its surface by two texels before it is looked up,
-// so that ground does not shade itself across the texel it falls in. And
-// what the map does not hold is lit: beyond it nothing is known to stand
-// before the sun, and unknown is never dark.
-fn sunlit(p: vec3f, n: vec3f) -> f32 {
-    let at = frame.sun_view_proj * vec4f(p + n * (2.0 * frame.shadow.y), 1.0);
-    let uv = vec2f(at.x, -at.y) * 0.5 + 0.5;
-    if (any(uv < vec2f(0.0)) || any(uv > vec2f(1.0)) || at.z < 0.0 || at.z > 1.0) {
-        return 1.0;
-    }
-    let texel = 1.0 / frame.shadow.z;
-    var lit = 0.0;
-    for (var j = -1; j <= 1; j++) {
-        for (var i = -1; i <= 1; i++) {
-            let to = uv + vec2f(f32(i), f32(j)) * texel;
-            lit += textureSampleCompareLevel(shadow_map, shadow_samp, to, at.z);
-        }
-    }
-    // Towards where they stop, shadows fade: no line across the ground
-    // where the map ends.
-    let fade = smoothstep(0.8 * frame.shadow.w, frame.shadow.w, length(p));
-    return lit / 9.0 * (1.0 - fade) + fade;
-}
-
 fn position_at(i: u32) -> vec3f {
     return vec3f(positions[3u * i], positions[3u * i + 1u], positions[3u * i + 2u]);
 }
