@@ -110,7 +110,32 @@ pub fn encoded(mesh: &DecodedMesh, origin_ecef: [f64; 3], base_color_factor: [f3
     }
 }
 
+/// The bytes `mesh`'s vertices and indices hold.
+pub fn heap_bytes(mesh: &DecodedMesh) -> usize {
+    use std::mem::size_of_val;
+    size_of_val(mesh.positions.as_slice())
+        + mesh.normals.as_deref().map_or(0, size_of_val)
+        + mesh.uvs.as_deref().map_or(0, size_of_val)
+        + size_of_val(mesh.indices.as_slice())
+}
+
 impl Stitching {
+    /// The bytes the meshes and edges it holds take.
+    pub fn heap_bytes(&self) -> usize {
+        self.held
+            .values()
+            .map(|held| {
+                heap_bytes(&held.mesh)
+                    + held
+                        .edges
+                        .sides
+                        .iter()
+                        .map(|side| std::mem::size_of_val(side.as_slice()))
+                        .sum::<usize>()
+            })
+            .sum()
+    }
+
     /// With corrections reaching `band` of a tile inward.
     pub fn new(band: f32) -> Self {
         Self {
@@ -170,6 +195,13 @@ impl Stitching {
             }
         }
         Some((origin, mesh))
+    }
+
+    /// The mesh of `key` as it entered, about its origin: as drawn when
+    /// nothing is stitched. `None` for a tile not held.
+    pub fn held(&self, key: &TileKey) -> Option<(DVec3, &DecodedMesh)> {
+        let held = self.held.get(key)?;
+        Some((held.edges.origin, &held.mesh))
     }
 
     pub fn leave(&mut self, key: &TileKey) {
