@@ -63,8 +63,8 @@ pub use layer::{Layer, Zone, DURABLE_EPOCH};
 pub use ledger::{IndexReader, KnownZone, Ledger, Publication, RegisteredTile, TileBatches};
 pub use peers::{Announce, Claim, Emitted, FreshTiles, SharedTile, SharedTiles};
 pub use pmtiles::{Compression, TileType};
-pub use register::MemoryRegister;
 pub use projection::{Eye, Footprint, LayerProjection, ProjectionReport, ZoneListing};
+pub use register::MemoryRegister;
 pub use service::{
     etag_of, LayerMeta, ServiceConfig, ServiceError, ServiceStats, Source, TileResponse,
     TileService,
