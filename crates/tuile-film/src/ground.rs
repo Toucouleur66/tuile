@@ -62,10 +62,25 @@ pub fn prepared(mesh: Mesh, how: Prepare) -> (Mesh, Smoothed) {
 /// Where the line down a place starts: above any ground there is.
 const ABOVE_M: f64 = 12_000.0;
 
+/// A tile as drawn, kept for its heights alone: where its vertices are and
+/// how they make triangles.
 struct Drawn {
     rect: GeoRect,
     origin: DVec3,
-    mesh: DecodedMesh,
+    positions: Vec<[f32; 3]>,
+    indices: Vec<u32>,
+}
+
+impl Drawn {
+    fn of(key: &TileKey, origin: DVec3, mesh: DecodedMesh) -> Self {
+        let (level, x, y) = TileId(key.id).terrain_coord();
+        Self {
+            rect: GeographicTilingScheme::default().tile_rect(TileCoord::new(level, x, y)),
+            origin,
+            positions: mesh.positions,
+            indices: mesh.indices,
+        }
+    }
 }
 
 /// The ground of one frame: the meshes of the tiles it draws, as drawn.
@@ -78,17 +93,34 @@ impl Ground {
     /// The ground `stitching` draws for `selection`, as last planned
     /// ([`Stitching::frame`]). Tiles it does not hold are not ground.
     pub fn of(stitching: &Stitching, selection: &[TileKey]) -> Self {
-        let scheme = GeographicTilingScheme::default();
         let tiles = selection
             .iter()
             .filter_map(|key| {
                 let (origin, mesh) = stitching.drawn(key)?;
-                let (level, x, y) = TileId(key.id).terrain_coord();
-                Some(Drawn {
-                    rect: scheme.tile_rect(TileCoord::new(level, x, y)),
+                Some(Drawn::of(key, origin, mesh))
+            })
+            .collect();
+        Self { tiles }
+    }
+
+    /// The ground `stitching` holds for `selection`, unstitched: each tile
+    /// as it entered, whatever was last planned.
+    pub fn unstitched(stitching: &Stitching, selection: &[TileKey]) -> Self {
+        let tiles = selection
+            .iter()
+            .filter_map(|key| {
+                let (origin, mesh) = stitching.held(key)?;
+                Some(Drawn::of(
+                    key,
                     origin,
-                    mesh,
-                })
+                    DecodedMesh {
+                        positions: mesh.positions.clone(),
+                        normals: None,
+                        uvs: None,
+                        indices: mesh.indices.clone(),
+                        material: Default::default(),
+                    },
+                ))
             })
             .collect();
         Self { tiles }
@@ -101,6 +133,17 @@ impl Ground {
 
     pub fn is_empty(&self) -> bool {
         self.tiles.is_empty()
+    }
+
+    /// The bytes the meshes it is made of take.
+    pub fn heap_bytes(&self) -> usize {
+        self.tiles
+            .iter()
+            .map(|t| {
+                std::mem::size_of_val(t.positions.as_slice())
+                    + std::mem::size_of_val(t.indices.as_slice())
+            })
+            .sum()
     }
 
     /// The height of the drawn ground at `lon`, `lat` (radians): where a
@@ -122,17 +165,17 @@ impl Ground {
                     && lat >= t.rect.south - ON
                     && lat <= t.rect.north + ON
             })
-            .filter_map(|t| first_hit(&t.mesh, top - t.origin, down))
+            .filter_map(|t| first_hit(&t.positions, &t.indices, top - t.origin, down))
             .map(|along| ABOVE_M - along)
             .reduce(f64::max)
     }
 }
 
-/// How far along `dir` from `from` the ray first meets one of `mesh`'s
-/// triangles (both sides), in the mesh's frame.
-fn first_hit(mesh: &DecodedMesh, from: DVec3, dir: DVec3) -> Option<f64> {
-    let p = |i: u32| DVec3::from(mesh.positions[i as usize].map(f64::from));
-    mesh.indices
+/// How far along `dir` from `from` the ray first meets one of the
+/// triangles `indices` makes of `positions` (both sides), in their frame.
+fn first_hit(positions: &[[f32; 3]], indices: &[u32], from: DVec3, dir: DVec3) -> Option<f64> {
+    let p = |i: u32| DVec3::from(positions[i as usize].map(f64::from));
+    indices
         .as_chunks::<3>()
         .0
         .iter()

@@ -6,12 +6,12 @@
 //! Everything the C ABI exposes is a thin projection of what is here, so this
 //! module is testable in plain Rust without going through the boundary.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use glam::DVec3;
-use tuile_core::content::{DecodedMesh, DecodedTileContent, TileContent};
+use tuile_core::content::{DecodedTileContent, TileContent};
 use tuile_core::drive::SceneState;
 use tuile_core::protocol::{ClientMessage, GeometryStream, ServerMessage, StreamError};
 use tuile_core::runtime::in_process_with;
@@ -590,16 +590,15 @@ pub(crate) struct Live {
     /// selection is known to answer the current camera rather than the
     /// previous one.
     generation: u64,
-    /// The terrain mesh of every resident tile, as it came, when the session
-    /// is asked to keep it ([`Session::keep_ground`]): what
+    /// What is kept of every resident tile's terrain, when the session is
+    /// asked to keep it ([`Session::keep_ground`]): what
     /// [`Session::ground`] draws the ground from, whatever `finish` lets go.
-    grounds: Option<HashMap<TileId, (DVec3, Arc<DecodedMesh>)>>,
-    /// The ground last drawn, tile by tile, and how it was prepared: a tile
-    /// selected again is not prepared again.
-    prepared: (
-        Option<tuile_film::ground::Prepare>,
-        HashMap<TileId, tuile_film::Mesh>,
-    ),
+    grounds: Option<Grounds>,
+    /// The ground last drawn, tile by tile, prepared and held for
+    /// stitching: a tile selected again is not prepared again.
+    drawn: Drawn,
+    /// The bytes of the ground the last [`Session::ground`] returned.
+    ground_built: usize,
     /// Kept alive for as long as the session: dropping it ends the server.
     _server: std::thread::JoinHandle<()>,
 }
@@ -707,7 +706,7 @@ impl Session {
     /// session.
     pub fn keep_ground(&mut self) {
         if let Source::Live(live) = &mut self.0 {
-            live.grounds.get_or_insert_with(HashMap::new);
+            live.grounds.get_or_insert_with(Grounds::default);
         }
     }
 
@@ -733,38 +732,86 @@ impl Session {
             .selected()
             .iter()
             .map(|(tile, _)| *tile)
-            .filter(|tile| grounds.contains_key(tile))
+            .filter(|tile| grounds.kept.contains_key(tile))
             .collect();
-        // What the last ground drew and this one does not, let go; what it
-        // drew too, kept as it was prepared.
-        if live.prepared.0 != Some(how) {
-            live.prepared = (Some(how), HashMap::new());
+        let key = |tile: TileId| tuile_film::TileKey {
+            id: tile.0,
+            drape: 0,
+        };
+        let drawn = &mut live.drawn;
+        if drawn.how != Some(how) {
+            *drawn = Drawn {
+                how: Some(how),
+                ..Drawn::default()
+            };
         }
-        live.prepared.1.retain(|tile, _| selected.contains(tile));
-        let mut stitching = tuile_film::stitching::Stitching::default();
+        // What the last ground drew and this one does not, let go — and a
+        // tile that came again since, prepared again; what it drew too,
+        // kept as it was prepared.
+        let wanted: HashSet<TileId> = selected.iter().copied().collect();
+        let gone: Vec<TileId> = drawn
+            .entered
+            .iter()
+            .filter(|(tile, arrival)| {
+                !wanted.contains(*tile) || grounds.kept.get(*tile).map(|(a, _)| a) != Some(*arrival)
+            })
+            .map(|(tile, _)| *tile)
+            .collect();
+        for tile in gone {
+            drawn.entered.remove(&tile);
+            drawn.stitching.leave(&key(tile));
+        }
         let mut keys = Vec::with_capacity(selected.len());
         for tile in selected {
-            let mesh = live.prepared.1.entry(tile).or_insert_with(|| {
-                let (origin, mesh) = &grounds[&tile];
-                let mesh = tuile_film::stitching::encoded(mesh, origin.to_array(), [1.0; 4]);
-                tuile_film::ground::prepared(mesh, how).0
-            });
-            let key = tuile_film::TileKey {
-                id: tile.0,
-                drape: 0,
-            };
-            let source = live
-                .resident
-                .get(&tile)
-                .and_then(|g| g.refs.as_ref())
-                .map(|refs| u32::from(refs.terrain.level));
-            stitching.enter(key, source, mesh);
-            keys.push(key);
+            if let (Some((arrival, kept)), false) =
+                (grounds.kept.get(&tile), drawn.entered.contains_key(&tile))
+            {
+                let mesh = tuile_film::stitching::encoded(
+                    &kept.mesh(tile),
+                    kept.origin().to_array(),
+                    [1.0; 4],
+                );
+                let mut mesh = tuile_film::ground::prepared(mesh, how).0;
+                // Heights read no normals, and nothing a vertex is stitched
+                // by depends on them.
+                mesh.normals = Vec::new();
+                let source = live
+                    .resident
+                    .get(&tile)
+                    .and_then(|g| g.refs.as_ref())
+                    .map(|refs| u32::from(refs.terrain.level));
+                drawn.stitching.enter(key(tile), source, &mesh);
+                drawn.entered.insert(tile, *arrival);
+            }
+            keys.push(key(tile));
         }
-        if stitch {
-            stitching.frame(&keys);
-        }
-        Some(tuile_film::ground::Ground::of(&stitching, &keys))
+        let ground = if stitch {
+            drawn.stitching.frame(&keys);
+            tuile_film::ground::Ground::of(&drawn.stitching, &keys)
+        } else {
+            tuile_film::ground::Ground::unstitched(&drawn.stitching, &keys)
+        };
+        live.ground_built = ground.heap_bytes();
+        tracing::debug!(memory = ?self.ground_memory(), "ground");
+        Some(ground)
+    }
+
+    /// The bytes the ground a camera is kept over takes: what is kept of
+    /// every resident tile, what is prepared of the selected ones, and what
+    /// the last [`Self::ground`] built on them. `None` where
+    /// [`Self::ground`] answers none.
+    pub fn ground_memory(&self) -> Option<GroundMemory> {
+        let Source::Live(live) = &self.0 else {
+            return None;
+        };
+        let grounds = live.grounds.as_ref()?;
+        Some(GroundMemory {
+            kept_tiles: grounds.kept.len(),
+            kept_bytes: grounds.kept.values().map(|(_, k)| k.heap_bytes()).sum(),
+            prepared_tiles: live.drawn.entered.len(),
+            prepared_bytes: live.drawn.stitching.heap_bytes(),
+            drawn_bytes: live.ground_built,
+        })
     }
 
     /// Resolves one frame for the given views.
@@ -818,6 +865,40 @@ impl Session {
     ) -> Result<Frame, FrameError> {
         self.frame(vec![pose_view(pose, viewport)])
     }
+}
+
+/// The bytes the ground a camera is kept over takes
+/// ([`Session::ground_memory`]): vertices and indices, not the maps' own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GroundMemory {
+    /// Every resident tile's terrain, as kept for [`Session::ground`].
+    pub kept_tiles: usize,
+    pub kept_bytes: usize,
+    /// The tiles last drawn, as prepared (skirts, smoothing) and held for
+    /// stitching — kept from one ground to the next.
+    pub prepared_tiles: usize,
+    pub prepared_bytes: usize,
+    /// The ground it returned, which its caller holds.
+    pub drawn_bytes: usize,
+}
+
+/// What is kept of the resident tiles' terrain ([`Session::keep_ground`]).
+#[derive(Default)]
+struct Grounds {
+    /// Each tile's, with the arrival it came by.
+    kept: HashMap<TileId, (u64, crate::ground::Kept)>,
+    /// Counts the tiles that came, so that one that came again is told from
+    /// the one before it.
+    arrivals: u64,
+}
+
+/// The ground last drawn ([`Session::ground`]): each tile prepared as
+/// `how` says, held for stitching, with the arrival it was prepared from.
+#[derive(Default)]
+struct Drawn {
+    how: Option<tuile_film::ground::Prepare>,
+    stitching: tuile_film::stitching::Stitching,
+    entered: HashMap<TileId, u64>,
 }
 
 /// A tape pose as the traversal's own camera.
@@ -923,7 +1004,8 @@ impl Live {
             scene: SceneState::default(),
             generation: 0,
             grounds: None,
-            prepared: (None, HashMap::new()),
+            drawn: Drawn::default(),
+            ground_built: 0,
             _server: server_thread,
         })
     }
@@ -1131,7 +1213,7 @@ async fn converge(
     stream: &mut tuile_core::protocol::InProcessStream,
     scene: &mut SceneState,
     resident: &mut HashMap<TileId, Arc<TileGeometry>>,
-    mut grounds: Option<&mut HashMap<TileId, (DVec3, Arc<DecodedMesh>)>>,
+    mut grounds: Option<&mut Grounds>,
     memo: Arc<TextureMemo>,
     dataset: &str,
     bake_max_size: u32,
@@ -1151,8 +1233,12 @@ async fn converge(
     // and `resident` is a map. A frame converges once the server says so AND
     // every tile it sent is finished.
     let pool = finish_pool();
-    let mut finishing: tokio::task::JoinSet<(TileId, u64, TileGeometry)> =
-        tokio::task::JoinSet::new();
+    let mut finishing: tokio::task::JoinSet<(
+        TileId,
+        u64,
+        TileGeometry,
+        Option<crate::ground::Kept>,
+    )> = tokio::task::JoinSet::new();
     // A tile evicted — or re-sent — while it is being finished must not come
     // back from a stale task: each arrival gets a number, and only the latest
     // is taken in.
@@ -1166,10 +1252,14 @@ async fn converge(
         tokio::select! {
             finished = finishing.join_next(), if !finishing.is_empty() => {
                 match finished {
-                    Some(Ok((tile, arrival, geometry))) => {
+                    Some(Ok((tile, arrival, geometry, kept))) => {
                         if arrivals.get(&tile) == Some(&arrival) {
                             arrivals.remove(&tile);
                             resident.insert(tile, Arc::new(geometry));
+                            if let (Some(grounds), Some(kept)) = (grounds.as_deref_mut(), kept) {
+                                grounds.arrivals += 1;
+                                grounds.kept.insert(tile, (grounds.arrivals, kept));
+                            }
                         }
                     }
                     // A panicking finish is a bug, not a missing tile to wait
@@ -1203,25 +1293,7 @@ async fn converge(
                         content: TileContent::Decoded(decoded),
                         ..
                     } => {
-                        // The mesh as it came, before a finish by identity
-                        // lets it go: the ground a camera is kept over.
-                        if let (Some(grounds), Some(mesh)) =
-                            (grounds.as_deref_mut(), decoded.meshes.first())
-                        {
-                            grounds.insert(
-                                tile,
-                                (
-                                    decoded.local_origin_ecef,
-                                    Arc::new(DecodedMesh {
-                                        positions: mesh.positions.clone(),
-                                        normals: None,
-                                        uvs: mesh.uvs.clone(),
-                                        indices: mesh.indices.clone(),
-                                        material: Default::default(),
-                                    }),
-                                ),
-                            );
-                        }
+                        let keep_ground = grounds.is_some();
                         next_arrival += 1;
                         arrivals.insert(tile, next_arrival);
                         let arrival = next_arrival;
@@ -1229,7 +1301,19 @@ async fn converge(
                         let provenance = provenance.clone();
                         let (done, result) = tokio::sync::oneshot::channel();
                         pool.spawn(move || {
-                            let _ = done.send(finish_tile_as(
+                            // The mesh as it came, before a finish by
+                            // identity lets it go: the ground a camera is
+                            // kept over. Kept on the pool, beside the
+                            // finish, rather than on the thread that
+                            // receives the stream.
+                            let kept = decoded
+                                .meshes
+                                .first()
+                                .filter(|_| keep_ground)
+                                .map(|mesh| {
+                                    crate::ground::Kept::of(tile, decoded.local_origin_ecef, mesh)
+                                });
+                            let geometry = finish_tile_as(
                                 &memo,
                                 &dataset,
                                 tile,
@@ -1237,11 +1321,13 @@ async fn converge(
                                 bake_max_size,
                                 provenance.as_deref(),
                                 finish,
-                            ));
+                            );
+                            let _ = done.send((geometry, kept));
                         });
                         finishing.spawn(async move {
-                            let geometry = result.await.expect("a tile finish panicked");
-                            (tile, arrival, geometry)
+                            let (geometry, kept) =
+                                result.await.expect("a tile finish panicked");
+                            (tile, arrival, geometry, kept)
                         });
                     }
                     ServerMessage::Evict { tiles } => {
@@ -1249,7 +1335,7 @@ async fn converge(
                             arrivals.remove(&tile);
                             resident.remove(&tile);
                             if let Some(grounds) = grounds.as_deref_mut() {
-                                grounds.remove(&tile);
+                                grounds.kept.remove(&tile);
                             }
                         }
                     }
