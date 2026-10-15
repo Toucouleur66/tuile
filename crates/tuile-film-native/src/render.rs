@@ -23,8 +23,8 @@ use tuile_film::from_store::{compose, imagery_texture, is_baked, terrain_mesh};
 use tuile_film::smoothing::Smooth;
 use tuile_film::stitching::Stitching;
 use tuile_film::{
-    refs_of, texture_of_span, Content, Cursor, Eye, FrameCamera, Look, Mesh, OverlayCamera,
-    OverlayMesh, Overlays, Pack, Stereo, TileKey,
+    refs_of, texture_of_span, Content, Cursor, Eye, FrameCamera, FrameLight, Look, Mesh,
+    OverlayCamera, OverlayMesh, Overlays, Pack, Stereo, TileKey,
 };
 use tuile_film_gpu::{
     DrapeLayer, FilmGpu, LayerCorner, LayerField, LayerGrade, Settings, Shot, TileMesh,
@@ -328,8 +328,9 @@ async fn read_back(film: &FilmGpu, buffer: &wgpu::Buffer) -> Result<Vec<u8>, Err
 
 /// Renders `film` as `order` says, each picture to `sink`, `observer` told
 /// of everything. `overlays` is asked, once a frame — for both eyes of a
-/// stereo film — for what the frame shows beside the ground; `&mut ()` has
-/// nothing to show.
+/// stereo film — for what the frame shows beside the ground and for the
+/// light it is lit by ([`Overlays::light`]); `&mut ()` has nothing to show
+/// and leaves the light to `order.look`.
 pub async fn render(
     sources: &Sources,
     film: &Film,
@@ -450,6 +451,8 @@ pub async fn render(
     let mut textures: HashMap<(u8, u32, u32), (wgpu::Texture, bool)> = HashMap::new();
     // The frame's overlays, the same allocation from one frame to the next.
     let mut shapes = Vec::new();
+    // The light of a frame whose host does not place it: the order's.
+    let ordered_light = FrameLight::of(&look);
     let mut index = 0u32;
 
     for file in &film.packs {
@@ -1003,6 +1006,10 @@ pub async fn render(
                 }
             }
             timings.stitch += ms(t);
+            // The frame's light, before anything of the frame is drawn or
+            // fitted — the sun's map included — and the same for both eyes:
+            // the host's when it places it, else the order's.
+            gpu.set_light(overlays.light(diff.frame).unwrap_or(ordered_light));
             let camera = FrameCamera::of(&diff.view, aspect);
             let pair = stereo.as_ref().map(|stereo| stereo.eyes(&camera));
             // The frame's overlays, once for every picture of it: made for

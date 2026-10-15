@@ -209,6 +209,47 @@ impl Look {
         let cos = normal.dot(self.to_sun).max(0.0);
         albedo * (self.world + self.sun * cos)
     }
+
+    /// This look under `light`: its sun's place and strength and its dome
+    /// are the light's, everything else is the look's own. A light whose
+    /// direction has no length leaves the sun where the look has it.
+    pub fn lit_by(self, light: FrameLight) -> Self {
+        Self {
+            to_sun: light.to_sun.try_normalize().unwrap_or(self.to_sun),
+            sun: light.sun,
+            world: light.world,
+            ..self
+        }
+    }
+}
+
+/// The light of one frame, as a host places it: where the sun stands and
+/// what it and the dome give. A film is lit by its look from its first frame
+/// to its last unless its host says otherwise frame by frame
+/// ([`crate::Overlays::light`]) — which is how a sun moves across a film
+/// rather than jumping between the segments it is rendered in.
+///
+/// Only the light: exposure, contrast and saturation stay the look's, so a
+/// film's grade does not follow the hour.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameLight {
+    /// Towards the sun, ECEF axes; normalised when it is applied.
+    pub to_sun: Vec3,
+    /// The sun's strength, linear RGB, as [`Look::sun`].
+    pub sun: Vec3,
+    /// The dome's radiance, linear RGB, as [`Look::world`].
+    pub world: Vec3,
+}
+
+impl FrameLight {
+    /// The light `look` already has.
+    pub fn of(look: &Look) -> Self {
+        Self {
+            to_sun: look.to_sun,
+            sun: look.sun,
+            world: look.world,
+        }
+    }
 }
 
 /// The direction *towards* a Blender sun lamp with this `rotation_euler`.
@@ -224,6 +265,40 @@ pub fn blender_sun(euler_xyz: Vec3) -> Vec3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_frames_light_replaces_the_looks_light_and_nothing_else() {
+        let look = Look {
+            exposure_ev: 0.3,
+            contrast: 1.2,
+            saturation: 0.9,
+            shadow: 0.7,
+            ..Look::cycles_film()
+        };
+        // The look's own light gives the look back, bit for bit.
+        assert_eq!(look.lit_by(FrameLight::of(&look)), look);
+        let light = FrameLight {
+            to_sun: Vec3::new(0.0, 3.0, 4.0),
+            sun: Vec3::new(2.0, 1.5, 1.0),
+            world: Vec3::new(0.2, 0.3, 0.5),
+        };
+        let lit = look.lit_by(light);
+        assert!((lit.to_sun - Vec3::new(0.0, 0.6, 0.8)).length() < 1e-6);
+        assert_eq!((lit.sun, lit.world), (light.sun, light.world));
+        let unlit = Look {
+            to_sun: look.to_sun,
+            sun: look.sun,
+            world: look.world,
+            ..lit
+        };
+        assert_eq!(unlit, look, "only the light moves");
+        // A direction of no length keeps the sun where it was.
+        let nowhere = look.lit_by(FrameLight {
+            to_sun: Vec3::ZERO,
+            ..light
+        });
+        assert_eq!(nowhere.to_sun, look.to_sun);
+    }
 
     #[test]
     fn an_unrotated_sun_is_overhead() {

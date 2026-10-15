@@ -14,7 +14,7 @@
 
 use tuile_pack::BakedView;
 
-use crate::{Eye, EyePair, FrameCamera};
+use crate::{Eye, EyePair, FrameCamera, FrameLight};
 
 /// What a mesh is tested against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -217,12 +217,23 @@ impl OverlayCamera {
     }
 }
 
-/// The overlays of a film, asked for frame by frame.
+/// The overlays of a film, asked for frame by frame — and, when the host
+/// places it, the frame's light.
 pub trait Overlays {
     /// Adds to `out` what `frame` shows beside the ground, once a frame —
     /// for both eyes of a stereo film. `camera` is the frame's; `out`
     /// comes in empty.
     fn frame(&mut self, frame: u32, camera: &OverlayCamera, out: &mut Vec<OverlayMesh>);
+
+    /// The light `frame` is lit by, asked once a frame before anything of
+    /// it is drawn — before its overlays, and before the sun's map is
+    /// fitted, so that the shadows fall from this sun — and shared by both
+    /// eyes of a stereo film. `None`, the default: the film's look, as
+    /// ordered.
+    fn light(&mut self, frame: u32) -> Option<FrameLight> {
+        let _ = frame;
+        None
+    }
 }
 
 /// No overlays.
@@ -241,6 +252,11 @@ mod tests {
             indices: vec![0, 1, 2],
             ..OverlayMesh::default()
         }
+    }
+
+    #[test]
+    fn a_host_that_says_nothing_of_the_light_leaves_it_to_the_look() {
+        assert_eq!(().light(7), None);
     }
 
     #[test]

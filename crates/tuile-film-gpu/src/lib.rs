@@ -52,7 +52,7 @@ use std::collections::HashMap;
 
 use glam::{DVec3, Vec3};
 use tuile_film::{
-    Eye, EyePair, FrameCamera, Look, OverlayBlend, OverlayDepth, OverlayMesh, TileKey,
+    Eye, EyePair, FrameCamera, FrameLight, Look, OverlayBlend, OverlayDepth, OverlayMesh, TileKey,
 };
 use wgpu::util::DeviceExt;
 
@@ -1429,6 +1429,13 @@ impl FilmGpu {
 
     pub fn settings(&self) -> &Settings {
         &self.settings
+    }
+
+    /// Lights what is drawn from now on by `light`: the sun's place and
+    /// strength and the dome, the rest of the look unchanged. The sun's map
+    /// is fitted afresh for every picture, so the shadows follow it.
+    pub fn set_light(&mut self, light: FrameLight) {
+        self.settings.look = self.settings.look.lit_by(light);
     }
 
     /// How fine the shadows of the frame last recorded are: the metres of
