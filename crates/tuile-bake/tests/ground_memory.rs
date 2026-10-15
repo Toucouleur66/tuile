@@ -11,19 +11,19 @@
 //! and as drawn plainly, and its height read on a grid of places around the
 //! eye.
 //!
-//! The heights are compared, bit for bit, with the ones written in
-//! `fixtures/ground_heights.txt`: what this ground answered before the way
-//! it is kept changed. A camera's placement is a function of these numbers
-//! and a film of its placement, so a ground kept more cheaply has to answer
-//! exactly the same ones. `TUILE_WRITE_GROUND_HEIGHTS=1` writes the file
-//! instead — only ever from a tree whose ground is the one to compare with.
+//! The heights are compared, bit for bit, with those of the ground drawn
+//! the way it was before the meshes were kept small — from every mesh as it
+//! came, prepared and stitched afresh — on the same session, the same
+//! selection, in the same run: whatever order the tiles arrive in, the two
+//! are drawn from one resident set. A camera's placement is a function of
+//! these numbers and a film of its placement, so a ground kept more cheaply
+//! has to answer exactly the same ones.
 //!
 //! What the ground takes, frame by frame, is printed (`--nocapture`).
 
 #[path = "../../tuile-terrain/tests/support/mod.rs"]
 mod support;
 
-use std::fmt::Write as _;
 use std::sync::Arc;
 
 use glam::DVec3;
@@ -159,32 +159,31 @@ fn mib(bytes: usize) -> f64 {
 }
 
 #[test]
-fn the_ground_kept_answers_the_heights_it_answered() {
-    // One fetch at a time, so that the selection is the same run to run
-    // (see `projection_bake.rs`). The only test in this binary.
-    std::env::set_var("TUILE_FETCHES", "1");
+fn the_ground_kept_small_answers_the_heights_of_the_meshes_as_they_came() {
     let mut config = GlobeConfig::new("");
     config.sources = Some(SourcesHandle(Arc::new(MadeUp)));
     config.session.traversal.maximum_screen_space_error = SSE;
     config.session.finish = Finish::Identity;
     let mut session = Session::globe(config).expect("a globe");
-    session.keep_ground();
+    session.keep_ground_and_meshes();
 
-    let mut heights = String::new();
-    let mut read = 0usize;
+    let (mut read, mut differing) = (0usize, 0usize);
     for i in 0..FRAMES {
         let frame = session.frame_for_pose(&pose(i), VIEWPORT).expect("a frame");
         for (k, (how, stitch)) in DRAWN.iter().enumerate() {
             let ground = session.ground(*how, *stitch).expect("kept");
+            let as_it_came = session
+                .ground_as_it_came(*how, *stitch)
+                .expect("the meshes kept");
+            assert_eq!(ground.len(), as_it_came.len(), "frame {i} ground {k}");
+            assert!(!ground.is_empty(), "frame {i} ground {k}");
             let memory = session.ground_memory().expect("kept");
             eprintln!(
-                "frame {i} ground {k}: {} tiles drawn of {} resident | kept {:.2} MiB \
-                 ({} tiles), prepared and stitched {:.2} MiB ({} tiles), \
-                 drawn {:.2} MiB",
+                "frame {i} ground {k}: {} tiles drawn of {} resident | kept {:.2} MiB, \
+                 prepared and stitched {:.2} MiB ({} tiles), drawn {:.2} MiB",
                 frame.tiles.len(),
                 memory.kept_tiles,
                 mib(memory.kept_bytes),
-                memory.kept_tiles,
                 mib(memory.prepared_bytes),
                 memory.prepared_tiles,
                 mib(memory.drawn_bytes),
@@ -192,42 +191,21 @@ fn the_ground_kept_answers_the_heights_it_answered() {
             // A grid of places round the point under the eye: near, where
             // the ground is fine, and up to a few kilometres off.
             let (lat0, lon0) = ((LAT + f64::from(i) * 0.003).to_radians(), LON.to_radians());
-            let _ = write!(heights, "{i} {k}");
+            let f = |n: u32| (f64::from(n) / f64::from(GRID - 1) - 0.5) * 0.0012;
             for a in 0..GRID {
                 for b in 0..GRID {
-                    let f = |n: u32| (f64::from(n) / f64::from(GRID - 1) - 0.5) * 0.0012;
-                    let h = ground.height_at(lon0 + f(a) * 1.6, lat0 + f(b) + 0.0004);
-                    read += usize::from(h.is_some());
-                    let _ = match h {
-                        Some(h) => write!(heights, " {:016x}", h.to_bits()),
-                        None => write!(heights, " -"),
-                    };
+                    let (lon, lat) = (lon0 + f(a) * 1.6, lat0 + f(b) + 0.0004);
+                    let (now, then) = (ground.height_at(lon, lat), as_it_came.height_at(lon, lat));
+                    read += usize::from(then.is_some());
+                    differing += usize::from(now.map(f64::to_bits) != then.map(f64::to_bits));
                 }
             }
-            heights.push('\n');
         }
     }
     assert!(read > 0, "the ground answered somewhere");
-
-    let path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ground_heights.txt");
-    if std::env::var_os("TUILE_WRITE_GROUND_HEIGHTS").is_some() {
-        std::fs::create_dir_all(path.parent().expect("a directory")).expect("directory");
-        std::fs::write(&path, &heights).expect("written");
-        eprintln!("wrote {read} heights to {}", path.display());
-        return;
-    }
-    let before = std::fs::read_to_string(&path).expect("the heights written before");
-    let mut differing = 0usize;
-    for (now, then) in heights.lines().zip(before.lines()) {
-        for (a, b) in now.split(' ').zip(then.split(' ')) {
-            differing += usize::from(a != b);
-        }
-    }
-    assert_eq!(heights.lines().count(), before.lines().count());
     assert_eq!(
         differing, 0,
-        "{differing} heights differ from those written before ({read} read)"
+        "{differing} heights differ from those of the meshes as they came ({read} read)"
     );
-    eprintln!("{read} heights read, every one as before");
+    eprintln!("{read} heights read, every one as from the meshes as they came");
 }

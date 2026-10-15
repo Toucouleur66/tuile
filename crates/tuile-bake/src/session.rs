@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use glam::DVec3;
-use tuile_core::content::{DecodedTileContent, TileContent};
+use tuile_core::content::{DecodedMesh, DecodedTileContent, TileContent};
 use tuile_core::drive::SceneState;
 use tuile_core::protocol::{ClientMessage, GeometryStream, ServerMessage, StreamError};
 use tuile_core::runtime::in_process_with;
@@ -710,6 +710,63 @@ impl Session {
         }
     }
 
+    /// [`Self::keep_ground`], and beside what it keeps, every mesh as it
+    /// came — the whole of it, which is what keeping the ground used to
+    /// cost — for [`Self::ground_as_it_came`]. For tests that compare the
+    /// two grounds on one session; never for a bake.
+    #[doc(hidden)]
+    pub fn keep_ground_and_meshes(&mut self) {
+        if let Source::Live(live) = &mut self.0 {
+            live.grounds
+                .get_or_insert_with(Grounds::default)
+                .as_it_came
+                .get_or_insert_with(HashMap::new);
+        }
+    }
+
+    /// The ground [`Self::ground`] draws, drawn the way it was before the
+    /// meshes were kept small: from the meshes as they came, each tile
+    /// prepared again and stitched on a stitching of its own. The same
+    /// selection, the same functions; `None` unless the session was asked
+    /// to [keep the meshes](Self::keep_ground_and_meshes).
+    #[doc(hidden)]
+    pub fn ground_as_it_came(
+        &self,
+        how: tuile_film::ground::Prepare,
+        stitch: bool,
+    ) -> Option<tuile_film::ground::Ground> {
+        let Source::Live(live) = &self.0 else {
+            return None;
+        };
+        let grounds = live.grounds.as_ref()?;
+        let meshes = grounds.as_it_came.as_ref()?;
+        let mut stitching = tuile_film::stitching::Stitching::default();
+        let mut keys = Vec::new();
+        for (tile, _) in live.scene.selected() {
+            let (Some((origin, mesh)), true) = (meshes.get(tile), grounds.kept.contains_key(tile))
+            else {
+                continue;
+            };
+            let key = tuile_film::TileKey {
+                id: tile.0,
+                drape: 0,
+            };
+            let mesh = tuile_film::stitching::encoded(mesh, origin.to_array(), [1.0; 4]);
+            let mesh = tuile_film::ground::prepared(mesh, how).0;
+            let source = live
+                .resident
+                .get(tile)
+                .and_then(|g| g.refs.as_ref())
+                .map(|refs| u32::from(refs.terrain.level));
+            stitching.enter(key, source, &mesh);
+            keys.push(key);
+        }
+        if stitch {
+            stitching.frame(&keys);
+        }
+        Some(tuile_film::ground::Ground::of(&stitching, &keys))
+    }
+
     /// The ground the last frame's selection draws, as a film's renderer
     /// draws it: each tile's mesh prepared as `how` says (skirts,
     /// smoothing), then stitched to its neighbours when `stitch` — the
@@ -890,6 +947,15 @@ struct Grounds {
     /// Counts the tiles that came, so that one that came again is told from
     /// the one before it.
     arrivals: u64,
+    /// Each tile's mesh as it came, when asked
+    /// ([`Session::keep_ground_and_meshes`]).
+    as_it_came: Option<HashMap<TileId, (DVec3, DecodedMesh)>>,
+}
+
+/// What the finish pool keeps of a tile's mesh for the ground.
+struct KeptTile {
+    kept: crate::ground::Kept,
+    as_it_came: Option<DecodedMesh>,
 }
 
 /// The ground last drawn ([`Session::ground`]): each tile prepared as
@@ -1233,12 +1299,8 @@ async fn converge(
     // and `resident` is a map. A frame converges once the server says so AND
     // every tile it sent is finished.
     let pool = finish_pool();
-    let mut finishing: tokio::task::JoinSet<(
-        TileId,
-        u64,
-        TileGeometry,
-        Option<crate::ground::Kept>,
-    )> = tokio::task::JoinSet::new();
+    let mut finishing: tokio::task::JoinSet<(TileId, u64, TileGeometry, Option<KeptTile>)> =
+        tokio::task::JoinSet::new();
     // A tile evicted — or re-sent — while it is being finished must not come
     // back from a stale task: each arrival gets a number, and only the latest
     // is taken in.
@@ -1257,8 +1319,13 @@ async fn converge(
                             arrivals.remove(&tile);
                             resident.insert(tile, Arc::new(geometry));
                             if let (Some(grounds), Some(kept)) = (grounds.as_deref_mut(), kept) {
+                                if let (Some(meshes), Some(mesh)) =
+                                    (grounds.as_it_came.as_mut(), kept.as_it_came)
+                                {
+                                    meshes.insert(tile, (kept.kept.origin(), mesh));
+                                }
                                 grounds.arrivals += 1;
-                                grounds.kept.insert(tile, (grounds.arrivals, kept));
+                                grounds.kept.insert(tile, (grounds.arrivals, kept.kept));
                             }
                         }
                     }
@@ -1294,6 +1361,8 @@ async fn converge(
                         ..
                     } => {
                         let keep_ground = grounds.is_some();
+                        let keep_meshes =
+                            grounds.as_ref().is_some_and(|g| g.as_it_came.is_some());
                         next_arrival += 1;
                         arrivals.insert(tile, next_arrival);
                         let arrival = next_arrival;
@@ -1310,8 +1379,19 @@ async fn converge(
                                 .meshes
                                 .first()
                                 .filter(|_| keep_ground)
-                                .map(|mesh| {
-                                    crate::ground::Kept::of(tile, decoded.local_origin_ecef, mesh)
+                                .map(|mesh| KeptTile {
+                                    kept: crate::ground::Kept::of(
+                                        tile,
+                                        decoded.local_origin_ecef,
+                                        mesh,
+                                    ),
+                                    as_it_came: keep_meshes.then(|| DecodedMesh {
+                                        positions: mesh.positions.clone(),
+                                        normals: None,
+                                        uvs: mesh.uvs.clone(),
+                                        indices: mesh.indices.clone(),
+                                        material: Default::default(),
+                                    }),
                                 });
                             let geometry = finish_tile_as(
                                 &memo,
@@ -1336,6 +1416,9 @@ async fn converge(
                             resident.remove(&tile);
                             if let Some(grounds) = grounds.as_deref_mut() {
                                 grounds.kept.remove(&tile);
+                                if let Some(meshes) = grounds.as_it_came.as_mut() {
+                                    meshes.remove(&tile);
+                                }
                             }
                         }
                     }
