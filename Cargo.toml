@@ -53,6 +53,7 @@ authors = ["lapoule.dev"]
 # Features are additive and unified across the graph: a feature listed here is
 # enabled wherever the dep is used — harmless for crates that don't need it.
 glam = { version = "0.33.1", features = ["serde"] }
+half = "2.7"
 # NREL's Solar Position Algorithm (Reda & Andreas 2003). Pre-1.0, in the
 # wasm path through tuile-atmosphere: see that crate's `sun` module for why
 # this one. libm, no std: the same bits on every target.

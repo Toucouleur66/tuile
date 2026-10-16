@@ -14,12 +14,21 @@
 //! for [`DAYLIGHT_EV100`]: an illumination at that EV100 with no
 //! compensation leaves the look's exposure as it is.
 //!
-//! # Provisional
+//! # Physical or provisional
 //!
-//! The atmosphere model that turns a sun's elevation and the air's state
-//! into these numbers is not written yet ([`ReferenceIllumination::provisional`]
-//! stands in for it). Until it is, the colour and strength of the light are
-//! the look's own constants, and only the sun's direction follows the hour.
+//! [`crate::LutAtmosphere::light`] works these numbers out from the air
+//! (Hillaire 2020). [`ReferenceIllumination::provisional`] stands in where
+//! no atmosphere is drawn: the colour and strength of the light are then the
+//! look's own constants, and only the sun's direction follows the hour.
+//!
+//! # How the camera meets the light
+//!
+//! Like a camera on automatic, but not all the way: its exposure makes up
+//! [`EXPOSURE_FOLLOWS`] of a light's difference from daylight, and never
+//! raises the picture by more than [`MAX_ADAPTATION_EV`] — dusk is darker
+//! than noon, and night is dim, not black. Its white balance goes
+//! [`ReferenceIllumination::WHITE_ADAPTATION`] of the way to the light's
+//! white: dawn and dusk stay warm (`docs/19-sky-atmosphere.md` §4.6).
 
 use glam::{DVec3, Vec3};
 
@@ -27,6 +36,13 @@ use glam::{DVec3, Vec3};
 /// 16" rule's 15. An illumination brighter than that is exposed down by the
 /// difference, a dimmer one up.
 pub const DAYLIGHT_EV100: f32 = 15.0;
+
+/// How much of a light's difference from daylight, in stops, the camera's
+/// exposure makes up.
+pub const EXPOSURE_FOLLOWS: f32 = 0.75;
+
+/// The most, in stops, a dim light's exposure is raised over daylight's.
+pub const MAX_ADAPTATION_EV: f32 = 4.0;
 
 /// What a moment's sun and sky give a scene, and how the camera meets it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -38,8 +54,9 @@ pub struct ReferenceIllumination {
     /// The sky's irradiance as an L1 spherical harmonic, its constants
     /// folded in: a surface of normal `n` (ECEF axes) receives
     /// `sky_sh[0] + sky_sh[1]·n.x + sky_sh[2]·n.y + sky_sh[3]·n.z`.
-    /// `sky_sh[0]` alone is the sky averaged over every facing — what a
-    /// renderer with one ambient term uses.
+    /// `sky_sh[0]` alone is the sky averaged over the facings of a wall all
+    /// round — what a renderer with one ambient term uses; level ground
+    /// receives `sky_sh[0] + sky_sh[·]·up`.
     pub sky_sh: [[f32; 3]; 4],
     /// The white the camera balances towards: the colour a white surface
     /// takes under this light. Equal channels: no cast.
@@ -59,9 +76,13 @@ pub struct ReferenceIllumination {
 }
 
 impl ReferenceIllumination {
-    /// The night floor the provisional illumination states: a tenth of
-    /// daylight.
-    pub const NIGHT_FLOOR: f32 = 0.1;
+    /// The night floor: a fiftieth of the reference daylight on level
+    /// ground — under the exposure's cap, a third of noon's brightness on
+    /// the picture.
+    pub const NIGHT_FLOOR: f32 = 0.02;
+
+    /// How far the camera's white balance goes towards a light's white.
+    pub const WHITE_ADAPTATION: f32 = 0.6;
 
     /// **Provisional**, until an atmosphere model computes the light: the
     /// sun at `to_sun_ecef`, and the light the renderer's look already
@@ -88,9 +109,11 @@ impl ReferenceIllumination {
     }
 
     /// Stops to add to a look exposed for daylight: the compensation, less
-    /// how much brighter than daylight the light is.
+    /// [`EXPOSURE_FOLLOWS`] of how much brighter than daylight the light is,
+    /// a dim light raised by [`MAX_ADAPTATION_EV`] at the most.
     pub fn exposure_offset_ev(&self) -> f32 {
-        self.compensation_ev - (self.ev100 - DAYLIGHT_EV100)
+        let metered = (self.ev100 - DAYLIGHT_EV100) * EXPOSURE_FOLLOWS;
+        self.compensation_ev - metered.max(-MAX_ADAPTATION_EV)
     }
 
     /// The camera's white balance, as gains on the picture's light: none
@@ -124,7 +147,18 @@ mod tests {
         let mut light = ReferenceIllumination::provisional(DVec3::Z, [1.0; 3], [1.0; 3]);
         light.ev100 = DAYLIGHT_EV100 + 2.0;
         light.compensation_ev = 0.5;
-        assert!((light.exposure_offset_ev() + 1.5).abs() < 1e-6);
+        assert!((light.exposure_offset_ev() - (0.5 - 2.0 * EXPOSURE_FOLLOWS)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_dim_light_is_exposed_up_to_the_cap_and_no_further() {
+        let mut light = ReferenceIllumination::provisional(DVec3::Z, [1.0; 3], [1.0; 3]);
+        light.ev100 = DAYLIGHT_EV100 - 2.0;
+        assert!((light.exposure_offset_ev() - 2.0 * EXPOSURE_FOLLOWS).abs() < 1e-6);
+        light.ev100 = DAYLIGHT_EV100 - 12.0;
+        assert_eq!(light.exposure_offset_ev(), MAX_ADAPTATION_EV);
+        // Darker than daylight on the picture, however dim.
+        assert!(light.exposure_offset_ev() < DAYLIGHT_EV100 - light.ev100);
     }
 
     #[test]

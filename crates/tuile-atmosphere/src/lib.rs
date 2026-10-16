@@ -23,7 +23,7 @@
 //! So: renderer-agnostic, engine-agnostic, and consumed by both. It computes
 //! parameters; a backend draws with them.
 //!
-//! ## The three pieces
+//! ## The pieces
 //!
 //! - [`sun`] — where the sun is at a stated instant. Everything else is
 //!   downstream of it, which is why a globe lit "at 18:00 UTC" needs this rather
@@ -32,6 +32,11 @@
 //!   a surface's colour, and the strongest depth cue a globe has.
 //! - [`illumination`] — what one moment's sun and sky give a scene, and how a
 //!   camera meets it: the per-frame contract a renderer is lit by.
+//! - [`hillaire`] — the physical atmosphere (Hillaire 2020): transmittance
+//!   and multiple-scattering tables, the sky and the air between eye and
+//!   ground marched over them, and a moment's [`ReferenceIllumination`]
+//!   worked out from them. [`params`] says what the air is made of and
+//!   which sphere it is laid on.
 //! - [`sky`] — the air with nothing behind it but space. A colour of its own,
 //!   drawn as a shell, turning over from blue through orange to dark with the
 //!   hour.
@@ -55,11 +60,17 @@
 //! scene.
 
 pub mod aerial;
+pub mod hillaire;
 pub mod illumination;
+pub mod params;
 pub mod sky;
 pub mod sun;
 
 pub use aerial::{AerialPerspective, WGSL};
-pub use illumination::{ReferenceIllumination, DAYLIGHT_EV100};
+pub use hillaire::{Calibration, LutAtmosphere, SkyLight};
+pub use illumination::{
+    ReferenceIllumination, DAYLIGHT_EV100, EXPOSURE_FOLLOWS, MAX_ADAPTATION_EV,
+};
+pub use params::{AtmosphereFrame, AtmosphereParams};
 pub use sky::SkyShell;
 pub use sun::{Sun, SunSeen};

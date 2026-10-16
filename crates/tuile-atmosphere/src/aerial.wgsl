@@ -32,7 +32,9 @@ const PI: f32 = 3.14159265358979;
 struct Air {
     /// Eye in render space (xyz), its height above ground (w).
     eye: vec4f,
-    /// Planet centre in render space (xyz), its radius (w).
+    /// Centre of the sphere osculating the ellipsoid under the eye, in render
+    /// space (xyz), its radius (w): lengths from it less the radius are
+    /// geodetic heights.
     earth: vec4f,
     /// Scattering per metre RGB (xyz), scale height (w).
     rayleigh: vec4f,

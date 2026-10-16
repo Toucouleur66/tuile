@@ -2,7 +2,7 @@
 // Copyright (c) lapoule.dev
 
 use glam::{DVec3, Vec3};
-use tuile_atmosphere::ReferenceIllumination;
+use tuile_atmosphere::{AtmosphereParams, ReferenceIllumination};
 
 /// How imagery's stored values are read before they are lit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,11 +157,36 @@ pub struct Look {
     /// look's own times what a frame's light adapts to. Not on
     /// the overlays: their colours are the display's already. One is none.
     pub white_balance: Vec3,
-    /// How turbid the air is, for an atmosphere model that reads it — the
-    /// Linke turbidity factor, 2 a clear sky, 6 a hazy one. Nothing reads it
-    /// yet: carried so that a host stating it frame by frame is heard as
-    /// soon as a model does. `None`: the model's own.
+    /// How turbid the air is, for the [`Look::atmosphere`] that reads it —
+    /// the air's whole optical depth over its molecules' alone, 2 a clear
+    /// sky, 6 a hazy one ([`AtmosphereParams::with_turbidity`]). `None`: the
+    /// atmosphere's own.
     pub turbidity: Option<f32>,
+    /// The physical atmosphere (Hillaire 2020, `docs/19-sky-atmosphere.md`),
+    /// or none — the default, the look's own lights and [`Look::haze`] as
+    /// they are.
+    ///
+    /// With one, a frame's light is worked out from the air
+    /// ([`tuile_atmosphere::LutAtmosphere::light`]): the sun's colour and
+    /// strength through it, the sky's light on every facing, the camera's
+    /// exposure and white balance — scaled so that a clear day's sun 45° up
+    /// lights level ground as [`Look::sun`] and [`Look::world`] do, which is
+    /// how the imagery was calibrated. The sky is drawn, the air between the
+    /// eye and the ground marched through, and [`Look::haze`] is not read.
+    /// Contrast, saturation and shadows stay the look's.
+    pub atmosphere: Option<AtmosphereParams>,
+    /// The reflectance of real ground that an imagery value of one stands
+    /// for, under a physical atmosphere: the air's own light (the sky, the
+    /// light it scatters between eye and ground) is drawn against ground as
+    /// bright as the imagery times this. Imagery is a photograph, not a
+    /// reflectance — read as one, dark satellite imagery is ground a
+    /// fraction as bright as it is, and the air a veil over it.
+    ///
+    /// Measured on decoded imagery (film 1557732, frame 4500: moorland and
+    /// conifers): mean linear value 0.012 under this look, where such
+    /// ground reflects about 0.08 of daylight — 6.5. Not read without
+    /// [`Look::atmosphere`].
+    pub reflectance: f32,
 }
 
 impl Default for Look {
@@ -179,6 +204,8 @@ impl Default for Look {
             haze: None,
             white_balance: Vec3::ONE,
             turbidity: None,
+            atmosphere: None,
+            reflectance: 6.5,
         }
     }
 }
@@ -205,6 +232,9 @@ impl Look {
         Self {
             exposure_ev: -1.5 + 2.3,
             imagery: Imagery::AsStored,
+            // The same ground's imagery read as stored: 0.11 where decoded
+            // it is 0.012.
+            reflectance: 0.7,
             contrast: 1.0,
             saturation: 1.0,
             ..Self::default()
@@ -263,9 +293,12 @@ impl Look {
 /// automatic exposure on top of the film's
 /// ([`ReferenceIllumination::exposure_offset_ev`]).
 ///
-/// Of the sky's irradiance the renderer reads only its average over every
-/// facing ([`ReferenceIllumination::sky_ambient`]) today, and of the air its
-/// haze's density; the turbidity is carried for the atmosphere model.
+/// Without a physical atmosphere ([`Look::atmosphere`]), the renderer reads
+/// of the sky's irradiance only its first term
+/// ([`ReferenceIllumination::sky_ambient`]), and of the air its haze's
+/// density. With one, the illumination is the atmosphere's: of a host's
+/// light only the sun's direction, the compensation and the air are heard
+/// — the turbidity, and the haze's density as the aerosols' extinction.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FrameLight {
     pub illumination: ReferenceIllumination,
@@ -345,7 +378,7 @@ mod tests {
         assert_eq!(lit.sun, Vec3::new(2.0, 1.5, 1.0));
         assert_eq!(lit.world, Vec3::new(0.2, 0.3, 0.5), "the sky's average");
         assert!(
-            (lit.exposure_ev - (0.3 + 0.5 - 1.0)).abs() < 1e-6,
+            (lit.exposure_ev - (0.3 + 0.5 - tuile_atmosphere::EXPOSURE_FOLLOWS)).abs() < 1e-6,
             "added: {}",
             lit.exposure_ev
         );

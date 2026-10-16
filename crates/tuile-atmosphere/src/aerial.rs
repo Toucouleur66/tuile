@@ -34,6 +34,8 @@ pub const WGSL: &str = include_str!("aerial.wgsl");
 use glam::DVec3;
 use tuile_core::geo::WGS84_A;
 
+use crate::params::AtmosphereFrame;
+
 /// Rayleigh scattering per metre at sea level, for R, G and B.
 ///
 /// Blue scatters about six times as strongly as red. That ratio is the whole of
@@ -78,7 +80,8 @@ const _: () = assert!(
 pub struct AerialPerspective {
     /// Eye in render space (xyz); its height above the surface (w).
     pub eye: [f32; 4],
-    /// The planet's centre in render space (xyz); its radius (w).
+    /// The centre of the sphere osculating the ellipsoid under the eye, in
+    /// render space (xyz); its radius (w).
     pub earth: [f32; 4],
     /// [`RAYLEIGH_SCATTERING`] (xyz); [`RAYLEIGH_SCALE_HEIGHT`] (w).
     pub rayleigh: [f32; 4],
@@ -124,10 +127,14 @@ impl AerialPerspective {
     /// protocol the geometry uses, for the same reason.
     pub fn new(eye_ecef: DVec3, render_origin: DVec3, sun: &Sun, strength: f32) -> Self {
         let eye_local = eye_ecef - render_origin;
-        let centre_local = -render_origin;
-        // Height above a *sphere*, not the ellipsoid: the two radii differ by
-        // 21 km, under 0.3% of either, and nothing here reads at that level.
-        let eye_height = (eye_ecef.length() - WGS84_A).max(0.0);
+        // The sphere that osculates the ellipsoid under the eye: distances
+        // to its centre less its radius are geodetic heights around the
+        // eye. A sphere of the equatorial radius about the Earth's centre
+        // put sea level ten kilometres under the ground at 43°N, and every
+        // height in the Pyrenees clamped to zero (`docs/19` §2, step 0).
+        let frame = AtmosphereFrame::at(tuile_core::geo::ecef_to_geodetic(eye_ecef));
+        let centre_local = frame.centre - render_origin;
+        let eye_height = frame.height(eye_ecef).max(0.0);
         let travel = sun.light_travel_direction();
         Self {
             eye: [
@@ -140,7 +147,7 @@ impl AerialPerspective {
                 centre_local.x as f32,
                 centre_local.y as f32,
                 centre_local.z as f32,
-                WGS84_A as f32,
+                frame.radius as f32,
             ],
             mie: [MIE_SCATTERING, MIE_SCALE_HEIGHT, MIE_ANISOTROPY, strength],
             sun: [travel.x as f32, travel.y as f32, travel.z as f32, 1.0],
@@ -261,6 +268,34 @@ mod tests {
         );
     }
 
+    /// `docs/19` §6, step 0: away from the equator the eye's height and the
+    /// ground's, as the shader measures them against the uniform's sphere,
+    /// are their heights over the ellipsoid — not over a sphere of the
+    /// equatorial radius, under which sea level at 43°N is ten kilometres
+    /// down and every height in the Pyrenees clamps to zero.
+    #[test]
+    fn heights_are_geodetic_at_43_north() {
+        let (lon, lat) = (0.5f64.to_radians(), 43.0f64.to_radians());
+        let eye = eye_at(lon, lat, 5_000.0);
+        let a = AerialPerspective::new(eye, eye, &noon(), 1.0);
+        assert!((a.eye[3] - 5_000.0).abs() < 1.0, "eye at {} m", a.eye[3]);
+        let centre = glam::Vec3::from_slice(&a.earth[0..3]);
+        for (height, dlat) in [(0.0, 0.0), (1_200.0, 0.2), (0.0, -0.25)] {
+            let ground = (eye_at(lon, lat + f64::to_radians(dlat), height) - eye).as_vec3();
+            // `ground_height` in `aerial.wgsl`, in f32.
+            let measured = (ground - centre).length() - a.earth[3];
+            assert!(
+                (measured - height as f32).abs() < 60.0,
+                "{height} m at {dlat}°: measured {measured}"
+            );
+        }
+        // So the air seen from 5 km over 30 km is clearer than at sea level.
+        let sea = AerialPerspective::new(eye_at(lon, lat, 0.0), eye, &noon(), 1.0);
+        let high = a.transmittance(f64::from(a.eye[3]), f64::from(a.eye[3]), 30_000.0);
+        let low = sea.transmittance(f64::from(sea.eye[3]), f64::from(sea.eye[3]), 30_000.0);
+        assert!(high[2] > low[2], "{high:?} against {low:?}");
+    }
+
     /// The whole point of render space: with the origin at the eye, the eye is
     /// at zero and the planet's centre is one radius away, both exactly
     /// representable. ECEF positions are what f32 cannot hold.
@@ -269,10 +304,12 @@ mod tests {
         let eye = eye_at(0.11, 0.81, 5_000.0);
         let a = AerialPerspective::new(eye, eye, &noon(), 1.0);
         assert_eq!([a.eye[0], a.eye[1], a.eye[2]], [0.0, 0.0, 0.0]);
+        // The sphere's centre is its radius and the eye's height away.
         let to_centre = f64::from(glam::Vec3::from_slice(&a.earth[0..3]).length());
+        let wanted = f64::from(a.earth[3]) + 5_000.0;
         assert!(
-            (to_centre - eye.length()).abs() < 1.0,
-            "the centre should sit one eye-radius away, got {to_centre}"
+            (to_centre - wanted).abs() < 2.0,
+            "the centre should sit {wanted} m away, got {to_centre}"
         );
     }
 

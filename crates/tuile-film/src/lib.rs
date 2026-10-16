@@ -41,7 +41,7 @@ pub use stereo::{
     DEFAULT_DIVERGENCE, MAX_DIVERGENCE,
 };
 pub use survey::{cameras, frame_tiles, CameraSample, TileInfo};
-pub use tuile_atmosphere::ReferenceIllumination;
+pub use tuile_atmosphere::{AtmosphereParams, ReferenceIllumination};
 pub use tuile_pack::{
     blob_start, fb, refs_of, BakedView, Content, Fnv1a, ImageryPlacement, Pack, PackError,
     StoreTile, TileRefs, PREAMBLE,
