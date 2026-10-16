@@ -4,7 +4,8 @@
 // Supersampled HDR → display pixels: box filter over the k×k block, sky where
 // no tile was drawn, exposure, then the sRGB curve ("Standard" view: no tone
 // mapping, a straight clip). The sky is the dome's one colour, or, for a
-// look that has air, runs from the horizon's colour to the zenith's.
+// look that has air, runs from the horizon's colour to the zenith's — or,
+// under a physical atmosphere, is read from the frame's sky-view table.
 //
 // A host's overlays, when the frame carries any, are laid over the picture
 // between the two: after its tone — they are display-linear, and no
@@ -22,6 +23,24 @@
 fn oetf(c: vec3f) -> vec3f {
     let x = clamp(c, vec3f(0.0), vec3f(1.0));
     return select(1.055 * pow(x, vec3f(1.0 / 2.4)) - 0.055, 12.92 * x, x <= vec3f(0.0031308));
+}
+
+// The physical sky along `d` from the frame's eye: the sky-view table,
+// what the night floor adds, and the sun's disc, darkened towards its limb.
+fn sky_seen(d: vec3f) -> vec3f {
+    let uv = sky_view_uv_of(d);
+    var sky = textureSampleLevel(sky_view_lut, lut_sampler, uv, 0.0).rgb
+        * atmosphere.illuminance.xyz + atmosphere.floor.xyz;
+    let n = normalize(d);
+    let apart = acos(clamp(dot(n, atmosphere.sun.xyz), -1.0, 1.0));
+    if (apart < SUN_ANGULAR_RADIUS) {
+        let x = apart / SUN_ANGULAR_RADIUS;
+        let limb = 1.0 - 0.6 * (1.0 - sqrt(max(1.0 - x * x, 0.0)));
+        let solid = 2.0 * ATMOSPHERE_PI * (1.0 - cos(SUN_ANGULAR_RADIUS));
+        let mu_s = dot(atmosphere.up.xyz, atmosphere.sun.xyz);
+        sky += atmosphere.illuminance.xyz * sunlight(atmosphere.sun.w, mu_s) * limb / solid;
+    }
+    return sky;
 }
 
 // Where the roll-off of highlights begins, in linear luminance.
@@ -53,7 +72,11 @@ fn present(@builtin(global_invocation_id) id: vec3u) {
                     let inside = towards * towards - (r - 6.35e6) * (r + 6.35e6) * dot(d, d);
                     hole = hole || (towards < 0.0 && inside > 0.0);
                 }
-                if (frame.haze.w != 0.0) {
+                if (atmosphere.shape.w != 0.0) {
+                    let ndc = (vec2f(s) + 0.5) / vec2f(frame.size.xy) * vec2f(2.0, -2.0)
+                        + vec2f(-1.0, 1.0);
+                    sum += sky_seen(frame.fwd.xyz + ndc.x * frame.right.xyz + ndc.y * frame.up.xyz);
+                } else if (frame.haze.w != 0.0) {
                     // The sample's own ray, as the resolve builds it.
                     let ndc = (vec2f(s) + 0.5) / vec2f(frame.size.xy) * vec2f(2.0, -2.0)
                         + vec2f(-1.0, 1.0);

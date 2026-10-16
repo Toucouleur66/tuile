@@ -128,8 +128,18 @@ fn resolve(@builtin(global_invocation_id) id: vec3u) {
         base = mix(vec3f(0.02, 0.02, 0.05), vec3f(0.55), smoothstep(0.6, 1.6, near));
     }
     let cos = max(dot(normal, frame.to_sun.xyz), 0.0);
-    var radiance = base * (frame.world.xyz + frame.sun.xyz * cos);
-    if (frame.shadow.x > 0.0 || frame.haze.w != 0.0) {
+    // The sky's light on this facing: the look's dome, and under a physical
+    // atmosphere the sky's gradient over it (an L1 harmonic) — a slope
+    // facing the sun's side of the sky receives more than one facing away.
+    var ambient = frame.world.xyz;
+    let physical = atmosphere.shape.w != 0.0;
+    if (physical) {
+        ambient += atmosphere.sh_x.xyz * normal.x + atmosphere.sh_y.xyz * normal.y
+            + atmosphere.sh_z.xyz * normal.z;
+        ambient = max(ambient, vec3f(0.0));
+    }
+    var radiance = base * (ambient + frame.sun.xyz * cos);
+    if (frame.shadow.x > 0.0 || frame.haze.w != 0.0 || physical) {
         // Where the ray meets the triangle, from the eye — held inside the
         // triangle. The raster says the pixel is on it; of a triangle seen
         // nearly edge-on, a skirt at a seam, the ray's own meeting with
@@ -152,7 +162,7 @@ fn resolve(@builtin(global_invocation_id) id: vec3u) {
             // A shadow takes the sun, and only the sun: the dome lights
             // shadowed ground as it lights any other.
             let sun = cos * (1.0 - frame.shadow.x * (1.0 - sunlit(p, normal)));
-            radiance = base * (frame.world.xyz + frame.sun.xyz * sun);
+            radiance = base * (ambient + frame.sun.xyz * sun);
         }
         if (known && frame.haze.w != 0.0) {
             // What the air leaves of the ground, and its own light for the
@@ -160,6 +170,16 @@ fn resolve(@builtin(global_invocation_id) id: vec3u) {
             // exactly as it was.
             let left = air_left(p);
             radiance = radiance * left + frame.horizon.xyz * (1.0 - left);
+        }
+        if (known && physical) {
+            // The air between the eye and the ground, marched over the
+            // tables: what it lets through, and the light it scatters
+            // towards the eye — with, at night, the floor's share of the
+            // sky's, so that far ground fades to the night sky.
+            let air = air_between(p);
+            radiance = radiance * air.transmittance
+                + air.inscattered * atmosphere.illuminance.xyz
+                + atmosphere.floor.xyz * (vec3f(1.0) - air.transmittance);
         }
     }
     // The probe of holes: a pixel whose ground is not a place, or is

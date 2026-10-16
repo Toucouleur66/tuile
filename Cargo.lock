@@ -6503,10 +6503,12 @@ version = "0.6.1"
 dependencies = [
  "bytemuck",
  "glam 0.33.1",
+ "half",
  "image",
  "pollster",
  "tempfile",
  "thiserror 2.0.18",
+ "tuile-atmosphere",
  "tuile-core",
  "tuile-film",
  "tuile-terrain",

@@ -135,7 +135,12 @@ impl FrameUniform {
         let right = v.row(0).truncate() / p.x_axis.x;
         let up = v.row(1).truncate() / p.y_axis.y;
         let fwd = -v.row(2).truncate() + right * p.z_axis.x + up * p.z_axis.y;
-        let air = look.haze.map(|haze| (haze, haze.at(camera.eye)));
+        // The closed-form air, unless the physical atmosphere stands in its
+        // place.
+        let air = look
+            .haze
+            .filter(|_| look.atmosphere.is_none())
+            .map(|haze| (haze, haze.at(camera.eye)));
         Self {
             view_proj: camera.view_projection().to_cols_array_2d(),
             right: right.extend(0.0).to_array(),
