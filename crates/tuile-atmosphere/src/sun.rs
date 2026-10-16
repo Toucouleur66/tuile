@@ -9,27 +9,33 @@
 //! at a *stated* time needs the sun placed from that time rather than from a
 //! direction someone picked by eye.
 //!
-//! # Accuracy, and what it is for
+//! # Where the numbers come from
 //!
-//! A low-precision solar position: better than 0.01° over the years around
-//! J2000, which is a few hundredths of a degree of terminator placement. The
-//! high-precision algorithms exist for pointing instruments; nothing here is
-//! doing that. What this has to get right is *which side of the planet is lit
-//! at 18:00 UTC*, and it does that to well under a pixel.
+//! NREL's Solar Position Algorithm (Reda & Andreas, 2003), as the
+//! `solar-positioning` crate implements it: ±0.0003° from the year −2000 to
+//! 6000, with ΔT (TT − UT) estimated from Espenak & Meeus's fits. That is
+//! far more than a terminator or a shadow needs; what it buys is that the
+//! sun here is *the* sun of the stated instant — the one a reference
+//! calculator gives — and never a second opinion to argue with.
 //!
-//! Not modelled: refraction near the horizon (which lifts the apparent sun by
-//! about half a degree at sunset), nutation, and the equation of the equinoxes.
-//! Each is smaller than the eye can read on a horizon, and each would need a
-//! term nobody could check.
+//! The crate is built with `libm` and without `std`: the same arithmetic,
+//! bit for bit, on every target, the browser's included.
+//!
+//! Not modelled: refraction. Every position here is geometric — the sun
+//! where it is, not where the air shows it, which near the horizon is about
+//! half a degree higher. Light is computed from where the sun is.
 
 use glam::DVec3;
-use std::f64::consts::{PI, TAU};
+use solar_positioning::{time::JulianDate, Location, SolarPositions};
+use tuile_core::geo::{enu_frame, Geodetic};
 
-/// Julian date of the J2000.0 epoch, 2000-01-01 12:00 TT.
-const J2000: f64 = 2_451_545.0;
 /// Julian date of the Unix epoch, 1970-01-01 00:00 UTC.
 const UNIX_EPOCH_JD: f64 = 2_440_587.5;
 const SECONDS_PER_DAY: f64 = 86_400.0;
+/// ΔT where its fit cannot say: about this century's.
+const FALLBACK_DELTA_T: f64 = 69.0;
+/// The equatorial radius SPA's parallax is written against, metres.
+const SPA_EARTH_RADIUS: f64 = 6_378_140.0;
 
 /// The sun, seen from Earth at one instant.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -58,46 +64,50 @@ impl Sun {
         Self::at_julian_date(UNIX_EPOCH_JD + utc / SECONDS_PER_DAY)
     }
 
-    /// The sun at a Julian date (UTC).
+    /// The sun at a Julian date (UTC), as seen from the Earth's centre.
+    ///
+    /// SPA answers for an observer; one placed at the Earth's centre — on
+    /// the equator, at the prime meridian, its height minus SPA's radius —
+    /// has no parallax at all, and its azimuth and elevation are the
+    /// geocentric direction itself, written in the axes of that meridian.
+    /// An instant SPA refuses (not finite) gives a direction of NaN.
     pub fn at_julian_date(jd: f64) -> Self {
-        // Days since J2000. UTC is used where the algorithm asks for TT: they
-        // differ by about a minute this century, which moves the sun by under
-        // 0.005° — an order of magnitude below the model's own error.
-        let n = jd - J2000;
+        let Some(seen) = spa(jd, 0.0, 0.0, -SPA_EARTH_RADIUS) else {
+            return Self::from_direction_unchecked(DVec3::NAN);
+        };
+        // East, north and up at (0°, 0°) are +Y, +Z and +X.
+        let (azimuth, elevation) = (seen.0.to_radians(), seen.1.to_radians());
+        let d = DVec3::new(
+            elevation.sin(),
+            elevation.cos() * azimuth.sin(),
+            elevation.cos() * azimuth.cos(),
+        );
+        Self::from_direction_unchecked(d)
+    }
 
-        // The sun's position along the ecliptic, as a mean motion plus the two
-        // largest terms of the equation of centre. Earth's orbit is very nearly
-        // circular, so those two carry almost all of the departure from uniform.
-        let mean_longitude = (280.460 + 0.985_647_4 * n).to_radians();
-        let mean_anomaly = (357.528 + 0.985_600_3 * n).to_radians();
-        let ecliptic_longitude = mean_longitude
-            + (1.915_f64).to_radians() * mean_anomaly.sin()
-            + (0.020_f64).to_radians() * (2.0 * mean_anomaly).sin();
+    /// The sun at a UTC instant (Unix seconds) as it stands over the place
+    /// `at` — its azimuth and elevation over that place's horizon, and the
+    /// direction towards it from there, ECEF. `None` for an instant or a
+    /// place SPA refuses.
+    pub fn seen_from(utc: f64, at: Geodetic) -> Option<SunSeen> {
+        let (lon, lat) = (at.lon.to_degrees(), at.lat.to_degrees());
+        let (azimuth_deg, elevation_deg) =
+            spa(UNIX_EPOCH_JD + utc / SECONDS_PER_DAY, lon, lat, at.height)?;
+        let local = enu_frame(at);
+        let (azimuth, elevation) = (azimuth_deg.to_radians(), elevation_deg.to_radians());
+        let level = local.x_axis * azimuth.sin() + local.y_axis * azimuth.cos();
+        Some(SunSeen {
+            azimuth_deg,
+            elevation_deg,
+            direction_ecef: (level * elevation.cos() + local.z_axis * elevation.sin()).normalize(),
+        })
+    }
 
-        // The tilt of the axis: the only reason the subsolar point leaves the
-        // equator at all, and therefore the only reason there are seasons.
-        let obliquity = (23.439 - 4.0e-7 * n).to_radians();
-
-        let declination = (obliquity.sin() * ecliptic_longitude.sin()).asin();
-        let right_ascension =
-            (obliquity.cos() * ecliptic_longitude.sin()).atan2(ecliptic_longitude.cos());
-
-        // Which meridian faces the sun is a question about the planet's own
-        // rotation, so it needs sidereal time — the solar day is four minutes
-        // longer than a rotation, and using it instead would drift the
-        // terminator by a degree a day.
-        let gmst = (280.460_618_378 + 360.985_647_366_29 * n).to_radians();
-        let subsolar_lon = wrap_to_pi(right_ascension - gmst);
-        let subsolar_lat = declination;
-
+    fn from_direction_unchecked(d: DVec3) -> Self {
         Self {
-            direction_ecef: DVec3::new(
-                subsolar_lat.cos() * subsolar_lon.cos(),
-                subsolar_lat.cos() * subsolar_lon.sin(),
-                subsolar_lat.sin(),
-            ),
-            subsolar_lat,
-            subsolar_lon,
+            direction_ecef: d,
+            subsolar_lat: d.z.clamp(-1.0, 1.0).asin(),
+            subsolar_lon: d.y.atan2(d.x),
         }
     }
 
@@ -132,7 +142,40 @@ impl Sun {
     }
 }
 
+/// The sun from one place: where it stands over that place's horizon.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SunSeen {
+    /// Degrees from north, clockwise through east.
+    pub azimuth_deg: f64,
+    /// Degrees above the horizon, geometric; negative below it.
+    pub elevation_deg: f64,
+    /// Unit vector towards the sun from the place, ECEF.
+    pub direction_ecef: DVec3,
+}
+
+/// SPA's azimuth and elevation, degrees, geometric, at Julian date `jd`
+/// (UTC) for an observer at `lon`, `lat` (degrees) and `height` metres.
+fn spa(jd: f64, lon: f64, lat: f64, height: f64) -> Option<(f64, f64)> {
+    let year = 2000.0 + (jd - 2_451_545.0) / 365.25;
+    let delta_t = solar_positioning::delta_t::estimate(year).unwrap_or(FALLBACK_DELTA_T);
+    let time = JulianDate::new(jd, delta_t).ok()?;
+    let at = SolarPositions::new()
+        .at_from_julian(
+            time,
+            Location {
+                latitude: lat,
+                longitude: lon,
+            },
+            height,
+            None,
+        )
+        .ok()?;
+    Some((at.azimuth(), at.elevation_angle()))
+}
+
+#[cfg(test)]
 fn wrap_to_pi(radians: f64) -> f64 {
+    use std::f64::consts::{PI, TAU};
     let wrapped = radians.rem_euclid(TAU);
     if wrapped > PI {
         wrapped - TAU
@@ -228,6 +271,70 @@ mod tests {
         let b = Sun::at_unix_seconds(start + 86_400.0);
         let drift = wrap_to_pi(b.subsolar_lon - a.subsolar_lon).to_degrees();
         assert!(drift.abs() < 0.5, "a day moved the meridian by {drift}°");
+    }
+
+    /// NREL's own worked example (Reda & Andreas 2003, table A4.1):
+    /// 2003-10-17 12:30:30 at UTC−7, 39.742476° N 105.1786° W, 1830.14 m.
+    /// The paper's zenith, 50.11162°, includes 0.0163° of refraction at its
+    /// 820 mbar and 11 °C; the geometric sun is that much lower. Its ΔT is
+    /// 67 s where ours is estimated, a few seconds off: hundredths of a
+    /// degree at most.
+    #[test]
+    fn the_sun_seen_from_a_place_is_nrels_worked_example() {
+        let at = Geodetic {
+            lon: (-105.1786f64).to_radians(),
+            lat: 39.742476f64.to_radians(),
+            height: 1830.14,
+        };
+        let seen = Sun::seen_from(utc(2003, 10, 17, 19, 30) + 30.0, at).expect("seen");
+        let elevation = 90.0 - (50.11162 + 0.0163);
+        assert!(
+            (seen.elevation_deg - elevation).abs() < 0.02,
+            "{} against {elevation}",
+            seen.elevation_deg
+        );
+        assert!(
+            (seen.azimuth_deg - 194.34024).abs() < 0.02,
+            "{}",
+            seen.azimuth_deg
+        );
+        // The direction says what the angles say, over the place's own
+        // horizon.
+        let up = enu_frame(at).z_axis;
+        let sine = seen.direction_ecef.dot(up);
+        assert!((sine - seen.elevation_deg.to_radians().sin()).abs() < 1e-9);
+        // And the sun from the Earth's centre is the same sun, but for the
+        // parallax of a planet's radius at an astronomical unit: 0.0025°.
+        let apart = seen
+            .direction_ecef
+            .angle_between(Sun::at_unix_seconds(utc(2003, 10, 17, 19, 30) + 30.0).direction_ecef)
+            .to_degrees();
+        assert!(apart < 0.003, "{apart}°");
+    }
+
+    /// From the Earth's centre there is no parallax: the subsolar latitude
+    /// is SPA's geocentric declination itself, to rounding.
+    #[test]
+    fn the_sun_from_the_earths_centre_is_spas_geocentric_sun() {
+        for t in [
+            utc(2024, 6, 20, 20, 51),
+            utc(2003, 10, 17, 19, 30),
+            utc(2026, 2, 1, 6, 0),
+        ] {
+            let jd = UNIX_EPOCH_JD + t / SECONDS_PER_DAY;
+            let year = 2000.0 + (jd - 2_451_545.0) / 365.25;
+            let delta_t = solar_positioning::delta_t::estimate(year).expect("ΔT");
+            let time = JulianDate::new(jd, delta_t).expect("time");
+            let declination = SolarPositions::new()
+                .for_time_from_julian(time)
+                .expect("prepared")
+                .declination();
+            let lat = Sun::at_unix_seconds(t).subsolar_lat.to_degrees();
+            assert!(
+                (lat - declination).abs() < 1e-7,
+                "{lat} against {declination}"
+            );
+        }
     }
 
     /// The direction light travels is the negation of the direction to the sun.

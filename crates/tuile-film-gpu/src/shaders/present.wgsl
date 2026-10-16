@@ -71,7 +71,7 @@ fn present(@builtin(global_invocation_id) id: vec3u) {
             if (overlaid) { over += textureLoad(overlay, s, 0); }
         }
     }
-    var linear = sum / f32(k * k) * frame.world.w;
+    var linear = sum / f32(k * k) * frame.world.w * frame.white_balance.xyz;
     // The picture's own contrast and saturation: one setting for every
     // film, whatever its imagery. Luminance is raised to a power about
     // middle grey, colours keeping their ratios, then what is not

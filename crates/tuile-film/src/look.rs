@@ -2,6 +2,7 @@
 // Copyright (c) lapoule.dev
 
 use glam::{DVec3, Vec3};
+use tuile_atmosphere::ReferenceIllumination;
 
 /// How imagery's stored values are read before they are lit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +152,16 @@ pub struct Look {
     /// The air, or none: the ground as clear at any distance, and the sky
     /// the dome's one colour.
     pub haze: Option<Haze>,
+    /// Gains on the picture's light, linear RGB, applied with the exposure
+    /// and before contrast and saturation — a camera's white balance, the
+    /// look's own times what a frame's light adapts to. Not on
+    /// the overlays: their colours are the display's already. One is none.
+    pub white_balance: Vec3,
+    /// How turbid the air is, for an atmosphere model that reads it — the
+    /// Linke turbidity factor, 2 a clear sky, 6 a hazy one. Nothing reads it
+    /// yet: carried so that a host stating it frame by frame is heard as
+    /// soon as a model does. `None`: the model's own.
+    pub turbidity: Option<f32>,
 }
 
 impl Default for Look {
@@ -166,6 +177,8 @@ impl Default for Look {
             saturation: 1.0,
             shadow: 0.0,
             haze: None,
+            white_balance: Vec3::ONE,
+            turbidity: None,
         }
     }
 }
@@ -209,6 +222,79 @@ impl Look {
         let cos = normal.dot(self.to_sun).max(0.0);
         albedo * (self.world + self.sun * cos)
     }
+
+    /// This look under `light`: its sun's place and strength and its dome
+    /// are the light's, the light's exposure is added to its own and its
+    /// white balance laid over its own, and its air takes what the light says of it; contrast,
+    /// saturation, shadows and imagery stay the look's. A light whose
+    /// direction has no length leaves the sun where the look has it.
+    pub fn lit_by(self, light: FrameLight) -> Self {
+        let lit = &light.illumination;
+        Self {
+            to_sun: lit
+                .to_sun_ecef
+                .as_vec3()
+                .try_normalize()
+                .unwrap_or(self.to_sun),
+            sun: Vec3::from_array(lit.sun_rgb),
+            world: Vec3::from_array(lit.sky_ambient()),
+            exposure_ev: self.exposure_ev + lit.exposure_offset_ev(),
+            white_balance: self.white_balance * Vec3::from_array(lit.white_balance()),
+            haze: match (self.haze, light.air.haze_density) {
+                (Some(haze), Some(density)) => Some(Haze { density, ..haze }),
+                (haze, _) => haze,
+            },
+            turbidity: light.air.turbidity.or(self.turbidity),
+            ..self
+        }
+    }
+}
+
+/// The light of one frame, as a host places it: the moment's
+/// [`ReferenceIllumination`] — where the sun stands, what it and the sky
+/// give, how the camera meets them — and what the host says of the air. A
+/// film is lit by its look from its first frame to its last unless its host
+/// says otherwise frame by frame ([`crate::Overlays::light`]), which is how
+/// a sun moves across a film rather than jumping between the segments it is
+/// rendered in. One light a frame, for both eyes of a stereo frame.
+///
+/// The film's grade is not the light's: contrast and saturation stay the
+/// look's, and the light's exposure is *added* to the look's — a camera's
+/// automatic exposure on top of the film's
+/// ([`ReferenceIllumination::exposure_offset_ev`]).
+///
+/// Of the sky's irradiance the renderer reads only its average over every
+/// facing ([`ReferenceIllumination::sky_ambient`]) today, and of the air its
+/// haze's density; the turbidity is carried for the atmosphere model.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameLight {
+    pub illumination: ReferenceIllumination,
+    pub air: FrameAir,
+}
+
+/// What a host may say of a frame's air; what it leaves unsaid is the
+/// look's.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct FrameAir {
+    /// As [`Look::turbidity`].
+    pub turbidity: Option<f32>,
+    /// The haze's extinction at the ellipsoid, per metre, as
+    /// [`Haze::density`]: heard only by a look that has haze.
+    pub haze_density: Option<f32>,
+}
+
+impl FrameLight {
+    /// The light `look` already has: applied, it changes nothing.
+    pub fn of(look: &Look) -> Self {
+        Self {
+            illumination: ReferenceIllumination::provisional(
+                look.to_sun.as_dvec3(),
+                look.sun.to_array(),
+                look.world.to_array(),
+            ),
+            air: FrameAir::default(),
+        }
+    }
 }
 
 /// The direction *towards* a Blender sun lamp with this `rotation_euler`.
@@ -224,6 +310,80 @@ pub fn blender_sun(euler_xyz: Vec3) -> Vec3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_frames_light_replaces_the_looks_light_and_nothing_else() {
+        let look = Look {
+            exposure_ev: 0.3,
+            contrast: 1.2,
+            saturation: 0.9,
+            shadow: 0.7,
+            haze: Some(Haze::default()),
+            white_balance: Vec3::new(1.0, 0.9, 0.8),
+            ..Look::cycles_film()
+        };
+        // The look's own light gives the look back, bit for bit.
+        assert_eq!(look.lit_by(FrameLight::of(&look)), look);
+        let light = FrameLight {
+            illumination: ReferenceIllumination {
+                to_sun_ecef: glam::DVec3::new(0.0, 3.0, 4.0),
+                sun_rgb: [2.0, 1.5, 1.0],
+                sky_sh: [[0.2, 0.3, 0.5], [9.0; 3], [9.0; 3], [9.0; 3]],
+                white: [1.25, 1.0, 0.5],
+                adaptation: 1.0,
+                ev100: tuile_atmosphere::DAYLIGHT_EV100 + 1.0,
+                compensation_ev: 0.5,
+                night_floor: 0.1,
+            },
+            air: FrameAir {
+                turbidity: Some(3.0),
+                haze_density: Some(2.0e-5),
+            },
+        };
+        let lit = look.lit_by(light);
+        assert!((lit.to_sun - Vec3::new(0.0, 0.6, 0.8)).length() < 1e-6);
+        assert_eq!(lit.sun, Vec3::new(2.0, 1.5, 1.0));
+        assert_eq!(lit.world, Vec3::new(0.2, 0.3, 0.5), "the sky's average");
+        assert!(
+            (lit.exposure_ev - (0.3 + 0.5 - 1.0)).abs() < 1e-6,
+            "added: {}",
+            lit.exposure_ev
+        );
+        let balanced = lit.white_balance / look.white_balance * Vec3::new(1.25, 1.0, 0.5);
+        assert!(
+            (balanced - Vec3::splat(balanced.y)).length() < 1e-5,
+            "over the look's own, the white made grey: {balanced}"
+        );
+        assert_eq!(lit.turbidity, Some(3.0));
+        let haze = lit.haze.expect("haze");
+        assert_eq!(haze.density, 2.0e-5);
+        assert_eq!(
+            Haze {
+                density: Haze::default().density,
+                ..haze
+            },
+            Haze::default(),
+            "only the density"
+        );
+        let unlit = Look {
+            to_sun: look.to_sun,
+            sun: look.sun,
+            world: look.world,
+            exposure_ev: look.exposure_ev,
+            white_balance: look.white_balance,
+            haze: look.haze,
+            turbidity: look.turbidity,
+            ..lit
+        };
+        assert_eq!(unlit, look, "only the light moves");
+        // A direction of no length keeps the sun where it was; a look with
+        // no haze is given none by a density.
+        let mut nowhere = light;
+        nowhere.illumination.to_sun_ecef = glam::DVec3::ZERO;
+        let clear = Look { haze: None, ..look }.lit_by(nowhere);
+        assert_eq!(clear.to_sun, look.to_sun);
+        assert_eq!(clear.haze, None);
+    }
 
     #[test]
     fn an_unrotated_sun_is_overhead() {

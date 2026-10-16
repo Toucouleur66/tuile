@@ -53,6 +53,10 @@ authors = ["lapoule.dev"]
 # Features are additive and unified across the graph: a feature listed here is
 # enabled wherever the dep is used — harmless for crates that don't need it.
 glam = { version = "0.33.1", features = ["serde"] }
+# NREL's Solar Position Algorithm (Reda & Andreas 2003). Pre-1.0, in the
+# wasm path through tuile-atmosphere: see that crate's `sun` module for why
+# this one. libm, no std: the same bits on every target.
+solar-positioning = { version = "0.7.1", default-features = false, features = ["libm"] }
 # Second-order IIR filters; the camera path smoothing runs its low-pass both
 # ways. no_std, one dependency (num-traits), MIT OR Apache-2.0.
 biquad = "0.6.0"

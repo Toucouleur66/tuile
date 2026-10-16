@@ -30,6 +30,8 @@
 //!   than a direction someone picked by eye.
 //! - [`aerial`] — the air between the eye and the ground. A correction applied to
 //!   a surface's colour, and the strongest depth cue a globe has.
+//! - [`illumination`] — what one moment's sun and sky give a scene, and how a
+//!   camera meets it: the per-frame contract a renderer is lit by.
 //! - [`sky`] — the air with nothing behind it but space. A colour of its own,
 //!   drawn as a shell, turning over from blue through orange to dark with the
 //!   hour.
@@ -53,9 +55,11 @@
 //! scene.
 
 pub mod aerial;
+pub mod illumination;
 pub mod sky;
 pub mod sun;
 
 pub use aerial::{AerialPerspective, WGSL};
+pub use illumination::{ReferenceIllumination, DAYLIGHT_EV100};
 pub use sky::SkyShell;
-pub use sun::Sun;
+pub use sun::{Sun, SunSeen};

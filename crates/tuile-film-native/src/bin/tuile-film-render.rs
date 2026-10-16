@@ -175,7 +175,7 @@ use tuile_film::{
 };
 
 use tuile_farm::{BucketConfig, ObjectRunStore, RunStore, Tuning};
-use tuile_film_native::setup::{bucket, film_sink, rgb, sun_at};
+use tuile_film_native::setup::{bucket, film_sink, placed_sun, rgb};
 use tuile_film_native::{
     render, Error, Film, LightMeter, Nothing, Observer, Order, Pictures, Reference, Sink, Sources,
     Tone,
@@ -559,11 +559,16 @@ async fn main() -> Result<(), Error> {
         film.packs.len()
     );
 
-    if let Some(sun) = value("--sun") {
-        let (azimuth, elevation) = sun
-            .split_once(',')
-            .ok_or("--sun is <azimuth>,<elevation>")?;
-        let (azimuth, elevation) = (azimuth.parse::<f64>()?, elevation.parse::<f64>()?);
+    {
+        let sun = match value("--sun") {
+            Some(sun) => {
+                let (azimuth, elevation) = sun
+                    .split_once(',')
+                    .ok_or("--sun is <azimuth>,<elevation>")?;
+                Some((azimuth.parse::<f64>()?, elevation.parse::<f64>()?))
+            }
+            None => None,
+        };
         // East, north and up where the first frame rendered is seen from.
         let from = order.frames.map_or(first, |f| f.0);
         let pack = film
@@ -574,7 +579,7 @@ async fn main() -> Result<(), Error> {
         let eye = tuile_film::Pack::open_table(&pack.head)?
             .view_of(from)?
             .position;
-        order.look.to_sun = sun_at(eye, azimuth, elevation);
+        order.look.to_sun = placed_sun(eye, sun);
     }
 
     let mut sinks: Vec<Box<dyn Sink>> = Vec::new();

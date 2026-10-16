@@ -89,6 +89,29 @@ pub fn rgb(name: &str, colour: &str) -> Result<Vec3, Error> {
     }
 }
 
+/// The sun a film is lit by when nobody placed one: 45° up, facing the
+/// equator from 30° east of the meridian — 150° in the northern hemisphere,
+/// 30° in the southern. A mid-morning sun where any film is: relief reads,
+/// shadows fall away from the camera's usual side, and the ground is never
+/// lit from the pole.
+///
+/// It replaced a sun left unoriented — along the Earth's axis, a sun over
+/// the north pole — which lit every film from the north at an elevation
+/// equal to its latitude. Films that placed no sun changed with it.
+pub const DEFAULT_SUN: (f64, f64) = (150.0, 45.0);
+
+/// The sun `sun` places where `eye` (ECEF) is — azimuth and elevation in
+/// degrees — or, when none is given, [`DEFAULT_SUN`] there, its azimuth
+/// mirrored south of the equator.
+pub fn placed_sun(eye: [f64; 3], sun: Option<(f64, f64)>) -> Vec3 {
+    let (azimuth, elevation) = sun.unwrap_or_else(|| {
+        let north = ecef_to_geodetic(DVec3::from_array(eye)).lat >= 0.0;
+        let (azimuth, elevation) = DEFAULT_SUN;
+        (if north { azimuth } else { 180.0 - azimuth }, elevation)
+    });
+    sun_at(eye, azimuth, elevation)
+}
+
 /// The direction of a sun at `azimuth` from north towards east and
 /// `elevation` above the horizon, both in degrees, where `eye` (ECEF) is.
 pub fn sun_at(eye: [f64; 3], azimuth: f64, elevation: f64) -> Vec3 {
@@ -139,5 +162,34 @@ pub fn film_sink(path: String, bitrate: u32, codec: Option<&str>) -> Result<Box<
     match codec {
         Some("av1") | None => Ok(Box::new(Av1Film::at(path, bitrate))),
         Some(other) => Err(format!("no {other} encoder was built into this binary").into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tuile_core::geo::{geodetic_to_ecef, Geodetic};
+
+    /// Nobody's sun is 45° up and faces the equator, whichever side of it
+    /// the film is; a sun asked for is that one.
+    #[test]
+    fn the_default_sun_stands_over_the_equator_side_never_the_pole() {
+        for lat in [45.0f64, -33.0] {
+            let at = Geodetic {
+                lon: 6.0f64.to_radians(),
+                lat: lat.to_radians(),
+                height: 1500.0,
+            };
+            let eye = geodetic_to_ecef(at).to_array();
+            let local = enu_frame(at);
+            let sun = placed_sun(eye, None).as_dvec3();
+            let up = sun.dot(local.z_axis).asin().to_degrees();
+            assert!((up - 45.0).abs() < 1e-3, "{lat}: {up}° up");
+            let towards_pole = sun.dot(local.y_axis) * lat.signum();
+            assert!(towards_pole < -0.5, "{lat}: facing the equator");
+            assert!(sun.dot(local.x_axis) > 0.3, "{lat}: from the east");
+            let asked = placed_sun(eye, Some((270.0, 10.0))).as_dvec3();
+            assert!((asked - sun_at(eye, 270.0, 10.0).as_dvec3()).length() < 1e-9);
+        }
     }
 }
