@@ -198,7 +198,7 @@ impl Config {
 mod tests {
     use super::*;
 
-    const EXAMPLE: &str = include_str!("../../../examples/film-web/film-bench.example.toml");
+    const EXAMPLE: &str = include_str!("../../tuile-pack-api/film-bench.example.toml");
 
     /// The example a deployment copies must itself be a configuration.
     #[test]

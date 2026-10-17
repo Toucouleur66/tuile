@@ -1,4 +1,4 @@
-# What the film bench serves. Copy to `film-bench.toml` (ignored by git) in the
+# What `tuile-pack-api` serves. Copy to `film-bench.toml` (ignored by git) in the
 # directory `tuile-pack-api` is started from, and name your own buckets.
 #
 # The buckets share one endpoint and one key, taken from the environment (or a

@@ -32,5 +32,5 @@ videos/*
 # Packs fetched once by tuile-pack-api.
 .pack-cache/
 
-# The bench's local configuration: it names a deployment's buckets.
+# tuile-pack-api's local configuration: it names a deployment's buckets.
 film-bench.toml
