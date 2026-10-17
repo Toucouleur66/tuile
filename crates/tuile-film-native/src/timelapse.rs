@@ -68,6 +68,54 @@ mod tests {
     }
 
     #[test]
+    fn a_moon_high_in_a_winter_night_is_in_frame_with_the_ground() {
+        // The night after the full Moon of 2026-10-26, from the summit and
+        // from 70 km: the Moon climbs from 46° to 61°, and was left out of
+        // the picture to keep the horizon in its lower quarter. (Over 65°,
+        // near its highest, it still is: the ground comes first.)
+        for (height, fov) in [(4000, 80), (70000, 90)] {
+            let t = TimeLapse::parse(&words(&format!(
+                "place=0.1423,42.9364 height={height} start=2026-10-27T22:00Z hours=1.5 length=2 \
+                 fps=30 track=sun-moon pitch=-4 fov={fov}"
+            )))
+            .unwrap();
+            let cameras = t.cameras(Some(&Ephemerides)).expect("cameras");
+            let place = Geodetic {
+                lon: t.lon_deg.to_radians(),
+                lat: t.lat_deg.to_radians(),
+                height: t.height_m,
+            };
+            let half_h = ((t.fovy_deg.to_radians() / 2.0).tan() * 16.0 / 9.0).atan();
+            for (i, c) in cameras.iter().enumerate() {
+                let time = t.clock().instant(i as u32 + 1);
+                let moon = tuile_atmosphere::Moon::seen_from(time, place).unwrap();
+                assert!(
+                    moon.elevation_deg > 45.0,
+                    "a high Moon: {}",
+                    moon.elevation_deg
+                );
+                let d = DVec3::from_array(c.direction);
+                let up = DVec3::from_array(c.up);
+                let right = d.cross(up);
+                let to = moon.direction_ecef;
+                let (x, y, z) = (to.dot(right), to.dot(up), to.dot(d));
+                assert!(
+                    z > 0.0 && (x / z).atan().abs() < half_h && (y / z).atan().abs() < c.fovy / 2.0,
+                    "{height} m, frame {}: the Moon at {:.1}° is out of the picture",
+                    i + 1,
+                    moon.elevation_deg
+                );
+                let bottom = (d * (c.fovy / 2.0).cos() - up * (c.fovy / 2.0).sin()).normalize();
+                assert!(
+                    bottom.dot(enu_frame(place).z_axis) < -0.05,
+                    "{height} m, frame {}: ground in the picture",
+                    i + 1
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_tracking_camera_keeps_the_sun_by_day_and_the_moon_by_night_in_frame() {
         let t = TimeLapse::parse(&words(
             "place=0.1423,42.9364 height=4000 start=2026-10-19T00:00Z days=14 length=120 fps=60 \
@@ -98,7 +146,7 @@ mod tests {
             if sun.elevation_deg > 1.0 {
                 sun_days += 1;
                 sun_seen += usize::from(inside(sun.direction_ecef));
-            } else if sun.elevation_deg < -12.0 && (2.0..50.0).contains(&moon.elevation_deg) {
+            } else if sun.elevation_deg < -12.0 && (2.0..60.0).contains(&moon.elevation_deg) {
                 moon_nights += 1;
                 moon_seen += usize::from(inside(moon.direction_ecef));
             }
