@@ -22,6 +22,8 @@ plist = "1.7"
 icns = "0.3"
 # PNG in and out, and the resampling from the 1024-pixel master.
 image = { workspace = true }
+# A phone's asset catalogue is JSON.
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

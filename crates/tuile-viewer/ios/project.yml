@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+#
+# The phone application, as an Xcode project description for `xcodegen`.
+#
+# Generated, never committed: `build.sh` runs `xcodegen generate` and then
+# `xcodebuild`. The project is a wrapper and nothing more — the program is the
+# Rust binary `tuile-wgpu-viewer`, built by cargo in the phase below, and the
+# property list and assets come from `tuile-viewer-bundle phone`. What Xcode
+# adds is what only it can do: compile the asset catalogue, embed a
+# provisioning profile, and sign for a device.
+name: Tuile
+options:
+  bundleIdPrefix: dev.lapoule
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    # A script that runs cargo needs the workspace, not a sandbox.
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+targets:
+  Tuile:
+    type: application
+    platform: iOS
+    sources:
+      - path: Generated/Assets.xcassets
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_NAME: Tuile
+        PRODUCT_BUNDLE_IDENTIFIER: dev.lapoule.tuile.viewer
+        EXECUTABLE_NAME: tuile-wgpu-viewer
+        INFOPLIST_FILE: Generated/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        TARGETED_DEVICE_FAMILY: "1,2"
+        ARCHS: arm64
+        CODE_SIGN_STYLE: Automatic
+        # From the environment: `TUILE_TEAM=… ./build.sh device`.
+        DEVELOPMENT_TEAM: $(TUILE_TEAM)
+    preBuildScripts:
+      - name: Build the viewer with cargo
+        basedOnDependencyAnalysis: false
+        script: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          case "$PLATFORM_NAME" in
+            iphonesimulator) TRIPLE=aarch64-apple-ios-sim ;;
+            iphoneos) TRIPLE=aarch64-apple-ios ;;
+            *) echo "error: no Rust target for $PLATFORM_NAME"; exit 1 ;;
+          esac
+          WORKSPACE="$SRCROOT/../../.."
+          # Xcode's SDKROOT is the phone's SDK, which is what the target needs;
+          # the toolchain ignores it for the build scripts it runs on this Mac.
+          cargo build --release --locked --target "$TRIPLE" -p tuile-wgpu-viewer \
+            --manifest-path "$WORKSPACE/Cargo.toml"
+          TARGET_DIR="${CARGO_TARGET_DIR:-$WORKSPACE/target}"
+          mkdir -p "$TARGET_BUILD_DIR/$WRAPPER_NAME"
+          cp "$TARGET_DIR/$TRIPLE/release/tuile-wgpu-viewer" "$TARGET_BUILD_DIR/$EXECUTABLE_PATH"
