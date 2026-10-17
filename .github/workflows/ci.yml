@@ -66,10 +66,8 @@ jobs:
           -p tuile-terrain
           -p tuile-camera
           -p tuile-atmosphere
-          -p tuile-film-web
           -p tuile-ui
           -p tuile-wasm-globe
-          -p tuile-pack-worker
           -p tuile-film
 
   docs:

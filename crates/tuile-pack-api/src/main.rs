@@ -5,25 +5,25 @@
 //!
 //! The routes and what they mean are `tuile_repository::bench`'s: this file
 //! opens the buckets a configuration names, hands them to a `Bench`, and
-//! turns each request into a call to it. A Worker serves the very same
-//! routes from the same `Bench`; the two differ in how they reach a bucket
-//! and in nothing a client can see.
+//! turns each request into a call to it. Its readers are the farm's own
+//! programs (`tuile-migrate-packs` lists the projects and their packs here)
+//! and any client of the store routes (`TUILE_TILES_REMOTE`).
 //!
 //! **Nothing is downloaded whole.** Each project's bucket is wrapped in
-//! `Cached`: a pack runs to gigabytes and a browser reads a few megabytes of
-//! it per frame, so objects are fetched in fixed chunks, on demand, each
+//! `Cached`: a pack runs to gigabytes and a reader asks for a few megabytes
+//! of it at a time, so objects are fetched in fixed chunks, on demand, each
 //! chunk once.
 //!
 //! What is served is described by a configuration file (`--config`, default
 //! `film-bench.toml`): the projects, each a bucket read through one layout,
-//! and the tile store. See `examples/film-web/film-bench.example.toml`. The
+//! and the tile store. See `crates/tuile-pack-api/film-bench.example.toml`. The
 //! buckets share one endpoint and one key, taken from the environment as the
 //! farm takes them — `TUILE_STORE_ENDPOINT`, `TUILE_STORE_ACCESS_KEY_ID`,
 //! `TUILE_STORE_SECRET_ACCESS_KEY` — with a `.env` in the working directory
 //! read first. Credentials stay in this process.
 //!
 //! ```bash
-//! cargo run --release -p tuile-pack-api -- --www examples/film-web/www
+//! cargo run --release -p tuile-pack-api -- --config film-bench.toml
 //! ```
 
 use std::net::SocketAddr;
@@ -35,8 +35,6 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
 use tower_http::cors::CorsLayer;
-use tower_http::services::ServeDir;
-use tower_http::set_header::SetResponseHeaderLayer;
 use tuile_farm::{BucketConfig, ObjectRunStore, StoreError, Tuning};
 use tuile_repository::{
     ArchivedTiles, Asked, Bench, Cached, Config, DiskChunks, FilmRepository, HttpGet, Layout,
@@ -350,25 +348,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let posting = bench.clone();
-    let mut app = Router::new().route(
+    let app = Router::new().route(
         "/api/{*rest}",
         axum::routing::get(move |request: Request| api(bench.clone(), request))
             .post(move |request: Request| posted(posting.clone(), request)),
     );
-    if let Some(www) = arg(&args, "--www") {
-        // The page, its scripts and its wasm are rebuilt together and must be
-        // loaded together: a cached script against a fresh module fails at
-        // the first call. `no-cache` makes the browser ask each time; an
-        // unchanged file still costs only a 304.
-        app = app.fallback_service(
-            tower::ServiceBuilder::new()
-                .layer(SetResponseHeaderLayer::overriding(
-                    header::CACHE_CONTROL,
-                    HeaderValue::from_static("no-cache"),
-                ))
-                .service(ServeDir::new(www)),
-        );
-    }
     // A preflight is kept for as long as browsers agree to (two hours): the
     // one route that is a POST of JSON then costs a page of another origin
     // one `OPTIONS` per film, not one per request.

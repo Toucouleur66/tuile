@@ -7,11 +7,10 @@
 //! those is written to a bucket under a key layout. This crate is the read
 //! side of those layouts, so that nothing downstream builds a key by hand:
 //!
-//! - [`Objects`] — bytes in a bucket, read by range. One contract, three
-//!   implementations: a bucket or directory ([`tuile_farm::ObjectRunStore`]),
-//!   a bucket asked over signed HTTP ([`s3::S3Objects`]), and [`Cached`],
-//!   which wraps any other and keeps each chunk it has read in a
-//!   [`ChunkStore`] — a directory, or a Worker's edge cache.
+//! - [`Objects`] — bytes in a bucket, read by range. A bucket or directory
+//!   ([`tuile_farm::ObjectRunStore`]), a store served by someone else
+//!   ([`RemoteLive`], [`RemoteBlocks`]), and [`Cached`], which wraps any other
+//!   and keeps each chunk it has read in a [`ChunkStore`].
 //! - [`FilmRepository`] — the films a bucket holds and what each is made of.
 //!   [`ScenePacks`] reads the engine's own layout (packs keyed by scene
 //!   digest); [`RunFilms`] reads run directories as an orchestrator lays
@@ -37,7 +36,6 @@ mod objects;
 pub mod remote;
 mod revalidated;
 mod runs;
-pub mod s3;
 mod scenes;
 mod tiles;
 pub mod tone;

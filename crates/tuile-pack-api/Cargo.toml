@@ -16,8 +16,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = "0.8"
 tokio = { workspace = true, features = ["fs", "io-util", "sync", "net"] }
-tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "fs", "set-header"] }
+tower-http = { version = "0.6", features = ["cors"] }
 # The contract of a store of bytes, which what packs hold is remembered in.
 tuile-core = { version = "0.7.1", path = "../tuile-core" }
 tuile-repository = { version = "0.7.1", path = "../tuile-repository" }
