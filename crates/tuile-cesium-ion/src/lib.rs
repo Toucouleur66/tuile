@@ -25,11 +25,13 @@ use std::sync::Arc;
 use tuile_core::fetch::{FetchError, TileFetcher};
 use url::Url;
 
+pub mod sources;
 mod terrain;
 #[cfg(test)]
 mod tests_support;
 pub mod tms;
 
+pub use sources::IonSources;
 pub use terrain::IonTerrainSource;
 
 pub const ION_API_BASE: &str = "https://api.cesium.com/";

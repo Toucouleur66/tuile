@@ -6394,7 +6394,9 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
+ "tuile-bing",
  "tuile-core",
+ "tuile-planetary",
  "tuile-terrain",
  "url",
 ]
@@ -6944,10 +6946,7 @@ dependencies = [
  "tracing",
  "tuile-bing",
  "tuile-cesium-ion",
- "tuile-core",
  "tuile-native-fetchers",
- "tuile-planetary",
- "tuile-terrain",
  "tuile-viewer",
 ]
 
