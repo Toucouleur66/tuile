@@ -14,7 +14,8 @@
 //!
 //! Positions are fractions of the drawable, fixed when the script starts.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 use super::touch::Phase;
 

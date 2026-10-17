@@ -18,10 +18,10 @@ pub(super) struct Warmup {
     /// "coarse" means.
     pub(super) pinned_level: Option<u32>,
     /// When the wait began, so it can be given up on.
-    pub(super) since: std::time::Instant,
+    pub(super) since: web_time::Instant,
     /// When it last said where it had got to. A silent minute with no window
     /// looks exactly like a hang.
-    pub(super) last_report: std::time::Instant,
+    pub(super) last_report: web_time::Instant,
 }
 
 impl App {
@@ -161,7 +161,7 @@ impl App {
         let m = tuile_core::metrics::metrics();
         let p = priming.unwrap_or_default();
         if self.warmup.last_report.elapsed() >= REPORT_EVERY {
-            self.warmup.last_report = std::time::Instant::now();
+            self.warmup.last_report = web_time::Instant::now();
             tracing::info!(
                 held,
                 total = p.total,

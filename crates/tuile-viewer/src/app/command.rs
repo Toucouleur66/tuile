@@ -48,7 +48,7 @@ impl App {
                 steer::north_up(&mut self.controller, viewport);
             }
             Command::Here => self.locator.request(
-                std::time::Instant::now(),
+                web_time::Instant::now(),
                 crate::location::Placement::OVERHEAD,
             ),
             Command::Freeze(on) => {
@@ -164,7 +164,7 @@ impl App {
         /// How long a message stays beside the position.
         const NOTICE: std::time::Duration = std::time::Duration::from_secs(8);
 
-        let now = std::time::Instant::now();
+        let now = web_time::Instant::now();
         if now.duration_since(self.title_at) < EVERY {
             return;
         }

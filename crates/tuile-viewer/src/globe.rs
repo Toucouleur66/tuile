@@ -46,7 +46,7 @@ pub(crate) struct Switched {
     /// The imagery generation the globe is now draping, or why it is not.
     pub outcome: Result<u64, String>,
     /// When it was asked for — the start of the wait a person sees.
-    pub asked: std::time::Instant,
+    pub asked: web_time::Instant,
 }
 
 /// Changes the imagery a running globe drapes.
@@ -75,7 +75,7 @@ pub(crate) struct Switcher {
 impl Switcher {
     /// Starts the switch to `layers[layer]`.
     pub(crate) fn ask(&self, layer: usize, choice: &ImageryChoice) {
-        let asked = std::time::Instant::now();
+        let asked = web_time::Instant::now();
         let (sources, store) = (Arc::clone(&self.sources), self.store.clone());
         let (switch, resolved) = (self.switch.clone(), Arc::clone(&self.resolved));
         let (done, choice) = (self.done.0.clone(), choice.clone());

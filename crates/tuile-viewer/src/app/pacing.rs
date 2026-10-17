@@ -18,7 +18,7 @@ use glam::DVec3;
 pub(super) struct Pacing {
     /// The top of the previous frame, and the only number the easing is allowed
     /// to depend on. See [`tuile_camera::CameraController::advance`].
-    pub(super) last_frame: std::time::Instant,
+    pub(super) last_frame: web_time::Instant,
     /// How far the camera moved last frame, and how long that frame took.
     pub(super) last_step: Option<f64>,
     pub(super) last_seconds: f64,
@@ -40,7 +40,7 @@ pub(super) struct Watch {
     pub(super) last_traversals: u64,
     pub(super) last_altitude: Option<f64>,
     pub(super) silent_passes: u32,
-    pub(super) last_log: std::time::Instant,
+    pub(super) last_log: web_time::Instant,
 }
 
 impl App {

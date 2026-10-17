@@ -69,7 +69,7 @@ impl App {
     /// depend on.
     fn start_the_frame(&mut self) -> std::time::Duration {
         let dt = self.pacing.last_frame.elapsed();
-        self.pacing.last_frame = std::time::Instant::now();
+        self.pacing.last_frame = web_time::Instant::now();
         let m = tuile_core::metrics::metrics();
         m.frames.inc();
         m.frame_seconds.record(dt);
@@ -354,7 +354,7 @@ impl App {
             // Captured before the reset below, because the rate printed further
             // down divides by it.
             let interval = self.watch.last_log.elapsed().as_secs_f64();
-            self.watch.last_log = std::time::Instant::now();
+            self.watch.last_log = web_time::Instant::now();
             if let Some(bar) = self.statusbar.as_ref() {
                 bar.refresh();
                 // Where the eye is, and how it is held. The second half is what

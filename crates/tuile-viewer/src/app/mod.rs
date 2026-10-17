@@ -223,7 +223,7 @@ pub struct App {
     /// Trying a failed start-up again, on a phone.
     retries: Option<crate::launch::Retries>,
     /// When the start-up now under way began.
-    launching_since: Option<std::time::Instant>,
+    launching_since: Option<web_time::Instant>,
     profile: crate::profile::Profile,
     runtime: tokio::runtime::Handle,
     lifecycle: lifecycle::Lifecycle,
@@ -239,7 +239,7 @@ pub struct App {
     /// The device's temperature and power saving, and when they were read.
     thermal: crate::profile::Thermal,
     low_power: bool,
-    device_read: Option<std::time::Instant>,
+    device_read: Option<web_time::Instant>,
 
     // The rest is grouped by the module that owns it, so that a field and the
     // code that reads it are never in different files. Each of these is defined
@@ -268,10 +268,10 @@ pub struct App {
     /// Tiles drawn in the last frame, and whether all were the ones selected.
     drawn: (usize, bool),
     /// The last thing said to the person, and when.
-    notice: Option<(String, std::time::Instant)>,
+    notice: Option<(String, web_time::Instant)>,
     /// What the title bar shows, and when it was last looked at.
     title_shown: String,
-    title_at: std::time::Instant,
+    title_at: web_time::Instant,
     /// Why the session is ending, once something has decided that it is.
     pub(crate) ended_by: Option<&'static str>,
     /// Whether the view is written down at the end for the next start.
@@ -298,9 +298,9 @@ impl App {
         // system's question — if it has one — is up while the globe warms.
         let mut locator = crate::location::Locator::platform();
         if let Some(placement) = config.here {
-            locator.request(std::time::Instant::now(), placement);
+            locator.request(web_time::Instant::now(), placement);
         }
-        let now = std::time::Instant::now();
+        let now = web_time::Instant::now();
         let mut app = Self {
             imagery: imagery::Imagery::new(config.layers, config.layer),
             locator,
@@ -386,7 +386,7 @@ impl App {
     /// Takes the session if it has arrived since the last turn of the loop,
     /// or the reason it never will. Never waits.
     fn take_the_session(&mut self) {
-        let now = std::time::Instant::now();
+        let now = web_time::Instant::now();
         // A start-up that failed, due again: on a phone, and only in front.
         if self.launch.is_none()
             && self.session.is_none()
@@ -435,7 +435,7 @@ impl App {
 
     /// What the caption says while the session is not up and is being tried
     /// again: the explicit "offline, retrying" state.
-    fn waiting_note(&self, now: std::time::Instant) -> Option<String> {
+    fn waiting_note(&self, now: web_time::Instant) -> Option<String> {
         self.failed.as_ref()?;
         let retries = self.retries.as_ref()?;
         Some(match retries.next() {
@@ -528,7 +528,7 @@ impl App {
     /// Moves the view if the location that was asked for has arrived, and
     /// says how the request ended either way.
     fn take_the_location(&mut self) {
-        let now = std::time::Instant::now();
+        let now = web_time::Instant::now();
         if let Some(outcome) = self.locator.tick(now, &mut self.controller) {
             self.located |= matches!(outcome, crate::location::Outcome::Centred { .. });
             self.say(&outcome.to_string());
@@ -568,7 +568,7 @@ impl App {
     /// stays a few seconds, or until the next one replaces it.
     fn say(&mut self, message: &str) {
         tracing::info!("{message}");
-        let now = std::time::Instant::now();
+        let now = web_time::Instant::now();
         self.notice = Some((message.to_owned(), now));
         // Shown on the next turn of the loop, not a quarter of a second on.
         self.title_at = now - std::time::Duration::from_secs(1);
@@ -618,7 +618,7 @@ impl ApplicationHandler for App {
             // Back in front: a start-up that failed is tried at once — the
             // person may have just typed a token in the system's settings.
             if let Some(retries) = self.retries.as_mut() {
-                retries.foreground(std::time::Instant::now());
+                retries.foreground(web_time::Instant::now());
             }
             return;
         }

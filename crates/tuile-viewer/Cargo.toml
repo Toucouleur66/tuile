@@ -39,6 +39,7 @@ tuile-terrain = { version = "0.8.1", path = "../tuile-terrain" }
 tuile-ui = { version = "0.8.1", path = "../tuile-ui" }
 tuile-wgpu = { version = "0.8.1", path = "../tuile-wgpu" }
 wgpu = { workspace = true }
+web-time = { workspace = true }
 winit = { workspace = true }
 
 [dev-dependencies]

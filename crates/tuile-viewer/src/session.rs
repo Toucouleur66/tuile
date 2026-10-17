@@ -25,7 +25,7 @@ pub(crate) struct Stats {
     pub(crate) holes: u64,
     /// Errors the server reported.
     pub(crate) errors: u64,
-    pub(crate) started: Option<std::time::Instant>,
+    pub(crate) started: Option<web_time::Instant>,
 }
 
 impl std::fmt::Display for Stats {

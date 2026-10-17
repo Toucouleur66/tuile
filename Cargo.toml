@@ -99,6 +99,10 @@ bytemuck = { version = "1", features = ["derive"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 winit = "0.30.13"
+# `std::time::Instant` panics on wasm32-unknown-unknown; this is the same type
+# on native and `performance.now()` in a browser. Already in the graph through
+# winit, which uses it for the same reason.
+web-time = "1.1"
 dotenvy = "0.15"
 tempfile = "3"
 

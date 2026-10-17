@@ -27,7 +27,8 @@
 //! runs as it always did. The tests drive the same [`Locator`] with a source
 //! that is a script.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 use tuile_camera::CameraController;
 
@@ -469,7 +470,8 @@ mod system {
     /// the viewer, and prints how the request ended — never where.
     #[cfg(test)]
     mod probe {
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
+        use web_time::Instant;
 
         use objc2_foundation::{NSDate, NSRunLoop};
 

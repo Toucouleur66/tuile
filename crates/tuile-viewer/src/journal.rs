@@ -75,8 +75,8 @@ pub(crate) fn note(what: &str) {
         .write(true)
         .truncate(oversized)
         .open(&path);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let now = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     if let Ok(mut file) = file {
         let _ = writeln!(file, "{} [{}] {what}", timestamp(now), std::process::id());

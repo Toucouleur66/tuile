@@ -6839,6 +6839,7 @@ dependencies = [
  "tuile-terrain",
  "tuile-ui",
  "tuile-wgpu",
+ "web-time",
  "wgpu",
  "winit",
 ]
@@ -6930,6 +6931,7 @@ dependencies = [
  "tuile-planetary",
  "tuile-terrain",
  "url",
+ "web-time",
  "wgpu",
 ]
 

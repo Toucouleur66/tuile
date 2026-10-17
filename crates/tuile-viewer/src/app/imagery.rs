@@ -14,7 +14,7 @@
 //! last layer a person asked for matters, and two resolutions racing each
 //! other would settle on whichever happened to finish last.
 
-use std::time::Instant;
+use web_time::Instant;
 
 use super::App;
 use crate::embed::ImageryChoice;

@@ -49,8 +49,8 @@ pub(crate) fn lit_at() -> anyhow::Result<f64> {
         tracing::info!("scene lit for the instant TUILE_LIT_AT={seconds}");
         return Ok(seconds);
     }
-    Ok(std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
+    Ok(web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)?
         .as_secs_f64())
 }
 

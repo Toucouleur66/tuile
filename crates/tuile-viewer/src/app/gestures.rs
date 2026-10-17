@@ -9,7 +9,7 @@
 //! [`super::touch`], [`super::lifecycle`], [`super::loading`],
 //! [`super::demand`] — and tested there. What is here carries them out.
 
-use std::time::Instant;
+use web_time::Instant;
 
 use tuile_core::protocol::{ClientMessage, GeometryStream};
 use winit::event::TouchPhase;

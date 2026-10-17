@@ -25,7 +25,8 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 use glam::{DVec2, DVec3};
 use tuile_core::math::{BoundingVolume, Sphere};

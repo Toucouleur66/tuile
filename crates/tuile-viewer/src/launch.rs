@@ -73,7 +73,7 @@ pub(crate) struct Retries {
     plan: Plan,
     runtime: tokio::runtime::Handle,
     failures: u32,
-    next: Option<std::time::Instant>,
+    next: Option<web_time::Instant>,
 }
 
 /// How long to wait after `failures` failures in a row.
@@ -93,7 +93,7 @@ impl Retries {
     }
 
     /// Notes a failure; returns how long until the next attempt.
-    pub(crate) fn failed(&mut self, now: std::time::Instant) -> std::time::Duration {
+    pub(crate) fn failed(&mut self, now: web_time::Instant) -> std::time::Duration {
         self.failures += 1;
         let wait = backoff(self.failures);
         self.next = Some(now + wait);
@@ -111,19 +111,19 @@ impl Retries {
     }
 
     /// When the next attempt is due, if one is waiting.
-    pub(crate) fn next(&self) -> Option<std::time::Instant> {
+    pub(crate) fn next(&self) -> Option<web_time::Instant> {
         self.next
     }
 
     /// The application is back in front: a waiting attempt goes now.
-    pub(crate) fn foreground(&mut self, now: std::time::Instant) {
+    pub(crate) fn foreground(&mut self, now: web_time::Instant) {
         if self.next.is_some() {
             self.next = Some(now);
         }
     }
 
     /// The next start-up, if one is due.
-    pub(crate) fn due(&mut self, now: std::time::Instant) -> Option<Launch> {
+    pub(crate) fn due(&mut self, now: web_time::Instant) -> Option<Launch> {
         let next = self.next?;
         if now < next {
             return None;
@@ -240,7 +240,8 @@ async fn bring_up_now(plan: Plan, runtime: tokio::runtime::Handle) -> Result<Sta
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    use web_time::Instant;
 
     /// A host whose service never answers — the network a phone has in a
     /// lift, or a captive portal.

@@ -18,6 +18,7 @@ thiserror = { workspace = true }
 tuile-atmosphere = { version = "0.8.1", path = "../tuile-atmosphere" }
 tuile-core = { version = "0.8.1", path = "../tuile-core" }
 wgpu = { workspace = true }
+web-time = { workspace = true }
 
 [dev-dependencies]
 futures-executor = { workspace = true }
