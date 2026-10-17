@@ -6814,10 +6814,12 @@ version = "0.8.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "console_error_panic_hook",
  "ctrlc",
  "futures-executor",
  "futures-util",
  "glam 0.33.1",
+ "js-sys",
  "muda 0.19.3",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
@@ -6827,12 +6829,16 @@ dependencies = [
  "objc2-ui-kit 0.3.2",
  "pollster",
  "rlimit",
+ "serde",
+ "serde-wasm-bindgen",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "tuile-atmosphere",
+ "tuile-bing",
  "tuile-camera",
+ "tuile-cesium-ion",
  "tuile-core",
  "tuile-metrics",
  "tuile-planetary",
@@ -6840,7 +6846,11 @@ dependencies = [
  "tuile-tape",
  "tuile-terrain",
  "tuile-ui",
+ "tuile-web",
  "tuile-wgpu",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
  "web-time",
  "wgpu",
  "winit",
@@ -6897,17 +6907,14 @@ version = "0.8.1"
 dependencies = [
  "async-trait",
  "bytes",
- "console_error_panic_hook",
+ "futures-channel",
  "futures-util",
  "glam 0.33.1",
  "js-sys",
- "serde",
  "thiserror 2.0.18",
  "tracing",
- "tuile-bing",
  "tuile-cesium-ion",
  "tuile-core",
- "tuile-planetary",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -7418,6 +7425,7 @@ dependencies = [
  "thiserror 2.0.18",
  "wgpu-core-deps-apple",
  "wgpu-core-deps-emscripten",
+ "wgpu-core-deps-wasm",
  "wgpu-core-deps-windows-linux-android",
  "wgpu-hal",
  "wgpu-naga-bridge",
@@ -7438,6 +7446,15 @@ name = "wgpu-core-deps-emscripten"
 version = "29.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3487cd6293a963bc5c0c0396f6a2192043c50003c07f4efdccbad3d90ec9d819"
+dependencies = [
+ "wgpu-hal",
+]
+
+[[package]]
+name = "wgpu-core-deps-wasm"
+version = "29.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af1fb1798be2a912497d4c224f72d39bb0cb34af50e8bcc29865bc339c943059"
 dependencies = [
  "wgpu-hal",
 ]

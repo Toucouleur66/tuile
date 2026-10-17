@@ -2,7 +2,9 @@
 // Copyright (c) lapoule.dev
 
 //! The browser side of tuile: a `fetch`-backed transport, so the same engine
-//! that runs on a laptop runs in a Web Worker.
+//! that runs on a laptop runs in a Web Worker, and the streaming protocol over
+//! `postMessage`, so the page that draws it consumes the same messages a
+//! desktop does.
 //!
 //! # Why a crate rather than an example
 //!
@@ -30,17 +32,25 @@
 //! made faster by pretending: a worker has one thread, and parallelism comes
 //! from running several workers, not from a scheduler inside one.
 //!
-//! # What is portable
+//! # Three pieces
 //!
-//! Everything that touches the browser is gated on `wasm32`. The forwarding
-//! rules ([`forward`]) are not: they are pure Rust, so they are tested on the
-//! host and checked by every native build of the workspace.
+//! - `WebFetcher` and `WebIonHttp`: the engine's two fetch seams over the
+//!   global `fetch`, the counterpart of `tuile-native-fetchers`.
+//! - [`wire`]: [`ClientMessage`](tuile_core::protocol::ClientMessage) and
+//!   [`ServerMessage`](tuile_core::protocol::ServerMessage) as bytes. Pure
+//!   Rust, compiled and tested on every target.
+//! - `post`: the third binding of the streaming protocol, beside the
+//!   in-process channels and the WebSocket — a
+//!   [`GeometryStream`](tuile_core::protocol::GeometryStream) on the page whose
+//!   server runs in a worker.
+//!
+//! None of it knows what draws the tiles, or why.
 
-pub mod forward;
+pub mod wire;
 
+#[cfg(target_arch = "wasm32")]
+pub mod post;
 #[cfg(target_arch = "wasm32")]
 mod transport;
 #[cfg(target_arch = "wasm32")]
 pub use transport::{WebFetcher, WebIonHttp};
-#[cfg(target_arch = "wasm32")]
-pub mod worker;
