@@ -6735,6 +6735,7 @@ dependencies = [
 name = "tuile-tape"
 version = "0.7.1"
 dependencies = [
+ "chrono",
  "glam 0.33.1",
  "image",
  "mcap",
@@ -6742,6 +6743,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "tuile-camera",
  "tuile-core",
 ]
 
