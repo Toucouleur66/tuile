@@ -24,13 +24,18 @@ impl Messages {
         self.pending.push((title, text));
     }
 
-    /// What may be shown now: everything, once there is a window; nothing
-    /// before.
-    pub(super) fn release(&mut self, window_up: bool) -> Vec<(String, String)> {
-        if window_up {
-            std::mem::take(&mut self.pending)
-        } else {
-            Vec::new()
+    /// Offers each waiting message to `show`, in order, once there is a
+    /// window; a message `show` could not present stays for the next turn,
+    /// and so does everything after it.
+    pub(super) fn offer(&mut self, window_up: bool, mut show: impl FnMut(&str, &str) -> bool) {
+        if !window_up {
+            return;
+        }
+        while let Some((title, text)) = self.pending.first() {
+            if !show(title, text) {
+                return;
+            }
+            self.pending.remove(0);
         }
     }
 }
@@ -39,18 +44,31 @@ impl Messages {
 mod tests {
     use super::*;
 
-    /// A failure that arrives before the window waits for it, in order, and
-    /// is shown once.
+    /// A failure that arrives before the window waits for it; one the
+    /// platform could not present yet waits again; each is shown once, in
+    /// order.
     #[test]
-    fn nothing_is_shown_before_there_is_a_window() {
+    fn a_message_waits_for_a_window_that_can_show_it() {
         let mut m = Messages::default();
         m.say("Tuile cannot start yet".into(), "no token".into());
         m.say("second".into(), "text".into());
-        assert!(m.release(false).is_empty());
-        assert!(m.release(false).is_empty(), "held, not dropped");
-        let shown = m.release(true);
-        assert_eq!(shown.len(), 2);
-        assert_eq!(shown[0].1, "no token");
-        assert!(m.release(true).is_empty(), "shown once");
+        let mut shown = Vec::new();
+        m.offer(false, |_, t| {
+            shown.push(t.to_owned());
+            true
+        });
+        assert!(shown.is_empty(), "shown before there was a window");
+        // A window, not yet on screen: the presentation does not take.
+        m.offer(true, |_, _| false);
+        m.offer(true, |_, t| {
+            shown.push(t.to_owned());
+            true
+        });
+        assert_eq!(shown, ["no token", "text"]);
+        m.offer(true, |_, t| {
+            shown.push(t.to_owned());
+            true
+        });
+        assert_eq!(shown.len(), 2, "shown once");
     }
 }

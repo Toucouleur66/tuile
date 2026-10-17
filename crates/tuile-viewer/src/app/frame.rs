@@ -512,6 +512,10 @@ impl App {
     /// all sit perfectly still when the server is dead — which is
     /// indistinguishable from a server with nothing to do. This one is not.
     fn watch_that_the_server_is_still_turning(&mut self, cam: tuile_camera::GlobeCamera) {
+        // No session, no server to have stopped.
+        if self.session.is_none() {
+            return;
+        }
         // The server's own pass counter, so a loop that has stopped turning
         // is one glance away instead of an afternoon. Every server-sourced
         // number below is a *last received* value: they all sit perfectly

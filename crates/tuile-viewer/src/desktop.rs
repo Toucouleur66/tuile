@@ -41,6 +41,16 @@ pub(crate) fn alert(title: &str, text: &str) {
     system::alert(title, text);
 }
 
+/// Shows a message if it can be shown now, and says whether it was.
+///
+/// A phone presents a message over its window, and a presentation asked for
+/// before that window is on screen is dropped without a word — so the caller
+/// keeps the message and asks again on a later turn. Everywhere else this is
+/// [`alert`], and always shown.
+pub(crate) fn try_alert(title: &str, text: &str) -> bool {
+    system::try_alert(title, text)
+}
+
 /// Shows a line of text over the bottom of the window, where there is no title
 /// bar to carry it: whose pictures are on screen, and the last thing said.
 /// Nothing where the window has a title bar, which already says it.
@@ -338,6 +348,11 @@ mod system {
         alert.runModal();
     }
 
+    pub(super) fn try_alert(title: &str, text: &str) -> bool {
+        alert(title, text);
+        true
+    }
+
     /// The title bar says it.
     pub(super) fn caption(_text: &str) {}
 
@@ -406,29 +421,42 @@ mod system {
     }
 
     pub(super) fn alert(title: &str, text: &str) {
-        let shown = MainThreadMarker::new().and_then(|mtm| {
-            let root = root(mtm)?;
-            let controller = UIAlertController::alertControllerWithTitle_message_preferredStyle(
-                Some(&NSString::from_str(title)),
-                Some(&NSString::from_str(text)),
-                UIAlertControllerStyle::Alert,
-                mtm,
-            );
-            // A nil handler: the button only dismisses the alert.
-            let ok = UIAlertAction::actionWithTitle_style_handler(
-                Some(&NSString::from_str("OK")),
-                UIAlertActionStyle::Default,
-                None,
-                mtm,
-            );
-            controller.addAction(&ok);
-            // On the window's root, on the main thread; no completion.
-            root.presentViewController_animated_completion(&controller, true, None);
-            Some(())
-        });
-        if shown.is_none() {
+        if !try_alert(title, text) {
             eprintln!("{title}\n\n{text}");
         }
+    }
+
+    /// Presents the message over the window's root, if that root's view is
+    /// on screen and showing nothing else, and says whether it took.
+    pub(super) fn try_alert(title: &str, text: &str) -> bool {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return false;
+        };
+        let Some(root) = root(mtm) else {
+            return false;
+        };
+        let on_screen = root.isViewLoaded() && root.view().and_then(|v| v.window()).is_some();
+        if !on_screen || root.presentedViewController().is_some() {
+            return false;
+        }
+        let controller = UIAlertController::alertControllerWithTitle_message_preferredStyle(
+            Some(&NSString::from_str(title)),
+            Some(&NSString::from_str(text)),
+            UIAlertControllerStyle::Alert,
+            mtm,
+        );
+        // A nil handler: the button only dismisses the alert.
+        let ok = UIAlertAction::actionWithTitle_style_handler(
+            Some(&NSString::from_str("OK")),
+            UIAlertActionStyle::Default,
+            None,
+            mtm,
+        );
+        controller.addAction(&ok);
+        // On the window's root, on the main thread; no completion.
+        root.presentViewController_animated_completion(&controller, true, None);
+        // Dropped presentations leave nothing presented.
+        root.presentedViewController().is_some()
     }
 
     pub(super) fn caption(text: &str) {
@@ -518,6 +546,11 @@ mod system {
 
     pub(super) fn alert(title: &str, text: &str) {
         eprintln!("{title}\n\n{text}");
+    }
+
+    pub(super) fn try_alert(title: &str, text: &str) -> bool {
+        alert(title, text);
+        true
     }
 
     pub(super) fn caption(_text: &str) {}

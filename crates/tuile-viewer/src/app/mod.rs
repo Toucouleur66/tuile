@@ -620,9 +620,8 @@ impl ApplicationHandler for App {
         // location is taken on whatever turn of the loop it arrives, hidden
         // and warming included.
         self.take_the_session();
-        for (title, text) in self.messages.release(self.active.is_some()) {
-            crate::desktop::alert(&title, &text);
-        }
+        self.messages
+            .offer(self.active.is_some(), crate::desktop::try_alert);
         self.take_the_location();
         self.take_the_commands();
         self.take_the_imagery();
