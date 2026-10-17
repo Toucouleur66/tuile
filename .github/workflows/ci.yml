@@ -66,6 +66,7 @@ jobs:
           -p tuile-terrain
           -p tuile-camera
           -p tuile-atmosphere
+          -p tuile-film-gpu
           -p tuile-ui
           -p tuile-wasm-globe
           -p tuile-film
