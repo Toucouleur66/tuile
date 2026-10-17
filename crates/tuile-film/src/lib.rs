@@ -7,7 +7,7 @@
 //! meshes, which imagery. What is left for a renderer is bookkeeping — which
 //! tiles enter and leave between two frames — plus the camera and the look.
 //! That bookkeeping lives here, free of any GPU and any I/O, so the same film
-//! drives a browser worker and a headless binary.
+//! drives any renderer, a headless binary as well as one compiled to wasm.
 
 mod camera;
 mod cursor;

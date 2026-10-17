@@ -128,8 +128,7 @@ A long film is baked and rendered **by chunks**, one pack each, in parallel;
 segments into one mp4, in Rust. `tuile-film` reads a baked film frame by frame
 with no GPU and no I/O; `tuile-film-gpu` draws it (one visibility raster, the
 rest in compute); `tuile-film-native` renders it to an mp4 through the
-machine's own encoder; `tuile-film-web` renders the same film in a browser
-worker, frames handed to WebCodecs.
+machine's own encoder.
 
 ## Colour: radiometric calibration
 
@@ -207,8 +206,8 @@ tiles **as their source delivered them, kept once**, on any object store.
 
 There is no HTTP server in the library. `tuile-repository` defines the API as
 **a function from a request to a reply**, and a host is an adapter of a few
-lines: `tuile-pack-api` (a native process) and `tuile-pack-worker` (a worker
-at the edge) serve the same routes from the same code, and any other host can.
+lines: `tuile-pack-api` (a native process) serves these routes, and any
+other host can serve the same ones from the same code.
 
 ```text
 GET  /api/projects                       the projects and the tile store
@@ -262,13 +261,11 @@ Routing, authentication and limits belong to whoever deploys it.
 | | `tuile-film` | A baked film read frame by frame — no GPU, no I/O |
 | | `tuile-film-gpu` | A film on wgpu: one visibility raster, the rest in compute |
 | | `tuile-film-native` | A film rendered natively to an mp4 |
-| | `tuile-film-web` | A film rendered in a browser worker |
 | | `tuile-radiometry` | Imagery tiles brought to one another's light |
 | | `tuile-mp4` | H.264 samples into an mp4, in memory |
 | Storage and serving | `tuile-tile-server` | The tile store: archives per zone and layer, compacted in stream |
 | | `tuile-repository` | Repositories over the buckets that hold packs, tapes and tiles |
 | | `tuile-pack-api` | A read-only HTTP API over those buckets |
-| | `tuile-pack-worker` | The same API as an edge worker |
 | | `tuile-farm` | A render farm's storage: ranged reads, multipart writes, film assembly |
 | | `tuile-metrics` | The core's counters on a metrics endpoint |
 
@@ -341,7 +338,7 @@ cargo run --release -p tuile-film-native --bin tuile-film-render -- <packs prefi
 The film renderer reads its packs and the tile store from the buckets named in
 its environment. Its options and variables are listed at the head of
 [`tuile-film-render.rs`](crates/tuile-film-native/src/bin/tuile-film-render.rs);
-[`film-bench.example.toml`](examples/film-web/film-bench.example.toml) shows
+[`film-bench.example.toml`](crates/tuile-pack-api/film-bench.example.toml) shows
 how buckets are named.
 
 ## How it holds together

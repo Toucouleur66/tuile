@@ -64,13 +64,11 @@ const libraries = [
   'tuile-film',
   'tuile-film-gpu',
   'tuile-film-native',
-  'tuile-film-web',
   'tuile-mp4',
   // integrations
   'tuile-usd',
   'tuile-hydra',
   'tuile-metrics',
-  'tuile-pack-worker',
 ];
 
 // …and these programs, as [package, binary].
