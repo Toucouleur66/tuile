@@ -1,0 +1,32 @@
+{
+  "name": "@lapoule-dev/tuile-viewer",
+  "version": "0.7.1",
+  "description": "A streaming terrain and imagery globe for the web: WebGPU, with a WebGL2 fallback, its geometry server in a worker",
+  "license": "MIT OR Apache-2.0",
+  "author": "lapoule.dev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lapoule-dev/tuile.git",
+    "directory": "packages/tuile-viewer"
+  },
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "worker.js",
+    "wasm/tuile_viewer.js",
+    "wasm/tuile_viewer_bg.wasm",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "keywords": ["globe", "terrain", "3d-tiles", "webgpu", "webgl2", "wasm"]
+}

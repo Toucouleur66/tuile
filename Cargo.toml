@@ -33,7 +33,6 @@ members = [
     "crates/tuile-wgpu",
     "examples/globe-bulk",
     "examples/orbit-probe",
-    "examples/wasm-globe",
     "examples/warm-cache",
     "examples/wgpu-viewer",
 ]

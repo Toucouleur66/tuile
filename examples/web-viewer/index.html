@@ -1,0 +1,33 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+<!-- Copyright (c) lapoule.dev -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>Tuile globe</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; color: #ddd; font: 14px system-ui, sans-serif; }
+    #globe { position: fixed; inset: 0; }
+    #token { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+    #token[hidden] { display: none; }
+    #token form { display: flex; flex-direction: column; gap: 8px; width: min(420px, calc(100% - 32px)); }
+    #token input { font: inherit; padding: 8px; }
+    #status { position: fixed; top: 6px; left: 8px; font-size: 12px; text-shadow: 0 0 3px #000; pointer-events: none; }
+  </style>
+</head>
+<body>
+  <div id="globe"></div>
+  <div id="token" hidden>
+    <form>
+      <label for="token-value">Cesium ion access token</label>
+      <input id="token-value" type="password" autocomplete="off" required>
+      <button type="submit">Open the globe</button>
+      <small>Kept in this page only: never stored, never sent anywhere but the catalog.</small>
+    </form>
+  </div>
+  <div id="status"></div>
+  <script type="module" src="./main.js"></script>
+</body>
+</html>
