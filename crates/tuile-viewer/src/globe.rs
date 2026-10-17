@@ -20,7 +20,7 @@ use tuile_core::storage::ContentStore;
 use tuile_planetary::{
     globe_on, GlobeOptions, Held, ImageryDetail, LayerBudget, Sources, SwitchableImagery,
 };
-use tuile_storage_foyer::FoyerStore;
+use tuile_storage_foyer::SuspendableStore as FoyerStore;
 use tuile_terrain::{CachedTerrain, TerrainHeights, TerrainSource};
 
 use crate::embed::{ImageryChoice, TerrainChoice};
@@ -185,7 +185,7 @@ pub(crate) async fn open_the_store_at(
         disk_bytes,
         ..tuile_storage_foyer::StoreConfig::at(dir)
     };
-    let first = match FoyerStore::with_config(config()).await {
+    let first = match FoyerStore::open(config()).await {
         Ok(store) => {
             tracing::info!(dir = %dir.display(), "tile store open");
             return Some(Arc::new(store));
@@ -205,7 +205,7 @@ pub(crate) async fn open_the_store_at(
     if let Err(e) = cleared {
         tracing::warn!("could not clear {} ({e})", dir.display());
     }
-    match FoyerStore::with_config(config()).await {
+    match FoyerStore::open(config()).await {
         Ok(store) => Some(Arc::new(store)),
         Err(e) => {
             tracing::warn!("no tile store ({e}); every tile will be re-fetched");

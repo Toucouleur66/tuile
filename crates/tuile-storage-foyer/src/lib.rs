@@ -263,6 +263,87 @@ impl ContentStore for FoyerStore {
     }
 }
 
+/// A [`FoyerStore`] that can be closed and opened again behind one handle.
+///
+/// A store keeps its most recent entries in memory and writes them to disk
+/// when memory lets go of them, or when it is closed. A desktop closes it on
+/// the way out. A phone's application is never shut down: it goes to the
+/// background and is ended there without a word, and whatever the memory tier
+/// held is lost — measured on a device: a session's tiles, none of them found
+/// by the next launch. So the host suspends the store when it leaves the
+/// screen, which closes it and writes everything down, and resumes it when it
+/// comes back.
+///
+/// Callers never see the difference: while suspended a read is a miss and a
+/// write is declined, which is what a store is allowed to answer at any time.
+pub struct SuspendableStore {
+    config: StoreConfig,
+    live: std::sync::Mutex<Option<FoyerStore>>,
+}
+
+impl SuspendableStore {
+    /// Opens the store with `config`.
+    pub async fn open(config: StoreConfig) -> Result<Self, StoreError> {
+        let store = FoyerStore::with_config(config.clone()).await?;
+        Ok(Self {
+            config,
+            live: std::sync::Mutex::new(Some(store)),
+        })
+    }
+
+    fn current(&self) -> Option<FoyerStore> {
+        self.live.lock().ok().and_then(|live| live.clone())
+    }
+
+    /// Writes everything down and closes the store. Reads miss and writes
+    /// are declined until [`Self::resume`]. Harmless when already suspended.
+    pub async fn suspend(&self) -> Result<(), StoreError> {
+        let taken = self.live.lock().ok().and_then(|mut live| live.take());
+        match taken {
+            Some(store) => store.close().await,
+            None => Ok(()),
+        }
+    }
+
+    /// Opens the store again, from what is on disk. Harmless when open.
+    pub async fn resume(&self) -> Result<(), StoreError> {
+        if self.current().is_some() {
+            return Ok(());
+        }
+        let store = FoyerStore::with_config(self.config.clone()).await?;
+        if let Ok(mut live) = self.live.lock() {
+            if live.is_none() {
+                *live = Some(store);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the store is suspended.
+    pub fn is_suspended(&self) -> bool {
+        self.current().is_none()
+    }
+
+    /// Writes everything down and closes the store, for good: see
+    /// [`FoyerStore::close`].
+    pub async fn close(&self) -> Result<(), StoreError> {
+        self.suspend().await
+    }
+}
+
+#[async_trait]
+impl ContentStore for SuspendableStore {
+    async fn get(&self, key: &str) -> Option<Bytes> {
+        self.current()?.get(key).await
+    }
+
+    async fn put(&self, key: &str, value: Bytes, ttl: Option<Duration>) {
+        if let Some(store) = self.current() {
+            store.put(key, value, ttl).await;
+        }
+    }
+}
+
 /// Milliseconds since the Unix epoch. A clock that reads before the epoch is
 /// not worth branching on: treat it as the epoch, which expires everything and
 /// degrades to a cold store rather than serving content forever.
@@ -358,6 +439,60 @@ fn cache_dir_for(os: &str, xdg: Option<PathBuf>, home: Option<PathBuf>) -> PathB
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a suspended store held is on disk for whoever opens it next —
+    /// the next launch — and the same handle serves again once resumed.
+    /// While suspended it misses and declines, as a store may.
+    #[test]
+    fn a_suspended_store_has_written_everything_down() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        // Room for a few blocks: a store of one block cannot reclaim, and
+        // waits for ever on close.
+        let config = |dir: &Path| StoreConfig {
+            disk_bytes: 64 << 20,
+            ..config(dir)
+        };
+        runtime.block_on(async {
+            let store = SuspendableStore::open(config(dir.path()))
+                .await
+                .expect("open");
+            for i in 0..20 {
+                store
+                    .put(&format!("tile/{i}"), Bytes::from(vec![i as u8; 1000]), None)
+                    .await;
+            }
+            store.suspend().await.expect("suspended");
+            assert!(store.is_suspended());
+            assert_eq!(
+                store.get("tile/3").await,
+                None,
+                "a suspended store answered"
+            );
+            store.put("tile/late", Bytes::from_static(b"x"), None).await;
+
+            // The next process, as it were: a store opened on the same files.
+            let next = FoyerStore::with_config(config(dir.path()))
+                .await
+                .expect("reopened");
+            let found = next.get("tile/3").await;
+            next.close().await.expect("closed");
+            assert_eq!(found.as_deref(), Some(&[3u8; 1000][..]), "lost on suspend");
+
+            store.resume().await.expect("resumed");
+            assert_eq!(store.get("tile/7").await.as_deref(), Some(&[7u8; 1000][..]));
+            assert_eq!(
+                store.get("tile/late").await,
+                None,
+                "a write while suspended"
+            );
+            store.close().await.expect("closed");
+        });
+    }
 
     /// A passing condition is told from damage: out of descriptors, busy or
     /// a full disk is transient; a file where the store's directory should be

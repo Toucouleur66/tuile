@@ -24,7 +24,7 @@ use std::sync::Arc;
 use tuile_core::protocol::InProcessStream;
 use tuile_core::source::TileLoader;
 use tuile_planetary::{ImageryDetail, LayerBudget};
-use tuile_storage_foyer::FoyerStore;
+use tuile_storage_foyer::SuspendableStore as FoyerStore;
 use tuile_terrain::TerrainHeights;
 
 use crate::embed::{ImageryChoice, TerrainChoice, ViewerHost};

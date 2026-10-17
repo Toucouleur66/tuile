@@ -84,7 +84,10 @@ environment, which xcodebuild writes into its log.
 - **Lifecycle**: no frame and no GPU work outside the foreground; loads held
   at a gate while away; the surface and render targets released in the
   background and rebuilt before the first frame back (again on every turn
-  until that succeeds). The background trim's evictions are taken in the
+  until that succeeds). The tile store is written down and closed on the
+  way into the background and opened again on the way back: a phone ends a
+  background application without a word, and a store that is never closed
+  keeps nothing of its memory tier for the next launch. The background trim's evictions are taken in the
   background too, without touching the GPU, so the memory is back while
   the system weighs the application.
 - **Start-up**: given up after 20 s, then tried again after 2, 4, 8… s up to

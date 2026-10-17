@@ -8,7 +8,7 @@
 //! command* while comparing — and a comparison whose two halves were launched
 //! differently is not a comparison.
 
-use tuile_storage_foyer::FoyerStore;
+use tuile_storage_foyer::SuspendableStore as FoyerStore;
 
 /// Logs to stderr; `RUST_LOG` overrides. From a terminal the default shows
 /// tile streaming (`tuile_planetary=debug`) plus app-level info.

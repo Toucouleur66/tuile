@@ -301,6 +301,9 @@ pub(super) trait Carry {
     fn resend_view(&mut self);
     fn release_surface(&mut self);
     fn restore_surface(&mut self);
+    /// Write the tile store down and close it, off the window's thread.
+    fn suspend_store(&mut self);
+    fn resume_store(&mut self);
     fn redraw(&mut self);
 }
 
@@ -322,6 +325,8 @@ pub(super) fn carry(steps: Vec<Step>, to: &mut impl Carry) {
                 to.send(ClientMessage::Trim { budget_bytes });
                 to.resend_view();
             }
+            Step::SuspendStore => to.suspend_store(),
+            Step::ResumeStore => to.resume_store(),
             Step::ReleaseSurface => to.release_surface(),
             Step::RestoreSurface => to.restore_surface(),
             Step::Redraw => to.redraw(),
@@ -363,6 +368,28 @@ impl Carry for App {
         self.restore_the_surface();
     }
 
+    fn suspend_store(&mut self) {
+        if let Some(store) = self.session.as_ref().and_then(|s| s.store.clone()) {
+            self.runtime.spawn(async move {
+                match store.suspend().await {
+                    Ok(()) => tracing::info!("tile store written down and closed"),
+                    Err(e) => tracing::warn!("the tile store did not close ({e})"),
+                }
+            });
+        }
+    }
+
+    fn resume_store(&mut self) {
+        if let Some(store) = self.session.as_ref().and_then(|s| s.store.clone()) {
+            self.runtime.spawn(async move {
+                match store.resume().await {
+                    Ok(()) => tracing::info!("tile store open again"),
+                    Err(e) => tracing::warn!("the tile store did not open again ({e})"),
+                }
+            });
+        }
+    }
+
     fn redraw(&mut self) {
         self.demand.poke();
         if let Some(active) = self.active.as_ref() {
@@ -402,6 +429,12 @@ mod tests {
         fn restore_surface(&mut self) {
             self.did.push("restore".into());
         }
+        fn suspend_store(&mut self) {
+            self.did.push("suspend".into());
+        }
+        fn resume_store(&mut self) {
+            self.did.push("resume".into());
+        }
         fn redraw(&mut self) {
             self.did.push("redraw".into());
         }
@@ -417,19 +450,29 @@ mod tests {
             ..Recorded::default()
         };
         carry(
-            vec![Step::PauseLoads, Step::Trim(1 << 20), Step::ReleaseSurface],
+            vec![
+                Step::PauseLoads,
+                Step::Trim(1 << 20),
+                Step::SuspendStore,
+                Step::ReleaseSurface,
+            ],
             &mut to,
         );
         assert!(to.gate.as_ref().is_some_and(Gate::is_shut));
-        assert_eq!(to.did, ["trim 1048576", "view", "release"]);
+        assert_eq!(to.did, ["trim 1048576", "view", "suspend", "release"]);
 
         to.did.clear();
         carry(
-            vec![Step::RestoreSurface, Step::ResumeLoads, Step::Redraw],
+            vec![
+                Step::RestoreSurface,
+                Step::ResumeStore,
+                Step::ResumeLoads,
+                Step::Redraw,
+            ],
             &mut to,
         );
         assert!(to.gate.as_ref().is_some_and(|g| !g.is_shut()));
-        assert_eq!(to.did, ["restore", "redraw"]);
+        assert_eq!(to.did, ["restore", "resume", "redraw"]);
 
         // Before the session is up there is no gate, and nothing breaks.
         let mut early = Recorded::default();

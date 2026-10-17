@@ -47,6 +47,12 @@ pub(super) enum Step {
     ResumeLoads,
     /// Ask the server to let go of residency beyond this many bytes.
     Trim(usize),
+    /// Write the tile store down and close it: the system ends background
+    /// applications without a word, and an unclosed store loses its memory
+    /// tier.
+    SuspendStore,
+    /// Open it again.
+    ResumeStore,
     /// Drop the surface and the render targets.
     ReleaseSurface,
     /// Build them again, before any frame.
@@ -61,6 +67,7 @@ pub(super) struct Lifecycle {
     /// A phone's rules, or a desktop's. See the module.
     handheld: bool,
     surface_released: bool,
+    store_suspended: bool,
     /// Bytes to trim to on a memory warning, and in the background.
     trim_on_warning: usize,
     trim_in_background: usize,
@@ -72,6 +79,7 @@ impl Lifecycle {
             phase: Phase::Active,
             handheld: profile.release_surface_in_background,
             surface_released: false,
+            store_suspended: false,
             trim_on_warning: profile.trim_on_warning(),
             trim_in_background: profile.trim_in_background(),
         }
@@ -112,6 +120,9 @@ impl Lifecycle {
             steps.push(Step::PauseLoads);
         }
         steps.push(Step::Trim(self.trim_in_background));
+        if !std::mem::replace(&mut self.store_suspended, true) {
+            steps.push(Step::SuspendStore);
+        }
         if !self.surface_released {
             self.surface_released = true;
             steps.push(Step::ReleaseSurface);
@@ -142,6 +153,9 @@ impl Lifecycle {
         let mut steps = Vec::new();
         if std::mem::take(&mut self.surface_released) {
             steps.push(Step::RestoreSurface);
+        }
+        if std::mem::take(&mut self.store_suspended) {
+            steps.push(Step::ResumeStore);
         }
         if self.handheld && was != Phase::Active {
             steps.push(Step::ResumeLoads);
@@ -191,7 +205,11 @@ mod tests {
 
         assert_eq!(
             l.background(),
-            [Step::Trim(p.trim_in_background()), Step::ReleaseSurface]
+            [
+                Step::Trim(p.trim_in_background()),
+                Step::SuspendStore,
+                Step::ReleaseSurface
+            ]
         );
         assert!(!l.may_draw());
         // Said twice, done once.
@@ -203,7 +221,12 @@ mod tests {
 
         assert_eq!(
             l.activate(),
-            [Step::RestoreSurface, Step::ResumeLoads, Step::Redraw]
+            [
+                Step::RestoreSurface,
+                Step::ResumeStore,
+                Step::ResumeLoads,
+                Step::Redraw
+            ]
         );
         assert!(l.may_draw());
     }
