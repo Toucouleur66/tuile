@@ -42,8 +42,68 @@ use tuile_core::storage::ContentStore;
 /// The store could not be built. Once running, the store never fails a caller:
 /// misses and declined writes are normal, not errors.
 #[derive(Debug, thiserror::Error)]
-#[error("content store: {0}")]
-pub struct StoreError(String);
+#[error("content store: {message}")]
+pub struct StoreError {
+    message: String,
+    transient: bool,
+}
+
+impl StoreError {
+    /// From any error, judged by the I/O error at the bottom of its chain.
+    fn from_error(error: &(dyn std::error::Error + 'static)) -> Self {
+        let mut io = None;
+        let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
+        while let Some(e) = cause {
+            if let Some(found) = e.downcast_ref::<std::io::Error>() {
+                io = Some(found);
+            }
+            cause = e.source();
+        }
+        Self {
+            message: error.to_string(),
+            transient: io.is_some_and(is_transient),
+        }
+    }
+
+    /// Whether the failure says nothing about the store's files: another
+    /// process holding them, the process out of descriptors or memory, a full
+    /// disk, a call interrupted or timed out. Such a store is fine and will
+    /// open again; **clearing it to start afresh would throw away a good
+    /// cache over a passing condition**. Anything else — a file where the
+    /// directory should be, data that does not read back — is damage.
+    pub fn is_transient(&self) -> bool {
+        self.transient
+    }
+}
+
+impl From<std::io::Error> for StoreError {
+    fn from(error: std::io::Error) -> Self {
+        Self::from_error(&error)
+    }
+}
+
+fn is_transient(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{
+        Interrupted, OutOfMemory, PermissionDenied, QuotaExceeded, ResourceBusy, StorageFull,
+        TimedOut, WouldBlock,
+    };
+    // ENFILE, EMFILE — the system or the process out of descriptors — which
+    // carry no kind of their own. The same numbers on macOS, iOS and Linux.
+    const OUT_OF_DESCRIPTORS: [i32; 2] = [23, 24];
+    matches!(
+        error.kind(),
+        Interrupted
+            | WouldBlock
+            | TimedOut
+            | ResourceBusy
+            | OutOfMemory
+            | StorageFull
+            | QuotaExceeded
+            | PermissionDenied
+    ) || error
+        .raw_os_error()
+        .is_some_and(|code| OUT_OF_DESCRIPTORS.contains(&code))
+}
 
 /// Capacities and location of a [`FoyerStore`].
 #[derive(Debug, Clone)]
@@ -106,7 +166,7 @@ impl FoyerStore {
         self.cache
             .close()
             .await
-            .map_err(|e| StoreError(e.to_string()))
+            .map_err(|e| StoreError::from_error(&e))
     }
 
     /// Builds a store with an explicit configuration.
@@ -128,11 +188,11 @@ impl FoyerStore {
     }
 
     async fn build(cfg: StoreConfig, policy: foyer::HybridCachePolicy) -> Result<Self, StoreError> {
-        std::fs::create_dir_all(&cfg.dir).map_err(|e| StoreError(e.to_string()))?;
+        std::fs::create_dir_all(&cfg.dir).map_err(|e| StoreError::from_error(&e))?;
         let device = FsDeviceBuilder::new(&cfg.dir)
             .with_capacity(cfg.disk_bytes)
             .build()
-            .map_err(|e| StoreError(e.to_string()))?;
+            .map_err(|e| StoreError::from_error(&e))?;
         // Writes to the disk go through a queue, and foyer DROPS what arrives
         // while that queue is over its threshold (32 MiB by default): right
         // for a cache that may forget, and the reason a store asked to keep
@@ -157,7 +217,7 @@ impl FoyerStore {
             .with_engine_config(engine)
             .build()
             .await
-            .map_err(|e| StoreError(e.to_string()))?;
+            .map_err(|e| StoreError::from_error(&e))?;
         Ok(Self {
             cache,
             default_ttl: cfg.default_ttl,
@@ -261,14 +321,30 @@ impl Stamped {
 }
 
 /// A stable per-user cache directory (`$XDG_CACHE_HOME`, else `~/Library/Caches`
-/// on macOS / `~/.cache` elsewhere, else the temp dir), suffixed `tuile`.
+/// on macOS and iOS / `~/.cache` elsewhere, else the temp dir), suffixed
+/// `tuile`.
+///
+/// iOS included, and it matters there more than anywhere: an application's
+/// `$HOME` is its container, `Library/Caches` is the one directory in it the
+/// system may purge when space runs short — and the only right place for a
+/// cache of hundreds of megabytes — while `~/.cache` at the container's root
+/// is neither purgeable nor a place an application is meant to write.
 pub fn default_cache_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
+    cache_dir_for(
+        std::env::consts::OS,
+        std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+/// [`default_cache_dir`], for the operating system `os` (as
+/// [`std::env::consts::OS`] names it) and the given variables.
+fn cache_dir_for(os: &str, xdg: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+    let apple = matches!(os, "macos" | "ios");
+    let base = xdg
         .or_else(|| {
-            std::env::var_os("HOME").map(|home| {
-                let home = PathBuf::from(home);
-                if cfg!(target_os = "macos") {
+            home.map(|home| {
+                if apple {
                     home.join("Library/Caches")
                 } else {
                     home.join(".cache")
@@ -282,6 +358,61 @@ pub fn default_cache_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A passing condition is told from damage: out of descriptors, busy or
+    /// a full disk is transient; a file where the store's directory should be
+    /// is not.
+    #[test]
+    fn a_store_error_says_whether_it_will_pass() {
+        use std::io::{Error, ErrorKind};
+        for passing in [
+            Error::from_raw_os_error(24),
+            Error::from_raw_os_error(23),
+            Error::from(ErrorKind::ResourceBusy),
+            Error::from(ErrorKind::WouldBlock),
+            Error::from(ErrorKind::StorageFull),
+            Error::from(ErrorKind::PermissionDenied),
+        ] {
+            assert!(StoreError::from(passing).is_transient());
+        }
+        assert!(!StoreError::from(Error::from(ErrorKind::InvalidData)).is_transient());
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let in_the_way = dir.path().join("store");
+        std::fs::write(&in_the_way, b"not a directory").expect("a file");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let error = runtime
+            .block_on(FoyerStore::with_config(config(&in_the_way)))
+            .err()
+            .expect("a file where the store goes");
+        assert!(!error.is_transient(), "{error}");
+    }
+
+    /// A phone's container keeps its caches where a Mac does, under
+    /// `Library/Caches` — the purgeable directory — and nowhere else does.
+    #[test]
+    fn the_cache_lives_in_library_caches_on_apple_systems() {
+        let home = || Some(PathBuf::from("/home/x"));
+        for os in ["macos", "ios"] {
+            assert_eq!(
+                cache_dir_for(os, None, home()),
+                PathBuf::from("/home/x/Library/Caches/tuile"),
+                "{os}"
+            );
+        }
+        assert_eq!(
+            cache_dir_for("linux", None, home()),
+            PathBuf::from("/home/x/.cache/tuile")
+        );
+        assert_eq!(
+            cache_dir_for("ios", Some("/xdg".into()), home()),
+            PathBuf::from("/xdg/tuile"),
+            "XDG_CACHE_HOME wins everywhere"
+        );
+    }
 
     fn config(dir: &Path) -> StoreConfig {
         StoreConfig {
