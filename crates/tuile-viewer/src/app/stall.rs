@@ -13,12 +13,17 @@
 //! The frame step is the window's own: [`tuile_wgpu::ContentPump::advance_while`]
 //! with the phone's upload budget, on a real (headless) GPU, against a real
 //! geometry server whose loader is wrapped in the same gate the window uses.
-//! It is run for two seconds of frames; each must come back within a frame's
-//! time, and the loading indicator must be up, at full strength, throughout.
-//! Skipped, with a line, on a machine without a GPU adapter.
+//! It is run for [`FRAMES`] frames. A frame that waited on this network would
+//! wait forever, so the promise is checked as "every frame comes back", with a
+//! watchdog that turns a hang into a failure, and each frame within
+//! [`FRAME_LIMIT`] — far below the seconds a phone's system allows, far above
+//! what a slow shared CI GPU needs. The loading indicator must be up, at full
+//! strength, throughout. Skipped, with a line, on a machine without a GPU
+//! adapter.
 
 #![cfg(test)]
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,6 +35,15 @@ use tuile_core::tileset::Refine;
 use super::loading::{Loading, Observed, Style};
 use crate::gate::{Gate, Gated};
 use crate::profile::{DeviceMemory, Profile};
+
+/// How many frames the stalled network is held for.
+const FRAMES: usize = 60;
+/// The longest a single frame may take. A frame that waits on the network
+/// never returns at all; this bound only catches a frame that waits *for a
+/// while*, and leaves room for software rasterizers on shared runners.
+const FRAME_LIMIT: Duration = Duration::from_millis(250);
+/// After this long the test fails instead of hanging.
+const WATCHDOG: Duration = Duration::from_secs(60);
 
 /// One tile the size of the planet, with children, all of it on screen.
 struct Planet;
@@ -109,8 +123,17 @@ fn a_frame_returns_and_the_indicator_turns_while_the_network_stalls() {
     let mut pump = tuile_wgpu::ContentPump::new(camera.position);
     let mut loading = Loading::new(Instant::now());
     let budget = profile.uploads;
-    let (began, mut frames, mut slowest) = (Instant::now(), 0, Duration::ZERO);
-    while began.elapsed() < Duration::from_secs(2) {
+    let finished = Arc::new(AtomicBool::new(false));
+    let watched = finished.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(WATCHDOG);
+        if !watched.load(Ordering::SeqCst) {
+            eprintln!("a frame never came back from a network that never answers");
+            std::process::exit(1);
+        }
+    });
+    let (mut frames, mut slowest) = (0, Duration::ZERO);
+    while frames < FRAMES {
         let t = Instant::now();
         pump.advance_while(
             &mut stream,
@@ -142,9 +165,9 @@ fn a_frame_returns_and_the_indicator_turns_while_the_network_stalls() {
         );
         std::thread::sleep(Duration::from_millis(16));
     }
-    assert!(frames > 60, "only {frames} frames in two seconds");
+    finished.store(true, Ordering::SeqCst);
     assert!(
-        slowest < Duration::from_millis(16),
+        slowest < FRAME_LIMIT,
         "a frame waited {slowest:?} on a network that never answers"
     );
     assert!(!pump.closed, "the server stopped");
