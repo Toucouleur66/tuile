@@ -12,7 +12,7 @@
 //!
 //! ```text
 //!   page  ──set_view(eye, dir, up, viewport, fovy)──▶  worker
-//!   page  ◀──drain(): Add | Drop | Stats ────────────  worker
+//!   page  ◀──drain(): select | add | evict | retire | priming | error ──  worker
 //! ```
 //!
 //! Pull, not push. The worker does not post messages when it feels like it; the
@@ -40,13 +40,14 @@ use std::sync::Arc;
 
 use wasm_bindgen::prelude::*;
 
-use tuile_core::content::TileContent;
-use tuile_core::protocol::{ClientMessage, GeometryStream, ServerMessage};
+use tuile_core::content::DecodedTileContent;
+use tuile_core::protocol::{Ancestry, ClientMessage, GeometryStream};
 use tuile_core::raster::ImageryCoord;
 use tuile_core::runtime::in_process_with;
 use tuile_core::source::TileId;
 use tuile_core::traversal::{Config, ViewState};
 
+use crate::forward::{Forward, Forwarder};
 use crate::{WebFetcher, WebIonHttp};
 
 /// Cesium World Terrain, and Bing Aerial. The same two assets the native viewer
@@ -62,6 +63,9 @@ pub struct WorkerEngine {
     /// note: this is what stops one texture crossing once per tile that drapes
     /// it.
     sent_imagery: HashSet<ImageryCoord>,
+    /// What the page holds, and the rules that follow from it. See
+    /// [`crate::forward`].
+    forward: Forwarder,
 }
 
 #[wasm_bindgen]
@@ -137,13 +141,14 @@ impl WorkerEngine {
         Ok(WorkerEngine {
             stream,
             sent_imagery: HashSet::new(),
+            forward: Forwarder::new(),
         })
     }
 
     /// Hands the server the camera. One call per frame; the server coalesces.
     #[allow(clippy::too_many_arguments)]
     pub fn set_view(
-        &self,
+        &mut self,
         eye_x: f64,
         eye_y: f64,
         eye_z: f64,
@@ -164,10 +169,13 @@ impl WorkerEngine {
             glam::DVec2::new(width, height),
             fovy,
         );
+        // Numbered, so a selection that answers a camera already left behind
+        // can be recognised and dropped before it reaches the page.
+        let generation = self.forward.next_generation();
         self.stream
             .send(ClientMessage::ViewerState {
                 views: vec![view],
-                generation: 0,
+                generation,
             })
             .map_err(|e| JsError::new(&e.to_string()))
     }
@@ -185,7 +193,15 @@ impl WorkerEngine {
         loop {
             match self.stream.poll_message(&mut cx) {
                 std::task::Poll::Ready(Some(msg)) => {
-                    if let Some(value) = self.encode(msg) {
+                    let routed = self.forward.route(msg);
+                    if let Some(tile) = routed.ack {
+                        // The page applies a batch in one task on receipt, so
+                        // forwarding is the upload as far as the server can
+                        // tell. Best effort: a closed stream is reported below.
+                        let _ = self.stream.send(ClientMessage::Ack { tile });
+                    }
+                    if let Some(forward) = routed.forward {
+                        let value = self.encode(forward);
                         out.push(&value);
                     }
                 }
@@ -203,159 +219,67 @@ impl WorkerEngine {
         out
     }
 
-    /// Turns one server message into the object the page consumes.
-    fn encode(&mut self, msg: ServerMessage) -> Option<JsValue> {
+    /// Turns one forwarded message into the object the page consumes.
+    fn encode(&mut self, msg: Forward) -> JsValue {
         let obj = js_sys::Object::new();
         match msg {
-            ServerMessage::Select { tiles, stats } => {
+            Forward::Select {
+                tiles,
+                ancestry,
+                stats,
+                generation,
+            } => {
                 set(&obj, "kind", &JsValue::from_str("select"));
                 let ids = js_sys::Array::new();
                 for (tile, _sse) in &tiles {
                     ids.push(&JsValue::from_str(&tile_key(*tile)));
                 }
                 set(&obj, "tiles", &ids);
+                // The closure, not one link per tile: a page climbing to the
+                // nearest ancestor it holds passes through tiles it has never
+                // been sent, and needs their links too.
+                let chain = js_sys::Array::new();
+                for (tile, a) in &ancestry {
+                    let link = ancestry_object(a);
+                    set(&link, "tile", &JsValue::from_str(&tile_key(*tile)));
+                    chain.push(&link);
+                }
+                set(&obj, "ancestry", &chain);
+                set(&obj, "generation", &JsValue::from_f64(generation as f64));
                 set(&obj, "selected", &JsValue::from_f64(stats.selected as f64));
                 set(&obj, "visited", &JsValue::from_f64(stats.visited as f64));
                 set(&obj, "culled", &JsValue::from_f64(stats.culled as f64));
             }
-            ServerMessage::Evict { tiles } => {
+            Forward::Evict { tiles } => {
                 set(&obj, "kind", &JsValue::from_str("evict"));
-                let ids = js_sys::Array::new();
-                for tile in &tiles {
-                    ids.push(&JsValue::from_str(&tile_key(*tile)));
-                }
-                set(&obj, "tiles", &ids);
+                set(&obj, "tiles", &keys(&tiles));
             }
-            // A take-back of stand-ins only. Forwarded under its own kind so
-            // the page can drop exactly the meshes it flagged as fills — an
-            // "evict" here would also drop real content still queued page-side,
-            // which is the failure the variant exists to prevent.
-            ServerMessage::Retire { tiles } => {
+            // Already narrowed to the tiles the page holds as stand-ins: the
+            // page drops these and nothing else.
+            Forward::Retire { tiles } => {
                 set(&obj, "kind", &JsValue::from_str("retire"));
-                let ids = js_sys::Array::new();
-                for tile in &tiles {
-                    ids.push(&JsValue::from_str(&tile_key(*tile)));
-                }
-                set(&obj, "tiles", &ids);
+                set(&obj, "tiles", &keys(&tiles));
             }
-            // A stand-in reaches the page through the same door as content and
-            // says so, so THREE can drop it the moment the real tile lands — and
-            // so a page held together by approximations can be seen to be.
-            ServerMessage::Fill { tile, content } => {
+            // Real content and stand-ins cross through the same door and carry
+            // the same payload — a stand-in is an upsample of an ancestor and
+            // drapes its mosaic — and say which they are.
+            Forward::Add {
+                tile,
+                ancestry,
+                fill,
+                content,
+            } => {
                 set(&obj, "kind", &JsValue::from_str("add"));
-                set(&obj, "fill", &JsValue::from_bool(true));
+                set(&obj, "fill", &JsValue::from_bool(fill));
                 set(&obj, "tile", &JsValue::from_str(&tile_key(tile)));
-                let origin = js_sys::Array::new();
-                origin.push(&JsValue::from_f64(content.local_origin_ecef.x));
-                origin.push(&JsValue::from_f64(content.local_origin_ecef.y));
-                origin.push(&JsValue::from_f64(content.local_origin_ecef.z));
-                set(&obj, "origin", &origin);
-                let meshes = js_sys::Array::new();
-                for mesh in &content.meshes {
-                    let m = js_sys::Object::new();
-                    set(&m, "positions", &flat3(&mesh.positions));
-                    if let Some(normals) = &mesh.normals {
-                        set(&m, "normals", &flat3(normals));
-                    }
-                    if let Some(uvs) = &mesh.uvs {
-                        set(&m, "uvs", &flat2(uvs));
-                    }
-                    set(&m, "indices", &js_sys::Uint32Array::from(&mesh.indices[..]));
-                    meshes.push(&m);
-                }
-                set(&obj, "meshes", &meshes);
-                set(&obj, "imagery", &js_sys::Array::new());
-            }
-            ServerMessage::Content { tile, content } => {
-                let TileContent::Decoded(decoded) = content else {
-                    // `Raw` never reaches a consumer in the in-process binding.
-                    return None;
-                };
-                set(&obj, "kind", &JsValue::from_str("add"));
-                set(&obj, "tile", &JsValue::from_str(&tile_key(tile)));
-                // f64, and it must stay f64: this is the whole anti-jitter
-                // mechanism. The page keeps it in double precision and folds it
-                // against the camera each frame.
-                let origin = js_sys::Array::new();
-                origin.push(&JsValue::from_f64(decoded.local_origin_ecef.x));
-                origin.push(&JsValue::from_f64(decoded.local_origin_ecef.y));
-                origin.push(&JsValue::from_f64(decoded.local_origin_ecef.z));
-                set(&obj, "origin", &origin);
-
-                let meshes = js_sys::Array::new();
-                for mesh in &decoded.meshes {
-                    let m = js_sys::Object::new();
-                    set(&m, "positions", &flat3(&mesh.positions));
-                    if let Some(normals) = &mesh.normals {
-                        set(&m, "normals", &flat3(normals));
-                    }
-                    if let Some(uvs) = &mesh.uvs {
-                        set(&m, "uvs", &flat2(uvs));
-                    }
-                    let indices = js_sys::Uint32Array::from(&mesh.indices[..]);
-                    set(&m, "indices", &indices);
-                    meshes.push(&m);
-                }
-                set(&obj, "meshes", &meshes);
-
-                // The packed table, exactly as the native backend uploads it.
-                //
-                // The page used to receive one object per real layer and pad
-                // the rest itself — which meant it also owned a copy of the
-                // slot count, of the empty-coverage sentinel and of the
-                // identity placement. Four hand-written copies of a rule
-                // `imagery_layer_table` already states, and nothing tested any
-                // of them. It is documented as "the contract *between*
-                // backends"; sending its output is what makes that true rather
-                // than aspirational.
-                // The floor rather than a detected count: this worker does not own the
-                // WebGL context that would report one, and the page it posts to
-                // is free to split the layers into passes of whatever width it
-                // can bind. Sending the packed table at the floor is the widest
-                // shape every consumer can read.
-                let table = tuile_core::raster::imagery_layer_table(
-                    &decoded.imagery,
-                    tuile_core::raster::MIN_IMAGERY_SLOTS,
-                );
-                set(
-                    &obj,
-                    "layerTable",
-                    &js_sys::Float32Array::from(table.as_flattened()),
-                );
-                // And the sentinel it pads with, so a consumer that has to mask
-                // a slot for its own reasons masks it the same way.
-                set(
-                    &obj,
-                    "emptyCoverage",
-                    &js_sys::Float32Array::from(&tuile_core::raster::EMPTY_COVERAGE[..]),
-                );
-
-                // Identity and pixels only: which texture belongs in which slot,
-                // in slot order, and the bytes the first time a coordinate is
-                // seen.
-                let layers = js_sys::Array::new();
-                for layer in &decoded.imagery {
-                    let l = js_sys::Object::new();
-                    set(&l, "coord", &JsValue::from_str(&coord_key(layer.coord)));
-                    if self.sent_imagery.insert(layer.coord) {
-                        set(&l, "width", &JsValue::from_f64(layer.texture.width as f64));
-                        set(
-                            &l,
-                            "height",
-                            &JsValue::from_f64(layer.texture.height as f64),
-                        );
-                        let rgba = js_sys::Uint8Array::from(&layer.texture.rgba8[..]);
-                        set(&l, "rgba", &rgba);
-                    }
-                    layers.push(&l);
-                }
-                set(&obj, "imagery", &layers);
+                set(&obj, "ancestry", &ancestry_object(&ancestry));
+                self.encode_content(&obj, &content);
             }
             // The warm-up's own progress. Relayed rather than swallowed so the
             // page can hold its globe back exactly as the native viewer holds
             // its window back — and, more importantly, so a warm-up that stalls
             // is visible instead of looking like a slow network.
-            ServerMessage::Priming(p) => {
+            Forward::Priming(p) => {
                 set(&obj, "kind", &JsValue::from_str("priming"));
                 set(&obj, "total", &JsValue::from_f64(p.total as f64));
                 set(
@@ -371,7 +295,7 @@ impl WorkerEngine {
                 set(&obj, "expected", &JsValue::from_f64(p.expected() as f64));
                 set(&obj, "settled", &JsValue::from_bool(p.settled()));
             }
-            ServerMessage::Error { tile, message } => {
+            Forward::Error { tile, message } => {
                 set(&obj, "kind", &JsValue::from_str("error"));
                 if let Some(tile) = tile {
                     set(&obj, "tile", &JsValue::from_str(&tile_key(tile)));
@@ -379,8 +303,95 @@ impl WorkerEngine {
                 set(&obj, "message", &JsValue::from_str(&message));
             }
         }
-        Some(obj.into())
+        obj.into()
     }
+
+    /// Geometry, origin and imagery of one tile, onto `obj`.
+    fn encode_content(&mut self, obj: &js_sys::Object, decoded: &DecodedTileContent) {
+        // f64, and it must stay f64: this is the whole anti-jitter
+        // mechanism. The page keeps it in double precision and folds it
+        // against the camera each frame.
+        let origin = js_sys::Array::new();
+        origin.push(&JsValue::from_f64(decoded.local_origin_ecef.x));
+        origin.push(&JsValue::from_f64(decoded.local_origin_ecef.y));
+        origin.push(&JsValue::from_f64(decoded.local_origin_ecef.z));
+        set(obj, "origin", &origin);
+
+        let meshes = js_sys::Array::new();
+        for mesh in &decoded.meshes {
+            let m = js_sys::Object::new();
+            set(&m, "positions", &flat3(&mesh.positions));
+            if let Some(normals) = &mesh.normals {
+                set(&m, "normals", &flat3(normals));
+            }
+            if let Some(uvs) = &mesh.uvs {
+                set(&m, "uvs", &flat2(uvs));
+            }
+            set(&m, "indices", &js_sys::Uint32Array::from(&mesh.indices[..]));
+            meshes.push(&m);
+        }
+        set(obj, "meshes", &meshes);
+
+        // The packed table, exactly as the native backend uploads it: the
+        // contract *between* backends, sent rather than re-derived page-side.
+        // At the floor slot count, because this worker does not own the
+        // context that would report a wider one.
+        let table = tuile_core::raster::imagery_layer_table(
+            &decoded.imagery,
+            tuile_core::raster::MIN_IMAGERY_SLOTS,
+        );
+        set(
+            obj,
+            "layerTable",
+            &js_sys::Float32Array::from(table.as_flattened()),
+        );
+        // And the sentinel it pads with, so a consumer that has to mask a slot
+        // for its own reasons masks it the same way.
+        set(
+            obj,
+            "emptyCoverage",
+            &js_sys::Float32Array::from(&tuile_core::raster::EMPTY_COVERAGE[..]),
+        );
+
+        // Identity and pixels only: which texture belongs in which slot, in
+        // slot order, and the bytes the first time a coordinate is seen.
+        let layers = js_sys::Array::new();
+        for layer in &decoded.imagery {
+            let l = js_sys::Object::new();
+            set(&l, "coord", &JsValue::from_str(&coord_key(layer.coord)));
+            if self.sent_imagery.insert(layer.coord) {
+                set(&l, "width", &JsValue::from_f64(layer.texture.width as f64));
+                set(
+                    &l,
+                    "height",
+                    &JsValue::from_f64(layer.texture.height as f64),
+                );
+                let rgba = js_sys::Uint8Array::from(&layer.texture.rgba8[..]);
+                set(&l, "rgba", &rgba);
+            }
+            layers.push(&l);
+        }
+        set(obj, "imagery", &layers);
+    }
+}
+
+/// `{ level, parent }`, the parent as a key or `null` at a root.
+fn ancestry_object(a: &Ancestry) -> js_sys::Object {
+    let o = js_sys::Object::new();
+    set(&o, "level", &JsValue::from_f64(a.level as f64));
+    let parent = a
+        .parent
+        .map_or(JsValue::NULL, |p| JsValue::from_str(&tile_key(p)));
+    set(&o, "parent", &parent);
+    o
+}
+
+fn keys(tiles: &[TileId]) -> js_sys::Array {
+    let ids = js_sys::Array::new();
+    for tile in tiles {
+        ids.push(&JsValue::from_str(&tile_key(*tile)));
+    }
+    ids
 }
 
 /// A tile's identity as the page's `Map` key. Strings because a JS `Map` keyed
