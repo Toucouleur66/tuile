@@ -8,9 +8,9 @@
 //! is started. So the loop is started with the first viewer and kept: a
 //! viewer destroyed is taken out of it, and the next one created is handed to
 //! it ([`Pages`]). One viewer at a time; a second one created while the first
-//! lives replaces it.
+//! lives replaces it, and the first one's handle then does nothing.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use tuile_camera::CameraController;
@@ -29,25 +29,27 @@ use crate::profile::Profile;
 use crate::start::StartView;
 use crate::steer::{Command, Goto, Request};
 
-/// What the page's handle asks of the loop.
+/// What the page's handle asks of the loop, for the viewer it names.
 #[derive(Debug, Clone, Copy)]
 enum Wake {
     /// A viewer is waiting to be taken in.
     Adopt,
     /// A request is queued, or the host wants a frame: now, rather than at
     /// the next wake-up.
-    Poke,
+    Poke(u64),
     /// The host says the view is off screen, or back.
-    Hidden(bool),
+    Hidden(u64, bool),
     /// End the viewer and let go of everything it holds.
-    Destroy,
+    Destroy(u64),
 }
 
 thread_local! {
     /// The loop, once started: it is never started twice.
     static LOOP: RefCell<Option<EventLoopProxy<Wake>>> = const { RefCell::new(None) };
     /// A viewer created and not yet taken in by the loop.
-    static WAITING: RefCell<Option<App>> = const { RefCell::new(None) };
+    static WAITING: RefCell<Option<(u64, App)>> = const { RefCell::new(None) };
+    /// The viewer of the moment: the only one whose handle still acts.
+    static CURRENT: Cell<u64> = const { Cell::new(0) };
 }
 
 /// The page's viewer, as the package holds it. The package wraps it in the
@@ -55,6 +57,7 @@ thread_local! {
 #[wasm_bindgen]
 pub struct WebViewer {
     proxy: EventLoopProxy<Wake>,
+    id: u64,
 }
 
 /// Creates a viewer on `canvas`.
@@ -124,7 +127,9 @@ pub fn start_viewer(
         backends: Some(options.backend.backends()),
     };
     let app = App::new(config, launch);
-    WAITING.with(|w| *w.borrow_mut() = Some(app));
+    let id = CURRENT.with(|c| c.get()) + 1;
+    CURRENT.with(|c| c.set(id));
+    WAITING.with(|w| *w.borrow_mut() = Some((id, app)));
     let proxy = match LOOP.with(|l| l.borrow().clone()) {
         Some(proxy) => {
             proxy
@@ -143,7 +148,7 @@ pub fn start_viewer(
             proxy
         }
     };
-    Ok(WebViewer { proxy })
+    Ok(WebViewer { proxy, id })
 }
 
 #[wasm_bindgen]
@@ -176,15 +181,17 @@ impl WebViewer {
                 .map_err(|e| JsError::new(&e))?,
             seconds: seconds.filter(|s| s.is_finite() && *s > 0.0),
         };
-        crate::desktop::queue(Request::Do(Command::Goto(goto)));
-        self.wake(Wake::Poke)
+        if self.current() {
+            crate::desktop::queue(Request::Do(Command::Goto(goto)));
+        }
+        self.wake(Wake::Poke(self.id))
     }
 
     /// The view the last frame was drawn from: `{lon, lat, altitude,
     /// heading, pitch}`, or `undefined` before the first frame.
     #[wasm_bindgen(js_name = getView)]
     pub fn get_view(&self) -> JsValue {
-        let Some(snapshot) = crate::snapshot::current() else {
+        let Some(snapshot) = crate::snapshot::current().filter(|_| self.current()) else {
             return JsValue::UNDEFINED;
         };
         let StartView {
@@ -211,29 +218,36 @@ impl WebViewer {
     /// once it does.
     #[wasm_bindgen(getter)]
     pub fn backend(&self) -> Option<String> {
-        super::system::backend()
+        self.current().then(super::system::backend).flatten()
     }
 
     /// Draws a frame now: after a change of size no layout saw, say.
     pub fn redraw(&self) -> Result<(), JsError> {
-        self.wake(Wake::Poke)
+        self.wake(Wake::Poke(self.id))
     }
 
     /// Stops drawing and holds the loads, as a hidden tab does.
     pub fn pause(&self) -> Result<(), JsError> {
-        self.wake(Wake::Hidden(true))
+        self.wake(Wake::Hidden(self.id, true))
     }
 
     /// Draws and loads again.
     pub fn resume(&self) -> Result<(), JsError> {
-        self.wake(Wake::Hidden(false))
+        self.wake(Wake::Hidden(self.id, false))
     }
 
     /// Ends the viewer: the GPU device, the surface, the worker and every
     /// listener are let go of. The canvas stays the page's.
     pub fn destroy(&self) -> Result<(), JsError> {
-        super::system::disconnect();
-        self.wake(Wake::Destroy)
+        if self.current() {
+            super::system::disconnect();
+        }
+        self.wake(Wake::Destroy(self.id))
+    }
+
+    /// Whether this is the viewer of the moment.
+    fn current(&self) -> bool {
+        CURRENT.with(|c| c.get()) == self.id
     }
 
     fn wake(&self, wake: Wake) -> Result<(), JsError> {
@@ -243,28 +257,42 @@ impl WebViewer {
     }
 }
 
-/// The page's event loop: the viewer of the moment, if there is one.
+/// The page's event loop: the viewer of the moment and its number, if there
+/// is one.
 struct Pages {
-    app: Option<App>,
+    app: Option<(u64, App)>,
 }
 
 impl Pages {
     /// Takes in the viewer waiting, ending the one before it.
     fn adopt(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(mut app) = WAITING.with(|w| w.borrow_mut().take()) else {
+        let Some((id, mut app)) = WAITING.with(|w| w.borrow_mut().take()) else {
             return;
         };
-        if let Some(mut old) = self.app.take() {
+        if let Some((_, mut old)) = self.app.take() {
+            old.ended_by = Some("the page created another viewer");
             old.end();
         }
         ApplicationHandler::resumed(&mut app, event_loop);
-        self.app = Some(app);
+        self.app = Some((id, app));
+    }
+
+    /// The viewer numbered `id`, if it is the one running.
+    fn viewer(&mut self, id: u64) -> Option<&mut App> {
+        self.app
+            .as_mut()
+            .filter(|(running, _)| *running == id)
+            .map(|(_, app)| app)
+    }
+
+    fn running(&mut self) -> Option<&mut App> {
+        self.app.as_mut().map(|(_, app)| app)
     }
 }
 
 impl ApplicationHandler<Wake> for Pages {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        match self.app.as_mut() {
+        match self.running() {
             Some(app) => ApplicationHandler::resumed(app, event_loop),
             None => self.adopt(event_loop),
         }
@@ -274,34 +302,36 @@ impl ApplicationHandler<Wake> for Pages {
         match wake {
             Wake::Adopt => self.adopt(event_loop),
             // `about_to_wait` drains the queue; the frame shows the result.
-            Wake::Poke => {
-                if let Some(app) = self.app.as_mut() {
+            Wake::Poke(id) => {
+                if let Some(app) = self.viewer(id) {
                     app.draw_soon();
                 }
             }
-            Wake::Hidden(hidden) => {
-                if let Some(app) = self.app.as_mut() {
+            Wake::Hidden(id, hidden) => {
+                if let Some(app) = self.viewer(id) {
                     app.hidden(hidden);
                 }
             }
-            Wake::Destroy => {
-                if let Some(mut app) = self.app.take() {
-                    app.ended_by = Some("the page destroyed the viewer");
-                    app.end();
+            Wake::Destroy(id) => {
+                if self.viewer(id).is_some() {
+                    if let Some((_, mut app)) = self.app.take() {
+                        app.ended_by = Some("the page destroyed the viewer");
+                        app.end();
+                    }
+                    event_loop.set_control_flow(ControlFlow::Wait);
                 }
-                event_loop.set_control_flow(ControlFlow::Wait);
             }
         }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-        if let Some(app) = self.app.as_mut() {
+        if let Some(app) = self.running() {
             app.window_event(event_loop, id, event);
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        match self.app.as_mut() {
+        match self.running() {
             Some(app) => app.about_to_wait(event_loop),
             // Nothing to draw until the next viewer: sleep until woken.
             None => event_loop.set_control_flow(ControlFlow::Wait),
@@ -309,13 +339,13 @@ impl ApplicationHandler<Wake> for Pages {
     }
 
     fn suspended(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(app) = self.app.as_mut() {
+        if let Some(app) = self.running() {
             app.suspended(event_loop);
         }
     }
 
     fn exiting(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(app) = self.app.as_mut() {
+        if let Some(app) = self.running() {
             app.exiting(event_loop);
         }
     }
