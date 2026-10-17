@@ -41,6 +41,13 @@ pub(crate) fn alert(title: &str, text: &str) {
     system::alert(title, text);
 }
 
+/// Shows a line of text over the bottom of the window, where there is no title
+/// bar to carry it: whose pictures are on screen, and the last thing said.
+/// Nothing where the window has a title bar, which already says it.
+pub(crate) fn caption(text: &str) {
+    system::caption(text);
+}
+
 /// Puts `text` on the clipboard; `false` when there is no clipboard to put it
 /// on.
 pub(crate) fn copy(text: &str) -> bool {
@@ -331,6 +338,9 @@ mod system {
         alert.runModal();
     }
 
+    /// The title bar says it.
+    pub(super) fn caption(_text: &str) {}
+
     pub(super) fn copy(text: &str) -> bool {
         let board = NSPasteboard::generalPasteboard();
         board.clearContents();
@@ -347,7 +357,149 @@ mod system {
     }
 }
 
-#[cfg(not(all(target_os = "macos", feature = "application")))]
+/// A phone: a message is an alert over the window, and the caption a label
+/// along its bottom edge. Neither blocks — a phone's main thread may not wait
+/// for a person — and both are dropped, with a line on stderr, when there is
+/// no window yet to show them over.
+#[cfg(all(target_os = "ios", feature = "application"))]
+mod system {
+    #![allow(unsafe_code)]
+
+    use std::cell::RefCell;
+    use std::sync::mpsc::{channel, Receiver};
+
+    use objc2::rc::Retained;
+    use objc2::MainThreadMarker;
+    use objc2_foundation::NSString;
+    use objc2_ui_kit::{
+        UIAlertAction, UIAlertActionStyle, UIAlertController, UIAlertControllerStyle,
+        UIApplication, UIColor, UIFont, UILabel, UIPasteboard, UIView, UIViewAutoresizing,
+        UIViewController,
+    };
+
+    use crate::steer::Request;
+
+    thread_local! {
+        /// The caption's label, once made. Main thread only, as every view.
+        static CAPTION: RefCell<Option<Retained<UILabel>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn listen() -> Receiver<Request> {
+        // Nothing steers a phone's viewer from outside yet: the queue is
+        // always empty.
+        channel().1
+    }
+
+    /// The window's root view controller: what an alert is presented on, and
+    /// whose view the caption is laid over.
+    fn root(mtm: MainThreadMarker) -> Option<Retained<UIViewController>> {
+        let app = UIApplication::sharedApplication(mtm);
+        #[allow(deprecated)]
+        let window = app.keyWindow()?;
+        window.rootViewController()
+    }
+
+    pub(super) fn alert(title: &str, text: &str) {
+        let shown = MainThreadMarker::new().and_then(|mtm| {
+            let root = root(mtm)?;
+            let controller = UIAlertController::alertControllerWithTitle_message_preferredStyle(
+                Some(&NSString::from_str(title)),
+                Some(&NSString::from_str(text)),
+                UIAlertControllerStyle::Alert,
+                mtm,
+            );
+            // A nil handler: the button only dismisses the alert.
+            let ok = UIAlertAction::actionWithTitle_style_handler(
+                Some(&NSString::from_str("OK")),
+                UIAlertActionStyle::Default,
+                None,
+                mtm,
+            );
+            controller.addAction(&ok);
+            // On the window's root, on the main thread; no completion.
+            root.presentViewController_animated_completion(&controller, true, None);
+            Some(())
+        });
+        if shown.is_none() {
+            eprintln!("{title}\n\n{text}");
+        }
+    }
+
+    pub(super) fn caption(text: &str) {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let Some(view) = root(mtm).and_then(|root| root.view()) else {
+            return;
+        };
+        CAPTION.with(|cell| {
+            let mut cell = cell.borrow_mut();
+            let label = cell.get_or_insert_with(|| make_label(mtm, &view));
+            label.setText(Some(&NSString::from_str(text)));
+            place(label, &view);
+            // Over the drawable: a surface made again after the background
+            // puts its layer on top of everything already in the view.
+            view.bringSubviewToFront(label);
+        });
+    }
+
+    fn make_label(mtm: MainThreadMarker, view: &UIView) -> Retained<UILabel> {
+        let label = UILabel::new(mtm);
+        // SAFETY: plain property writes on a label made on this thread, with
+        // objects of the types the properties hold.
+        unsafe {
+            label.setFont(Some(&UIFont::systemFontOfSize(11.0)));
+            label.setTextColor(Some(&UIColor::colorWithWhite_alpha(1.0, 0.85)));
+        }
+        label.setShadowColor(Some(&UIColor::colorWithWhite_alpha(0.0, 0.6)));
+        label.setUserInteractionEnabled(false);
+        // Follows the bottom edge and the width through a rotation.
+        label.setAutoresizingMask(
+            UIViewAutoresizing::FlexibleWidth | UIViewAutoresizing::FlexibleTopMargin,
+        );
+        view.addSubview(&label);
+        label
+    }
+
+    /// Along the bottom of the safe area, clear of the home indicator.
+    fn place(label: &UILabel, view: &UIView) {
+        let bounds = view.bounds();
+        let insets = view.safeAreaInsets();
+        let height = 16.0;
+        let frame = objc2_core_foundation::CGRect::new(
+            objc2_core_foundation::CGPoint::new(
+                insets.left + 12.0,
+                bounds.size.height - insets.bottom - height - 4.0,
+            ),
+            objc2_core_foundation::CGSize::new(
+                (bounds.size.width - insets.left - insets.right - 24.0).max(0.0),
+                height,
+            ),
+        );
+        label.setFrame(frame);
+    }
+
+    pub(super) fn copy(text: &str) -> bool {
+        MainThreadMarker::new().is_some_and(|_| {
+            // SAFETY: a property write of a string, on the main thread.
+            unsafe { UIPasteboard::generalPasteboard().setString(Some(&NSString::from_str(text))) };
+            true
+        })
+    }
+
+    pub(super) fn paste() -> Option<String> {
+        MainThreadMarker::new()?;
+        // SAFETY: a property read, on the main thread.
+        unsafe { UIPasteboard::generalPasteboard().string() }.map(|text| text.to_string())
+    }
+
+    pub(super) fn send(_request: Request) {}
+}
+
+#[cfg(not(any(
+    all(target_os = "macos", feature = "application"),
+    all(target_os = "ios", feature = "application")
+)))]
 mod system {
     use std::sync::mpsc::{channel, Receiver};
 
@@ -361,6 +513,8 @@ mod system {
     pub(super) fn alert(title: &str, text: &str) {
         eprintln!("{title}\n\n{text}");
     }
+
+    pub(super) fn caption(_text: &str) {}
 
     pub(super) fn copy(_text: &str) -> bool {
         false

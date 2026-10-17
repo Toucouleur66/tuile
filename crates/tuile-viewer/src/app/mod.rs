@@ -6,17 +6,24 @@
 //! drives the geometry stream through the [`ContentPump`].
 
 mod command;
+mod demand;
 mod frame;
+mod gestures;
 mod imagery;
 mod input;
+mod lifecycle;
+mod loading;
 mod pacing;
+mod readout;
+mod script;
 mod setup;
+mod stall;
 mod tape;
+mod touch;
 mod warmup;
 
 use std::sync::Arc;
 use tuile_camera::CameraController;
-use tuile_core::protocol::InProcessStream;
 use tuile_ui::NavWidget;
 use tuile_wgpu::{ContentPump, GpuContext, OverlayRenderer, TileRenderer};
 use winit::application::ApplicationHandler;
@@ -42,13 +49,12 @@ const ATMOSPHERE_STRENGTH: f32 = 1.0;
 const AMBIENT: f32 = 0.5;
 
 /// Everything known before the window exists.
+///
+/// The session itself — the stream, the globe's handles — is not here: it
+/// arrives through a [`crate::launch::Launch`], at once on a desktop and a few
+/// seconds into the window's life on a phone.
 pub struct ViewerConfig {
-    pub stream: InProcessStream,
     pub controller: CameraController,
-    pub detail: tuile_planetary::ImageryDetail,
-    /// How many imagery layers a drape may carry, filled in from the device
-    /// once there is one — see [`tuile_planetary::LayerBudget`].
-    pub layer_budget: tuile_planetary::LayerBudget,
     pub title: String,
     /// The host's imagery layers, and which of them the session opens on.
     pub layers: &'static [crate::embed::ImageryChoice],
@@ -65,17 +71,69 @@ pub struct ViewerConfig {
     /// The instant the scene is lit for, UTC seconds since the Unix epoch —
     /// which sets where the sun is, and so where the terminator falls.
     pub lit_at_unix_seconds: f64,
+    /// The level held in memory for the session, if any.
+    pub pinned_level: Option<u32>,
+    /// How hard the session may push the machine.
+    pub(crate) profile: crate::profile::Profile,
+    /// The session's async runtime, for flushing the store on the way out.
+    pub runtime: tokio::runtime::Handle,
+}
+
+/// Where the on-screen controls live: the part of the frame not under a
+/// notch, a rounded corner or the home indicator, and how many device pixels
+/// one of the controls' units is.
+///
+/// On a desktop that is the whole frame at one pixel per unit — the controls
+/// look exactly as they always did. On a phone it is the safe area, at the
+/// display's scale, so the compass is a thumb's width and not a third of one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct UiFrame {
+    /// The safe area's top-left corner, in device pixels.
+    pub origin: (f64, f64),
+    /// Device pixels per control unit.
+    pub scale: f64,
+    /// The safe area's size, in control units.
+    pub size: (f64, f64),
+}
+
+impl UiFrame {
+    /// From device pixels to the controls' units.
+    pub(super) fn to(&self, px: (f64, f64)) -> (f64, f64) {
+        (
+            (px.0 - self.origin.0) / self.scale,
+            (px.1 - self.origin.1) / self.scale,
+        )
+    }
+
+    /// From the controls' units to device pixels.
+    pub(super) fn from(&self, at: [f32; 2]) -> [f32; 2] {
+        [
+            (f64::from(at[0]) * self.scale + self.origin.0) as f32,
+            (f64::from(at[1]) * self.scale + self.origin.1) as f32,
+        ]
+    }
+
+    /// The safe area's centre, in device pixels.
+    pub(super) fn centre(&self) -> (f64, f64) {
+        (
+            self.origin.0 + self.size.0 * self.scale * 0.5,
+            self.origin.1 + self.size.1 * self.scale * 0.5,
+        )
+    }
 }
 
 struct Active {
     window: Arc<Window>,
-    surface: wgpu::Surface<'static>,
+    /// Kept to build the surface again when the application comes back from
+    /// the background, where a phone's surface is let go of.
+    instance: wgpu::Instance,
+    /// `None` while released: see [`lifecycle`].
+    surface: Option<wgpu::Surface<'static>>,
     surface_format: wgpu::TextureFormat,
     gpu: GpuContext,
     renderer: TileRenderer,
     overlay: OverlayRenderer,
     pump: ContentPump,
-    stream: InProcessStream,
     /// The multisampled colour target and its depth buffer. The surface itself
     /// has one sample, so the scene is drawn here and *resolved* into it —
     /// which is what turns the staircase on the limb into a smooth edge.
@@ -94,6 +152,9 @@ struct Active {
     /// screen can show, which is four times the tiles for type at half the size
     /// it was drawn to be read at.
     scale: f64,
+    /// The safe area, in device pixels: left, top, width, height. The whole
+    /// frame on a desktop.
+    safe: (f64, f64, f64, f64),
     /// Where a traced frame is copied before being read back.
     readback: tuile_wgpu::Readback,
     /// A whole-planet shell, five hundred metres below the ellipsoid, drawn
@@ -137,7 +198,6 @@ pub(crate) const DIAGNOSTICS: [(&str, &str); 4] = [
 ];
 
 pub struct App {
-    config: Option<ViewerConfig>,
     controller: CameraController,
     detail: tuile_planetary::ImageryDetail,
     layer_budget: tuile_planetary::LayerBudget,
@@ -149,6 +209,28 @@ pub struct App {
     /// Everything that only exists once there is a window. `None` until
     /// `resumed`, and that is the only reason this is an `Option`.
     active: Option<Active>,
+    /// The session, once it is up: its stream and the globe's handles.
+    session: Option<crate::launch::Started>,
+    /// The session on its way up; `None` once it has arrived or failed.
+    launch: Option<crate::launch::Launch>,
+    /// Why the session could not start, once that is known.
+    failed: Option<String>,
+    profile: crate::profile::Profile,
+    runtime: tokio::runtime::Handle,
+    lifecycle: lifecycle::Lifecycle,
+    loading: loading::Loading,
+    demand: demand::Demand,
+    touches: touch::Touches,
+    /// A scripted hand, when `TUILE_TOUCH_SCRIPT` names one.
+    script: Option<script::TouchScript>,
+    /// The last frame's resolution, which the next frame's indicator reads.
+    resolution: Option<tuile_wgpu::Resolution>,
+    /// Tiles uploaded on the last frame.
+    uploaded: usize,
+    /// The device's temperature and power saving, and when they were read.
+    thermal: crate::profile::Thermal,
+    low_power: bool,
+    device_read: Option<std::time::Instant>,
 
     // The rest is grouped by the module that owns it, so that a field and the
     // code that reads it are never in different files. Each of these is defined
@@ -172,8 +254,6 @@ pub struct App {
     /// The imagery: the host's layers, which one is draped, and a change of
     /// layer on its way — see `imagery.rs`.
     imagery: imagery::Imagery,
-    /// How a change of layer is asked of the globe.
-    switcher: crate::globe::Switcher,
     /// Steering waiting to be carried out.
     requests: std::sync::mpsc::Receiver<crate::steer::Request>,
     /// Tiles drawn in the last frame, and whether all were the ones selected.
@@ -192,7 +272,7 @@ pub struct App {
     /// platforms.
     occluded: bool,
     /// The menu-bar readout, if the platform gave us one.
-    statusbar: Option<tuile_ui::StatusBar>,
+    statusbar: Option<readout::StatusBar>,
     /// The application's menu bar, where the platform has one.
     menu: Option<crate::menu::Installed>,
     /// Running totals, reported once per second and again on the way out.
@@ -200,8 +280,9 @@ pub struct App {
 }
 
 impl App {
-    /// `switcher` is how the imagery is changed under the running session.
-    pub fn new(mut config: ViewerConfig, switcher: crate::globe::Switcher) -> Self {
+    /// `launch` brings the session: already arrived on a desktop, on its way
+    /// on a phone.
+    pub(crate) fn new(mut config: ViewerConfig, launch: crate::launch::Launch) -> Self {
         // The queue is taken out of the configuration: there is one reader.
         let requests = std::mem::replace(&mut config.requests, std::sync::mpsc::channel().1);
         // Asked for here, on the main thread and before the loop turns, so the
@@ -210,25 +291,37 @@ impl App {
         if let Some(placement) = config.here {
             locator.request(std::time::Instant::now(), placement);
         }
-        Self {
+        let now = std::time::Instant::now();
+        let mut app = Self {
             imagery: imagery::Imagery::new(config.layers, config.layer),
-            switcher,
             locator,
             located: false,
             requests,
             drawn: (0, false),
             notice: None,
             title_shown: String::new(),
-            title_at: std::time::Instant::now(),
+            title_at: now,
             ended_by: None,
             remembers: config.remembers,
             controller: config.controller.clone(),
-            detail: config.detail.clone(),
-            layer_budget: config.layer_budget.clone(),
+            detail: tuile_planetary::ImageryDetail::default(),
+            layer_budget: tuile_planetary::LayerBudget::default(),
             title: config.title.clone(),
             sun: tuile_atmosphere::Sun::at_unix_seconds(config.lit_at_unix_seconds),
-            config: Some(config),
             active: None,
+            session: None,
+            launch: Some(launch),
+            failed: None,
+            lifecycle: lifecycle::Lifecycle::new(&config.profile),
+            loading: loading::Loading::new(now),
+            demand: demand::Demand::default(),
+            touches: touch::Touches::default(),
+            script: script::TouchScript::from_environment(),
+            resolution: None,
+            uploaded: 0,
+            thermal: crate::profile::Thermal::Nominal,
+            low_power: false,
+            device_read: None,
             pointer: input::Pointer::default(),
             views: input::Views::default(),
             recording: tape::Recording {
@@ -237,13 +330,15 @@ impl App {
                 finished: false,
             },
             warmup: warmup::Warmup {
-                holding: true,
-                pinned_level: crate::settings::pinned_level(),
-                since: std::time::Instant::now(),
-                last_report: std::time::Instant::now(),
+                // Only a desktop holds its window shut; a phone opens at once
+                // with the loading indicator over the globe.
+                holding: config.profile.hold_window_until_warm,
+                pinned_level: config.pinned_level,
+                since: now,
+                last_report: now,
             },
             pacing: pacing::Pacing {
-                last_frame: std::time::Instant::now(),
+                last_frame: now,
                 last_step: None,
                 last_seconds: 0.0,
                 frames_at_last_log: 0,
@@ -254,7 +349,7 @@ impl App {
                 last_traversals: 0,
                 last_altitude: None,
                 silent_passes: 0,
-                last_log: std::time::Instant::now(),
+                last_log: now,
             },
             nav: NavWidget::new(),
             occluded: false,
@@ -263,9 +358,106 @@ impl App {
             statusbar: None,
             menu: None,
             stats: crate::session::Stats {
-                started: Some(std::time::Instant::now()),
+                started: Some(now),
                 ..crate::session::Stats::default()
             },
+            profile: config.profile,
+            runtime: config.runtime,
+        };
+        // A desktop's launch has already arrived: adopt it before the first
+        // turn of the loop, as the session always did.
+        app.take_the_session();
+        app
+    }
+
+    /// Takes the session if it has arrived since the last turn of the loop,
+    /// or the reason it never will. Never waits.
+    fn take_the_session(&mut self) {
+        let Some(outcome) = self.launch.as_mut().and_then(crate::launch::Launch::poll) else {
+            return;
+        };
+        self.launch = None;
+        match outcome {
+            Ok(started) => self.adopt(started),
+            Err(why) => {
+                crate::journal::note(&format!("session failed: {why}"));
+                tracing::error!("the session could not start: {why}");
+                crate::desktop::alert(&format!("{} cannot start yet", self.title), &why);
+                self.failed = Some(why);
+            }
+        }
+    }
+
+    /// Takes over a session that has come up: its stream, the relief the
+    /// camera stands on, the imagery detail the loader reads, how many layers
+    /// a drape may carry.
+    fn adopt(&mut self, started: crate::launch::Started) {
+        self.controller = self.controller.clone().with_ground(started.heights.clone());
+        self.detail = started.detail.clone();
+        self.layer_budget = started.layer_budget.clone();
+        self.fit_the_layer_budget();
+        // Away already: the loads wait until the application is back.
+        if self.lifecycle.phase() != lifecycle::Phase::Active {
+            started.gate.shut();
+        }
+        if self.session.is_none() && !self.profile.hold_window_until_warm {
+            tracing::info!(
+                seconds = self
+                    .stats
+                    .started
+                    .map_or(0.0, |t| t.elapsed().as_secs_f32()),
+                "session up; the window was drawing all along"
+            );
+        }
+        self.session = Some(started);
+        self.demand.poke();
+    }
+
+    /// Tells the loader how many imagery layers the device binds, once both
+    /// exist.
+    fn fit_the_layer_budget(&mut self) {
+        let Some(active) = self.active.as_ref() else {
+            return;
+        };
+        self.layer_budget.set_from_device(
+            active
+                .gpu
+                .device
+                .limits()
+                .max_sampled_textures_per_shader_stage,
+        );
+    }
+
+    /// Closes the session down: the stream, then the store, then the server.
+    ///
+    /// The store is closed *before* the server is joined: the server thread
+    /// blocks on the runtime, and the runtime waits for the store's blocking
+    /// workers — so waiting for the thread first and only then asking the
+    /// store to close is a deadlock by construction. A phone, on its way out,
+    /// is given seconds for all of it, and does not wait for the server.
+    pub fn shut_down(&mut self, handle: &tokio::runtime::Handle) {
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        let crate::launch::Started {
+            stream,
+            server,
+            store,
+            ..
+        } = session;
+        drop(stream);
+        let patience = if self.profile.hold_window_until_warm {
+            std::time::Duration::from_secs(60)
+        } else {
+            std::time::Duration::from_secs(3)
+        };
+        crate::settings::close_the_store(store, handle, patience);
+        if self.profile.hold_window_until_warm {
+            if let Some(server) = server {
+                if server.join().is_err() {
+                    tracing::error!("the geometry server panicked; its last work is lost");
+                }
+            }
         }
     }
 
@@ -328,14 +520,60 @@ impl App {
             .as_ref()
             .map_or((1920.0, 1080.0), |a| (a.size.0 as f64, a.size.1 as f64))
     }
+
+    /// Where the on-screen controls live this frame. See [`UiFrame`].
+    fn ui_frame(&self) -> UiFrame {
+        let (w, h) = self.viewport();
+        let Some(active) = self.active.as_ref() else {
+            return UiFrame {
+                origin: (0.0, 0.0),
+                scale: 1.0,
+                size: (w, h),
+            };
+        };
+        if self.profile.hold_window_until_warm {
+            // A desktop: as it always was.
+            return UiFrame {
+                origin: (0.0, 0.0),
+                scale: 1.0,
+                size: (w, h),
+            };
+        }
+        let (x, y, sw, sh) = active.safe;
+        let scale = active.scale.max(1.0);
+        UiFrame {
+            origin: (x, y),
+            scale,
+            size: (sw / scale, sh / scale),
+        }
+    }
 }
 
 impl ApplicationHandler for App {
+    /// The first time, the window; after that — on a phone, every time the
+    /// application comes back to the front — the lifecycle's way back.
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.active.is_some() {
+            let steps = self.lifecycle.activate();
+            self.carry_out(steps);
             return;
         }
         self.start_window(event_loop);
+    }
+
+    /// A phone's application is about to leave the front.
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        let steps = self.lifecycle.resign();
+        self.carry_out(steps);
+    }
+
+    /// The system is short of memory: the server lets go of what the view
+    /// does not draw. Never what it draws, nor its ancestors.
+    fn memory_warning(&mut self, _event_loop: &ActiveEventLoop) {
+        tracing::warn!("memory warning; trimming the residency");
+        crate::journal::note("memory warning");
+        let steps = self.lifecycle.memory_warning();
+        self.carry_out(steps);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -359,6 +597,12 @@ impl ApplicationHandler for App {
         ));
         self.close_the_tape();
         self.remember_the_view();
+        // A phone's loop never returns to `session`, so this is the last
+        // chance to flush the store.
+        if !self.profile.hold_window_until_warm {
+            let handle = self.runtime.clone();
+            self.shut_down(&handle);
+        }
     }
 
     /// Drives the animation: one redraw per loop iteration while the window is
@@ -369,6 +613,7 @@ impl ApplicationHandler for App {
         // Before anything that can return early: an answer about the current
         // location is taken on whatever turn of the loop it arrives, hidden
         // and warming included.
+        self.take_the_session();
         self.take_the_location();
         self.take_the_commands();
         self.take_the_imagery();
@@ -400,6 +645,11 @@ impl ApplicationHandler for App {
         if self.warmup.holding {
             self.pump_while_hidden();
             event_loop.set_control_flow(ControlFlow::Poll);
+            return;
+        }
+        // A phone draws on demand, and only in the foreground.
+        if self.profile.render_on_demand {
+            self.pace_the_frames(event_loop);
             return;
         }
         event_loop.set_control_flow(if self.occluded {

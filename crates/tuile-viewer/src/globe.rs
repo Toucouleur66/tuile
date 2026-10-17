@@ -143,8 +143,50 @@ pub(crate) async fn imagery(
 /// decoded tiles to stay inside its GPU budget, and this is what makes coming
 /// back to them cheap. A store that fails to open is not worth failing the
 /// application over.
-pub(crate) async fn open_the_store(name: &str) -> Option<Arc<FoyerStore>> {
-    match FoyerStore::shared(name).await {
+pub(crate) async fn open_the_store(
+    name: &str,
+    memory_bytes: usize,
+    disk_bytes: usize,
+) -> Option<Arc<FoyerStore>> {
+    open_the_store_at(
+        &tuile_storage_foyer::default_cache_dir().join(name),
+        memory_bytes,
+        disk_bytes,
+    )
+    .await
+}
+
+/// [`open_the_store`], in `dir`.
+///
+/// A store that will not open is started afresh, once, before it is given up
+/// on. The directory is a cache: a phone purges it without asking when space
+/// runs short, and may leave half of it behind; a crash may leave a file
+/// foyer will not read. Nothing in it is worth more than the next run
+/// starting at all, and an empty store refills.
+pub(crate) async fn open_the_store_at(
+    dir: &std::path::Path,
+    memory_bytes: usize,
+    disk_bytes: usize,
+) -> Option<Arc<FoyerStore>> {
+    let config = || tuile_storage_foyer::StoreConfig {
+        memory_bytes,
+        disk_bytes,
+        ..tuile_storage_foyer::StoreConfig::at(dir)
+    };
+    let first = match FoyerStore::with_config(config()).await {
+        Ok(store) => return Some(Arc::new(store)),
+        Err(e) => e,
+    };
+    tracing::warn!("the tile store would not open ({first}); starting it afresh");
+    let cleared = if dir.is_dir() {
+        std::fs::remove_dir_all(dir)
+    } else {
+        std::fs::remove_file(dir)
+    };
+    if let Err(e) = cleared {
+        tracing::warn!("could not clear {} ({e})", dir.display());
+    }
+    match FoyerStore::with_config(config()).await {
         Ok(store) => Some(Arc::new(store)),
         Err(e) => {
             tracing::warn!("no tile store ({e}); every tile will be re-fetched");
@@ -170,6 +212,7 @@ pub(crate) async fn assemble(
     terrain: &TerrainChoice,
     layers: &[ImageryChoice],
     opening: usize,
+    decode_threads: usize,
 ) -> anyhow::Result<Globe> {
     let runtime = tokio::runtime::Handle::current();
     let opening_layer = layers
@@ -200,7 +243,11 @@ pub(crate) async fn assemble(
     // Decoding and resampling go to their own threads. Left on the server's
     // thread they run one at a time no matter how many loads are in flight —
     // measured at sixty-four outstanding and a single core busy.
-    let decode = tuile_core::offload::threaded();
+    // As many as the profile allows: every core on a desktop, a few on a
+    // phone, where the window and the runtime need theirs.
+    let decode: Arc<dyn tuile_core::offload::Offload> = Arc::new(
+        tuile_core::offload::ThreadPool::with_threads(decode_threads),
+    );
 
     // How many imagery layers a drape may carry is the renderer's answer, and
     // the renderer does not exist yet — the window comes after the stream. The
@@ -287,6 +334,7 @@ mod tests {
                 &terrain,
                 &layers,
                 0,
+                1,
             ))
             .err()
             .expect("there is no terrain");
@@ -301,5 +349,26 @@ mod tests {
             *asked.0.lock().expect("asked"),
             ["terrain 41", "imagery 77"]
         );
+    }
+
+    /// A store directory the system half-purged, or a crash left unreadable,
+    /// is started afresh rather than costing the session its store — here,
+    /// the worst case: a plain file where the directory should be.
+    #[test]
+    fn a_damaged_store_is_started_afresh() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("tiles");
+        std::fs::write(&path, b"not a store").expect("a file in the way");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let store = runtime.block_on(open_the_store_at(&path, 1 << 20, 64 << 20));
+        assert!(store.is_some(), "the store was given up on");
+        assert!(path.is_dir());
+        if let Some(store) = store {
+            runtime.block_on(store.close()).expect("closed");
+        }
     }
 }

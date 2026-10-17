@@ -59,16 +59,18 @@ pub(crate) fn lit_at() -> anyhow::Result<f64> {
 /// The count is `4^level`, so the choice is a memory decision and a steep one:
 /// level 5 is 1024 tiles over the globe and about 341 MiB of imagery if every
 /// one were held; level 8 is 65 536 tiles and 21 GiB, which this machine does
-/// not have. Unset means level 4; `none` disables the pin.
+/// not have. Unset means `default` — level 4 on a desktop, the backdrop's level
+/// on a phone (see [`crate::profile::Profile::pinned_level`]); `none` disables
+/// the pin.
 ///
 /// Level 4 rather than 5 because the window is held shut until the whole pinned
 /// pyramid is on the GPU, and the pyramid is a quarter of the size at each step
 /// up: 2730 tiles through level 5 against 682 through level 4. What is bought
 /// with the other three quarters is a fallback texel twice as wide — a blurrier
 /// stand-in for the moment before real data lands, not a gap.
-pub fn pinned_level() -> Option<u32> {
+pub fn pinned_level(default: u32) -> Option<u32> {
     let Ok(setting) = std::env::var("TUILE_PIN_LEVEL") else {
-        return Some(4);
+        return Some(default);
     };
     if setting.trim().eq_ignore_ascii_case("none") {
         tracing::info!("no pinned level: every tile is evictable");
@@ -87,7 +89,7 @@ pub fn pinned_level() -> Option<u32> {
         }
         Err(_) => {
             tracing::warn!("TUILE_PIN_LEVEL={setting:?} is not a level; keeping the default");
-            Some(4)
+            Some(default)
         }
     }
 }
@@ -104,9 +106,13 @@ pub fn pinned_level() -> Option<u32> {
 /// So it is reported either way, with the numbers that say whether the cache
 /// earned its keep this session. `SIGKILL` still takes the buffer with it and
 /// nothing can be done about that from inside the process.
+///
+/// `patience` bounds the wait: a phone on its way out has seconds, and a
+/// flush that outlives them is ended by the system with nothing written.
 pub(crate) fn close_the_store(
     store: Option<std::sync::Arc<FoyerStore>>,
     handle: &tokio::runtime::Handle,
+    patience: std::time::Duration,
 ) {
     let m = tuile_core::metrics::metrics();
     let (hits, misses) = (m.store_hits.get(), m.store_misses.get());
@@ -122,7 +128,13 @@ pub(crate) fn close_the_store(
         tracing::warn!("no tile store this session; every tile came from the network");
         return;
     };
-    match handle.block_on(store.close()) {
+    let closed = handle.block_on(async {
+        match tokio::time::timeout(patience, store.close()).await {
+            Ok(closed) => closed.map_err(|e| e.to_string()),
+            Err(_) => Err(format!("not closed within {patience:?}")),
+        }
+    });
+    match closed {
         Ok(()) => tracing::info!(
             "tile store flushed: {hits}/{asked} served from cache ({hit_rate:.0}%), \
              {:.0} MiB served, {:.0} MiB fetched",

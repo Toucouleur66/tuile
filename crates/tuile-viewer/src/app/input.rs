@@ -67,14 +67,22 @@ impl App {
                     tracing::info!(scale = active.scale, "display density changed");
                 }
             }
+            // On a phone, a rotation: the drawable turns, and with it the
+            // safe area the controls keep to.
             WindowEvent::Resized(new) => {
                 if let Some(active) = self.active.as_mut() {
                     active.size = (new.width.max(1), new.height.max(1));
-                    configure_surface(active);
-                    active.targets.resize(&active.gpu, active.size);
+                    active.safe = super::setup::safe_area(&active.window, active.size);
+                    // A released surface is configured when it is made again.
+                    if active.surface.is_some() {
+                        configure_surface(active);
+                        active.targets.resize(&active.gpu, active.size);
+                    }
                     active.window.request_redraw();
                 }
+                self.demand.poke();
             }
+            WindowEvent::Touch(touch) => self.on_touch(touch),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 match event.logical_key {
                     // One table for the keys and the menu: see `crate::menu`.
@@ -109,9 +117,10 @@ impl App {
                     MouseButton::Left if pressed => {
                         // The control gets first refusal; only what it declines
                         // becomes a globe drag.
-                        let vp = self.viewport();
-                        let cursor = self.pointer.cursor;
-                        self.pointer.dragging = !self.nav.press(cursor, vp, &mut self.controller);
+                        let ui = self.ui_frame();
+                        let cursor = ui.to(self.pointer.cursor);
+                        self.pointer.dragging =
+                            !self.nav.press(cursor, ui.size, &mut self.controller);
                     }
                     MouseButton::Left => {
                         self.pointer.dragging = false;
@@ -127,9 +136,13 @@ impl App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let vp = self.viewport();
+                let ui = self.ui_frame();
                 let prev = self.pointer.cursor;
                 let cur = (position.x, position.y);
-                if self.nav.drag(prev, cur, vp, &mut self.controller) {
+                if self
+                    .nav
+                    .drag(ui.to(prev), ui.to(cur), ui.size, &mut self.controller)
+                {
                     // The control owns this gesture.
                 } else if self.pointer.dragging {
                     // Drag the globe: the grabbed point follows the cursor.
@@ -139,7 +152,7 @@ impl App {
                     self.controller.tilt((cur.1 - prev.1) * 0.005, vp);
                     self.controller.rotate_heading((cur.0 - prev.0) * 0.005, vp);
                 }
-                self.nav.hover(cur, vp);
+                self.nav.hover(ui.to(cur), ui.size);
                 self.pointer.cursor = cur;
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -192,6 +205,17 @@ impl App {
             // covers it. Rendering anyway leaks GPU memory on Apple platforms
             // (see `render`), and an occluded surface does not block on vsync,
             // so the loop would free-run and leak all the faster.
+            //
+            // On a phone this is the application entering and leaving the
+            // background, and the lifecycle says what that takes.
+            WindowEvent::Occluded(occluded) if self.profile.release_surface_in_background => {
+                let steps = if occluded {
+                    self.lifecycle.background()
+                } else {
+                    self.lifecycle.foreground()
+                };
+                self.carry_out(steps);
+            }
             WindowEvent::Occluded(occluded) => {
                 self.occluded = occluded;
                 if let Some(active) = self.active.as_ref() {

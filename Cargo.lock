@@ -4079,6 +4079,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-ui-kit"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d87d638e33c06f577498cbcc50491496a3ed4246998a7fbba7ccb98b1e7eab22"
+dependencies = [
+ "bitflags 2.13.0",
+ "block2 0.6.2",
+ "objc2 0.6.4",
+ "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
+]
+
+[[package]]
 name = "objc2-uniform-type-identifiers"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6879,14 +6892,18 @@ dependencies = [
  "async-trait",
  "ctrlc",
  "futures-executor",
+ "futures-util",
  "glam 0.33.1",
  "muda 0.19.3",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
+ "objc2-core-foundation",
  "objc2-core-location 0.3.2",
  "objc2-foundation 0.3.2",
+ "objc2-ui-kit 0.3.2",
  "pollster",
  "rlimit",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -6912,6 +6929,7 @@ dependencies = [
  "icns",
  "image",
  "plist",
+ "serde_json",
  "tempfile",
 ]
 
@@ -7949,7 +7967,7 @@ dependencies = [
  "objc2 0.5.2",
  "objc2-app-kit 0.2.2",
  "objc2-foundation 0.2.2",
- "objc2-ui-kit",
+ "objc2-ui-kit 0.2.2",
  "orbclient",
  "percent-encoding",
  "pin-project",

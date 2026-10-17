@@ -189,6 +189,16 @@ impl App {
             if let Some(active) = self.active.as_ref() {
                 active.window.set_title(&title);
             }
+            // Where there is no title bar, the part a person needs: whose
+            // pictures these are, and the last thing said.
+            let mut caption = snapshot
+                .imagery
+                .map(|layer| format!("{} · {}", layer.name, layer.attribution))
+                .unwrap_or_default();
+            if let Some((notice, _)) = &self.notice {
+                caption = format!("{caption} — {notice}");
+            }
+            crate::desktop::caption(&caption);
             self.title_shown = title;
         }
     }

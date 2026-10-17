@@ -50,8 +50,14 @@ pub(crate) fn app_name() -> &'static str {
 pub(crate) trait Host {
     fn var(&self, name: &str) -> Option<String>;
     fn read(&self, path: &Path) -> std::io::Result<String>;
-    /// Whether directories follow the macOS layout.
+    /// Whether directories follow the macOS layout — which an iOS
+    /// application's container does too, under its own home.
     fn is_macos(&self) -> bool;
+    /// Whether this is a phone or a tablet, where the person can reach only
+    /// the application's `Documents`, through the Files application.
+    fn is_handheld(&self) -> bool {
+        false
+    }
 }
 
 /// The real one.
@@ -82,7 +88,11 @@ impl Host for Machine {
     }
 
     fn is_macos(&self) -> bool {
-        cfg!(target_os = "macos")
+        cfg!(any(target_os = "macos", target_os = "ios"))
+    }
+
+    fn is_handheld(&self) -> bool {
+        cfg!(target_os = "ios")
     }
 }
 
@@ -141,8 +151,15 @@ pub(crate) fn last_view_file(host: &dyn Host) -> Option<PathBuf> {
     Some(support_dir(host)?.join("last-view"))
 }
 
-/// The one file a token may be read from.
+/// The file a token is read from, and the one a person is told to create.
+///
+/// On a phone that is `Documents/token`: the one directory of an application
+/// the person can put a file in, through the Files application ("On My
+/// iPhone", under the application's name) — `Library` is out of their reach.
 pub(crate) fn token_file(host: &dyn Host) -> Option<PathBuf> {
+    if host.is_handheld() {
+        return Some(home(host)?.join("Documents").join("token"));
+    }
     Some(support_dir(host)?.join("token"))
 }
 
@@ -221,6 +238,7 @@ mod tests {
         vars: HashMap<&'static str, &'static str>,
         files: HashMap<PathBuf, &'static str>,
         macos: bool,
+        handheld: bool,
     }
 
     impl Host for Fake {
@@ -238,6 +256,10 @@ mod tests {
         fn is_macos(&self) -> bool {
             self.macos
         }
+
+        fn is_handheld(&self) -> bool {
+            self.handheld
+        }
     }
 
     const TOKEN_VARIABLE: &str = "SOME_TOKEN";
@@ -250,6 +272,7 @@ mod tests {
             vars,
             files: file.map(|t| (PathBuf::from(FILE), t)).into_iter().collect(),
             macos: true,
+            handheld: false,
         }
     }
 
@@ -377,6 +400,40 @@ mod tests {
             assert_eq!(with(bad), None, "{bad:?}");
         }
         assert_eq!(crate::start::remembered(&mac(&[], None)), None);
+    }
+
+    /// On a phone the token is read from, and asked for in, the one folder
+    /// the person can reach: the application's `Documents`.
+    #[test]
+    fn a_phone_reads_its_token_from_documents() {
+        const HOME: &str = "/var/mobile/Containers/Data/Application/ABCD";
+        let phone = |file: Option<&'static str>| Fake {
+            vars: [("HOME", HOME)].into_iter().collect(),
+            files: file
+                .map(|t| (PathBuf::from(format!("{HOME}/Documents/token")), t))
+                .into_iter()
+                .collect(),
+            macos: true,
+            handheld: true,
+        };
+        assert_eq!(
+            token(&phone(Some("abc.def\n")), TOKEN_VARIABLE),
+            Ok((
+                "abc.def".to_owned(),
+                TokenFrom::File(format!("{HOME}/Documents/token").into())
+            ))
+        );
+        assert_eq!(
+            token(&phone(None), TOKEN_VARIABLE),
+            Err(MissingToken {
+                file: Some(format!("{HOME}/Documents/token").into())
+            })
+        );
+        // The rest of the application's files stay out of the person's way.
+        assert_eq!(
+            last_view_file(&phone(None)),
+            Some(format!("{HOME}/Library/Application Support/Tuile/last-view").into())
+        );
     }
 
     #[test]

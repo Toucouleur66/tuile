@@ -51,12 +51,16 @@
 mod app;
 mod backdrop;
 mod desktop;
+mod device;
 pub mod embed;
+mod gate;
 mod globe;
 mod host;
 mod journal;
+mod launch;
 mod location;
 mod menu;
+mod profile;
 mod recording;
 mod session;
 mod settings;
@@ -75,9 +79,10 @@ pub use embed::{
     TerrainChoice, ViewerHost,
 };
 
+use std::sync::Arc;
+
 use app::{App, ViewerConfig};
 use tuile_camera::CameraController;
-use tuile_core::runtime::in_process_with;
 use tuile_core::traversal::Config;
 use winit::event_loop::{ControlFlow, EventLoop};
 
@@ -98,7 +103,7 @@ fn in_a_bundle() -> bool {
 pub fn main(embedder: impl ViewerHost) -> ! {
     embed::adopt(embedder.identity(), embedder.imagery());
     journal::open();
-    if let Err(error) = session(&embedder) {
+    if let Err(error) = session(Arc::new(embedder)) {
         journal::note(&format!("session failed: {error:#}"));
         // From an icon, stderr is the system log and nobody is reading it: an
         // application that fails must say so in a window, or it has simply
@@ -144,7 +149,7 @@ fn lift_the_open_file_limit() {
     }
 }
 
-fn session(embedder: &dyn ViewerHost) -> anyhow::Result<()> {
+fn session(embedder: Arc<dyn ViewerHost>) -> anyhow::Result<()> {
     // The command line first, before the logger, the token, the network and
     // the window: a mistyped flag must cost nothing but the message that says
     // so. Exit code 2 is the usual one for a command that was not understood.
@@ -183,8 +188,9 @@ fn session(embedder: &dyn ViewerHost) -> anyhow::Result<()> {
         None => 0,
     };
     // Started from an icon, there is no terminal: the log goes quiet and
-    // what would have been an error line becomes a window.
-    let bundled = in_a_bundle();
+    // what would have been an error line becomes a window. A phone's
+    // application is only ever started from an icon.
+    let bundled = in_a_bundle() || cfg!(target_os = "ios");
     // Started from an icon with nothing said about where: open where the last
     // such session ended. From a terminal the default view stays the default
     // — a command opens on what the command says.
@@ -195,58 +201,49 @@ fn session(embedder: &dyn ViewerHost) -> anyhow::Result<()> {
     };
     settings::init_tracing(bundled);
     lift_the_open_file_limit();
+    // How hard this machine may be pushed: the desktop's numbers, or a
+    // phone's, sized from its memory. See `profile`.
+    let profile = profile::Profile::current();
+    tracing::info!(
+        resident_mib = profile.resident_budget_bytes >> 20,
+        fetches = profile.simultaneous_fetches,
+        decode_threads = profile.decode_threads,
+        runtime_threads = profile.runtime_workers,
+        "profile"
+    );
     // Before the loop exists, so that a URL which *launched* the application
     // is not missed.
     let requests = desktop::listen();
 
-    // The geometry server is async (ion fetches over reqwest): build the scene
-    // and run the server on a background multi-thread runtime. The window
-    // talks to it over the in-process stream (channels, Send across threads).
+    // The geometry server is async (fetches over reqwest): the scene is built
+    // and the server run on a background multi-thread runtime, bounded by
+    // the profile — a phone gets two workers, not one per core. The window
+    // talks to the server over the in-process stream (channels).
     let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(profile.runtime_workers)
+        .max_blocking_threads(profile.blocking_threads)
+        .thread_name("tuile-runtime")
         .enable_all()
         .build()?;
-    // The runtime moves to the server thread; keep a handle so the store can
-    // still be flushed from here on the way out.
     let handle = rt.handle().clone();
-    // The host's turn: its credentials, from wherever it keeps them, and
-    // its sources. A refusal is a sentence for the person, and for a session
-    // started from an icon it has to be a window — there is nobody reading
-    // stderr.
-    let sources = match rt.block_on(embedder.connect()) {
-        Ok(sources) => sources,
-        Err(why) if bundled => {
-            desktop::alert(&format!("{} cannot start yet", host::app_name()), &why);
-            std::process::exit(1);
-        }
-        Err(why) => anyhow::bail!("{why}"),
-    };
-    let globe::Globe {
-        tree,
-        loader,
-        detail,
-        heights,
-        store,
-        budget: layer_budget,
-        switcher,
-    } = rt.block_on(async {
-        let store = globe::open_the_store(&embed::identity().store).await;
-        globe::assemble(sources, store, &embedder.terrain(), layers, opening).await
-    })?;
     // The budget counts decoded CPU bytes; the GPU copy costs about 1.35× that
-    // (mip chains, interleaved vertices), measured — so 3 GiB here is ~4 GiB of
-    // GPU, which unified memory carries comfortably now that a drape is a
-    // quarter of what it was.
+    // (mip chains, interleaved vertices), measured — so the desktop's 4 GiB is
+    // ~5 GiB of GPU, which unified memory carries comfortably now that a
+    // drape is a quarter of what it was. A phone's is sized from what the
+    // system leaves the process: see `profile::Profile::handheld`.
     //
     // Sized above the working set on purpose. `forbid_holes` loads a whole
     // subtree before selecting any of it, and a tile loaded but not yet
     // selected is protected by nothing: squeeze the budget below what a view
     // needs and those tiles are evicted and re-requested forever. At 768 MiB a
-    // motionless camera still churned twenty tiles a second — the session never
-    // settles, and it reads as the app hanging.
+    // desktop's motionless camera still churned twenty tiles a second — the
+    // session never settles, and it reads as the app hanging.
+    //
     // The reference session, shared with the headless tests rather than written
     // out here. When these numbers lived only in this file, every test invented
     // its own and a harness that never evicted passed while the globe went
     // black — see `Config::interactive_globe`.
+    let pinned = settings::pinned_level(profile.pinned_level);
     let config = Config {
         // TUILE_NO_CULL=1 keeps every tile the traversal reaches, however far
         // off screen. Expensive and not a mode anyone should run in — it exists
@@ -258,19 +255,48 @@ fn session(embedder: &dyn ViewerHost) -> anyhow::Result<()> {
         // ground is missing, each of the two things that can remove it has to
         // be switchable off on its own.
         horizon_culling: std::env::var("TUILE_NO_HORIZON_CULL").is_err(),
-        ..Config::interactive_globe(settings::pinned_level())
+        ..profile.traversal(pinned)
     };
-    let (stream, server) = in_process_with(tree, loader, config);
-    let server_thread = std::thread::Builder::new()
-        .name("geometry-server".into())
-        .spawn(move || rt.block_on(server.run()))?;
+    // Everything between here and a running server is network, and runs on
+    // the runtime: see `launch`. The host's credentials and sources, the
+    // store, the globe.
+    let launch = launch::Launch::start(
+        &handle,
+        launch::Plan {
+            host: Arc::clone(&embedder),
+            terrain: embedder.terrain(),
+            layers,
+            opening,
+            store: embed::identity().store.clone(),
+            config,
+            profile: profile.clone(),
+        },
+    );
+    // A desktop waits for it here, with no window yet: its window is held
+    // shut until the globe has a floor anyway, and a refusal is a sentence
+    // for the person — shown in a window when there is no terminal. A phone
+    // opens its window now and collects the launch from its loop, drawing the
+    // loading indicator meanwhile.
+    let launch = if profile.hold_window_until_warm {
+        match launch.wait() {
+            Ok(started) => launch::Launch::finished(Ok(started)),
+            Err(why) if bundled => {
+                desktop::alert(&format!("{} cannot start yet", host::app_name()), &why);
+                std::process::exit(1);
+            }
+            Err(why) => anyhow::bail!("{why}"),
+        }
+    } else {
+        launch
+    };
 
     // Where the command line said; straight down at France from ~2000 km up
     // when it said nothing.
     let camera = view.camera();
-    // Clamp against the terrain, not the ellipsoid: a metre over the sea and a
-    // metre over a summit are the same request, and only the relief tells them
-    // apart. The handle is shared and live, so the floor sharpens as tiles land.
+    // Clamped against the terrain, not the ellipsoid, once the globe is up:
+    // a metre over the sea and a metre over a summit are the same request,
+    // and only the relief tells them apart. The handle is shared and live, so
+    // the floor sharpens as tiles land — see `App::adopt`.
     //
     // One metre, not the hundred and fifty it was. A floor that high is a
     // helicopter: it puts the eye above everything a person might want to stand
@@ -278,9 +304,7 @@ fn session(embedder: &dyn ViewerHost) -> anyhow::Result<()> {
     // below it. The near plane follows — it is a quarter of the clearance — so
     // getting close costs nothing but the precision that rebasing already
     // provides.
-    let controller = CameraController::new(camera)
-        .with_min_altitude(1.0)
-        .with_ground(heights);
+    let controller = CameraController::new(camera).with_min_altitude(1.0);
 
     tracing::info!(
         "globe viewer — streaming terrain and imagery\n\
@@ -289,10 +313,7 @@ fn session(embedder: &dyn ViewerHost) -> anyhow::Result<()> {
          F: freeze · Esc"
     );
     let app_config = ViewerConfig {
-        stream,
         controller,
-        detail,
-        layer_budget,
         title: host::app_name().into(),
         layers,
         layer: opening,
@@ -307,41 +328,43 @@ fn session(embedder: &dyn ViewerHost) -> anyhow::Result<()> {
             pitch: view.pitch,
         }),
         lit_at_unix_seconds: settings::lit_at()?,
+        pinned_level: pinned,
+        profile: profile.clone(),
+        runtime: handle.clone(),
     };
 
     // Everything the engine counts, scrapeable, so the log can stop being a
-    // wall of numbers and go back to reporting events.
-    tuile_metrics::serve(&handle);
+    // wall of numbers and go back to reporting events. Not on a phone: an
+    // HTTP listener is a thread and a socket nobody there can reach.
+    if profile.metrics_endpoint {
+        tuile_metrics::serve(&handle);
+    }
 
     // Before the loop: Ctrl-C and `kill` must end the session, not the process,
-    // or a recording dies with it.
-    signals::catch_interruptions();
+    // or a recording dies with it. A phone's application is never sent
+    // either, and could not leave its loop if it were.
+    if !cfg!(target_os = "ios") {
+        signals::catch_interruptions();
+    }
     let event_loop = event_loop()?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::new(app_config, switcher);
+    let mut app = App::new(app_config, launch);
+    // On a phone this never returns: the system owns the loop, and the
+    // session ends in `App::exiting`, or not at all.
     let outcome = event_loop.run_app(&mut app);
     // Belt and braces: `exiting` covers a loop that unwinds normally, this
     // covers one that does not. Closing an already-closed tape is a no-op.
     app.close_the_tape();
     let report = app.report();
 
-    // Shut down in dependency order. Dropping the app drops the client stream,
-    // which is how the server learns the session is over.
+    // Shut down in dependency order. The store is closed *before* the server
+    // thread is joined: the thread blocks on the runtime, and the runtime
+    // waits for the store's blocking workers — waiting for the thread first
+    // and only then asking the store to close is a deadlock by construction.
+    app.shut_down(&handle);
     drop(app);
-    // The store is closed *before* the join, not after.
-    //
-    // The server thread owns the tokio runtime and `block_on`s the session on
-    // it, so when `run()` returns the runtime drops on that thread — and
-    // `Runtime::drop` waits for the store's blocking workers to finish. Waiting
-    // for the thread first and only then asking the store to close is a
-    // deadlock by construction: the thread cannot finish until a `close()` that
-    // cannot be issued until it has. It survives only because `run()` normally
-    // outlives this point.
-    settings::close_the_store(store, &handle);
-    if server_thread.join().is_err() {
-        tracing::error!("the geometry server panicked; its last work is lost");
-    }
     tracing::info!("{report}");
+    drop(rt);
     outcome?;
     Ok(())
 }

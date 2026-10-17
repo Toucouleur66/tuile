@@ -16,7 +16,9 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 glam = { workspace = true }
 pollster = { workspace = true }
-tokio = { workspace = true }
+# `sync` for the gate a paused session's loads wait on, `time` for the
+# bounded flush of the tile store on the way out.
+tokio = { workspace = true, features = ["sync", "time"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tuile-atmosphere = { version = "0.6.1", path = "../tuile-atmosphere" }
@@ -34,13 +36,20 @@ ctrlc = { version = "3.5", features = ["termination"] }
 # the headless probes and the warm-up job want exactly the same endpoint.
 tuile-metrics = { version = "0.6.1", path = "../tuile-metrics" }
 tuile-terrain = { version = "0.6.1", path = "../tuile-terrain" }
-tuile-ui = { version = "0.6.1", path = "../tuile-ui", features = ["statusbar"] }
+tuile-ui = { version = "0.6.1", path = "../tuile-ui" }
 tuile-wgpu = { version = "0.6.1", path = "../tuile-wgpu" }
 wgpu = { workspace = true }
 winit = { workspace = true }
 
 [dev-dependencies]
 futures-executor = { workspace = true }
+futures-util = { workspace = true }
+tempfile = { workspace = true }
+
+# The menu-bar readout is a desktop's: a phone has no menu bar, and the crates
+# behind it do not build there.
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+tuile-ui = { version = "0.6.1", path = "../tuile-ui", features = ["statusbar"] }
 
 # A process started from an icon gets 256 file descriptors; the tile store
 # alone wants more. The established safe wrapper over `setrlimit`, since the
@@ -49,9 +58,9 @@ futures-executor = { workspace = true }
 rlimit = "0.10"
 
 # The operating system's location service, for `--here` and the `L` key.
-# macOS only, and only this example: no library crate knows where the machine
-# is. Without the feature, or on another platform, the flag and the key answer
-# "not available" and the viewer runs as it always did.
+# macOS and iOS, and only this example: no library crate knows where the
+# machine is. Without the feature, or on another platform, the flag and the key
+# answer "not available" and the viewer runs as it always did.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6.4", optional = true }
 objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSAppleEventDescriptor", "NSAppleEventManager", "NSArray", "NSDate", "NSDictionary", "NSError", "NSRunLoop", "NSScriptCommand", "NSScriptCommandDescription", "NSString", "NSValue"] }
@@ -62,10 +71,22 @@ objc2-app-kit = { version = "0.3.2", optional = true, default-features = false, 
 muda = { version = "0.19", optional = true }
 objc2-core-location = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CLLocation", "CLLocationManager", "CLLocationManagerDelegate"] }
 
+# The phone: the same location service, plus what a handset asks of the
+# system and a desktop never needs to — how much memory the process may still
+# take, how hot the device is running, a message shown over the window, the
+# clipboard. The same bindings as the desktop's, from the same release train.
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = { version = "0.6.4", optional = true }
+objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSArray", "NSDate", "NSError", "NSProcessInfo", "NSRunLoop", "NSString", "NSValue"] }
+objc2-ui-kit = { version = "0.3.2", optional = true, default-features = false, features = ["std", "block2", "objc2-core-foundation", "UIAlertController", "UIApplication", "UIColor", "UIFont", "UIGeometry", "UILabel", "UIPasteboard", "UIResponder", "UIView", "UIViewController", "UIWindow"] }
+objc2-core-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CFCGTypes"] }
+objc2-core-location = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CLLocation", "CLLocationManager", "CLLocationManagerDelegate"] }
+
 [features]
 default = ["current-location", "application"]
 current-location = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-core-location"]
 # What makes the viewer an application on its desktop: steering URLs from
 # other programs, a message window when there is no terminal, the clipboard.
-# macOS only; elsewhere the feature compiles to nothing.
-application = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-app-kit", "dep:muda"]
+# On a phone: the message over the window, the clipboard, and the device's
+# memory and temperature. macOS and iOS; elsewhere it compiles to nothing.
+application = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-app-kit", "dep:muda", "dep:objc2-ui-kit", "dep:objc2-core-foundation"]
