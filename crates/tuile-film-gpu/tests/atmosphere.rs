@@ -30,6 +30,20 @@ fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
     })
 }
 
+/// The adapter the tests run on, as `(backend, name)`: the same default
+/// adapter [`device`] asks for.
+fn adapter() -> Option<(wgpu::Backend, String)> {
+    pollster::block_on(async {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .await
+            .ok()?;
+        let info = adapter.get_info();
+        Some((info.backend, info.name))
+    })
+}
+
 fn le<T: Copy + bytemuck::Pod>(v: &[T]) -> Vec<u8> {
     bytemuck::cast_slice(v).to_vec()
 }
@@ -466,6 +480,11 @@ fn without_an_atmosphere_or_a_hosts_light_the_film_is_the_looks_own() {
 /// frozen from main before the sky's work (07be3d0, and the same on this
 /// branch); a change here changes
 /// every default film, and is a decision, never an accident.
+///
+/// Rasterisers differ in their last bit, so a digest holds for the adapter it
+/// was frozen on only: an Apple GPU through Metal, where the films are checked
+/// by eye. On any other adapter (a CI runner's software Vulkan, say) the
+/// digest is printed and the comparison is skipped, saying so.
 #[test]
 fn a_default_films_pictures_are_the_same_to_the_byte() {
     let look = Look {
@@ -482,7 +501,14 @@ fn a_default_films_pictures_are_the_same_to_the_byte() {
     for b in down.iter().chain(&sky) {
         hash = (hash ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
     }
-    println!("DEFAULT-FILM-DIGEST {hash:016x}");
+    let (backend, name) = adapter().unwrap_or((wgpu::Backend::Noop, String::new()));
+    println!("DEFAULT-FILM-DIGEST {hash:016x} on {backend:?} {name}");
+    if backend != wgpu::Backend::Metal || !name.starts_with("Apple") {
+        eprintln!(
+            "SKIP: the default film's digest is frozen on an Apple GPU, not on {backend:?} {name}"
+        );
+        return;
+    }
     assert_eq!(format!("{hash:016x}"), FROZEN_DEFAULT_FILM);
 }
 

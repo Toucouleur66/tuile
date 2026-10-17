@@ -6,7 +6,7 @@
 //! What a view from 70 or 300 kilometres needs is the whole planet imaged,
 //! not a relief no camera that high can read. These are its two halves:
 //!
-//! - **[`ELLIPSOID`]**: terrain that is the WGS84 ellipsoid itself, every
+//! - **`ELLIPSOID`**: terrain that is the WGS84 ellipsoid itself, every
 //!   tile a regular grid at height zero, made here. Its curvature is the
 //!   only relief there is to see from orbit.
 //! - **[`BLUE_MARBLE`]**: NASA's *Blue Marble: Next Generation* (land
