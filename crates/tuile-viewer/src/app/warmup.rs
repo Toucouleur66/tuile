@@ -33,12 +33,12 @@ impl App {
     /// for the GPU, and the sooner this finishes the sooner the window appears.
     pub(super) fn pump_while_hidden(&mut self) {
         const WHILE_NOBODY_IS_WATCHING: usize = 64;
-        let Some(active) = self.active.as_mut() else {
+        let (Some(active), Some(session)) = (self.active.as_mut(), self.session.as_mut()) else {
             return;
         };
         active
             .pump
-            .pump(&mut active.stream, &active.gpu, WHILE_NOBODY_IS_WATCHING);
+            .pump(&mut session.stream, &active.gpu, WHILE_NOBODY_IS_WATCHING);
         if self.still_warming() {
             return;
         }
@@ -170,7 +170,7 @@ impl App {
                 queued_uploads = active.pump.pending_uploads(),
                 network_mib = m.store_bytes_fetched.get() / (1024 * 1024),
                 from_cache = m.store_hits.get(),
-                "holding the window until the coarse pyramid is on the GPU"
+                "waiting for the coarse pyramid to be on the GPU"
             );
         }
         if self.warmup.since.elapsed() > GIVE_UP_AFTER {

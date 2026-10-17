@@ -281,7 +281,15 @@ impl std::error::Error for MissingCredential {}
 /// The value is handed over and never logged; the log says only where it was
 /// found.
 pub fn credential(variable: &str) -> Result<String, MissingCredential> {
-    match host::token(&host::Machine, variable) {
+    credential_from(&host::Machine, variable)
+}
+
+/// [`credential`], on a given machine — the one the tests are.
+pub(crate) fn credential_from(
+    machine: &dyn host::Host,
+    variable: &str,
+) -> Result<String, MissingCredential> {
+    match host::token(machine, variable) {
         Ok((token, from)) => {
             tracing::info!("access token from {from:?}");
             Ok(token)

@@ -22,7 +22,7 @@
 //! **The platform stays in its corner.** Everything the rest of the viewer
 //! sees is the [`LocationSource`] trait and plain numbers. The one
 //! implementation that talks to an operating system is the private `system`
-//! module at the bottom, compiled on macOS with the `current-location`
+//! module at the bottom, compiled on macOS and iOS with the `current-location`
 //! feature; everywhere else the source answers "not available" and the viewer
 //! runs as it always did. The tests drive the same [`Locator`] with a source
 //! that is a script.
@@ -71,7 +71,10 @@ impl std::fmt::Debug for Fix {
 // without it still has to name the other answers, because the locator and its
 // tests are the same code everywhere.
 #[cfg_attr(
-    not(all(target_os = "macos", feature = "current-location")),
+    not(all(
+        any(target_os = "macos", target_os = "ios"),
+        feature = "current-location"
+    )),
     allow(dead_code)
 )]
 #[derive(Debug, Clone, PartialEq)]
@@ -270,7 +273,10 @@ fn placed(fix: Fix, placement: Placement, controller: &CameraController) -> Opti
 /// Authorisation is read back on every poll rather than through the delegate's
 /// change callback: it is the same information, and it leaves the delegate
 /// with exactly two methods.
-#[cfg(all(target_os = "macos", feature = "current-location"))]
+#[cfg(all(
+    any(target_os = "macos", target_os = "ios"),
+    feature = "current-location"
+))]
 mod system {
     #![allow(unsafe_code)]
 
@@ -497,7 +503,10 @@ mod system {
 
 /// Everywhere the system's service is not compiled in: the request is taken
 /// and answered at once, so the flag and the key say why nothing happened.
-#[cfg(not(all(target_os = "macos", feature = "current-location")))]
+#[cfg(not(all(
+    any(target_os = "macos", target_os = "ios"),
+    feature = "current-location"
+)))]
 mod system {
     use super::{LocationSource, Progress};
 
@@ -508,7 +517,7 @@ mod system {
 
         fn poll(&mut self) -> Progress {
             Progress::Unavailable(
-                if cfg!(target_os = "macos") {
+                if cfg!(any(target_os = "macos", target_os = "ios")) {
                     "this build was made without the `current-location` feature"
                 } else {
                     "not available on this platform"

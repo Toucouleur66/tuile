@@ -18,8 +18,7 @@ use winit::window::Window;
 impl App {
     /// Creates the window and everything that hangs off it.
     pub(super) fn start_window(&mut self, event_loop: &ActiveEventLoop) {
-        let config = self.config.take().expect("config consumed once");
-        self.statusbar = tuile_ui::StatusBar::new();
+        self.statusbar = super::readout::StatusBar::new();
         // Here and not earlier: a menu wants the application object the event
         // loop creates, and the main thread.
         self.menu = crate::menu::Installed::install(self.imagery.layers);
@@ -32,11 +31,21 @@ impl App {
         // its holes — the one state this whole design prevents, on screen at
         // the moment someone forms a first impression. See
         // [`App::still_warming`], which also decides when to give up waiting.
+        //
+        // A phone's window is the exception: the system ends an application
+        // that shows nothing, so it opens at once on the globe's shell and the
+        // loading indicator — see `loading`.
         let attrs = Window::default_attributes()
             .with_title(self.title.clone())
-            .with_visible(false);
+            .with_visible(!self.profile.hold_window_until_warm);
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
-        let size = window.inner_size();
+        // The drawable is the whole window, edge to edge; on a phone the
+        // inner size is only its safe area, which the controls keep to.
+        let size = if self.profile.hold_window_until_warm {
+            window.inner_size()
+        } else {
+            window.outer_size()
+        };
         let size = (size.width.max(1), size.height.max(1));
         let scale = window.scale_factor().max(1.0);
         // Said out loud, because everything downstream divides by it and a wrong
@@ -120,50 +129,104 @@ impl App {
         // stream was built; this is the first moment anything knows what the
         // device will actually bind. On the WebGPU baseline it stays at the
         // floor, on Metal it opens up to the fetch-cost ceiling.
-        self.layer_budget
-            .set_from_device(gpu.device.limits().max_sampled_textures_per_shader_stage);
         tracing::info!(
-            slots = self.layer_budget.get(),
             reported = gpu.device.limits().max_sampled_textures_per_shader_stage,
-            "imagery layers per drape"
+            "imagery layers a drape may bind"
         );
         let renderer = TileRenderer::new(&gpu, surface_format);
         // The viewer's pass carries depth, so the overlay must declare it too.
         let overlay = OverlayRenderer::new(&gpu, surface_format, Some(DEPTH_FORMAT));
         // The render origin tracks the eye (set each frame); start there.
         let pump = ContentPump::new(self.controller.camera.position);
+        let safe = safe_area(&window, size);
         let targets = tuile_wgpu::FrameTargets::new(&gpu, surface_format, size);
         // Built and uploaded once for the whole session.
         let shell = tuile_wgpu::prepare(&gpu, &crate::backdrop::shell_content(), DVec3::ZERO);
 
         let active = Active {
             window,
-            surface,
+            instance,
+            surface: Some(surface),
             surface_format,
             gpu,
             renderer,
             overlay,
             pump,
-            stream: config.stream,
             targets,
             size,
             scale,
+            safe,
             readback: tuile_wgpu::Readback::default(),
             shell,
         };
         configure_surface(&active);
         active.window.request_redraw();
         self.active = Some(active);
+        // The loader has been running against the correctness floor; this is
+        // the first moment anything knows what the device will bind.
+        self.fit_the_layer_budget();
+        tracing::info!(slots = self.layer_budget.get(), "imagery layers per drape");
+    }
+
+    /// Lets go of the surface and shrinks the render targets to nothing: a
+    /// phone's application in the background keeps neither.
+    pub(super) fn release_the_surface(&mut self) {
+        let Some(active) = self.active.as_mut() else {
+            return;
+        };
+        active.surface = None;
+        active.targets.resize(&active.gpu, (1, 1));
+        tracing::info!("surface released");
+    }
+
+    /// Builds the surface again, before any frame is drawn into it.
+    pub(super) fn restore_the_surface(&mut self) {
+        let Some(active) = self.active.as_mut() else {
+            return;
+        };
+        if active.surface.is_some() {
+            return;
+        }
+        match active.instance.create_surface(active.window.clone()) {
+            Ok(surface) => {
+                active.surface = Some(surface);
+                active.targets.resize(&active.gpu, active.size);
+                configure_surface(active);
+                tracing::info!("surface restored");
+                // Said again on the next turn, over the new surface.
+                self.title_shown.clear();
+            }
+            Err(e) => tracing::error!("the surface could not be made again: {e}"),
+        }
     }
 }
 
-pub(super) fn configure_surface(active: &Active) {
-    configure(
-        &active.surface,
-        &active.gpu,
-        active.surface_format,
-        active.size,
+/// The window's safe area in device pixels, relative to the drawable:
+/// left, top, width, height.
+pub(super) fn safe_area(window: &Window, size: (u32, u32)) -> (f64, f64, f64, f64) {
+    let whole = (0.0, 0.0, f64::from(size.0), f64::from(size.1));
+    let (Ok(inner), Ok(outer)) = (window.inner_position(), window.outer_position()) else {
+        return whole;
+    };
+    let inner_size = window.inner_size();
+    let (x, y) = (
+        f64::from(inner.x - outer.x).max(0.0),
+        f64::from(inner.y - outer.y).max(0.0),
     );
+    let (w, h) = (
+        f64::from(inner_size.width).min(f64::from(size.0) - x),
+        f64::from(inner_size.height).min(f64::from(size.1) - y),
+    );
+    if w <= 0.0 || h <= 0.0 {
+        return whole;
+    }
+    (x, y, w, h)
+}
+
+pub(super) fn configure_surface(active: &Active) {
+    if let Some(surface) = active.surface.as_ref() {
+        configure(surface, &active.gpu, active.surface_format, active.size);
+    }
 }
 
 /// The same, by parts.

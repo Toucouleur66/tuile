@@ -32,7 +32,9 @@ impl App {
     /// it. Skipping the frame entirely is the workaround the ecosystem settled
     /// on (the wgpu examples carry the same guard).
     pub(super) fn render(&mut self) {
-        if self.occluded {
+        // Covered on a desktop, or not in front on a phone — where the system
+        // ends an application that uses the GPU from the background.
+        if self.occluded || !self.lifecycle.may_draw() {
             return;
         }
         let dt = self.start_the_frame();
@@ -43,10 +45,14 @@ impl App {
         self.choose_the_imagery_detail();
         self.take_this_frames_share_of_the_stream();
         self.upload_the_view();
-        self.upload_the_control();
-        let Some((rendered, resolution, old_imagery)) = self.draw_and_present() else {
+        let indicator = self.the_loading_indicator();
+        self.upload_the_control(indicator);
+        let drew = self.draw_and_present();
+        self.note_what_needs_frames(indicator);
+        let Some((rendered, resolution, old_imagery)) = drew else {
             return;
         };
+        self.resolution = Some(resolution);
         self.note_the_turn_over(old_imagery);
         // After the draw, and deliberately: neither of these is drawing, and
         // both want the whole of `self` while the drawn tiles still borrow the
@@ -115,31 +121,48 @@ impl App {
         let cam = self.controller.camera;
         let (width, height) = self.viewport();
         let viewport = DVec2::new(width, height);
+        self.uploaded = 0;
+        // Anti-jitter: render origin = eye, so the f32 the GPU sees is small.
+        let origin = cam.position;
         let Some(active) = self.active.as_mut() else {
             return;
         };
         self.stats.frames += 1;
+        // The shell too, and forgetting it is why it was invisible: the pump
+        // rebases the tiles it owns, the shell is not one of them, and a mesh
+        // still anchored to the Earth's centre while the view is relative to
+        // the eye is drawn six thousand kilometres from where it belongs. And
+        // before the session is up: on a phone the shell is the whole first
+        // frame.
+        active.shell.rebase(&active.gpu.queue, origin);
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
         let before = active.pump.prepared_count();
-        // Anti-jitter: render origin = eye, so the f32 the GPU sees is small.
-        let origin = cam.position;
+        let budget = self.profile.uploads;
         // The frame's streaming step, shared with the headless tests — send the
         // camera, take this frame's share of uploads, rebase. Freezing simply
         // withholds the camera, which is what makes `F` a test of the renderer
         // against a fixed selection.
+        //
+        // The upload budget is the profile's: a count on a desktop, a count
+        // and a share of the frame's time on a phone.
         let uploaded = if self.views.freeze {
-            active.pump.pump(
-                &mut active.stream,
-                &active.gpu,
-                tuile_wgpu::UPLOADS_PER_FRAME,
-            )
+            active
+                .pump
+                .pump_while(&mut session.stream, &active.gpu, |done, spent| {
+                    budget.allows(done, spent)
+                })
         } else {
-            active.pump.advance(
-                &mut active.stream,
+            active.pump.advance_while(
+                &mut session.stream,
                 &active.gpu,
-                cam.view_state(viewport),
+                &[cam.view_state(viewport)],
                 origin,
+                |done, spent| budget.allows(done, spent),
             )
         };
+        self.uploaded = uploaded;
         self.stats.uploads += uploaded as u64;
         // A drop in the prepared count is the server reclaiming: worth counting
         // separately from uploads, since a healthy session does far more of the
@@ -149,11 +172,6 @@ impl App {
         if self.views.freeze {
             active.pump.rebase(&active.gpu.queue, origin);
         }
-        // The shell too, and forgetting it is why it was invisible: the pump
-        // rebases the tiles it owns, the shell is not one of them, and a mesh
-        // still anchored to the Earth's centre while the view is relative to
-        // the eye is drawn six thousand kilometres from where it belongs.
-        active.shell.rebase(&active.gpu.queue, origin);
     }
 
     /// Uploads the view matrix, the sun and the air.
@@ -191,23 +209,30 @@ impl App {
 
     /// Builds the on-screen control's geometry for the camera as it now stands,
     /// so the needle agrees with the frame it is drawn over.
-    fn upload_the_control(&mut self) {
-        let (width, height) = self.viewport();
-        let viewport = DVec2::new(width, height);
+    fn upload_the_control(&mut self, indicator: Option<tuile_ui::Spinner>) {
+        let ui = self.ui_frame();
         let Some(active) = self.active.as_mut() else {
             return;
         };
         // The control reads the camera as it now stands, so the needle and the
-        // horizon bar agree with the frame they are drawn over.
-        let nav_mesh: Vec<OverlayVertex> = self
+        // horizon bar agree with the frame they are drawn over. Drawn in its
+        // own units and placed in the safe area — see `UiFrame`.
+        let mut nav_mesh: Vec<OverlayVertex> = self
             .nav
-            .mesh((viewport.x, viewport.y), &self.controller)
+            .mesh(ui.size, &self.controller)
             .into_iter()
             .map(|v| OverlayVertex {
-                position: v.position,
+                position: ui.from(v.position),
                 color: v.color,
             })
             .collect();
+        // The loading indicator over everything, already in device pixels.
+        if let Some(spinner) = indicator {
+            nav_mesh.extend(spinner.mesh().into_iter().map(|v| OverlayVertex {
+                position: v.position,
+                color: v.color,
+            }));
+        }
         active
             .overlay
             .set_geometry(&active.gpu, &nav_mesh, active.size);
@@ -263,6 +288,7 @@ impl App {
         };
         let wireframe = self.views.wireframe;
         let trace = self.recording.trace.is_some();
+        let surface = active.surface.as_ref()?;
         // The acquire, the pass, the submit and the present — including the four
         // ways a drawable can fail to arrive — belong to the backend now. What
         // is left here is the one winit call in the sequence, and the choice of
@@ -270,7 +296,7 @@ impl App {
         let outcome = tuile_wgpu::draw_to_surface(
             tuile_wgpu::FrameOnSurface {
                 gpu: &active.gpu,
-                surface: &active.surface,
+                surface,
                 targets: &active.targets,
                 // Space black.
                 clear: wgpu::Color {
@@ -281,14 +307,7 @@ impl App {
                 },
                 trace: trace.then_some(&mut active.readback),
             },
-            || {
-                super::setup::configure(
-                    &active.surface,
-                    &active.gpu,
-                    active.surface_format,
-                    active.size,
-                )
-            },
+            || super::setup::configure(surface, &active.gpu, active.surface_format, active.size),
             || active.window.pre_present_notify(),
             |pass| {
                 active.renderer.paint(
@@ -493,6 +512,10 @@ impl App {
     /// all sit perfectly still when the server is dead — which is
     /// indistinguishable from a server with nothing to do. This one is not.
     fn watch_that_the_server_is_still_turning(&mut self, cam: tuile_camera::GlobeCamera) {
+        // No session, no server to have stopped.
+        if self.session.is_none() {
+            return;
+        }
         // The server's own pass counter, so a loop that has stopped turning
         // is one glance away instead of an afternoon. Every server-sourced
         // number below is a *last received* value: they all sit perfectly

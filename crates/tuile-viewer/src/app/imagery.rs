@@ -102,17 +102,21 @@ impl App {
         let Some(choice) = self.imagery.layers.get(layer) else {
             return;
         };
+        let Some(session) = self.session.as_ref() else {
+            self.say("the globe is still starting");
+            return;
+        };
         if !self.imagery.ask(layer) {
             return;
         }
-        self.switcher.ask(layer, choice);
+        session.switcher.ask(layer, choice);
         self.say(&format!("imagery: {}…", choice.name));
     }
 
     /// Takes the answer to a switch that was asked for, on whatever turn of
     /// the loop it arrives.
     pub(super) fn take_the_imagery(&mut self) {
-        while let Some(switched) = self.switcher.poll() {
+        while let Some(switched) = self.session.as_ref().and_then(|s| s.switcher.poll()) {
             let name = self
                 .imagery
                 .layers
@@ -137,8 +141,8 @@ impl App {
                     self.imagery.answered(switched.layer, None)
                 }
             };
-            if let Some(next) = next {
-                self.switcher.ask(next, &self.imagery.layers[next]);
+            if let (Some(next), Some(session)) = (next, self.session.as_ref()) {
+                session.switcher.ask(next, &self.imagery.layers[next]);
             }
         }
     }

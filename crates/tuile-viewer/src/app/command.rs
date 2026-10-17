@@ -185,10 +185,27 @@ impl App {
         if let Some((notice, _)) = &self.notice {
             title = format!("{title} — {notice}");
         }
+        let waiting = self.waiting_note(now);
+        if let Some(waiting) = &waiting {
+            title = format!("{title} — {waiting}");
+        }
         if title != self.title_shown {
             if let Some(active) = self.active.as_ref() {
                 active.window.set_title(&title);
             }
+            // Where there is no title bar, the part a person needs: whose
+            // pictures these are, and the last thing said.
+            let mut caption = snapshot
+                .imagery
+                .map(|layer| format!("{} · {}", layer.name, layer.attribution))
+                .unwrap_or_default();
+            if let Some((notice, _)) = &self.notice {
+                caption = format!("{caption} — {notice}");
+            }
+            if let Some(waiting) = waiting {
+                caption = format!("{caption} — {waiting}");
+            }
+            crate::desktop::caption(&caption);
             self.title_shown = title;
         }
     }

@@ -27,7 +27,7 @@ use tuile_bing::{BingImageryProvider, BingMetadata};
 use tuile_cesium_ion::tms::TmsImagery;
 use tuile_cesium_ion::{AssetEndpoint, IonClient, IonTerrainSource};
 use tuile_core::raster::ImageryProvider;
-use tuile_native_fetchers::NativeHttp;
+use tuile_native_fetchers::{default_cache_dir, CacheConfig, NativeHttp};
 use tuile_terrain::{LayerJson, TerrainSource};
 use tuile_viewer::{Identity, ImageryChoice, Sources, TerrainChoice, ViewerHost};
 
@@ -155,8 +155,15 @@ impl ViewerHost for Public {
 
     async fn connect(&self) -> Result<Arc<dyn Sources>, String> {
         let token = tuile_viewer::credential(TOKEN_VARIABLE).map_err(|e| e.to_string())?;
-        // One pooled, cached native transport drives both ion and Bing.
-        let http = Arc::new(NativeHttp::shared().await.map_err(|e| e.to_string())?);
+        // One pooled, cached native transport drives both ion and Bing — with
+        // a phone's smaller cache on a phone, where the viewer's own tile
+        // store already holds the tiles.
+        let http = if cfg!(target_os = "ios") {
+            NativeHttp::with_config(CacheConfig::handheld(default_cache_dir())).await
+        } else {
+            NativeHttp::shared().await
+        };
+        let http = Arc::new(http.map_err(|e| e.to_string())?);
         Ok(Arc::new(Ion { http, token }))
     }
 }

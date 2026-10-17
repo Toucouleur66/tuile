@@ -10,26 +10,35 @@
 //! be visible in the command that started it; that rule is unchanged, and a
 //! variable that is set is never overridden by anything.
 //!
-//! **Otherwise, from one file the person owns.** An application started from
-//! an icon has no shell and no environment, so there is exactly one other
-//! place:
+//! **Then, on a phone, from what the person typed** in the system's settings
+//! page for the application (*Settings › Tuile*), under the variable's name.
+//!
+//! **Then, on a phone, from the bundle** — a value written into `Info.plist`
+//! when the application was built (`crates/tuile-viewer/ios/build.sh` does so
+//! by default for a device build). **For a developer's own device only:**
+//! anything in a bundle can be read back out of the `.app`, so a build for the
+//! App Store, TestFlight or anyone else must not carry one.
+//!
+//! **Last, from one file the person owns.** An application started from an
+//! icon has no shell and no environment:
 //!
 //! ```text
 //! macOS      ~/Library/Application Support/Tuile/token
+//! iOS        Documents/token in the container (Files › On My iPhone › Tuile)
 //! elsewhere  $XDG_CONFIG_HOME/tuile/token   (or ~/.config/tuile/token)
 //! ```
 //!
 //! The file holds the token on a line of its own — or a `NAME=value` line, so
 //! a line lifted from a shell profile works as it is. Blank lines and lines
-//! starting with `#` are skipped. Create it yourself, mode 0600:
+//! starting with `#` are skipped. On a desktop, create it yourself, mode 0600:
 //!
 //! ```text
 //! install -m 600 /dev/null ~/Library/Application\ Support/Tuile/token
 //! ```
 //!
-//! Nothing in this repository creates that file, no build puts a token in the
-//! application bundle, and the token is never logged: this module hands it to
-//! the caller as a `String` and says only *where* it was found.
+//! Nothing in this repository creates that file, and the token is never
+//! logged: this module hands it to the caller as a `String` and says only
+//! *where* it was found.
 //!
 //! This is not the `.env` in the working directory that `main` explains the
 //! removal of. That file made a process behave differently depending on where
@@ -50,9 +59,39 @@ pub(crate) fn app_name() -> &'static str {
 pub(crate) trait Host {
     fn var(&self, name: &str) -> Option<String>;
     fn read(&self, path: &Path) -> std::io::Result<String>;
-    /// Whether directories follow the macOS layout.
+    /// Whether directories follow the macOS layout — which an iOS
+    /// application's container does too, under its own home.
     fn is_macos(&self) -> bool;
+    /// Whether this is a phone or a tablet, where the person can reach only
+    /// the application's `Documents`, through the Files application.
+    fn is_handheld(&self) -> bool {
+        false
+    }
+    /// A value the person typed in the system's settings for this
+    /// application, under `key`. Only a phone has such a page.
+    fn setting(&self, _key: &str) -> Option<String> {
+        None
+    }
+    /// A value written into the application bundle when it was built, under
+    /// `key`. For a developer's own builds only: see [`bundled_key`].
+    fn bundled(&self, _key: &str) -> Option<String> {
+        None
+    }
 }
+
+/// The `Info.plist` key a build-time credential for `variable` is written
+/// under.
+///
+/// **A developer's own device only.** Anything in a bundle can be read back
+/// out of it by whoever has the `.app`; a build that is distributed — the
+/// App Store, TestFlight, a file sent to someone — must not carry one.
+pub(crate) fn bundled_key(variable: &str) -> String {
+    format!("{}{variable}", BUNDLED_PREFIX.trim())
+}
+
+/// The key's prefix, in one file that the bundler, which writes the key,
+/// reads too: the two programs cannot drift apart.
+const BUNDLED_PREFIX: &str = include_str!("../ios/bundled-credential-prefix.txt");
 
 /// The real one.
 pub(crate) struct Machine;
@@ -68,7 +107,10 @@ impl Host for Machine {
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(path)?.permissions().mode();
-            if mode & 0o077 != 0 {
+            // A phone's application is the only account that can read its
+            // container, and a file dropped in through Files arrives 0644:
+            // nothing to warn about there.
+            if mode & 0o077 != 0 && !self.is_handheld() {
                 // Said, not refused: a refusal here would be a second way for
                 // the application to fail to start over the same file.
                 tracing::error!(
@@ -82,7 +124,47 @@ impl Host for Machine {
     }
 
     fn is_macos(&self) -> bool {
-        cfg!(target_os = "macos")
+        cfg!(any(target_os = "macos", target_os = "ios"))
+    }
+
+    fn is_handheld(&self) -> bool {
+        cfg!(target_os = "ios")
+    }
+
+    fn setting(&self, key: &str) -> Option<String> {
+        system::setting(key)
+    }
+
+    fn bundled(&self, key: &str) -> Option<String> {
+        system::bundled(key)
+    }
+}
+
+/// A phone's settings page and bundle, read through Foundation.
+#[cfg(all(target_os = "ios", feature = "application"))]
+mod system {
+    use objc2_foundation::{NSBundle, NSString, NSUserDefaults};
+
+    pub(super) fn setting(key: &str) -> Option<String> {
+        NSUserDefaults::standardUserDefaults()
+            .stringForKey(&NSString::from_str(key))
+            .map(|v| v.to_string())
+    }
+
+    pub(super) fn bundled(key: &str) -> Option<String> {
+        let value = NSBundle::mainBundle().objectForInfoDictionaryKey(&NSString::from_str(key))?;
+        value.downcast::<NSString>().ok().map(|v| v.to_string())
+    }
+}
+
+#[cfg(not(all(target_os = "ios", feature = "application")))]
+mod system {
+    pub(super) fn setting(_key: &str) -> Option<String> {
+        None
+    }
+
+    pub(super) fn bundled(_key: &str) -> Option<String> {
+        None
     }
 }
 
@@ -141,8 +223,15 @@ pub(crate) fn last_view_file(host: &dyn Host) -> Option<PathBuf> {
     Some(support_dir(host)?.join("last-view"))
 }
 
-/// The one file a token may be read from.
+/// The file a token is read from, and the one a person is told to create.
+///
+/// On a phone that is `Documents/token`: the one directory of an application
+/// the person can put a file in, through the Files application ("On My
+/// iPhone", under the application's name) — `Library` is out of their reach.
 pub(crate) fn token_file(host: &dyn Host) -> Option<PathBuf> {
+    if host.is_handheld() {
+        return Some(home(host)?.join("Documents").join("token"));
+    }
     Some(support_dir(host)?.join("token"))
 }
 
@@ -150,6 +239,10 @@ pub(crate) fn token_file(host: &dyn Host) -> Option<PathBuf> {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TokenFrom {
     Environment,
+    /// The system's settings page for the application.
+    Settings,
+    /// Written into the bundle at build time.
+    Bundle,
     File(PathBuf),
 }
 
@@ -172,17 +265,27 @@ fn token_line(text: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
-/// Finds the token: the environment if it has one, the person's file if not.
+/// Finds the token, first found wins:
 ///
-/// A variable that is set but empty counts as unset — it is what an unfilled
-/// template exports, and "the token is the empty string" helps nobody.
+/// 1. the environment variable — what a command line said;
+/// 2. the system's settings page (a phone's *Settings › Tuile*), under the
+///    variable's name — what the person typed there;
+/// 3. a value written into the bundle at build time (a developer's own
+///    device only — see [`bundled_key`]);
+/// 4. the person's file ([`token_file`]).
+///
+/// A value that is set but blank counts as unset — it is what an unfilled
+/// template, or a settings field cleared by hand, holds.
 pub(crate) fn token(host: &dyn Host, variable: &str) -> Result<(String, TokenFrom), MissingToken> {
-    if let Some(token) = host
-        .var(variable)
-        .map(|t| t.trim().to_owned())
-        .filter(|t| !t.is_empty())
-    {
+    let filled = |v: Option<String>| v.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty());
+    if let Some(token) = filled(host.var(variable)) {
         return Ok((token, TokenFrom::Environment));
+    }
+    if let Some(token) = filled(host.setting(variable)) {
+        return Ok((token, TokenFrom::Settings));
+    }
+    if let Some(token) = filled(host.bundled(&bundled_key(variable))) {
+        return Ok((token, TokenFrom::Bundle));
     }
     let file = token_file(host);
     let found = file
@@ -221,6 +324,9 @@ mod tests {
         vars: HashMap<&'static str, &'static str>,
         files: HashMap<PathBuf, &'static str>,
         macos: bool,
+        handheld: bool,
+        settings: HashMap<String, &'static str>,
+        bundle: HashMap<String, &'static str>,
     }
 
     impl Host for Fake {
@@ -238,6 +344,18 @@ mod tests {
         fn is_macos(&self) -> bool {
             self.macos
         }
+
+        fn is_handheld(&self) -> bool {
+            self.handheld
+        }
+
+        fn setting(&self, key: &str) -> Option<String> {
+            self.settings.get(key).map(|v| (*v).to_owned())
+        }
+
+        fn bundled(&self, key: &str) -> Option<String> {
+            self.bundle.get(key).map(|v| (*v).to_owned())
+        }
     }
 
     const TOKEN_VARIABLE: &str = "SOME_TOKEN";
@@ -250,6 +368,8 @@ mod tests {
             vars,
             files: file.map(|t| (PathBuf::from(FILE), t)).into_iter().collect(),
             macos: true,
+            handheld: false,
+            ..Fake::default()
         }
     }
 
@@ -377,6 +497,153 @@ mod tests {
             assert_eq!(with(bad), None, "{bad:?}");
         }
         assert_eq!(crate::start::remembered(&mac(&[], None)), None);
+    }
+
+    /// On a phone the token is read from, and asked for in, the one folder
+    /// the person can reach: the application's `Documents`.
+    #[test]
+    fn a_phone_reads_its_token_from_documents() {
+        const HOME: &str = "/var/mobile/Containers/Data/Application/ABCD";
+        let phone = |file: Option<&'static str>| Fake {
+            vars: [("HOME", HOME)].into_iter().collect(),
+            files: file
+                .map(|t| (PathBuf::from(format!("{HOME}/Documents/token")), t))
+                .into_iter()
+                .collect(),
+            macos: true,
+            handheld: true,
+            ..Fake::default()
+        };
+        assert_eq!(
+            token(&phone(Some("abc.def\n")), TOKEN_VARIABLE),
+            Ok((
+                "abc.def".to_owned(),
+                TokenFrom::File(format!("{HOME}/Documents/token").into())
+            ))
+        );
+        assert_eq!(
+            token(&phone(None), TOKEN_VARIABLE),
+            Err(MissingToken {
+                file: Some(format!("{HOME}/Documents/token").into())
+            })
+        );
+        // The rest of the application's files stay out of the person's way.
+        assert_eq!(
+            last_view_file(&phone(None)),
+            Some(format!("{HOME}/Library/Application Support/Tuile/last-view").into())
+        );
+    }
+
+    /// Environment, then the settings page, then the bundle, then the
+    /// file: each one wins over everything after it, and a blank one is
+    /// passed over.
+    /// The bundled key, as the bundler writes it: the shared prefix, then
+    /// the variable.
+    #[test]
+    fn the_bundled_key_is_the_shared_prefix_and_the_variable() {
+        assert_eq!(
+            bundled_key("SOME_TOKEN"),
+            "TuileBundledCredential_SOME_TOKEN"
+        );
+    }
+
+    #[test]
+    fn the_token_is_looked_for_in_order() {
+        const HOME: &str = "/var/mobile/Containers/Data/Application/ABCD";
+        let file = PathBuf::from(format!("{HOME}/Documents/token"));
+        let phone = |env: Option<&'static str>,
+                     setting: Option<&'static str>,
+                     bundle: Option<&'static str>,
+                     in_file: Option<&'static str>| {
+            let mut vars: HashMap<_, _> = [("HOME", HOME)].into_iter().collect();
+            if let Some(v) = env {
+                vars.insert(TOKEN_VARIABLE, v);
+            }
+            Fake {
+                vars,
+                files: in_file.map(|t| (file.clone(), t)).into_iter().collect(),
+                macos: true,
+                handheld: true,
+                settings: setting
+                    .map(|t| (TOKEN_VARIABLE.to_owned(), t))
+                    .into_iter()
+                    .collect(),
+                bundle: bundle
+                    .map(|t| (bundled_key(TOKEN_VARIABLE), t))
+                    .into_iter()
+                    .collect(),
+            }
+        };
+        let got = |h: Fake| token(&h, TOKEN_VARIABLE);
+        assert_eq!(
+            got(phone(Some("e"), Some("s"), Some("b"), Some("f"))),
+            Ok(("e".into(), TokenFrom::Environment))
+        );
+        assert_eq!(
+            got(phone(None, Some("s"), Some("b"), Some("f"))),
+            Ok(("s".into(), TokenFrom::Settings))
+        );
+        assert_eq!(
+            got(phone(None, Some("  "), Some("b"), Some("f"))),
+            Ok(("b".into(), TokenFrom::Bundle)),
+            "a cleared settings field falls through"
+        );
+        assert_eq!(
+            got(phone(None, None, Some(""), Some("f\n"))),
+            Ok(("f".into(), TokenFrom::File(file.clone())))
+        );
+        assert_eq!(
+            got(phone(None, None, None, None)),
+            Err(MissingToken { file: Some(file) })
+        );
+    }
+
+    /// Wherever the token came from, the real resolution — the one the
+    /// application runs, logging included — writes no line that carries it.
+    #[test]
+    fn the_token_is_never_in_a_log_line() {
+        const SECRET: &str = "eyJhbGciOiJIUzI1NiJ9.secret-part.signature";
+        #[derive(Clone, Default)]
+        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .finish();
+        let mut found = Vec::new();
+        tracing::subscriber::with_default(subscriber, || {
+            let in_env = mac(&[(TOKEN_VARIABLE, SECRET)], None);
+            let mut in_settings = mac(&[], None);
+            in_settings
+                .settings
+                .insert(TOKEN_VARIABLE.to_owned(), SECRET);
+            let mut in_bundle = mac(&[], None);
+            in_bundle.bundle.insert(bundled_key(TOKEN_VARIABLE), SECRET);
+            let in_file = mac(&[], Some(SECRET));
+            for host in [&in_env, &in_settings, &in_bundle, &in_file] {
+                found.push(crate::embed::credential_from(host, TOKEN_VARIABLE));
+            }
+            // And the refusal, which names where to put one.
+            found.push(crate::embed::credential_from(
+                &mac(&[], None),
+                TOKEN_VARIABLE,
+            ));
+        });
+        assert!(found[..4].iter().all(|f| f.as_deref() == Ok(SECRET)));
+        assert!(found[4].is_err());
+        let log = String::from_utf8(captured.0.lock().expect("log").clone()).expect("utf-8");
+        assert_eq!(log.matches("access token from").count(), 4, "{log}");
+        assert!(!log.contains("secret-part"), "the token reached the log");
     }
 
     #[test]

@@ -230,11 +230,28 @@ impl ContentPump {
         gpu: &GpuContext,
         max_uploads: usize,
     ) -> usize {
+        self.pump_while(stream, gpu, |done, _| done < max_uploads)
+    }
+
+    /// Takes every message the server has sent — selections, evictions,
+    /// content into the upload queue — and touches nothing on the GPU: no
+    /// upload, no stitch, no buffer write. An evicted surface is dropped, which
+    /// releases its memory without submitting any work.
+    ///
+    /// For a host that may not use the GPU at all — a phone's application in
+    /// the background, where the system ends anything that submits — and
+    /// still wants the memory a trim lets go of back now rather than on its
+    /// next frame. Returns how many messages were taken.
+    pub fn drain<S: GeometryStream>(&mut self, stream: &mut S) -> usize {
         let waker = futures_util::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
+        let mut taken = 0;
         loop {
             match stream.poll_message(&mut cx) {
-                Poll::Ready(Some(msg)) => self.on_message(msg),
+                Poll::Ready(Some(msg)) => {
+                    self.on_message(msg);
+                    taken += 1;
+                }
                 Poll::Ready(None) => {
                     self.closed = true;
                     break;
@@ -242,9 +259,42 @@ impl ContentPump {
                 Poll::Pending => break,
             }
         }
+        taken
+    }
+
+    /// Sends the camera, one generation on from the last: the first half of
+    /// [`Self::advance_while`], for a host that wants the server to run a pass
+    /// — and answer it — without drawing anything.
+    pub fn send_view<S: GeometryStream>(&mut self, stream: &mut S, views: &[ViewState]) {
+        // Best effort: a closed stream means the session is over, and a frame is
+        // not the place to discover it.
+        self.generation_sent += 1;
+        let _ = stream.send(ClientMessage::ViewerState {
+            views: views.to_vec(),
+            generation: self.generation_sent,
+        });
+    }
+
+    /// [`Self::pump`], with the upload budget as a rule rather than a count:
+    /// `more(done, spent)` is asked before each upload, with how many this
+    /// call has made and how long they took, and the uploads stop at the first
+    /// `false`.
+    ///
+    /// For a host whose frame cannot afford a fixed number: one tile is a few
+    /// kilobytes of mesh and the next megabytes of imagery, so a phone stops
+    /// on time spent as well as on count. Messages are drained whatever the
+    /// rule says — only uploads wait.
+    pub fn pump_while<S: GeometryStream>(
+        &mut self,
+        stream: &mut S,
+        gpu: &GpuContext,
+        mut more: impl FnMut(usize, std::time::Duration) -> bool,
+    ) -> usize {
+        self.drain(stream);
 
         let mut uploaded = 0;
-        while uploaded < max_uploads {
+        let began = std::time::Instant::now();
+        while more(uploaded, began.elapsed()) {
             let Some((tile, content, is_fill)) = self.pending.pop_front() else {
                 break;
             };
@@ -351,14 +401,22 @@ impl ContentPump {
         views: &[ViewState],
         render_origin: DVec3,
     ) -> usize {
-        // Best effort: a closed stream means the session is over, and a frame is
-        // not the place to discover it.
-        self.generation_sent += 1;
-        let _ = stream.send(ClientMessage::ViewerState {
-            views: views.to_vec(),
-            generation: self.generation_sent,
-        });
-        let uploaded = self.pump(stream, gpu, UPLOADS_PER_FRAME);
+        self.advance_while(stream, gpu, views, render_origin, |done, _| {
+            done < UPLOADS_PER_FRAME
+        })
+    }
+
+    /// [`Self::advance_with`], with the upload budget of [`Self::pump_while`].
+    pub fn advance_while<S: GeometryStream>(
+        &mut self,
+        stream: &mut S,
+        gpu: &crate::context::GpuContext,
+        views: &[ViewState],
+        render_origin: DVec3,
+        more: impl FnMut(usize, std::time::Duration) -> bool,
+    ) -> usize {
+        self.send_view(stream, views);
+        let uploaded = self.pump_while(stream, gpu, more);
         self.rebase(&gpu.queue, render_origin);
         uploaded
     }
@@ -1215,5 +1273,94 @@ mod coverage_tests {
         assert_eq!(counts.lost, 1);
         assert_eq!(counts.deepest_lost, 3);
         assert_eq!(unresolved, vec![orphan]);
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    use tuile_core::content::TileContent;
+    use tuile_core::protocol::{Ancestry, StreamError};
+
+    /// A stream that hands out a script of server messages, and keeps what
+    /// was sent to it.
+    #[derive(Default)]
+    struct Scripted {
+        inbox: VecDeque<ServerMessage>,
+        sent: Mutex<Vec<ClientMessage>>,
+    }
+
+    impl GeometryStream for Scripted {
+        fn send(&self, msg: ClientMessage) -> Result<(), StreamError> {
+            self.sent.lock().expect("sent").push(msg);
+            Ok(())
+        }
+
+        fn poll_message(&mut self, _cx: &mut Context<'_>) -> Poll<Option<ServerMessage>> {
+            match self.inbox.pop_front() {
+                Some(msg) => Poll::Ready(Some(msg)),
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    fn content(tile: TileId) -> ServerMessage {
+        ServerMessage::Content {
+            tile,
+            ancestry: Ancestry {
+                level: 0,
+                parent: None,
+            },
+            content: TileContent::Decoded(DecodedTileContent {
+                meshes: Vec::new(),
+                textures: Vec::new(),
+                imagery: Vec::new(),
+                withheld_drape: None,
+                local_origin_ecef: DVec3::ZERO,
+                transform_local: glam::Mat4::IDENTITY,
+            }),
+        }
+    }
+
+    /// Draining takes every message and uploads nothing: content waits in
+    /// the queue for a frame, and nothing is acknowledged — the server must
+    /// not believe a tile is on the GPU when no frame has run.
+    #[test]
+    fn draining_takes_messages_and_does_no_gpu_work() {
+        let mut stream = Scripted::default();
+        stream.inbox.push_back(content(TileId(1)));
+        stream.inbox.push_back(content(TileId(2)));
+        let mut pump = ContentPump::new(DVec3::ZERO);
+        assert_eq!(pump.drain(&mut stream), 2);
+        assert_eq!(pump.pending_uploads(), 2);
+        assert_eq!(pump.prepared_count(), 0, "a drain uploaded");
+        assert!(
+            stream.sent.lock().expect("sent").is_empty(),
+            "a drain acked"
+        );
+        assert_eq!(pump.drain(&mut stream), 0);
+    }
+
+    /// Sending the view is one generation on each time, as a frame's is.
+    #[test]
+    fn a_view_sent_without_a_frame_is_a_new_generation() {
+        let mut stream = Scripted::default();
+        let mut pump = ContentPump::new(DVec3::ZERO);
+        pump.send_view(&mut stream, &[]);
+        pump.send_view(&mut stream, &[]);
+        let generations: Vec<u64> = stream
+            .sent
+            .lock()
+            .expect("sent")
+            .iter()
+            .filter_map(|m| match m {
+                ClientMessage::ViewerState { generation, .. } => Some(*generation),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(generations, [1, 2]);
+        assert_eq!(pump.generation_sent(), 2);
     }
 }

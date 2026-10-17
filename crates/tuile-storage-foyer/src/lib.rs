@@ -42,8 +42,68 @@ use tuile_core::storage::ContentStore;
 /// The store could not be built. Once running, the store never fails a caller:
 /// misses and declined writes are normal, not errors.
 #[derive(Debug, thiserror::Error)]
-#[error("content store: {0}")]
-pub struct StoreError(String);
+#[error("content store: {message}")]
+pub struct StoreError {
+    message: String,
+    transient: bool,
+}
+
+impl StoreError {
+    /// From any error, judged by the I/O error at the bottom of its chain.
+    fn from_error(error: &(dyn std::error::Error + 'static)) -> Self {
+        let mut io = None;
+        let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
+        while let Some(e) = cause {
+            if let Some(found) = e.downcast_ref::<std::io::Error>() {
+                io = Some(found);
+            }
+            cause = e.source();
+        }
+        Self {
+            message: error.to_string(),
+            transient: io.is_some_and(is_transient),
+        }
+    }
+
+    /// Whether the failure says nothing about the store's files: another
+    /// process holding them, the process out of descriptors or memory, a full
+    /// disk, a call interrupted or timed out. Such a store is fine and will
+    /// open again; **clearing it to start afresh would throw away a good
+    /// cache over a passing condition**. Anything else — a file where the
+    /// directory should be, data that does not read back — is damage.
+    pub fn is_transient(&self) -> bool {
+        self.transient
+    }
+}
+
+impl From<std::io::Error> for StoreError {
+    fn from(error: std::io::Error) -> Self {
+        Self::from_error(&error)
+    }
+}
+
+fn is_transient(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{
+        Interrupted, OutOfMemory, PermissionDenied, QuotaExceeded, ResourceBusy, StorageFull,
+        TimedOut, WouldBlock,
+    };
+    // ENFILE, EMFILE — the system or the process out of descriptors — which
+    // carry no kind of their own. The same numbers on macOS, iOS and Linux.
+    const OUT_OF_DESCRIPTORS: [i32; 2] = [23, 24];
+    matches!(
+        error.kind(),
+        Interrupted
+            | WouldBlock
+            | TimedOut
+            | ResourceBusy
+            | OutOfMemory
+            | StorageFull
+            | QuotaExceeded
+            | PermissionDenied
+    ) || error
+        .raw_os_error()
+        .is_some_and(|code| OUT_OF_DESCRIPTORS.contains(&code))
+}
 
 /// Capacities and location of a [`FoyerStore`].
 #[derive(Debug, Clone)]
@@ -106,7 +166,7 @@ impl FoyerStore {
         self.cache
             .close()
             .await
-            .map_err(|e| StoreError(e.to_string()))
+            .map_err(|e| StoreError::from_error(&e))
     }
 
     /// Builds a store with an explicit configuration.
@@ -128,11 +188,11 @@ impl FoyerStore {
     }
 
     async fn build(cfg: StoreConfig, policy: foyer::HybridCachePolicy) -> Result<Self, StoreError> {
-        std::fs::create_dir_all(&cfg.dir).map_err(|e| StoreError(e.to_string()))?;
+        std::fs::create_dir_all(&cfg.dir).map_err(|e| StoreError::from_error(&e))?;
         let device = FsDeviceBuilder::new(&cfg.dir)
             .with_capacity(cfg.disk_bytes)
             .build()
-            .map_err(|e| StoreError(e.to_string()))?;
+            .map_err(|e| StoreError::from_error(&e))?;
         // Writes to the disk go through a queue, and foyer DROPS what arrives
         // while that queue is over its threshold (32 MiB by default): right
         // for a cache that may forget, and the reason a store asked to keep
@@ -157,7 +217,7 @@ impl FoyerStore {
             .with_engine_config(engine)
             .build()
             .await
-            .map_err(|e| StoreError(e.to_string()))?;
+            .map_err(|e| StoreError::from_error(&e))?;
         Ok(Self {
             cache,
             default_ttl: cfg.default_ttl,
@@ -200,6 +260,87 @@ impl ContentStore for FoyerStore {
         let deadline = Deadline::in_(ttl.or(self.default_ttl), now_millis());
         self.cache
             .insert(key.to_owned(), Stamped::join(deadline, &value));
+    }
+}
+
+/// A [`FoyerStore`] that can be closed and opened again behind one handle.
+///
+/// A store keeps its most recent entries in memory and writes them to disk
+/// when memory lets go of them, or when it is closed. A desktop closes it on
+/// the way out. A phone's application is never shut down: it goes to the
+/// background and is ended there without a word, and whatever the memory tier
+/// held is lost — measured on a device: a session's tiles, none of them found
+/// by the next launch. So the host suspends the store when it leaves the
+/// screen, which closes it and writes everything down, and resumes it when it
+/// comes back.
+///
+/// Callers never see the difference: while suspended a read is a miss and a
+/// write is declined, which is what a store is allowed to answer at any time.
+pub struct SuspendableStore {
+    config: StoreConfig,
+    live: std::sync::Mutex<Option<FoyerStore>>,
+}
+
+impl SuspendableStore {
+    /// Opens the store with `config`.
+    pub async fn open(config: StoreConfig) -> Result<Self, StoreError> {
+        let store = FoyerStore::with_config(config.clone()).await?;
+        Ok(Self {
+            config,
+            live: std::sync::Mutex::new(Some(store)),
+        })
+    }
+
+    fn current(&self) -> Option<FoyerStore> {
+        self.live.lock().ok().and_then(|live| live.clone())
+    }
+
+    /// Writes everything down and closes the store. Reads miss and writes
+    /// are declined until [`Self::resume`]. Harmless when already suspended.
+    pub async fn suspend(&self) -> Result<(), StoreError> {
+        let taken = self.live.lock().ok().and_then(|mut live| live.take());
+        match taken {
+            Some(store) => store.close().await,
+            None => Ok(()),
+        }
+    }
+
+    /// Opens the store again, from what is on disk. Harmless when open.
+    pub async fn resume(&self) -> Result<(), StoreError> {
+        if self.current().is_some() {
+            return Ok(());
+        }
+        let store = FoyerStore::with_config(self.config.clone()).await?;
+        if let Ok(mut live) = self.live.lock() {
+            if live.is_none() {
+                *live = Some(store);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the store is suspended.
+    pub fn is_suspended(&self) -> bool {
+        self.current().is_none()
+    }
+
+    /// Writes everything down and closes the store, for good: see
+    /// [`FoyerStore::close`].
+    pub async fn close(&self) -> Result<(), StoreError> {
+        self.suspend().await
+    }
+}
+
+#[async_trait]
+impl ContentStore for SuspendableStore {
+    async fn get(&self, key: &str) -> Option<Bytes> {
+        self.current()?.get(key).await
+    }
+
+    async fn put(&self, key: &str, value: Bytes, ttl: Option<Duration>) {
+        if let Some(store) = self.current() {
+            store.put(key, value, ttl).await;
+        }
     }
 }
 
@@ -261,14 +402,30 @@ impl Stamped {
 }
 
 /// A stable per-user cache directory (`$XDG_CACHE_HOME`, else `~/Library/Caches`
-/// on macOS / `~/.cache` elsewhere, else the temp dir), suffixed `tuile`.
+/// on macOS and iOS / `~/.cache` elsewhere, else the temp dir), suffixed
+/// `tuile`.
+///
+/// iOS included, and it matters there more than anywhere: an application's
+/// `$HOME` is its container, `Library/Caches` is the one directory in it the
+/// system may purge when space runs short — and the only right place for a
+/// cache of hundreds of megabytes — while `~/.cache` at the container's root
+/// is neither purgeable nor a place an application is meant to write.
 pub fn default_cache_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
+    cache_dir_for(
+        std::env::consts::OS,
+        std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+/// [`default_cache_dir`], for the operating system `os` (as
+/// [`std::env::consts::OS`] names it) and the given variables.
+fn cache_dir_for(os: &str, xdg: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+    let apple = matches!(os, "macos" | "ios");
+    let base = xdg
         .or_else(|| {
-            std::env::var_os("HOME").map(|home| {
-                let home = PathBuf::from(home);
-                if cfg!(target_os = "macos") {
+            home.map(|home| {
+                if apple {
                     home.join("Library/Caches")
                 } else {
                     home.join(".cache")
@@ -282,6 +439,115 @@ pub fn default_cache_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a suspended store held is on disk for whoever opens it next —
+    /// the next launch — and the same handle serves again once resumed.
+    /// While suspended it misses and declines, as a store may.
+    #[test]
+    fn a_suspended_store_has_written_everything_down() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        // Room for a few blocks: a store of one block cannot reclaim, and
+        // waits for ever on close.
+        let config = |dir: &Path| StoreConfig {
+            disk_bytes: 64 << 20,
+            ..config(dir)
+        };
+        runtime.block_on(async {
+            let store = SuspendableStore::open(config(dir.path()))
+                .await
+                .expect("open");
+            for i in 0..20 {
+                store
+                    .put(&format!("tile/{i}"), Bytes::from(vec![i as u8; 1000]), None)
+                    .await;
+            }
+            store.suspend().await.expect("suspended");
+            assert!(store.is_suspended());
+            assert_eq!(
+                store.get("tile/3").await,
+                None,
+                "a suspended store answered"
+            );
+            store.put("tile/late", Bytes::from_static(b"x"), None).await;
+
+            // The next process, as it were: a store opened on the same files.
+            let next = FoyerStore::with_config(config(dir.path()))
+                .await
+                .expect("reopened");
+            let found = next.get("tile/3").await;
+            next.close().await.expect("closed");
+            assert_eq!(found.as_deref(), Some(&[3u8; 1000][..]), "lost on suspend");
+
+            store.resume().await.expect("resumed");
+            assert_eq!(store.get("tile/7").await.as_deref(), Some(&[7u8; 1000][..]));
+            assert_eq!(
+                store.get("tile/late").await,
+                None,
+                "a write while suspended"
+            );
+            store.close().await.expect("closed");
+        });
+    }
+
+    /// A passing condition is told from damage: out of descriptors, busy or
+    /// a full disk is transient; a file where the store's directory should be
+    /// is not.
+    #[test]
+    fn a_store_error_says_whether_it_will_pass() {
+        use std::io::{Error, ErrorKind};
+        for passing in [
+            Error::from_raw_os_error(24),
+            Error::from_raw_os_error(23),
+            Error::from(ErrorKind::ResourceBusy),
+            Error::from(ErrorKind::WouldBlock),
+            Error::from(ErrorKind::StorageFull),
+            Error::from(ErrorKind::PermissionDenied),
+        ] {
+            assert!(StoreError::from(passing).is_transient());
+        }
+        assert!(!StoreError::from(Error::from(ErrorKind::InvalidData)).is_transient());
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let in_the_way = dir.path().join("store");
+        std::fs::write(&in_the_way, b"not a directory").expect("a file");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let error = runtime
+            .block_on(FoyerStore::with_config(config(&in_the_way)))
+            .err()
+            .expect("a file where the store goes");
+        assert!(!error.is_transient(), "{error}");
+    }
+
+    /// A phone's container keeps its caches where a Mac does, under
+    /// `Library/Caches` — the purgeable directory — and nowhere else does.
+    #[test]
+    fn the_cache_lives_in_library_caches_on_apple_systems() {
+        let home = || Some(PathBuf::from("/home/x"));
+        for os in ["macos", "ios"] {
+            assert_eq!(
+                cache_dir_for(os, None, home()),
+                PathBuf::from("/home/x/Library/Caches/tuile"),
+                "{os}"
+            );
+        }
+        assert_eq!(
+            cache_dir_for("linux", None, home()),
+            PathBuf::from("/home/x/.cache/tuile")
+        );
+        assert_eq!(
+            cache_dir_for("ios", Some("/xdg".into()), home()),
+            PathBuf::from("/xdg/tuile"),
+            "XDG_CACHE_HOME wins everywhere"
+        );
+    }
 
     fn config(dir: &Path) -> StoreConfig {
         StoreConfig {
