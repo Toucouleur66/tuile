@@ -1,0 +1,1004 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) lapoule.dev
+
+//! The physical atmosphere: Hillaire's look-up tables, computed on the CPU,
+//! in f64 — the reference every GPU path is held against.
+//!
+//! After S. Hillaire, *A Scalable and Production Ready Sky and Atmosphere
+//! Rendering Technique* (EGSR 2020), §4–5: a **transmittance** table indexed
+//! by height and the cosine of a ray's zenith angle (Bruneton's
+//! parametrisation, *Precomputed Atmospheric Scattering*, 2017), a
+//! **multiple-scattering** table — the paper's isotropic approximation of
+//! every order past the first, `Ψ = L₂ / (1 − f_ms)` — indexed by height and
+//! the sun's zenith cosine, and short ray marches over both for the sky seen
+//! from a point and for the air between an eye and the ground. Written from
+//! the paper; its MIT reference implementation and Bevy's were read for the
+//! parametrisations, nothing of either is copied.
+//!
+//! `aerial.wgsl` and `hillaire.wgsl` are this module's twins on the GPU:
+//! [`WGSL`] marches as [`LutAtmosphere::march`] does, over the same tables
+//! uploaded.
+//!
+//! # Units
+//!
+//! The sun's irradiance outside the air is one, in every channel: a radiance
+//! here is per unit of it. A renderer scales by what one is in its own units
+//! ([`SkyLight::illuminance`]).
+
+use std::f64::consts::PI;
+
+use glam::{DMat3, DVec3};
+use tuile_core::geo::{enu_frame, Geodetic};
+
+use crate::illumination::{ReferenceIllumination, DAYLIGHT_EV100};
+use crate::params::{AtmosphereFrame, AtmosphereParams};
+
+/// The GPU twin: the tables' parametrisations and the marches, as WGSL
+/// functions over an `Atmosphere` uniform the including module binds.
+pub const WGSL: &str = include_str!("hillaire.wgsl");
+
+/// Transmittance table: width (zenith cosine) by height.
+pub const TRANSMITTANCE_SIZE: [usize; 2] = [256, 64];
+/// Multiple-scattering table: sun zenith cosine by height.
+pub const MULTI_SCATTERING_SIZE: [usize; 2] = [32, 32];
+/// Sky-view table, made per frame: azimuth from the sun by zenith angle.
+pub const SKY_VIEW_SIZE: [usize; 2] = [192, 108];
+/// The planet radius the tables are laid out for. A height indexes them; the
+/// radius shapes only where the horizon falls in them, and the Earth's
+/// differ from this one by a few parts in a thousand.
+pub const LUT_RADIUS: f64 = 6_360_000.0;
+/// The sun's angular radius, in radians: half of 0.533°.
+pub const SUN_ANGULAR_RADIUS: f64 = 0.004_652;
+
+/// Steps of each ray of the multiple-scattering table, and its directions.
+const MULTI_SCATTERING_STEPS: usize = 20;
+const MULTI_SCATTERING_SQRT_DIRECTIONS: usize = 8;
+/// Steps of a transmittance ray, to the top of the air.
+const TRANSMITTANCE_STEPS: usize = 100;
+/// Steps of a sky ray, in [`LutAtmosphere::sky_radiance`] and the sky-view.
+pub const SKY_STEPS: usize = 30;
+/// Directions over which the sky's irradiance is summed.
+const IRRADIANCE_DIRECTIONS: usize = 1024;
+
+/// The physical atmosphere of one [`AtmosphereParams`], its two constant
+/// tables built.
+#[derive(Debug, Clone)]
+pub struct LutAtmosphere {
+    params: AtmosphereParams,
+    transmittance: Vec<[f64; 3]>,
+    multi_scattering: Vec<[f64; 3]>,
+}
+
+/// Bruneton's half-texel remap: a table's texel `i` holds the unit value
+/// `i / (n − 1)`, its first and last texels the ends of the range exactly.
+fn uv_from_unit(x: f64, n: usize) -> f64 {
+    0.5 / n as f64 + x * (1.0 - 1.0 / n as f64)
+}
+
+fn bilinear(table: &[[f64; 3]], size: [usize; 2], u: f64, v: f64) -> [f64; 3] {
+    let [w, h] = size;
+    let x = (u * w as f64 - 0.5).clamp(0.0, (w - 1) as f64);
+    let y = (v * h as f64 - 0.5).clamp(0.0, (h - 1) as f64);
+    let (x0, y0) = (x.floor() as usize, y.floor() as usize);
+    let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
+    let (fx, fy) = (x - x0 as f64, y - y0 as f64);
+    let at = |x: usize, y: usize| table[y * w + x];
+    let mut out = [0.0; 3];
+    for (c, o) in out.iter_mut().enumerate() {
+        let top = at(x0, y0)[c] * (1.0 - fx) + at(x1, y0)[c] * fx;
+        let bottom = at(x0, y1)[c] * (1.0 - fx) + at(x1, y1)[c] * fx;
+        *o = top * (1.0 - fy) + bottom * fy;
+    }
+    out
+}
+
+/// Where a ray from radius `r` at zenith cosine `mu` leaves a sphere of
+/// radius `radius`, if it meets it: the far crossing for a sphere around
+/// the point, the near one for a sphere under it.
+fn sphere_exit(r: f64, mu: f64, radius: f64) -> Option<f64> {
+    let disc = r * r * (mu * mu - 1.0) + radius * radius;
+    (disc >= 0.0).then(|| -r * mu + disc.sqrt())
+}
+
+fn ground_hit(r: f64, mu: f64, bottom: f64) -> Option<f64> {
+    let disc = r * r * (mu * mu - 1.0) + bottom * bottom;
+    if mu >= 0.0 || disc < 0.0 {
+        return None;
+    }
+    let t = -r * mu - disc.sqrt();
+    (t >= 0.0).then_some(t)
+}
+
+/// How much of the sun's disc stands over the horizon of radius `r`, the
+/// sun at zenith cosine `mu_s`: a smooth step across the disc's diameter, so
+/// that a sun setting dims over the minutes it takes rather than at once.
+pub fn sun_visible(r: f64, mu_s: f64) -> f64 {
+    let horizon = -(1.0 - (LUT_RADIUS / r).min(1.0).powi(2)).max(0.0).sqrt();
+    let over = mu_s.clamp(-1.0, 1.0).asin() - horizon.asin();
+    let x = ((over + SUN_ANGULAR_RADIUS) / (2.0 * SUN_ANGULAR_RADIUS)).clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
+}
+
+/// Rayleigh's phase function.
+pub fn rayleigh_phase(cos: f64) -> f64 {
+    3.0 / (16.0 * PI) * (1.0 + cos * cos)
+}
+
+/// Cornette and Shanks' phase function for aerosols of anisotropy `g`.
+pub fn mie_phase(cos: f64, g: f64) -> f64 {
+    let g2 = g * g;
+    3.0 / (8.0 * PI) * (1.0 - g2) * (1.0 + cos * cos)
+        / ((2.0 + g2) * (1.0 + g2 - 2.0 * g * cos).max(1e-6).powf(1.5))
+}
+
+/// The sky-view table's parametrisation (Hillaire 2020 §5.3), as
+/// `hillaire.wgsl`'s `sky_view_direction`: for unit coordinates across and
+/// down the table, seen from `height`, the cosine of the zenith angle and
+/// the cosine of the azimuth from the sun. Across, `1 − 2u²`; down, the
+/// horizon at the middle and the rows bunched towards it.
+pub fn sky_view_direction(unit: [f64; 2], height: f64) -> (f64, f64) {
+    let h = height.max(0.0);
+    let r = LUT_RADIUS + h;
+    let beta = ((h * (2.0 * LUT_RADIUS + h)).sqrt() / r)
+        .clamp(-1.0, 1.0)
+        .acos();
+    let zenith_horizon = PI - beta;
+    let theta = if unit[1] < 0.5 {
+        let k = 1.0 - 2.0 * unit[1];
+        zenith_horizon * (1.0 - k * k)
+    } else {
+        let k = 2.0 * unit[1] - 1.0;
+        zenith_horizon + beta * k * k
+    };
+    (theta.cos(), 1.0 - 2.0 * unit[0] * unit[0])
+}
+
+/// The direction the sky-view table's texel `(i, j)` holds, seen from
+/// `height`, in a frame whose `z` is up and whose `x` is towards the sun's
+/// azimuth.
+pub fn sky_view_texel_direction(i: usize, j: usize, height: f64) -> DVec3 {
+    let [w, h] = SKY_VIEW_SIZE;
+    let unit = [i as f64 / (w - 1) as f64, j as f64 / (h - 1) as f64];
+    let (mu, c) = sky_view_direction(unit, height);
+    let s = (1.0 - mu * mu).max(0.0).sqrt();
+    DVec3::new(s * c, s * (1.0 - c * c).max(0.0).sqrt(), mu)
+}
+
+/// The light of one ray through the air: what it gathers on the way and
+/// what it lets through.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ray {
+    pub inscattered: [f64; 3],
+    pub transmittance: [f64; 3],
+}
+
+impl LutAtmosphere {
+    /// `params`' atmosphere, its transmittance and multiple-scattering
+    /// tables computed.
+    pub fn new(params: AtmosphereParams) -> Self {
+        let mut atmosphere = Self {
+            params,
+            transmittance: Vec::new(),
+            multi_scattering: Vec::new(),
+        };
+        atmosphere.transmittance = atmosphere.build_transmittance();
+        atmosphere.multi_scattering = atmosphere.build_multi_scattering();
+        atmosphere
+    }
+
+    pub fn params(&self) -> &AtmosphereParams {
+        &self.params
+    }
+
+    fn top(&self) -> f64 {
+        LUT_RADIUS + self.params.thickness
+    }
+
+    /// The transmittance table, row by row (height), RGB.
+    pub fn transmittance_table(&self) -> &[[f64; 3]] {
+        &self.transmittance
+    }
+
+    /// The multiple-scattering table, row by row (height), RGB: Ψ, the
+    /// radiance every order past the first adds, per unit of scattering.
+    pub fn multi_scattering_table(&self) -> &[[f64; 3]] {
+        &self.multi_scattering
+    }
+
+    /// Bruneton's parametrisation of the transmittance table: unit
+    /// coordinates for radius `r` and zenith cosine `mu`.
+    fn transmittance_unit(&self, r: f64, mu: f64) -> (f64, f64) {
+        let (bottom, top) = (LUT_RADIUS, self.top());
+        let h = (top * top - bottom * bottom).sqrt();
+        let rho = (r * r - bottom * bottom).max(0.0).sqrt();
+        let d = sphere_exit(r, mu, top).unwrap_or(0.0).max(0.0);
+        let (d_min, d_max) = (top - r, rho + h);
+        (((d - d_min) / (d_max - d_min)).clamp(0.0, 1.0), rho / h)
+    }
+
+    fn transmittance_r_mu(&self, x_mu: f64, x_r: f64) -> (f64, f64) {
+        let (bottom, top) = (LUT_RADIUS, self.top());
+        let h = (top * top - bottom * bottom).sqrt();
+        let rho = h * x_r;
+        let r = (rho * rho + bottom * bottom).sqrt();
+        let (d_min, d_max) = (top - r, rho + h);
+        let d = d_min + x_mu * (d_max - d_min);
+        let mu = if d == 0.0 {
+            1.0
+        } else {
+            ((h * h - rho * rho - d * d) / (2.0 * r * d)).clamp(-1.0, 1.0)
+        };
+        (r, mu)
+    }
+
+    fn build_transmittance(&self) -> Vec<[f64; 3]> {
+        let [w, h] = TRANSMITTANCE_SIZE;
+        let mut table = Vec::with_capacity(w * h);
+        for j in 0..h {
+            for i in 0..w {
+                let (r, mu) =
+                    self.transmittance_r_mu(i as f64 / (w - 1) as f64, j as f64 / (h - 1) as f64);
+                let length = sphere_exit(r, mu, self.top()).unwrap_or(0.0).max(0.0);
+                // Steps spread quadratically: dense where the ray starts,
+                // which is where it is lowest unless it grazes, and a
+                // grazing ray's height changes slowly about its lowest
+                // point.
+                let n = TRANSMITTANCE_STEPS as f64;
+                let mut depth = [0.0; 3];
+                for s in 0..TRANSMITTANCE_STEPS {
+                    let s = s as f64;
+                    let t = length * ((s + 0.5) / n).powi(2);
+                    let dt = length * ((s + 1.0) * (s + 1.0) - s * s) / (n * n);
+                    let height = (r * r + t * t + 2.0 * r * mu * t).sqrt() - LUT_RADIUS;
+                    let e = self.params.medium(height).extinction;
+                    for c in 0..3 {
+                        depth[c] += e[c] * dt;
+                    }
+                }
+                table.push(depth.map(|d| (-d).exp()));
+            }
+        }
+        table
+    }
+
+    /// The share of light left along a ray from radius `r` at zenith
+    /// cosine `mu` to the top of the air, from the table. A ray that meets
+    /// the ground is read as the one that grazes it: what keeps the light
+    /// out is [`sun_visible`].
+    pub fn transmittance(&self, r: f64, mu: f64) -> [f64; 3] {
+        let (x_mu, x_r) = self.transmittance_unit(r, mu);
+        let [w, h] = TRANSMITTANCE_SIZE;
+        bilinear(
+            &self.transmittance,
+            TRANSMITTANCE_SIZE,
+            uv_from_unit(x_mu, w),
+            uv_from_unit(x_r, h),
+        )
+    }
+
+    /// The sun's light reaching radius `r`, the sun at zenith cosine `mu_s`:
+    /// the transmittance, the planet's shadow taken.
+    pub fn sunlight(&self, r: f64, mu_s: f64) -> [f64; 3] {
+        let v = sun_visible(r, mu_s);
+        self.transmittance(r, mu_s).map(|t| t * v)
+    }
+
+    /// Ψ at `height`, the sun at zenith cosine `mu_s`.
+    pub fn multi_scattering(&self, height: f64, mu_s: f64) -> [f64; 3] {
+        let [w, h] = MULTI_SCATTERING_SIZE;
+        let x = (mu_s * 0.5 + 0.5).clamp(0.0, 1.0);
+        let y = (height / self.params.thickness).clamp(0.0, 1.0);
+        bilinear(
+            &self.multi_scattering,
+            MULTI_SCATTERING_SIZE,
+            uv_from_unit(x, w),
+            uv_from_unit(y, h),
+        )
+    }
+
+    fn build_multi_scattering(&self) -> Vec<[f64; 3]> {
+        let [w, h] = MULTI_SCATTERING_SIZE;
+        let n = MULTI_SCATTERING_SQRT_DIRECTIONS;
+        let mut table = Vec::with_capacity(w * h);
+        for j in 0..h {
+            for i in 0..w {
+                let mu_s = 2.0 * (i as f64 / (w - 1) as f64) - 1.0;
+                let height = (j as f64 / (h - 1) as f64) * self.params.thickness;
+                let r = LUT_RADIUS + height.max(1.0);
+                let sun = DVec3::new((1.0 - mu_s * mu_s).max(0.0).sqrt(), 0.0, mu_s);
+                let (mut second, mut f_ms) = ([0.0; 3], [0.0; 3]);
+                for a in 0..n {
+                    for b in 0..n {
+                        let cos_theta = 1.0 - 2.0 * (a as f64 + 0.5) / n as f64;
+                        let sin_theta = (1.0 - cos_theta * cos_theta).max(0.0).sqrt();
+                        let phi = 2.0 * PI * (b as f64 + 0.5) / n as f64;
+                        let dir =
+                            DVec3::new(sin_theta * phi.cos(), sin_theta * phi.sin(), cos_theta);
+                        let (l, f) = self.multi_scattering_ray(r, dir, sun);
+                        for c in 0..3 {
+                            second[c] += l[c] / (n * n) as f64;
+                            f_ms[c] += f[c] / (n * n) as f64;
+                        }
+                    }
+                }
+                let mut psi = [0.0; 3];
+                for c in 0..3 {
+                    psi[c] = second[c] / (1.0 - f_ms[c]).max(1e-6);
+                }
+                table.push(psi);
+            }
+        }
+        table
+    }
+
+    /// One direction of a multiple-scattering texel: the light scattered
+    /// once towards the point, phase taken isotropic, and the share of light
+    /// scattered towards it at all — both before the `1/4π` of an isotropic
+    /// phase over the sphere's `4π`, which cancel.
+    fn multi_scattering_ray(&self, r: f64, dir: DVec3, sun: DVec3) -> ([f64; 3], [f64; 3]) {
+        let mu = dir.z;
+        let ground = ground_hit(r, mu, LUT_RADIUS);
+        let length = ground
+            .or_else(|| sphere_exit(r, mu, self.top()))
+            .unwrap_or(0.0);
+        let dt = length / MULTI_SCATTERING_STEPS as f64;
+        let origin = DVec3::new(0.0, 0.0, r);
+        let (mut l, mut f, mut through) = ([0.0; 3], [0.0; 3], [1.0; 3]);
+        let isotropic = 1.0 / (4.0 * PI);
+        for s in 0..MULTI_SCATTERING_STEPS {
+            let p = origin + dir * ((s as f64 + 0.5) * dt);
+            let pr = p.length();
+            let medium = self.params.medium(pr - LUT_RADIUS);
+            let sunlight = self.sunlight(pr, p.dot(sun) / pr);
+            for c in 0..3 {
+                let scattering = medium.rayleigh[c] + medium.mie;
+                let e = medium.extinction[c].max(1e-12);
+                let step = (-e * dt).exp();
+                let integral = (1.0 - step) / e;
+                l[c] += through[c] * scattering * sunlight[c] * isotropic * integral;
+                f[c] += through[c] * scattering * integral;
+                through[c] *= step;
+            }
+        }
+        if let Some(t) = ground {
+            let p = origin + dir * t;
+            let up = p.normalize();
+            let lit = self.sunlight(p.length(), up.dot(sun));
+            let cos = up.dot(sun).max(0.0);
+            for c in 0..3 {
+                l[c] += through[c] * lit[c] * cos * self.params.ground_albedo / PI;
+            }
+        }
+        (l, f)
+    }
+
+    /// A ray from `height` along `dir`, the sun along `sun` (both unit, in
+    /// a frame whose `z` is up at the start), for `length` metres or, if
+    /// `None`, to the ground or out of the air — the ground, met, lit by the
+    /// sun and sending its albedo's share back.
+    ///
+    /// `steps` samples, spread quadratically (denser near the start, where
+    /// a sky ray's air is) when `quadratic`, evenly otherwise, each step
+    /// integrated as Hillaire integrates it — the scattering over the step's
+    /// own extinction, which stays exact however long the step.
+    pub fn march(
+        &self,
+        height: f64,
+        dir: DVec3,
+        sun: DVec3,
+        length: Option<f64>,
+        steps: usize,
+        quadratic: bool,
+    ) -> Ray {
+        let r = LUT_RADIUS + height.max(0.0);
+        let mu = dir.z;
+        let ground = ground_hit(r, mu, LUT_RADIUS);
+        let to_end = ground
+            .or_else(|| sphere_exit(r, mu, self.top()))
+            .unwrap_or(0.0);
+        let (t_max, ends_on_ground) = match length {
+            Some(l) => (l.min(to_end.max(0.0)).max(0.0), false),
+            None => (to_end.max(0.0), ground.is_some()),
+        };
+        let cos = dir.dot(sun);
+        let (p_r, p_m) = (
+            rayleigh_phase(cos),
+            mie_phase(cos, self.params.mie_anisotropy),
+        );
+        let origin = DVec3::new(0.0, 0.0, r);
+        let (mut inscattered, mut through) = ([0.0; 3], [1.0; 3]);
+        let mut t_prev = 0.0;
+        for s in 0..steps {
+            let (t, t_next) = if quadratic {
+                let a = (s as f64 + 0.3) / steps as f64;
+                let b = (s as f64 + 1.0) / steps as f64;
+                (t_max * a * a, t_max * b * b)
+            } else {
+                (
+                    t_max * (s as f64 + 0.5) / steps as f64,
+                    t_max * (s as f64 + 1.0) / steps as f64,
+                )
+            };
+            let dt = t_next - t_prev;
+            t_prev = t_next;
+            let p = origin + dir * t;
+            let pr = p.length();
+            let h = pr - LUT_RADIUS;
+            let medium = self.params.medium(h);
+            let mu_s = p.dot(sun) / pr;
+            let sunlight = self.sunlight(pr, mu_s);
+            let multi = self.multi_scattering(h, mu_s);
+            for c in 0..3 {
+                let scattering = medium.rayleigh[c] + medium.mie;
+                let source = medium.rayleigh[c] * p_r * sunlight[c]
+                    + medium.mie * p_m * sunlight[c]
+                    + scattering * multi[c];
+                let e = medium.extinction[c].max(1e-12);
+                let step = (-e * dt).exp();
+                inscattered[c] += through[c] * source * (1.0 - step) / e;
+                through[c] *= step;
+            }
+        }
+        if ends_on_ground {
+            let p = origin + dir * t_max;
+            let up = p.normalize();
+            let mu_s = up.dot(sun);
+            let lit = self.sunlight(p.length(), mu_s);
+            for c in 0..3 {
+                inscattered[c] +=
+                    through[c] * lit[c] * mu_s.max(0.0) * self.params.ground_albedo / PI;
+            }
+        }
+        Ray {
+            inscattered,
+            transmittance: through,
+        }
+    }
+
+    /// The sky's radiance seen from `height` along `dir`, the sun along
+    /// `sun` (unit vectors, `z` up): what the sky-view table holds, without
+    /// the sun's disc.
+    pub fn sky_radiance(&self, height: f64, dir: DVec3, sun: DVec3) -> [f64; 3] {
+        self.march(height, dir, sun, None, SKY_STEPS, true)
+            .inscattered
+    }
+
+    /// The sky's irradiance at `height` on surfaces facing each of
+    /// `normals` (`z` up), the sun along `sun`: the radiance of every
+    /// direction, the ground's below the horizon included, summed over the
+    /// hemisphere each faces.
+    pub fn sky_irradiance(&self, height: f64, sun: DVec3, normals: &[DVec3]) -> Vec<[f64; 3]> {
+        let mut out = vec![[0.0; 3]; normals.len()];
+        let n = IRRADIANCE_DIRECTIONS;
+        let golden = PI * (3.0 - 5f64.sqrt());
+        let solid_angle = 4.0 * PI / n as f64;
+        for i in 0..n {
+            let z = 1.0 - 2.0 * (i as f64 + 0.5) / n as f64;
+            let ring = (1.0 - z * z).max(0.0).sqrt();
+            let phi = golden * i as f64;
+            let dir = DVec3::new(ring * phi.cos(), ring * phi.sin(), z);
+            let l = self.sky_radiance(height, dir, sun);
+            for (o, normal) in out.iter_mut().zip(normals) {
+                let cos = normal.dot(dir);
+                if cos > 0.0 {
+                    for c in 0..3 {
+                        o[c] += l[c] * cos * solid_angle;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// What one moment's sun and sky give the ground at `at`, the sun along
+    /// `to_sun_ecef`, in the renderer's units — those in which, under
+    /// `reference`'s air (a clear day's), a sun 45° up gives level ground
+    /// what `calibration` gives it. Imagery is a photograph taken by such a
+    /// light: under it the picture is the renderer's as it was, and at every
+    /// other hour it follows the physical ratio (`docs/18` §6).
+    pub fn light(
+        &self,
+        reference: &LutAtmosphere,
+        at: Geodetic,
+        to_sun_ecef: DVec3,
+        calibration: Calibration,
+        compensation_ev: f32,
+    ) -> SkyLight {
+        let height = at.height.max(0.0);
+        let r = LUT_RADIUS + height;
+        let enu: DMat3 = enu_frame(at);
+        let to_sun = to_sun_ecef.try_normalize().unwrap_or(enu.z_axis);
+        let sun = enu.transpose() * to_sun;
+        // Horizontal axes turned to the sun's azimuth: the sky is symmetric
+        // about the sun's vertical plane, so only `x` has a gradient.
+        let toward = DVec3::new(sun.x, sun.y, 0.0)
+            .try_normalize()
+            .unwrap_or(DVec3::X);
+        let aside = DVec3::Z.cross(toward);
+        let facings = [DVec3::Z, toward, -toward, aside, -aside];
+        let e = self.sky_irradiance(height, sun, &facings);
+        // L1: a + b·n, level ground exact, the walls' mean `a`.
+        let mut a = [0.0; 3];
+        let mut b = [[0.0; 3]; 3];
+        for c in 0..3 {
+            a[c] = (e[1][c] + e[2][c] + e[3][c] + e[4][c]) / 4.0;
+            b[0][c] = (e[1][c] - e[2][c]) / 2.0;
+            b[1][c] = (e[3][c] - e[4][c]) / 2.0;
+            b[2][c] = e[0][c] - a[c];
+        }
+        let transmitted = self.sunlight(r, sun.z);
+
+        // The reference: a sun 45° up through a clear day's air, here.
+        let up45 = std::f64::consts::FRAC_1_SQRT_2;
+        let reference_sun = reference.sunlight(r, up45);
+        let reference_sky =
+            reference.sky_irradiance(height, DVec3::new(up45, 0.0, up45), &[DVec3::Z])[0];
+        let mut scale = [0.0f64; 3];
+        let mut calibrated = [0.0f64; 3];
+        for c in 0..3 {
+            calibrated[c] = f64::from(calibration.sun[c]) * up45 + f64::from(calibration.sky[c]);
+            let physical = (reference_sun[c] * up45 + reference_sky[c]) / PI;
+            scale[c] = calibrated[c] / physical.max(1e-12);
+        }
+
+        // The air's own light against the imagery's ground: a texel of one
+        // is ground of this reflectance.
+        let air = f64::from(calibration.reflectance).max(1e-6);
+
+        let mut sun_rgb = [0.0f32; 3];
+        let mut sky_sh = [[0.0f32; 3]; 4];
+        let mut level = [0.0f64; 3];
+        let axes = [toward, aside, DVec3::Z].map(|axis| enu * axis);
+        for c in 0..3 {
+            sun_rgb[c] = (transmitted[c] / PI * scale[c]) as f32;
+            sky_sh[0][c] = (a[c] / PI * scale[c]) as f32;
+            // The gradient, from the local axes to ECEF ones.
+            let mut ecef = DVec3::ZERO;
+            for (k, axis) in axes.iter().enumerate() {
+                ecef += *axis * b[k][c];
+            }
+            let ecef = ecef / PI * scale[c];
+            sky_sh[1][c] = ecef.x as f32;
+            sky_sh[2][c] = ecef.y as f32;
+            sky_sh[3][c] = ecef.z as f32;
+            level[c] = transmitted[c] / PI * scale[c] * sun.z.max(0.0) + e[0][c] / PI * scale[c];
+        }
+
+        // The night floor: level ground never lit by less than this share of
+        // the reference's light. What is missing is added to the sky's light
+        // on the ground; the sky itself is raised to what dark ground shows
+        // under that light ([`NIGHT_SKY_ALBEDO`]) — raised by as much, a
+        // night sky under the camera's raised exposure would be brighter
+        // than noon's.
+        let night_floor = ReferenceIllumination::NIGHT_FLOOR;
+        let luminance = |v: [f64; 3]| 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
+        let (lit, wanted) = (luminance(level), luminance(calibrated));
+        let missing = (f64::from(night_floor) * wanted - lit).max(0.0);
+        let tint = NIGHT_TINT.map(f64::from);
+        let added = tint.map(|t| t * missing / luminance(tint));
+        let floor = added.map(|a| a * NIGHT_SKY_ALBEDO);
+        for c in 0..3 {
+            sky_sh[0][c] += added[c] as f32;
+            level[c] += added[c];
+        }
+        let ev100 = DAYLIGHT_EV100 + (luminance(level) / wanted).log2() as f32;
+        let white_lum = luminance(level) / wanted;
+        let mut white = [0.0f32; 3];
+        for c in 0..3 {
+            white[c] = (level[c] / calibrated[c].max(1e-12) / white_lum.max(1e-12)) as f32;
+        }
+
+        SkyLight {
+            illumination: ReferenceIllumination {
+                to_sun_ecef: to_sun,
+                sun_rgb,
+                sky_sh,
+                white,
+                adaptation: ReferenceIllumination::WHITE_ADAPTATION,
+                ev100,
+                compensation_ev,
+                night_floor,
+            },
+            illuminance: scale.map(|s| (s / air) as f32),
+            floor: floor.map(|f| (f / air) as f32),
+            frame: AtmosphereFrame::at(at),
+            height,
+        }
+    }
+}
+
+/// The colour of the light the night floor adds: a clear twilight's sky,
+/// blue — normalised to unit luminance where it is used.
+pub const NIGHT_TINT: [f32; 3] = [0.55, 0.7, 1.0];
+
+/// The night sky is as bright as ground of this albedo under the night
+/// floor's light: a clear moonlit night's, the sky about as dark as the
+/// ground.
+pub const NIGHT_SKY_ALBEDO: f64 = 0.1;
+
+/// The renderer's own lights — a dome's radiance and a sun's, as a white
+/// Lambert surface comes out under each — which a clear day's sun 45° up is
+/// brought to on level ground: [`LutAtmosphere::light`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Calibration {
+    pub sun: [f32; 3],
+    pub sky: [f32; 3],
+    /// The reflectance of real ground that a texel of one stands for: the
+    /// air's own light — the sky, what it scatters towards the eye, the
+    /// night floor's sky — is divided by it, so that the air stands to the
+    /// imagery as it stands to the ground it shows. The ground's light is
+    /// not: under the reference the imagery is lit as it always was.
+    pub reflectance: f32,
+}
+
+/// One moment's light, as [`LutAtmosphere::light`] works it out: the
+/// [`ReferenceIllumination`] a renderer is lit by, and what its sky and air
+/// passes need besides.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SkyLight {
+    pub illumination: ReferenceIllumination,
+    /// What a radiance of the model, per unit of the sun outside the air, is
+    /// in the renderer's units, RGB, set against the imagery's ground
+    /// ([`Calibration::reflectance`]): what the sky-view and the air between
+    /// eye and ground are scaled by.
+    pub illuminance: [f32; 3],
+    /// The radiance the night floor adds to the sky, in the renderer's
+    /// units: what ground of [`NIGHT_SKY_ALBEDO`] shows under the light the
+    /// floor adds. Far ground fades to it.
+    pub floor: [f32; 3],
+    /// The sphere the air is laid on, at the place the light was worked out.
+    pub frame: AtmosphereFrame,
+    /// The height the light was worked out at, over the ground, in metres.
+    pub height: f64,
+}
+
+#[cfg(test)]
+// Three channels, read and written side by side: an index says so best.
+#[allow(clippy::needless_range_loop)]
+mod tests {
+    use super::*;
+    use std::sync::OnceLock;
+
+    fn clear() -> &'static LutAtmosphere {
+        static CLEAR: OnceLock<LutAtmosphere> = OnceLock::new();
+        CLEAR.get_or_init(|| LutAtmosphere::new(AtmosphereParams::default()))
+    }
+
+    fn up_at(elevation_deg: f64) -> DVec3 {
+        let e = elevation_deg.to_radians();
+        DVec3::new(e.cos(), 0.0, e.sin())
+    }
+
+    #[test]
+    fn the_molecules_straight_up_are_a_tenth_deep_in_the_green() {
+        // Only the molecules: no aerosol, no ozone.
+        let params = AtmosphereParams {
+            ozone_absorption: [0.0; 3],
+            ..AtmosphereParams::default().with_turbidity(1.0)
+        };
+        let air = LutAtmosphere::new(params);
+        let depth = -air.transmittance(LUT_RADIUS, 1.0)[1].ln();
+        assert!((depth - 0.108).abs() < 0.005, "τ = {depth}");
+        // And through all the air, blue loses most.
+        let t = air.transmittance(LUT_RADIUS, 1.0);
+        assert!(t[0] > t[1] && t[1] > t[2], "{t:?}");
+    }
+
+    #[test]
+    fn the_table_holds_what_a_direct_march_finds() {
+        let air = clear();
+        for (h, mu) in [(0.0, 1.0), (1500.0, 0.3), (8000.0, 0.05), (300.0, -0.01)] {
+            let r = LUT_RADIUS + h;
+            let length = sphere_exit(r, mu, air.top()).unwrap();
+            let n = 4000;
+            let mut depth = [0.0; 3];
+            for s in 0..n {
+                let t = (s as f64 + 0.5) * length / n as f64;
+                let height = (r * r + t * t + 2.0 * r * mu * t).sqrt() - LUT_RADIUS;
+                let e = air.params().medium(height).extinction;
+                for c in 0..3 {
+                    depth[c] += e[c] * length / n as f64;
+                }
+            }
+            let table = air.transmittance(r, mu);
+            for c in 0..3 {
+                let direct = (-depth[c]).exp();
+                assert!(
+                    (table[c] - direct).abs() < 0.01 * direct.max(0.02),
+                    "{h} m, μ {mu}, channel {c}: {} against {direct}",
+                    table[c]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_zenith_sun_brings_a_clear_days_direct_light_to_sea_level() {
+        // 128 klx outside; about 100 klx measured at sea level under a
+        // clear sky, the sun overhead. (`docs/19` step 2 states it in W/m²,
+        // 850 to 1 050: broadband, water vapour's infrared absorption
+        // included, which three visible channels do not model.)
+        let t = clear().sunlight(LUT_RADIUS, 1.0);
+        let direct = 128_000.0 * (0.2126 * t[0] + 0.7152 * t[1] + 0.0722 * t[2]);
+        assert!((90_000.0..=112_000.0).contains(&direct), "{direct} lx");
+    }
+
+    #[test]
+    fn the_setting_sun_reddens_and_dims() {
+        let air = clear();
+        let mut last_ratio = 0.0;
+        for elevation in [90.0, 60.0, 30.0, 15.0, 5.0, 2.0] {
+            let t = air.sunlight(LUT_RADIUS + 500.0, up_at(elevation).z);
+            assert!(t[0] > t[1] && t[1] > t[2], "{elevation}°: {t:?}");
+            let ratio = t[0] / t[2];
+            assert!(ratio > last_ratio, "{elevation}°: R/B {ratio}");
+            last_ratio = ratio;
+        }
+        // Under the horizon by more than the disc, no sun at all.
+        assert_eq!(air.sunlight(LUT_RADIUS + 500.0, up_at(-1.0).z), [0.0; 3]);
+    }
+
+    #[test]
+    fn the_sky_is_blue_overhead_and_brighter_towards_the_sun() {
+        let air = clear();
+        let sun = up_at(40.0);
+        let zenith = air.sky_radiance(500.0, DVec3::Z, sun);
+        assert!(zenith[2] > zenith[1] && zenith[1] > zenith[0], "{zenith:?}");
+        let lum = |l: [f64; 3]| 0.2126 * l[0] + 0.7152 * l[1] + 0.0722 * l[2];
+        // At the sun's height, near it and opposite it.
+        let near = air.sky_radiance(500.0, up_at(35.0), sun);
+        let away = air.sky_radiance(500.0, DVec3::new(-up_at(35.0).x, 0.0, up_at(35.0).z), sun);
+        assert!(lum(near) > 2.0 * lum(away), "{near:?} against {away:?}");
+    }
+
+    #[test]
+    fn the_twilight_zenith_is_blue_because_of_ozone() {
+        let sun = up_at(-4.0);
+        let with = clear().sky_radiance(0.0, DVec3::Z, sun);
+        assert!(with[2] > with[0], "with ozone: {with:?}");
+        let without = LutAtmosphere::new(AtmosphereParams {
+            ozone_absorption: [0.0; 3],
+            ..AtmosphereParams::default()
+        })
+        .sky_radiance(0.0, DVec3::Z, sun);
+        // Without it, the blue falls back towards the red.
+        assert!(
+            without[2] / without[0] < with[2] / with[0],
+            "{without:?} against {with:?}"
+        );
+    }
+
+    #[test]
+    fn the_diffuse_share_of_daylight_grows_as_the_sun_sets() {
+        let air = clear();
+        let mut last = 0.0;
+        for elevation in [60.0, 40.0, 20.0, 10.0, 5.0] {
+            let sun = up_at(elevation);
+            let sky = air.sky_irradiance(300.0, sun, &[DVec3::Z])[0][1];
+            let direct = air.sunlight(LUT_RADIUS + 300.0, sun.z)[1] * sun.z;
+            let share = sky / (sky + direct);
+            if elevation == 60.0 {
+                assert!((0.08..=0.22).contains(&share), "60°: {share}");
+            }
+            assert!(share > last, "{elevation}°: {share}");
+            last = share;
+        }
+    }
+
+    #[test]
+    fn a_clear_skys_brightness_against_the_ground_is_what_is_measured() {
+        // Measured under clear skies, the sun about 50° up: the zenith at
+        // 3 to 7 kcd/m² while the sun's beam alone brings level ground 75 to
+        // 85 klx — a white Lambert surface under it at E/π, 24 to 27 kcd/m².
+        // The zenith is a tenth to three tenths of such ground; the horizon
+        // a side from the sun, by the CIE clear sky's gradation and
+        // indicatrix, about one and a half times the zenith. Against the
+        // beam alone, not the whole daylight: a sky drawn too bright would
+        // brighten its own share of the daylight too, and hide in it.
+        let air = clear();
+        let sun = up_at(50.0);
+        let lum = |l: [f64; 3]| 0.2126 * l[0] + 0.7152 * l[1] + 0.0722 * l[2];
+        let white = lum(air.sunlight(LUT_RADIUS, sun.z)) * sun.z / PI;
+        let zenith = lum(air.sky_radiance(0.0, DVec3::Z, sun)) / white;
+        assert!((0.1..=0.3).contains(&zenith), "zenith at {zenith} of white");
+        // Just over the horizon, square to the sun.
+        let side = DVec3::new(0.0, 3f64.to_radians().cos(), 3f64.to_radians().sin());
+        let horizon = lum(air.sky_radiance(0.0, side, sun)) / white;
+        let gradation = horizon / zenith;
+        assert!(
+            (1.0..=3.0).contains(&gradation),
+            "horizon at {gradation} of the zenith"
+        );
+    }
+
+    /// The renderer's own lights, as `tuile_film::Look::default` has them.
+    const CALIBRATION: Calibration = Calibration {
+        sun: [2.5, 2.45, 2.3],
+        sky: [0.72, 0.76, 0.8],
+        reflectance: 1.0,
+    };
+
+    fn lit(elevation: f64, at_height: f64) -> SkyLight {
+        let at = Geodetic {
+            lon: 0.5f64.to_radians(),
+            lat: 43.0f64.to_radians(),
+            height: at_height,
+        };
+        // The sun at `elevation`, due south.
+        let enu = enu_frame(at);
+        let e = elevation.to_radians();
+        let to_sun = enu * DVec3::new(0.0, -e.cos(), e.sin());
+        clear().light(clear(), at, to_sun, CALIBRATION, 0.0)
+    }
+
+    fn level(light: &SkyLight, up: DVec3) -> [f64; 3] {
+        let i = &light.illumination;
+        let sun = i.to_sun_ecef.dot(up).max(0.0);
+        let mut out = [0.0; 3];
+        for c in 0..3 {
+            out[c] = f64::from(i.sun_rgb[c]) * sun
+                + f64::from(i.sky_sh[0][c])
+                + f64::from(i.sky_sh[1][c]) * up.x
+                + f64::from(i.sky_sh[2][c]) * up.y
+                + f64::from(i.sky_sh[3][c]) * up.z;
+        }
+        out
+    }
+
+    fn luminance(v: [f64; 3]) -> f64 {
+        0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2]
+    }
+
+    fn up_ecef() -> DVec3 {
+        enu_frame(Geodetic {
+            lon: 0.5f64.to_radians(),
+            lat: 43.0f64.to_radians(),
+            height: 0.0,
+        })
+        .z_axis
+    }
+
+    #[test]
+    fn under_the_reference_day_level_ground_is_lit_as_the_calibration_says() {
+        for height in [0.0, 1_500.0] {
+            let light = lit(45.0, height);
+            let got = level(&light, up_ecef());
+            let half = std::f64::consts::FRAC_1_SQRT_2;
+            for c in 0..3 {
+                let wanted = f64::from(CALIBRATION.sun[c]) * half + f64::from(CALIBRATION.sky[c]);
+                assert!(
+                    (got[c] - wanted).abs() < 1e-4 * wanted,
+                    "{height} m, channel {c}: {} against {wanted}",
+                    got[c]
+                );
+            }
+            let i = light.illumination;
+            assert!((i.ev100 - DAYLIGHT_EV100).abs() < 1e-4, "{}", i.ev100);
+            assert!(
+                i.white.iter().all(|w| (w - 1.0).abs() < 1e-4),
+                "{:?}",
+                i.white
+            );
+            assert_eq!(light.floor, [0.0; 3]);
+            assert!(i.exposure_offset_ev().abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn the_air_is_set_against_the_ground_the_imagery_stands_for() {
+        // Imagery whose texel of one is ground four times as bright: the
+        // air's light a quarter of what it is against a white texel, the
+        // ground's light unchanged — night floor included.
+        for elevation in [45.0, -18.0] {
+            let at = Geodetic {
+                lon: 0.5f64.to_radians(),
+                lat: 43.0f64.to_radians(),
+                height: 500.0,
+            };
+            let e = f64::to_radians(elevation);
+            let to_sun = enu_frame(at) * DVec3::new(0.0, -e.cos(), e.sin());
+            let white = clear().light(clear(), at, to_sun, CALIBRATION, 0.0);
+            let dark = Calibration {
+                reflectance: 4.0,
+                ..CALIBRATION
+            };
+            let imagery = clear().light(clear(), at, to_sun, dark, 0.0);
+            assert_eq!(imagery.illumination, white.illumination);
+            for c in 0..3 {
+                assert!((imagery.illuminance[c] * 4.0 - white.illuminance[c]).abs() < 1e-6);
+                assert!((imagery.floor[c] * 4.0 - white.floor[c]).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn the_light_falls_and_warms_as_the_sun_sets_and_never_below_the_floor() {
+        let mut last_ev = f32::INFINITY;
+        let mut last_warmth = 0.0;
+        for elevation in [60.0, 45.0, 20.0, 5.0, 0.0, -2.0, -6.0, -18.0, -60.0] {
+            let light = lit(elevation, 500.0);
+            let i = light.illumination;
+            assert!(i.ev100 <= last_ev + 1e-4, "{elevation}°: EV {}", i.ev100);
+            last_ev = i.ev100;
+            let got = luminance(level(&light, up_ecef()));
+            let reference = luminance(level(&lit(45.0, 500.0), up_ecef()));
+            assert!(
+                got >= f64::from(ReferenceIllumination::NIGHT_FLOOR) * reference * 0.999,
+                "{elevation}°: {got} against {reference}"
+            );
+            // On the picture, after the camera's exposure: darker than noon
+            // under the sun's dimming, never under a third of it.
+            let shown = got / reference * f64::from(i.exposure_offset_ev()).exp2();
+            assert!(
+                shown > 0.3,
+                "{elevation}°: shown at {shown} of the reference"
+            );
+            if elevation > 0.0 {
+                let warmth = f64::from(i.white[0] / i.white[2]);
+                assert!(warmth >= last_warmth, "{elevation}°: R/B {warmth}");
+                last_warmth = warmth;
+            }
+        }
+        assert!(lit(-18.0, 500.0).floor.iter().all(|f| *f > 0.0));
+        assert!(lit(5.0, 500.0).illumination.sun_rgb[0] > lit(5.0, 500.0).illumination.sun_rgb[2]);
+    }
+
+    #[test]
+    fn the_light_moves_smoothly_through_sunset() {
+        let mut last: Option<SkyLight> = None;
+        for step in 0..=40 {
+            let elevation = 2.0 - 0.1 * f64::from(step);
+            let light = lit(elevation, 500.0);
+            if let Some(last) = last {
+                let (a, b) = (last.illumination, light.illumination);
+                assert!(
+                    (a.ev100 - b.ev100).abs() < 0.25,
+                    "{elevation}°: {} to {}",
+                    a.ev100,
+                    b.ev100
+                );
+                for c in 0..3 {
+                    assert!(
+                        (a.sun_rgb[c] - b.sun_rgb[c]).abs() < 0.08,
+                        "{elevation}°: the sun {:?} to {:?}",
+                        a.sun_rgb,
+                        b.sun_rgb
+                    );
+                    assert!((a.white[c] - b.white[c]).abs() < 0.05);
+                }
+            }
+            last = Some(light);
+        }
+    }
+
+    #[test]
+    fn the_sky_view_parametrisation_turns_back_on_itself() {
+        for height in [0.0, 2_000.0, 10_000.0] {
+            for (x, y) in [
+                (0.0f64, 0.0f64),
+                (0.3, 0.2),
+                (0.7, 0.49),
+                (0.5, 0.51),
+                (1.0, 0.9),
+                (0.2, 1.0),
+            ] {
+                let (mu, c) = sky_view_direction([x, y], height);
+                let h = height;
+                let r = LUT_RADIUS + h;
+                let beta = ((h * (2.0 * LUT_RADIUS + h)).sqrt() / r).acos();
+                let zh = PI - beta;
+                let theta = mu.clamp(-1.0, 1.0).acos();
+                let back_y = if theta < zh {
+                    0.5 * (1.0 - (1.0 - theta / zh).max(0.0).sqrt())
+                } else {
+                    0.5 + 0.5 * ((theta - zh) / beta).max(0.0).sqrt()
+                };
+                let back_x = (0.5 - 0.5 * c).clamp(0.0, 1.0).sqrt();
+                assert!(
+                    (back_x - x).abs() < 1e-9 && (back_y - y).abs() < 1e-6,
+                    "{x},{y} at {h}"
+                );
+            }
+        }
+    }
+}

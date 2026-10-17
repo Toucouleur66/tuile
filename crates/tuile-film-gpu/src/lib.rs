@@ -25,6 +25,12 @@
 //! the eye, in closed form in the resolve, and a sky that runs from the
 //! horizon's colour to the zenith's in `present`.
 //!
+//! **The physical atmosphere** ([`tuile_film::Look::atmosphere`],
+//! Hillaire 2020): the frame's light worked out from the air, once a frame;
+//! a sky-view table made in compute and read by `present` for the sky; and,
+//! in the resolve, a short march of the air between the eye and each
+//! pixel's ground over the transmittance and multiple-scattering tables.
+//!
 //! A frame may also carry a host's **overlays** ([`tuile_film::OverlayMesh`]):
 //! coloured triangles placed in the world, lit when they have normals. They
 //! are the one thing rastered besides visibility — after it, into a target
@@ -46,6 +52,7 @@
 //! The device is the caller's. A browser hands in a WebGPU device, a binary a
 //! headless one; this crate never creates either.
 
+mod atmosphere;
 mod frame;
 
 use std::collections::HashMap;
@@ -56,6 +63,7 @@ use tuile_film::{
 };
 use wgpu::util::DeviceExt;
 
+pub use atmosphere::AtmosphereUniform;
 pub use frame::{shadow_reach, FrameUniform, SunView, TileFrame};
 
 /// How many tiles may be resident at once. Fixed because the scan that bins
@@ -355,6 +363,13 @@ pub struct FilmGpu {
     /// Drapes to be kept from one of their levels down: the whole one, the
     /// one kept, the first level kept.
     pending_tails: Vec<(wgpu::Texture, wgpu::Texture, u32)>,
+    /// The light the frame being drawn was given ([`Self::set_light`]),
+    /// and the look it makes of the ordered one: what the frame is drawn
+    /// with. The ordered look itself, in `settings`, is never changed.
+    light: FrameLight,
+    lit: Look,
+    /// The physical atmosphere's tables, uniform and sky-view.
+    atmosphere: atmosphere::AtmosphereGpu,
 }
 
 /// One imagery tile of a drape and where it lies on the terrain tile.
@@ -665,6 +680,26 @@ impl FilmGpu {
             label: Some("film slot"),
             entries: &[uniform(0, compute_only, true)],
         });
+        let atmosphere_bgl = atmosphere::layout(&device);
+        let present_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("film present"),
+            entries: &[
+                uniform(0, compute_only, false),
+                texture(1, wgpu::TextureSampleType::Float { filterable: false }),
+                texture(2, wgpu::TextureSampleType::Uint),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: compute_only,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: OUTPUT_FORMAT,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                texture(4, wgpu::TextureSampleType::Float { filterable: false }),
+            ],
+        });
 
         let raster_module = shader(&device, "film raster", include_str!("shaders/raster.wgsl"));
         let raster = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -930,7 +965,10 @@ impl FilmGpu {
         let resolve_module = shader(
             &device,
             "film resolve",
-            concat!(
+            &format!(
+                "{}{}{}{}{}",
+                atmosphere::declarations(3),
+                tuile_atmosphere::hillaire::WGSL,
                 include_str!("shaders/air.wgsl"),
                 include_str!("shaders/sunlit.wgsl"),
                 include_str!("shaders/resolve.wgsl")
@@ -938,17 +976,30 @@ impl FilmGpu {
         );
         let resolve_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("film resolve"),
-            bind_group_layouts: &[Some(&resolve_bgl), Some(&tile_bgl), Some(&slot_bgl)],
+            bind_group_layouts: &[
+                Some(&resolve_bgl),
+                Some(&tile_bgl),
+                Some(&slot_bgl),
+                Some(&atmosphere_bgl),
+            ],
             immediate_size: 0,
         });
         let present_module = shader(
             &device,
             "film present",
-            concat!(
+            &format!(
+                "{}{}{}{}",
+                atmosphere::declarations(1),
+                tuile_atmosphere::hillaire::WGSL,
                 include_str!("shaders/air.wgsl"),
                 include_str!("shaders/present.wgsl")
             ),
         );
+        let present_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("film present"),
+            bind_group_layouts: &[Some(&present_bgl), Some(&atmosphere_bgl)],
+            immediate_size: 0,
+        });
         let mips_module = shader(&device, "film mips", include_str!("shaders/mips.wgsl"));
         let compose_module = shader(
             &device,
@@ -965,7 +1016,7 @@ impl FilmGpu {
             scan: compute(&device, &bin, "scan", None),
             scatter: compute(&device, &bin, "scatter", None),
             resolve: compute(&device, &resolve_module, "resolve", Some(&resolve_layout)),
-            present: compute(&device, &present_module, "present", None),
+            present: compute(&device, &present_module, "present", Some(&present_layout)),
             mips: compute(&device, &mips_module, "downsample", None),
             compose: compute(&device, &compose_module, "compose", None),
             y_plane: compute(&device, &i420_module, "y_plane", None),
@@ -1143,7 +1194,17 @@ impl FilmGpu {
             &shadow_sampler,
         );
 
+        let atmosphere = atmosphere::AtmosphereGpu::new(&device, &atmosphere_bgl);
+        queue.write_buffer(
+            &atmosphere.uniform,
+            0,
+            bytemuck::bytes_of(&AtmosphereUniform::zeroed_off()),
+        );
+
         Self {
+            light: FrameLight::of(&settings.look),
+            lit: settings.look,
+            atmosphere,
             device,
             queue,
             settings,
@@ -1434,8 +1495,29 @@ impl FilmGpu {
     /// Lights what is drawn from now on by `light`: the sun's place and
     /// strength and the dome, the rest of the look unchanged. The sun's map
     /// is fitted afresh for every picture, so the shadows follow it.
+    ///
+    /// Each frame's light is laid over the look as it was ordered, never
+    /// over the last frame's: an exposure or a white balance does not
+    /// accumulate from frame to frame. Under a physical atmosphere
+    /// ([`Look::atmosphere`]) the light is worked out from the air when the
+    /// frame is drawn, and of `light` only the sun's direction, the
+    /// compensation and the air are heard.
     pub fn set_light(&mut self, light: FrameLight) {
-        self.settings.look = self.settings.look.lit_by(light);
+        self.light = light;
+        self.lit = self.settings.look.lit_by(light);
+    }
+
+    /// The sky-view table of the frame last drawn under a physical
+    /// atmosphere: `Rgba16Float`, `tuile_atmosphere::hillaire::SKY_VIEW_SIZE`,
+    /// in the model's units.
+    pub fn sky_view_texture(&self) -> &wgpu::Texture {
+        &self.atmosphere.sky_view
+    }
+
+    /// The look the frame last drawn was drawn with: the ordered one under
+    /// the frame's light.
+    pub fn lit(&self) -> &Look {
+        &self.lit
     }
 
     /// How fine the shadows of the frame last recorded are: the metres of
@@ -2000,9 +2082,9 @@ impl FilmGpu {
         }
         let k = self.settings.supersample.max(1);
         let size = [self.settings.width * k, self.settings.height * k, k, 0];
-        let rays = FrameUniform::new(camera, &self.settings.look, size).bounding_rays();
+        let rays = FrameUniform::new(camera, &self.lit, size).bounding_rays();
         Ok(SunView::fitted(
-            self.settings.look.to_sun,
+            self.lit.to_sun,
             camera.eye,
             spheres.into_iter(),
             &rays,
@@ -2036,6 +2118,9 @@ impl FilmGpu {
         overlays: &[OverlayMesh],
     ) -> Result<wgpu::CommandEncoder, FilmGpuError> {
         let camera = &shot.camera;
+        // The frame's light, from the air, before anything reads the sun:
+        // worked out once from the frame's own camera, so both eyes share it.
+        self.light_frame(&shot.frame, selection)?;
         // The sun's view, fitted to the frame's own camera and placed for
         // this one: the same map, ground for ground, in either eye.
         let sun = self
@@ -2045,7 +2130,7 @@ impl FilmGpu {
                 view.view_proj *= glam::Mat4::from_translation(apart);
                 (view, side)
             });
-        let to_sun = self.settings.look.to_sun.normalize_or_zero();
+        let to_sun = self.lit.to_sun.normalize_or_zero();
         // Everything of the overlays that can fail does before anything is
         // recorded: one vertex buffer for the frame, eye-relative — each
         // origin meets the eye in f64, and only the difference is narrowed.
@@ -2158,6 +2243,7 @@ impl FilmGpu {
                 label: Some("film frame"),
             });
         self.record_pending(&mut encoder);
+        self.atmosphere.record_sky_view(&mut encoder);
         let mut drawn = Vec::with_capacity(selection.len());
         let mut top = 0usize;
         for key in selection {
@@ -2176,10 +2262,9 @@ impl FilmGpu {
         }
         let k = self.settings.supersample.max(1);
         let (w, h) = (self.settings.width * k, self.settings.height * k);
-        let mut uniform =
-            FrameUniform::new(camera, &self.settings.look, [w, h, k, u32::from(overlaid)]);
+        let mut uniform = FrameUniform::new(camera, &self.lit, [w, h, k, u32::from(overlaid)]);
         if let Some((view, side)) = &sun {
-            uniform = uniform.shadowed(view, self.settings.look.shadow, *side);
+            uniform = uniform.shadowed(view, self.lit.shadow, *side);
         }
         uniform.zenith[3] = self.normal_strength;
         uniform.horizon[3] = f32::from(u8::from(self.wire));
@@ -2187,7 +2272,7 @@ impl FilmGpu {
             // Up at the eye and its distance from the Earth's centre, as a
             // look with air sets them: the probe needs both with no air.
             uniform.local_up[3] = 1.0;
-            if self.settings.look.haze.is_none() {
+            if uniform.haze[3] == 0.0 {
                 let up = camera.eye.normalize().as_vec3();
                 uniform.local_up = [up.x, up.y, up.z, 1.0];
                 uniform.haze[2] = (0.5 / camera.eye.length()) as f32;
@@ -2196,6 +2281,12 @@ impl FilmGpu {
         self.shadow_texel = sun.as_ref().map(|(view, _)| view.texel);
         self.queue
             .write_buffer(&self.frame_buf, 0, bytemuck::bytes_of(&uniform));
+        // The air's sphere, placed for this picture's eye.
+        if let Some(light) = &self.atmosphere.light {
+            let placed = self.atmosphere.frame_uniform.seen_from(light, camera.eye);
+            self.queue
+                .write_buffer(&self.atmosphere.uniform, 0, bytemuck::bytes_of(&placed));
+        }
         if top > 0 {
             self.queue
                 .write_buffer(&self.tiles_buf, 0, bytemuck::cast_slice(&self.tiles[..top]));
@@ -2340,6 +2431,7 @@ impl FilmGpu {
 
             pass.set_pipeline(&self.pipelines.resolve);
             pass.set_bind_group(0, &self.targets.resolve_bg, &[]);
+            pass.set_bind_group(3, &self.atmosphere.bind, &[]);
             for r in &drawn {
                 pass.set_bind_group(1, &r.bind, &[]);
                 pass.set_bind_group(2, &self.slot_bg, &[r.slot * SLOT_STRIDE as u32]);
@@ -2348,6 +2440,7 @@ impl FilmGpu {
 
             pass.set_pipeline(&self.pipelines.present);
             pass.set_bind_group(0, &self.targets.present_bg, &[]);
+            pass.set_bind_group(1, &self.atmosphere.bind, &[]);
             pass.dispatch_workgroups(
                 self.settings.width.div_ceil(8),
                 self.settings.height.div_ceil(8),
@@ -2355,6 +2448,117 @@ impl FilmGpu {
             );
         }
         Ok(encoder)
+    }
+
+    /// The frame's light under a physical atmosphere, worked out from the
+    /// air for the frame whose camera is `frame` — once a frame: a second
+    /// picture of it (the other eye) finds it made. Without an atmosphere,
+    /// the light [`Self::set_light`] was given.
+    fn light_frame(
+        &mut self,
+        frame: &FrameCamera,
+        selection: &[TileKey],
+    ) -> Result<(), FilmGpuError> {
+        let base = self.settings.look;
+        let Some(params) = base.atmosphere else {
+            if self.atmosphere.light.take().is_some() {
+                self.queue.write_buffer(
+                    &self.atmosphere.uniform,
+                    0,
+                    bytemuck::bytes_of(&AtmosphereUniform::zeroed_off()),
+                );
+            }
+            return Ok(());
+        };
+        let light = self.light;
+        // The frame's air: the host's turbidity or the look's, and the
+        // host's haze density as the aerosols' extinction.
+        let mut params = params;
+        if let Some(t) = light.air.turbidity.or(base.turbidity) {
+            params = params.with_turbidity(f64::from(t));
+        }
+        if let Some(density) = light.air.haze_density {
+            params = params.with_mie_extinction(f64::from(density));
+        }
+        let to_sun = light
+            .illumination
+            .to_sun_ecef
+            .try_normalize()
+            .unwrap_or(base.to_sun.as_dvec3());
+        let ground = self.ground_under(frame.eye, selection)?;
+        let key = atmosphere::LightKey {
+            params,
+            frame_eye: frame.eye,
+            ground: ground.to_array(),
+            to_sun,
+            compensation_ev: light.illumination.compensation_ev,
+        };
+        if self.atmosphere.key == Some(key) {
+            return Ok(());
+        }
+        self.atmosphere.hold(&self.queue, params);
+        let geodetic = tuile_core::geo::ecef_to_geodetic(ground);
+        let model = self.atmosphere.model.as_ref().expect("held above");
+        let reference = self.atmosphere.reference.as_ref().expect("held above");
+        let sky = model.light(
+            reference,
+            geodetic,
+            to_sun,
+            tuile_atmosphere::Calibration {
+                sun: base.sun.to_array(),
+                sky: base.world.to_array(),
+                reflectance: base.reflectance,
+            },
+            light.illumination.compensation_ev,
+        );
+        self.lit = base.lit_by(FrameLight {
+            illumination: sky.illumination,
+            air: light.air,
+        });
+        self.atmosphere.frame_uniform = AtmosphereUniform::new(&params, &sky, frame.eye);
+        // Written now for the sky-view, placed from each eye when drawn.
+        self.queue.write_buffer(
+            &self.atmosphere.uniform,
+            0,
+            bytemuck::bytes_of(&self.atmosphere.frame_uniform.seen_from(&sky, frame.eye)),
+        );
+        self.atmosphere.light = Some(sky);
+        self.atmosphere.key = Some(key);
+        self.atmosphere.sky_view_stale = true;
+        Ok(())
+    }
+
+    /// The ground the frame's light is worked out at (ECEF): under the eye,
+    /// at the height of the finest tiles drawn — those nearest the camera —
+    /// and never over the eye. At sea level when nothing is drawn.
+    fn ground_under(&self, eye: DVec3, selection: &[TileKey]) -> Result<DVec3, FilmGpuError> {
+        let mut finest = f32::INFINITY;
+        for key in selection {
+            let r = self
+                .resident
+                .get(key)
+                .ok_or(FilmGpuError::NotResident(*key))?;
+            if r.index_count > 0 {
+                finest = finest.min(r.radius);
+            }
+        }
+        let (mut sum, mut n) = (0.0, 0u32);
+        for key in selection {
+            let r = &self.resident[key];
+            if r.index_count > 0 && r.radius <= 2.0 * finest {
+                let centre = DVec3::from_array(r.origin_ecef) + r.centre.as_dvec3();
+                sum += tuile_core::geo::ecef_to_geodetic(centre).height;
+                n += 1;
+            }
+        }
+        let at = tuile_core::geo::ecef_to_geodetic(eye);
+        let height = if n > 0 { sum / f64::from(n) } else { 0.0 };
+        Ok(tuile_core::geo::geodetic_to_ecef(
+            tuile_core::geo::Geodetic {
+                height: height.clamp(0.0, at.height.max(0.0)),
+                ..at
+            },
+        ))
     }
 
     fn record_mips(

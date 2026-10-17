@@ -111,17 +111,22 @@ impl Default for SkyShell {
 impl SkyShell {
     /// For tiles rebased onto `render_origin`, lit by `sun`.
     pub fn new(render_origin: DVec3, sun: &Sun, strength: f32) -> Self {
-        let centre = -render_origin;
+        // The sphere osculating the ellipsoid under the render origin, as
+        // `AerialPerspective` lays its air: never the equatorial radius
+        // about the Earth's centre (`docs/19` §2, step 0).
+        let frame =
+            crate::params::AtmosphereFrame::at(tuile_core::geo::ecef_to_geodetic(render_origin));
+        let centre = frame.centre - render_origin;
         let travel = sun.light_travel_direction();
         Self {
             earth: [
                 centre.x as f32,
                 centre.y as f32,
                 centre.z as f32,
-                WGS84_A as f32,
+                frame.radius as f32,
             ],
             shell: [
-                WGS84_A as f32 + ATMOSPHERE_THICKNESS,
+                frame.radius as f32 + ATMOSPHERE_THICKNESS,
                 RAYLEIGH_SCALE_HEIGHT,
                 MIE_SCATTERING,
                 strength,
