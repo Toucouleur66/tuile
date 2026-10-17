@@ -102,17 +102,6 @@ extern "C" {
     ) -> Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>;
 }
 
-thread_local! {
-    /// Blocks this scope took from the network, and from the browser's
-    /// cache storage: what says whether a block was read twice.
-    static BLOCKS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
-}
-
-/// `(from the network, from what the browser kept)`, for this page or worker.
-pub fn blocks_read() -> (u64, u64) {
-    BLOCKS.with(std::cell::Cell::get)
-}
-
 async fn read(response: wasm_bindgen::JsValue) -> Result<Got, String> {
     let status = number(&response, "status") as u16;
     let size = call(&get(&response, "headers"), "get", &["x-object-size".into()])
@@ -159,15 +148,6 @@ impl FetchGet {
         if path.contains(&format!("/{}/", tuile_repository::block_segment())) {
             let (name, value) = header.unzip();
             let answer = tuile_block(&url, &key, name, value).await.map_err(text)?;
-            let kept = get(&answer, "1").as_bool().unwrap_or(false);
-            BLOCKS.with(|b| {
-                let (network, held) = b.get();
-                b.set(if kept {
-                    (network, held + 1)
-                } else {
-                    (network + 1, held)
-                });
-            });
             return read(get(&answer, "0")).await;
         }
         once(&url, header.as_ref(), None).await
@@ -291,18 +271,6 @@ impl Store {
             live,
             blocks,
         })
-    }
-
-    /// One of the store's small files, whole — or `None` if the store has
-    /// no such file. A failure to ask is a failure, not an absence: a
-    /// renderer that took the one for the other would draw without what it
-    /// was meant to draw with, and say nothing.
-    pub async fn small(&self, key: &str) -> Result<Option<Vec<u8>>, RepoError> {
-        match self.live.read_all(key).await {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(RepoError::NotFound(_)) => Ok(None),
-            Err(other) => Err(other),
-        }
     }
 
     /// The store's small files, as objects: what
