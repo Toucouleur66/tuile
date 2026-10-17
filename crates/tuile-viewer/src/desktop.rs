@@ -5,10 +5,12 @@
 //! and a script's questions and commands — show a message when there is no
 //! terminal to print it in, and put a line of text on the clipboard.
 //!
-//! The rest of the viewer sees three plain functions. The implementation that
-//! talks to an operating system is the private `system` module, compiled on
-//! macOS with the `application` feature; everywhere else nothing ever arrives,
-//! the message goes to stderr and the clipboard declines.
+//! The rest of the viewer sees plain functions. The implementation that talks
+//! to an operating system is the private `system` module, compiled on macOS
+//! and iOS with the `application` feature; in a browser the same services are
+//! the page's, through the web shell — messages and the view become events for
+//! the host's script; everywhere else nothing ever arrives, the message goes
+//! to stderr and the clipboard declines.
 //!
 //! **Exercised by hand only**, like the location service: nothing here can be
 //! called from a test without a window server and a person. What a URL
@@ -18,6 +20,7 @@
 
 use std::sync::mpsc::Receiver;
 
+use crate::snapshot::Snapshot;
 use crate::steer::Request;
 
 /// Starts listening for steering and returns where it will arrive.
@@ -68,6 +71,26 @@ pub(crate) fn copy(text: &str) -> bool {
 /// asks for it — "go to copied link" — and only looked at as a steering URL.
 pub(crate) fn paste() -> Option<String> {
     system::paste()
+}
+
+/// Tells whoever embeds the viewer — a page — that the window draws, and
+/// through which graphics backend; or that it never will, and why. An
+/// application that is the whole window has nobody to tell, here and in the
+/// two below: it says a failure in its own words, through an alert.
+pub(crate) fn drawing(outcome: Result<&str, &str>) {
+    system::drawing(outcome);
+}
+
+/// Tells the embedder whether the loading indicator is up, every frame, and
+/// how far the launch has got when that is known.
+pub(crate) fn loading(shown: bool, progress: Option<f32>) {
+    system::loading(shown, progress);
+}
+
+/// Tells the embedder the view, whenever the title line changes: a few times
+/// a second at most while the eye moves.
+pub(crate) fn view(snapshot: &Snapshot) {
+    system::view(snapshot);
 }
 
 /// Puts a request on the queue the render loop drains: the one way anything
@@ -128,6 +151,12 @@ mod system {
             }
         }
     }
+
+    pub(super) fn drawing(_outcome: Result<&str, &str>) {}
+
+    pub(super) fn loading(_shown: bool, _progress: Option<f32>) {}
+
+    pub(super) fn view(_snapshot: &crate::snapshot::Snapshot) {}
 
     define_class!(
         // SAFETY: `NSObject` has no subclassing requirements, and the class
@@ -528,11 +557,26 @@ mod system {
     }
 
     pub(super) fn send(_request: Request) {}
+
+    pub(super) fn drawing(_outcome: Result<&str, &str>) {}
+
+    pub(super) fn loading(_shown: bool, _progress: Option<f32>) {}
+
+    pub(super) fn view(_snapshot: &crate::snapshot::Snapshot) {}
+}
+
+/// A page: everything goes to the host's script through the web shell.
+#[cfg(target_arch = "wasm32")]
+mod system {
+    pub(super) use crate::web::system::{
+        alert, caption, copy, drawing, listen, loading, paste, send, try_alert, view,
+    };
 }
 
 #[cfg(not(any(
     all(target_os = "macos", feature = "application"),
-    all(target_os = "ios", feature = "application")
+    all(target_os = "ios", feature = "application"),
+    target_arch = "wasm32"
 )))]
 mod system {
     use std::sync::mpsc::{channel, Receiver};
@@ -564,4 +608,10 @@ mod system {
     }
 
     pub(super) fn send(_request: Request) {}
+
+    pub(super) fn drawing(_outcome: Result<&str, &str>) {}
+
+    pub(super) fn loading(_shown: bool, _progress: Option<f32>) {}
+
+    pub(super) fn view(_snapshot: &crate::snapshot::Snapshot) {}
 }

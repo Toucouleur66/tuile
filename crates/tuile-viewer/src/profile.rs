@@ -16,6 +16,11 @@
 //! one pool of memory between the CPU and the GPU, and the system ends an
 //! application that takes too much of it without asking — so the budgets
 //! are a share of what the process may still take, not a constant.
+//!
+//! [`Profile::browser`] is a page: the desktop's numbers or the phone's, cut
+//! to what a tab may hold — the worker that keeps the residency is a wasm32
+//! heap, four gibibytes at the very most — drawn on demand, and paused while
+//! the tab is hidden.
 
 use std::time::Duration;
 
@@ -108,6 +113,12 @@ pub(crate) struct Profile {
     /// Whether the surface and its render targets are let go of while the
     /// application is in the background.
     pub release_surface_in_background: bool,
+    /// Whether loads are held, and residency trimmed, while the view is not
+    /// on screen: a phone in the background, a hidden browser tab.
+    pub pause_loads_when_hidden: bool,
+    /// Whether the window is the application's own, which Escape closes and
+    /// a missing GPU ends — never a page's canvas, which belongs to the page.
+    pub owns_its_window: bool,
     /// Whether the counters are served on a local HTTP endpoint.
     pub metrics_endpoint: bool,
     /// Whether a damaged tile store is cleared and started afresh — a phone,
@@ -136,10 +147,14 @@ impl Profile {
                 time: None,
             },
             store_memory_bytes: 256 * MIB,
-            store_disk_bytes: 4096 * MIB,
+            // Saturating, as the core's own four gibibytes are: on a 32-bit target
+            // (a page's wasm) the number does not fit, and is never used there.
+            store_disk_bytes: 4096usize.saturating_mul(MIB),
             hold_window_until_warm: true,
             render_on_demand: false,
             release_surface_in_background: false,
+            pause_loads_when_hidden: false,
+            owns_its_window: true,
             metrics_endpoint: true,
             clear_damaged_store: false,
         }
@@ -176,12 +191,69 @@ impl Profile {
             hold_window_until_warm: false,
             render_on_demand: true,
             release_surface_in_background: true,
+            pause_loads_when_hidden: true,
+            owns_its_window: true,
             metrics_endpoint: false,
             clear_damaged_store: true,
         }
     }
 
-    /// The profile for this build's platform and this device.
+    /// A page in a browser: a desktop's or a phone's, by `handheld`, with
+    /// `memory_gib` the device's memory as the browser reports it.
+    ///
+    /// The residency is held by the worker, whose heap is wasm32: four
+    /// gibibytes at the very most and in practice half that before a tab is
+    /// killed, so the desktop's budget does not fit and is cut. There is no
+    /// tile store yet, no runtime of threads, no counters' endpoint; decoding
+    /// runs in the worker, which has one thread. The pinned level is the one
+    /// the backdrop draws — 85 tiles, not the desktop's 682 — because a page
+    /// opens on its indicator at once rather than holding a window shut.
+    #[cfg(any(target_arch = "wasm32", test))]
+    pub(crate) fn browser(handheld: bool, memory_gib: Option<f64>) -> Self {
+        const GIB: f64 = (1u64 << 30) as f64;
+        let base = if handheld {
+            let physical = memory_gib.unwrap_or(4.0).max(1.0) * GIB;
+            Self::handheld(
+                DeviceMemory {
+                    physical: physical as u64,
+                    available: None,
+                },
+                1,
+            )
+        } else {
+            Self::desktop()
+        };
+        let ceiling = if handheld { 384 * MIB } else { 768 * MIB };
+        let resident = base.resident_budget_bytes.min(ceiling);
+        Self {
+            resident_budget_bytes: resident,
+            resident_tile_limit: (resident / (256 * 1024)).max(1024),
+            simultaneous_fetches: if handheld { 16 } else { 32 },
+            pinned_level: crate::backdrop::BASE_LEVEL,
+            runtime_workers: 1,
+            blocking_threads: 1,
+            decode_threads: 1,
+            // Uploads run on the page's one thread, between its frames: a
+            // share of the frame's time on every device, not only a phone.
+            uploads: UploadBudget {
+                tiles: base.uploads.tiles,
+                time: Some(Duration::from_millis(if handheld { 6 } else { 8 })),
+            },
+            store_memory_bytes: 0,
+            store_disk_bytes: 0,
+            hold_window_until_warm: false,
+            render_on_demand: true,
+            release_surface_in_background: false,
+            pause_loads_when_hidden: true,
+            owns_its_window: false,
+            metrics_endpoint: false,
+            clear_damaged_store: false,
+        }
+    }
+
+    /// The profile for this build's platform and this device. A page's is
+    /// [`Profile::browser`], chosen by the page.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn current() -> Self {
         if cfg!(target_os = "ios") {
             let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
@@ -254,6 +326,7 @@ mod tests {
             reference.maximum_simultaneous_fetches
         );
         assert!(p.hold_window_until_warm && !p.render_on_demand);
+        assert!(p.owns_its_window && !p.pause_loads_when_hidden);
         assert_eq!(p.uploads.tiles, tuile_wgpu::UPLOADS_PER_FRAME);
         assert_eq!(p.frame_interval(Thermal::Critical, true), Duration::ZERO);
     }
@@ -291,6 +364,7 @@ mod tests {
             assert!(p.decode_threads >= 1);
             assert!(!p.hold_window_until_warm && p.render_on_demand);
             assert!(p.release_surface_in_background && !p.metrics_endpoint);
+            assert!(p.pause_loads_when_hidden && p.owns_its_window);
         }
     }
 
@@ -307,6 +381,30 @@ mod tests {
         );
         assert_eq!(p.pinned_level, crate::backdrop::BASE_LEVEL);
         assert_eq!(p.decode_threads, 1);
+    }
+
+    /// A page fits a wasm32 heap, opens at once on its indicator, draws on
+    /// demand, pauses when hidden, keeps its surface and never quits on a key.
+    #[test]
+    fn a_browser_fits_a_tab_and_belongs_to_its_page() {
+        let desktop = Profile::browser(false, Some(16.0));
+        let phone = Profile::browser(true, Some(4.0));
+        for p in [&desktop, &phone] {
+            assert!(p.resident_budget_bytes <= 768 * MIB);
+            assert!(p.resident_tile_limit >= 1024);
+            assert_eq!(p.pinned_level, crate::backdrop::BASE_LEVEL);
+            assert!(!p.hold_window_until_warm && p.render_on_demand);
+            assert!(p.pause_loads_when_hidden && !p.release_surface_in_background);
+            assert!(!p.owns_its_window && !p.metrics_endpoint);
+            assert_eq!((p.store_memory_bytes, p.store_disk_bytes), (0, 0));
+            assert!(p.uploads.time.is_some());
+        }
+        assert!(phone.resident_budget_bytes < desktop.resident_budget_bytes);
+        assert!(phone.resident_budget_bytes <= 384 * MIB);
+        assert!(phone.simultaneous_fetches < desktop.simultaneous_fetches);
+        // A browser that does not say how much memory there is gets a phone
+        // of four gibibytes, not nothing.
+        assert!(Profile::browser(true, None).resident_budget_bytes >= 160 * MIB);
     }
 
     /// A trim never asks for more than the budget, and the background asks

@@ -85,6 +85,7 @@ pub(crate) fn note(what: &str) {
 
 /// Marks the start of a session, and makes a panic leave its line before the
 /// process goes.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn open() {
     note(&format!("started, version {}", env!("CARGO_PKG_VERSION")));
     let previous = std::panic::take_hook();

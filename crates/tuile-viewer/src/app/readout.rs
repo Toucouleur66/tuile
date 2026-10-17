@@ -4,19 +4,20 @@
 //! The menu-bar readout, where there is a menu bar.
 //!
 //! A desktop shows where the eye is in a status item beside the clock. A phone
-//! has no menu bar and the crates behind the item do not build for it, so
-//! there the readout is a type with the same three calls that never exists:
+//! and a page have no menu bar and the crates behind the item do not build
+//! for them, so there the readout is a type with the same three calls that
+//! never exists:
 //! [`StatusBar::new`] answers `None`, exactly as it does on a desktop that
 //! declines the item, and every caller already handles that.
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_arch = "wasm32")))]
 pub(super) use tuile_ui::StatusBar;
 
 /// No menu bar, so no readout.
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_arch = "wasm32"))]
 pub(super) struct StatusBar;
 
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_arch = "wasm32"))]
 impl StatusBar {
     pub(super) fn new() -> Option<Self> {
         None

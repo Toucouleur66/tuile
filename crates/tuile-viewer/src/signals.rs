@@ -22,7 +22,8 @@ pub static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// signals a person actually sends have to reach the normal exit path — where
 /// the tape gets closed. `SIGKILL` cannot be caught by anyone, and neither can
 /// a segfault or the power going out: the journal beside the MCAP file is
-/// what covers those.
+/// what covers those. A browser sends none of them.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn catch_interruptions() {
     if let Err(e) = ctrlc::set_handler(|| {
         INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);

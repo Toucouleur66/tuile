@@ -12,10 +12,12 @@
 //! All of it is cheap enough to ask once a second from the frame loop: a
 //! property read on the process object and one system call.
 
-use crate::profile::{DeviceMemory, Thermal};
+use crate::profile::Thermal;
 
-/// The device's memory, and what is left to this process.
-pub(crate) fn memory() -> DeviceMemory {
+/// The device's memory, and what is left to this process. A page is told
+/// its device's memory by the browser instead.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn memory() -> crate::profile::DeviceMemory {
     system::memory()
 }
 
@@ -74,10 +76,11 @@ mod system {
 
 #[cfg(not(all(target_os = "ios", feature = "application")))]
 mod system {
-    use crate::profile::{DeviceMemory, Thermal};
+    use crate::profile::Thermal;
 
-    pub(super) fn memory() -> DeviceMemory {
-        DeviceMemory {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn memory() -> crate::profile::DeviceMemory {
+        crate::profile::DeviceMemory {
             // Unused off a phone, where the profile is not sized from memory.
             physical: 8 << 30,
             available: None,

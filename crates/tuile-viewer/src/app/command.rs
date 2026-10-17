@@ -39,7 +39,22 @@ impl App {
     pub(super) fn apply(&mut self, command: Command) {
         match command {
             Command::Goto(goto) => {
-                steer::go(&mut self.controller, goto);
+                match goto.seconds.filter(|s| *s > 0.0) {
+                    Some(seconds) => {
+                        let from = steer::view_of(self.controller.target());
+                        let to = steer::destination(&self.controller, goto);
+                        self.flight = Some(super::flight::Flight::new(
+                            from,
+                            to,
+                            web_time::Instant::now(),
+                            seconds,
+                        ));
+                    }
+                    None => {
+                        self.flight = None;
+                        steer::go(&mut self.controller, goto);
+                    }
+                }
                 // A place somebody named is not a secret.
                 self.located = false;
             }
@@ -206,6 +221,7 @@ impl App {
                 caption = format!("{caption} — {waiting}");
             }
             crate::desktop::caption(&caption);
+            crate::desktop::view(snapshot);
             self.title_shown = title;
         }
     }

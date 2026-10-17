@@ -129,7 +129,9 @@ impl Identity {
         Some(self.support_dir()?.join("token"))
     }
 
-    /// Where the tile store lives on disk.
+    /// Where the tile store lives on disk. A browser has no disk to keep one
+    /// on.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn caches_dir(&self) -> PathBuf {
         tuile_storage_foyer::default_cache_dir().join(&self.store)
     }
@@ -149,6 +151,7 @@ pub(crate) fn identity() -> &'static Identity {
 
 /// Fixes the process's identity and its layers. Once: the first host wins,
 /// and there is one.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn adopt(identity: Identity, layers: Vec<ImageryChoice>) {
     let _ = IDENTITY.set(identity);
     let _ = LAYERS.set(layers);

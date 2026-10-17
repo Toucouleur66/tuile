@@ -11,17 +11,16 @@
 //! own namespace, and the decode work moved off the server's thread.
 
 use std::collections::HashMap;
-use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
+use tuile_core::offload::Offload;
 use tuile_core::raster::{CachedImagery, ImageryProvider};
 use tuile_core::source::{TileLoader, TileTree};
 use tuile_core::storage::ContentStore;
 use tuile_planetary::{
     globe_on, GlobeOptions, Held, ImageryDetail, LayerBudget, Sources, SwitchableImagery,
 };
-use tuile_storage_foyer::SuspendableStore as FoyerStore;
-use tuile_terrain::{CachedTerrain, TerrainHeights, TerrainSource};
+use tuile_terrain::{CachedTerrain, TerrainSource};
 
 use crate::embed::{ImageryChoice, TerrainChoice};
 
@@ -30,13 +29,13 @@ pub(crate) struct Globe {
     pub tree: Box<dyn TileTree>,
     pub loader: Arc<dyn TileLoader>,
     pub detail: ImageryDetail,
-    pub heights: Arc<TerrainHeights>,
-    /// Kept so it can be flushed on the way out: a store that is merely
-    /// dropped leaves the disk as cold as it found it.
-    pub store: Option<Arc<FoyerStore>>,
+    /// The relief the camera stands on. A page records its own from the
+    /// content it is sent, on the other side of the worker.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub heights: Arc<tuile_terrain::TerrainHeights>,
     pub budget: LayerBudget,
-    /// The handle the window changes imagery through.
-    pub switcher: Switcher,
+    /// What a change of imagery is resolved against.
+    pub layers: Layers,
 }
 
 /// How a switch of imagery that was asked for ended.
@@ -49,63 +48,51 @@ pub(crate) struct Switched {
     pub asked: web_time::Instant,
 }
 
-/// Changes the imagery a running globe drapes.
-///
-/// Asking is one call that returns at once: resolving a layer is a round trip
-/// or two to the host's service, and the window must not wait on it. The
-/// resolution runs on the session's async runtime and the answer is collected
-/// by the render loop ([`Switcher::poll`]) — the same shape as the location
-/// request, for the same reason.
+/// What changing the imagery of a running globe is resolved against: the
+/// host's sources, the store, the switch the globe was built over, and the
+/// layers already resolved.
 ///
 /// Nothing here takes anything off the screen. A resolved layer is handed to
 /// the [`SwitchableImagery`] the globe was built over, and the engine does the
 /// rest: every tile keeps the old picture until its new drape is resident.
 /// A layer that cannot be resolved changes nothing at all.
-pub(crate) struct Switcher {
+///
+/// Resolving is a round trip or two to the host's service, so it is never
+/// done on the window's thread: each shell runs [`Layers::switch_to`] where it
+/// runs its other network work — the desktop's runtime, the browser's worker.
+#[derive(Clone)]
+pub(crate) struct Layers {
     sources: Arc<dyn Sources>,
-    store: Option<Arc<FoyerStore>>,
+    store: Option<Arc<dyn ContentStore>>,
     switch: SwitchableImagery,
-    runtime: tokio::runtime::Handle,
     /// Layers already resolved, so that going back to one costs nothing — and
     /// does not open a second session with a service that counts them.
     resolved: Arc<Mutex<HashMap<usize, Arc<dyn ImageryProvider>>>>,
-    done: (Sender<Switched>, Receiver<Switched>),
 }
 
-impl Switcher {
-    /// Starts the switch to `layers[layer]`.
-    pub(crate) fn ask(&self, layer: usize, choice: &ImageryChoice) {
-        let asked = web_time::Instant::now();
-        let (sources, store) = (Arc::clone(&self.sources), self.store.clone());
-        let (switch, resolved) = (self.switch.clone(), Arc::clone(&self.resolved));
-        let (done, choice) = (self.done.0.clone(), choice.clone());
-        self.runtime.spawn(async move {
-            let known = resolved.lock().ok().and_then(|r| r.get(&layer).cloned());
-            let provider = match known {
-                Some(provider) => Ok(provider),
-                None => imagery(sources.as_ref(), &choice, store.as_ref())
-                    .await
-                    .map_err(|e| e.to_string()),
-            };
-            let outcome = provider.map(|provider| {
-                if let Ok(mut resolved) = resolved.lock() {
-                    resolved.insert(layer, Arc::clone(&provider));
-                }
-                switch.switch_to(provider)
-            });
-            // A closed channel means the window is gone, and with it the
-            // point of saying how it went.
-            let _ = done.send(Switched {
-                layer,
-                outcome,
-                asked,
-            });
-        });
-    }
-
-    /// The outcome of a switch that has finished resolving, if one has.
-    pub(crate) fn poll(&self) -> Option<Switched> {
-        self.done.1.try_recv().ok()
+impl Layers {
+    /// Drapes `choice`, the host's layer `layer`. Returns the imagery
+    /// generation now being draped, or why it could not be.
+    pub(crate) async fn switch_to(
+        &self,
+        layer: usize,
+        choice: &ImageryChoice,
+    ) -> Result<u64, String> {
+        let known = self
+            .resolved
+            .lock()
+            .ok()
+            .and_then(|r| r.get(&layer).cloned());
+        let provider = match known {
+            Some(provider) => provider,
+            None => imagery(self.sources.as_ref(), choice, self.store.as_ref())
+                .await
+                .map_err(|e| e.to_string())?,
+        };
+        if let Ok(mut resolved) = self.resolved.lock() {
+            resolved.insert(layer, Arc::clone(&provider));
+        }
+        Ok(self.switch.switch_to(provider))
     }
 }
 
@@ -118,7 +105,7 @@ impl Switcher {
 pub(crate) async fn imagery(
     sources: &dyn Sources,
     choice: &ImageryChoice,
-    store: Option<&Arc<FoyerStore>>,
+    store: Option<&Arc<dyn ContentStore>>,
 ) -> anyhow::Result<Arc<dyn ImageryProvider>> {
     let provider = sources
         .imagery(choice.asset)
@@ -127,91 +114,11 @@ pub(crate) async fn imagery(
     Ok(match store {
         Some(store) => Arc::new(CachedImagery::new(
             Held(provider),
-            Arc::clone(store) as Arc<dyn ContentStore>,
+            Arc::clone(store),
             choice.cache.clone(),
         )),
         None => provider,
     })
-}
-
-/// Resolves the host's terrain and its opening imagery layer and crosses them.
-/// The tile store an application keeps between runs, or `None` with a line
-/// saying so.
-///
-/// One store, several callers: the terrain source and each imagery layer keep
-/// their own bytes in it, keyed by tile rather than by URL. The server evicts
-/// decoded tiles to stay inside its GPU budget, and this is what makes coming
-/// back to them cheap. A store that fails to open is not worth failing the
-/// application over.
-pub(crate) async fn open_the_store(
-    name: &str,
-    memory_bytes: usize,
-    disk_bytes: usize,
-    clear_when_damaged: bool,
-) -> Option<Arc<FoyerStore>> {
-    open_the_store_at(
-        &tuile_storage_foyer::default_cache_dir().join(name),
-        memory_bytes,
-        disk_bytes,
-        clear_when_damaged,
-    )
-    .await
-}
-
-/// Whether a store that would not open is to be cleared and opened afresh.
-///
-/// Only when the platform allows it — a phone, whose system purges caches and
-/// may leave half of one behind — and only when the failure is damage. Never
-/// over a passing condition: another process holding the files, the process
-/// out of descriptors, a full disk. Clearing then would throw away gigabytes
-/// of good cache for nothing, and the next run would start cold.
-pub(crate) fn clear_the_store(
-    clear_when_damaged: bool,
-    error: &tuile_storage_foyer::StoreError,
-) -> bool {
-    clear_when_damaged && !error.is_transient()
-}
-
-/// [`open_the_store`], in `dir`. Without a store the session still runs; every
-/// tile is fetched again.
-pub(crate) async fn open_the_store_at(
-    dir: &std::path::Path,
-    memory_bytes: usize,
-    disk_bytes: usize,
-    clear_when_damaged: bool,
-) -> Option<Arc<FoyerStore>> {
-    let config = || tuile_storage_foyer::StoreConfig {
-        memory_bytes,
-        disk_bytes,
-        ..tuile_storage_foyer::StoreConfig::at(dir)
-    };
-    let first = match FoyerStore::open(config()).await {
-        Ok(store) => {
-            tracing::info!(dir = %dir.display(), "tile store open");
-            return Some(Arc::new(store));
-        }
-        Err(e) => e,
-    };
-    if !clear_the_store(clear_when_damaged, &first) {
-        tracing::warn!("no tile store ({first}); every tile will be re-fetched");
-        return None;
-    }
-    tracing::warn!("the tile store is damaged ({first}); starting it afresh");
-    let cleared = if dir.is_dir() {
-        std::fs::remove_dir_all(dir)
-    } else {
-        std::fs::remove_file(dir)
-    };
-    if let Err(e) = cleared {
-        tracing::warn!("could not clear {} ({e})", dir.display());
-    }
-    match FoyerStore::open(config()).await {
-        Ok(store) => Some(Arc::new(store)),
-        Err(e) => {
-            tracing::warn!("no tile store ({e}); every tile will be re-fetched");
-            None
-        }
-    }
 }
 
 /// How deep the quadtree divides when the host offers several layers.
@@ -225,15 +132,18 @@ pub(crate) async fn open_the_store_at(
 const DEPTH_FOR_ANY_LAYER: u32 = 21;
 
 /// Resolves the host's terrain and its opening imagery layer and crosses them.
+///
+/// `store` keeps tiles between runs where the shell has one; `decode` is where
+/// decoding and resampling run — a pool of threads on a desktop, inline in a
+/// browser's worker, which has one thread.
 pub(crate) async fn assemble(
     sources: Arc<dyn Sources>,
-    store: Option<Arc<FoyerStore>>,
+    store: Option<Arc<dyn ContentStore>>,
     terrain: &TerrainChoice,
     layers: &[ImageryChoice],
     opening: usize,
-    decode_threads: usize,
+    decode: Arc<dyn Offload>,
 ) -> anyhow::Result<Globe> {
-    let runtime = tokio::runtime::Handle::current();
     let opening_layer = layers
         .get(opening)
         .ok_or_else(|| anyhow::anyhow!("the host offers no imagery layer"))?;
@@ -246,7 +156,7 @@ pub(crate) async fn assemble(
     let ground: Arc<dyn TerrainSource> = match &store {
         Some(store) => Arc::new(CachedTerrain::new(
             Held(ground),
-            Arc::clone(store) as Arc<dyn ContentStore>,
+            Arc::clone(store),
             terrain.cache.clone(),
         )),
         None => ground,
@@ -258,15 +168,6 @@ pub(crate) async fn assemble(
     // then be changed under a running session, and the engine refreshes each
     // tile behind the old picture. See `tuile_planetary::SwitchableImagery`.
     let switch = SwitchableImagery::new(Arc::clone(&picture));
-
-    // Decoding and resampling go to their own threads. Left on the server's
-    // thread they run one at a time no matter how many loads are in flight —
-    // measured at sixty-four outstanding and a single core busy.
-    // As many as the profile allows: every core on a desktop, a few on a
-    // phone, where the window and the runtime need theirs.
-    let decode: Arc<dyn tuile_core::offload::Offload> = Arc::new(
-        tuile_core::offload::ThreadPool::with_threads(decode_threads),
-    );
 
     // How many imagery layers a drape may carry is the renderer's answer, and
     // the renderer does not exist yet — the window comes after the stream. The
@@ -284,21 +185,22 @@ pub(crate) async fn assemble(
     };
     let (tree, loader, detail, heights) =
         globe_on(Held(ground), switch.clone(), layer, opts, decode);
+    // The worker's relief stays in the worker: the page keeps its own.
+    #[cfg(target_arch = "wasm32")]
+    drop(heights);
     Ok(Globe {
         tree,
         loader,
         detail,
+        #[cfg(not(target_arch = "wasm32"))]
         heights,
         budget,
-        switcher: Switcher {
+        layers: Layers {
             sources: sources_kept,
-            store: store.clone(),
+            store,
             switch,
-            runtime,
             resolved: Arc::new(Mutex::new(HashMap::from([(opening, picture)]))),
-            done: channel(),
         },
-        store,
     })
 }
 
@@ -337,26 +239,22 @@ mod tests {
     #[test]
     fn the_globe_asks_the_hosts_sources_for_the_hosts_assets() {
         let asked = Arc::new(Asked::default());
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("a runtime");
         let terrain = TerrainChoice {
             asset: 41,
             cache: "t".into(),
         };
         let layer = ImageryChoice::new("survey", "Survey", 77, "© someone");
         let layers = [layer.clone()];
-        let refused = runtime
-            .block_on(assemble(
-                Arc::clone(&asked) as Arc<dyn Sources>,
-                None,
-                &terrain,
-                &layers,
-                0,
-                1,
-            ))
-            .err()
-            .expect("there is no terrain");
+        let refused = futures_executor::block_on(assemble(
+            Arc::clone(&asked) as Arc<dyn Sources>,
+            None,
+            &terrain,
+            &layers,
+            0,
+            Arc::new(tuile_core::offload::Inline),
+        ))
+        .err()
+        .expect("there is no terrain");
         assert_eq!(refused.to_string(), "terrain: no terrain here");
         assert_eq!(*asked.0.lock().expect("asked"), ["terrain 41"]);
 
@@ -368,45 +266,5 @@ mod tests {
             *asked.0.lock().expect("asked"),
             ["terrain 41", "imagery 77"]
         );
-    }
-
-    /// A store directory the system half-purged, or a crash left unreadable,
-    /// is started afresh rather than costing the session its store — here,
-    /// the worst case: a plain file where the directory should be.
-    #[test]
-    fn a_damaged_store_is_started_afresh() {
-        let dir = tempfile::tempdir().expect("a temporary directory");
-        let path = dir.path().join("tiles");
-        std::fs::write(&path, b"not a store").expect("a file in the way");
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .expect("a runtime");
-        // Where the platform does not allow it — a desktop — nothing is
-        // cleared: the file is still there, and the session runs without.
-        assert!(runtime
-            .block_on(open_the_store_at(&path, 1 << 20, 64 << 20, false))
-            .is_none());
-        assert!(path.is_file(), "a desktop's store was cleared");
-        let store = runtime.block_on(open_the_store_at(&path, 1 << 20, 64 << 20, true));
-        assert!(store.is_some(), "the store was given up on");
-        assert!(path.is_dir());
-        if let Some(store) = store {
-            runtime.block_on(store.close()).expect("closed");
-        }
-    }
-
-    /// A passing condition never clears a store, wherever it runs; damage
-    /// clears it only where the platform allows.
-    #[test]
-    fn a_store_is_cleared_only_for_damage_and_only_where_allowed() {
-        use std::io::{Error, ErrorKind};
-        let busy = tuile_storage_foyer::StoreError::from(Error::from_raw_os_error(24));
-        let damaged = tuile_storage_foyer::StoreError::from(Error::from(ErrorKind::InvalidData));
-        assert!(!clear_the_store(true, &busy));
-        assert!(!clear_the_store(false, &busy));
-        assert!(!clear_the_store(false, &damaged));
-        assert!(clear_the_store(true, &damaged));
     }
 }

@@ -133,6 +133,7 @@ impl StartView {
 /// The view the last session started from an icon ended on, if it left one
 /// and it still reads as a view. Anything else — no file, an edited file, a
 /// value out of bounds — is no view, and the default stands.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn remembered(host: &dyn crate::host::Host) -> Option<StartView> {
     let file = crate::host::last_view_file(host)?;
     let text = host.read(&file).ok()?;
@@ -149,6 +150,7 @@ pub(crate) fn remembered(host: &dyn crate::host::Host) -> Option<StartView> {
 }
 
 /// What the command line asked for.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Invocation {
     /// Open the window on this view — and, with `here`, move it over the
@@ -174,6 +176,8 @@ struct Flag {
     unit: &'static str,
     min: f64,
     max: f64,
+    /// The command line's: a page is given its view as numbers.
+    #[cfg(not(target_arch = "wasm32"))]
     field: fn(&mut StartView) -> &mut f64,
 }
 
@@ -195,6 +199,7 @@ const FLAGS: [Flag; 5] = [
         unit: "degrees",
         min: -180.0,
         max: 180.0,
+        #[cfg(not(target_arch = "wasm32"))]
         field: |v| &mut v.lon,
     },
     Flag {
@@ -202,6 +207,7 @@ const FLAGS: [Flag; 5] = [
         unit: "degrees",
         min: -90.0,
         max: 90.0,
+        #[cfg(not(target_arch = "wasm32"))]
         field: |v| &mut v.lat,
     },
     Flag {
@@ -209,6 +215,7 @@ const FLAGS: [Flag; 5] = [
         unit: "metres",
         min: 1.0,
         max: 1.0e8,
+        #[cfg(not(target_arch = "wasm32"))]
         field: |v| &mut v.altitude,
     },
     Flag {
@@ -216,6 +223,7 @@ const FLAGS: [Flag; 5] = [
         unit: "degrees",
         min: -360.0,
         max: 360.0,
+        #[cfg(not(target_arch = "wasm32"))]
         field: |v| &mut v.heading,
     },
     Flag {
@@ -223,6 +231,7 @@ const FLAGS: [Flag; 5] = [
         unit: "degrees",
         min: 0.0,
         max: 90.0,
+        #[cfg(not(target_arch = "wasm32"))]
         field: |v| &mut v.pitch,
     },
 ];
@@ -294,6 +303,7 @@ pub(crate) fn value(name: &str, text: &str) -> Result<f64, String> {
 ///
 /// A value is whatever follows its flag, taken unconditionally — `--lon -2.86`
 /// is a western longitude, not a flag called `-2.86`.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn parse<I, S>(args: I) -> Result<Invocation, String>
 where
     I: IntoIterator<Item = S>,
