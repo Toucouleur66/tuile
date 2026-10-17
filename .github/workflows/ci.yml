@@ -50,7 +50,27 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --target wasm32-unknown-unknown -p tuile-core
+      # Every crate that claims wasm, not only the core. `tuile-web` is
+      # entirely gated on wasm32, so no native build ever compiled it: it
+      # stopped building in August and nothing said so until October.
+      # `-D warnings` because a warning only seen on wasm is seen by nobody.
+      - name: cargo check (wasm32, -D warnings)
+        env:
+          RUSTFLAGS: -D warnings
+        run: >-
+          cargo check --target wasm32-unknown-unknown
+          -p tuile-core
+          -p tuile-web
+          -p tuile-wgpu
+          -p tuile-planetary
+          -p tuile-terrain
+          -p tuile-camera
+          -p tuile-atmosphere
+          -p tuile-film-web
+          -p tuile-ui
+          -p tuile-wasm-globe
+          -p tuile-pack-worker
+          -p tuile-film
 
   docs:
     runs-on: ubuntu-latest
