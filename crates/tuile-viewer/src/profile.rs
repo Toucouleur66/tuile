@@ -110,6 +110,10 @@ pub(crate) struct Profile {
     pub release_surface_in_background: bool,
     /// Whether the counters are served on a local HTTP endpoint.
     pub metrics_endpoint: bool,
+    /// Whether a damaged tile store is cleared and started afresh — a phone,
+    /// whose system purges caches from under it — rather than left alone for
+    /// the session to run without.
+    pub clear_damaged_store: bool,
 }
 
 impl Profile {
@@ -137,6 +141,7 @@ impl Profile {
             render_on_demand: false,
             release_surface_in_background: false,
             metrics_endpoint: true,
+            clear_damaged_store: false,
         }
     }
 
@@ -172,6 +177,7 @@ impl Profile {
             render_on_demand: true,
             release_surface_in_background: true,
             metrics_endpoint: false,
+            clear_damaged_store: true,
         }
     }
 

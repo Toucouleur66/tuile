@@ -10,26 +10,35 @@
 //! be visible in the command that started it; that rule is unchanged, and a
 //! variable that is set is never overridden by anything.
 //!
-//! **Otherwise, from one file the person owns.** An application started from
-//! an icon has no shell and no environment, so there is exactly one other
-//! place:
+//! **Then, on a phone, from what the person typed** in the system's settings
+//! page for the application (*Settings › Tuile*), under the variable's name.
+//!
+//! **Then, on a phone, from the bundle** — a value written into `Info.plist`
+//! when the application was built (`crates/tuile-viewer/ios/build.sh` does so
+//! by default for a device build). **For a developer's own device only:**
+//! anything in a bundle can be read back out of the `.app`, so a build for the
+//! App Store, TestFlight or anyone else must not carry one.
+//!
+//! **Last, from one file the person owns.** An application started from an
+//! icon has no shell and no environment:
 //!
 //! ```text
 //! macOS      ~/Library/Application Support/Tuile/token
+//! iOS        Documents/token in the container (Files › On My iPhone › Tuile)
 //! elsewhere  $XDG_CONFIG_HOME/tuile/token   (or ~/.config/tuile/token)
 //! ```
 //!
 //! The file holds the token on a line of its own — or a `NAME=value` line, so
 //! a line lifted from a shell profile works as it is. Blank lines and lines
-//! starting with `#` are skipped. Create it yourself, mode 0600:
+//! starting with `#` are skipped. On a desktop, create it yourself, mode 0600:
 //!
 //! ```text
 //! install -m 600 /dev/null ~/Library/Application\ Support/Tuile/token
 //! ```
 //!
-//! Nothing in this repository creates that file, no build puts a token in the
-//! application bundle, and the token is never logged: this module hands it to
-//! the caller as a `String` and says only *where* it was found.
+//! Nothing in this repository creates that file, and the token is never
+//! logged: this module hands it to the caller as a `String` and says only
+//! *where* it was found.
 //!
 //! This is not the `.env` in the working directory that `main` explains the
 //! removal of. That file made a process behave differently depending on where
@@ -77,8 +86,12 @@ pub(crate) trait Host {
 /// out of it by whoever has the `.app`; a build that is distributed — the
 /// App Store, TestFlight, a file sent to someone — must not carry one.
 pub(crate) fn bundled_key(variable: &str) -> String {
-    format!("TuileBundledCredential_{variable}")
+    format!("{}{variable}", BUNDLED_PREFIX.trim())
 }
+
+/// The key's prefix, in one file that the bundler, which writes the key,
+/// reads too: the two programs cannot drift apart.
+const BUNDLED_PREFIX: &str = include_str!("../ios/bundled-credential-prefix.txt");
 
 /// The real one.
 pub(crate) struct Machine;
@@ -94,7 +107,10 @@ impl Host for Machine {
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(path)?.permissions().mode();
-            if mode & 0o077 != 0 {
+            // A phone's application is the only account that can read its
+            // container, and a file dropped in through Files arrives 0644:
+            // nothing to warn about there.
+            if mode & 0o077 != 0 && !self.is_handheld() {
                 // Said, not refused: a refusal here would be a second way for
                 // the application to fail to start over the same file.
                 tracing::error!(
@@ -521,6 +537,16 @@ mod tests {
     /// Environment, then the settings page, then the bundle, then the
     /// file: each one wins over everything after it, and a blank one is
     /// passed over.
+    /// The bundled key, as the bundler writes it: the shared prefix, then
+    /// the variable.
+    #[test]
+    fn the_bundled_key_is_the_shared_prefix_and_the_variable() {
+        assert_eq!(
+            bundled_key("SOME_TOKEN"),
+            "TuileBundledCredential_SOME_TOKEN"
+        );
+    }
+
     #[test]
     fn the_token_is_looked_for_in_order() {
         const HOME: &str = "/var/mobile/Containers/Data/Application/ABCD";
@@ -572,8 +598,8 @@ mod tests {
         );
     }
 
-    /// Wherever the token came from, what is said about it — the log line
-    /// and the reason a session gives — never contains it.
+    /// Wherever the token came from, the real resolution — the one the
+    /// application runs, logging included — writes no line that carries it.
     #[test]
     fn the_token_is_never_in_a_log_line() {
         const SECRET: &str = "eyJhbGciOiJIUzI1NiJ9.secret-part.signature";
@@ -594,19 +620,29 @@ mod tests {
             .with_max_level(tracing::Level::TRACE)
             .with_writer(move || writer.clone())
             .finish();
+        let mut found = Vec::new();
         tracing::subscriber::with_default(subscriber, || {
-            let mut host = mac(&[], None);
-            host.settings.insert(TOKEN_VARIABLE.to_owned(), SECRET);
-            let (found, from) = token(&host, TOKEN_VARIABLE).expect("found");
-            assert_eq!(found, SECRET);
-            tracing::info!("access token from {from:?}");
-            host.settings.clear();
-            host.bundle.insert(bundled_key(TOKEN_VARIABLE), SECRET);
-            let (_, from) = token(&host, TOKEN_VARIABLE).expect("found");
-            tracing::info!("access token from {from:?}");
+            let in_env = mac(&[(TOKEN_VARIABLE, SECRET)], None);
+            let mut in_settings = mac(&[], None);
+            in_settings
+                .settings
+                .insert(TOKEN_VARIABLE.to_owned(), SECRET);
+            let mut in_bundle = mac(&[], None);
+            in_bundle.bundle.insert(bundled_key(TOKEN_VARIABLE), SECRET);
+            let in_file = mac(&[], Some(SECRET));
+            for host in [&in_env, &in_settings, &in_bundle, &in_file] {
+                found.push(crate::embed::credential_from(host, TOKEN_VARIABLE));
+            }
+            // And the refusal, which names where to put one.
+            found.push(crate::embed::credential_from(
+                &mac(&[], None),
+                TOKEN_VARIABLE,
+            ));
         });
+        assert!(found[..4].iter().all(|f| f.as_deref() == Ok(SECRET)));
+        assert!(found[4].is_err());
         let log = String::from_utf8(captured.0.lock().expect("log").clone()).expect("utf-8");
-        assert!(log.contains("Settings") && log.contains("Bundle"), "{log}");
+        assert_eq!(log.matches("access token from").count(), 4, "{log}");
         assert!(!log.contains("secret-part"), "the token reached the log");
     }
 

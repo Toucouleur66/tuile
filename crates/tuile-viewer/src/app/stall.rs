@@ -74,13 +74,15 @@ impl TileTree for Planet {
     }
 }
 
-/// A loader on the network nobody answers: every load is accepted and never
-/// finishes.
-struct NeverAnswers;
+/// A loader on the network nobody answers: every load is accepted, counted,
+/// and never finishes.
+#[derive(Default)]
+struct NeverAnswers(std::sync::atomic::AtomicUsize);
 
 #[async_trait::async_trait]
 impl TileLoader for NeverAnswers {
     async fn load(&self, _id: TileId) -> Result<Loaded, LoadError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
         std::future::pending().await
     }
 }
@@ -106,8 +108,9 @@ fn a_frame_returns_and_the_indicator_turns_while_the_network_stalls() {
         .enable_all()
         .build()
         .expect("a runtime");
+    let asked = Arc::new(NeverAnswers::default());
     let loader: Arc<dyn TileLoader> = Arc::new(Gated {
-        inner: Arc::new(NeverAnswers),
+        inner: Arc::clone(&asked) as Arc<dyn TileLoader>,
         gate: Gate::default(),
     });
     let (mut stream, server) = tuile_core::runtime::in_process_with(
@@ -163,7 +166,6 @@ fn a_frame_returns_and_the_indicator_turns_while_the_network_stalls() {
             indicator.opacity, 1.0,
             "the indicator let go at frame {frames}"
         );
-        std::thread::sleep(Duration::from_millis(16));
     }
     finished.store(true, Ordering::SeqCst);
     assert!(
@@ -171,6 +173,25 @@ fn a_frame_returns_and_the_indicator_turns_while_the_network_stalls() {
         "a frame waited {slowest:?} on a network that never answers"
     );
     assert!(!pump.closed, "the server stopped");
+    // The stall was real: the server asked the loader for tiles, and not one
+    // of them came back while the frames above ran.
+    // The frames are quick; the server's first pass may come after them.
+    let asked_by = Instant::now() + Duration::from_secs(5);
+    while asked.0.load(Ordering::SeqCst) == 0 && Instant::now() < asked_by {
+        pump.advance_while(
+            &mut stream,
+            &gpu,
+            &[camera.view_state(viewport)],
+            camera.position,
+            |done, spent| budget.allows(done, spent),
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        asked.0.load(Ordering::SeqCst) > 0,
+        "the loader was never asked: nothing stalled"
+    );
+    assert_eq!(pump.prepared_count(), 0);
     drop(stream);
     runtime.shutdown_background();
 }

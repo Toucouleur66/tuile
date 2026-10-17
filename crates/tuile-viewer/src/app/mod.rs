@@ -78,6 +78,8 @@ pub struct ViewerConfig {
     pub(crate) profile: crate::profile::Profile,
     /// The session's async runtime, for flushing the store on the way out.
     pub runtime: tokio::runtime::Handle,
+    /// How a failed start-up is tried again; `None` where it is not.
+    pub(crate) retries: Option<crate::launch::Retries>,
 }
 
 /// Where the on-screen controls live: the part of the frame not under a
@@ -218,6 +220,10 @@ pub struct App {
     failed: Option<String>,
     /// What the person is to be told, once there is a window to tell them.
     messages: messages::Messages,
+    /// Trying a failed start-up again, on a phone.
+    retries: Option<crate::launch::Retries>,
+    /// When the start-up now under way began.
+    launching_since: Option<std::time::Instant>,
     profile: crate::profile::Profile,
     runtime: tokio::runtime::Handle,
     lifecycle: lifecycle::Lifecycle,
@@ -316,6 +322,8 @@ impl App {
             launch: Some(launch),
             failed: None,
             messages: messages::Messages::default(),
+            retries: None,
+            launching_since: Some(now),
             lifecycle: lifecycle::Lifecycle::new(&config.profile),
             loading: loading::Loading::new(now),
             demand: demand::Demand::default(),
@@ -368,6 +376,7 @@ impl App {
             profile: config.profile,
             runtime: config.runtime,
         };
+        app.retries = config.retries;
         // A desktop's launch has already arrived: adopt it before the first
         // turn of the loop, as the session always did.
         app.take_the_session();
@@ -377,21 +386,65 @@ impl App {
     /// Takes the session if it has arrived since the last turn of the loop,
     /// or the reason it never will. Never waits.
     fn take_the_session(&mut self) {
+        let now = std::time::Instant::now();
+        // A start-up that failed, due again: on a phone, and only in front.
+        if self.launch.is_none()
+            && self.session.is_none()
+            && self.lifecycle.phase() == lifecycle::Phase::Active
+        {
+            if let Some(launch) = self.retries.as_mut().and_then(|r| r.due(now)) {
+                tracing::info!("trying to start the session again");
+                self.launch = Some(launch);
+                self.launching_since = Some(now);
+            }
+        }
         let Some(outcome) = self.launch.as_mut().and_then(crate::launch::Launch::poll) else {
             return;
         };
         self.launch = None;
+        self.launching_since = None;
         match outcome {
-            Ok(started) => self.adopt(started),
+            Ok(started) => {
+                if let Some(retries) = self.retries.as_mut() {
+                    retries.succeeded();
+                }
+                self.failed = None;
+                self.adopt(started);
+            }
             Err(why) => {
                 crate::journal::note(&format!("session failed: {why}"));
                 tracing::error!("the session could not start: {why}");
-                // Shown once there is a window: see `messages`.
-                self.messages
-                    .say(format!("{} cannot start yet", self.title), why.clone());
+                let first = match self.retries.as_mut() {
+                    Some(retries) => {
+                        let wait = retries.failed(now);
+                        tracing::info!(seconds = wait.as_secs(), "trying again later");
+                        retries.failures() == 1
+                    }
+                    None => true,
+                };
+                // Said once, in a window: see `messages`. After that the
+                // caption says it is still trying.
+                if first {
+                    self.messages
+                        .say(format!("{} cannot start yet", self.title), why.clone());
+                }
                 self.failed = Some(why);
             }
         }
+    }
+
+    /// What the caption says while the session is not up and is being tried
+    /// again: the explicit "offline, retrying" state.
+    fn waiting_note(&self, now: std::time::Instant) -> Option<String> {
+        self.failed.as_ref()?;
+        let retries = self.retries.as_ref()?;
+        Some(match retries.next() {
+            Some(next) => format!(
+                "cannot start — trying again in {} s",
+                next.saturating_duration_since(now).as_secs() + 1
+            ),
+            None => "cannot start — trying again".to_owned(),
+        })
     }
 
     /// Takes over a session that has come up: its stream, the relief the
@@ -562,6 +615,11 @@ impl ApplicationHandler for App {
         if self.active.is_some() {
             let steps = self.lifecycle.activate();
             self.carry_out(steps);
+            // Back in front: a start-up that failed is tried at once — the
+            // person may have just typed a token in the system's settings.
+            if let Some(retries) = self.retries.as_mut() {
+                retries.foreground(std::time::Instant::now());
+            }
             return;
         }
         self.start_window(event_loop);

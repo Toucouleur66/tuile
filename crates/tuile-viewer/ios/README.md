@@ -5,8 +5,10 @@ The same application as the desktop one — `tuile-viewer`, hosted by
 is a [`Profile`](../src/profile.rs) of numbers and a handful of platform calls.
 
 ```text
+xcrun simctl boot "iPhone 16 Pro"                # once: a booted simulator
 ./build.sh simulator --run                       # build, install on the booted simulator, launch
 TUILE_TEAM=ABCDE12345 ./build.sh device --install # build signed, install on the connected iPhone
+TUILE_DEVICE="my phone" TUILE_TEAM=… ./build.sh device --install  # one of several
 ```
 
 Needs Xcode, `xcodegen` (`brew install xcodegen`) and the two Rust targets
@@ -31,11 +33,33 @@ instead of a committed `.pbxproj`.
 
 ## The access token
 
-The phone reads `CESIUM_ION_TOKEN` from its environment (a simulator launched
-with `SIMCTL_CHILD_CESIUM_ION_TOKEN=…`) or from the file `token` in the
-application's **Documents** — visible in the Files application under *On My
-iPhone › Tuile*. Put the token there on a line of its own. Nothing puts a
-token in the bundle.
+The host says which credential its sources need — the public viewer's is in
+`examples/wgpu-viewer/phone.conf`: the variable's name, which is also the key
+of the field on the settings page, and that field's title. At run time the
+token is looked for in this order, first found wins:
+
+1. the environment variable (a simulator launched with
+   `SIMCTL_CHILD_<VARIABLE>=…`);
+2. the secure field in **Settings › Tuile**, typed by the person — it wins
+   over everything below, so a token pasted there replaces a built-in one;
+3. a token **built into the bundle**;
+4. the file `token` in the application's **Documents** — Files › On My
+   iPhone › Tuile — on a line of its own;
+5. otherwise a message that says where to put one, and a new attempt every
+   time the application comes back to the front (and every 2 s to 1 min).
+
+**A device build embeds the token by default**: `build.sh device` reads
+`TUILE_TILES_TOKEN` (or the host's older name for it, `TUILE_ION_TOKEN` for the
+public viewer) from the environment, else from the workspace's `.env` — a
+worktree's main checkout's, failing that — and writes it into the generated,
+gitignored `Info.plist`. `TUILE_TILES_TOKEN=none` builds without one. It is
+never printed, never a command-line argument, and kept out of xcodebuild's
+environment, which xcodebuild writes into its log.
+
+> **The developer's own device only.** Anything in a bundle can be read back
+> out of the `.app`. A build for the App Store, TestFlight or anyone else must
+> not embed a token: build it with `TUILE_TILES_TOKEN=none` and let the person
+> type theirs in Settings.
 
 ## What it does differently on a phone
 
@@ -49,14 +73,23 @@ token in the bundle.
   process (`os_proc_available_memory`), between 160 and 768 MiB; a memory
   warning trims residency to half, the background to a quarter — never the
   tiles the view draws or their ancestors. The tile store lives in
-  `Library/Caches` with a 768 MiB disk cap, and is started afresh if the
-  system purged it from under the application.
+  `Library/Caches` — the directory the system may purge — with a 768 MiB
+  disk cap. If it does not open because it is damaged (purged half-way, a
+  file where a directory should be) it is started afresh; a passing
+  condition (descriptors, a lock, a full disk) never clears it, and on a
+  desktop nothing ever does.
 - **Threads**: two runtime workers, four blocking threads, one to three
   decoders, sixteen fetches in flight over one HTTP/2 connection, and an
   upload budget per frame of four tiles or 6 ms.
 - **Lifecycle**: no frame and no GPU work outside the foreground; loads held
   at a gate while away; the surface and render targets released in the
-  background and rebuilt before the first frame back.
+  background and rebuilt before the first frame back (again on every turn
+  until that succeeds). The background trim's evictions are taken in the
+  background too, without touching the GPU, so the memory is back while
+  the system weighs the application.
+- **Start-up**: given up after 20 s, then tried again after 2, 4, 8… s up to
+  a minute, and at once on coming back to the front; the caption says so,
+  and a launch that waits is drawn at 15 frames a second.
 - **Energy**: frames are drawn only while something changes — a gesture, an
   ease, an upload, the indicator — and four times a second otherwise; 30 fps
   when the device runs hot or saves power, 20 when critical.

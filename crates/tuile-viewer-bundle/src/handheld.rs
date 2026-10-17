@@ -200,9 +200,9 @@ fn asset_catalogue(master: &image::RgbaImage, out: &Path) -> anyhow::Result<()> 
 /// named after, what the settings page calls it, and — for a developer's own
 /// device only — a value to write into the bundle.
 pub(crate) struct Credential {
-    /// The variable's name: `CESIUM_ION_TOKEN`. Also the settings key.
+    /// The variable's name, the host's: `TUILE_TILES_TOKEN`, say. Also the settings key.
     pub variable: String,
-    /// What the settings page shows: `Cesium ion token`.
+    /// What the settings page shows: `Tile service token`, say.
     pub title: String,
     /// A build-time default, written into `Info.plist`.
     ///
@@ -215,8 +215,11 @@ pub(crate) struct Credential {
 /// The `Info.plist` key a bundled credential is written under. The viewer
 /// reads the same key (`tuile_viewer` `host::bundled_key`).
 pub(crate) fn bundled_key(variable: &str) -> String {
-    format!("TuileBundledCredential_{variable}")
+    format!("{}{variable}", BUNDLED_PREFIX.trim())
 }
+
+/// Shared with the viewer, which reads the key: one file, two readers.
+const BUNDLED_PREFIX: &str = include_str!("../../tuile-viewer/ios/bundled-credential-prefix.txt");
 
 /// The settings page: one secure text field for the credential, under the
 /// key the application reads first.
@@ -472,9 +475,11 @@ mod tests {
                 .and_then(plist::Value::as_string),
             Some("abc.def")
         );
-        // The viewer reads the same key.
+        // The viewer reads the same key: the same file, and the same literal
+        // the viewer's own test pins.
+        assert_eq!(key, "TuileBundledCredential_SOME_TOKEN");
         assert!(include_str!("../../tuile-viewer/src/host.rs")
-            .contains("format!(\"TuileBundledCredential_{variable}\")"));
+            .contains("include_str!(\"../ios/bundled-credential-prefix.txt\")"));
     }
 
     #[test]

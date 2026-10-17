@@ -93,42 +93,12 @@ impl App {
         }
     }
 
-    /// Carries out what a change of phase asks for.
+    /// Carries out what a change of phase asks for. See [`carry`].
     pub(super) fn carry_out(&mut self, steps: Vec<Step>) {
-        for step in steps {
+        for step in &steps {
             tracing::info!(?step, phase = ?self.lifecycle.phase(), "lifecycle");
-            match step {
-                Step::PauseLoads => {
-                    if let Some(session) = self.session.as_ref() {
-                        session.gate.shut();
-                    }
-                }
-                Step::ResumeLoads => {
-                    if let Some(session) = self.session.as_ref() {
-                        session.gate.open();
-                    }
-                }
-                Step::Trim(budget_bytes) => {
-                    if let Some(session) = self.session.as_mut() {
-                        // Best effort: a closed stream means the session is over.
-                        let _ = session.stream.send(ClientMessage::Trim { budget_bytes });
-                    }
-                }
-                Step::ReleaseSurface => {
-                    // The last moment the application is sure to run: a
-                    // phone ends background applications without a word.
-                    self.remember_the_view();
-                    self.release_the_surface();
-                }
-                Step::RestoreSurface => self.restore_the_surface(),
-                Step::Redraw => {
-                    self.demand.poke();
-                    if let Some(active) = self.active.as_ref() {
-                        active.window.request_redraw();
-                    }
-                }
-            }
         }
+        carry(steps, self);
     }
 
     /// Decides this frame's loading indicator, from what the last frame saw.
@@ -227,11 +197,30 @@ impl App {
     /// A phone's turn of the loop: a frame when one is due, and otherwise a
     /// sleep until it is — never a spin.
     pub(super) fn pace_the_frames(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        // In front with no surface: the one made on the way back failed. Made
+        // again on every turn until it exists — a screen that stays empty is
+        // not an option.
+        if self.lifecycle.phase() == super::lifecycle::Phase::Active
+            && self.active.as_ref().is_some_and(|a| a.surface.is_none())
+        {
+            self.restore_the_surface();
+        }
         if !self.lifecycle.may_draw() || self.active.is_none() {
-            event_loop.set_control_flow(ControlFlow::Wait);
+            // Away: no frame and no GPU work, but what the server lets go of
+            // after a trim is let go of here too — dropping a surface submits
+            // nothing — so the memory is back while the system is judging the
+            // application, not on its first frame back.
+            if let (Some(active), Some(session)) = (self.active.as_mut(), self.session.as_mut()) {
+                active.pump.drain(&mut session.stream);
+            }
+            event_loop.set_control_flow(if self.session.is_some() {
+                ControlFlow::WaitUntil(now + IDLE_WAKE)
+            } else {
+                ControlFlow::Wait
+            });
             return;
         }
-        let now = Instant::now();
         self.read_the_device(now);
         if let Some(held) = self.touches.tick(now) {
             self.gesture(held);
@@ -241,6 +230,10 @@ impl App {
             Pace::Continuous => self.profile.frame_interval(self.thermal, self.low_power),
             Pace::Idle => IDLE_WAKE,
         };
+        let interval = super::demand::while_waiting(
+            interval,
+            self.launching_since.map(|since| now.duration_since(since)),
+        );
         let due = self.pacing.last_frame + interval;
         if now >= due {
             if let Some(active) = self.active.as_ref() {
@@ -293,5 +286,154 @@ impl App {
             self.thermal = thermal;
             self.low_power = low_power;
         }
+    }
+}
+
+/// What carrying out a change of phase needs from the window: the session's
+/// gate and stream, the surface, a frame. A trait so the wiring of each
+/// [`Step`] is tested against a recording stand-in rather than a window.
+pub(super) trait Carry {
+    fn gate(&self) -> Option<&crate::gate::Gate>;
+    /// A message to the server, best effort.
+    fn send(&mut self, message: ClientMessage);
+    /// The current camera to the server again, so it runs a pass — the pass
+    /// is what announces the evictions a trim decided.
+    fn resend_view(&mut self);
+    fn release_surface(&mut self);
+    fn restore_surface(&mut self);
+    fn redraw(&mut self);
+}
+
+/// Each step, carried out on `to`.
+pub(super) fn carry(steps: Vec<Step>, to: &mut impl Carry) {
+    for step in steps {
+        match step {
+            Step::PauseLoads => {
+                if let Some(gate) = to.gate() {
+                    gate.shut();
+                }
+            }
+            Step::ResumeLoads => {
+                if let Some(gate) = to.gate() {
+                    gate.open();
+                }
+            }
+            Step::Trim(budget_bytes) => {
+                to.send(ClientMessage::Trim { budget_bytes });
+                to.resend_view();
+            }
+            Step::ReleaseSurface => to.release_surface(),
+            Step::RestoreSurface => to.restore_surface(),
+            Step::Redraw => to.redraw(),
+        }
+    }
+}
+
+impl Carry for App {
+    fn gate(&self) -> Option<&crate::gate::Gate> {
+        self.session.as_ref().map(|s| &s.gate)
+    }
+
+    fn send(&mut self, message: ClientMessage) {
+        if let Some(session) = self.session.as_mut() {
+            // Best effort: a closed stream means the session is over.
+            let _ = session.stream.send(message);
+        }
+    }
+
+    fn resend_view(&mut self) {
+        let (width, height) = self.viewport();
+        let view = self
+            .controller
+            .camera
+            .view_state(glam::DVec2::new(width, height));
+        if let (Some(active), Some(session)) = (self.active.as_mut(), self.session.as_mut()) {
+            active.pump.send_view(&mut session.stream, &[view]);
+        }
+    }
+
+    fn release_surface(&mut self) {
+        // The last moment the application is sure to run: a phone ends
+        // background applications without a word.
+        self.remember_the_view();
+        self.release_the_surface();
+    }
+
+    fn restore_surface(&mut self) {
+        self.restore_the_surface();
+    }
+
+    fn redraw(&mut self) {
+        self.demand.poke();
+        if let Some(active) = self.active.as_ref() {
+            active.window.request_redraw();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gate::Gate;
+
+    /// A window that is a log of what it was asked.
+    #[derive(Default)]
+    struct Recorded {
+        gate: Option<Gate>,
+        did: Vec<String>,
+    }
+
+    impl Carry for Recorded {
+        fn gate(&self) -> Option<&Gate> {
+            self.gate.as_ref()
+        }
+        fn send(&mut self, message: ClientMessage) {
+            self.did.push(match message {
+                ClientMessage::Trim { budget_bytes } => format!("trim {budget_bytes}"),
+                other => format!("{other:?}"),
+            });
+        }
+        fn resend_view(&mut self) {
+            self.did.push("view".into());
+        }
+        fn release_surface(&mut self) {
+            self.did.push("release".into());
+        }
+        fn restore_surface(&mut self) {
+            self.did.push("restore".into());
+        }
+        fn redraw(&mut self) {
+            self.did.push("redraw".into());
+        }
+    }
+
+    /// Each step reaches the thing it names: the gate shuts and opens, a
+    /// trim goes to the server followed by the view that makes it act, the
+    /// surface goes and comes back before the frame.
+    #[test]
+    fn each_step_reaches_what_it_names() {
+        let mut to = Recorded {
+            gate: Some(Gate::default()),
+            ..Recorded::default()
+        };
+        carry(
+            vec![Step::PauseLoads, Step::Trim(1 << 20), Step::ReleaseSurface],
+            &mut to,
+        );
+        assert!(to.gate.as_ref().is_some_and(Gate::is_shut));
+        assert_eq!(to.did, ["trim 1048576", "view", "release"]);
+
+        to.did.clear();
+        carry(
+            vec![Step::RestoreSurface, Step::ResumeLoads, Step::Redraw],
+            &mut to,
+        );
+        assert!(to.gate.as_ref().is_some_and(|g| !g.is_shut()));
+        assert_eq!(to.did, ["restore", "redraw"]);
+
+        // Before the session is up there is no gate, and nothing breaks.
+        let mut early = Recorded::default();
+        carry(vec![Step::PauseLoads, Step::ResumeLoads], &mut early);
+        assert!(early.did.is_empty());
     }
 }

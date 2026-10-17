@@ -147,26 +147,38 @@ pub(crate) async fn open_the_store(
     name: &str,
     memory_bytes: usize,
     disk_bytes: usize,
+    clear_when_damaged: bool,
 ) -> Option<Arc<FoyerStore>> {
     open_the_store_at(
         &tuile_storage_foyer::default_cache_dir().join(name),
         memory_bytes,
         disk_bytes,
+        clear_when_damaged,
     )
     .await
 }
 
-/// [`open_the_store`], in `dir`.
+/// Whether a store that would not open is to be cleared and opened afresh.
 ///
-/// A store that will not open is started afresh, once, before it is given up
-/// on. The directory is a cache: a phone purges it without asking when space
-/// runs short, and may leave half of it behind; a crash may leave a file
-/// foyer will not read. Nothing in it is worth more than the next run
-/// starting at all, and an empty store refills.
+/// Only when the platform allows it — a phone, whose system purges caches and
+/// may leave half of one behind — and only when the failure is damage. Never
+/// over a passing condition: another process holding the files, the process
+/// out of descriptors, a full disk. Clearing then would throw away gigabytes
+/// of good cache for nothing, and the next run would start cold.
+pub(crate) fn clear_the_store(
+    clear_when_damaged: bool,
+    error: &tuile_storage_foyer::StoreError,
+) -> bool {
+    clear_when_damaged && !error.is_transient()
+}
+
+/// [`open_the_store`], in `dir`. Without a store the session still runs; every
+/// tile is fetched again.
 pub(crate) async fn open_the_store_at(
     dir: &std::path::Path,
     memory_bytes: usize,
     disk_bytes: usize,
+    clear_when_damaged: bool,
 ) -> Option<Arc<FoyerStore>> {
     let config = || tuile_storage_foyer::StoreConfig {
         memory_bytes,
@@ -174,10 +186,17 @@ pub(crate) async fn open_the_store_at(
         ..tuile_storage_foyer::StoreConfig::at(dir)
     };
     let first = match FoyerStore::with_config(config()).await {
-        Ok(store) => return Some(Arc::new(store)),
+        Ok(store) => {
+            tracing::info!(dir = %dir.display(), "tile store open");
+            return Some(Arc::new(store));
+        }
         Err(e) => e,
     };
-    tracing::warn!("the tile store would not open ({first}); starting it afresh");
+    if !clear_the_store(clear_when_damaged, &first) {
+        tracing::warn!("no tile store ({first}); every tile will be re-fetched");
+        return None;
+    }
+    tracing::warn!("the tile store is damaged ({first}); starting it afresh");
     let cleared = if dir.is_dir() {
         std::fs::remove_dir_all(dir)
     } else {
@@ -364,11 +383,30 @@ mod tests {
             .enable_all()
             .build()
             .expect("a runtime");
-        let store = runtime.block_on(open_the_store_at(&path, 1 << 20, 64 << 20));
+        // Where the platform does not allow it — a desktop — nothing is
+        // cleared: the file is still there, and the session runs without.
+        assert!(runtime
+            .block_on(open_the_store_at(&path, 1 << 20, 64 << 20, false))
+            .is_none());
+        assert!(path.is_file(), "a desktop's store was cleared");
+        let store = runtime.block_on(open_the_store_at(&path, 1 << 20, 64 << 20, true));
         assert!(store.is_some(), "the store was given up on");
         assert!(path.is_dir());
         if let Some(store) = store {
             runtime.block_on(store.close()).expect("closed");
         }
+    }
+
+    /// A passing condition never clears a store, wherever it runs; damage
+    /// clears it only where the platform allows.
+    #[test]
+    fn a_store_is_cleared_only_for_damage_and_only_where_allowed() {
+        use std::io::{Error, ErrorKind};
+        let busy = tuile_storage_foyer::StoreError::from(Error::from_raw_os_error(24));
+        let damaged = tuile_storage_foyer::StoreError::from(Error::from(ErrorKind::InvalidData));
+        assert!(!clear_the_store(true, &busy));
+        assert!(!clear_the_store(false, &busy));
+        assert!(!clear_the_store(false, &damaged));
+        assert!(clear_the_store(true, &damaged));
     }
 }

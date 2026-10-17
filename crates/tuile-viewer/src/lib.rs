@@ -260,18 +260,21 @@ fn session(embedder: Arc<dyn ViewerHost>) -> anyhow::Result<()> {
     // Everything between here and a running server is network, and runs on
     // the runtime: see `launch`. The host's credentials and sources, the
     // store, the globe.
-    let launch = launch::Launch::start(
-        &handle,
-        launch::Plan {
-            host: Arc::clone(&embedder),
-            terrain: embedder.terrain(),
-            layers,
-            opening,
-            store: embed::identity().store.clone(),
-            config,
-            profile: profile.clone(),
-        },
-    );
+    let plan = launch::Plan {
+        host: Arc::clone(&embedder),
+        terrain: embedder.terrain(),
+        layers,
+        opening,
+        store: embed::identity().store.clone(),
+        config,
+        profile: profile.clone(),
+        timeout: launch::START_TIMEOUT,
+    };
+    let launch = launch::Launch::start(&handle, plan.clone());
+    // A phone tries again by itself; a desktop says why and stops, as it
+    // always has — its command line is how it is tried again.
+    let retries =
+        (!profile.hold_window_until_warm).then(|| launch::Retries::new(plan, handle.clone()));
     // A desktop waits for it here, with no window yet: its window is held
     // shut until the globe has a floor anyway, and a refusal is a sentence
     // for the person — shown in a window when there is no terminal. A phone
@@ -331,6 +334,7 @@ fn session(embedder: Arc<dyn ViewerHost>) -> anyhow::Result<()> {
         pinned_level: pinned,
         profile: profile.clone(),
         runtime: handle.clone(),
+        retries,
     };
 
     // Everything the engine counts, scrapeable, so the log can stop being a

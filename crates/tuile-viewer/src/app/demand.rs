@@ -59,6 +59,22 @@ pub(super) enum Pace {
     Idle,
 }
 
+/// A start-up taking longer than this is waiting on a slow or absent network.
+const PATIENT_AFTER: Duration = Duration::from_secs(3);
+/// The frame interval while it waits: the indicator still turns, at a rate
+/// that costs little.
+const WHILE_WAITING: Duration = Duration::from_nanos(1_000_000_000 / 15);
+
+/// The frame interval for `interval`, given how long the session has been
+/// waiting to start (`None` once it is up). A start-up that hangs on a dead
+/// network must not draw sixty frames a second of a spinner.
+pub(super) fn while_waiting(interval: Duration, waited: Option<Duration>) -> Duration {
+    match waited {
+        Some(waited) if waited >= PATIENT_AFTER => interval.max(WHILE_WAITING),
+        _ => interval,
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct Demand {
     /// Since when nothing has needed a frame; `None` while something does.
@@ -92,6 +108,22 @@ impl Demand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A launch gets full rate for its first seconds, then fifteen frames a
+    /// second for as long as it hangs; a running session is never held back.
+    #[test]
+    fn a_long_wait_to_start_is_drawn_slowly() {
+        let full = Duration::from_secs(1) / 60;
+        assert_eq!(while_waiting(full, None), full);
+        assert_eq!(while_waiting(full, Some(Duration::from_secs(1))), full);
+        assert_eq!(
+            while_waiting(full, Some(Duration::from_secs(4))),
+            WHILE_WAITING
+        );
+        // Already slower (idle, or hot): not made faster.
+        let idle = IDLE_WAKE;
+        assert_eq!(while_waiting(idle, Some(Duration::from_secs(9))), idle);
+    }
 
     #[test]
     fn a_quiet_session_slows_down_after_a_grace_and_wakes_on_news() {
