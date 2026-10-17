@@ -303,6 +303,24 @@ impl CacheConfig {
     }
 }
 
+impl CacheConfig {
+    /// Defaults for a phone, rooted at `dir`: 16 MiB RAM, 128 MiB disk, each
+    /// overridable as [`CacheConfig::at`]'s are.
+    ///
+    /// Small, because on a phone this is the *second* cache: the viewer files
+    /// every tile in its own store, so what this one keeps is mostly the
+    /// services' metadata. Memory is shared with the GPU there and the system
+    /// ends the largest applications first, and the disk tier sits in a
+    /// directory the system purges when space runs short.
+    pub fn handheld(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            dir: dir.into(),
+            memory_bytes: mib("TUILE_CACHE_MEMORY_MB", 16),
+            disk_bytes: mib("TUILE_CACHE_DISK_MB", 128),
+        }
+    }
+}
+
 /// A size in mebibytes from the environment, as bytes. Never zero: foyer wants
 /// a positive capacity, and a cache of nothing is better asked for by pointing
 /// it somewhere small than by tripping an assertion inside the engine.
@@ -600,6 +618,22 @@ async fn build_cache(cfg: &CacheConfig) -> Result<HybridCache<String, Vec<u8>>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A phone's transport cache is a fraction of a desktop's in both tiers,
+    /// and still above the disk tier's smallest workable size (one 16 MiB
+    /// block is not a cache).
+    #[test]
+    fn a_phones_cache_is_small_but_workable() {
+        if std::env::var_os("TUILE_CACHE_MEMORY_MB").is_some()
+            || std::env::var_os("TUILE_CACHE_DISK_MB").is_some()
+        {
+            return;
+        }
+        let (phone, desk) = (CacheConfig::handheld("/c"), CacheConfig::at("/c"));
+        assert!(phone.memory_bytes * 8 <= desk.memory_bytes);
+        assert!(phone.disk_bytes * 16 <= desk.disk_bytes);
+        assert!(phone.disk_bytes >= 64 << 20);
+    }
     use reqwest::header::{HeaderMap, HeaderValue, CACHE_CONTROL};
 
     fn headers(value: &str) -> HeaderMap {

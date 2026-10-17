@@ -16,6 +16,9 @@
 //! that crate to camera state and gestures. The widgets are pure: no I/O, no
 //! graphics API, wasm-clean.
 //!
+//! [`Spinner`] is the loading indicator a viewer shows while the ground under
+//! its first view is still arriving.
+//!
 //! One thing here is not a widget and not pure: [`StatusBar`], behind the
 //! `statusbar` feature, which is a **native menu-bar item**. It lives here
 //! because it is a control a viewer offers a person, and it is optional
@@ -23,10 +26,12 @@
 //! dependency to get the compass.
 
 mod nav;
+mod spinner;
 #[cfg(feature = "statusbar")]
 mod statusbar;
 
 pub use nav::{NavWidget, Part};
+pub use spinner::{Spinner, SPOKES};
 
 /// A 2-D vertex in **pixel** coordinates, with a straight (non-premultiplied)
 /// RGBA colour.

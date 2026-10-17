@@ -230,6 +230,24 @@ impl ContentPump {
         gpu: &GpuContext,
         max_uploads: usize,
     ) -> usize {
+        self.pump_while(stream, gpu, |done, _| done < max_uploads)
+    }
+
+    /// [`Self::pump`], with the upload budget as a rule rather than a count:
+    /// `more(done, spent)` is asked before each upload, with how many this
+    /// call has made and how long they took, and the uploads stop at the first
+    /// `false`.
+    ///
+    /// For a host whose frame cannot afford a fixed number: one tile is a few
+    /// kilobytes of mesh and the next megabytes of imagery, so a phone stops
+    /// on time spent as well as on count. Messages are drained whatever the
+    /// rule says — only uploads wait.
+    pub fn pump_while<S: GeometryStream>(
+        &mut self,
+        stream: &mut S,
+        gpu: &GpuContext,
+        mut more: impl FnMut(usize, std::time::Duration) -> bool,
+    ) -> usize {
         let waker = futures_util::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
         loop {
@@ -244,7 +262,8 @@ impl ContentPump {
         }
 
         let mut uploaded = 0;
-        while uploaded < max_uploads {
+        let began = std::time::Instant::now();
+        while more(uploaded, began.elapsed()) {
             let Some((tile, content, is_fill)) = self.pending.pop_front() else {
                 break;
             };
@@ -351,6 +370,20 @@ impl ContentPump {
         views: &[ViewState],
         render_origin: DVec3,
     ) -> usize {
+        self.advance_while(stream, gpu, views, render_origin, |done, _| {
+            done < UPLOADS_PER_FRAME
+        })
+    }
+
+    /// [`Self::advance_with`], with the upload budget of [`Self::pump_while`].
+    pub fn advance_while<S: GeometryStream>(
+        &mut self,
+        stream: &mut S,
+        gpu: &crate::context::GpuContext,
+        views: &[ViewState],
+        render_origin: DVec3,
+        more: impl FnMut(usize, std::time::Duration) -> bool,
+    ) -> usize {
         // Best effort: a closed stream means the session is over, and a frame is
         // not the place to discover it.
         self.generation_sent += 1;
@@ -358,7 +391,7 @@ impl ContentPump {
             views: views.to_vec(),
             generation: self.generation_sent,
         });
-        let uploaded = self.pump(stream, gpu, UPLOADS_PER_FRAME);
+        let uploaded = self.pump_while(stream, gpu, more);
         self.rebase(&gpu.queue, render_origin);
         uploaded
     }
