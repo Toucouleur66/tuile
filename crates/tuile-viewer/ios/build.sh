@@ -57,10 +57,21 @@ case "$then" in
     xcrun simctl launch booted "$identifier"
     ;;
   --install)
-    device="$(xcrun devicectl list devices --hide-headers 2>/dev/null \
-      | awk '/available \(paired\)/ {for (i=1;i<=NF;i++) if ($i ~ /^[0-9A-F-]{36}$/) {print $i; exit}}')"
+    # The first paired, connected device, from devicectl's JSON (its table
+    # changes between Xcode versions).
+    listing="$(mktemp)"
+    xcrun devicectl list devices --quiet --json-output "$listing" >/dev/null 2>&1 || true
+    device="$(python3 -c '
+import json, sys
+devices = json.load(open(sys.argv[1])).get("result", {}).get("devices", [])
+for d in devices:
+    c = d.get("connectionProperties", {})
+    if c.get("pairingState") == "paired" and c.get("tunnelState") == "connected":
+        print(d["identifier"]); break
+' "$listing" 2>/dev/null || true)"
+    rm -f "$listing"
     if [[ -z "$device" ]]; then
-      echo "error: no paired device is connected and unlocked" >&2
+      echo "error: no paired device is connected" >&2
       exit 3
     fi
     xcrun devicectl device install app --device "$device" "$app"
