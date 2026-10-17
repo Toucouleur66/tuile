@@ -31,13 +31,17 @@ credential=(--credential CESIUM_ION_TOKEN --credential-title "Cesium ion token")
 bundled=""
 if [[ "$kind" == device ]]; then
   bundled="${TUILE_ION_TOKEN:-}"
+  [[ "$bundled" == none ]] && skip_env=1 || skip_env=""
   common="$(git -C "$workspace" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
   for envfile in "${TUILE_ENV_FILE:-}" "$workspace/.env" "${common:+$common/../.env}"; do
-    [[ -n "$bundled" || -z "$envfile" || ! -f "$envfile" ]] && continue
+    [[ -n "$skip_env" || -n "$bundled" || -z "$envfile" || ! -f "$envfile" ]] && continue
     bundled="$(sed -n 's/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}TUILE_ION_TOKEN=//p' "$envfile" \
       | tail -n 1 | sed "s/^[\"']//; s/[\"']\$//")"
   done
 fi
+# `TUILE_ION_TOKEN=none`: build without one, to see what a person without a
+# token sees.
+[[ "$bundled" == none ]] && bundled=""
 if [[ -n "$bundled" ]]; then
   echo "note: a token is built into this bundle — for this developer's own device only" >&2
   TUILE_BUNDLED_CREDENTIAL="$bundled" cargo run --quiet --manifest-path "$workspace/Cargo.toml" \
