@@ -335,6 +335,7 @@ fn main() -> anyhow::Result<()> {
         Some("phone") => {
             let mut out = workspace().join("crates/tuile-viewer/ios/Generated");
             let mut bundle = Bundle::default();
+            let (mut variable, mut title) = (None, None);
             while let Some(arg) = args.next() {
                 let Some(value) = args.next() else {
                     bail!("{arg} needs a value");
@@ -344,19 +345,35 @@ fn main() -> anyhow::Result<()> {
                     "--name" => bundle.name = value,
                     "--identifier" => bundle.identifier = value,
                     "--package" => bundle.executable = value,
+                    // The credential the settings page asks for. Its value is
+                    // never an argument — arguments are visible to every
+                    // process on the machine — but TUILE_BUNDLED_CREDENTIAL,
+                    // for a developer's own device only.
+                    "--credential" => variable = Some(value),
+                    "--credential-title" => title = Some(value),
                     _ => bail!("unknown argument {arg:?}"),
                 }
             }
             let master = image::load_from_memory(MASTER)
                 .context("reading the icon master")?
                 .to_rgba8();
-            handheld::resources(&bundle, &master, &out)?;
+            let credential = variable.map(|variable| handheld::Credential {
+                title: title.unwrap_or_else(|| variable.clone()),
+                variable,
+                bundled: std::env::var("TUILE_BUNDLED_CREDENTIAL").ok(),
+            });
+            if credential.as_ref().is_some_and(|c| c.bundled.is_some()) {
+                eprintln!(
+                    "a credential is built into this bundle: for this developer's own device only"
+                );
+            }
+            handheld::resources(&bundle, &master, &out, credential.as_ref())?;
             println!("{}", out.display());
             Ok(())
         }
         _ => bail!(
             "usage: tuile-viewer-bundle phone [--out DIR] [--name NAME] [--identifier ID] \
-             [--package PACKAGE] | app [--out DIR] [--binary PATH] [--name NAME] \
+             [--package PACKAGE] [--credential VARIABLE [--credential-title TITLE]] | app [--out DIR] [--binary PATH] [--name NAME] \
              [--identifier ID] [--scheme SCHEME] [--package PACKAGE] [--icon PNG] | icon"
         ),
     }

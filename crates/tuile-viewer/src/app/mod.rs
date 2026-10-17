@@ -13,6 +13,7 @@ mod imagery;
 mod input;
 mod lifecycle;
 mod loading;
+mod messages;
 mod pacing;
 mod readout;
 mod script;
@@ -215,6 +216,8 @@ pub struct App {
     launch: Option<crate::launch::Launch>,
     /// Why the session could not start, once that is known.
     failed: Option<String>,
+    /// What the person is to be told, once there is a window to tell them.
+    messages: messages::Messages,
     profile: crate::profile::Profile,
     runtime: tokio::runtime::Handle,
     lifecycle: lifecycle::Lifecycle,
@@ -312,6 +315,7 @@ impl App {
             session: None,
             launch: Some(launch),
             failed: None,
+            messages: messages::Messages::default(),
             lifecycle: lifecycle::Lifecycle::new(&config.profile),
             loading: loading::Loading::new(now),
             demand: demand::Demand::default(),
@@ -382,7 +386,9 @@ impl App {
             Err(why) => {
                 crate::journal::note(&format!("session failed: {why}"));
                 tracing::error!("the session could not start: {why}");
-                crate::desktop::alert(&format!("{} cannot start yet", self.title), &why);
+                // Shown once there is a window: see `messages`.
+                self.messages
+                    .say(format!("{} cannot start yet", self.title), why.clone());
                 self.failed = Some(why);
             }
         }
@@ -614,6 +620,9 @@ impl ApplicationHandler for App {
         // location is taken on whatever turn of the loop it arrives, hidden
         // and warming included.
         self.take_the_session();
+        for (title, text) in self.messages.release(self.active.is_some()) {
+            crate::desktop::alert(&title, &text);
+        }
         self.take_the_location();
         self.take_the_commands();
         self.take_the_imagery();

@@ -43,10 +43,7 @@ impl DeviceMemory {
 
 /// How hot the device is running, as the system grades it.
 // Only a phone's system reports anything but nominal.
-#[cfg_attr(
-    not(all(target_os = "ios", feature = "application")),
-    allow(dead_code)
-)]
+#[cfg_attr(not(all(target_os = "ios", feature = "application")), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub(crate) enum Thermal {
     #[default]

@@ -58,6 +58,26 @@ pub(crate) trait Host {
     fn is_handheld(&self) -> bool {
         false
     }
+    /// A value the person typed in the system's settings for this
+    /// application, under `key`. Only a phone has such a page.
+    fn setting(&self, _key: &str) -> Option<String> {
+        None
+    }
+    /// A value written into the application bundle when it was built, under
+    /// `key`. For a developer's own builds only: see [`bundled_key`].
+    fn bundled(&self, _key: &str) -> Option<String> {
+        None
+    }
+}
+
+/// The `Info.plist` key a build-time credential for `variable` is written
+/// under.
+///
+/// **A developer's own device only.** Anything in a bundle can be read back
+/// out of it by whoever has the `.app`; a build that is distributed — the
+/// App Store, TestFlight, a file sent to someone — must not carry one.
+pub(crate) fn bundled_key(variable: &str) -> String {
+    format!("TuileBundledCredential_{variable}")
 }
 
 /// The real one.
@@ -93,6 +113,42 @@ impl Host for Machine {
 
     fn is_handheld(&self) -> bool {
         cfg!(target_os = "ios")
+    }
+
+    fn setting(&self, key: &str) -> Option<String> {
+        system::setting(key)
+    }
+
+    fn bundled(&self, key: &str) -> Option<String> {
+        system::bundled(key)
+    }
+}
+
+/// A phone's settings page and bundle, read through Foundation.
+#[cfg(all(target_os = "ios", feature = "application"))]
+mod system {
+    use objc2_foundation::{NSBundle, NSString, NSUserDefaults};
+
+    pub(super) fn setting(key: &str) -> Option<String> {
+        NSUserDefaults::standardUserDefaults()
+            .stringForKey(&NSString::from_str(key))
+            .map(|v| v.to_string())
+    }
+
+    pub(super) fn bundled(key: &str) -> Option<String> {
+        let value = NSBundle::mainBundle().objectForInfoDictionaryKey(&NSString::from_str(key))?;
+        value.downcast::<NSString>().ok().map(|v| v.to_string())
+    }
+}
+
+#[cfg(not(all(target_os = "ios", feature = "application")))]
+mod system {
+    pub(super) fn setting(_key: &str) -> Option<String> {
+        None
+    }
+
+    pub(super) fn bundled(_key: &str) -> Option<String> {
+        None
     }
 }
 
@@ -167,6 +223,10 @@ pub(crate) fn token_file(host: &dyn Host) -> Option<PathBuf> {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TokenFrom {
     Environment,
+    /// The system's settings page for the application.
+    Settings,
+    /// Written into the bundle at build time.
+    Bundle,
     File(PathBuf),
 }
 
@@ -189,17 +249,27 @@ fn token_line(text: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
-/// Finds the token: the environment if it has one, the person's file if not.
+/// Finds the token, first found wins:
 ///
-/// A variable that is set but empty counts as unset — it is what an unfilled
-/// template exports, and "the token is the empty string" helps nobody.
+/// 1. the environment variable — what a command line said;
+/// 2. the system's settings page (a phone's *Settings › Tuile*), under the
+///    variable's name — what the person typed there;
+/// 3. a value written into the bundle at build time (a developer's own
+///    device only — see [`bundled_key`]);
+/// 4. the person's file ([`token_file`]).
+///
+/// A value that is set but blank counts as unset — it is what an unfilled
+/// template, or a settings field cleared by hand, holds.
 pub(crate) fn token(host: &dyn Host, variable: &str) -> Result<(String, TokenFrom), MissingToken> {
-    if let Some(token) = host
-        .var(variable)
-        .map(|t| t.trim().to_owned())
-        .filter(|t| !t.is_empty())
-    {
+    let filled = |v: Option<String>| v.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty());
+    if let Some(token) = filled(host.var(variable)) {
         return Ok((token, TokenFrom::Environment));
+    }
+    if let Some(token) = filled(host.setting(variable)) {
+        return Ok((token, TokenFrom::Settings));
+    }
+    if let Some(token) = filled(host.bundled(&bundled_key(variable))) {
+        return Ok((token, TokenFrom::Bundle));
     }
     let file = token_file(host);
     let found = file
@@ -239,6 +309,8 @@ mod tests {
         files: HashMap<PathBuf, &'static str>,
         macos: bool,
         handheld: bool,
+        settings: HashMap<String, &'static str>,
+        bundle: HashMap<String, &'static str>,
     }
 
     impl Host for Fake {
@@ -260,6 +332,14 @@ mod tests {
         fn is_handheld(&self) -> bool {
             self.handheld
         }
+
+        fn setting(&self, key: &str) -> Option<String> {
+            self.settings.get(key).map(|v| (*v).to_owned())
+        }
+
+        fn bundled(&self, key: &str) -> Option<String> {
+            self.bundle.get(key).map(|v| (*v).to_owned())
+        }
     }
 
     const TOKEN_VARIABLE: &str = "SOME_TOKEN";
@@ -273,6 +353,7 @@ mod tests {
             files: file.map(|t| (PathBuf::from(FILE), t)).into_iter().collect(),
             macos: true,
             handheld: false,
+            ..Fake::default()
         }
     }
 
@@ -415,6 +496,7 @@ mod tests {
                 .collect(),
             macos: true,
             handheld: true,
+            ..Fake::default()
         };
         assert_eq!(
             token(&phone(Some("abc.def\n")), TOKEN_VARIABLE),
@@ -434,6 +516,98 @@ mod tests {
             last_view_file(&phone(None)),
             Some(format!("{HOME}/Library/Application Support/Tuile/last-view").into())
         );
+    }
+
+    /// Environment, then the settings page, then the bundle, then the
+    /// file: each one wins over everything after it, and a blank one is
+    /// passed over.
+    #[test]
+    fn the_token_is_looked_for_in_order() {
+        const HOME: &str = "/var/mobile/Containers/Data/Application/ABCD";
+        let file = PathBuf::from(format!("{HOME}/Documents/token"));
+        let phone = |env: Option<&'static str>,
+                     setting: Option<&'static str>,
+                     bundle: Option<&'static str>,
+                     in_file: Option<&'static str>| {
+            let mut vars: HashMap<_, _> = [("HOME", HOME)].into_iter().collect();
+            if let Some(v) = env {
+                vars.insert(TOKEN_VARIABLE, v);
+            }
+            Fake {
+                vars,
+                files: in_file.map(|t| (file.clone(), t)).into_iter().collect(),
+                macos: true,
+                handheld: true,
+                settings: setting
+                    .map(|t| (TOKEN_VARIABLE.to_owned(), t))
+                    .into_iter()
+                    .collect(),
+                bundle: bundle
+                    .map(|t| (bundled_key(TOKEN_VARIABLE), t))
+                    .into_iter()
+                    .collect(),
+            }
+        };
+        let got = |h: Fake| token(&h, TOKEN_VARIABLE);
+        assert_eq!(
+            got(phone(Some("e"), Some("s"), Some("b"), Some("f"))),
+            Ok(("e".into(), TokenFrom::Environment))
+        );
+        assert_eq!(
+            got(phone(None, Some("s"), Some("b"), Some("f"))),
+            Ok(("s".into(), TokenFrom::Settings))
+        );
+        assert_eq!(
+            got(phone(None, Some("  "), Some("b"), Some("f"))),
+            Ok(("b".into(), TokenFrom::Bundle)),
+            "a cleared settings field falls through"
+        );
+        assert_eq!(
+            got(phone(None, None, Some(""), Some("f\n"))),
+            Ok(("f".into(), TokenFrom::File(file.clone())))
+        );
+        assert_eq!(
+            got(phone(None, None, None, None)),
+            Err(MissingToken { file: Some(file) })
+        );
+    }
+
+    /// Wherever the token came from, what is said about it — the log line
+    /// and the reason a session gives — never contains it.
+    #[test]
+    fn the_token_is_never_in_a_log_line() {
+        const SECRET: &str = "eyJhbGciOiJIUzI1NiJ9.secret-part.signature";
+        #[derive(Clone, Default)]
+        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut host = mac(&[], None);
+            host.settings.insert(TOKEN_VARIABLE.to_owned(), SECRET);
+            let (found, from) = token(&host, TOKEN_VARIABLE).expect("found");
+            assert_eq!(found, SECRET);
+            tracing::info!("access token from {from:?}");
+            host.settings.clear();
+            host.bundle.insert(bundled_key(TOKEN_VARIABLE), SECRET);
+            let (_, from) = token(&host, TOKEN_VARIABLE).expect("found");
+            tracing::info!("access token from {from:?}");
+        });
+        let log = String::from_utf8(captured.0.lock().expect("log").clone()).expect("utf-8");
+        assert!(log.contains("Settings") && log.contains("Bundle"), "{log}");
+        assert!(!log.contains("secret-part"), "the token reached the log");
     }
 
     #[test]

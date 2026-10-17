@@ -196,14 +196,97 @@ fn asset_catalogue(master: &image::RgbaImage, out: &Path) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Writes `Info.plist` and the asset catalogue under `out`.
+/// A credential the application reads: the environment variable it is
+/// named after, what the settings page calls it, and — for a developer's own
+/// device only — a value to write into the bundle.
+pub(crate) struct Credential {
+    /// The variable's name: `CESIUM_ION_TOKEN`. Also the settings key.
+    pub variable: String,
+    /// What the settings page shows: `Cesium ion token`.
+    pub title: String,
+    /// A build-time default, written into `Info.plist`.
+    ///
+    /// **Anything in a bundle can be read back out of the `.app`.** This is
+    /// for builds that never leave the developer's own device; a build for
+    /// the App Store, TestFlight or anyone else must not carry one.
+    pub bundled: Option<String>,
+}
+
+/// The `Info.plist` key a bundled credential is written under. The viewer
+/// reads the same key (`tuile_viewer` `host::bundled_key`).
+pub(crate) fn bundled_key(variable: &str) -> String {
+    format!("TuileBundledCredential_{variable}")
+}
+
+/// The settings page: one secure text field for the credential, under the
+/// key the application reads first.
+fn settings_bundle(credential: &Credential, out: &Path) -> anyhow::Result<()> {
+    use plist::Value::{Array, Boolean, Dictionary, String as Text};
+    let settings = out.join("Settings.bundle");
+    if settings.exists() {
+        std::fs::remove_dir_all(&settings)?;
+    }
+    std::fs::create_dir_all(&settings)?;
+    let text = |s: &str| Text(s.to_owned());
+    let mut group = plist::Dictionary::new();
+    group.insert("Type".into(), text("PSGroupSpecifier"));
+    group.insert("Title".into(), text("Access"));
+    group.insert(
+        "FooterText".into(),
+        text(
+            "Read first, before any token built into the application and before \
+             the file \"token\" in Files.",
+        ),
+    );
+    let mut field = plist::Dictionary::new();
+    for (key, value) in [
+        ("Type", text("PSTextFieldSpecifier")),
+        ("Title", text(&credential.title)),
+        ("Key", text(&credential.variable)),
+        ("IsSecure", Boolean(true)),
+        ("KeyboardType", text("Alphabet")),
+        ("AutocapitalizationType", text("None")),
+        ("AutocorrectionType", text("No")),
+        ("DefaultValue", text("")),
+    ] {
+        field.insert(key.into(), value);
+    }
+    let mut root = plist::Dictionary::new();
+    root.insert(
+        "PreferenceSpecifiers".into(),
+        Array(vec![Dictionary(group), Dictionary(field)]),
+    );
+    Dictionary(root).to_file_xml(settings.join("Root.plist"))?;
+    Ok(())
+}
+
+/// Writes `Info.plist`, the asset catalogue and — with a credential — the
+/// settings page under `out`.
 pub(crate) fn resources(
     bundle: &Bundle,
     master: &image::RgbaImage,
     out: &Path,
+    credential: Option<&Credential>,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(out)?;
-    info_plist(bundle, env!("CARGO_PKG_VERSION")).to_file_xml(out.join("Info.plist"))?;
+    let mut info = info_plist(bundle, env!("CARGO_PKG_VERSION"));
+    if let Some(credential) = credential {
+        settings_bundle(credential, out)?;
+        if let (Some(value), Some(dict)) = (
+            credential
+                .bundled
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty()),
+            info.as_dictionary_mut(),
+        ) {
+            dict.insert(
+                bundled_key(&credential.variable),
+                plist::Value::String(value.to_owned()),
+            );
+        }
+    }
+    info.to_file_xml(out.join("Info.plist"))?;
     asset_catalogue(master, out)
 }
 
@@ -317,10 +400,87 @@ mod tests {
         );
     }
 
+    /// The settings page has one secure field under the variable's name;
+    /// a bundled default lands under the key the viewer reads, and only when
+    /// there is one — a build without it carries no such key at all.
+    #[test]
+    fn the_credential_is_a_settings_field_and_optionally_a_bundled_default() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let credential = |bundled: Option<&str>| Credential {
+            variable: "SOME_TOKEN".into(),
+            title: "Some token".into(),
+            bundled: bundled.map(str::to_owned),
+        };
+        resources(
+            &Bundle::default(),
+            &crate::icon::draw(64),
+            dir.path(),
+            Some(&credential(None)),
+        )
+        .expect("written");
+        let root = plist::Value::from_file(dir.path().join("Settings.bundle/Root.plist"))
+            .expect("a settings page");
+        let fields = root
+            .as_dictionary()
+            .and_then(|d| d.get("PreferenceSpecifiers"))
+            .and_then(plist::Value::as_array)
+            .expect("specifiers");
+        let field = fields
+            .iter()
+            .filter_map(plist::Value::as_dictionary)
+            .find(|f| {
+                f.get("Type").and_then(plist::Value::as_string) == Some("PSTextFieldSpecifier")
+            })
+            .expect("a text field");
+        assert_eq!(
+            field.get("Key").and_then(plist::Value::as_string),
+            Some("SOME_TOKEN")
+        );
+        assert_eq!(
+            field.get("IsSecure").and_then(plist::Value::as_boolean),
+            Some(true)
+        );
+        let info = plist::Value::from_file(dir.path().join("Info.plist")).expect("a plist");
+        let key = bundled_key("SOME_TOKEN");
+        assert!(info.as_dictionary().is_some_and(|d| !d.contains_key(&key)));
+
+        for blank in ["", "  "] {
+            resources(
+                &Bundle::default(),
+                &crate::icon::draw(64),
+                dir.path(),
+                Some(&credential(Some(blank))),
+            )
+            .expect("written");
+            let info = plist::Value::from_file(dir.path().join("Info.plist")).expect("a plist");
+            assert!(
+                info.as_dictionary().is_some_and(|d| !d.contains_key(&key)),
+                "{blank:?}"
+            );
+        }
+        resources(
+            &Bundle::default(),
+            &crate::icon::draw(64),
+            dir.path(),
+            Some(&credential(Some("abc.def\n"))),
+        )
+        .expect("written");
+        let info = plist::Value::from_file(dir.path().join("Info.plist")).expect("a plist");
+        assert_eq!(
+            info.as_dictionary()
+                .and_then(|d| d.get(&key))
+                .and_then(plist::Value::as_string),
+            Some("abc.def")
+        );
+        // The viewer reads the same key.
+        assert!(include_str!("../../tuile-viewer/src/host.rs")
+            .contains("format!(\"TuileBundledCredential_{variable}\")"));
+    }
+
     #[test]
     fn the_resources_are_a_plist_and_a_catalogue() {
         let dir = tempfile::tempdir().expect("a temporary directory");
-        resources(&Bundle::default(), &crate::icon::draw(64), dir.path()).expect("written");
+        resources(&Bundle::default(), &crate::icon::draw(64), dir.path(), None).expect("written");
         let read_back = plist::Value::from_file(dir.path().join("Info.plist")).expect("a plist");
         assert_eq!(
             read_back,

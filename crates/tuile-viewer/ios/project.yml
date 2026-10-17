@@ -26,6 +26,9 @@ targets:
     sources:
       - path: Generated/Assets.xcassets
         buildPhase: resources
+      # The settings page: the access token, typed by the person.
+      - path: Generated/Settings.bundle
+        buildPhase: resources
     settings:
       base:
         PRODUCT_NAME: Tuile

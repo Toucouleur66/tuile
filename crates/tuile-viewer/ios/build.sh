@@ -20,8 +20,33 @@ kind="${1:-simulator}"
 then="${2:-}"
 identifier="dev.lapoule.tuile.viewer"
 
-cargo run --quiet --manifest-path "$workspace/Cargo.toml" -p tuile-viewer-bundle -- \
-  phone --out "$here/Generated"
+# The access token: typed by the person in Settings › Tuile, or — for a
+# device build on the developer's own phone only — built into the bundle from
+# TUILE_ION_TOKEN, taken from the environment or from the workspace's `.env`
+# (a worktree's main checkout's, failing that). Anything in a bundle can be
+# read back out of the .app: never for a build that leaves this desk. The value
+# is never printed, never an argument, and never reaches xcodebuild's
+# environment, which it dumps into its log.
+credential=(--credential CESIUM_ION_TOKEN --credential-title "Cesium ion token")
+bundled=""
+if [[ "$kind" == device ]]; then
+  bundled="${TUILE_ION_TOKEN:-}"
+  common="$(git -C "$workspace" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+  for envfile in "${TUILE_ENV_FILE:-}" "$workspace/.env" "${common:+$common/../.env}"; do
+    [[ -n "$bundled" || -z "$envfile" || ! -f "$envfile" ]] && continue
+    bundled="$(sed -n 's/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}TUILE_ION_TOKEN=//p' "$envfile" \
+      | tail -n 1 | sed "s/^[\"']//; s/[\"']\$//")"
+  done
+fi
+if [[ -n "$bundled" ]]; then
+  echo "note: a token is built into this bundle — for this developer's own device only" >&2
+  TUILE_BUNDLED_CREDENTIAL="$bundled" cargo run --quiet --manifest-path "$workspace/Cargo.toml" \
+    -p tuile-viewer-bundle -- phone --out "$here/Generated" "${credential[@]}"
+else
+  cargo run --quiet --manifest-path "$workspace/Cargo.toml" -p tuile-viewer-bundle -- \
+    phone --out "$here/Generated" "${credential[@]}"
+fi
+unset bundled TUILE_ION_TOKEN
 (cd "$here" && xcodegen generate --quiet)
 
 case "$kind" in
@@ -45,7 +70,8 @@ case "$kind" in
     ;;
 esac
 
-xcodebuild -project "$here/Tuile.xcodeproj" -scheme Tuile -configuration Release \
+env -u TUILE_ION_TOKEN -u TUILE_BUNDLED_CREDENTIAL -u CESIUM_ION_TOKEN \
+  xcodebuild -project "$here/Tuile.xcodeproj" -scheme Tuile -configuration Release \
   -destination "$destination" -derivedDataPath "$here/build" -quiet \
   "${signing[@]}" build
 app="$here/build/Build/Products/$products/Tuile.app"

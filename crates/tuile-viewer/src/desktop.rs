@@ -369,7 +369,7 @@ mod system {
     use std::sync::mpsc::{channel, Receiver};
 
     use objc2::rc::Retained;
-    use objc2::MainThreadMarker;
+    use objc2::{ClassType, MainThreadMarker};
     use objc2_foundation::NSString;
     use objc2_ui_kit::{
         UIAlertAction, UIAlertActionStyle, UIAlertController, UIAlertControllerStyle,
@@ -393,7 +393,13 @@ mod system {
     /// The window's root view controller: what an alert is presented on, and
     /// whose view the caption is laid over.
     fn root(mtm: MainThreadMarker) -> Option<Retained<UIViewController>> {
-        let app = UIApplication::sharedApplication(mtm);
+        let _ = mtm;
+        // SAFETY: a class method with no arguments, on the main thread. Asked
+        // for as an `Option` rather than through the binding, which panics on
+        // the null it returns before the system's loop has started.
+        let app: Option<Retained<UIApplication>> =
+            unsafe { objc2::msg_send![UIApplication::class(), sharedApplication] };
+        let app = app?;
         #[allow(deprecated)]
         let window = app.keyWindow()?;
         window.rootViewController()
