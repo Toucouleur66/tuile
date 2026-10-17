@@ -100,9 +100,13 @@ pub fn draw_to_surface(
         }
         wgpu::CurrentSurfaceTexture::Validation => return Presented::Invalid,
     };
-    let drawable = frame
-        .texture
-        .create_view(&wgpu::TextureViewDescriptor::default());
+    // Viewed in the format the frame is drawn in, which is the surface's own
+    // format everywhere but a browser: there the canvas is linear and the
+    // frame is resolved into an sRGB view of it. See [`surface_format`].
+    let drawable = frame.texture.create_view(&wgpu::TextureViewDescriptor {
+        format: Some(targets.format()),
+        ..Default::default()
+    });
 
     let mut encoder = gpu.device.create_command_encoder(&Default::default());
     {
@@ -162,4 +166,81 @@ pub fn preferred_format(caps: &wgpu::SurfaceCapabilities) -> wgpu::TextureFormat
         .copied()
         .find(wgpu::TextureFormat::is_srgb)
         .unwrap_or(caps.formats[0])
+}
+
+/// The formats a host configures a surface with, and draws in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SurfaceFormat {
+    /// What the surface is configured with.
+    pub surface: wgpu::TextureFormat,
+    /// What the frame is drawn in: the pipelines and [`FrameTargets`] are
+    /// built for it. When it differs from [`SurfaceFormat::surface`] it is the
+    /// sRGB view of it, and the host must list it in the configuration's
+    /// `view_formats`.
+    pub render: wgpu::TextureFormat,
+}
+
+impl SurfaceFormat {
+    /// The `view_formats` the surface configuration must carry.
+    pub fn view_formats(&self) -> Vec<wgpu::TextureFormat> {
+        if self.render == self.surface {
+            Vec::new()
+        } else {
+            vec![self.render]
+        }
+    }
+}
+
+/// [`preferred_format`], for surfaces that offer no sRGB format at all.
+///
+/// A browser's canvas is one: WebGPU configures it as `bgra8unorm` or
+/// `rgba8unorm` and nothing else, and drawing into that linear format writes
+/// every colour without its transfer curve — the washed-out globe
+/// [`preferred_format`] exists to prevent. The answer there is to keep the
+/// linear surface and draw into its sRGB *view*, which every backend allows.
+pub fn surface_format(caps: &wgpu::SurfaceCapabilities) -> SurfaceFormat {
+    let surface = preferred_format(caps);
+    SurfaceFormat {
+        surface,
+        render: surface.add_srgb_suffix(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn caps(formats: &[wgpu::TextureFormat]) -> wgpu::SurfaceCapabilities {
+        wgpu::SurfaceCapabilities {
+            formats: formats.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    /// Where an sRGB format is on offer it is used as it is: the desktop and
+    /// the phone configure exactly what they always did.
+    #[test]
+    fn an_offered_srgb_format_is_drawn_in_directly() {
+        let chosen = surface_format(&caps(&[
+            wgpu::TextureFormat::Bgra8Unorm,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+        ]));
+        assert_eq!(chosen.surface, wgpu::TextureFormat::Bgra8UnormSrgb);
+        assert_eq!(chosen.render, chosen.surface);
+        assert!(chosen.view_formats().is_empty());
+    }
+
+    /// A canvas that only offers linear formats is drawn into through its
+    /// sRGB view, never written linear.
+    #[test]
+    fn a_linear_only_surface_is_drawn_through_its_srgb_view() {
+        let chosen = surface_format(&caps(&[
+            wgpu::TextureFormat::Bgra8Unorm,
+            wgpu::TextureFormat::Rgba16Float,
+        ]));
+        assert_eq!(chosen.surface, wgpu::TextureFormat::Bgra8Unorm);
+        assert_eq!(chosen.render, wgpu::TextureFormat::Bgra8UnormSrgb);
+        assert!(chosen.render.is_srgb());
+        assert_eq!(chosen.view_formats(), [wgpu::TextureFormat::Bgra8UnormSrgb]);
+    }
 }

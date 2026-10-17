@@ -6931,6 +6931,7 @@ dependencies = [
  "futures-util",
  "glam 0.33.1",
  "image",
+ "naga",
  "pollster",
  "thiserror 2.0.18",
  "tracing",

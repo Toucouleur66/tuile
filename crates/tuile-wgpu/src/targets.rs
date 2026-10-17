@@ -60,6 +60,12 @@ impl FrameTargets {
     pub fn size(&self) -> (u32, u32) {
         self.size
     }
+
+    /// The colour format the frame is drawn in — and so the format the
+    /// drawable it resolves into is viewed as.
+    pub fn format(&self) -> wgpu::TextureFormat {
+        self.format
+    }
 }
 
 fn attachment(
