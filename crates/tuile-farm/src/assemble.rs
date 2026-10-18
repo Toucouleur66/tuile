@@ -171,14 +171,14 @@ pub async fn assemble(
         })?;
     // Segments in parallel, each itself in parallel ranges: the store's own
     // concurrency bounds the parts in flight per segment, four segments at a
-    // time bound the whole.
+    // time (`TUILE_ASSEMBLE_SEGMENTS`) bound the whole.
     let locals: Vec<PathBuf> = stream::iter(segments.iter().copied())
         .map(|g| async move {
             let local = work.join(format!("seg{g}.mp4"));
             store.get(&run.segment(g), &local).await?;
             Ok::<_, StoreError>(local)
         })
-        .buffered(4)
+        .buffered(crate::assemble_segments())
         .try_collect()
         .await?;
 

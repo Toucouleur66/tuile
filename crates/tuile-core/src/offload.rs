@@ -103,8 +103,16 @@ pub struct ThreadPool {
 impl ThreadPool {
     /// Sized from the machine: one thread per core, less one, at least one.
     pub fn sized_to_machine() -> Self {
+        Self::with_threads(Self::machine_threads())
+    }
+
+    /// The thread count [`sized_to_machine`](Self::sized_to_machine) uses: one
+    /// per core, less one, at least one. Public so a host that lets its
+    /// operator choose the count (from its own configuration — the core reads
+    /// none) keeps this as the default.
+    pub fn machine_threads() -> usize {
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-        Self::with_threads(cores.saturating_sub(1).max(1))
+        cores.saturating_sub(1).max(1)
     }
 
     /// `threads` workers, named so they are legible in a profiler — which is

@@ -41,14 +41,34 @@ pub const BANDS: [u64; 2] = [0, 1 << 60];
 
 /// An extract goes into the bucket in parts of this size…
 pub const PUT_PART_BYTES: usize = 32 << 20;
-/// …this many of them in flight at once.
+/// …this many of them in flight at once, unless `TUILE_EXTRACT_PUT_PARTS`
+/// says.
 const PUT_PARTS_AT_ONCE: usize = 8;
 
-/// Tiles of one archive read at once, each by its own range.
+/// Tiles of one archive read at once, each by its own range, unless
+/// `TUILE_EXTRACT_TILES` says.
 const TILES_AT_ONCE: usize = 32;
 
-/// Zones read at once while extracting.
+/// Zones read at once while extracting, unless `TUILE_EXTRACT_ZONES` says.
 const ZONES_AT_ONCE: usize = 16;
+
+/// [`PUT_PARTS_AT_ONCE`], or what the environment says, read once.
+fn put_parts_at_once() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    crate::knob::count(&N, "TUILE_EXTRACT_PUT_PARTS", PUT_PARTS_AT_ONCE)
+}
+
+/// [`TILES_AT_ONCE`], or what the environment says, read once.
+fn tiles_at_once() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    crate::knob::count(&N, "TUILE_EXTRACT_TILES", TILES_AT_ONCE)
+}
+
+/// [`ZONES_AT_ONCE`], or what the environment says, read once.
+fn zones_at_once() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    crate::knob::count(&N, "TUILE_EXTRACT_ZONES", ZONES_AT_ONCE)
+}
 
 /// What an extract holds.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -195,7 +215,7 @@ impl TileStore {
                         let (layer, keep) = (layer.clone(), keep.clone());
                         async move { self.extract_zone(&layer, zone, &keep).await }
                     })
-                    .buffer_unordered(ZONES_AT_ONCE)
+                    .buffer_unordered(zones_at_once())
                     .try_collect()
                     .await?;
             // Zones do not share tiles, nor bands layers: the maps join
@@ -335,7 +355,7 @@ impl TileStore {
                         Ok::<_, StoreError>((id, tile))
                     }
                 })
-                .buffer_unordered(TILES_AT_ONCE)
+                .buffer_unordered(tiles_at_once())
                 .try_collect()
                 .await?;
             for (id, tile) in found {
@@ -384,7 +404,7 @@ impl TileStore {
                         }
                     }
                 })
-                .buffered(ZONES_AT_ONCE)
+                .buffered(zones_at_once())
                 .try_collect()
                 .await?;
         let mut tiles = BTreeMap::new();
@@ -440,7 +460,7 @@ async fn put_file(
         if filled == 0 {
             break;
         }
-        if let Err(e) = writer.wait_for_capacity(PUT_PARTS_AT_ONCE).await {
+        if let Err(e) = writer.wait_for_capacity(put_parts_at_once()).await {
             let _ = writer.abort().await;
             return Err(e.into());
         }

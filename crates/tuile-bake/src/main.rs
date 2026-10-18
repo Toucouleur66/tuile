@@ -349,6 +349,15 @@ environment:
                      bouton d'un balayage machine, qui doit pouvoir répondre
                      « ce qu'un autre seuil aurait sélectionné » sans qu'on
                      reconstruise une image pour chaque valeur
+  TUILE_SESSION_THREADS     session runtime workers (default: one per core)
+  TUILE_TILES_THREADS       tile store runtime workers (default 2)
+  TUILE_DECODE_THREADS      decode and resample threads (default: cores - 1)
+  TUILE_FINISH_THREADS      tile finishing threads (default: one per core)
+  TUILE_FETCHES             tile requests in flight (default 64)
+  TUILE_HTTP_IDLE_PER_HOST  keep-alive connections per host (default 64)
+  TUILE_PROJECTION_ZONES, TUILE_PROJECTION_RANGES, TUILE_FLUSH_ZONES,
+  TUILE_UPLOAD_PARTS, TUILE_DEDUP, TUILE_EXTRACT_ZONES, TUILE_EXTRACT_TILES,
+  TUILE_EXTRACT_PUT_PARTS   tile store concurrency (defaults in tuile-tile-server)
   TUILE_*            every traversal knob the render honours is honoured here,
                      because they are read by the same code — and a pack is the
                      bake of the settings it was made with, not of the defaults

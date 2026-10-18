@@ -737,7 +737,7 @@ async fn lanes_then_film(
             store.get(&keys.segment(part), &local).await?;
             Ok::<_, StoreError>(local)
         })
-        .buffered(4)
+        .buffered(crate::assemble_segments())
         .collect::<Vec<_>>()
         .await
         .into_iter()

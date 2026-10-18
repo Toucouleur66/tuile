@@ -92,12 +92,24 @@ pub const DEFAULT_PUBLISH_ATTEMPTS: usize = 64;
 // Transfer and merge tuning.
 
 /// Zones flushed at once: each is an upload and a conditional publication,
-/// mostly waiting on the network.
+/// mostly waiting on the network. `TUILE_FLUSH_ZONES` overrides it.
 pub const FLUSH_IN_FLIGHT: usize = 16;
 /// Part size of a multipart upload.
 const UPLOAD_PART: usize = 8 * MIB;
-/// Parts of one upload in flight at once.
+/// Parts of one upload in flight at once, unless `TUILE_UPLOAD_PARTS` says.
 const UPLOAD_PARTS_IN_FLIGHT: usize = 8;
+
+/// [`FLUSH_IN_FLIGHT`], or what the environment says, read once.
+fn flush_in_flight() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    crate::knob::count(&N, "TUILE_FLUSH_ZONES", FLUSH_IN_FLIGHT)
+}
+
+/// [`UPLOAD_PARTS_IN_FLIGHT`], or what the environment says, read once.
+fn upload_parts_in_flight() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    crate::knob::count(&N, "TUILE_UPLOAD_PARTS", UPLOAD_PARTS_IN_FLIGHT)
+}
 /// Read size when streaming a local archive to the bucket.
 const UPLOAD_READ: usize = MIB;
 /// Tiles queued between the merge stream and the synchronous writer.
@@ -292,8 +304,15 @@ struct Manifests {
 /// Zones remembered as already prefetched, so a busy zone does not schedule
 /// its neighbours on every read.
 const PREFETCHED_ZONES: u64 = 100_000;
-/// Tiles of one publication checked against the store at once.
+/// Tiles of one publication checked against the store at once, unless
+/// `TUILE_DEDUP` says.
 const DEDUP_IN_FLIGHT: usize = 32;
+
+/// [`DEDUP_IN_FLIGHT`], or what the environment says, read once.
+fn dedup_in_flight() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    crate::knob::count(&N, "TUILE_DEDUP", DEDUP_IN_FLIGHT)
+}
 
 /// Tiles of every configured layer, kept in an object store.
 pub struct TileStore {
@@ -1160,7 +1179,8 @@ impl TileStore {
         Ok(due.len())
     }
 
-    /// Flushes every non-empty buffer, [`FLUSH_IN_FLIGHT`] zones at a time.
+    /// Flushes every non-empty buffer, [`FLUSH_IN_FLIGHT`] zones at a time (or
+    /// what `TUILE_FLUSH_ZONES` says).
     pub async fn flush_all(&self) -> Result<usize, StoreError> {
         let keys: Vec<ZoneKey> = {
             let buffers = self.buffers.lock().map_err(|_| StoreError::Poisoned)?;
@@ -1172,7 +1192,7 @@ impl TileStore {
         };
         let results: Vec<Result<(), StoreError>> = futures_util::stream::iter(keys.clone())
             .map(|key| async move { self.flush_zone(&key).await })
-            .buffer_unordered(FLUSH_IN_FLIGHT)
+            .buffer_unordered(flush_in_flight())
             .collect()
             .await;
         // Every zone was attempted; the first failure is the one reported.
@@ -1478,7 +1498,7 @@ impl TileStore {
                 };
                 (id, keep)
             })
-            .buffer_unordered(DEDUP_IN_FLIGHT)
+            .buffer_unordered(dedup_in_flight())
             .collect()
             .await;
         let dropped = verdicts.iter().filter(|(_, keep)| !keep).count() as u64;
@@ -2246,7 +2266,7 @@ async fn upload(
         if n == 0 {
             break;
         }
-        writer.wait_for_capacity(UPLOAD_PARTS_IN_FLIGHT).await?;
+        writer.wait_for_capacity(upload_parts_in_flight()).await?;
         writer.write(&buf[..n]);
     }
     writer.finish().await?;
