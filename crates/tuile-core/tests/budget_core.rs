@@ -705,6 +705,29 @@ mod generations {
         assert_eq!(a, b);
     }
 
+    /// C25, §4.5.5: two contradictory arrivals for one load (a result and a
+    /// failure) resolve the same whatever order they came in: the result.
+    #[test]
+    fn contradictory_arrivals_resolve_the_same_whatever_their_order() {
+        let run = |failure_first: bool| {
+            let mut r = Rig::interactive();
+            let a = t(3, 2, 2);
+            let s = *r.step(&drawn(&[a])).start.first().expect(RED);
+            if failure_first {
+                r.b.on_failed(mesh(a), s.gen, Failure::Transient);
+                r.b.on_loaded(mesh(a), s.gen, est(mesh(a)));
+            } else {
+                r.b.on_loaded(mesh(a), s.gen, est(mesh(a)));
+                r.b.on_failed(mesh(a), s.gen, Failure::Transient);
+            }
+            let d = r.step(&drawn(&[a]));
+            (d.digest(), r.b.resource(mesh(a)).map(|v| v.state))
+        };
+        let (a, b) = (run(true), run(false));
+        assert_eq!(a, b);
+        assert_eq!(a.1, Some(ResourceState::InTransit));
+    }
+
     /// §3: an arrival changes nothing until the next step.
     #[test]
     fn an_arrival_changes_nothing_until_the_next_step() {
