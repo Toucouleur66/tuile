@@ -5,8 +5,10 @@
 //! templates it listed — answered by asset number, as every host's are.
 //!
 //! The catalog is the connector's ([`tuile_cesium_ion::IonSources`]), over
-//! the browser's `fetch`. A template layer is answered here, by the number
-//! [`SourcesSpec::choices`] gave it.
+//! the browser's `fetch`, asked through the proxy the page names — which holds
+//! the catalog's token, so that the page never does (see
+//! `tuile_cesium_ion::proxy`). A template layer is answered here, by the
+//! number [`SourcesSpec::choices`] gave it.
 
 use std::sync::Arc;
 
@@ -26,16 +28,10 @@ pub(crate) struct PageSources {
 }
 
 impl PageSources {
-    /// Over `spec`, with `token` as the catalog's bearer.
-    pub(crate) fn new(spec: SourcesSpec, token: Option<String>) -> Result<Self, String> {
-        let mut catalog = IonSources::new(
-            Arc::new(WebIonHttp),
-            Arc::new(WebFetcher),
-            token.unwrap_or_default(),
-        );
-        if let Some(base) = spec.catalog_base()? {
-            catalog = catalog.with_api_base(base);
-        }
+    /// Over `spec`, through the catalog proxy it names, with no token.
+    pub(crate) fn new(spec: SourcesSpec) -> Result<Self, String> {
+        let catalog = IonSources::new(Arc::new(WebIonHttp), Arc::new(WebFetcher), "")
+            .with_api_base(spec.catalog_base()?);
         Ok(Self { catalog, spec })
     }
 }

@@ -18,12 +18,11 @@ use super::options::{ProfileChoice, SourcesSpec};
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub(crate) enum ToWorker {
     /// Bring the session up: the sources, which terrain and layers, the
-    /// numbers to run with. The token is the catalog's bearer; it is used and
-    /// never logged.
+    /// numbers to run with. No credential: the catalog is a proxy that holds
+    /// its own.
     #[serde(rename_all = "camelCase")]
     Start {
         sources: SourcesSpec,
-        token: Option<String>,
         opening: usize,
         profile: ProfileChoice,
         device_memory: Option<f64>,

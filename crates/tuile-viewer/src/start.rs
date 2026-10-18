@@ -16,9 +16,9 @@
 
 use tuile_camera::GlobeCamera;
 
-/// What `--help` prints. The keys are listed with the flags because this is the
-/// only text the binary can show before a window exists.
-const USAGE: &str = "\
+/// What `--help` prints before the keys. The keys are listed with the flags
+/// because this is the only text the binary can show before a window exists.
+const FLAGS_TEXT: &str = "\
 FLAGS_HEADER
 
 FLAGS (each takes one number; `--flag value` or `--flag=value`):
@@ -33,7 +33,11 @@ FLAGS (each takes one number; `--flag value` or `--flag=value`):
     --imagery <name>   the imagery layer to open on, by key or by name
 IMAGERY_LAYERS
     -h, --help         print this and exit
+";
 
+/// The keys, the same in a window and on a page — but for the last line,
+/// which only an application that is its own window answers.
+const KEYS: &str = "\
 KEYS:
     drag               move the globe under the cursor
     right-drag         tilt (vertical) and turn (horizontal)
@@ -47,8 +51,22 @@ KEYS:
     W                  wireframe
     D                  cycle the diagnostic views
     F                  freeze the traversal
-    Esc                quit
+";
 
+/// What only an application that is its own window answers.
+const QUIT: &str = "    Esc                quit\n";
+
+/// The gestures, where there is a touch screen to make them on.
+const TOUCH: &str = "\
+TOUCH:
+    one finger         move the globe under it
+    two fingers        pinch to zoom, twist to turn, slide together to tilt
+    double tap         zoom in
+    finger held still  centre on the current location
+";
+
+/// What `--help` ends on.
+const ELSEWHERE: &str = "
 Everything else a session is started with is an environment variable; see the
 header of `settings.rs`. A running viewer is steered with URLs of its own
 scheme (see the header of `steer.rs`) and, as the macOS application, by
@@ -77,10 +95,20 @@ pub(crate) fn usage() -> String {
             )
         })
         .collect();
-    USAGE
+    format!("{FLAGS_TEXT}\n{KEYS}{QUIT}{ELSEWHERE}")
         .replace("IMAGERY_LAYERS\n", &format!("{}\n", layers.join("\n")))
         .replace("FLAGS_HEADER\n", &head)
         .replace("tuile://", &format!("{}://", identity.scheme))
+}
+
+/// The keys and gestures a viewer in a page answers: no flags, since a page
+/// is started by its host's script, and no Esc, since the page is not the
+/// viewer's to close.
+pub(crate) fn keys() -> String {
+    format!("{KEYS}\n{TOUCH}").replace(
+        "tuile://",
+        &format!("{}://", crate::embed::identity().scheme),
+    )
 }
 
 /// The view a session opens on, in the units a person types: degrees and
@@ -136,7 +164,12 @@ impl StartView {
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn remembered(host: &dyn crate::host::Host) -> Option<StartView> {
     let file = crate::host::last_view_file(host)?;
-    let text = host.read(&file).ok()?;
+    view_in_link(&host.read(&file).ok()?)
+}
+
+/// The view a remembered link describes — the whole of one, and nothing
+/// else: a link that is not a single complete `goto` is no view.
+pub(crate) fn view_in_link(text: &str) -> Option<StartView> {
     match crate::steer::parse_url(text.trim()).ok()?.as_slice() {
         [crate::steer::Command::Goto(goto)] => Some(StartView {
             lon: goto.lon?,
@@ -542,7 +575,7 @@ mod tests {
         ] {
             assert!(parse(bad).is_err(), "{bad:?}");
         }
-        assert!(USAGE.contains("--imagery"));
+        assert!(FLAGS_TEXT.contains("--imagery"));
     }
 
     #[test]
@@ -566,12 +599,53 @@ mod tests {
         }
     }
 
+    /// A page's help lists every key the window answers and every gesture,
+    /// and neither the flags nor Esc, which a page's viewer does not have.
+    #[test]
+    fn a_pages_help_is_the_keys_and_the_gestures_only() {
+        let keys = keys();
+        for (key, _) in crate::menu::KEYS {
+            let shown = format!("    {}  ", key.to_ascii_uppercase());
+            assert!(keys.contains(&shown), "{key:?} is not in a page's help");
+            assert!(usage().contains(&shown), "{key:?} is not in --help");
+        }
+        assert!(keys.contains("TOUCH:") && keys.contains("double tap"));
+        assert!(!keys.contains("--lon") && !keys.contains("Esc"), "{keys}");
+        assert!(usage().contains("Esc") && usage().contains("--lon"));
+    }
+
+    /// A remembered link is a view only when it is one whole `goto`.
+    #[test]
+    fn a_remembered_link_is_a_whole_view_or_none() {
+        let view = StartView {
+            lon: 6.86,
+            lat: 45.83,
+            altitude: 9000.0,
+            heading: 120.0,
+            pitch: 30.0,
+        };
+        let link = crate::steer::link(&view);
+        let read = view_in_link(&format!("{link}\n")).expect("a view");
+        assert!((read.lon - view.lon).abs() < 1e-9 && (read.pitch - view.pitch).abs() < 1e-9);
+        assert_eq!(view_in_link("tuile://north"), None);
+        assert_eq!(
+            view_in_link("tuile://goto?lon=2&lat=46"),
+            None,
+            "half a view"
+        );
+        assert_eq!(view_in_link("not a link"), None);
+    }
+
     #[test]
     fn help_wins_wherever_it_stands_and_lists_every_flag() {
         assert_eq!(parse(["--help"]), Ok(Invocation::Help));
         assert_eq!(parse(["--lat", "10", "-h"]), Ok(Invocation::Help));
         for flag in &FLAGS {
-            assert!(USAGE.contains(flag.name), "{} is not in --help", flag.name);
+            assert!(
+                FLAGS_TEXT.contains(flag.name),
+                "{} is not in --help",
+                flag.name
+            );
         }
     }
 

@@ -67,9 +67,21 @@ pub(crate) fn copy(text: &str) -> bool {
     system::copy(text)
 }
 
-/// The text on the clipboard, if it holds text. Read only when the person
-/// asks for it — "go to copied link" — and only looked at as a steering URL.
-pub(crate) fn paste() -> Option<String> {
+/// What a paste found.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Pasted {
+    /// The text on the clipboard, if it holds text.
+    Now(Option<String>),
+    /// Nothing yet: a page's clipboard answers later, once the browser has
+    /// asked the person, and the text arrives on the steering queue as
+    /// [`Request::Pasted`].
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    Later,
+}
+
+/// The text on the clipboard. Read only when the person asks for it — "go to
+/// copied link" — and only looked at as a steering URL.
+pub(crate) fn paste() -> Pasted {
     system::paste()
 }
 
@@ -392,12 +404,14 @@ mod system {
         board.setString_forType(&NSString::from_str(text), unsafe { NSPasteboardTypeString })
     }
 
-    pub(super) fn paste() -> Option<String> {
+    pub(super) fn paste() -> super::Pasted {
         let board = NSPasteboard::generalPasteboard();
         // SAFETY: the string type is a constant the framework exports.
-        board
-            .stringForType(unsafe { NSPasteboardTypeString })
-            .map(|text| text.to_string())
+        super::Pasted::Now(
+            board
+                .stringForType(unsafe { NSPasteboardTypeString })
+                .map(|text| text.to_string()),
+        )
     }
 }
 
@@ -550,10 +564,14 @@ mod system {
         })
     }
 
-    pub(super) fn paste() -> Option<String> {
-        MainThreadMarker::new()?;
+    pub(super) fn paste() -> super::Pasted {
+        if MainThreadMarker::new().is_none() {
+            return super::Pasted::Now(None);
+        }
         // SAFETY: a property read, on the main thread.
-        unsafe { UIPasteboard::generalPasteboard().string() }.map(|text| text.to_string())
+        super::Pasted::Now(
+            unsafe { UIPasteboard::generalPasteboard().string() }.map(|text| text.to_string()),
+        )
     }
 
     pub(super) fn send(_request: Request) {}
@@ -603,8 +621,8 @@ mod system {
         false
     }
 
-    pub(super) fn paste() -> Option<String> {
-        None
+    pub(super) fn paste() -> super::Pasted {
+        super::Pasted::Now(None)
     }
 
     pub(super) fn send(_request: Request) {}

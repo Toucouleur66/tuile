@@ -20,6 +20,23 @@ use tuile_camera::CameraController;
 use tuile_core::traversal::Config;
 use winit::event_loop::{ControlFlow, EventLoop};
 
+/// Keeps `link` as the view the next session started from an icon opens on —
+/// a file in the application's support directory — or, with `None`, removes
+/// the one kept before.
+pub(crate) fn keep_the_view(link: Option<&str>) {
+    let Some(file) = host::last_view_file(&host::Machine) else {
+        return;
+    };
+    let Some(link) = link else {
+        let _ = std::fs::remove_file(&file);
+        return;
+    };
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&file, format!("{link}\n"));
+}
+
 /// Whether this process was started from an application bundle — from an
 /// icon, most likely, with no terminal behind it.
 fn in_a_bundle() -> bool {

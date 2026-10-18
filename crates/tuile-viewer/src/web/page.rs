@@ -21,7 +21,8 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::platform::web::{EventLoopExtWebSys, WindowAttributesExtWebSys};
 use winit::window::{Window, WindowId};
 
-use super::options::{Options, ProfileChoice};
+use super::options::{CaptionSide, Options, ProfileChoice};
+use super::screen::Side;
 use super::session::{self, Plan};
 use crate::app::{App, ViewerConfig};
 use crate::launch::Retries;
@@ -52,6 +53,16 @@ thread_local! {
     static CURRENT: Cell<u64> = const { Cell::new(0) };
 }
 
+/// Wakes the loop for the viewer of the moment: something was queued for it
+/// from outside a turn of the loop — a click on the menu, an answer from the
+/// clipboard.
+pub(super) fn poke() {
+    let id = CURRENT.with(Cell::get);
+    if let Some(proxy) = LOOP.with(|l| l.borrow().clone()) {
+        let _ = proxy.send_event(Wake::Poke(id));
+    }
+}
+
 /// The page's viewer, as the package holds it. The package wraps it in the
 /// typed API it documents; this is the narrow, untyped seam underneath.
 #[wasm_bindgen]
@@ -63,16 +74,15 @@ pub struct WebViewer {
 /// Creates a viewer on `canvas`.
 ///
 /// `options` is the package's normalised options object; `make_worker`
-/// returns a new worker running the package's worker script; `token` the catalog's
-/// bearer, kept in this page and its worker only; `events` is called as
-/// `events(kind, detail)`. Fails with a sentence when the options are wrong
+/// returns a new worker running the package's worker script; `events` is
+/// called as `events(kind, detail)`. No credential crosses here: the catalog
+/// is a proxy that holds its own. Fails with a sentence when the options are wrong
 /// or the page cannot run an event loop.
 #[wasm_bindgen(js_name = startViewer)]
 pub fn start_viewer(
     canvas: web_sys::HtmlCanvasElement,
     options: JsValue,
     make_worker: js_sys::Function,
-    token: Option<String>,
     events: js_sys::Function,
 ) -> Result<WebViewer, JsError> {
     super::log::install();
@@ -81,11 +91,22 @@ pub fn start_viewer(
     let (_, layers) = options.sources.choices().map_err(|e| JsError::new(&e))?;
     // Per viewer, for the viewer's life and a little past it: a few strings.
     let layers: &'static [crate::embed::ImageryChoice] = Box::leak(layers.into_boxed_slice());
-    let view = options
+    let asked = options
         .view
         .map(super::options::ViewSpec::view)
         .transpose()
-        .map_err(|e| JsError::new(&e))?
+        .map_err(|e| JsError::new(&e))?;
+    // A view the page names is the view, as the flags are a desktop's; with
+    // none, the viewer opens where it was left, as an application started
+    // from its icon does.
+    let remembers = options.remember_view && asked.is_none();
+    let view = asked
+        .or_else(|| {
+            remembers
+                .then(|| super::system::remembered_view(&options.name))
+                .flatten()
+                .and_then(|link| crate::start::view_in_link(&link))
+        })
         .unwrap_or_default();
     let handheld = options.profile == ProfileChoice::Handheld;
     let profile = Profile::browser(handheld, options.device_memory);
@@ -95,11 +116,15 @@ pub fn start_viewer(
         backend = ?options.backend,
         "browser profile"
     );
-    super::system::connect(events);
+    super::system::connect(events, &options.name, remembers);
+    let side = match options.attribution {
+        CaptionSide::BottomLeft => Side::Left,
+        CaptionSide::BottomRight => Side::Right,
+    };
+    super::screen::attach(&canvas, side, options.show_unsupported_message);
     let plan = Rc::new(Plan {
         make_worker,
         sources: options.sources.clone(),
-        token,
         profile: options.profile,
         device_memory: options.device_memory,
     });
@@ -112,7 +137,7 @@ pub fn start_viewer(
         layer: 0,
         here: None,
         requests: crate::desktop::listen(),
-        remembers: false,
+        remembers,
         lit_at_unix_seconds: web_time::SystemTime::now()
             .duration_since(web_time::UNIX_EPOCH)
             .map_or(0.0, |d| d.as_secs_f64()),

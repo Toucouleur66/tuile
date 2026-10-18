@@ -32,6 +32,7 @@ impl App {
                     Ok(commands) => commands.into_iter().for_each(|c| self.apply(c)),
                     Err(why) => tracing::error!("steering URL ignored: {why}"),
                 },
+                Request::Pasted(text) => self.go_to_the_link(text),
             }
         }
     }
@@ -81,9 +82,15 @@ impl App {
             }
             Command::CopyLink => self.copy_the_link(),
             Command::PasteLink => self.go_to_the_copied_link(),
-            Command::ShowKeys => crate::desktop::alert(
+            // An application that is its own window was started with flags;
+            // a page's viewer was started by its host's script, and has none.
+            Command::ShowKeys if self.profile.owns_its_window => crate::desktop::alert(
                 &format!("{} — keys and flags", self.title),
                 &crate::start::usage(),
+            ),
+            Command::ShowKeys => crate::desktop::alert(
+                &format!("{} — keys and gestures", self.title),
+                &crate::start::keys(),
             ),
             Command::Imagery(layer) => self.drape(layer),
             Command::NextImagery => {
@@ -110,7 +117,17 @@ impl App {
     /// in another session. Only a `goto`: what is pasted is a place, and a
     /// clipboard is not a way to flip switches.
     fn go_to_the_copied_link(&mut self) {
-        let goto = crate::desktop::paste()
+        match crate::desktop::paste() {
+            crate::desktop::Pasted::Now(text) => self.go_to_the_link(text),
+            // The text comes back on the queue: see `take_the_commands`.
+            crate::desktop::Pasted::Later => {}
+        }
+    }
+
+    /// Goes where `text`, from the clipboard, says — if it is a link to a
+    /// view and nothing else.
+    fn go_to_the_link(&mut self, text: Option<String>) {
+        let goto = text
             .and_then(|text| steer::parse_url(text.trim()).ok())
             .and_then(|commands| match commands.as_slice() {
                 [Command::Goto(goto)] => Some(*goto),

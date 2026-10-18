@@ -34,7 +34,6 @@ pub fn run_worker() {
             match serde_wasm_bindgen::from_value::<ToWorker>(event.data()) {
                 Ok(ToWorker::Start {
                     sources,
-                    token,
                     opening,
                     profile,
                     device_memory,
@@ -45,7 +44,7 @@ pub fn run_worker() {
                     wasm_bindgen_futures::spawn_local(async move {
                         let profile =
                             Profile::browser(profile == ProfileChoice::Handheld, device_memory);
-                        if let Err(reason) = start(sources, token, opening, profile).await {
+                        if let Err(reason) = start(sources, opening, profile).await {
                             tracing::error!("the session could not start: {reason}");
                             post(&ToPage::Failed { reason });
                         }
@@ -61,14 +60,9 @@ pub fn run_worker() {
 }
 
 /// Brings the session up and serves it to the page.
-async fn start(
-    spec: SourcesSpec,
-    token: Option<String>,
-    opening: usize,
-    profile: Profile,
-) -> Result<(), String> {
+async fn start(spec: SourcesSpec, opening: usize, profile: Profile) -> Result<(), String> {
     let (terrain, layers) = spec.choices()?;
-    let sources = Arc::new(PageSources::new(spec, token)?);
+    let sources = Arc::new(PageSources::new(spec)?);
     let globe = crate::globe::assemble(
         sources,
         None,

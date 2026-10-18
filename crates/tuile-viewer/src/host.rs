@@ -219,6 +219,7 @@ pub(crate) fn log_file_of(host: &dyn Host, name: &str) -> Option<PathBuf> {
 
 /// Where a session started from an icon leaves the view it ended on, for the
 /// next one to open on: one line, a `goto` URL.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn last_view_file(host: &dyn Host) -> Option<PathBuf> {
     Some(support_dir(host)?.join("last-view"))
 }

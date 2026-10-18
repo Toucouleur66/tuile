@@ -42,9 +42,6 @@ pub(crate) struct Plan {
     /// sees the worker script and ships it.
     pub make_worker: js_sys::Function,
     pub sources: SourcesSpec,
-    /// The catalog's bearer. Held for the page's lifetime and posted to each
-    /// worker it starts; never logged, never in a URL.
-    pub token: Option<String>,
     pub profile: ProfileChoice,
     pub device_memory: Option<f64>,
 }
@@ -285,7 +282,6 @@ pub(crate) fn start(plan: &Plan) -> Launch {
     });
     link.post(&ToWorker::Start {
         sources: plan.sources.clone(),
-        token: plan.token.clone(),
         opening: 0,
         profile: plan.profile,
         device_memory: plan.device_memory,

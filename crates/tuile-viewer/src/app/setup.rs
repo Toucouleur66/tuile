@@ -154,7 +154,11 @@ impl App {
         self.statusbar = super::readout::StatusBar::new();
         // Here and not earlier: a menu wants the application object the event
         // loop creates, and the main thread.
-        self.menu = crate::menu::Installed::install(self.imagery.layers);
+        // With the on-screen controls: a page that brings its own has its
+        // own menu too.
+        if self.controls {
+            self.menu = crate::menu::Installed::install(self.imagery.layers);
+        }
         if self.statusbar.is_none() {
             tracing::info!("no status-bar item on this platform; the readout is off");
         }

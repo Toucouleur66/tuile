@@ -538,27 +538,19 @@ impl App {
 
     /// Leaves the view this session ends on for the next one to open on.
     ///
-    /// Only for a session started from an icon: from a terminal, the view a
-    /// command opens on is what the command says and nothing else. And never
-    /// a view centred on the current location — that one is not written
-    /// anywhere, and the file from before is removed so that the next start
-    /// does not pretend to return to it.
+    /// Only for a session that opens where the last one ended — a desktop's
+    /// started from an icon, a page's unless it says where to open: from a
+    /// terminal, the view a command opens on is what the command says and
+    /// nothing else. And never a view centred on the current location — that
+    /// one is not written anywhere, and the one from before is forgotten so
+    /// that the next start does not pretend to return to it.
     fn remember_the_view(&self) {
         if !self.remembers {
             return;
         }
-        let Some(file) = crate::host::last_view_file(&crate::host::Machine) else {
-            return;
-        };
-        if self.located {
-            let _ = std::fs::remove_file(&file);
-            return;
-        }
-        let link = crate::steer::link(&crate::steer::view_of(self.controller.target()));
-        if let Some(dir) = file.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = std::fs::write(&file, format!("{link}\n"));
+        let link = (!self.located)
+            .then(|| crate::steer::link(&crate::steer::view_of(self.controller.target())));
+        crate::shell::keep_the_view(link.as_deref());
     }
 
     /// Tells the person something they asked about, where they are looking.
@@ -598,6 +590,11 @@ impl App {
     /// The view has gone off screen, or come back: a covered window, a phone
     /// in the background, a hidden tab.
     pub(crate) fn hidden(&mut self, hidden: bool) {
+        // Possibly the last moment the application runs: a tab that is
+        // closed is hidden first, and a phone ends what it put away.
+        if hidden {
+            self.remember_the_view();
+        }
         // Rendering while covered leaks GPU memory on Apple platforms (see
         // `render`), and a covered surface does not block on vsync, so the
         // loop would free-run and leak all the faster. Where the platform asks

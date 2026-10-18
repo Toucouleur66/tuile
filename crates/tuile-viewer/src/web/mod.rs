@@ -30,7 +30,11 @@ mod control;
 #[cfg(target_arch = "wasm32")]
 mod log;
 #[cfg(target_arch = "wasm32")]
+pub(crate) mod menu;
+#[cfg(target_arch = "wasm32")]
 pub mod page;
+#[cfg(target_arch = "wasm32")]
+mod screen;
 #[cfg(target_arch = "wasm32")]
 mod session;
 #[cfg(target_arch = "wasm32")]
@@ -42,3 +46,5 @@ pub mod worker;
 
 #[cfg(target_arch = "wasm32")]
 pub(crate) use session::{Budget, Detail, Gate, Started};
+#[cfg(target_arch = "wasm32")]
+pub(crate) use system::keep_the_view;

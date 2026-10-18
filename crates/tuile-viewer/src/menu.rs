@@ -27,8 +27,10 @@
 //! # The platform
 //!
 //! The menu itself is built with `muda`, the menu crate already in this
-//! workspace's lock file, on macOS with the `application` feature. Elsewhere
-//! there is no menu and the keys are all there is, exactly as before.
+//! workspace's lock file, on macOS with the `application` feature. A page
+//! builds the same table into menus that open from a button over the view
+//! (`crate::web::menu`). Elsewhere there is no menu and the keys are all
+//! there is, exactly as before.
 
 use crate::embed::ImageryChoice;
 use crate::snapshot::Snapshot;
@@ -42,7 +44,10 @@ pub(crate) const DIAGNOSTICS: [&str; 4] = ["Normal", "Unlit", "Coverage", "Geome
 /// where a person thinks relatively.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(
-    not(all(target_os = "macos", feature = "application")),
+    not(any(
+        all(target_os = "macos", feature = "application"),
+        target_arch = "wasm32"
+    )),
     allow(dead_code)
 )]
 pub(crate) enum Ask {
@@ -96,7 +101,10 @@ impl Ask {
     /// Whether an item asking this shows a check mark in `now`; `None` for
     /// an item that is an action and not a state.
     #[cfg_attr(
-        not(all(target_os = "macos", feature = "application")),
+        not(any(
+            all(target_os = "macos", feature = "application"),
+            target_arch = "wasm32"
+        )),
         allow(dead_code)
     )]
     pub(crate) fn checked(self, now: &State) -> Option<bool> {
@@ -139,7 +147,10 @@ pub(crate) fn key(c: char) -> Option<Ask> {
 /// One line of a menu.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(
-    not(all(target_os = "macos", feature = "application")),
+    not(any(
+        all(target_os = "macos", feature = "application"),
+        target_arch = "wasm32"
+    )),
     allow(dead_code)
 )]
 pub(crate) enum Entry {
@@ -156,7 +167,10 @@ pub(crate) enum Entry {
 /// application menu, Window and Help are the platform's and are added where
 /// the platform's menu is built.
 #[cfg_attr(
-    not(all(target_os = "macos", feature = "application")),
+    not(any(
+        all(target_os = "macos", feature = "application"),
+        target_arch = "wasm32"
+    )),
     allow(dead_code)
 )]
 pub(crate) fn layout(layers: &[ImageryChoice]) -> Vec<(&'static str, Vec<Entry>)> {
@@ -394,7 +408,16 @@ mod platform {
     }
 }
 
-#[cfg(not(all(target_os = "macos", feature = "application")))]
+/// A page: the menus open from a button over the view; see `crate::web::menu`.
+#[cfg(target_arch = "wasm32")]
+mod platform {
+    pub(crate) use crate::web::menu::Installed;
+}
+
+#[cfg(not(any(
+    all(target_os = "macos", feature = "application"),
+    target_arch = "wasm32"
+)))]
 mod platform {
     use super::State;
     use crate::embed::ImageryChoice;

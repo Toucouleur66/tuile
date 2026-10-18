@@ -20,11 +20,12 @@
 //! was obtained and how wide its uncertainty is.
 //!
 //! **The platform stays in its corner.** Everything the rest of the viewer
-//! sees is the [`LocationSource`] trait and plain numbers. The one
-//! implementation that talks to an operating system is the private `system`
-//! module at the bottom, compiled on macOS and iOS with the `current-location`
-//! feature; everywhere else the source answers "not available" and the viewer
-//! runs as it always did. The tests drive the same [`Locator`] with a source
+//! sees is the [`LocationSource`] trait and plain numbers. The
+//! implementations that talk to a platform are the private `system` modules
+//! at the bottom: the operating system's service on macOS and iOS with the
+//! `current-location` feature, the browser's Geolocation API on a page;
+//! everywhere else the source answers "not available" and the viewer runs as
+//! it always did. The tests drive the same [`Locator`] with a source
 //! that is a script.
 
 use std::time::Duration;
@@ -72,9 +73,12 @@ impl std::fmt::Debug for Fix {
 // without it still has to name the other answers, because the locator and its
 // tests are the same code everywhere.
 #[cfg_attr(
-    not(all(
-        any(target_os = "macos", target_os = "ios"),
-        feature = "current-location"
+    not(any(
+        all(
+            any(target_os = "macos", target_os = "ios"),
+            feature = "current-location"
+        ),
+        target_arch = "wasm32"
     )),
     allow(dead_code)
 )]
@@ -503,11 +507,165 @@ mod system {
     }
 }
 
-/// Everywhere the system's service is not compiled in: the request is taken
-/// and answered at once, so the flag and the key say why nothing happened.
-#[cfg(not(all(
-    any(target_os = "macos", target_os = "ios"),
-    feature = "current-location"
+/// The browser's Geolocation API, on a page.
+///
+/// **Exercised by hand only**, like the operating system's: a test would need
+/// a person to answer the browser's question. The browser asks the person
+/// itself, the first time a page wants the position; the Permissions API
+/// says whether that question is up, so that the time spent reading it is not
+/// charged to the search, as on a desktop. A page served over plain HTTP from
+/// anywhere but the machine itself has no geolocation at all, and the
+/// browser's refusal says so.
+#[cfg(target_arch = "wasm32")]
+mod system {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    use wasm_bindgen::prelude::*;
+    use wasm_bindgen::JsCast;
+
+    use super::{Fix, LocationSource, Progress, FIX_TIMEOUT};
+
+    /// The browser's "permission denied" code.
+    const DENIED: u16 = 1;
+    /// And its "timeout".
+    const TIMEOUT: u16 = 3;
+
+    const REFUSED: &str = "this page is not allowed to use the current location — \
+        allow it in the browser's site settings";
+
+    /// A callback the browser calls with one value.
+    type Callback = Closure<dyn FnMut(JsValue)>;
+
+    /// Where the callbacks leave the answer for the next poll, and whether
+    /// the browser's question is up.
+    #[derive(Default)]
+    struct Shared {
+        answer: RefCell<Option<Result<Fix, String>>>,
+        asking: Cell<bool>,
+    }
+
+    struct Browser {
+        shared: Rc<Shared>,
+        /// The callbacks of the request in flight, held until it ends.
+        callbacks: Option<(Callback, Callback)>,
+        /// Watches the permission's state while its question may be up.
+        watch: Option<Callback>,
+    }
+
+    impl LocationSource for Browser {
+        fn request(&mut self) {
+            self.shared.answer.replace(None);
+            self.shared.asking.set(false);
+            let Some(navigator) = web_sys::window().map(|w| w.navigator()) else {
+                self.shared
+                    .answer
+                    .replace(Some(Err("not available on this page".to_owned())));
+                return;
+            };
+            let geolocation = match navigator.geolocation() {
+                Ok(geolocation) => geolocation,
+                Err(_) => {
+                    self.shared
+                        .answer
+                        .replace(Some(Err("this browser gives pages no location".to_owned())));
+                    return;
+                }
+            };
+            self.watch_the_permission(&navigator);
+            let found = {
+                let shared = Rc::clone(&self.shared);
+                Callback::new(move |position: JsValue| {
+                    let coords = position.unchecked_into::<web_sys::Position>().coords();
+                    shared.asking.set(false);
+                    shared.answer.replace(Some(Ok(Fix {
+                        lon: coords.longitude(),
+                        lat: coords.latitude(),
+                        accuracy: coords.accuracy(),
+                    })));
+                })
+            };
+            let failed = {
+                let shared = Rc::clone(&self.shared);
+                Callback::new(move |error: JsValue| {
+                    let error = error.unchecked_into::<web_sys::PositionError>();
+                    shared.asking.set(false);
+                    let why = match error.code() {
+                        DENIED => REFUSED.to_owned(),
+                        TIMEOUT => "the browser found no position in time".to_owned(),
+                        _ => format!("the browser could not tell: {}", error.message()),
+                    };
+                    shared.answer.replace(Some(Err(why)));
+                })
+            };
+            // The browser's own timeout runs from the moment it is allowed to
+            // look, which is the locator's search timeout.
+            let options = web_sys::PositionOptions::new();
+            options.set_timeout(u32::try_from(FIX_TIMEOUT.as_millis()).unwrap_or(u32::MAX));
+            options.set_maximum_age(60_000);
+            if let Err(e) = geolocation.get_current_position_with_error_callback_and_options(
+                found.as_ref().unchecked_ref(),
+                Some(failed.as_ref().unchecked_ref()),
+                &options,
+            ) {
+                self.shared
+                    .answer
+                    .replace(Some(Err(format!("the browser refused the request: {e:?}"))));
+            }
+            self.callbacks = Some((found, failed));
+        }
+
+        fn poll(&mut self) -> Progress {
+            match self.shared.answer.borrow_mut().take() {
+                Some(Ok(fix)) => Progress::Fix(fix),
+                Some(Err(why)) => Progress::Unavailable(why),
+                None if self.shared.asking.get() => Progress::AwaitingPermission,
+                None => Progress::Waiting,
+            }
+        }
+    }
+
+    impl Browser {
+        /// Marks the question as up while the permission is still to be
+        /// given, and follows it until it is answered.
+        fn watch_the_permission(&mut self, navigator: &web_sys::Navigator) {
+            let Ok(permissions) = navigator.permissions() else {
+                return;
+            };
+            let descriptor = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&descriptor, &"name".into(), &"geolocation".into());
+            let Ok(query) = permissions.query(&descriptor) else {
+                return;
+            };
+            let shared = Rc::clone(&self.shared);
+            let watch = Callback::new(move |status: JsValue| {
+                let status = status.unchecked_into::<web_sys::PermissionStatus>();
+                let undecided = status.state() == web_sys::PermissionState::Prompt;
+                let answered = shared.answer.borrow().is_some();
+                shared.asking.set(undecided && !answered);
+            });
+            let _ = query.then(&watch);
+            self.watch = Some(watch);
+        }
+    }
+
+    pub(super) fn source() -> Box<dyn LocationSource> {
+        Box::new(Browser {
+            shared: Rc::default(),
+            callbacks: None,
+            watch: None,
+        })
+    }
+}
+
+/// Everywhere no location service is compiled in: the request is taken and
+/// answered at once, so the flag and the key say why nothing happened.
+#[cfg(not(any(
+    all(
+        any(target_os = "macos", target_os = "ios"),
+        feature = "current-location"
+    ),
+    target_arch = "wasm32"
 )))]
 mod system {
     use super::{LocationSource, Progress};

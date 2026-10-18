@@ -30,9 +30,28 @@ pub(crate) struct Options {
     pub backend: BackendChoice,
     #[serde(default)]
     pub view: Option<ViewSpec>,
-    /// Whether the on-screen controls are drawn.
+    /// Whether the on-screen controls and the menu are drawn.
     #[serde(default = "yes")]
     pub ui: bool,
+    /// Which bottom corner the caption — whose pictures these are — keeps to.
+    #[serde(default)]
+    pub attribution: CaptionSide,
+    /// Whether a viewer that cannot draw says so in its container.
+    #[serde(default = "yes")]
+    pub show_unsupported_message: bool,
+    /// Whether a viewer opened without a `view` opens where the last one
+    /// ended, as a desktop's application does.
+    #[serde(default = "yes")]
+    pub remember_view: bool,
+}
+
+/// Which bottom corner the caption keeps to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum CaptionSide {
+    BottomLeft,
+    #[default]
+    BottomRight,
 }
 
 fn default_name() -> String {
@@ -107,20 +126,19 @@ impl ViewSpec {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct SourcesSpec {
-    /// A catalog that resolves asset numbers to endpoints, if the host uses
-    /// one. Its token travels separately and is never part of these options.
+    /// The catalog that resolves asset numbers to endpoints: the address of
+    /// the proxy that holds its token. A page never holds one.
     #[serde(default)]
     pub catalog: Option<CatalogSpec>,
     pub terrain: AssetSpec,
     pub imagery: Vec<LayerSpec>,
 }
 
-/// The catalog's address; the connector's own when unsaid.
+/// The catalog: the proxy that answers for it and holds its token.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CatalogSpec {
-    #[serde(default)]
-    pub url: Option<String>,
+    pub url: String,
 }
 
 /// An asset of the catalog, by number.
@@ -165,9 +183,7 @@ impl SourcesSpec {
     /// never uses — negative, by its place in the list — which is what the
     /// worker's sources answer it by.
     pub(crate) fn choices(&self) -> Result<(TerrainChoice, Vec<ImageryChoice>), String> {
-        if self.catalog.is_none() {
-            return Err("terrain comes from a catalog: `sources.catalog` is required".to_owned());
-        }
+        self.catalog_base()?;
         if self.imagery.is_empty() {
             return Err("`sources.imagery` lists no layer".to_owned());
         }
@@ -212,15 +228,19 @@ impl SourcesSpec {
         self.imagery.get(index).filter(|l| l.template.is_some())
     }
 
-    /// The catalog's API base, when the page names one rather than taking
-    /// the connector's own.
-    pub(crate) fn catalog_base(&self) -> Result<Option<url::Url>, String> {
-        let Some(url) = self.catalog.as_ref().and_then(|c| c.url.as_deref()) else {
-            return Ok(None);
+    /// The catalog proxy's address, ending in `/` so that the catalog's
+    /// paths are read under it.
+    pub(crate) fn catalog_base(&self) -> Result<url::Url, String> {
+        let Some(url) = self.catalog.as_ref().map(|c| c.url.as_str()) else {
+            return Err(
+                "terrain comes from a catalog: `sources.catalog.url` is required".to_owned(),
+            );
         };
-        url::Url::parse(url)
-            .map(Some)
-            .map_err(|e| format!("catalog url {url:?}: {e}"))
+        let mut base = url::Url::parse(url).map_err(|e| format!("catalog url {url:?}: {e}"))?;
+        if !base.path().ends_with('/') {
+            base.set_path(&format!("{}/", base.path()));
+        }
+        Ok(base)
     }
 }
 
@@ -256,7 +276,7 @@ mod tests {
         "name": "Atlas",
         "profile": "desktop",
         "sources": {
-            "catalog": {},
+            "catalog": { "url": "https://tiles.test/catalog" },
             "terrain": { "asset": 1 },
             "imagery": [
                 { "key": "aerial", "name": "Aerial", "attribution": "© survey", "asset": 2 },
@@ -281,13 +301,19 @@ mod tests {
         assert!(o.sources.template_of(layers[0].asset).is_none());
         assert!(o.sources.template_of(-99).is_none());
         assert!(o.ui, "the controls are on unless the page says otherwise");
+        assert_eq!(o.attribution, CaptionSide::BottomRight);
+        assert!(o.show_unsupported_message && o.remember_view);
         assert_eq!(o.backend, BackendChoice::Auto);
         assert_eq!(o.profile, ProfileChoice::Desktop);
         assert_eq!(
             template.tiling(),
             tuile_core::raster::TilingScheme::web_mercator()
         );
-        assert_eq!(o.sources.catalog_base(), Ok(None));
+        assert_eq!(
+            o.sources.catalog_base().map(String::from).as_deref(),
+            Ok("https://tiles.test/catalog/"),
+            "a base the catalog's paths are read under"
+        );
     }
 
     /// Every option the package documents reaches Rust as it was given.
@@ -297,6 +323,7 @@ mod tests {
             r#"{
             "name": "Atlas", "profile": "handheld", "deviceMemory": 4, "backend": "webgl2",
             "ui": false, "view": { "lon": 6.86, "lat": 45.83, "altitude": 6000 },
+            "attribution": "bottom-left", "showUnsupportedMessage": false, "rememberView": false,
             "sources": {
                 "catalog": { "url": "https://catalog.test/" },
                 "terrain": { "asset": 7 },
@@ -310,15 +337,14 @@ mod tests {
         assert_eq!(o.device_memory, Some(4.0));
         assert_eq!(o.backend, BackendChoice::Webgl2);
         assert!(!o.ui);
+        assert_eq!(o.attribution, CaptionSide::BottomLeft);
+        assert!(!o.show_unsupported_message);
+        assert!(!o.remember_view);
         let view = o.view.expect("a view").view().expect("in bounds");
         assert_eq!((view.heading, view.pitch), (0.0, 90.0));
         assert_eq!(
-            o.sources
-                .catalog_base()
-                .expect("a url")
-                .map(String::from)
-                .as_deref(),
-            Some("https://catalog.test/")
+            String::from(o.sources.catalog_base().expect("a url")),
+            "https://catalog.test/"
         );
         let tiling = o.sources.imagery[0].tiling();
         assert_eq!(

@@ -136,6 +136,10 @@ pub(crate) enum Request {
     /// A script's `set imagery to "…"`: a layer by key or name, still to be
     /// looked up in the host's list.
     Imagery(String),
+    /// The clipboard's text, read for "go to copied link" by a platform
+    /// whose clipboard answers later: see `crate::desktop::Pasted`.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    Pasted(Option<String>),
 }
 
 impl Goto {
