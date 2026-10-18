@@ -38,8 +38,13 @@
 //! against the ground's depth, the overlays' or nothing as it asks — and
 //! `present` lays them over the picture once its tone is done. Those that
 //! cast are drawn into the sun's map with the ground; those that receive
-//! read it as the ground does. A frame without any costs nothing more than
-//! before.
+//! read it as the ground does. Those that project theirs
+//! ([`tuile_film::OverlayShadow::Project`]) stay out of the map: each of
+//! their triangles is drawn as the prism it sweeps down the sun's rays,
+//! and each pixel of ground under a prism asks whether its own ray to the
+//! sun meets the triangle — an exact shadow, as sharp as the picture's
+//! samples, that no grid of texels makes crawl as the sun moves. A frame
+//! without any costs nothing more than before.
 //!
 //! A stereo frame is drawn once an eye ([`Shot`]): the sun's map is fitted
 //! to the frame's own camera, so both eyes are shaded by the same map, and
@@ -76,6 +81,8 @@ const SLOT_STRIDE: u64 = 256;
 const VIS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Uint;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// Where the ground is in a projected shadow ([`OverlayShadow::Project`]).
+const PROJECTED_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 /// Overlays are blended in linear light before they are filtered down: a
 /// byte a channel would band their dark colours.
 const OVERLAY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -238,6 +245,9 @@ struct Resident {
 struct Targets {
     vis: wgpu::TextureView,
     depth: wgpu::TextureView,
+    /// The ground that projected shadows fall on, a sample a texel: see
+    /// `projected.wgsl`.
+    projected: wgpu::TextureView,
     hdr: wgpu::TextureView,
     /// Made when a frame first carries an overlay: a film that never does
     /// never pays for it.
@@ -299,6 +309,8 @@ struct Pipelines {
     raster: wgpu::RenderPipeline,
     /// The same tiles, depth alone, as the sun sees them.
     shadow: wgpu::RenderPipeline,
+    /// The ground in the shadows shapes project: see `projected.wgsl`.
+    projected: wgpu::RenderPipeline,
     /// A tile's vertices, moved by its strips: see `stitch.wgsl`.
     displace: wgpu::ComputePipeline,
     overlay: OverlayPipelines,
@@ -327,6 +339,10 @@ pub struct FilmGpu {
     overlay_vertices: Growing,
     overlay_indices: Growing,
     overlay_edges: Growing,
+    /// The corners of the triangles whose shadows are projected, and what
+    /// reads them.
+    projected_corners: Growing,
+    projected_bgl: wgpu::BindGroupLayout,
     /// The sun's map and its side, for a look that has shadows.
     shadow_map: Option<(wgpu::TextureView, u32)>,
     /// The map — a texel that shades nothing without shadows — and how it
@@ -543,6 +559,20 @@ fn stitch_wgsl() -> String {
         .replace("/*BAND*/", &format!("{:?}", tuile_core::stitch::BAND))
 }
 
+/// How far a corner at `at` (ECEF) of a shape that projects its shadow is
+/// swept down the rays of a sun towards `to_sun`: past any ground under it —
+/// the deepest ground on Earth is under a kilometre below the ellipsoid —
+/// however low the sun. Nothing where the sun is under its horizon.
+fn swept_to_the_ground(at: DVec3, to_sun: Vec3) -> f32 {
+    let height = tuile_core::geo::ecef_to_geodetic(at).height;
+    let rising = to_sun.as_dvec3().dot(at.normalize());
+    if rising <= 0.0 {
+        return 0.0;
+    }
+    // A sun a third of a degree up: some 200 km for a corner 1 km up.
+    ((height + 1_000.0).max(0.0) / rising.max(0.005)).min(1.0e6) as f32
+}
+
 fn shader(device: &wgpu::Device, name: &str, body: &str) -> wgpu::ShaderModule {
     let source = format!("{}\n{body}", include_str!("shaders/common.wgsl"));
     device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -676,6 +706,7 @@ impl FilmGpu {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                     count: None,
                 },
+                texture(10, wgpu::TextureSampleType::Float { filterable: false }),
             ],
         });
         let slot_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -954,6 +985,55 @@ impl FilmGpu {
             ),
         };
 
+        let projected_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("film projected shadows"),
+            entries: &[
+                uniform(0, wgpu::ShaderStages::VERTEX_FRAGMENT, false),
+                wgpu::BindGroupLayoutEntry {
+                    visibility: fragment_only,
+                    ..texture(1, wgpu::TextureSampleType::Depth)
+                },
+                storage(2, wgpu::ShaderStages::VERTEX_FRAGMENT, true),
+            ],
+        });
+        let projected_module = shader(
+            &device,
+            "film projected shadows",
+            include_str!("shaders/projected.wgsl"),
+        );
+        let projected = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("film projected shadows"),
+            layout: Some(
+                &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("film projected shadows"),
+                    bind_group_layouts: &[Some(&projected_bgl)],
+                    immediate_size: 0,
+                }),
+            ),
+            vertex: wgpu::VertexState {
+                module: &projected_module,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState {
+                // A prism's far side as well as its near one.
+                cull_mode: None,
+                ..Default::default()
+            },
+            // The ground is read in the shader; nothing is tested.
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &projected_module,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(PROJECTED_FORMAT.into())],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let displace = compute(
             &device,
             &device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1012,6 +1092,7 @@ impl FilmGpu {
         let pipelines = Pipelines {
             raster,
             shadow,
+            projected,
             displace,
             overlay,
             count: compute(&device, &bin, "count", None),
@@ -1219,6 +1300,8 @@ impl FilmGpu {
             overlay_vertices: Growing::default(),
             overlay_indices: Growing::default(),
             overlay_edges: Growing::default(),
+            projected_corners: Growing::default(),
+            projected_bgl,
             shadow_map: (settings.look.shadow > 0.0).then(|| (shadow_view.clone(), shadow_side)),
             shadow_view,
             shadow_sampler,
@@ -1293,6 +1376,14 @@ impl FilmGpu {
         let depth = make(
             "film depth",
             DEPTH_FORMAT,
+            U::RENDER_ATTACHMENT | U::TEXTURE_BINDING,
+            w,
+            h,
+        )
+        .create_view(&Default::default());
+        let projected = make(
+            "film projected shadows",
+            PROJECTED_FORMAT,
             U::RENDER_ATTACHMENT | U::TEXTURE_BINDING,
             w,
             h,
@@ -1374,6 +1465,7 @@ impl FilmGpu {
                     entry(7, wgpu::BindingResource::Sampler(sampler)),
                     entry(8, wgpu::BindingResource::TextureView(shadow_map)),
                     entry(9, wgpu::BindingResource::Sampler(shadow_sampler)),
+                    entry(10, wgpu::BindingResource::TextureView(&projected)),
                 ],
             }),
             present_bg: Self::present_bg(
@@ -1397,6 +1489,7 @@ impl FilmGpu {
             ),
             vis,
             depth,
+            projected,
             hdr,
             overlay: None,
             out,
@@ -2164,6 +2257,10 @@ impl FilmGpu {
         // vertex.
         let mut cast_triangles = Vec::new();
         let mut cast_edges = Vec::new();
+        // Of each triangle whose shadow is projected: its corners from the
+        // eye, each with how far it is swept down the sun's rays.
+        let mut projected: Vec<[f32; 4]> = Vec::new();
+        let projecting = self.lit.shadow > 0.0 && to_sun != Vec3::ZERO;
         for mesh in overlays {
             if let Some(fault) = mesh.fault() {
                 return Err(FilmGpuError::Overlay(fault));
@@ -2212,6 +2309,26 @@ impl FilmGpu {
                     }
                 },
             ));
+            if projecting && mesh.shadow.projects() {
+                let corners: Vec<[f32; 4]> = mesh
+                    .positions
+                    .iter()
+                    .map(|p| {
+                        let at = DVec3::from_array(mesh.origin_ecef)
+                            + DVec3::new(p[0].into(), p[1].into(), p[2].into());
+                        let from_eye = (at - camera.eye).as_vec3();
+                        [
+                            from_eye.x,
+                            from_eye.y,
+                            from_eye.z,
+                            swept_to_the_ground(at, to_sun),
+                        ]
+                    })
+                    .collect();
+                for &i in &mesh.indices {
+                    projected.push(corners[i as usize]);
+                }
+            }
             let first = indices.len() as u32;
             indices.extend_from_slice(&mesh.indices);
             let triangles = first..indices.len() as u32;
@@ -2377,8 +2494,9 @@ impl FilmGpu {
                     view: &self.targets.depth,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(0.0),
-                        // Kept only for overlays to be tested against.
-                        store: if overlaid {
+                        // Kept only for overlays to be tested against, and
+                        // for the ground projected shadows fall on.
+                        store: if overlaid || !projected.is_empty() {
                             wgpu::StoreOp::Store
                         } else {
                             wgpu::StoreOp::Discard
@@ -2395,6 +2513,54 @@ impl FilmGpu {
             for r in &drawn {
                 pass.set_bind_group(1, &r.bind, &[]);
                 pass.draw(0..r.index_count, r.slot..r.slot + 1);
+            }
+        }
+
+        {
+            // The ground in projected shadows; none, as often as not, and
+            // the target cleared all the same.
+            let corners = (!projected.is_empty()).then(|| {
+                self.projected_corners
+                    .holding(
+                        &self.device,
+                        &self.queue,
+                        "film projected corners",
+                        wgpu::BufferUsages::STORAGE,
+                        bytemuck::cast_slice(&projected),
+                    )
+                    .clone()
+            });
+            let bind = corners.as_ref().map(|corners| {
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("film projected shadows"),
+                    layout: &self.projected_bgl,
+                    entries: &[
+                        entry(0, self.frame_buf.as_entire_binding()),
+                        entry(1, wgpu::BindingResource::TextureView(&self.targets.depth)),
+                        entry(2, corners.as_entire_binding()),
+                    ],
+                })
+            });
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("film projected shadows"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.targets.projected,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if let Some(bind) = &bind {
+                pass.set_pipeline(&self.pipelines.projected);
+                pass.set_bind_group(0, bind, &[]);
+                pass.draw(0..24, 0..(projected.len() / 3) as u32);
             }
         }
 

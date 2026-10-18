@@ -83,6 +83,15 @@ impl OverlayEyes {
 /// it never vanishes — and only one that wide or wider casts its whole
 /// shadow. A host that wants a thin ribbon's shadow whole widens what casts
 /// it.
+///
+/// A mesh that **projects** stays out of the map: its shadow is worked out
+/// exactly, for each pixel of ground, by following the ground's own ray to
+/// the sun and asking whether it meets one of the mesh's triangles. Nothing
+/// of a grid of texels is in it, so a thin shape — a line, a ribbon a few
+/// metres wide — casts its whole shadow, with edges as sharp as the
+/// picture's, and that shadow stands still while the sun moves, as far
+/// along the ground as the shape's height over the tangent of the sun's
+/// elevation. Its shadow falls on the ground only: no overlay receives it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OverlayShadow {
     #[default]
@@ -90,6 +99,10 @@ pub enum OverlayShadow {
     Cast,
     Receive,
     CastAndReceive,
+    /// Casts by projection, receives nothing.
+    Project,
+    /// Casts by projection and receives the map's shadows.
+    ProjectAndReceive,
 }
 
 /// The least width, in texels of the sun's map, of a caster whose shadow
@@ -102,7 +115,21 @@ impl OverlayShadow {
     }
 
     pub fn receives(self) -> bool {
-        matches!(self, OverlayShadow::Receive | OverlayShadow::CastAndReceive)
+        matches!(
+            self,
+            OverlayShadow::Receive
+                | OverlayShadow::CastAndReceive
+                | OverlayShadow::ProjectAndReceive
+        )
+    }
+
+    /// Whether its shadow is projected onto the ground rather than drawn
+    /// into the sun's map.
+    pub fn projects(self) -> bool {
+        matches!(
+            self,
+            OverlayShadow::Project | OverlayShadow::ProjectAndReceive
+        )
     }
 }
 
