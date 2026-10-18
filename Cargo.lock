@@ -6673,6 +6673,7 @@ version = "0.8.1"
 dependencies = [
  "async-trait",
  "bytes",
+ "futures-channel",
  "futures-executor",
  "futures-util",
  "glam 0.33.1",

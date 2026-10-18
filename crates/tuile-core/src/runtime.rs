@@ -1425,6 +1425,104 @@ mod tests {
         );
     }
 
+    /// **A request the network never answers costs one slot, not the
+    /// session.** One leaf's load never completes — a browser `fetch` with no
+    /// answer, before transports bounded their requests. With room for two
+    /// loads at once, every other tile still arrives through the other slot,
+    /// the leaf's parent stays selected over its ground — the ancestor drawn,
+    /// not a hole — and the server keeps answering views.
+    #[test]
+    fn a_load_that_never_answers_holds_one_slot_and_the_ancestor_stays() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = write_deep_fixture(dir.path());
+        let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
+        let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
+        let root = tileset.root();
+        let mids = tileset.tile(root).children.clone();
+        let stalled = tileset.tile(mids[0]).children[0];
+        let others: Vec<TileId> = mids
+            .iter()
+            .flat_map(|m| tileset.tile(*m).children.clone())
+            .filter(|t| *t != stalled)
+            .collect();
+
+        /// Real content for every tile but one, which never answers.
+        struct Silent(Arc<dyn TileLoader>, TileId);
+
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        impl TileLoader for Silent {
+            async fn load(&self, id: TileId) -> Result<Loaded, LoadError> {
+                if id == self.1 {
+                    return futures_util::future::pending().await;
+                }
+                self.0.load(id).await
+            }
+        }
+
+        let arena = Arc::new(RwLock::new(tileset));
+        let tree: Box<dyn TileTree> = Box::new(TilesetTree::new(Arc::clone(&arena)));
+        let inner: Arc<dyn TileLoader> = Arc::new(TilesetLoader::new(arena, Arc::new(FsFetcher)));
+        let (mut stream, server) = in_process_with(
+            tree,
+            Arc::new(Silent(inner, stalled)) as Arc<dyn TileLoader>,
+            Config {
+                pinned_level: None,
+                maximum_simultaneous_fetches: 2,
+                ..Config::default()
+            },
+        );
+        let mut server = Box::pin(server.run());
+        let waker = futures_util::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut delivered: HashSet<TileId> = HashSet::new();
+        let mut selected: HashSet<TileId> = HashSet::new();
+        let mut selections = 0usize;
+        // The camera keeps sending views, as a frame loop does.
+        for _ in 0..64 {
+            stream
+                .send(ClientMessage::ViewerState {
+                    views: vec![near_view()],
+                    generation: 0,
+                })
+                .expect("the server still listens");
+            for _ in 0..16 {
+                assert!(
+                    server.as_mut().poll(&mut cx).is_pending(),
+                    "the session ended over one silent request"
+                );
+                while let Poll::Ready(Some(msg)) = stream.poll_message(&mut cx) {
+                    match msg {
+                        ServerMessage::Content { tile, .. } => {
+                            delivered.insert(tile);
+                            let _ = stream.send(ClientMessage::Ack { tile });
+                        }
+                        ServerMessage::Select { tiles, .. } => {
+                            selections += 1;
+                            selected = tiles.into_iter().map(|(t, _)| t).collect();
+                        }
+                        ServerMessage::Error { message, .. } => {
+                            unreachable!("unexpected error: {message}")
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        for tile in &others {
+            assert!(
+                delivered.contains(tile),
+                "{tile:?} never arrived past the silent load"
+            );
+        }
+        assert!(!delivered.contains(&stalled));
+        assert!(
+            selected.contains(&mids[0]),
+            "the silent leaf's parent stands over its ground: {selected:?}"
+        );
+        assert!(selections > 1, "selections kept coming");
+    }
+
     /// **Taking back a stand-in must never cost the consumer real content.**
     ///
     /// `Content` is sent exactly once per residency: the server marks the tile
