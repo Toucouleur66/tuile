@@ -68,6 +68,18 @@ fn evict_oldest(dir: &std::path::Path, budget: u64) -> (u64, u64) {
     (removed, freed)
 }
 
+/// Worker threads of the store's runtime: what `TUILE_TILES_THREADS` says,
+/// or the threads available to the process. Read when a store is opened,
+/// which a bake does once.
+///
+/// It was two. Every lookup a bake makes against the store, absences
+/// included, runs on this runtime, and two workers are the prime suspect
+/// for bakes starving on a farm worker (not yet measured).
+fn runtime_threads() -> usize {
+    crate::session::count_knob("TUILE_TILES_THREADS")
+        .unwrap_or_else(crate::session::available_threads)
+}
+
 /// Where the scene's projections are written, unless `TUILE_TILES_DIR` says.
 const DEFAULT_PROJECTION_DIR: &str = "/tmp/tuile-tiles";
 /// Imagery is kept eight times farther than terrain: a 2048² drape composes
@@ -179,7 +191,7 @@ impl Tiles {
                 },
             };
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(runtime_threads())
             .enable_all()
             .build()
             .map_err(|e| format!("tile store runtime: {e}"))?;
@@ -233,7 +245,7 @@ impl Tiles {
     /// the caller's own (a test's, in memory).
     pub fn over(objects: Arc<dyn object_store::ObjectStore>) -> Result<Self, String> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(runtime_threads())
             .enable_all()
             .build()
             .map_err(|e| format!("tile store runtime: {e}"))?;

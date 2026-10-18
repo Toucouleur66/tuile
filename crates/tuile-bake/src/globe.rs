@@ -29,6 +29,20 @@ pub use tuile_planetary::Sources;
 
 use crate::session::{Session, SessionConfig};
 
+/// A pool to decode and resample on: one thread per core less one, or
+/// `TUILE_DECODE_THREADS` of them.
+///
+/// The count is read here rather than in the core, which reads no
+/// environment: the core sizes the pool it is told to.
+fn decode_pool() -> Arc<dyn offload::Offload> {
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let threads = *THREADS.get_or_init(|| {
+        crate::session::count_knob("TUILE_DECODE_THREADS")
+            .unwrap_or_else(offload::ThreadPool::machine_threads)
+    });
+    Arc::new(offload::ThreadPool::with_threads(threads))
+}
+
 /// How many levels finer than the terrain the baked imagery may go.
 ///
 /// Default +1, and that number is a MEMORY decision as much as a sharpness
@@ -435,13 +449,7 @@ async fn resolve(
             imagery_by_stamp: names_only(config),
         };
         return Ok(match config.imagery_asset_id {
-            None => globe_with_provenance(
-                terrain,
-                NoImagery,
-                layer,
-                options(true),
-                offload::threaded(),
-            ),
+            None => globe_with_provenance(terrain, NoImagery, layer, options(true), decode_pool()),
             Some(asset) => {
                 let imagery = sources
                     .0
@@ -449,7 +457,7 @@ async fn resolve(
                     .await
                     .map_err(GlobeError::Sources)?;
                 let imagery = Cached::wrap_imagery(Held(imagery), cache(), asset);
-                globe_with_provenance(terrain, imagery, layer, options(false), offload::threaded())
+                globe_with_provenance(terrain, imagery, layer, options(false), decode_pool())
             }
         });
     }
@@ -504,7 +512,7 @@ async fn resolve(
                 composed_at: config.session.bake_max_size,
                 imagery_by_stamp: names_only(config),
             },
-            offload::threaded(),
+            decode_pool(),
         );
         return Ok((tree, loader, detail, heights, provenance));
     };
@@ -537,7 +545,7 @@ async fn resolve(
             imagery,
             layer,
             options,
-            offload::threaded(),
+            decode_pool(),
         ));
     }
 
@@ -587,7 +595,7 @@ async fn resolve(
                 config.tile_cache.clone().map(|c| c.0),
                 imagery_asset_id,
             );
-            globe_with_provenance(terrain, tms, layer, options, offload::threaded())
+            globe_with_provenance(terrain, tms, layer, options, decode_pool())
         }
         Some("BING") => {
             let o = &endpoint.options;
@@ -608,7 +616,7 @@ async fn resolve(
                 config.tile_cache.clone().map(|c| c.0),
                 imagery_asset_id,
             );
-            globe_with_provenance(terrain, bing, layer, options, offload::threaded())
+            globe_with_provenance(terrain, bing, layer, options, decode_pool())
         }
         Some(kind) => {
             return Err(GlobeError::UnsupportedImagery {

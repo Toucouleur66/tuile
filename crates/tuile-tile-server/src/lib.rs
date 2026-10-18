@@ -30,6 +30,22 @@
 //!   tiles and the source's absences kept in memory.
 //!
 //! No router and no authentication here: those belong to whoever deploys it.
+//!
+//! # Environment
+//!
+//! Concurrency limits, each read once per process, a missing, unparsable or
+//! zero value keeping the default:
+//!
+//! - `TUILE_PROJECTION_ZONES` (16): zones a projection works on at once.
+//! - `TUILE_PROJECTION_RANGES` (8): byte ranges of one zone a projection
+//!   fetches at once.
+//! - `TUILE_FLUSH_ZONES` (16): zones a store flushes at once.
+//! - `TUILE_UPLOAD_PARTS` (8): parts of one archive upload in flight.
+//! - `TUILE_DEDUP` (32): tiles of one publication checked against the store
+//!   at once.
+//! - `TUILE_EXTRACT_ZONES` (16): zones an extract reads at once.
+//! - `TUILE_EXTRACT_TILES` (32): tiles of one archive an extract reads at once.
+//! - `TUILE_EXTRACT_PUT_PARTS` (8): parts of an extract's upload in flight.
 
 pub mod absences;
 pub mod archive;
@@ -40,6 +56,7 @@ pub mod due;
 pub mod extract;
 pub mod grid;
 pub mod index;
+mod knob;
 pub mod layer;
 pub mod ledger;
 pub mod lru;

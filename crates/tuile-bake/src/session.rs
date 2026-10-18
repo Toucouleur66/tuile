@@ -1002,8 +1002,12 @@ impl Live {
     /// endpoint and a Bing metadata document have to be fetched before there is
     /// a tree to hand over — and doing that on a second runtime would mean two
     /// thread pools and two sets of connections for one session.
+    ///
+    /// `TUILE_SESSION_THREADS` sets its worker count; unset, the threads
+    /// available to the process ([`available_threads`]).
     pub(crate) fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
         tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(count_knob("TUILE_SESSION_THREADS").unwrap_or_else(available_threads))
             .enable_all()
             .build()
     }
@@ -1501,6 +1505,29 @@ fn env_knob<T: std::str::FromStr + PartialOrd>(name: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+/// A positive count from `raw`, or `None` when it is absent, unparsable or
+/// zero — the caller's default then applies, since a pool of no threads or a
+/// limit of nothing in flight would never finish anything.
+pub(crate) fn parse_count(raw: Option<&str>) -> Option<usize> {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+}
+
+/// The threads this process may run on: `available_parallelism`, which on
+/// Linux honours a cgroup CPU quota, so a container gets its share rather
+/// than the host's core count. Two when it cannot be told.
+pub(crate) fn available_threads() -> usize {
+    std::thread::available_parallelism().map_or(2, |n| n.get())
+}
+
+/// [`parse_count`] of the environment variable `name`.
+///
+/// For concurrency knobs, read where the pool or runtime they size is built,
+/// never per request.
+pub(crate) fn count_knob(name: &str) -> Option<usize> {
+    parse_count(std::env::var(name).ok().as_deref())
+}
+
 /// The traversal a bulk frame runs, whatever the caller asked for.
 ///
 /// Stand-ins are an interactive kindness — a plausible surface while the real
@@ -1898,6 +1925,18 @@ fn drape_key(tile: TileId, content: &DecodedTileContent, bake_max_size: u32) -> 
 
 #[cfg(test)]
 pub(crate) mod tests {
+
+    #[test]
+    fn a_count_knob_is_a_positive_number_or_nothing() {
+        use super::parse_count;
+        assert_eq!(parse_count(None), None);
+        assert_eq!(parse_count(Some("")), None);
+        assert_eq!(parse_count(Some("two")), None);
+        assert_eq!(parse_count(Some("-2")), None);
+        assert_eq!(parse_count(Some("0")), None);
+        assert_eq!(parse_count(Some("3")), Some(3));
+        assert_eq!(parse_count(Some(" 12\n")), Some(12));
+    }
 
     /// The imagery level follows the camera's height above the **ellipsoid**.
     ///

@@ -253,7 +253,34 @@ pub struct NativeFetchError(String);
 ///
 /// `tuile_bake`'s fetch wave defaults to this number for that reason; see the
 /// `TUILE_FETCHES` knob.
+///
+/// This is the default; `TUILE_HTTP_IDLE_PER_HOST` overrides what a client
+/// actually keeps (see [`connections_per_host`]). The fetch wave stays on this
+/// constant whatever that knob says: it is part of a bake's traversal, and a
+/// transport setting must not change what a bake selects — raise
+/// `TUILE_FETCHES` alongside it when both should move.
 pub const CONNECTIONS_PER_HOST: usize = 64;
+
+/// Keep-alive connections a client holds per host: `TUILE_HTTP_IDLE_PER_HOST`
+/// when it is a positive number, [`CONNECTIONS_PER_HOST`] otherwise. Read once
+/// per process.
+pub fn connections_per_host() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        parse_count(
+            std::env::var("TUILE_HTTP_IDLE_PER_HOST").ok().as_deref(),
+            CONNECTIONS_PER_HOST,
+        )
+    })
+}
+
+/// A positive count from `raw`, or `default` when it is absent, unparsable
+/// or zero.
+fn parse_count(raw: Option<&str>, default: usize) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
+}
 
 /// Capacities for the hybrid cache backing a [`NativeHttp`].
 #[derive(Debug, Clone)]
@@ -390,7 +417,7 @@ impl NativeHttp {
             // Saturate the fiber: keep many keep-alive connections per host so
             // parallel tile/imagery requests don't serialize on the pool —
             // fewer and every wave pays reconnects between bursts.
-            .pool_max_idle_per_host(CONNECTIONS_PER_HOST)
+            .pool_max_idle_per_host(connections_per_host())
             .cookie_store(true);
         if let Some(timeout) = cfg.request_timeout {
             builder = builder.timeout(timeout);
@@ -601,6 +628,15 @@ async fn build_cache(cfg: &CacheConfig) -> Result<HybridCache<String, Vec<u8>>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_count_falls_back_to_its_default_unless_set_to_a_positive_number() {
+        assert_eq!(parse_count(None, 64), 64);
+        assert_eq!(parse_count(Some("many"), 64), 64);
+        assert_eq!(parse_count(Some("0"), 64), 64);
+        assert_eq!(parse_count(Some("-1"), 64), 64);
+        assert_eq!(parse_count(Some("128"), 64), 128);
+    }
 
     /// A phone's transport cache is a fraction of a desktop's in both tiers,
     /// and still above the disk tier's smallest workable size (one 16 MiB

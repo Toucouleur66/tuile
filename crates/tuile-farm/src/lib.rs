@@ -178,6 +178,30 @@ fn env_number(name: &str) -> Option<usize> {
     std::env::var(name).ok()?.trim().parse().ok()
 }
 
+/// Segments fetched from the store at once to join a film, unless
+/// `TUILE_ASSEMBLE_SEGMENTS` says. Each is itself fetched in
+/// [`Tuning::concurrency`] parallel ranges.
+pub const ASSEMBLE_SEGMENTS: usize = 4;
+
+/// [`ASSEMBLE_SEGMENTS`], or what `TUILE_ASSEMBLE_SEGMENTS` says, read once.
+pub(crate) fn assemble_segments() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        positive_count(
+            std::env::var("TUILE_ASSEMBLE_SEGMENTS").ok().as_deref(),
+            ASSEMBLE_SEGMENTS,
+        )
+    })
+}
+
+/// A positive count from `raw`, or `default` when it is absent, unparsable
+/// or zero — nothing in flight would never finish.
+fn positive_count(raw: Option<&str>, default: usize) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
+}
+
 /// [`RunStore`] on any [`ObjectStore`].
 pub struct ObjectRunStore {
     store: Arc<dyn ObjectStore>,
@@ -713,6 +737,15 @@ pub async fn assert_run_store_contract(store: &dyn RunStore, prefix: &str, part_
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_count_falls_back_to_its_default_unless_set_to_a_positive_number() {
+        assert_eq!(positive_count(None, 4), 4);
+        assert_eq!(positive_count(Some("four"), 4), 4);
+        assert_eq!(positive_count(Some("0"), 4), 4);
+        assert_eq!(positive_count(Some("-4"), 4), 4);
+        assert_eq!(positive_count(Some("12"), 4), 12);
+    }
 
     #[tokio::test]
     async fn a_store_under_a_prefix_keeps_everything_under_it_and_reads_its_own() {

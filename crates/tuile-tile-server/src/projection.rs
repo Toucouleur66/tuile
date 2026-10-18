@@ -70,10 +70,23 @@ const EYE_SPACING_M: f64 = 500.0;
 /// its place: within [`EYE_SPACING_M`] across and as much in height. Added
 /// to every reach, so thinning the cameras never loses a tile.
 const EYE_SLACK_M: f64 = EYE_SPACING_M * std::f64::consts::SQRT_2;
-/// Zones projected at once.
+/// Zones projected at once, unless `TUILE_PROJECTION_ZONES` says.
 const ZONES_IN_FLIGHT: usize = 16;
-/// Byte ranges of one targeted zone fetched at once.
+/// Byte ranges of one targeted zone fetched at once, unless
+/// `TUILE_PROJECTION_RANGES` says.
 const RANGES_IN_FLIGHT: usize = 8;
+
+/// [`ZONES_IN_FLIGHT`], or what the environment says, read once.
+fn zones_in_flight() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    crate::knob::count(&N, "TUILE_PROJECTION_ZONES", ZONES_IN_FLIGHT)
+}
+
+/// [`RANGES_IN_FLIGHT`], or what the environment says, read once.
+fn ranges_in_flight() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    crate::knob::count(&N, "TUILE_PROJECTION_RANGES", RANGES_IN_FLIGHT)
+}
 /// Two ranges of an archive closer than this are fetched as one: a gap this
 /// size costs less than a request.
 pub const COALESCE_GAP: u64 = 64 << 10;
@@ -529,7 +542,7 @@ impl TileStore {
                     };
                     (layer, zone, targeted, r)
                 })
-                .buffer_unordered(ZONES_IN_FLIGHT)
+                .buffer_unordered(zones_in_flight())
                 .collect()
                 .await;
         for (layer, zone, targeted, r) in results {
@@ -742,7 +755,7 @@ impl TileStore {
             .collect();
         let listed: Vec<Option<archive::Listing>> = futures_util::stream::iter(&archives)
             .map(|a| archive::list_remote(self.object_store().as_ref(), &a.key))
-            .buffered(RANGES_IN_FLIGHT)
+            .buffered(ranges_in_flight())
             .try_collect()
             .await?;
         let mut out = ZoneListing {
@@ -829,7 +842,7 @@ impl TileStore {
                     Err(e) => Err(StoreError::from(e)),
                 }
             })
-            .buffer_unordered(RANGES_IN_FLIGHT)
+            .buffer_unordered(ranges_in_flight())
             .try_filter_map(|f| async move { Ok(f) })
             .try_collect()
             .await?;
