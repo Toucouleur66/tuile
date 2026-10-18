@@ -431,3 +431,18 @@ An orbit of Washington, baked cold with no access token: terrain and imagery bot
 Looked at, frames 1 and 24: the Mall, the Potomac and the street grid sharp to the horizon, ground everywhere, no black. No grade. Two seconds.
 
 As for the entry above, making it again needs an implementation of `Sources` and its server, which this repository does not hold.
+
+## 577d-f4500-projected-ribbon-8m-penumbra-x{0,1,2,4,8,20,40}.png, …-grid.png, …-grid-left-2x.png, …-before-after-x4.png — a projected shadow's penumbra (2026-10-18)
+
+Frame 4500 of run `1557732/20260924T221734Z-577d` (packs `…/packs`, bucket `stl-renders`; tile store `stl-tiles`; keys from `.env.film`), 1920×1080, supersample 2, no grade, rendered natively on Metal (Apple M2) by `tuile-film-render` (release) on branch `feat/projected-penumbra` (worktree `tuile-penumbra`). The demonstration ribbon of the `577d-f4500-overlay-ribbon-*` pictures (same 109 points), **8 m wide**, its shadow **projected** (`--ribbon-shadow project`), sun at azimuth 250°, 20° up, shadows full:
+
+```bash
+TUILE_STORE_BUCKET=stl-renders TUILE_TILES_BUCKET=stl-tiles \
+tuile-film-render 1557732/20260924T221734Z-577d/packs --frames 4500:4500 \
+  --sun 250,20 --shadow 1 --ribbon-width 8 --ribbon-shadow project \
+  --penumbra-scale <k> --ribbon "<the 109 points above>" --pictures <dir>
+```
+
+`x0` is the hard shadow as before the penumbra; `x1` the sun's own disc (the default), `x2` … `x40` the disc cut that many times wider. The grids are crops of the same frames: the forest east of the plateau (880,120)–(1680,620), and the ribbon's left turn (180,40)–(580,340) at twice the size.
+
+Looked at: at x1 the edge is already softer than x0, the band still dark; at x2 it reads as a soft, diffuse band and holds its darkness; at x4 it is faint, at x8 and past it barely there — an 8 m ribbon a few hundred metres up under a disc 20 m and more across hides a fifth of the sun or less. The shadow's upper end, cast from higher, fades first. `…-before-after-x4.png` sets the hard shadow, x1 and x4 side by side (the left turn and the forest, twice the size): x4 is the value chosen for a track ribbon; on this 8 m ribbon a few hundred metres up it is a light, diffuse veil, darker where the ribbon runs lower. No black, no gap, nothing flickers (one frame; the GPU tests pin the stillness).

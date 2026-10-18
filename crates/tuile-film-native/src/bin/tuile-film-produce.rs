@@ -175,6 +175,10 @@ struct Args {
     /// none).
     #[arg(long)]
     glare: Option<f32>,
+    /// The penumbrae of projected shadows, this many times the sun's disc
+    /// (1: the sun's own, 0: hard).
+    #[arg(long)]
+    penumbra_scale: Option<f32>,
     /// For two eyes, packed into one picture: `side-by-side` or `top-bottom`.
     #[arg(long, value_parser = ["side-by-side", "top-bottom"])]
     stereo: Option<String>,
@@ -345,6 +349,7 @@ fn rendering(args: &Args, tape_clock: Option<tuile_tape::Clock>) -> Result<Rende
         sun_scale: args.sun_scale,
         moon_scale: args.moon_scale,
         glare: args.glare,
+        penumbra_scale: args.penumbra_scale,
         stereo: args.stereo.as_deref().map(|packing| StereoSpec {
             packing: if packing == "top-bottom" {
                 StereoPacking::TopBottom

@@ -199,6 +199,15 @@ pub struct Look {
     /// lens's (1). 0: none. Read only under [`Look::atmosphere`], for the
     /// sun's disc and the Moon's.
     pub glare: f32,
+    /// How many times the sun's true angular radius the penumbrae of
+    /// projected shadows ([`crate::OverlayShadow::Project`]) are cut to:
+    /// at 1, the sun's own disc, half a degree across, so that a caster
+    /// `t` metres up the ray has a penumbra `t / 107` metres wide,
+    /// straddling its edge; larger, a softer shadow, as under a hazy sky's
+    /// wider source; 0, a hard one. A shadow keeps its whole darkness:
+    /// spread wider, a caster narrower than its penumbra gives a fainter
+    /// one, as it does under the sun.
+    pub penumbra_scale: f32,
 }
 
 impl Default for Look {
@@ -221,6 +230,7 @@ impl Default for Look {
             sun_scale: 1.0,
             moon_scale: 1.0,
             glare: 1.0,
+            penumbra_scale: 1.0,
         }
     }
 }

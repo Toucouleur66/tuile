@@ -44,11 +44,12 @@
 //! cast are drawn into the sun's map with the ground; those that receive
 //! read it as the ground does. Those that project theirs
 //! ([`tuile_film::OverlayShadow::Project`]) stay out of the map: each of
-//! their triangles is drawn as the prism it sweeps down the sun's rays,
-//! and each pixel of ground under a prism asks whether its own ray to the
-//! sun meets the triangle — an exact shadow, as sharp as the picture's
-//! samples, that no grid of texels makes crawl as the sun moves. A frame
-//! without any costs nothing more than before.
+//! their triangles is drawn as the volume its penumbra sweeps down the
+//! sun's rays, and each pixel of ground in it works out how much of the
+//! sun's disc, seen from there, the triangle hides — an exact shadow with
+//! its penumbra ([`tuile_film::Look::penumbra_scale`]), that no grid of
+//! texels makes crawl as the sun moves. A frame without any costs nothing
+//! more than before.
 //!
 //! A stereo frame is drawn once an eye ([`Shot`]): the sun's map is fitted
 //! to the frame's own camera, so both eyes are shaded by the same map, and
@@ -85,8 +86,13 @@ const SLOT_STRIDE: u64 = 256;
 const VIS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Uint;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
-/// Where the ground is in a projected shadow ([`OverlayShadow::Project`]).
-const PROJECTED_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
+/// How much of the sun the ground loses to projected shadows
+/// ([`OverlayShadow::Project`]): each triangle's share of the sun's disc,
+/// added — so a float, a byte's steps would band a penumbra — and taken
+/// at most whole by the resolve.
+const PROJECTED_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R16Float;
+/// The sun's angular radius, in radians: its disc is half a degree across.
+pub const SUN_ANGULAR_RADIUS: f32 = 4.65e-3;
 /// Overlays are blended in linear light before they are filtered down: a
 /// byte a channel would band their dark colours.
 const OVERLAY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -260,9 +266,10 @@ struct Resident {
 struct Targets {
     vis: wgpu::TextureView,
     depth: wgpu::TextureView,
-    /// The ground that projected shadows fall on, a sample a texel: see
+    /// How much of the sun projected shadows take, a sample a texel: see
     /// `projected.wgsl`.
     projected: wgpu::TextureView,
+    projected_texture: wgpu::Texture,
     hdr: wgpu::TextureView,
     /// Made when a frame first carries an overlay: a film that never does
     /// never pays for it.
@@ -358,6 +365,8 @@ pub struct FilmGpu {
     /// reads them.
     projected_corners: Growing,
     projected_bgl: wgpu::BindGroupLayout,
+    /// The penumbra of projected shadows: `projected.wgsl`'s `penumbra`.
+    projected_penumbra: wgpu::Buffer,
     /// The sun's maps, one view each, and their side, for a look that has
     /// shadows.
     shadow_map: Option<(Vec<wgpu::TextureView>, u32)>,
@@ -590,6 +599,17 @@ fn swept_to_the_ground(at: DVec3, to_sun: Vec3) -> f32 {
     }
     // A sun a third of a degree up: some 200 km for a corner 1 km up.
     ((height + 1_000.0).max(0.0) / rising.max(0.005)).min(1.0e6) as f32
+}
+
+/// The tangent of the angular radius of the sun's disc that projected
+/// shadows' penumbrae are cut to, `scale` times the sun's own
+/// ([`SUN_ANGULAR_RADIUS`]); none, a hard shadow, at 0. Held under a
+/// quarter turn's width either side, where a tangent still means a disc.
+fn penumbra_tangent(scale: f32) -> f32 {
+    if scale.is_nan() || scale <= 0.0 {
+        return 0.0;
+    }
+    (SUN_ANGULAR_RADIUS * scale).min(1.2).tan()
 }
 
 fn shader(device: &wgpu::Device, name: &str, body: &str) -> wgpu::ShaderModule {
@@ -1034,7 +1054,14 @@ impl FilmGpu {
                     ..texture(1, wgpu::TextureSampleType::Depth)
                 },
                 storage(2, wgpu::ShaderStages::VERTEX_FRAGMENT, true),
+                uniform(3, wgpu::ShaderStages::VERTEX_FRAGMENT, false),
             ],
+        });
+        let projected_penumbra = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("film projected penumbra"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
         let projected_module = shader(
             &device,
@@ -1057,8 +1084,9 @@ impl FilmGpu {
                 buffers: &[],
             },
             primitive: wgpu::PrimitiveState {
-                // A prism's far side as well as its near one.
-                cull_mode: None,
+                // A box's far side only: it covers each pixel the box does
+                // once, the eye outside the box or in it.
+                cull_mode: Some(wgpu::Face::Front),
                 ..Default::default()
             },
             // The ground is read in the shader; nothing is tested.
@@ -1068,7 +1096,20 @@ impl FilmGpu {
                 module: &projected_module,
                 entry_point: Some("fs"),
                 compilation_options: Default::default(),
-                targets: &[Some(PROJECTED_FORMAT.into())],
+                // Each triangle's share of the sun, added: the shares of a
+                // mesh's abutting triangles sum to the whole's.
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: PROJECTED_FORMAT,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent::REPLACE,
+                    }),
+                    write_mask: wgpu::ColorWrites::RED,
+                })],
             }),
             multiview_mask: None,
             cache: None,
@@ -1384,6 +1425,7 @@ impl FilmGpu {
             overlay_edges: Growing::default(),
             projected_corners: Growing::default(),
             projected_bgl,
+            projected_penumbra,
             shadow_map: (settings.look.shadow > 0.0).then_some((shadow_maps, shadow_side)),
             sun_map_passes,
             sun_map_stride,
@@ -1465,14 +1507,14 @@ impl FilmGpu {
             h,
         )
         .create_view(&Default::default());
-        let projected = make(
+        let projected_texture = make(
             "film projected shadows",
             PROJECTED_FORMAT,
-            U::RENDER_ATTACHMENT | U::TEXTURE_BINDING,
+            U::RENDER_ATTACHMENT | U::TEXTURE_BINDING | U::COPY_SRC,
             w,
             h,
-        )
-        .create_view(&Default::default());
+        );
+        let projected = projected_texture.create_view(&Default::default());
         let hdr = make(
             "film hdr",
             HDR_FORMAT,
@@ -1574,6 +1616,7 @@ impl FilmGpu {
             vis,
             depth,
             projected,
+            projected_texture,
             hdr,
             overlay: None,
             out,
@@ -1709,6 +1752,14 @@ impl FilmGpu {
     /// when the frame has no Moon.
     pub fn moon_view_texture(&self) -> &wgpu::Texture {
         &self.atmosphere.moon_view
+    }
+
+    /// How much of the sun the projected shadows of the frame last drawn
+    /// take from each sample of its supersampled picture: `R16Float`, each
+    /// triangle's share of the sun's disc summed — the resolve takes at
+    /// most the whole sun. Zero where no shadow is projected.
+    pub fn projected_shadow_texture(&self) -> &wgpu::Texture {
+        &self.targets.projected_texture
     }
 
     /// The look the frame last drawn was drawn with: the ordered one under
@@ -2623,6 +2674,16 @@ impl FilmGpu {
                     .clone()
             });
             let bind = corners.as_ref().map(|corners| {
+                self.queue.write_buffer(
+                    &self.projected_penumbra,
+                    0,
+                    bytemuck::cast_slice(&[
+                        penumbra_tangent(self.lit.penumbra_scale),
+                        0.0,
+                        0.0,
+                        0.0,
+                    ]),
+                );
                 self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("film projected shadows"),
                     layout: &self.projected_bgl,
@@ -2630,6 +2691,7 @@ impl FilmGpu {
                         entry(0, self.frame_buf.as_entire_binding()),
                         entry(1, wgpu::BindingResource::TextureView(&self.targets.depth)),
                         entry(2, corners.as_entire_binding()),
+                        entry(3, self.projected_penumbra.as_entire_binding()),
                     ],
                 })
             });
@@ -2652,7 +2714,7 @@ impl FilmGpu {
             if let Some(bind) = &bind {
                 pass.set_pipeline(&self.pipelines.projected);
                 pass.set_bind_group(0, bind, &[]);
-                pass.draw(0..24, 0..(projected.len() / 3) as u32);
+                pass.draw(0..36, 0..(projected.len() / 3) as u32);
             }
         }
 

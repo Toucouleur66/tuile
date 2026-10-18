@@ -85,6 +85,10 @@ pub struct RenderSpec {
     pub moon_scale: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub glare: Option<f32>,
+    /// The penumbrae of projected shadows, this many times the sun's disc
+    /// (`Look::penumbra_scale`; 0: hard).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub penumbra_scale: Option<f32>,
 }
 
 /// A film for two eyes, as a caller writes it: see [`tuile_film::Stereo`].
@@ -187,6 +191,7 @@ impl Default for RenderSpec {
             sun_scale: None,
             moon_scale: None,
             glare: None,
+            penumbra_scale: None,
         }
     }
 }
@@ -229,6 +234,9 @@ impl RenderSpec {
         }
         if let Some(glare) = self.glare {
             order.look.glare = glare;
+        }
+        if let Some(scale) = self.penumbra_scale {
+            order.look.penumbra_scale = scale;
         }
         if (self.atmosphere || self.turbidity.is_some())
             && order.clock.is_none()
@@ -310,11 +318,12 @@ pub fn film_prefix(packs: &str, rendering: &Rendering) -> String {
 #[cfg(test)]
 const FROZEN_DEFAULT_LOOK: &str = "ff9e7af3dbfa95e5";
 
-const LATER_FIELDS: [&str; 4] = [
+const LATER_FIELDS: [&str; 5] = [
     ", clock: None",
     ", sun_scale: 1.0",
     ", moon_scale: 1.0",
     ", glare: 1.0",
+    ", penumbra_scale: 1.0",
 ];
 
 /// The text a rendering is named by: everything but which frames are
