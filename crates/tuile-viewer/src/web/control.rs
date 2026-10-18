@@ -26,6 +26,9 @@ pub(crate) enum ToWorker {
         opening: usize,
         profile: ProfileChoice,
         device_memory: Option<f64>,
+        /// The most decode workers to start: see `schedule::pool_size`.
+        #[serde(default)]
+        decode_workers: Option<u32>,
     },
     /// The ground texel spacing the imagery is draped at, metres: see
     /// `tuile_planetary::ImageryDetail`.

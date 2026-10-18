@@ -13,7 +13,8 @@
 //! ```
 //!
 //! The page and the worker load the same wasm module and call different
-//! exports: [`page`] creates the viewer, [`worker`] runs the server. The
+//! exports: [`page`] creates the viewer, [`worker`] runs the server, and
+//! [`decode`] runs the decode workers the server's worker starts. The
 //! renderer, the frame step, the gestures, the indicator and the lifecycle are
 //! the desktop's own; what is here is only what a browser does differently —
 //! where the session comes from ([`session`]), what the host page is told
@@ -28,11 +29,16 @@ pub(crate) mod options;
 #[cfg(target_arch = "wasm32")]
 mod control;
 #[cfg(target_arch = "wasm32")]
+pub mod decode;
+#[cfg(target_arch = "wasm32")]
 mod log;
 #[cfg(target_arch = "wasm32")]
 pub(crate) mod menu;
 #[cfg(target_arch = "wasm32")]
 pub mod page;
+// The decode pool's bookkeeping, on every target so its tests run on the host.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod schedule;
 #[cfg(target_arch = "wasm32")]
 mod screen;
 #[cfg(target_arch = "wasm32")]

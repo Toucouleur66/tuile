@@ -44,6 +44,7 @@ pub(crate) struct Plan {
     pub sources: SourcesSpec,
     pub profile: ProfileChoice,
     pub device_memory: Option<f64>,
+    pub decode_workers: Option<u32>,
 }
 
 /// The worker, and the page's ear on it. Dropping the last handle ends both:
@@ -285,6 +286,7 @@ pub(crate) fn start(plan: &Plan) -> Launch {
         opening: 0,
         profile: plan.profile,
         device_memory: plan.device_memory,
+        decode_workers: plan.decode_workers,
     });
     *waiting.borrow_mut() = Some(Waiting {
         answer,

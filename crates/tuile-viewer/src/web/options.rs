@@ -43,6 +43,11 @@ pub(crate) struct Options {
     /// ended, as a desktop's application does.
     #[serde(default = "yes")]
     pub remember_view: bool,
+    /// The most Web Workers that decode imagery and terrain beside the
+    /// geometry server's: one per core less one, up to this. 0 decodes on the
+    /// geometry server's own thread.
+    #[serde(default)]
+    pub decode_workers: Option<u32>,
 }
 
 /// Which bottom corner the caption keeps to.
@@ -324,6 +329,7 @@ mod tests {
             "name": "Atlas", "profile": "handheld", "deviceMemory": 4, "backend": "webgl2",
             "ui": false, "view": { "lon": 6.86, "lat": 45.83, "altitude": 6000 },
             "attribution": "bottom-left", "showUnsupportedMessage": false, "rememberView": false,
+            "decodeWorkers": 0,
             "sources": {
                 "catalog": { "url": "https://catalog.test/" },
                 "terrain": { "asset": 7 },
@@ -340,6 +346,7 @@ mod tests {
         assert_eq!(o.attribution, CaptionSide::BottomLeft);
         assert!(!o.show_unsupported_message);
         assert!(!o.remember_view);
+        assert_eq!(o.decode_workers, Some(0));
         let view = o.view.expect("a view").view().expect("in bounds");
         assert_eq!((view.heading, view.pitch), (0.0, 90.0));
         assert_eq!(

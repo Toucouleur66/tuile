@@ -127,6 +127,7 @@ pub fn start_viewer(
         sources: options.sources.clone(),
         profile: options.profile,
         device_memory: options.device_memory,
+        decode_workers: options.decode_workers,
     });
     let launch = session::start(&plan);
     let retries = Retries::new(move || session::start(&plan));
