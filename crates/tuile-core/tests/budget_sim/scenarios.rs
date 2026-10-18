@@ -70,7 +70,7 @@ fn a_still_camera_converges_within_two_seconds_on_desktop() {
 
 /// I3: on a phone, within four.
 #[test]
-#[ignore = "tuning finding (Step 6): a cold phone converges in ~18 s, throughput-bound"]
+#[ignore = "throughput-bound: 6.4 s after the stop; the network model allows 6.3 s at best (740 loads, ~0.24 s each, 8+8 in flight); 4 s needs the target or the model changed"]
 fn a_still_camera_converges_within_four_seconds_on_a_phone() {
     converges(Profile::handheld());
 }
@@ -238,7 +238,10 @@ fn back_and_forth(t: f64) -> Camera {
 /// I14, B anti-patterns: going back and forth reuses what is held: the
 /// returns cost a fraction of the first pass, and little is thrashed.
 #[test]
-#[ignore = "tuning finding (Step 6): desktop drape churn, ~950 evict-then-request in 48 s"]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+)]
 fn back_and_forth_reuses_what_is_held() {
     let mut sim = Sim::new(Profile::desktop(), 7);
     sim.run(16.0, &back_and_forth);
@@ -355,7 +358,10 @@ fn a_lossy_stalling_network_never_blocks_the_view() {
 /// I14, I15: a relaunch fills the view from the store, without network for
 /// what the store holds.
 #[test]
-#[ignore = "tuning finding (Step 6): converges in ~7.5 s against 4 s"]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+)]
 fn a_relaunch_fills_the_view_from_the_store_without_network() {
     let mut first = Sim::new(Profile::handheld(), 12);
     // The first session converges, so its store holds the view.

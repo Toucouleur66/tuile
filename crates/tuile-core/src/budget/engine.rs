@@ -358,38 +358,78 @@ impl Budget {
         tiles
     }
 
+    /// How cheaply a drape could be drawn: on the GPU, decoded, in a local
+    /// store, or only remotely.
+    fn drape_tier(&self, r: ResourceId, presence: &dyn PresenceOracle) -> Tier {
+        let e = self.entries.get(&r);
+        let epoch = self.epochs[Class::Drape];
+        match e {
+            Some(e) if e.gpu.is_some_and(|g| g.epoch == epoch) => Tier::Gpu,
+            Some(e) if e.fresh_cpu(epoch).is_some() => Tier::Decoded,
+            Some(e) if e.store_missed => Tier::Remote,
+            _ => match presence.holds(r) {
+                Presence::Stored => Tier::Stored,
+                Presence::Absent => Tier::Remote,
+            },
+        }
+    }
+
     /// Each wanted tile's imagery level this step.
-    fn drape_needs(&mut self, tiles: &BTreeMap<TileId, TileNeed>) -> BTreeMap<TileId, u32> {
+    ///
+    /// The level follows the texel footprint (relaxed with the LOD, with
+    /// hysteresis). When that level is held nowhere locally, a level already
+    /// held (GPU, decoded, store) is taken instead if it lies within one
+    /// level of the window between the relaxed and the unrelaxed need: a
+    /// relaxation never sends to the network what a local tier can show
+    /// (I14, I15). Batch takes the exact level, a function of the frame.
+    fn drape_needs(
+        &mut self,
+        tiles: &BTreeMap<TileId, TileNeed>,
+        presence: &dyn PresenceOracle,
+    ) -> BTreeMap<TileId, u32> {
         let mut out = BTreeMap::new();
         let floor = self.cfg.pinned_level.unwrap_or(0);
-        let cap = self.cfg.imagery_cap();
         let batch = self.cfg.policy == Policy::Batch;
+        let cap = self.cfg.imagery_cap();
         for (t, tn) in tiles {
             let draped = matches!(tn.membership, Membership::Drawn | Membership::Blocker);
             let Some(img) = tn.need.imagery.filter(|_| draped) else {
                 continue;
             };
-            let prev = if batch {
-                None
-            } else {
-                self.imagery_prev.get(t).copied()
+            let clamp = LevelClamp {
+                floor,
+                terrain_level: tn.need.level,
+                over_terrain_cap: cap,
+                source_max: img.max_level,
             };
-            let level = needed_level(
-                prev,
-                img.footprint.relaxed(self.scale),
-                LevelClamp {
-                    floor,
-                    terrain_level: tn.need.level,
-                    over_terrain_cap: cap,
-                    source_max: img.max_level,
-                },
-            );
+            if batch {
+                out.insert(*t, needed_level(None, img.footprint, clamp));
+                continue;
+            }
+            let prev = self.imagery_prev.get(t).copied();
+            let relaxed = needed_level(prev, img.footprint.relaxed(self.scale), clamp);
+            let mut level = relaxed;
+            if self.drape_tier(ResourceId::Drape(*t, relaxed), presence) == Tier::Remote {
+                let full = needed_level(prev, img.footprint, clamp);
+                let ceiling = tn.need.level.saturating_add(cap).min(img.max_level);
+                let lo = relaxed.min(full).saturating_sub(1).max(floor);
+                let hi = relaxed.max(full).saturating_add(1).min(ceiling);
+                let best = (lo..=hi)
+                    .map(|l| {
+                        let tier = self.drape_tier(ResourceId::Drape(*t, l), presence);
+                        ((tier, l.abs_diff(relaxed), Reverse(l)), l)
+                    })
+                    .min();
+                if let Some(((tier, ..), l)) = best {
+                    if tier != Tier::Remote {
+                        level = l;
+                    }
+                }
+            }
             out.insert(*t, level);
         }
-        if !batch {
-            for (t, l) in &out {
-                self.imagery_prev.insert(*t, *l);
-            }
+        for (t, l) in &out {
+            self.imagery_prev.insert(*t, *l);
         }
         out
     }
@@ -722,7 +762,7 @@ impl Budget {
 
         self.apply_events(now, &mut st);
         let tiles = self.read_need(&input, &mut st);
-        let drapes = self.drape_needs(&tiles);
+        let drapes = self.drape_needs(&tiles, input.presence);
         let (draw, coarsening) = self.build_draw(&tiles, &drapes, &mut st);
         let mut wants = self.wants(&tiles, &drapes, &draw);
         // Drawn content of an older epoch is refreshed, new before old.
@@ -1175,7 +1215,12 @@ impl Budget {
             }
             if let Some(t) = self.recent.remove(r) {
                 if now.since(t) <= THRASH_WINDOW {
-                    st.thrash += 1;
+                    // Back from a local store is a demotion paying off; back
+                    // from the network is thrash.
+                    match source {
+                        Source::Network => st.thrash += 1,
+                        Source::Local => st.rereads += 1,
+                    }
                 }
             }
             d.start.push(Start {
@@ -1479,13 +1524,20 @@ impl Budget {
                 .entries
                 .iter()
                 .filter(|(_, e)| e.cpu.is_some() && e.transit.is_none())
-                // Copies of what the GPU still holds go first: they are
-                // duplicates now, while an evicted resource's copy is what
-                // saves a fetch when the view comes back.
+                // Release order: copies of protected GPU residents first
+                // (they will not be evicted soon), then of evictable GPU
+                // residents (their copy is what an eviction demotes to),
+                // then copies already demoted (they save a re-read when the
+                // view comes back).
                 .map(|(r, e)| {
+                    let rank = match (e.gpu.is_some(), drawn.contains(r)) {
+                        (true, true) => 0u8,
+                        (true, false) => 1,
+                        (false, _) => 2,
+                    };
                     (
                         (
-                            e.gpu.is_none(),
+                            rank,
                             e.last_needed,
                             Reverse(e.level),
                             Reverse(e.distance),

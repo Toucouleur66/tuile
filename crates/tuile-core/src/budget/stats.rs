@@ -55,8 +55,12 @@ pub struct BudgetStats {
     pub store_misses: u32,
     /// Network bytes avoided by local tiers this step.
     pub network_bytes_avoided: Bytes,
-    /// Resources re-requested within 10 s of their eviction.
+    /// Resources fetched again from the network within 10 s of their
+    /// eviction (what I14 forbids in spirit).
     pub thrash: u32,
+    /// Resources read again from a local store within 10 s of their
+    /// eviction: the eviction demoted them to the Stored tier.
+    pub rereads: u32,
     /// Entries of the bounded wish list.
     pub heap_len: u32,
     /// Network loads in flight per class.
@@ -120,6 +124,7 @@ impl BudgetStats {
             u64::from(self.store_misses),
             self.network_bytes_avoided.0,
             u64::from(self.thrash),
+            u64::from(self.rereads),
             u64::from(self.heap_len),
             u64::from(self.local_reads),
             u64::from(self.duplicates_in_flight),

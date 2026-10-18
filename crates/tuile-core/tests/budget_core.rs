@@ -1816,6 +1816,22 @@ mod stats {
         assert_eq!(d.stats.thrash, 1, "{RED}");
     }
 
+    /// I14, review of Checkpoint B: an evicted resource read back from a
+    /// local store is a demotion paying off, not thrash; only the network
+    /// counts as thrash.
+    #[test]
+    fn a_local_reread_after_eviction_is_not_thrash() {
+        let mut r = Rig::new(small(1));
+        let (a, b) = (t(3, 0, 0), t(3, 5, 5));
+        r.settle(&drawn(&[a]), 10);
+        r.settle(&drawn(&[b]), 10);
+        assert!(!r.b.residency().drawable(a), "a was evicted");
+        r.store.0.insert(mesh(a));
+        let d = r.step(&drawn(&[a]));
+        assert_eq!(d.start.first().map(|s| s.source), Some(Source::Local));
+        assert_eq!((d.stats.thrash, d.stats.rereads), (0, 1));
+    }
+
     /// I3, C28: convergence is reported once everything is exact and idle.
     #[test]
     fn convergence_is_reported_once_everything_is_exact_and_idle() {
