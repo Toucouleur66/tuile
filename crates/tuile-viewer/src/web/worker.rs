@@ -80,6 +80,9 @@ async fn start(spec: SourcesSpec, opening: usize, profile: Profile) -> Result<()
     });
     let config = profile.traversal(Some(profile.pinned_level));
     let (stream, server) = tuile_core::runtime::in_process_with(globe.tree, loader, config);
+    // The worker's one thread is also where the page's messages arrive — the
+    // camera, the acks: a burst answered from memory must let them in.
+    let server = server.with_breather(BURST, Arc::new(breathe));
     wasm_bindgen_futures::spawn_local(async move {
         server.run().await;
         tracing::info!("the geometry server has stopped");
@@ -96,6 +99,22 @@ async fn start(spec: SourcesSpec, opening: usize, profile: Profile) -> Result<()
     std::mem::forget(connection);
     post(&ToPage::Started);
     Ok(())
+}
+
+/// Events the server handles back to back before the worker's messages get
+/// their turn: a few milliseconds of work at most.
+const BURST: usize = 16;
+
+/// A pause on the worker's timer: a macrotask, so the messages queued behind
+/// the server's burst are delivered before it goes on. A promise alone would
+/// not do — its continuation is a microtask, which runs before them.
+fn breathe() -> tuile_core::runtime::Pause {
+    let promise = js_sys::Promise::new(&mut |resolve, _| {
+        let _ = scope().set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0);
+    });
+    Box::pin(async move {
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    })
 }
 
 /// The loader's handles, which the page's messages act on.

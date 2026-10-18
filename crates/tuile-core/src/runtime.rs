@@ -43,6 +43,17 @@ type BoxLoadFut = Pin<Box<dyn Future<Output = LoadMsg> + Send>>;
 type BoxLoadFut = Pin<Box<dyn Future<Output = LoadMsg>>>;
 type LoadFuture = Abortable<BoxLoadFut>;
 
+/// A pause the host's event loop gets to run in: see
+/// [`GeometryServer::with_breather`]. `Send` on native, like the loads, and
+/// not on wasm, where it is a JS timer.
+#[cfg(not(target_arch = "wasm32"))]
+pub type Pause = Pin<Box<dyn Future<Output = ()> + Send>>;
+#[cfg(target_arch = "wasm32")]
+pub type Pause = Pin<Box<dyn Future<Output = ()>>>;
+
+/// Makes a [`Pause`].
+pub type Breather = Arc<dyn Fn() -> Pause + Send + Sync>;
+
 /// Creates a geometry server for a **3D Tiles** tileset, bound in-process to
 /// one consumer. Convenience over [`in_process_with`]: it wraps the tileset in
 /// a shared arena and builds the [`TilesetTree`]/[`TilesetLoader`] pair.
@@ -104,6 +115,7 @@ pub fn in_process_with(
             view_moved: false,
             frame: 0,
             primed: false,
+            breather: None,
         },
     )
 }
@@ -157,11 +169,32 @@ pub struct GeometryServer {
     /// Whether the coarse pyramid has been asked for yet. See
     /// [`Session::prime`].
     primed: bool,
+    /// Handing the host its turn: after this many events in a row with no
+    /// wait between them, the pause. See [`GeometryServer::with_breather`].
+    breather: Option<(usize, Breather)>,
 }
 
 impl GeometryServer {
+    /// Hands the host its turn after every `every` events handled back to
+    /// back, by awaiting `pause()`.
+    ///
+    /// A load answered from memory completes on its first poll, and so does
+    /// the traversal it triggers, and the next load: a burst can run for
+    /// seconds without the loop ever waiting. On a desktop's thread pool that
+    /// costs a core. In a browser's worker, which has one thread and receives
+    /// the camera as messages, it is a server that hears nothing — no camera,
+    /// no acks — while it works, and a page that stops refining under a
+    /// moving view. The worker's pause is a timer, which lets its messages in.
+    #[must_use]
+    pub fn with_breather(mut self, every: usize, pause: Breather) -> Self {
+        self.breather = Some((every.max(1), pause));
+        self
+    }
+
     /// Runs the session until the consumer goes away.
     pub async fn run(mut self) {
+        let breather = self.breather.take();
+        let mut busy = 0usize;
         let mut rx = self.endpoint.rx;
         let tx = self.endpoint.tx.clone();
         let mut loads: FuturesUnordered<LoadFuture> = FuturesUnordered::new();
@@ -214,6 +247,9 @@ impl GeometryServer {
         let mut client_first = true;
 
         loop {
+            // Whether this turn had to wait: a turn that waited has given the
+            // host its turn already.
+            let mut waited = false;
             let event = poll_fn(|cx| {
                 let mut poll_client =
                     |cx: &mut std::task::Context<'_>| match Pin::new(&mut rx).poll_next(cx) {
@@ -221,7 +257,7 @@ impl GeometryServer {
                         Poll::Ready(None) => Poll::Ready(Some(Event::Closed)),
                         Poll::Pending => Poll::Ready(None),
                     };
-                if client_first {
+                let polled = if client_first {
                     if let Poll::Ready(Some(event)) = poll_client(cx) {
                         return Poll::Ready(event);
                     }
@@ -237,10 +273,21 @@ impl GeometryServer {
                         Poll::Ready(Some(event)) => Poll::Ready(event),
                         _ => Poll::Pending,
                     }
+                };
+                if polled.is_pending() {
+                    waited = true;
                 }
+                polled
             })
             .await;
             client_first = !client_first;
+            busy = if waited { 0 } else { busy + 1 };
+            if let Some((every, pause)) = &breather {
+                if busy >= *every {
+                    pause().await;
+                    busy = 0;
+                }
+            }
 
             // Why this session ended, named rather than implied.
             //
@@ -1422,6 +1469,78 @@ mod tests {
              holds them resident and acked, and that ground is coarse for the \
              rest of the session",
             wrongly_taken.len()
+        );
+    }
+
+    /// **A server answered from memory still hands its host a turn.** Every
+    /// load here completes on its first poll, so the loop never has to wait;
+    /// with a breather every four events it pauses all the same, and the
+    /// session goes on to deliver everything after each pause.
+    #[test]
+    fn a_busy_server_hands_its_host_a_turn() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Ready on the second poll: a turn given back to the executor.
+        struct Yield(bool);
+        impl Future for Yield {
+            type Output = ();
+            fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<()> {
+                if std::mem::replace(&mut self.0, true) {
+                    Poll::Ready(())
+                } else {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = write_deep_fixture(dir.path());
+        let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
+        let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
+        let pauses = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&pauses);
+        let (mut stream, server) = in_process(
+            tileset,
+            Arc::new(FsFetcher),
+            Config {
+                pinned_level: None,
+                ..Config::default()
+            },
+        );
+        let server = server.with_breather(
+            4,
+            Arc::new(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Box::pin(Yield(false))
+            }),
+        );
+        let mut server = Box::pin(server.run());
+        let waker = futures_util::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        stream
+            .send(ClientMessage::ViewerState {
+                views: vec![near_view()],
+                generation: 0,
+            })
+            .expect("send");
+        let mut delivered = 0usize;
+        for _ in 0..256 {
+            let _ = server.as_mut().poll(&mut cx);
+            while let Poll::Ready(Some(msg)) = stream.poll_message(&mut cx) {
+                if let ServerMessage::Content { tile, .. } = msg {
+                    delivered += 1;
+                    let _ = stream.send(ClientMessage::Ack { tile });
+                }
+            }
+        }
+        assert!(
+            pauses.load(Ordering::SeqCst) > 0,
+            "the host never had a turn"
+        );
+        assert!(
+            delivered >= 7,
+            "the session stopped after a pause: {delivered}"
         );
     }
 
