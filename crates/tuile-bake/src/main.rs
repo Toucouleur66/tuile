@@ -349,8 +349,8 @@ environment:
                      bouton d'un balayage machine, qui doit pouvoir répondre
                      « ce qu'un autre seuil aurait sélectionné » sans qu'on
                      reconstruise une image pour chaque valeur
-  TUILE_SESSION_THREADS     session runtime workers (default: one per core)
-  TUILE_TILES_THREADS       tile store runtime workers (default 2)
+  TUILE_SESSION_THREADS     session runtime workers (default: available threads)
+  TUILE_TILES_THREADS       tile store runtime workers (default: available threads)
   TUILE_DECODE_THREADS      decode and resample threads (default: cores - 1)
   TUILE_FINISH_THREADS      tile finishing threads (default: one per core)
   TUILE_FETCHES             tile requests in flight (default 64)

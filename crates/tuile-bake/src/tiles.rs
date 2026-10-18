@@ -68,14 +68,16 @@ fn evict_oldest(dir: &std::path::Path, budget: u64) -> (u64, u64) {
     (removed, freed)
 }
 
-/// Worker threads of the store's runtime, unless `TUILE_TILES_THREADS` says:
-/// its work is waiting on the bucket, not computing.
-const DEFAULT_RUNTIME_THREADS: usize = 2;
-
-/// [`DEFAULT_RUNTIME_THREADS`], or what `TUILE_TILES_THREADS` says. Read when
-/// a store is opened, which a bake does once.
+/// Worker threads of the store's runtime: what `TUILE_TILES_THREADS` says,
+/// or the threads available to the process. Read when a store is opened,
+/// which a bake does once.
+///
+/// It was two. Every lookup a bake makes against the store, absences
+/// included, runs on this runtime, and two workers are the prime suspect
+/// for bakes starving on a farm worker (not yet measured).
 fn runtime_threads() -> usize {
-    crate::session::count_knob("TUILE_TILES_THREADS").unwrap_or(DEFAULT_RUNTIME_THREADS)
+    crate::session::count_knob("TUILE_TILES_THREADS")
+        .unwrap_or_else(crate::session::available_threads)
 }
 
 /// Where the scene's projections are written, unless `TUILE_TILES_DIR` says.

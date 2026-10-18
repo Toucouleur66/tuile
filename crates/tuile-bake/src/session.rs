@@ -1003,14 +1003,13 @@ impl Live {
     /// a tree to hand over — and doing that on a second runtime would mean two
     /// thread pools and two sets of connections for one session.
     ///
-    /// `TUILE_SESSION_THREADS` sets its worker count; unset, tokio's default
-    /// (one per core).
+    /// `TUILE_SESSION_THREADS` sets its worker count; unset, the threads
+    /// available to the process ([`available_threads`]).
     pub(crate) fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
-        let mut builder = tokio::runtime::Builder::new_multi_thread();
-        if let Some(threads) = count_knob("TUILE_SESSION_THREADS") {
-            builder.worker_threads(threads);
-        }
-        builder.enable_all().build()
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(count_knob("TUILE_SESSION_THREADS").unwrap_or_else(available_threads))
+            .enable_all()
+            .build()
     }
 
     /// Starts a session on an already-built runtime.
@@ -1512,6 +1511,13 @@ fn env_knob<T: std::str::FromStr + PartialOrd>(name: &str, default: T) -> T {
 pub(crate) fn parse_count(raw: Option<&str>) -> Option<usize> {
     raw.and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|n| *n > 0)
+}
+
+/// The threads this process may run on: `available_parallelism`, which on
+/// Linux honours a cgroup CPU quota, so a container gets its share rather
+/// than the host's core count. Two when it cannot be told.
+pub(crate) fn available_threads() -> usize {
+    std::thread::available_parallelism().map_or(2, |n| n.get())
 }
 
 /// [`parse_count`] of the environment variable `name`.
