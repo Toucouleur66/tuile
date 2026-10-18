@@ -81,6 +81,28 @@ pub(super) struct Lifecycle {
     /// Bytes to trim to on a memory warning, and in the background.
     trim_on_warning: usize,
     trim_in_background: usize,
+    trim_on_critical: usize,
+}
+
+/// Acts once on each memory signal a system counts — Android's
+/// `onTrimMemory`, read as a count and a level — however many times the
+/// count is read.
+#[derive(Debug, Default)]
+pub(super) struct PressureWatch {
+    seen: u64,
+}
+
+impl PressureWatch {
+    /// The pressure to act on, if `count` is a signal not acted on yet.
+    pub(super) fn fresh(
+        &mut self,
+        (count, pressure): (u64, crate::profile::Pressure),
+    ) -> Option<crate::profile::Pressure> {
+        if count == std::mem::replace(&mut self.seen, count) {
+            return None;
+        }
+        (pressure != crate::profile::Pressure::Nominal).then_some(pressure)
+    }
 }
 
 impl Lifecycle {
@@ -93,6 +115,7 @@ impl Lifecycle {
             store_suspended: false,
             trim_on_warning: profile.trim_on_warning(),
             trim_in_background: profile.trim_in_background(),
+            trim_on_critical: profile.trim_on_critical_pressure(),
         }
     }
 
@@ -182,6 +205,27 @@ impl Lifecycle {
     /// The system is short of memory.
     pub(super) fn memory_warning(&self) -> Vec<Step> {
         vec![Step::Trim(self.trim_on_warning)]
+    }
+
+    /// The system took the window's surface away: Android does, whenever the
+    /// application leaves the front. Everything the background asks for, and
+    /// the surface let go of whatever the profile says — it no longer exists.
+    pub(super) fn surface_lost(&mut self) -> Vec<Step> {
+        let mut steps = self.background();
+        if !std::mem::replace(&mut self.surface_released, true) {
+            steps.push(Step::ReleaseSurface);
+        }
+        steps
+    }
+
+    /// The system says how short of memory it is.
+    pub(super) fn memory_pressure(&self, pressure: crate::profile::Pressure) -> Vec<Step> {
+        use crate::profile::Pressure;
+        match pressure {
+            Pressure::Nominal => Vec::new(),
+            Pressure::Warning => self.memory_warning(),
+            Pressure::Critical => vec![Step::Trim(self.trim_on_critical)],
+        }
     }
 }
 
@@ -299,6 +343,94 @@ mod tests {
         );
         assert!(l.may_draw());
         assert_eq!(l.phase(), Phase::Active);
+    }
+
+    fn android() -> (Lifecycle, Profile) {
+        let p = Profile::android(
+            DeviceMemory {
+                physical: 3 << 30,
+                available: Some(1 << 30),
+            },
+            8,
+        );
+        (Lifecycle::new(&p), p)
+    }
+
+    /// Android takes the surface away on the way out (winit's `suspended`):
+    /// loads held, memory trimmed, the store written down and the surface
+    /// gone, before the call returns. Back in front (`resumed`), the surface
+    /// first, then the store, then loads, then a frame.
+    #[test]
+    fn android_takes_the_surface_away_and_gives_it_back() {
+        let (mut l, p) = android();
+        assert!(l.may_draw());
+        assert_eq!(
+            l.surface_lost(),
+            [
+                Step::PauseLoads,
+                Step::Trim(p.trim_in_background()),
+                Step::SuspendStore,
+                Step::ReleaseSurface
+            ]
+        );
+        assert!(!l.may_draw(), "no frame without a surface");
+        assert!(l.surface_lost().is_empty(), "said twice, done once");
+        assert_eq!(
+            l.activate(),
+            [
+                Step::RestoreSurface,
+                Step::ResumeStore,
+                Step::ResumeLoads,
+                Step::Redraw
+            ]
+        );
+        assert!(l.may_draw());
+        // And again: a person switches away more than once.
+        assert!(l.surface_lost().contains(&Step::ReleaseSurface));
+        assert!(l.activate().contains(&Step::RestoreSurface));
+    }
+
+    /// A surface the system destroyed is released whatever the profile says
+    /// about keeping it: there is nothing left to keep.
+    #[test]
+    fn a_lost_surface_is_released_even_where_it_would_be_kept() {
+        let mut l = Lifecycle::new(&Profile::browser(true, None));
+        assert!(l.surface_lost().contains(&Step::ReleaseSurface));
+        assert!(!l.may_draw());
+        assert_eq!(l.activate()[0], Step::RestoreSurface);
+    }
+
+    /// Pressure, as Android grades it: nothing at nominal, half the budget on
+    /// a warning, a quarter when critical — never the view's own tiles, which
+    /// the server keeps whatever the number.
+    #[test]
+    fn memory_pressure_trims_by_how_short_the_system_is() {
+        use crate::profile::Pressure;
+        let (l, p) = android();
+        assert!(l.memory_pressure(Pressure::Nominal).is_empty());
+        assert_eq!(
+            l.memory_pressure(Pressure::Warning),
+            [Step::Trim(p.trim_on_warning())]
+        );
+        assert_eq!(
+            l.memory_pressure(Pressure::Critical),
+            [Step::Trim(p.trim_on_critical_pressure())]
+        );
+        assert_eq!(l.memory_pressure(Pressure::Warning), l.memory_warning());
+    }
+
+    /// Each signal is acted on once, however often the count is read; the
+    /// first read of a quiet system is not a signal.
+    #[test]
+    fn each_pressure_signal_is_acted_on_once() {
+        use crate::profile::Pressure;
+        let mut w = PressureWatch::default();
+        assert_eq!(w.fresh((0, Pressure::Nominal)), None);
+        assert_eq!(w.fresh((1, Pressure::Critical)), Some(Pressure::Critical));
+        assert_eq!(w.fresh((1, Pressure::Critical)), None, "read again");
+        assert_eq!(w.fresh((2, Pressure::Critical)), Some(Pressure::Critical));
+        assert_eq!(w.fresh((3, Pressure::Nominal)), None, "the window hidden");
+        assert_eq!(w.fresh((4, Pressure::Warning)), Some(Pressure::Warning));
     }
 
     #[test]

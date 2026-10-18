@@ -10,14 +10,14 @@
 //! [`StatusBar::new`] answers `None`, exactly as it does on a desktop that
 //! declines the item, and every caller already handles that.
 
-#[cfg(not(any(target_os = "ios", target_arch = "wasm32")))]
+#[cfg(not(any(target_os = "ios", target_os = "android", target_arch = "wasm32")))]
 pub(super) use tuile_ui::StatusBar;
 
 /// No menu bar, so no readout.
-#[cfg(any(target_os = "ios", target_arch = "wasm32"))]
+#[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
 pub(super) struct StatusBar;
 
-#[cfg(any(target_os = "ios", target_arch = "wasm32"))]
+#[cfg(any(target_os = "ios", target_os = "android", target_arch = "wasm32"))]
 impl StatusBar {
     pub(super) fn new() -> Option<Self> {
         None

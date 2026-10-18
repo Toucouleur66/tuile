@@ -5,6 +5,12 @@
 //! threads, the tile store on disk, the counters' endpoint, the signals —
 //! everything around the shared application that a browser does not have.
 
+#[cfg(target_os = "android")]
+pub mod android;
+// What the Android shell reads from the system, decoded: pure, and tested on
+// the host.
+#[cfg(any(target_os = "android", test))]
+pub(crate) mod android_signals;
 pub(crate) mod launch;
 pub(crate) mod settings;
 pub(crate) mod store;
@@ -76,12 +82,18 @@ pub fn main(embedder: impl ViewerHost) -> ! {
 /// The event loop — on macOS, without the windowing layer's stock menu bar:
 /// the application brings its own (`menu`), and two would be one too many.
 fn event_loop() -> Result<EventLoop<()>, winit::error::EventLoopError> {
+    // Android: bound to the activity the system started.
+    #[cfg(target_os = "android")]
+    return android::event_loop();
     #[cfg(all(target_os = "macos", feature = "application"))]
     {
         use winit::platform::macos::EventLoopBuilderExtMacOS;
         EventLoop::builder().with_default_menu(false).build()
     }
-    #[cfg(not(all(target_os = "macos", feature = "application")))]
+    #[cfg(not(any(
+        all(target_os = "macos", feature = "application"),
+        target_os = "android"
+    )))]
     EventLoop::new()
 }
 
@@ -104,7 +116,15 @@ fn session(embedder: Arc<dyn ViewerHost>) -> anyhow::Result<()> {
     // The command line first, before the logger, the token, the network and
     // the window: a mistyped flag must cost nothing but the message that says
     // so. Exit code 2 is the usual one for a command that was not understood.
-    let (view, here, imagery) = match start::parse(std::env::args().skip(1)) {
+    // An Android application has no command line: its process is forked from
+    // the system's, whose arguments are not the viewer's. Its knobs arrive
+    // as launch settings instead (see `android`).
+    let arguments: Vec<String> = if cfg!(target_os = "android") {
+        Vec::new()
+    } else {
+        std::env::args().skip(1).collect()
+    };
+    let (view, here, imagery) = match start::parse(arguments) {
         Ok(start::Invocation::Run {
             view,
             here,
@@ -141,7 +161,7 @@ fn session(embedder: Arc<dyn ViewerHost>) -> anyhow::Result<()> {
     // Started from an icon, there is no terminal: the log goes quiet and
     // what would have been an error line becomes a window. A phone's
     // application is only ever started from an icon.
-    let bundled = in_a_bundle() || cfg!(target_os = "ios");
+    let bundled = in_a_bundle() || cfg!(any(target_os = "ios", target_os = "android"));
     // Started from an icon with nothing said about where: open where the last
     // such session ended. From a terminal the default view stays the default
     // — a command opens on what the command says.
@@ -289,7 +309,9 @@ fn session(embedder: Arc<dyn ViewerHost>) -> anyhow::Result<()> {
         retries,
         window: winit::window::Window::default_attributes(),
         controls: true,
-        backends: None,
+        // `TUILE_BACKEND=gl` forces one — a launch setting on Android.
+        backends: crate::app::backend_named(std::env::var("TUILE_BACKEND").ok().as_deref())
+            .map_err(anyhow::Error::msg)?,
     };
 
     // Everything the engine counts, scrapeable, so the log can stop being a
@@ -302,7 +324,7 @@ fn session(embedder: Arc<dyn ViewerHost>) -> anyhow::Result<()> {
     // Before the loop: Ctrl-C and `kill` must end the session, not the process,
     // or a recording dies with it. A phone's application is never sent
     // either, and could not leave its loop if it were.
-    if !cfg!(target_os = "ios") {
+    if !cfg!(any(target_os = "ios", target_os = "android")) {
         signals::catch_interruptions();
     }
     let event_loop = event_loop()?;

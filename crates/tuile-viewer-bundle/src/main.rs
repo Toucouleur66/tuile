@@ -9,6 +9,7 @@
 //! cargo run -p tuile-viewer-bundle -- app --out ~/Applications
 //! cargo run -p tuile-viewer-bundle -- icon               # redraw icon-1024.png
 //! cargo run -p tuile-viewer-bundle -- phone --out DIR    # a phone's plist and assets
+//! cargo run -p tuile-viewer-bundle -- android --out DIR  # an Android manifest and resources
 //!
 //! # another host's application, or a second copy under another name:
 //! cargo run -p tuile-viewer-bundle -- app --out /tmp/apps --name "Tuile Test" \
@@ -26,6 +27,7 @@
 //! and tested here. The signature is the system's `codesign`: it is the tool
 //! whose opinion the system then asks, and it is one command.
 
+mod android;
 mod handheld;
 mod icon;
 
@@ -330,6 +332,31 @@ fn main() -> anyhow::Result<()> {
             println!("{}", app.display());
             Ok(())
         }
+        // An Android application's manifest and resources; its APK is
+        // linked, aligned and signed by the platform's build tools — see
+        // `android` and `crates/tuile-viewer/android/build.sh`.
+        Some("android") => {
+            let mut out = workspace().join("crates/tuile-viewer/android/Generated");
+            let mut bundle = Bundle::default();
+            while let Some(arg) = args.next() {
+                let Some(value) = args.next() else {
+                    bail!("{arg} needs a value");
+                };
+                match arg.as_str() {
+                    "--out" => out = PathBuf::from(value),
+                    "--name" => bundle.name = value,
+                    "--identifier" => bundle.identifier = value,
+                    "--package" => bundle.executable = value,
+                    _ => bail!("unknown argument {arg:?}"),
+                }
+            }
+            let master = image::load_from_memory(MASTER)
+                .context("reading the icon master")?
+                .to_rgba8();
+            android::resources(&bundle, env!("CARGO_PKG_VERSION"), &master, &out)?;
+            println!("{}", out.display());
+            Ok(())
+        }
         // The phone's resources; its bundle is laid out and signed by the
         // platform's build — see `handheld`.
         Some("phone") => {
@@ -374,7 +401,8 @@ fn main() -> anyhow::Result<()> {
         _ => bail!(
             "usage: tuile-viewer-bundle phone [--out DIR] [--name NAME] [--identifier ID] \
              [--package PACKAGE] [--credential VARIABLE [--credential-title TITLE]] | app [--out DIR] [--binary PATH] [--name NAME] \
-             [--identifier ID] [--scheme SCHEME] [--package PACKAGE] [--icon PNG] | icon"
+             [--identifier ID] [--scheme SCHEME] [--package PACKAGE] [--icon PNG] | android [--out DIR] \
+             [--name NAME] [--identifier ID] [--package PACKAGE] | icon"
         ),
     }
 }

@@ -19,6 +19,8 @@ mod pacing;
 mod readout;
 mod script;
 mod setup;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use setup::backend_named;
 mod stall;
 mod tape;
 mod touch;
@@ -254,6 +256,10 @@ pub struct App {
     thermal: crate::profile::Thermal,
     low_power: bool,
     device_read: Option<web_time::Instant>,
+    /// The memory signals acted on, and when the count was last read: in the
+    /// background too, where the system's trims matter most.
+    pressure: lifecycle::PressureWatch,
+    pressure_read: Option<web_time::Instant>,
 
     // The rest is grouped by the module that owns it, so that a field and the
     // code that reads it are never in different files. Each of these is defined
@@ -354,6 +360,8 @@ impl App {
             thermal: crate::profile::Thermal::Nominal,
             low_power: false,
             device_read: None,
+            pressure: lifecycle::PressureWatch::default(),
+            pressure_read: None,
             pointer: input::Pointer::default(),
             views: input::Views::default(),
             recording: tape::Recording {
@@ -674,9 +682,15 @@ impl ApplicationHandler for App {
         self.start_window(event_loop);
     }
 
-    /// A phone's application is about to leave the front.
+    /// A phone's application is about to leave the front — and on Android,
+    /// its surface is being destroyed: everything drawn into it must be let
+    /// go of before this returns.
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
-        let steps = self.lifecycle.resign();
+        let steps = if self.profile.suspend_takes_the_surface {
+            self.lifecycle.surface_lost()
+        } else {
+            self.lifecycle.resign()
+        };
         self.carry_out(steps);
     }
 

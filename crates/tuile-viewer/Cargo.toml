@@ -107,9 +107,22 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 url = { workspace = true }
 
+# Android: winit's backend over the platform's native activity (no Java of
+# the application's own beyond the small `TuileActivity`, so no Gradle);
+# `jni` to call that activity, at the version the TLS verifier below already
+# brings; logcat through the NDK's log library; and the platform's trust
+# store, which on Android needs the JVM handed to it. Each is the
+# rust-mobile or rustls project's own crate, and each is what winit, reqwest
+# and android-activity already build on.
+[target.'cfg(target_os = "android")'.dependencies]
+android_log-sys = "0.3"
+jni = { version = "0.22.4", default-features = false }
+rustls-platform-verifier = "0.7.0"
+winit = { workspace = true, features = ["android-native-activity"] }
+
 # The menu-bar readout is a desktop's: a phone has no menu bar, and the crates
 # behind it do not build there.
-[target.'cfg(not(any(target_os = "ios", target_arch = "wasm32")))'.dependencies]
+[target.'cfg(not(any(target_os = "ios", target_os = "android", target_arch = "wasm32")))'.dependencies]
 tuile-ui = { version = "0.8.1", path = "../tuile-ui", features = ["statusbar"] }
 
 # A process started from an icon gets 256 file descriptors; the tile store

@@ -203,6 +203,7 @@ impl App {
     /// sleep until it is — never a spin.
     pub(super) fn pace_the_frames(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
+        self.read_the_pressure(now);
         // In front with no surface: the one made on the way back failed. Made
         // again on every turn until it exists — a screen that stays empty is
         // not an option.
@@ -263,6 +264,29 @@ impl App {
                 self.gesture(gesture);
             }
             self.demand.poke();
+        }
+    }
+
+    /// Reads whether the system has said it is short of memory since the last
+    /// read, at most once a second, and trims when it has — in front or
+    /// away. A system that says so through a warning event instead (iOS)
+    /// never has anything to read here.
+    fn read_the_pressure(&mut self, now: Instant) {
+        if self
+            .pressure_read
+            .is_some_and(|at| now.duration_since(at) < READ_THE_DEVICE_EVERY)
+        {
+            return;
+        }
+        self.pressure_read = Some(now);
+        if let Some(pressure) = self.pressure.fresh(crate::device::pressure()) {
+            tracing::warn!(
+                ?pressure,
+                "the system is short of memory; trimming the residency"
+            );
+            crate::journal::note(&format!("memory pressure: {pressure:?}"));
+            let steps = self.lifecycle.memory_pressure(pressure);
+            self.carry_out(steps);
         }
     }
 
