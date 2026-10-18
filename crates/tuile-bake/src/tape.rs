@@ -20,7 +20,8 @@ use crate::{exact_traversal, source_namespace, tiles::Tiles, Finish, GlobeConfig
 /// The bake of a tape: its cameras, and every setting a pack is the bake of.
 #[derive(Debug, Clone)]
 pub struct TapeBake {
-    /// The source's token.
+    /// The source's token. Not read for the open sources
+    /// ([`crate::open`]).
     pub token: String,
     /// Where source tiles are kept between two bakes.
     pub cache_dir: Option<PathBuf>,
@@ -36,6 +37,13 @@ pub struct TapeBake {
     pub imagery: Option<i64>,
     /// What the pack carries of its tiles.
     pub content: tuile_pack::Content,
+    /// Where the ground comes from ([`crate::open::Ground`]): ion's assets
+    /// above, or an open source that needs no token.
+    pub ground: crate::open::Ground,
+    /// Towns lit at night: NASA's Black Marble, written into the tile store
+    /// as its layer over the film's footprint, and named by the pack
+    /// ([`crate::open::BlackMarble`]).
+    pub night_lights: Option<crate::open::NightLightsSource>,
 }
 
 impl TapeBake {
@@ -53,6 +61,24 @@ impl TapeBake {
         Ok(poses)
     }
 
+    /// The tile store's layers its sources need declared.
+    pub fn store_layers(&self) -> Vec<tuile_tile_server::LayerDef> {
+        let config = self.config();
+        let mut layers = crate::open::store_layers(
+            self.ground,
+            (config.terrain_asset_id, config.imagery_asset_id),
+        );
+        if self.night_lights.is_some() {
+            layers.push(crate::open::black_marble_layer());
+        }
+        layers
+    }
+
+    /// Whether a bake of it needs an ion token.
+    pub fn needs_token(&self) -> bool {
+        self.ground.needs_token()
+    }
+
     /// The globe as this bake sets it, before a session is opened on it.
     fn config(&self) -> GlobeConfig {
         let mut config = GlobeConfig::new(&self.token);
@@ -66,6 +92,32 @@ impl TapeBake {
         }
         if let Some(id) = self.imagery {
             config.imagery_asset_id = if id < 0 { None } else { Some(id) };
+        }
+        // The open sources answer for themselves: no token is read.
+        let open = match self.ground {
+            crate::open::Ground::Ion => None,
+            crate::open::Ground::OpenEarth => {
+                Some((crate::open::ELLIPSOID, Some(crate::open::BLUE_MARBLE)))
+            }
+            crate::open::Ground::Empty => Some((crate::open::NOTHING, None)),
+        };
+        // An open imagery over ion's relief: ion's terrain, the imagery
+        // answered by the open sources.
+        if open.is_none()
+            && config
+                .imagery_asset_id
+                .is_some_and(crate::open::is_open_imagery)
+        {
+            config.imagery_sources = Some(crate::globe::SourcesHandle(std::sync::Arc::new(
+                crate::open::OpenSources::new(self.cache_dir.clone()),
+            )));
+        }
+        if let Some((terrain, imagery)) = open {
+            config.terrain_asset_id = terrain;
+            config.imagery_asset_id = imagery;
+            config.sources = Some(crate::globe::SourcesHandle(std::sync::Arc::new(
+                crate::open::OpenSources::new(self.cache_dir.clone()),
+            )));
         }
         // A pack that only refers to the tile store holds no mesh and no
         // picture: its tiles are named, not drawn.
@@ -94,8 +146,26 @@ impl TapeBake {
         digest_of_scene(
             &self.poses,
             self.viewport,
-            &bake_settings(&config, &resolved),
+            &self.settings(&config, &resolved),
         )
+    }
+
+    /// What the pack is the bake of, beyond its cameras: the night layer
+    /// added only when there is one, so that a scene without names what it
+    /// always named.
+    fn settings(&self, config: &GlobeConfig, resolved: &tuile_core::traversal::Config) -> String {
+        let settings = bake_settings(config, resolved);
+        match self.night_layer() {
+            Some(layer) => format!("{settings}\nnight={layer}"),
+            None => settings,
+        }
+    }
+
+    /// The store's layer of the night lights, when the bake writes them.
+    pub fn night_layer(&self) -> Option<String> {
+        self.night_lights
+            .as_ref()
+            .map(|_| source_namespace(crate::open::BLACK_MARBLE))
     }
 
     /// The prefix of this bake's packs in a run store:
@@ -151,6 +221,35 @@ impl TapeBake {
             }
             config.tile_cache = Some(tiles.cache());
         }
+        // The night lights: the tiles any camera of the tape can see,
+        // written into the store as a source's are, before a pack names them.
+        if let Some(night) = &self.night_lights {
+            let Some(tiles) = tiles else {
+                return Err("night lights are kept in the tile store, and there is none".into());
+            };
+            if self.content == tuile_pack::Content::Embedded {
+                return Err("night lights are named by a pack of references only".into());
+            }
+            let footprint = crate::open::night_footprint(&self.poses);
+            let source = match night {
+                crate::open::NightLightsSource::Gibs => {
+                    crate::open::BlackMarble::from_gibs(self.cache_dir.clone())
+                }
+                crate::open::NightLightsSource::Given(mosaic) => {
+                    crate::open::BlackMarble::of(mosaic.as_ref().clone())
+                }
+            };
+            let kept = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("night lights runtime: {e}"))?
+                .block_on(crate::open::publish_night_layer(
+                    tiles.cache().0,
+                    source,
+                    &footprint,
+                ))?;
+            tracing::info!(tiles = kept, "NIGHT-LAYER");
+        }
         // What the pack already holds, mirrored for the loader so it never
         // fetches a drape twice.
         let packed = PackedMirror::new();
@@ -159,13 +258,14 @@ impl TapeBake {
         let scene = digest_of_scene(
             &self.poses,
             self.viewport,
-            &bake_settings(&config, &resolved),
+            &self.settings(&config, &resolved),
         );
         let culling = if resolved.cull { "full" } else { "disabled" };
         let content = PackContent {
             content: self.content,
             terrain_layer: layers.0,
             imagery_layer: layers.1.unwrap_or_default(),
+            night_layer: self.night_layer().unwrap_or_default(),
         };
         tracing::info!(
             scene,
@@ -216,7 +316,47 @@ mod tests {
             terrain: None,
             imagery: None,
             content: tuile_pack::Content::References,
+            ground: crate::open::Ground::Ion,
+            night_lights: None,
         }
+    }
+
+    #[test]
+    fn no_ground_is_baked_through_the_same_stages_with_no_token() {
+        let sky = TapeBake {
+            token: String::new(),
+            ground: crate::open::Ground::Empty,
+            ..bake()
+        };
+        assert!(!sky.needs_token());
+        assert_ne!(sky.scene(), bake().scene());
+        assert_eq!(sky.layers().1, None);
+        let dir = tempfile::tempdir().expect("dir");
+        let out = dir.path().join("sky.tuilepack");
+        let done = sky.bake(2, 3, &out, None).expect("baked with no token");
+        assert_eq!(done.poses.len(), 2);
+        let bytes = std::fs::read(&out).expect("read");
+        let pack = tuile_pack::Pack::open(&bytes).expect("open");
+        assert_eq!(pack.frame_range(), (2, 3));
+        // The two roots, and no triangle in either.
+        assert!(pack.tile_count() <= 2, "{}", pack.tile_count());
+    }
+
+    #[test]
+    fn an_open_imagery_drapes_ions_relief_and_names_its_own_scene() {
+        let nasa = TapeBake {
+            imagery: Some(crate::open::BLUE_MARBLE),
+            ..bake()
+        };
+        let config = nasa.config();
+        // Ion's relief, the open imagery: only the imagery is asked elsewhere.
+        assert!(config.sources.is_none());
+        assert!(config.imagery_sources.is_some());
+        assert_eq!(config.terrain_asset_id, crate::CESIUM_WORLD_TERRAIN);
+        assert!(nasa.needs_token());
+        assert_eq!(nasa.layers().1.as_deref(), Some("asset-1000000101"));
+        assert_ne!(nasa.scene(), bake().scene());
+        assert!(bake().config().imagery_sources.is_none());
     }
 
     #[test]

@@ -47,7 +47,10 @@ pub mod bake;
 mod by_index_tests;
 mod globe;
 mod ground;
+pub mod local_store;
 pub mod memory;
+pub mod open;
+
 pub mod packed;
 mod session;
 pub mod tape;
