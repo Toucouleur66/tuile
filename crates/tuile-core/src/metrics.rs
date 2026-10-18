@@ -118,6 +118,12 @@ impl Timer {
         self.peak_nanos.load(ORDER) as f64 / 1.0e6
     }
 
+    /// Everything recorded, added up: with [`Self::count`], the two halves of
+    /// a mean that a scraper can take the rate of.
+    pub fn total_seconds(&self) -> f64 {
+        self.nanos.load(ORDER) as f64 / 1.0e9
+    }
+
     /// The peak since this was last asked, and then forgotten.
     ///
     /// A lifetime peak answers "has this ever been bad", which a session answers
@@ -161,6 +167,51 @@ impl Peak {
     /// The peak so far, left in place.
     pub fn get(&self) -> f64 {
         self.0.load(ORDER) as f64 / 1000.0
+    }
+}
+
+/// How many of something each occurrence of something else carried: a sum, a
+/// count and a peak, so the mean and the worst both fall out.
+///
+/// A [`Timer`] for quantities that are not durations. "How many arrivals did
+/// one pass answer" is the question it was made for: a mean of one says every
+/// arrival bought its own pass, and a peak says how large the largest burst
+/// folded into one was.
+#[derive(Debug, Default)]
+pub struct Tally {
+    sum: AtomicU64,
+    count: AtomicU64,
+    peak: AtomicU64,
+}
+
+impl Tally {
+    pub fn record(&self, n: u64) {
+        self.sum.fetch_add(n, ORDER);
+        self.count.fetch_add(1, ORDER);
+        self.peak.fetch_max(n, ORDER);
+    }
+
+    /// How many occurrences were recorded.
+    pub fn count(&self) -> u64 {
+        self.count.load(ORDER)
+    }
+
+    /// What they carried, all together.
+    pub fn sum(&self) -> u64 {
+        self.sum.load(ORDER)
+    }
+
+    /// The most any one occurrence carried.
+    pub fn peak(&self) -> u64 {
+        self.peak.load(ORDER)
+    }
+
+    pub fn mean(&self) -> f64 {
+        let count = self.count();
+        if count == 0 {
+            return 0.0;
+        }
+        self.sum() as f64 / count as f64
     }
 }
 
@@ -274,7 +325,25 @@ pub struct Metrics {
     /// Passes run. One per camera update **and one per load completion**, which
     /// is why this climbs far faster than the frame rate.
     pub traversals: Counter,
+    /// The walk itself, [`crate::traversal::traverse`], and nothing of the
+    /// bookkeeping around it.
     pub traversal_seconds: Timer,
+    /// Building the [`crate::protocol::ServerMessage::Select`] a pass ends
+    /// with and handing it to the consumer: the selection and the ancestry of
+    /// its whole protected closure, cloned every pass.
+    pub select_seconds: Timer,
+    /// Load completions handled by each pass a completion provoked. One per
+    /// pass while every arrival runs its own traversal; the mean is how many
+    /// arrivals one pass answers, the peak the largest burst it folded in.
+    /// Passes provoked by the camera are not counted here.
+    pub arrivals_per_pass: Tally,
+    /// From a load's own future resolving to the loop handling its result.
+    ///
+    /// The time a tile that has already arrived spends waiting for the loop to
+    /// notice — behind a traversal, behind the camera, behind other arrivals.
+    /// Zero would be a loop that is never busy; a peak in the hundreds of
+    /// milliseconds is ground held back by the server rather than the network.
+    pub arrival_wait_seconds: Timer,
     pub tiles_visited: Gauge,
     pub tiles_culled: Gauge,
     pub tiles_selected: Gauge,
@@ -494,12 +563,17 @@ impl Metrics {
     /// not in the renderer.
     pub fn one_line(&self) -> String {
         format!(
-            "traversal {:.1}/{:.1} ms (mean/peak, {} passes) | loads {} started {} done {} failed \
+            "traversal {:.1}/{:.1} ms (mean/peak, {} passes) | arrivals {:.1}/{} per pass, \
+             waited {:.1}/{:.1} ms | loads {} started {} done {} failed \
              {} cancelled, {:.0}/{:.0} ms, {} in flight | in flight {} mesh ({:.0} ms), {} texture \
              ({:.0} ms) | {} upsampled | uploads {} done, {} queued, {:.1}/{:.1} ms | {} evicted",
             self.traversal_seconds.mean_millis(),
             self.traversal_seconds.peak_millis(),
             self.traversals.get(),
+            self.arrivals_per_pass.mean(),
+            self.arrivals_per_pass.peak(),
+            self.arrival_wait_seconds.mean_millis(),
+            self.arrival_wait_seconds.peak_millis(),
             self.loads_started.get(),
             self.loads_completed.get(),
             self.loads_failed.get(),
@@ -588,6 +662,25 @@ mod tests {
         // happened once still has to be visible a minute later.
         t.record(std::time::Duration::from_millis(1));
         assert!((t.peak_millis() - 30.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn a_tally_reports_a_mean_and_a_peak() {
+        let t = Tally::default();
+        assert_eq!(t.mean(), 0.0, "no samples is not a divide by zero");
+        t.record(1);
+        t.record(5);
+        t.record(0);
+        assert_eq!((t.count(), t.sum(), t.peak()), (3, 6, 5));
+        assert!((t.mean() - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_timer_adds_up_to_its_total() {
+        let t = Timer::default();
+        t.record(std::time::Duration::from_millis(250));
+        t.record(std::time::Duration::from_millis(750));
+        assert!((t.total_seconds() - 1.0).abs() < 1e-9);
     }
 
     #[test]

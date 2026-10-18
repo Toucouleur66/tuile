@@ -116,6 +116,43 @@ fn gib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0 * 1024.0)
 }
 
+/// Publishes the engine's metrics to Prometheus, when `TUILE_METRICS_ADDR`
+/// asks for it — and only then.
+///
+/// Off by default, unlike the viewer: a bake runs on a farm node beside other
+/// bakes, and a listener nobody asked for is a port collision waiting for the
+/// second one. Set, it is an address (`127.0.0.1:9464`); `off` is the same as
+/// unset.
+///
+/// On its own thread and its own runtime, like [`watch`] and for the same
+/// reason: the publisher must keep its beat while the session's runtime is
+/// saturated, which is exactly when the numbers are worth reading.
+pub fn export_metrics_if_asked() {
+    let Ok(setting) = std::env::var("TUILE_METRICS_ADDR") else {
+        return;
+    };
+    if setting.trim().is_empty() || setting.trim().eq_ignore_ascii_case("off") {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("tuile-metrics".into())
+        .spawn(|| {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(e) => {
+                    tracing::warn!("no metrics endpoint, no runtime for it: {e}");
+                    return;
+                }
+            };
+            tuile_metrics::serve(runtime.handle());
+            runtime.block_on(std::future::pending::<()>());
+        })
+        .ok();
+}
+
 /// Logs the memory picture every `interval`, for as long as the process lives.
 ///
 /// `watched` are directories whose contents count against the same limit —
@@ -167,6 +204,30 @@ pub fn watch(interval: Duration, watched: Vec<PathBuf>) {
                     loads_failed = m.loads_failed.get(),
                     loads_cancelled = m.loads_cancelled.get(),
                     traversals = m.traversals.get(),
+                    // The geometry loop, as the baseline of its speed-up
+                    // measures it: how long a pass walks, how many arrivals
+                    // each pass answers, and how long an arrived tile waits
+                    // for the loop to notice it.
+                    traversal_ms = format!(
+                        "{:.2}/{:.2}",
+                        m.traversal_seconds.mean_millis(),
+                        m.traversal_seconds.peak_millis()
+                    ),
+                    select_ms = format!(
+                        "{:.2}/{:.2}",
+                        m.select_seconds.mean_millis(),
+                        m.select_seconds.peak_millis()
+                    ),
+                    arrivals_per_pass = format!(
+                        "{:.2}/{}",
+                        m.arrivals_per_pass.mean(),
+                        m.arrivals_per_pass.peak()
+                    ),
+                    arrival_wait_ms = format!(
+                        "{:.2}/{:.2}",
+                        m.arrival_wait_seconds.mean_millis(),
+                        m.arrival_wait_seconds.peak_millis()
+                    ),
                     source,
                     "MEMORY"
                 );

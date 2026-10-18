@@ -34,13 +34,17 @@ use std::sync::{Arc, RwLock};
 use std::task::Poll;
 
 type LoadMsg = (TileId, Result<Loaded, LoadError>);
+/// A load's result and the moment its own future resolved — what the loop
+/// measures [`arrival_wait_seconds`](crate::metrics::Metrics::arrival_wait_seconds)
+/// from when it gets round to handling it.
+type Arrival = (LoadMsg, crate::metrics::Stamp);
 // The boxed load future is `Send` on native (driven by a multi-thread executor
 // like tokio) but `?Send` on wasm, where it holds JS futures (`!Send`) and runs
 // single-threaded under `spawn_local`. Same server loop, two host models.
 #[cfg(not(target_arch = "wasm32"))]
-type BoxLoadFut = Pin<Box<dyn Future<Output = LoadMsg> + Send>>;
+type BoxLoadFut = Pin<Box<dyn Future<Output = Arrival> + Send>>;
 #[cfg(target_arch = "wasm32")]
-type BoxLoadFut = Pin<Box<dyn Future<Output = LoadMsg>>>;
+type BoxLoadFut = Pin<Box<dyn Future<Output = Arrival>>>;
 type LoadFuture = Abortable<BoxLoadFut>;
 
 /// A pause the host's event loop gets to run in: see
@@ -226,7 +230,7 @@ impl GeometryServer {
         };
 
         enum Event {
-            Load(Result<LoadMsg, Aborted>),
+            Load(Result<Arrival, Aborted>),
             Client(ClientMessage),
             Closed,
         }
@@ -314,13 +318,22 @@ impl GeometryServer {
                         None
                     }
                 }
-                Event::Load(Ok(msg)) => match session.on_load_done(msg, &tx) {
-                    Err(stop) => Some(stop.why("delivering a tile")),
-                    Ok(()) => session
-                        .retraverse(&tx, &mut loads)
-                        .err()
-                        .map(|stop| stop.why("answering an arrival")),
-                },
+                Event::Load(Ok((msg, landed))) => {
+                    let m = crate::metrics::metrics();
+                    m.arrival_wait_seconds.record(landed.elapsed());
+                    match session.on_load_done(msg, &tx) {
+                        Err(stop) => Some(stop.why("delivering a tile")),
+                        Ok(()) => {
+                            // One arrival, one pass: what coalescing would
+                            // raise above one.
+                            m.arrivals_per_pass.record(1);
+                            session
+                                .retraverse(&tx, &mut loads)
+                                .err()
+                                .map(|stop| stop.why("answering an arrival"))
+                        }
+                    }
+                }
                 // Cancelled load: cleaned up at abort time.
                 Event::Load(Err(Aborted)) => None,
                 Event::Closed => Some("the client hung up".to_string()),
@@ -588,6 +601,7 @@ impl Session<'_> {
             self.rendered_last,
             self.out,
         );
+        let walked = started.elapsed();
         // What this pass actually put on screen, for the next one to consult.
         // A held REPLACE only cuts its subtree loose when it has nothing of its
         // own drawn yet — once it is on screen there is no black to avoid, and
@@ -628,7 +642,7 @@ impl Session<'_> {
         );
         let m = crate::metrics::metrics();
         m.traversals.inc();
-        m.traversal_seconds.record(started.elapsed());
+        m.traversal_seconds.record(walked);
         m.tiles_visited.set(u64::from(self.out.stats.visited));
         m.tiles_culled.set(u64::from(self.out.stats.culled));
         m.tiles_selected.set(u64::from(self.out.stats.selected));
@@ -728,7 +742,8 @@ impl Session<'_> {
         // ground it was covering has nothing left to fall back to, and goes
         // black. Announcing what is wanted before taking anything away costs a
         // line and removes the window entirely.
-        tx.unbounded_send(ServerMessage::Select {
+        let selecting = crate::metrics::stamp();
+        let sent = tx.unbounded_send(ServerMessage::Select {
             tiles: self.out.selected.clone(),
             // `self.selected` is the protected closure — the frontier, the chain
             // from each of its tiles up to the root, what is requested and what
@@ -741,8 +756,9 @@ impl Session<'_> {
                 .collect(),
             stats: self.out.stats,
             generation: *self.view_generation,
-        })
-        .map_err(|_| Stop::Gone)?;
+        });
+        m.select_seconds.record(selecting.elapsed());
+        sent.map_err(|_| Stop::Gone)?;
         if !reclaimed.is_empty() {
             tx.unbounded_send(ServerMessage::Evict { tiles: reclaimed })
                 .map_err(|_| Stop::Gone)?;
@@ -859,7 +875,7 @@ impl Session<'_> {
         let (handle, registration) = AbortHandle::new_pair();
         let fut: BoxLoadFut = Box::pin(async move {
             let result = loader.load(tile).await;
-            (tile, result)
+            ((tile, result), crate::metrics::stamp())
         });
         loads.push(Abortable::new(fut, registration));
         self.in_flight.insert(tile, handle);
