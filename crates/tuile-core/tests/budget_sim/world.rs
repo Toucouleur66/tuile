@@ -10,7 +10,9 @@
 
 use std::collections::BTreeSet;
 
-use tuile_core::budget::cost::{drape_bytes, TextureFormat};
+use super::detmath;
+
+use tuile_core::budget::cost::{drape_cost, Cost, TextureFormat};
 use tuile_core::budget::{
     Bytes, Class, GeoRect, ImageryNeed, Need, NeedSet, ResourceId, TexelFootprint, TileId,
 };
@@ -153,14 +155,15 @@ pub fn has_children(id: TileId) -> bool {
     id.terrain_coord().0 < region(id).terrain_max()
 }
 
-/// What a resource costs: meshes by region, drapes by mosaic size.
-pub fn cost(r: ResourceId) -> Bytes {
+/// What a resource costs: meshes by region, drapes by mosaic size (one
+/// 256² imagery tile per level of climb, squared).
+pub fn cost(r: ResourceId) -> Cost {
     match r {
-        ResourceId::Mesh(t) => region(t).mesh_bytes(),
+        ResourceId::Mesh(t) => Cost::flat(region(t).mesh_bytes()),
         ResourceId::Drape(t, level) => {
-            let up = level.saturating_sub(t.terrain_coord().0).min(3);
-            let tiles = 1u64 << (2 * up);
-            Bytes(drape_bytes(256, 256, TextureFormat::Rgba8).0 * tiles)
+            let up = level.saturating_sub(t.terrain_coord().0).min(4);
+            let side = 256u32 << up;
+            drape_cost(side, side, TextureFormat::Rgba8)
         }
     }
 }
@@ -183,27 +186,26 @@ pub fn sight(cam: &Camera, id: TileId, extra: f64) -> Sight {
     let [x0, x1, y0, y1] = square(id);
     let cx = cam.x.clamp(x0, x1);
     let cy = cam.y.clamp(y0, y1);
-    let dh = ((cx - cam.x).powi(2) + (cy - cam.y).powi(2)).sqrt();
+    let (ex, ey) = (cx - cam.x, cy - cam.y);
+    let dh = (ex * ex + ey * ey).sqrt();
     let distance = (dh * dh + cam.h * cam.h).sqrt();
-    let (mx, my) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
-    let dc = ((mx - cam.x).powi(2) + (my - cam.y).powi(2))
-        .sqrt()
-        .max(1e-6);
+    let (mx, my) = ((x0 + x1) / 2.0 - cam.x, (y0 + y1) / 2.0 - cam.y);
+    let dc = (mx * mx + my * my).sqrt().max(1e-6);
     let half_diag = (x1 - x0) * std::f64::consts::FRAC_1_SQRT_2;
-    let angle = (my - cam.y).atan2(mx - cam.x);
-    let mut off = (angle - cam.heading).rem_euclid(std::f64::consts::TAU);
-    if off > std::f64::consts::PI {
-        off = std::f64::consts::TAU - off;
-    }
-    let spread = (half_diag / dc).min(1.0).asin();
-    let half_fov = 30f64.to_radians() + 0.1 + extra;
+    let (hs, hc) = detmath::sin_cos(cam.heading);
+    let cos_off = ((mx * hc + my * hs) / dc).clamp(-1.0, 1.0);
+    // Visible when the off-axis angle is within the half field of view plus
+    // the tile's angular radius: compared as cosines, no inverse functions.
+    let (fs, fc) = detmath::sin_cos(30f64.to_radians() + 0.1 + extra);
+    let r = (half_diag / dc).min(1.0);
+    let cos_limit = fc * (1.0 - r * r).sqrt() - fs * r;
     let far = (60.0 * cam.h + 30_000.0).min(800_000.0);
     let under = dc - half_diag < cam.h * 0.5;
-    let visible = distance <= far && (under || off <= half_fov + spread);
+    let visible = distance <= far && (under || cos_off >= cos_limit);
     Sight {
         distance,
         visible,
-        centrality: (1.0 - off / std::f64::consts::PI).clamp(0.0, 1.0),
+        centrality: (1.0 + cos_off) / 2.0,
         cos_obliquity: (cam.h / distance).clamp(0.05, 1.0),
     }
 }
@@ -258,7 +260,7 @@ pub fn traverse(
 fn need_of(cam: &Camera, id: TileId, tau: f64) -> Need {
     let s = sight(cam, id, 0.0);
     let l = id.terrain_coord().0;
-    let excess = (sse(id, s.distance) / tau).log2().clamp(-8.0, 8.0);
+    let excess = detmath::log2(sse(id, s.distance) / tau).clamp(-8.0, 8.0);
     let mut n = Need::new(l, Class::TerrainMesh)
         .with_rect(rect(id))
         .with_sse_excess(excess as f32)

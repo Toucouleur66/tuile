@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use tuile_core::budget::Micros;
 
+use super::detmath;
 use super::server::{Profile, Sim};
 use super::world::{Camera, SIDE};
 
@@ -31,7 +32,8 @@ fn tour(t: f64) -> Camera {
         },
         u if u < 180.0 => Camera {
             x: base.x + 24_000.0,
-            h: 2_500.0 * 40f64.powf(((u - 120.0) / 30.0 - 1.0).abs().mul_add(-1.0, 1.0)),
+            h: 2_500.0
+                * detmath::exp2(detmath::log2(40.0) * (1.0 - ((u - 120.0) / 30.0 - 1.0).abs())),
             ..base
         },
         u => Camera {

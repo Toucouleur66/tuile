@@ -70,6 +70,14 @@ pub struct BudgetConfig {
     pub target: PerClass<Bytes>,
     /// Visible-only headroom above the target, per class. Batch: unused.
     pub overflow: PerClass<Bytes>,
+    /// The ceiling no delivery ever crosses, per class, whatever its
+    /// urgency: the guard against a jetsam or out-of-memory kill. Set by the
+    /// profile from the device. Batch: [`Bytes::MAX`].
+    pub hard_limit: PerClass<Bytes>,
+    /// The part of `hard_limit`, in percent, kept for swaps that shrink the
+    /// set: a coarser parent replacing its drawn children. Other work stops
+    /// below it, so a zoom-out at the ceiling can always complete.
+    pub hard_reserve_percent: u8,
     /// Decoded CPU bytes kept off the GPU (the second tier), all classes.
     pub decoded_target: Bytes,
     /// Network loads in flight per class.
@@ -98,8 +106,14 @@ pub struct BudgetConfig {
     /// The coarse floor (terrain and imagery): levels `0..=pinned_level` are
     /// requested first and never evicted.
     pub pinned_level: Option<u32>,
-    /// The most imagery levels a drape may sit above its tile's terrain level.
+    /// The most imagery levels a drape may sit above its tile's terrain level
+    /// (a profile parameter: desktop 3, handheld 2, low handheld 1).
     pub imagery_over_terrain_cap: u32,
+    /// The largest drape texture side, texels (desktop 2048, handheld 1024):
+    /// beyond it the drape is composed at the deepest level that fits.
+    pub max_drape_side: u32,
+    /// The side of one imagery tile, texels.
+    pub imagery_tile_px: u32,
     /// What a failed load does.
     pub failure: FailurePolicy,
     /// A load that has waited this long gets the full age bonus.
@@ -113,11 +127,13 @@ impl BudgetConfig {
     /// Step 6 of the plan tunes them per profile from simulated curves.
     pub fn interactive(gpu: Bytes) -> Self {
         let share = |pct: u64| gpu.scaled(pct, 100);
-        let target = PerClass([share(35), share(15), share(45), share(3), share(2)]);
+        let hard_limit = PerClass([share(35), share(15), share(45), share(3), share(2)]);
         BudgetConfig {
             policy: Policy::Interactive,
-            target,
-            overflow: PerClass::from_fn(|c| target[c].scaled(1, 4)),
+            target: PerClass::from_fn(|c| hard_limit[c].scaled(70, 100)),
+            overflow: PerClass::from_fn(|c| hard_limit[c].scaled(15, 100)),
+            hard_limit,
+            hard_reserve_percent: 15,
             decoded_target: gpu.scaled(1, 4),
             max_in_flight: PerClass([16, 8, 16, 4, 4]),
             max_local_reads: 8,
@@ -142,6 +158,8 @@ impl BudgetConfig {
             },
             pinned_level: Some(2),
             imagery_over_terrain_cap: 3,
+            max_drape_side: 2_048,
+            imagery_tile_px: 256,
             failure: FailurePolicy::RetryBackoff {
                 first: Micros::from_millis(500),
                 max: Micros::from_secs(30),
@@ -156,6 +174,8 @@ impl BudgetConfig {
             policy: Policy::Batch,
             target: PerClass::splat(Bytes::MAX),
             overflow: PerClass::splat(Bytes::ZERO),
+            hard_limit: PerClass::splat(Bytes::MAX),
+            hard_reserve_percent: 0,
             decoded_target: Bytes::MAX,
             max_in_flight: PerClass([64, 32, 64, 8, 8]),
             max_local_reads: 32,
@@ -180,9 +200,23 @@ impl BudgetConfig {
             },
             pinned_level: Some(2),
             imagery_over_terrain_cap: 3,
+            max_drape_side: 2_048,
+            imagery_tile_px: 256,
             failure: FailurePolicy::EndSession,
             age_full: Micros::from_secs(2),
         }
+    }
+
+    /// The most levels a drape may climb above its terrain: the configured
+    /// cap, and no more than the largest drape side allows.
+    pub fn imagery_cap(&self) -> u32 {
+        let mut fit = 0;
+        while fit < 16
+            && u64::from(self.imagery_tile_px) << (fit + 1) <= u64::from(self.max_drape_side)
+        {
+            fit += 1;
+        }
+        self.imagery_over_terrain_cap.min(fit)
     }
 
     /// Checks the numbers are coherent.
@@ -201,6 +235,15 @@ impl BudgetConfig {
             if self.max_in_flight[c] == 0 {
                 return Err(ConfigError::ZeroQuota(c));
             }
+            if self.hard_limit[c] < self.target[c] {
+                return Err(ConfigError::HardBelowTarget(c));
+            }
+        }
+        if self.hard_reserve_percent > 50 {
+            return Err(ConfigError::Reserve(self.hard_reserve_percent));
+        }
+        if self.imagery_tile_px == 0 || self.max_drape_side < self.imagery_tile_px {
+            return Err(ConfigError::DrapeSide);
         }
         if self.relax.max_scale < 1_000 {
             return Err(ConfigError::RelaxCeiling(self.relax.max_scale));

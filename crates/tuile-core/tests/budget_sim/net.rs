@@ -7,9 +7,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use tuile_core::budget::{
-    Bytes, Generation, Micros, Presence, PresenceOracle, ResourceId, Source, Start,
-};
+use tuile_core::budget::{Generation, Micros, Presence, PresenceOracle, ResourceId, Source, Start};
+
+use tuile_core::budget::cost::Cost;
 
 use super::rng::Rng;
 use super::world::cost;
@@ -90,8 +90,8 @@ impl NetProfile {
 /// What came back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Arrival {
-    /// Decoded, `est` bytes.
-    Loaded(ResourceId, Generation, Bytes),
+    /// Decoded, at `cost`.
+    Loaded(ResourceId, Generation, Cost),
     /// Failed, transient.
     Failed(ResourceId, Generation),
     /// The local store did not have it after all.
@@ -196,7 +196,7 @@ impl SimNet {
                 } else {
                     let ms = server.base_ms
                         + self.rng.exp(server.jitter_ms)
-                        + bytes.0 as f64 / server.bandwidth * 1_000.0;
+                        + bytes.gpu.0 as f64 / server.bandwidth * 1_000.0;
                     let out = if self.rng.permille(server.fail_permille) {
                         Outcome::Fail
                     } else {
@@ -241,7 +241,7 @@ impl SimNet {
                 Outcome::Ok => {
                     let local = self.store.held.contains(&r);
                     if !local {
-                        self.network_bytes += cost(r).0;
+                        self.network_bytes += cost(r).gpu.0;
                         self.latencies
                             .push((at, at.since(f.started).0 as f64 / 1_000.0));
                     }

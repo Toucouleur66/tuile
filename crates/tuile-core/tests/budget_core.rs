@@ -13,6 +13,7 @@
 mod budget_common;
 
 use budget_common::*;
+use tuile_core::budget::cost::Cost;
 use tuile_core::budget::{
     Budget, BudgetConfig, Bytes, Class, ConfigError, Failure, FailurePolicy, Micros, NeedSet,
     PerClass, Pressure, Protection, ResourceId, ResourceState, Role, SessionError, Source, Thermal,
@@ -34,6 +35,7 @@ fn small(target_meshes: u64) -> BudgetConfig {
     let mut c = Rig::interactive_config();
     c.target[Class::TerrainMesh] = Bytes(MESH.0 * target_meshes);
     c.overflow[Class::TerrainMesh] = Bytes::ZERO;
+    c.hard_limit[Class::TerrainMesh] = Bytes::mib(512);
     c.decoded_target = Bytes::ZERO;
     c
 }
@@ -93,21 +95,70 @@ mod config {
 
 mod ledger {
     use super::*;
-    use tuile_core::budget::cost::{drape_bytes, mesh_bytes, within_drift, TextureFormat};
+    use tuile_core::budget::cost::{drape_cost, mesh_cost, within_drift, Cost, TextureFormat};
 
-    /// C2: a drape costs its full mip chain.
+    /// C2: a drape costs its full mip chain, level by level; its staging
+    /// copy aligns every row to 256 bytes.
     #[test]
-    fn a_drape_costs_its_mip_chain() {
-        assert_eq!(drape_bytes(256, 256, TextureFormat::Rgba8), Bytes(349_525));
-        assert_eq!(drape_bytes(256, 256, TextureFormat::Block16), Bytes(87_381));
+    fn a_drape_costs_its_mip_chain_and_its_aligned_staging() {
+        assert_eq!(
+            drape_cost(256, 256, TextureFormat::Rgba8),
+            Cost {
+                gpu: Bytes(349_524),
+                staging: Bytes(360_192),
+            }
+        );
+        assert_eq!(
+            drape_cost(256, 256, TextureFormat::Block16),
+            Cost {
+                gpu: Bytes(87_408),
+                staging: Bytes(90_368),
+            }
+        );
     }
 
-    /// C2: on unified memory the CPU copy kept for stitching is paid for.
+    /// C2: a 100-texel row of RGBA stages as 512 bytes, not 400.
+    #[test]
+    fn an_unaligned_row_stages_at_the_next_256_bytes() {
+        let c = drape_cost(100, 1, TextureFormat::Rgba8);
+        // 100, 50, 25, 12, 6, 3, 1 texels wide, one row each.
+        assert_eq!(c.gpu, Bytes((100 + 50 + 25 + 12 + 6 + 3 + 1) * 4));
+        assert_eq!(c.staging, Bytes(512 + 256 * 6));
+    }
+
+    /// C2: buffers align to 4, the per-tile uniform to 256.
+    #[test]
+    fn buffers_and_the_uniform_are_aligned() {
+        let c = mesh_cost(3, 6, 3, false);
+        assert_eq!(c.gpu, Bytes(20 + 12 + 8_448));
+        assert_eq!(c.staging, c.gpu);
+    }
+
+    /// C2: on unified memory the CPU copy kept for stitching is paid for,
+    /// but never staged.
     #[test]
     fn a_mesh_costs_its_cpu_copy_on_unified_memory() {
-        let without = mesh_bytes(1_000, 16, 6_000, false);
-        let with = mesh_bytes(1_000, 16, 6_000, true);
-        assert_eq!(with.0 - without.0, 16_000 + 24_000);
+        let without = mesh_cost(1_000, 16, 6_000, false);
+        let with = mesh_cost(1_000, 16, 6_000, true);
+        assert_eq!(with.gpu.0 - without.gpu.0, 16_000 + 24_000);
+        assert_eq!(with.staging, without.staging);
+    }
+
+    /// D5, C2: the worst-case drape per profile, at its cap and side.
+    #[test]
+    fn the_worst_drape_per_profile_is_bounded() {
+        for (cap, side, worst) in [
+            (3, 2_048, 22_369_620),
+            (2, 1_024, 5_592_404),
+            (1, 512, 1_398_100),
+        ] {
+            let mut c = BudgetConfig::interactive(Bytes::mib(512));
+            c.imagery_over_terrain_cap = cap;
+            c.max_drape_side = side;
+            let tiles = 1u32 << c.imagery_cap();
+            let cost = drape_cost(256 * tiles, 256 * tiles, TextureFormat::Rgba8);
+            assert_eq!(cost.gpu, Bytes(worst), "cap {cap}, side {side}");
+        }
     }
 
     /// C2: an estimate more than 5 % off the actual bytes is detected.
@@ -605,11 +656,11 @@ mod generations {
             .map(|s| s.gen)
             .expect("restarted");
         assert_ne!(g1, g2);
-        r.b.on_loaded(mesh(a), g1, MESH);
+        r.b.on_loaded(mesh(a), g1, est(mesh(a)));
         let d = r.step(&drawn(&[a]));
         assert!(d.deliver.is_empty());
         assert_eq!(d.stats.stale, 1);
-        r.b.on_loaded(mesh(a), g2, MESH);
+        r.b.on_loaded(mesh(a), g2, est(mesh(a)));
         let d = r.step(&drawn(&[a]));
         assert_eq!(d.deliver, vec![(mesh(a), g2)]);
     }
@@ -626,11 +677,11 @@ mod generations {
             .first()
             .map(|s| s.gen)
             .expect(RED);
-        r.b.on_loaded(mesh(a), g, MESH);
+        r.b.on_loaded(mesh(a), g, est(mesh(a)));
         r.settle(&drawn(&[a]), 10);
         r.settle(&drawn(&[b]), 10);
         assert!(!r.b.residency().drawable(a), "a was evicted");
-        r.b.on_loaded(mesh(a), g, MESH);
+        r.b.on_loaded(mesh(a), g, est(mesh(a)));
         let d = r.step(&drawn(&[b]));
         assert!(d.deliver.iter().all(|(x, _)| *x != mesh(a)));
         assert!(!matches!(
@@ -665,7 +716,7 @@ mod generations {
                 }
                 for u in ups {
                     let g = r.delivered[&u];
-                    r.b.on_drawable(u, g, est(u));
+                    r.b.on_drawable(u, g, est(u).gpu);
                 }
             }
             digests
@@ -892,7 +943,7 @@ mod protection {
             let d = r.step(&drawn_draped(&[kid], 3));
             for s in &d.start {
                 if matches!(s.resource, ResourceId::Mesh(_)) {
-                    r.b.on_loaded(s.resource, s.gen, MESH);
+                    r.b.on_loaded(s.resource, s.gen, est(s.resource));
                 }
             }
             r.upload(&d);
@@ -966,7 +1017,9 @@ mod protection {
     #[test]
     #[ignore = "red until budget core"]
     fn ancestors_outlive_their_descendants() {
-        let mut r = Rig::new(small(3));
+        let mut c = small(3);
+        c.watermarks.low_percent = 100;
+        let mut r = Rig::new(c);
         let p = t(2, 1, 1);
         let c = children(p)[0];
         r.settle(&drawn(&[p, c]), 10);
@@ -1023,7 +1076,9 @@ mod protection {
     #[test]
     #[ignore = "red until budget core"]
     fn a_needed_blocker_is_evicted_only_after_unneeded_resources() {
-        let mut r = Rig::new(small(3));
+        let mut c = small(3);
+        c.watermarks.low_percent = 100;
+        let mut r = Rig::new(c);
         let (p, u) = (t(2, 0, 0), t(3, 7, 7));
         let b = children(p)[0];
         r.settle(&drawn(&[u]), 10);
@@ -1823,7 +1878,7 @@ mod stats {
         let (a, b) = (t(3, 0, 0), t(3, 1, 0));
         let d = r.step(&drawn(&[a, b]));
         for s in d.start.iter().filter(|s| s.resource == mesh(a)) {
-            r.b.on_loaded(s.resource, s.gen, MESH);
+            r.b.on_loaded(s.resource, s.gen, est(s.resource));
         }
         let ds = r.idle_for(&drawn(&[a]), Micros::from_secs(1));
         let completed: u32 = ds.iter().map(|d| d.stats.completed).sum();
@@ -1838,5 +1893,353 @@ mod stats {
         p[Class::Drape] = 7;
         assert_eq!(p.0[Class::Drape.index()], 7);
         assert_eq!(p.iter().filter(|(_, v)| *v == 7).count(), 1);
+    }
+}
+
+mod hard_limit {
+    use super::*;
+
+    fn ceiling(hard_meshes: u64) -> BudgetConfig {
+        let mut c = small(1);
+        c.hard_limit[Class::TerrainMesh] = Bytes(MESH.0 * hard_meshes);
+        c.hard_reserve_percent = 25;
+        c
+    }
+
+    /// I2, review of Checkpoint A: no delivery ever takes a class beyond its
+    /// hard limit, not even a hole's.
+    #[test]
+    #[ignore = "red until budget core"]
+    fn no_delivery_ever_crosses_the_hard_limit() {
+        let mut r = Rig::new(ceiling(4));
+        let tiles: Vec<_> = (0..8).map(|x| t(3, x, 0)).collect();
+        let mut exact = 0;
+        for _ in 0..60 {
+            let d = r.step(&drawn(&tiles));
+            assert!(r.b.ledger().gpu[Class::TerrainMesh] <= Bytes(MESH.0 * 4));
+            exact = d.stats.exact;
+            r.complete(&d);
+        }
+        // Holes stop at the hard limit less its reserve: three of four.
+        assert_eq!(exact, 3, "{RED}");
+    }
+
+    /// I8: at the hard limit the relaxation climbs faster than at mere
+    /// overflow.
+    #[test]
+    #[ignore = "red until budget core"]
+    fn at_the_hard_limit_the_relaxation_climbs_faster() {
+        let rise = |hard: u64| {
+            let mut r = Rig::new(ceiling(hard));
+            let tiles: Vec<_> = (0..8).map(|x| t(3, x, 0)).collect();
+            let before = r.settle(&drawn(&tiles), 30).sse_scale_milli;
+            let ds = r.idle_for(&drawn(&tiles), Micros::from_secs(1));
+            ds.last().map(|d| d.sse_scale_milli).unwrap_or(0) - before
+        };
+        let overflowing = rise(64);
+        let at_ceiling = rise(4);
+        assert!(overflowing > 0, "{RED}");
+        assert!(
+            at_ceiling >= 2 * overflowing,
+            "{at_ceiling} vs {overflowing}"
+        );
+    }
+
+    /// I1, I9: at the ceiling, a coarser parent replacing its drawn children
+    /// uses the reserve, so a zoom-out always completes.
+    #[test]
+    #[ignore = "red until budget core"]
+    fn a_coarsening_parent_uses_the_reserve_at_the_ceiling() {
+        let mut r = Rig::new(ceiling(4));
+        let p = t(2, 1, 1);
+        let kids = children(p);
+        // Three children fill the ceiling less its reserve.
+        r.settle(&drawn(&kids[..3]), 30);
+        assert_eq!(
+            r.b.ledger().gpu[Class::TerrainMesh],
+            Bytes(MESH.0 * 3),
+            "{RED}"
+        );
+        let d = r.settle(&drawn(&[p]), 30);
+        assert_eq!(d.draw.get(mesh(p)).map(|i| i.role), Some(Role::Exact));
+        assert!(r.b.ledger().gpu[Class::TerrainMesh] <= Bytes(MESH.0 * 4));
+    }
+}
+
+mod acknowledged {
+    use super::*;
+
+    /// I1, review of point 2: only acknowledged resources are drawn; a
+    /// discarded upload is never drawn and its fallback stays.
+    #[test]
+    #[ignore = "red until budget core"]
+    fn a_discarded_upload_is_never_drawn_and_its_fallback_stays() {
+        let mut r = Rig::interactive();
+        let root = t(0, 0, 0);
+        r.settle(&drawn(&[root]), 10);
+        let kid = children(root)[1];
+        let d = r.step(&drawn(&[kid]));
+        r.load(&d);
+        let d = r.step(&drawn(&[kid]));
+        let (_, g) = *d.deliver.first().expect(RED);
+        r.b.on_discarded(mesh(kid), g);
+        for _ in 0..10 {
+            let d = r.step(&drawn(&[kid]));
+            assert!(!d.draw.draws(kid));
+            assert_eq!(d.draw.get(mesh(root)).map(|i| i.role), Some(Role::Fallback));
+            assert_eq!(d.stats.lost, 0);
+        }
+    }
+
+    /// I1: a delivered, uploaded but unacknowledged resource is not drawn.
+    #[test]
+    #[ignore = "red until budget core"]
+    fn an_unacknowledged_upload_is_not_drawn() {
+        let mut r = Rig::interactive();
+        let root = t(0, 0, 0);
+        r.settle(&drawn(&[root]), 10);
+        let kid = children(root)[2];
+        let d = r.step(&drawn(&[kid]));
+        r.load(&d);
+        let d = r.step(&drawn(&[kid]));
+        assert!(!d.upload_plan.items.is_empty(), "{RED}");
+        let d = r.step(&drawn(&[kid]));
+        assert!(!d.draw.draws(kid));
+        assert_eq!(d.draw.get(mesh(root)).map(|i| i.role), Some(Role::Fallback));
+    }
+}
+
+mod refresh {
+    use super::*;
+
+    /// Review of point 7: an epoch change re-requests what is resident, at
+    /// the Refresh urgency, and swaps new before old without a hole.
+    #[test]
+    #[ignore = "red until budget core"]
+    fn an_epoch_change_refreshes_resident_drapes_without_a_hole() {
+        let mut r = Rig::interactive();
+        let a = t(3, 2, 2);
+        let need = drawn_draped(&[a], 4);
+        r.settle(&need, 10);
+        let old = r.b.resource(ResourceId::Drape(a, 4)).and_then(|v| v.gen);
+        r.b.new_epoch(Class::Drape);
+        let d = r.step(&need);
+        assert!(
+            d.start
+                .iter()
+                .any(|s| s.resource == ResourceId::Drape(a, 4)),
+            "{RED}"
+        );
+        assert_eq!(
+            r.b.resource(ResourceId::Drape(a, 4))
+                .and_then(|v| v.urgency),
+            Some(Urgency::Refresh)
+        );
+        r.complete(&d);
+        for _ in 0..10 {
+            let d = r.step(&need);
+            let worn = d
+                .draw
+                .get(mesh(a))
+                .and_then(|i| i.drape)
+                .map(|x| x.resource);
+            assert_eq!(worn, Some(ResourceId::Drape(a, 4)), "never a hole");
+            r.complete(&d);
+        }
+        let new = r.b.resource(ResourceId::Drape(a, 4)).and_then(|v| v.gen);
+        assert_ne!(new, old, "the new content replaced the old");
+        assert_eq!(
+            r.b.resource(ResourceId::Drape(a, 4)).map(|v| v.urgency),
+            Some(None)
+        );
+    }
+
+    /// Review of point 7: a refresh uses only free slots: floor, holes and
+    /// blockers go first.
+    #[test]
+    #[ignore = "red until budget core"]
+    fn a_refresh_never_starves_floor_hole_or_blocker() {
+        let mut c = Rig::interactive_config();
+        c.max_in_flight[Class::Drape] = 1;
+        let mut r = Rig::new(c);
+        let a = t(3, 2, 2);
+        r.settle(&drawn_draped(&[a], 4), 10);
+        r.b.new_epoch(Class::Drape);
+        let h = t(3, 6, 6);
+        let d = r.step(&drawn_draped(&[a, h], 4));
+        let drapes: Vec<_> = d
+            .start
+            .iter()
+            .filter(|s| s.class == Class::Drape)
+            .map(|s| s.resource)
+            .collect();
+        assert_eq!(drapes, vec![ResourceId::Drape(h, 4)], "{RED}");
+    }
+
+    /// Review of point 7: a refresh never preempts anything.
+    #[test]
+    #[ignore = "red until budget core"]
+    fn a_refresh_never_preempts() {
+        let mut c = Rig::interactive_config();
+        c.max_in_flight[Class::TerrainMesh] = 1;
+        let mut r = Rig::new(c);
+        let a = t(3, 2, 2);
+        r.settle(&drawn(&[a]), 10);
+        let g = t(3, 5, 5);
+        let mut need = drawn(&[a]);
+        need.ring.push((g, need_ring(g)));
+        let d = r.step(&need);
+        assert!(d.start.iter().any(|s| s.resource == mesh(g)), "{RED}");
+        r.b.new_epoch(Class::TerrainMesh);
+        let ds = r.idle_for(&need, Micros::from_secs(1));
+        assert!(ds.iter().all(|d| d.cancel.is_empty()));
+        assert!(!started(&ds, mesh(a)), "the ring holds the only slot");
+    }
+
+    fn need_ring(id: tuile_core::budget::TileId) -> tuile_core::budget::Need {
+        need(id)
+    }
+}
+
+mod drape_caps {
+    use super::*;
+
+    /// D5, review of point 14: the drape side caps how far a drape climbs:
+    /// at 1024 texels, two levels above terrain.
+    #[test]
+    #[ignore = "red until budget core"]
+    fn the_drape_side_caps_how_far_a_drape_climbs() {
+        let mut c = Rig::interactive_config();
+        c.max_drape_side = 1_024;
+        let mut r = Rig::new(c);
+        let a = t(2, 1, 1);
+        let d = r.step(&drawn_draped(&[a], 9));
+        assert!(
+            d.start
+                .iter()
+                .any(|s| s.resource == ResourceId::Drape(a, 4)),
+            "{RED}"
+        );
+    }
+
+    /// D5: the cap over terrain is a profile parameter.
+    #[test]
+    #[ignore = "red until budget core"]
+    fn the_cap_over_terrain_is_a_profile_parameter() {
+        let mut c = Rig::interactive_config();
+        c.imagery_over_terrain_cap = 1;
+        let mut r = Rig::new(c);
+        let a = t(2, 1, 1);
+        let d = r.step(&drawn_draped(&[a], 9));
+        assert!(
+            d.start
+                .iter()
+                .any(|s| s.resource == ResourceId::Drape(a, 3)),
+            "{RED}"
+        );
+    }
+
+    /// The configuration reports the effective cap.
+    #[test]
+    fn the_effective_cap_is_the_smaller_of_the_two() {
+        let mut c = BudgetConfig::interactive(Bytes::mib(64));
+        assert_eq!(c.imagery_cap(), 3);
+        c.max_drape_side = 1_024;
+        assert_eq!(c.imagery_cap(), 2);
+        c.max_drape_side = 256;
+        assert_eq!(c.imagery_cap(), 0);
+        c.imagery_over_terrain_cap = 0;
+        c.max_drape_side = 4_096;
+        assert_eq!(c.imagery_cap(), 0);
+    }
+}
+
+mod staging {
+    use super::*;
+
+    /// C2, review of point 17: staging bytes count against the delivery
+    /// credit.
+    #[test]
+    #[ignore = "red until budget core"]
+    fn staging_bytes_count_against_the_delivery_credit() {
+        let mut c = Rig::interactive_config();
+        c.delivery_credit = Bytes(MESH.0 * 4);
+        c.upload_bytes_per_frame = Bytes(1);
+        let mut r = Rig::new(c);
+        let tiles: Vec<_> = (0..8).map(|x| t(4, x, 0)).collect();
+        let need = drawn(&tiles);
+        let d = r.step(&need);
+        for s in &d.start {
+            r.b.on_loaded(
+                s.resource,
+                s.gen,
+                Cost {
+                    gpu: MESH,
+                    staging: Bytes(MESH.0 * 2),
+                },
+            );
+        }
+        let d = r.step(&need);
+        assert_eq!(d.deliver.len(), 2, "{RED}");
+        assert_eq!(r.b.ledger().in_transit, Bytes(MESH.0 * 4));
+    }
+}
+
+mod need_lifetime {
+    use super::*;
+
+    fn static_and_send<T: 'static + Send + Sync>() {}
+
+    /// I7, review: the budget holds no reference to a step's need; it is
+    /// `'static`, `Send` and `Sync`, so it cannot.
+    #[test]
+    fn the_budget_borrows_nothing_from_a_step() {
+        static_and_send::<Budget>();
+        let mut r = Rig::interactive();
+        {
+            let need = drawn(&[t(3, 1, 1)]);
+            r.step(&need);
+        }
+        r.step(&NeedSet::new());
+    }
+
+    /// I7: a huge need leaves nothing behind once it is gone.
+    #[test]
+    #[ignore = "red until budget core"]
+    fn a_huge_need_leaves_nothing_behind() {
+        let mut c = Rig::interactive_config();
+        c.request_heap = 64;
+        let mut r = Rig::new(c);
+        let tiles: Vec<_> = (0..128)
+            .flat_map(|x| (0..128).map(move |y| t(7, x, y)))
+            .collect();
+        let d = r.step(&drawn_draped(&tiles, 9));
+        assert!(!d.start.is_empty(), "{RED}");
+        assert!(r.b.tracked() <= 64 + 16, "{}", r.b.tracked());
+        r.idle_for(&NeedSet::new(), Micros::from_secs(2));
+        assert_eq!(r.b.tracked(), 0);
+    }
+}
+
+mod stats_digest {
+    use super::*;
+
+    /// Audit: the per-step statistics have a digest, so device runs compare
+    /// to the simulation.
+    #[test]
+    #[ignore = "red until budget core"]
+    fn the_stats_digest_follows_every_field() {
+        let mut r = Rig::interactive();
+        let a = t(3, 2, 2);
+        let d1 = r.step(&drawn(&[a]));
+        let mut r2 = Rig::interactive();
+        let d2 = r2.step(&drawn(&[a]));
+        assert_eq!(d1.stats.digest(), d2.stats.digest());
+        let mut other = d1.stats.clone();
+        other.exact += 1;
+        assert_ne!(other.digest(), d1.stats.digest(), "{RED}");
+        other = d1.stats.clone();
+        other.latency_ms[17] += 1;
+        assert_ne!(other.digest(), d1.stats.digest());
     }
 }

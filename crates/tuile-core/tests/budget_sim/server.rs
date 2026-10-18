@@ -34,9 +34,12 @@ pub struct Profile {
 impl Profile {
     /// A desktop: 2 GiB, a good network, 60 fps, 2 s to converge.
     pub fn desktop() -> Self {
+        let mut b = BudgetConfig::interactive(Bytes::gib(2));
+        b.imagery_over_terrain_cap = 3;
+        b.max_drape_side = 2_048;
         Profile {
             name: "desktop",
-            budget: BudgetConfig::interactive(Bytes::gib(2)),
+            budget: b,
             net: NetProfile::desktop(),
             dt: Micros(16_667),
             converge_within: Micros::from_secs(2),
@@ -49,6 +52,8 @@ impl Profile {
         b.max_in_flight = tuile_core::budget::PerClass([8, 4, 8, 2, 2]);
         b.upload_bytes_per_frame = Bytes::mib(4);
         b.delivery_credit = Bytes::mib(16);
+        b.imagery_over_terrain_cap = 2;
+        b.max_drape_side = 1_024;
         Profile {
             name: "handheld",
             budget: b,
@@ -69,6 +74,8 @@ impl Profile {
         p.budget.max_in_flight = quotas;
         p.budget.upload_bytes_per_frame = upload;
         p.budget.delivery_credit = Bytes::mib(8);
+        p.budget.imagery_over_terrain_cap = 1;
+        p.budget.max_drape_side = 512;
         p
     }
 
@@ -128,6 +135,8 @@ pub struct Sim {
     sse_scale: f64,
     last_cam: Option<Camera>,
     floor_in: bool,
+    /// When the floor first became drawable.
+    pub floor_at: Option<Micros>,
     /// Per tile: (mesh level drawn, drape level worn, last change time),
     /// tracked while the camera is still (I4).
     levels: BTreeMap<TileId, (u32, u32, Vec<Micros>)>,
@@ -149,6 +158,7 @@ impl Sim {
             sse_scale: 1.0,
             last_cam: None,
             floor_in: false,
+            floor_at: None,
             levels: BTreeMap::new(),
             profile,
         }
@@ -175,11 +185,18 @@ impl Sim {
                 Arrival::StoreMiss(r, g) => self.budget.on_store_miss(r, g),
             }
         }
+        // A film's frame is a function of its own inputs: no hysteresis on
+        // what an earlier frame drew.
+        let none = BTreeSet::new();
+        let drawn_last = match self.profile.budget.policy {
+            Policy::Batch => &none,
+            Policy::Interactive => &self.drawn_last,
+        };
         let need = traverse(
             &cam,
             &View(&self.budget),
             self.sse_scale,
-            &self.drawn_last,
+            drawn_last,
             self.pinned(),
         );
         let input = FrameInput::new(self.frame, self.now, &need).with_presence(&self.net.store);
@@ -228,6 +245,9 @@ impl Sim {
             .gpu
             .drawable
             .contains_key(&ResourceId::Mesh(super::world::tile(0, 0, 0)));
+        if self.floor_in && self.floor_at.is_none() {
+            self.floor_at = Some(self.now);
+        }
         self.now = self.now.plus(self.profile.dt);
         self.frame += 1;
         (need, d)
@@ -259,6 +279,12 @@ impl Sim {
         for c in Class::ALL {
             if s.gpu[c].minus(s.protected[c]) > s.target[c] {
                 self.fail(&format!("I2: {c:?} unprotected bytes over target"));
+            }
+        }
+        // I2: no class ever crosses its hard limit.
+        for c in Class::ALL {
+            if s.gpu[c] > cfg.hard_limit[c] || self.gpu.bytes[c] > cfg.hard_limit[c] {
+                self.fail(&format!("I2: {c:?} over its hard limit"));
             }
         }
         // I5: only the fresh generation is delivered.

@@ -29,7 +29,7 @@ impl Rng {
 
     /// Exponential with mean `mean`.
     pub fn exp(&mut self, mean: f64) -> f64 {
-        -mean * (1.0 - self.unit()).ln()
+        -mean * super::detmath::ln(1.0 - self.unit())
     }
 
     /// True with probability `permille / 1000`.

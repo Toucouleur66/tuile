@@ -35,6 +35,9 @@ pub enum Urgency {
     Ring,
     /// A preloaded ancestor.
     Ancestor,
+    /// Resident content whose upstream epoch changed: refreshed with free
+    /// slots and budget only, never preempting, new before old.
+    Refresh,
 }
 
 /// A need's floats, quantised once at the boundary.

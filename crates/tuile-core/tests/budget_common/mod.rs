@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use tuile_core::budget::cost::{drape_bytes, TextureFormat};
+use tuile_core::budget::cost::{drape_cost, Cost, TextureFormat};
 use tuile_core::budget::{
     Budget, BudgetConfig, Bytes, Class, Decisions, FrameInput, GeoRect, ImageryNeed, Micros, Need,
     NeedSet, Presence, PresenceOracle, ResourceId, TexelFootprint, TileId,
@@ -18,16 +18,16 @@ use tuile_core::budget::{
 /// The estimated bytes of every test mesh.
 pub const MESH: Bytes = Bytes(100 * 1024);
 
-/// The estimated bytes of every test drape.
+/// The estimated resident bytes of every test drape.
 pub fn drape() -> Bytes {
-    drape_bytes(256, 256, TextureFormat::Rgba8)
+    drape_cost(256, 256, TextureFormat::Rgba8).gpu
 }
 
-/// What a resource costs in these tests.
-pub fn est(r: ResourceId) -> Bytes {
+/// What a resource costs in these tests: meshes stage what they hold.
+pub fn est(r: ResourceId) -> Cost {
     match r {
-        ResourceId::Mesh(_) => MESH,
-        ResourceId::Drape(..) => drape(),
+        ResourceId::Mesh(_) => Cost::flat(MESH),
+        ResourceId::Drape(..) => drape_cost(256, 256, TextureFormat::Rgba8),
     }
 }
 
@@ -194,7 +194,7 @@ impl Rig {
     pub fn upload(&mut self, d: &Decisions) {
         for r in &d.upload_plan.items {
             if let Some(g) = self.delivered.get(r) {
-                self.b.on_drawable(*r, *g, est(*r));
+                self.b.on_drawable(*r, *g, est(*r).gpu);
             }
         }
     }

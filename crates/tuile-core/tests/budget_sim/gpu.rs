@@ -69,7 +69,7 @@ impl SimGpu {
             let Some(g) = self.pending.remove(r) else {
                 return Err(format!("{r:?} in the plan but never delivered"));
             };
-            let b = cost(*r);
+            let b = cost(*r).gpu;
             self.drawable.insert(*r, b);
             let c = class(*r);
             self.bytes[c] = self.bytes[c].plus(b);

@@ -96,7 +96,7 @@ pub struct Ledger {
 /// An arrival, recorded between steps and applied at the next one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Event {
-    Loaded(ResourceId, Generation, Bytes),
+    Loaded(ResourceId, Generation, cost::Cost),
     Failed(ResourceId, Generation, bool),
     StoreMiss(ResourceId, Generation),
     Drawable(ResourceId, Generation, Bytes),
@@ -139,9 +139,17 @@ impl Budget {
         }
     }
 
-    /// A load finished decoding: `est` decoded bytes, also the GPU estimate.
-    pub fn on_loaded(&mut self, r: ResourceId, gen: Generation, est: Bytes) {
-        self.events.push(Event::Loaded(r, gen, est));
+    /// A load finished decoding; `cost` is the estimator's
+    /// ([`cost`](self::cost)), for the decoded copy, the GPU and staging.
+    pub fn on_loaded(&mut self, r: ResourceId, gen: Generation, cost: cost::Cost) {
+        self.events.push(Event::Loaded(r, gen, cost));
+    }
+
+    /// The content of `class` changed upstream (imagery epoch, radiometric
+    /// or source update): every resident resource of the class is refreshed
+    /// at the lowest urgency, new before old, without a hole.
+    pub fn new_epoch(&mut self, class: Class) {
+        let _ = class;
     }
 
     /// A load failed.

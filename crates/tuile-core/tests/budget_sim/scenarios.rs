@@ -5,6 +5,7 @@
 
 use tuile_core::budget::{Bytes, Class, Micros, Pressure, Thermal};
 
+use super::detmath;
 use super::net::NetProfile;
 use super::server::{Profile, Sim};
 use super::world::{Camera, SIDE};
@@ -42,6 +43,8 @@ fn converges(profile: Profile) {
     let within = profile.converge_within;
     let mut sim = Sim::new(profile, 1);
     let stop = settle(&mut sim, 6.0);
+    // From the moment the camera stops and the floor is drawable.
+    let stop = stop.max(sim.floor_at.expect(RED));
     let took = sim.converged_after(stop).expect(RED);
     assert!(
         took <= within,
@@ -125,11 +128,11 @@ fn zoom(t: f64) -> Camera {
     let h = if t < 5.0 {
         2_000.0
     } else if t < 10.0 {
-        2_000.0 * 100f64.powf((t - 5.0) / 5.0)
+        2_000.0 * detmath::exp2(detmath::log2(100.0) * (t - 5.0) / 5.0)
     } else if t < 12.0 {
         200_000.0
     } else if t < 17.0 {
-        200_000.0 * 0.01f64.powf((t - 12.0) / 5.0)
+        200_000.0 * detmath::exp2(detmath::log2(0.01) * (t - 12.0) / 5.0)
     } else {
         2_000.0
     };
@@ -398,11 +401,10 @@ fn a_film_does_not_depend_on_how_frames_are_split() {
 }
 
 /// Golden decision digests per scenario: a change needs a reviewed update
-/// (`TUILE_BLESS_BUDGET=1`). Frozen on the platform that recorded them: the
-/// simulated world uses `libm`, whose last bits may differ elsewhere.
+/// (`TUILE_BLESS_BUDGET=1`). The simulation's inputs use no `libm`
+/// (`detmath`), so the digests hold on every platform, the Linux CI included.
 #[test]
 #[ignore = "red until budget core"]
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn golden_decision_digests_hold() {
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/budget_sim/goldens.txt");
@@ -423,4 +425,35 @@ fn golden_decision_digests_hold() {
     }
     let want = std::fs::read_to_string(&path).expect("goldens recorded");
     assert_eq!(got, want);
+}
+
+/// I1, I2, I9, review of point 9: at the hard ceiling of a small phone, a
+/// zoom-out whose parents are not resident keeps the children drawn until
+/// the parent is drawable, never crosses the ceiling (checked every step),
+/// and converges.
+#[test]
+#[ignore = "red until budget core"]
+fn a_zoom_out_at_the_hard_ceiling_never_deadlocks() {
+    let mut p = Profile::handheld_low();
+    p.budget.hard_limit[Class::TerrainMesh] = Bytes::mib(12);
+    p.budget.target[Class::TerrainMesh] = Bytes::mib(8);
+    p.budget.overflow[Class::TerrainMesh] = Bytes::mib(2);
+    p.budget.pinned_level = Some(2);
+    let mut sim = Sim::new(p, 25);
+    let out = |t: f64| {
+        let k = ((t - 8.0) / 3.0).clamp(0.0, 1.0);
+        Camera {
+            h: 2_000.0 * detmath::exp2(detmath::log2(25.0) * k),
+            ..approach(t.min(5.0))
+        }
+    };
+    sim.run(11.0, &out);
+    let stop = sim.now;
+    sim.run(15.0, &out);
+    assert!(
+        sim.log.iter().any(|l| l.stats.held > 0),
+        "{RED}: no zoom-out without a resident parent"
+    );
+    let took = sim.converged_after(stop).expect("converged");
+    assert!(took <= Micros::from_secs(10), "{took:?}");
 }

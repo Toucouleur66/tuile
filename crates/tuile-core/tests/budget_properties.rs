@@ -251,7 +251,7 @@ impl Harness {
                     for r in Self::pick(plan, seed) {
                         if let Some(g) = self.delivered.remove(&r) {
                             self.gpu.insert(r);
-                            self.b.on_drawable(r, g, est(r));
+                            self.b.on_drawable(r, g, est(r).gpu);
                         }
                     }
                 }
@@ -476,6 +476,24 @@ proptest! {
             let s = &rec.d.stats;
             for class in Class::ALL {
                 prop_assert!(s.gpu[class].minus(s.protected[class]) <= s.target[class]);
+            }
+        }
+        prop_assume!(decided_something(&tr));
+    }
+
+    /// I2, review of point 9: no class ever crosses its hard limit, whatever
+    /// the urgency, the pressure or the arrivals.
+    #[test]
+    #[ignore = "red until budget core"]
+    fn no_class_ever_crosses_its_hard_limit(ops in script()) {
+        let mut cfg = interactive();
+        cfg.hard_limit[Class::TerrainMesh] = Bytes(MESH.0 * 6);
+        cfg.target[Class::TerrainMesh] = Bytes(MESH.0 * 3);
+        cfg.overflow[Class::TerrainMesh] = Bytes(MESH.0);
+        let tr = trace(cfg.clone(), &ops);
+        for rec in &tr {
+            for class in Class::ALL {
+                prop_assert!(rec.d.stats.gpu[class] <= cfg.hard_limit[class]);
             }
         }
         prop_assume!(decided_something(&tr));

@@ -23,6 +23,15 @@ pub enum ConfigError {
     /// A class with no request slot can never load.
     #[error("class {0:?} has no request slot")]
     ZeroQuota(Class),
+    /// A class's hard limit is below its target.
+    #[error("class {0:?} has a hard limit below its target")]
+    HardBelowTarget(Class),
+    /// The swap reserve is more than half the hard limit.
+    #[error("swap reserve {0}% above 50%")]
+    Reserve(u8),
+    /// The drape side is zero or below one imagery tile.
+    #[error("the largest drape side is below one imagery tile")]
+    DrapeSide,
     /// The relaxation ceiling is below 1.0.
     #[error("relaxation ceiling {0}‰ is below 1000‰")]
     RelaxCeiling(u32),

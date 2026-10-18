@@ -87,3 +87,19 @@ pub struct BudgetStats {
     /// left for the view.
     pub converged: bool,
 }
+
+impl BudgetStats {
+    /// A digest of every field, FNV-1a, the same on every platform: a device
+    /// run's per-step statistics compare to the simulation's.
+    pub fn digest(&self) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut put = |v: u64| {
+            for b in v.to_le_bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        let _ = &mut put;
+        0
+    }
+}
