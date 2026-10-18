@@ -134,6 +134,14 @@ pub struct Budget {
     drawn_last: std::collections::BTreeSet<ResourceId>,
     swap_last: std::collections::BTreeSet<ResourceId>,
     chain_last: std::collections::BTreeSet<ResourceId>,
+    /// Resources loading or in transit (an index, so a step need not scan).
+    active: std::collections::BTreeSet<ResourceId>,
+    /// Resources of the floor (an index).
+    floor_set: std::collections::BTreeSet<ResourceId>,
+    /// Resources ranked last step (their urgency is cleared next step).
+    ranked_last: Vec<ResourceId>,
+    /// Steps taken, for the amortised prune.
+    steps: u64,
     wanted_last: std::collections::BTreeSet<ResourceId>,
     recent: std::collections::BTreeMap<ResourceId, Micros>,
     epochs: PerClass<u64>,
@@ -164,6 +172,10 @@ impl Budget {
             drawn_last: Default::default(),
             swap_last: Default::default(),
             chain_last: Default::default(),
+            active: Default::default(),
+            floor_set: Default::default(),
+            ranked_last: Vec::new(),
+            steps: 0,
             wanted_last: Default::default(),
             recent: Default::default(),
             epochs: PerClass::splat(0),

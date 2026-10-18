@@ -3,8 +3,6 @@
 
 //! The soak (I6, I7): a long scripted tour; the slopes must be flat.
 
-use std::time::Instant;
-
 use tuile_core::budget::Micros;
 
 use super::detmath;
@@ -93,19 +91,31 @@ fn window(sim: &Sim, from: Micros, to: Micros, decide: &[(Micros, f64)]) -> Wind
 fn soak(minutes: u64) {
     let mut sim = Sim::new(Profile::desktop(), 99);
     let end = Micros::from_secs(minutes * 60);
-    let mut decide = Vec::new();
     while sim.now < end {
         let t = sim.now.0 as f64 / 1e6;
-        let at = sim.now;
-        let clock = Instant::now();
         sim.step(tour(t));
-        decide.push((at, clock.elapsed().as_secs_f64() * 1e6));
     }
+    // `decide` alone: the budget's own cost per step, not the simulation's.
+    let decide = sim.decide_us.clone();
     // The first window warms the caches; the slope is measured from the
     // second one on.
     let span = Micros::from_secs(60).0 * minutes.min(5) / 5;
     let first = window(&sim, Micros(span), Micros(2 * span), &decide);
     let last = window(&sim, end.since(Micros(span)), end, &decide);
+    // The slopes, for the record (`--nocapture`).
+    eprintln!(
+        "soak {minutes} min: wait p95 {:.1} -> {:.1} ms; decide {:.1} -> {:.1} us; \
+         tracked beyond residency {:.0} -> {:.0}; heap {:.0} -> {:.0}; steps {}",
+        first.p95_ms,
+        last.p95_ms,
+        first.decide_us,
+        last.decide_us,
+        first.tracked,
+        last.tracked,
+        first.heap,
+        last.heap,
+        sim.log.len()
+    );
     assert!(first.p95_ms > 0.0, "nothing loaded");
     assert!(
         last.p95_ms <= 1.1 * first.p95_ms,

@@ -148,6 +148,8 @@ pub struct Sim {
     /// Wanted-to-drawable times of meshes, ms, with their time: the
     /// latency the budget's scheduling adds to the network's (I6).
     pub waits: Vec<(Micros, f64)>,
+    /// Wall time of each `decide` call alone, µs, with the step's time.
+    pub decide_us: Vec<(Micros, f64)>,
     /// Per tile: (mesh level drawn, drape level worn, last change time),
     /// tracked while the camera is still (I4).
     levels: BTreeMap<TileId, (u32, u32, Vec<Micros>)>,
@@ -172,6 +174,7 @@ impl Sim {
             floor_at: None,
             wanted_at: BTreeMap::new(),
             waits: Vec::new(),
+            decide_us: Vec::new(),
             levels: BTreeMap::new(),
             profile,
         }
@@ -213,7 +216,10 @@ impl Sim {
             self.pinned(),
         );
         let input = FrameInput::new(self.frame, self.now, &need).with_presence(&self.net.store);
+        let clock = std::time::Instant::now();
         let d = self.budget.decide(input);
+        self.decide_us
+            .push((self.now, clock.elapsed().as_secs_f64() * 1e6));
         self.check(&need, &d);
         for (r, g) in &d.cancel {
             self.net.cancel(*r, *g);

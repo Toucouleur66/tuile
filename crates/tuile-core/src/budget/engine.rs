@@ -433,6 +433,16 @@ impl Budget {
     }
 
     fn best_drape_for(&self, tile: TileId, need: u32) -> Option<DrapeChoice> {
+        // The tile's own drape at exactly its need is the best there is:
+        // the coarsest at or above the need, and the closest owner.
+        let own = ResourceId::Drape(tile, need);
+        if self.drawable(own) {
+            return Some(DrapeChoice {
+                resource: own,
+                level: need,
+                uv: UvTransform::IDENTITY,
+            });
+        }
         let rect = self.tiles.get(&tile).and_then(|i| i.rect);
         let mut chain = vec![tile];
         chain.extend(self.ancestors(tile));
@@ -702,10 +712,13 @@ impl Budget {
         let mut st = BudgetStats::default();
         let mut d = Decisions::default();
         let eff = self.eff();
-        for e in self.entries.values_mut() {
-            e.urgency = None;
-            e.priority = None;
+        for r in std::mem::take(&mut self.ranked_last) {
+            if let Some(e) = self.entries.get_mut(&r) {
+                e.urgency = None;
+                e.priority = None;
+            }
         }
+        self.steps += 1;
 
         self.apply_events(now, &mut st);
         let tiles = self.read_need(&input, &mut st);
@@ -757,7 +770,18 @@ impl Budget {
             .collect();
         let mut keep = drawn_res.clone();
         keep.extend(self.swap_last.iter().copied());
-        for (r, e) in self.entries.iter_mut() {
+        // Only what the view touched this step or the last: everything else
+        // was already marked unneeded.
+        let touched: BTreeSet<ResourceId> = wants
+            .keys()
+            .chain(drawn_res.iter())
+            .chain(self.wanted_last.iter())
+            .copied()
+            .collect();
+        for r in &touched {
+            let Some(e) = self.entries.get_mut(r) else {
+                continue;
+            };
             if let Some(w) = wants.get(r) {
                 e.last_needed = now;
                 e.unneeded_since = None;
@@ -828,6 +852,7 @@ impl Budget {
             }
         }
         jobs.sort_by_key(|j| j.0);
+        self.ranked_last = jobs.iter().map(|j| j.1).collect();
         for (k, r, _, w) in &jobs {
             if let Some(e) = self.entries.get_mut(r) {
                 e.urgency = Some(w.urgency);
@@ -879,7 +904,8 @@ impl Budget {
         }
 
         // 10. Relaxation.
-        self.relax(now, &eff, blocked, strained);
+        let protected = self.protected_bytes();
+        self.relax(now, &eff, &protected, blocked, strained);
         let thermal_floor = match (eff.batch, self.thermal) {
             (true, _) => 1_000,
             (_, Thermal::Serious) => 1_500,
@@ -946,7 +972,7 @@ impl Budget {
         st.in_flight = self.in_flight;
         st.local_reads = self.local_reads;
         st.tracked = self.entries.len() as u32;
-        st.protected = self.protected_bytes();
+        st.protected = protected;
         d.draw = draw;
         d.stats = st;
         d
@@ -954,8 +980,19 @@ impl Budget {
 
     fn protected_bytes(&self) -> PerClass<Bytes> {
         let mut p = PerClass::splat(Bytes::ZERO);
-        for (r, e) in &self.entries {
-            if self.protection(*r).is_some() {
+        let candidates: BTreeSet<ResourceId> = self
+            .drawn_last
+            .iter()
+            .chain(&self.swap_last)
+            .chain(&self.active)
+            .chain(&self.floor_set)
+            .copied()
+            .collect();
+        for r in candidates {
+            let Some(e) = self.entries.get(&r) else {
+                continue;
+            };
+            if self.protection(r).is_some() {
                 let b = e
                     .gpu
                     .map(|g| g.bytes)
@@ -973,7 +1010,11 @@ impl Budget {
         let batch = eff.batch;
         let failure = self.cfg.failure;
         let mut fatal = None;
-        for (r, e) in self.entries.iter_mut() {
+        let active: Vec<ResourceId> = self.active.iter().copied().collect();
+        for r in &active {
+            let Some(e) = self.entries.get_mut(r) else {
+                continue;
+            };
             if let Load::Loading {
                 gen,
                 source,
@@ -1118,6 +1159,10 @@ impl Budget {
                 started: now,
                 epoch,
             };
+            if self.cfg.pinned_level.is_some_and(|p| w.level <= p) {
+                self.floor_set.insert(*r);
+            }
+            self.active.insert(*r);
             match source {
                 Source::Network => {
                     self.in_flight[class] += 1;
@@ -1281,6 +1326,7 @@ impl Budget {
             let Some(e) = self.entries.get_mut(r) else {
                 continue;
             };
+            self.active.insert(*r);
             e.put_transit(
                 &mut self.ledger,
                 Transit {
@@ -1463,7 +1509,14 @@ impl Budget {
         }
     }
 
-    fn relax(&mut self, now: Micros, eff: &Eff, blocked: bool, strained: bool) {
+    fn relax(
+        &mut self,
+        now: Micros,
+        eff: &Eff,
+        protected: &PerClass<Bytes>,
+        blocked: bool,
+        strained: bool,
+    ) {
         if eff.batch {
             self.scale = 1_000;
             return;
@@ -1473,7 +1526,6 @@ impl Budget {
             .map(|l| now.since(l))
             .unwrap_or(Micros::ZERO)
             .0;
-        let protected = self.protected_bytes();
         let over = strained
             || Class::ALL
                 .iter()
@@ -1513,6 +1565,20 @@ impl Budget {
         wants: &BTreeMap<ResourceId, Want>,
         drapes: &BTreeMap<TileId, u32>,
     ) {
+        // Amortised: emptied entries and unreferenced tiles go every eighth
+        // step, so a step does not scan all it tracks.
+        if !self.steps.is_multiple_of(8) {
+            let held = &self.held_last;
+            self.imagery_prev
+                .retain(|t, _| drapes.contains_key(t) || held.contains(t));
+            return;
+        }
+        let entries = &self.entries;
+        self.active.retain(|r| {
+            entries
+                .get(r)
+                .is_some_and(|e| e.transit.is_some() || matches!(e.load, Load::Loading { .. }))
+        });
         self.entries.retain(|r, e| {
             if !e.is_empty() {
                 return true;
@@ -1525,6 +1591,8 @@ impl Budget {
             }
             wants.contains_key(r) && e.unneeded_since.is_none()
         });
+        let entries = &self.entries;
+        self.floor_set.retain(|r| entries.contains_key(r));
         // Keep only what is wanted this step among idle, never-started entries.
         self.recent.retain(|_, t| now.since(*t) <= THRASH_WINDOW);
         while self.recent.len() > RECENT_CAP {
@@ -1542,10 +1610,12 @@ impl Budget {
         keep.extend(self.held_last.iter().copied());
         let seeds: Vec<TileId> = keep.iter().copied().collect();
         for s in seeds {
-            for a in self.ancestors(s) {
-                if !keep.insert(a) {
+            let mut cur = s;
+            while let Some(p) = self.tiles.get(&cur).and_then(|i| i.parent) {
+                if !keep.insert(p) {
                     break;
                 }
+                cur = p;
             }
         }
         self.tiles.retain(|t, _| keep.contains(t));
