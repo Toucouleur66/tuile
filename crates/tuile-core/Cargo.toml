@@ -46,6 +46,9 @@ futures-executor = { workspace = true }
 # subscriber is installed in a test and its output parsed back.
 tracing-subscriber = { workspace = true }
 tempfile = { workspace = true }
+# The budget's properties (protection, total order, ledger, determinism,
+# cancellation) over random need and arrival sequences.
+proptest = { workspace = true }
 
 [features]
 default = []

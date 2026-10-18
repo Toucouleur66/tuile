@@ -25,8 +25,10 @@
 //! - [`tiles3d`] — the 3D Tiles binding of the source seam (tree + loader)
 //! - [`drive`] — render-agnostic consumer driving (progressive + bulk)
 //! - [`fetch`] — abstract byte source ([`fetch::FsFetcher`], `HttpFetcher`)
+//! - [`budget`] — the graphics budget: pure, deterministic GPU residency decisions
 //! - [`cache`] — resident-content LRU under a byte budget
 
+pub mod budget;
 pub mod cache;
 pub mod content;
 pub mod determinism;
