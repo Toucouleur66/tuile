@@ -35,6 +35,8 @@ impl Profile {
     /// A desktop: 2 GiB, a good network, 60 fps, 2 s to converge.
     pub fn desktop() -> Self {
         let mut b = BudgetConfig::interactive(Bytes::gib(2));
+        // Today's desktop viewer runs 64 fetches; the same, split by class.
+        b.max_in_flight = tuile_core::budget::PerClass([32, 16, 32, 4, 4]);
         b.imagery_over_terrain_cap = 3;
         b.max_drape_side = 2_048;
         Profile {
@@ -102,6 +104,10 @@ pub struct StepLog {
     pub stats: BudgetStats,
     /// The view is converged in the sense of I3.
     pub converged: bool,
+    /// Resources held on the GPU or decoded (bounded by bytes).
+    pub held: u32,
+    /// The step decided nothing: no start, cancel, delivery or eviction.
+    pub idle: bool,
 }
 
 struct View<'a>(&'a Budget);
@@ -137,6 +143,11 @@ pub struct Sim {
     floor_in: bool,
     /// When the floor first became drawable.
     pub floor_at: Option<Micros>,
+    /// When each wanted mesh was first wanted, until it is drawable.
+    wanted_at: BTreeMap<ResourceId, Micros>,
+    /// Wanted-to-drawable times of meshes, ms, with their time: the
+    /// latency the budget's scheduling adds to the network's (I6).
+    pub waits: Vec<(Micros, f64)>,
     /// Per tile: (mesh level drawn, drape level worn, last change time),
     /// tracked while the camera is still (I4).
     levels: BTreeMap<TileId, (u32, u32, Vec<Micros>)>,
@@ -159,6 +170,8 @@ impl Sim {
             last_cam: None,
             floor_in: false,
             floor_at: None,
+            wanted_at: BTreeMap::new(),
+            waits: Vec::new(),
             levels: BTreeMap::new(),
             profile,
         }
@@ -215,7 +228,20 @@ impl Sim {
             .gpu
             .apply(&d)
             .unwrap_or_else(|e| panic!("{} frame {}: {e}", self.profile.name, self.frame));
+        let mut seen = BTreeSet::new();
+        for (t, _) in need.drawn.iter().chain(&need.blockers) {
+            let r = ResourceId::Mesh(*t);
+            seen.insert(r);
+            if !self.gpu.drawable.contains_key(&r) {
+                self.wanted_at.entry(r).or_insert(self.now);
+            }
+        }
+        self.wanted_at.retain(|r, _| seen.contains(r));
         for (r, g, b) in acks {
+            if let Some(at) = self.wanted_at.remove(&r) {
+                self.waits
+                    .push((self.now, self.now.since(at).0 as f64 / 1_000.0));
+            }
             self.budget.on_drawable(r, g, b);
         }
         self.sse_scale = f64::from(d.sse_scale_milli) / 1000.0;
@@ -239,6 +265,21 @@ impl Sim {
             digest: d.digest(),
             stats: d.stats.clone(),
             converged,
+            idle: d.start.is_empty()
+                && d.cancel.is_empty()
+                && d.deliver.is_empty()
+                && d.evict.is_empty()
+                && d.upload_plan.items.is_empty()
+                && d.stats.in_flight.iter().all(|(_, n)| n == 0)
+                && d.stats.local_reads == 0
+                && d.stats.in_transit == Bytes::ZERO,
+            held: self
+                .gpu
+                .drawable
+                .keys()
+                .chain(self.decoded.iter())
+                .collect::<BTreeSet<_>>()
+                .len() as u32,
         });
         self.last_cam = Some(cam);
         self.floor_in = self
@@ -428,6 +469,29 @@ impl Sim {
             .iter()
             .find(|l| l.now >= since && l.converged)
             .map(|l| l.now.since(since))
+    }
+
+    /// From `since`, how long until the budget settles: one simulated second
+    /// in which it decides nothing (the view is as good as the budget allows,
+    /// and nothing churns).
+    pub fn settled_after(&self, since: Micros) -> Option<Micros> {
+        // Two idle steps in a row: the acknowledgements of the last plan
+        // have landed.
+        let mut quiet_from: Option<Micros> = None;
+        let mut prev_idle = false;
+        for l in self.log.iter().filter(|l| l.now >= since) {
+            let both = l.idle && prev_idle;
+            prev_idle = l.idle;
+            if both {
+                let from = *quiet_from.get_or_insert(l.now);
+                if l.now.since(from) >= Micros::from_secs(1) {
+                    return Some(from.since(since));
+                }
+            } else {
+                quiet_from = None;
+            }
+        }
+        None
     }
 
     /// The digest of the whole run.

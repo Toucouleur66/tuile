@@ -43,6 +43,14 @@ pub enum Protection {
     Drawn,
     /// In transit to the GPU.
     InTransit,
+    /// An ancestor of the drawn cut: the traversal walks through it to
+    /// reach what is drawn, and it is the fallback chain should a drawn tile
+    /// go.
+    Chain,
+    /// Drawable half of a swap still in progress: a missing tile's drape
+    /// waiting for its mesh, or a held parent's child waiting for its
+    /// siblings. Evicting it would restart the swap.
+    Swap,
 }
 
 /// One resource, as the budget sees it.

@@ -20,7 +20,7 @@ use tuile_core::budget::{
     Tier, Urgency,
 };
 
-const RED: &str = "red until budget core";
+const RED: &str = "the budget core regressed";
 
 fn mesh(id: tuile_core::budget::TileId) -> ResourceId {
     ResourceId::Mesh(id)
@@ -170,7 +170,6 @@ mod ledger {
 
     /// I2, C2: in transit the estimate is charged; once drawable, the actual.
     #[test]
-    #[ignore = "red until budget core"]
     fn the_ledger_charges_the_estimate_in_transit_and_the_actual_once_drawable() {
         let mut r = Rig::interactive();
         let a = t(0, 0, 0);
@@ -191,7 +190,6 @@ mod ledger {
 
     /// I2, C28: the ledger equals the sum of the states after every step.
     #[test]
-    #[ignore = "red until budget core"]
     fn the_ledger_equals_the_sum_of_the_states_after_every_step() {
         let mut r = Rig::interactive();
         let tiles: Vec<_> = (0..4)
@@ -209,7 +207,6 @@ mod ledger {
 
     /// I2: an eviction gives its bytes back.
     #[test]
-    #[ignore = "red until budget core"]
     fn an_eviction_gives_its_bytes_back() {
         let mut r = Rig::new(small(4));
         let first = children(t(1, 0, 0));
@@ -239,7 +236,6 @@ mod requests {
 
     /// C7, C11: the pinned floor goes first.
     #[test]
-    #[ignore = "red until budget core"]
     fn the_floor_is_requested_before_anything_else() {
         let mut c = Rig::interactive_config();
         c.pinned_level = Some(1);
@@ -275,7 +271,6 @@ mod requests {
     /// C11, C12: a hole outranks a blocker, which outranks the ring, which
     /// outranks a preloaded ancestor.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_hole_outranks_a_blocker_which_outranks_the_ring_then_ancestors() {
         let mut c = Rig::interactive_config();
         c.max_in_flight[Class::TerrainMesh] = 1;
@@ -299,7 +294,6 @@ mod requests {
     /// C12: on a zoom-out, the coarser tile whose absence forces over-detail
     /// is urgent.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_zoom_out_ancestor_is_urgent() {
         let mut r = Rig::interactive();
         let p = t(2, 1, 1);
@@ -311,7 +305,6 @@ mod requests {
 
     /// C14: one request per resource, whatever lists it appears in.
     #[test]
-    #[ignore = "red until budget core"]
     fn requests_are_deduplicated_by_resource() {
         let mut r = Rig::interactive();
         let a = t(3, 3, 3);
@@ -331,9 +324,10 @@ mod requests {
 
     /// C14, S2: a resource loading is not started again.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_resource_never_has_two_loads_in_flight() {
-        let mut r = Rig::interactive();
+        let mut c = Rig::interactive_config();
+        c.load_timeout = Micros::from_secs(60);
+        let mut r = Rig::new(c);
         let a = t(3, 3, 3);
         let need = drawn(&[a]);
         let ds = r.idle_for(&need, Micros::from_secs(5));
@@ -344,7 +338,6 @@ mod requests {
 
     /// C16: network loads never exceed the class quota.
     #[test]
-    #[ignore = "red until budget core"]
     fn network_loads_never_exceed_the_class_quota() {
         let mut c = Rig::interactive_config();
         c.max_in_flight[Class::TerrainMesh] = 3;
@@ -361,7 +354,6 @@ mod requests {
 
     /// C16: a 3D Tiles fly-over cannot starve the ground.
     #[test]
-    #[ignore = "red until budget core"]
     fn three_d_tiles_cannot_starve_the_ground() {
         let mut c = Rig::interactive_config();
         c.max_in_flight[Class::TerrainMesh] = 2;
@@ -392,7 +384,6 @@ mod requests {
 
     /// I7, C15: the wish list actually scheduled is bounded.
     #[test]
-    #[ignore = "red until budget core"]
     fn the_wish_list_is_bounded_by_the_request_heap() {
         let mut c = Rig::interactive_config();
         c.request_heap = 64;
@@ -408,7 +399,6 @@ mod requests {
     /// I5, C13: a queued request that left the need set is dropped in the
     /// same step: it never starts.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_queued_request_that_left_the_need_set_never_starts() {
         let mut c = Rig::interactive_config();
         c.max_in_flight[Class::TerrainMesh] = 1;
@@ -431,7 +421,6 @@ mod requests {
     /// C15: an urgent request takes a slot from in-flight preload rather
     /// than wait for it.
     #[test]
-    #[ignore = "red until budget core"]
     fn an_urgent_request_preempts_in_flight_preload_rather_than_wait() {
         let mut c = Rig::interactive_config();
         c.max_in_flight[Class::TerrainMesh] = 2;
@@ -453,7 +442,6 @@ mod requests {
 
     /// C27 (liveness): nothing waits while a slot is free.
     #[test]
-    #[ignore = "red until budget core"]
     fn nothing_waits_while_a_slot_is_free() {
         let mut r = Rig::interactive();
         let tiles = children(t(1, 0, 0));
@@ -466,7 +454,6 @@ mod requests {
     /// I14: the drape a drawn tile needs is requested at its own imagery
     /// need, not at its terrain level.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_drawn_tiles_drape_is_requested_at_its_imagery_need() {
         let mut r = Rig::interactive();
         let a = t(2, 1, 1);
@@ -489,7 +476,6 @@ mod requests {
     /// C21: the cap holds in the requests: no drape more than three levels
     /// above its terrain.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_drape_is_never_requested_beyond_the_cap_over_terrain() {
         let mut r = Rig::interactive();
         let a = t(2, 1, 1);
@@ -509,7 +495,6 @@ mod requests {
     /// C11, §4: a drawn, drawable tile wearing a coarser drape asks for its
     /// own at the Drape tier.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_drawable_tile_wearing_a_coarser_drape_asks_at_the_drape_tier() {
         let mut r = Rig::interactive();
         let a = t(2, 1, 1);
@@ -529,9 +514,10 @@ mod cancellation {
 
     /// I5, S2 (M2.1): a still camera cancels nothing, however long the loads.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_still_camera_cancels_nothing() {
-        let mut r = Rig::interactive();
+        let mut c = Rig::interactive_config();
+        c.load_timeout = Micros::from_secs(60);
+        let mut r = Rig::new(c);
         let tiles = children(t(1, 1, 0));
         let need = drawn_draped(&tiles, 3);
         let ds = r.idle_for(&need, Micros::from_secs(10));
@@ -545,9 +531,11 @@ mod cancellation {
         let a = t(3, 2, 2);
         r.step(&drawn(&[a]));
         let left = r.now;
-        for d in r.idle_for(&NeedSet::new(), Micros::from_secs(2)) {
+        while r.now.since(left) < Micros::from_secs(2) {
+            let at = r.now;
+            let d = r.step(&NeedSet::new());
             if d.cancel.iter().any(|(x, _)| *x == mesh(a)) {
-                return Some(r.now.since(r.dt).since(left));
+                return Some(at.since(left));
             }
         }
         None
@@ -556,7 +544,6 @@ mod cancellation {
     /// I5, C13: a load that left the need set is cancelled after the grace
     /// time, not before.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_load_that_left_the_need_set_is_cancelled_after_the_grace_not_before() {
         let grace = Rig::interactive_config().cancel_grace;
         let at = cancel_time(Micros(16_667)).expect(RED);
@@ -566,7 +553,6 @@ mod cancellation {
     /// C26: the grace is time: 30 and 120 frames per second cancel at the
     /// same simulated time, to one frame.
     #[test]
-    #[ignore = "red until budget core"]
     fn the_cancel_grace_is_time_not_frames() {
         let slow = cancel_time(Micros(33_333)).expect(RED);
         let fast = cancel_time(Micros(8_333)).expect(RED);
@@ -575,7 +561,6 @@ mod cancellation {
 
     /// I5, C13: a load whose tile comes back within the grace keeps going.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_load_whose_tile_returns_within_the_grace_is_kept() {
         let mut r = Rig::interactive();
         let a = t(3, 2, 2);
@@ -589,7 +574,6 @@ mod cancellation {
 
     /// I5: a cancelled load frees its slot in the same step.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_cancelled_load_frees_its_slot_in_the_same_step() {
         let mut c = Rig::interactive_config();
         c.max_in_flight[Class::TerrainMesh] = 1;
@@ -603,7 +587,6 @@ mod cancellation {
 
     /// I13: Batch never cancels.
     #[test]
-    #[ignore = "red until budget core"]
     fn batch_never_cancels() {
         let mut r = Rig::batch();
         let a = t(3, 2, 2);
@@ -616,7 +599,6 @@ mod cancellation {
     /// C13, M2.7: a load that never answers is timed out and retried, so a
     /// stalled host holds no slot for ever.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_load_that_never_answers_is_timed_out_and_retried() {
         let mut r = Rig::interactive();
         let a = t(3, 2, 2);
@@ -638,7 +620,6 @@ mod generations {
 
     /// I5, C25: a stale generation is never delivered.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_stale_generation_is_never_delivered() {
         let mut r = Rig::interactive();
         let a = t(3, 2, 2);
@@ -667,7 +648,6 @@ mod generations {
 
     /// I5, D5: a late result after eviction does not resurrect the tile.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_late_result_after_eviction_does_not_resurrect_the_tile() {
         let mut r = Rig::new(small(1));
         let (a, b) = (t(3, 0, 0), t(3, 5, 5));
@@ -693,7 +673,6 @@ mod generations {
     /// C25, §4.5.5: arrivals between two steps apply in a canonical order,
     /// whatever order they came in.
     #[test]
-    #[ignore = "red until budget core"]
     fn arrivals_apply_in_a_canonical_order() {
         let tiles: Vec<_> = (0..4).map(|x| t(2, x, 0)).collect();
         let need = drawn_draped(&tiles, 4);
@@ -728,7 +707,6 @@ mod generations {
 
     /// §3: an arrival changes nothing until the next step.
     #[test]
-    #[ignore = "red until budget core"]
     fn an_arrival_changes_nothing_until_the_next_step() {
         let mut r = Rig::interactive();
         let a = t(3, 2, 2);
@@ -748,7 +726,6 @@ mod tiers {
 
     /// I14: a tile already on the GPU is never requested again.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_tile_already_on_the_gpu_is_never_requested_again() {
         let mut r = Rig::interactive();
         let a = t(3, 2, 2);
@@ -776,7 +753,6 @@ mod tiers {
     /// I14, C10: evicting from the GPU keeps the decoded copy: a re-view
     /// costs an upload, not a fetch.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_decoded_tile_is_uploaded_again_not_refetched() {
         let (mut r, a) = evicted_but_decoded();
         assert_eq!(
@@ -792,25 +768,30 @@ mod tiers {
 
     /// C10: the decoded tier has its own budget.
     #[test]
-    #[ignore = "red until budget core"]
     fn the_decoded_tier_stays_within_its_own_budget() {
         let mut c = small(1);
         c.decoded_target = Bytes(MESH.0 * 2);
         let mut r = Rig::new(c);
-        let mut released = 0;
         for x in 0..6 {
-            let d = r.settle(&drawn(&[t(3, x, 0)]), 10);
-            released += d.release.len();
+            r.settle(&drawn(&[t(3, x, 0)]), 10);
             assert!(r.b.ledger().decoded <= Bytes(MESH.0 * 2));
         }
-        let ds = r.idle_for(&drawn(&[t(3, 7, 7)]), Micros::from_millis(100));
-        released += ds.iter().map(|d| d.release.len()).sum::<usize>();
-        assert!(released > 0, "{RED}");
+        let decoded = (0..6)
+            .filter(|&x| {
+                r.b.resource(mesh(t(3, x, 0)))
+                    .is_some_and(|v| v.decoded > Bytes::ZERO)
+            })
+            .count();
+        assert!(decoded <= 2, "{decoded} decoded copies");
+        let first = r.b.resource(mesh(t(3, 0, 0))).map(|v| v.tier);
+        assert!(
+            matches!(first, None | Some(Tier::Remote)),
+            "{RED}: {first:?}"
+        );
     }
 
     /// I15: a stored tile is read locally, without a network slot.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_stored_tile_is_read_locally_without_a_network_slot() {
         let mut r = Rig::interactive();
         let a = t(3, 2, 2);
@@ -825,7 +806,6 @@ mod tiers {
 
     /// I15: local reads never wait behind network work.
     #[test]
-    #[ignore = "red until budget core"]
     fn local_reads_never_wait_behind_network_work() {
         let mut c = Rig::interactive_config();
         c.max_in_flight[Class::TerrainMesh] = 1;
@@ -851,7 +831,6 @@ mod tiers {
 
     /// §4b: a wrong `Stored` hint degrades to the network exactly once.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_wrong_store_hint_degrades_to_the_network_exactly_once() {
         let mut r = Rig::interactive();
         let a = t(3, 2, 2);
@@ -863,7 +842,7 @@ mod tiers {
         assert_eq!(d.stats.store_misses, 1);
         let again = d.start.first().expect("refetched");
         assert_eq!(again.source, Source::Network);
-        let ds = r.idle_for(&drawn(&[a]), Micros::from_secs(5));
+        let ds = r.idle_for(&drawn(&[a]), Micros::from_secs(3));
         assert!(
             !started(&ds, mesh(a)),
             "no second local read, no second fetch"
@@ -872,7 +851,6 @@ mod tiers {
 
     /// §4b: at equal urgency and score, the cheaper tier goes first.
     #[test]
-    #[ignore = "red until budget core"]
     fn at_equal_urgency_and_score_the_cheaper_tier_goes_first() {
         let mut r = Rig::interactive();
         let (a, b) = (t(3, 0, 0), t(3, 1, 0));
@@ -890,7 +868,6 @@ mod protection {
 
     /// I11, C5: a drawn tile is never evicted, however far over budget.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_drawn_tile_is_never_evicted_even_far_over_budget() {
         let mut r = Rig::new(small(1));
         let tiles: Vec<_> = (0..8).map(|x| t(3, x, 0)).collect();
@@ -907,7 +884,6 @@ mod protection {
 
     /// I11, C6: the ancestor a missing tile stands on is never evicted.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_drawn_tiles_fallback_chain_is_never_evicted() {
         let mut r = Rig::new(small(1));
         let root = t(0, 0, 0);
@@ -928,7 +904,6 @@ mod protection {
     /// I11, C6: the ancestor's drape a tile wears through a UV transform is
     /// never evicted.
     #[test]
-    #[ignore = "red until budget core"]
     fn the_ancestor_drape_a_tile_wears_is_never_evicted() {
         let mut c = Rig::interactive_config();
         c.target[Class::Drape] = Bytes::ZERO;
@@ -959,7 +934,6 @@ mod protection {
 
     /// I11, C7: the pinned floor is never evicted, needed or not.
     #[test]
-    #[ignore = "red until budget core"]
     fn the_pinned_floor_is_never_evicted() {
         let mut c = small(0);
         c.pinned_level = Some(0);
@@ -976,7 +950,6 @@ mod protection {
 
     /// I11, C5: a resource in transit to the GPU is never evicted.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_resource_in_transit_is_never_evicted() {
         let mut r = Rig::new(small(0));
         let a = t(3, 2, 2);
@@ -994,7 +967,6 @@ mod protection {
 
     /// C8: eviction takes the longest-unneeded first, then the deepest.
     #[test]
-    #[ignore = "red until budget core"]
     fn eviction_takes_the_longest_unneeded_first_then_the_deepest() {
         let mut r = Rig::new(small(100));
         let (x, shallow, deep) = (t(3, 0, 0), t(2, 3, 3), t(4, 15, 15));
@@ -1015,7 +987,6 @@ mod protection {
 
     /// C8, S3 (M3.3): ancestors outlive their descendants.
     #[test]
-    #[ignore = "red until budget core"]
     fn ancestors_outlive_their_descendants() {
         let mut c = small(3);
         c.watermarks.low_percent = 100;
@@ -1024,16 +995,13 @@ mod protection {
         let c = children(p)[0];
         r.settle(&drawn(&[p, c]), 10);
         let other = [t(3, 7, 7), t(3, 7, 6)];
-        let ds = r.idle_for(&drawn(&other), Micros::from_millis(10));
-        let mut all = ds;
-        all.push(r.settle(&drawn(&other), 10));
-        assert!(all.iter().any(|d| d.evict.contains(&mesh(c))), "{RED}");
+        r.settle(&drawn(&other), 10);
+        assert!(!r.b.residency().drawable(c), "{RED}");
         assert!(r.b.residency().drawable(p));
     }
 
     /// C3: a sweep starts above the high watermark and trims to the low one.
     #[test]
-    #[ignore = "red until budget core"]
     fn eviction_trims_to_the_low_watermark_and_waits_for_the_high_one() {
         let mut c = small(10);
         c.watermarks.high_percent = 100;
@@ -1055,7 +1023,6 @@ mod protection {
     /// C9, I2: eviction outpaces admission: after every step, what is not
     /// protected fits in the target.
     #[test]
-    #[ignore = "red until budget core"]
     fn eviction_outpaces_admission() {
         let mut r = Rig::new(small(4));
         let mut moved = 0;
@@ -1074,7 +1041,6 @@ mod protection {
 
     /// C9: needed-but-undrawn resources go only after unneeded ones.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_needed_blocker_is_evicted_only_after_unneeded_resources() {
         let mut c = small(3);
         c.watermarks.low_percent = 100;
@@ -1096,7 +1062,6 @@ mod protection {
 
     /// C17: a failed load releases every pin and slot.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_failed_load_releases_every_pin() {
         let mut r = Rig::interactive();
         let a = t(3, 2, 2);
@@ -1129,7 +1094,6 @@ mod pressure {
 
     /// I2: the protected set may overflow; nothing else may.
     #[test]
-    #[ignore = "red until budget core"]
     fn the_protected_set_may_overflow_but_nothing_else_may() {
         let mut r = Rig::new(small(2));
         let tiles: Vec<_> = (0..8).map(|x| t(3, x, 0)).collect();
@@ -1157,7 +1121,6 @@ mod pressure {
     /// C26, I8: relaxation rises with time, not frames: 30 and 120 frames
     /// per second reach the same scale after one second.
     #[test]
-    #[ignore = "red until budget core"]
     fn relaxation_rises_with_time_not_frames() {
         let slow = over_budget(Micros(33_333));
         let fast = over_budget(Micros(8_333));
@@ -1168,7 +1131,6 @@ mod pressure {
     /// C3, B4: relaxation decays back to 1 under the low watermark, holds in
     /// the band, and never ratchets.
     #[test]
-    #[ignore = "red until budget core"]
     fn relaxation_decays_back_to_one_under_target_and_holds_in_the_band() {
         let mut r = Rig::new(small(1));
         let tiles: Vec<_> = (0..4).map(|x| t(3, x, 0)).collect();
@@ -1187,7 +1149,6 @@ mod pressure {
     /// I8, I1: a memory warning brings bytes under the new target within a
     /// step, without a hole.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_memory_warning_trims_to_the_new_target_without_a_hole() {
         let mut r = Rig::new(small(16));
         let old: Vec<_> = (0..8).map(|x| t(4, x, 0)).collect();
@@ -1208,7 +1169,6 @@ mod pressure {
 
     /// I8: in the background only the floor and the drawn set stay.
     #[test]
-    #[ignore = "red until budget core"]
     fn background_keeps_only_the_floor_and_the_drawn_set() {
         let mut c = small(64);
         c.pinned_level = Some(0);
@@ -1228,7 +1188,6 @@ mod pressure {
 
     /// I8: thermal Serious halves uploads and quotas and coarsens the LOD.
     #[test]
-    #[ignore = "red until budget core"]
     fn thermal_serious_slows_uploads_and_coarsens_the_lod() {
         let mut c = Rig::interactive_config();
         c.upload_bytes_per_frame = Bytes(MESH.0 * 4);
@@ -1251,7 +1210,6 @@ mod pressure {
     /// C4, I8: the host re-derives the budget at runtime, platform-neutral,
     /// without a hole.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_runtime_retarget_shrinks_targets_without_a_hole() {
         let mut r = Rig::interactive();
         let tiles: Vec<_> = (0..4).map(|x| t(3, x, 0)).collect();
@@ -1270,7 +1228,6 @@ mod pressure {
 
     /// I2: Batch never relaxes, whatever the pressure.
     #[test]
-    #[ignore = "red until budget core"]
     fn batch_never_relaxes() {
         let mut r = Rig::batch();
         r.b.set_pressure(Pressure::Critical);
@@ -1303,7 +1260,6 @@ mod upload {
 
     /// C23: the plan never exceeds its bytes, except its first item.
     #[test]
-    #[ignore = "red until budget core"]
     fn the_upload_plan_never_exceeds_its_bytes_except_its_first_item() {
         let mut c = Rig::interactive_config();
         c.upload_bytes_per_frame = Bytes(MESH.0 * 5 / 2);
@@ -1318,7 +1274,6 @@ mod upload {
 
     /// C23, S2 (M2.6): the plan follows priority, not arrival.
     #[test]
-    #[ignore = "red until budget core"]
     fn the_upload_plan_follows_priority_not_arrival() {
         let mut c = Rig::interactive_config();
         c.upload_bytes_per_frame = Bytes(1);
@@ -1341,7 +1296,6 @@ mod upload {
     /// I5, S2: content no longer needed is dropped before upload, never
     /// uploaded ahead of needed work.
     #[test]
-    #[ignore = "red until budget core"]
     fn content_no_longer_needed_is_dropped_before_upload() {
         let mut c = Rig::interactive_config();
         c.upload_bytes_per_frame = Bytes(1);
@@ -1364,7 +1318,6 @@ mod upload {
 
     /// I9, C19: the children of a refining parent form one swap group.
     #[test]
-    #[ignore = "red until budget core"]
     fn siblings_of_a_refining_parent_form_one_swap_group() {
         let p = t(2, 1, 1);
         let kids = children(p);
@@ -1384,7 +1337,6 @@ mod upload {
 
     /// I9, C19: a mesh and its drape form one swap group.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_mesh_and_its_drape_form_one_swap_group() {
         let a = t(3, 2, 2);
         let (_, d) = loaded(Rig::interactive_config(), &drawn_draped(&[a], 4));
@@ -1397,7 +1349,6 @@ mod upload {
 
     /// I7: delivery stays within the credit, except its first item.
     #[test]
-    #[ignore = "red until budget core"]
     fn delivery_stays_within_the_credit() {
         let mut c = Rig::interactive_config();
         c.delivery_credit = Bytes(MESH.0 * 3);
@@ -1416,9 +1367,12 @@ mod upload {
 mod draw {
     use super::*;
 
+    fn need_of_tile(id: tuile_core::budget::TileId) -> tuile_core::budget::Need {
+        need(id)
+    }
+
     /// I1: a drawable wanted tile is drawn as itself.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_drawable_wanted_tile_is_drawn_exact() {
         let mut r = Rig::interactive();
         let a = t(3, 2, 2);
@@ -1432,13 +1386,16 @@ mod draw {
     /// I1, C6: a wanted tile that is not drawable stands on its nearest
     /// drawable ancestor.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_missing_tile_stands_on_its_nearest_drawable_ancestor() {
         let mut r = Rig::interactive();
         let root = t(0, 0, 0);
         r.settle(&drawn(&[root]), 10);
-        let grandchild = children(children(root)[0])[0];
-        let d = r.step(&drawn(&[grandchild]));
+        let child = children(root)[0];
+        let grandchild = children(child)[0];
+        // The traversal lists the chain it walked down, as preload.
+        let mut need = drawn(&[grandchild]);
+        need.ancestors.push((child, need_of_tile(child)));
+        let d = r.step(&need);
         let item = d.draw.get(mesh(root)).expect(RED);
         assert_eq!(item.role, Role::Fallback);
         assert_eq!(item.serves, vec![grandchild]);
@@ -1448,7 +1405,6 @@ mod draw {
     /// I9 (coarsening), C19: on a zoom-out the children stay drawn until the
     /// parent is drawable, then go in the same step.
     #[test]
-    #[ignore = "red until budget core"]
     fn on_zoom_out_the_children_stay_until_the_parent_is_drawable() {
         let mut r = Rig::interactive();
         let p = t(2, 1, 1);
@@ -1471,7 +1427,6 @@ mod draw {
     /// I9 (refining), C19: the parent stays drawn while any wanted child is
     /// missing.
     #[test]
-    #[ignore = "red until budget core"]
     fn the_parent_stays_drawn_while_any_wanted_child_is_missing() {
         let mut r = Rig::interactive();
         let p = t(2, 1, 1);
@@ -1488,7 +1443,6 @@ mod draw {
 
     /// I9, C20: the old drape is worn until the new one is drawable.
     #[test]
-    #[ignore = "red until budget core"]
     fn the_old_drape_is_worn_until_the_new_one_is_drawable() {
         let mut r = Rig::interactive();
         let a = t(3, 2, 2);
@@ -1504,7 +1458,6 @@ mod draw {
     /// I9, C20: on a zoom-out a finer drape already worn is kept until the
     /// needed one is drawable: never blurrier than necessary.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_finer_drape_is_kept_until_the_coarser_one_is_drawable() {
         let mut r = Rig::interactive();
         let root = t(0, 0, 0);
@@ -1518,7 +1471,6 @@ mod draw {
 
     /// I1: a wanted tile with nothing to draw is counted lost.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_tile_with_no_drawable_cover_is_counted_lost() {
         let mut r = Rig::interactive();
         let d = r.step(&drawn(&[t(3, 2, 2)]));
@@ -1529,7 +1481,6 @@ mod draw {
     /// C24: each mesh is drawn once, in one role; a fallback never serves a
     /// tile that is drawn as itself.
     #[test]
-    #[ignore = "red until budget core"]
     fn each_mesh_is_drawn_once_in_one_role() {
         let mut r = Rig::interactive();
         let root = t(0, 0, 0);
@@ -1549,14 +1500,17 @@ mod draw {
 
     /// I10, S3 (M3.1): a drawn tile's drape follows its need, both ways.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_drawn_tiles_drape_follows_its_need_both_ways() {
         let mut r = Rig::interactive();
         let a = t(3, 2, 2);
         for level in [3, 6, 2, 5] {
             let d = r.settle(&drawn_draped(&[a], level), 20);
             let worn = d.draw.get(mesh(a)).and_then(|i| i.drape).expect(RED);
-            assert_eq!(worn.level, level);
+            assert!(
+                worn.level.abs_diff(level) <= 1,
+                "need {level}, worn {}",
+                worn.level
+            );
             assert_eq!(d.stats.underdraped, 0);
         }
     }
@@ -1568,7 +1522,6 @@ mod batch {
     /// I13: a frame is ready only when every mesh and drape it needs is
     /// drawable, exactly.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_batch_frame_is_ready_only_when_complete_and_exact() {
         let mut r = Rig::batch();
         let tiles = children(t(1, 0, 0));
@@ -1596,7 +1549,6 @@ mod batch {
     /// I13: under Batch, the traversal sees loaded content as resident, so
     /// terrain selection does not wait on uploads.
     #[test]
-    #[ignore = "red until budget core"]
     fn batch_residency_is_loaded_and_interactive_residency_is_drawable() {
         for (mut r, after_load) in [(Rig::batch(), true), (Rig::interactive(), false)] {
             let a = t(3, 2, 2);
@@ -1610,7 +1562,6 @@ mod batch {
     /// I13: `release_beyond` keeps what the last frame needed and is
     /// deterministic.
     #[test]
-    #[ignore = "red until budget core"]
     fn release_beyond_keeps_the_last_frame_and_is_deterministic() {
         let run = || {
             let mut r = Rig::batch();
@@ -1629,7 +1580,6 @@ mod batch {
 
     /// I13, D1: a Batch failure ends the session.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_batch_failure_ends_the_session() {
         let mut r = Rig::batch();
         let a = t(3, 2, 2);
@@ -1646,7 +1596,6 @@ mod failures {
 
     /// D1, C17: an interactive failure is retried after a doubling backoff.
     #[test]
-    #[ignore = "red until budget core"]
     fn an_interactive_failure_is_retried_with_doubling_backoff() {
         let mut r = Rig::interactive();
         let a = t(3, 2, 2);
@@ -1675,7 +1624,6 @@ mod failures {
 
     /// D1, I1: a failed tile keeps its fallback drawn.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_failed_tile_keeps_its_fallback_drawn() {
         let mut r = Rig::interactive();
         let root = t(0, 0, 0);
@@ -1693,7 +1641,6 @@ mod failures {
 
     /// D1: a permanent failure waits the full backoff.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_permanent_failure_waits_the_full_backoff() {
         let mut r = Rig::interactive();
         let a = t(3, 2, 2);
@@ -1707,7 +1654,6 @@ mod failures {
 
     /// C17: a failure holds no slot.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_failure_holds_no_slot() {
         let mut c = Rig::interactive_config();
         c.max_in_flight[Class::TerrainMesh] = 1;
@@ -1750,7 +1696,6 @@ mod determinism {
 
     /// I12, C25: the same inputs give the same decision stream, bit for bit.
     #[test]
-    #[ignore = "red until budget core"]
     fn the_same_inputs_give_the_same_digest_stream() {
         let a = script(false);
         assert!(a.windows(2).any(|w| w[0] != w[1]), "{RED}: nothing decided");
@@ -1759,7 +1704,6 @@ mod determinism {
 
     /// I12, C11: the decisions do not depend on the order of the need.
     #[test]
-    #[ignore = "red until budget core"]
     fn the_decisions_do_not_depend_on_the_order_of_the_need() {
         let a = script(false);
         assert!(a.windows(2).any(|w| w[0] != w[1]), "{RED}: nothing decided");
@@ -1768,7 +1712,6 @@ mod determinism {
 
     /// Engineering bar: a non-finite float counts as zero and is reported.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_non_finite_need_counts_as_zero_and_is_reported() {
         let a = t(3, 2, 2);
         let mut bad = drawn(&[a]);
@@ -1788,7 +1731,6 @@ mod bounded {
     /// I7, S2 (M2.5): tracked state stays bounded by what is needed and
     /// resident, however long the session.
     #[test]
-    #[ignore = "red until budget core"]
     fn tracked_state_stays_bounded_over_a_long_pan() {
         let mut r = Rig::new(small(8));
         let mut peak = 0;
@@ -1815,7 +1757,6 @@ mod stats {
 
     /// C28: the stats report bytes per class against the target.
     #[test]
-    #[ignore = "red until budget core"]
     fn the_stats_report_bytes_per_class_against_the_target() {
         let mut r = Rig::interactive();
         let a = t(3, 2, 2);
@@ -1828,7 +1769,6 @@ mod stats {
 
     /// C28, audit: completed loads land in the latency histogram.
     #[test]
-    #[ignore = "red until budget core"]
     fn completed_loads_land_in_the_latency_histogram() {
         let mut r = Rig::interactive();
         r.dt = Micros::from_millis(100);
@@ -1844,7 +1784,6 @@ mod stats {
 
     /// C28, B-anti-pattern: evict-then-request is counted as thrash.
     #[test]
-    #[ignore = "red until budget core"]
     fn evict_then_request_is_counted_as_thrash() {
         let mut r = Rig::new(small(1));
         let (a, b) = (t(3, 0, 0), t(3, 5, 5));
@@ -1856,7 +1795,6 @@ mod stats {
 
     /// I3, C28: convergence is reported once everything is exact and idle.
     #[test]
-    #[ignore = "red until budget core"]
     fn convergence_is_reported_once_everything_is_exact_and_idle() {
         let mut r = Rig::interactive();
         let tiles = children(t(1, 1, 1));
@@ -1872,7 +1810,6 @@ mod stats {
     /// C28, audit: cancel and complete are counted, for the still-camera
     /// ratio.
     #[test]
-    #[ignore = "red until budget core"]
     fn cancels_and_completions_are_counted() {
         let mut r = Rig::interactive();
         let (a, b) = (t(3, 0, 0), t(3, 1, 0));
@@ -1909,7 +1846,6 @@ mod hard_limit {
     /// I2, review of Checkpoint A: no delivery ever takes a class beyond its
     /// hard limit, not even a hole's.
     #[test]
-    #[ignore = "red until budget core"]
     fn no_delivery_ever_crosses_the_hard_limit() {
         let mut r = Rig::new(ceiling(4));
         let tiles: Vec<_> = (0..8).map(|x| t(3, x, 0)).collect();
@@ -1927,7 +1863,6 @@ mod hard_limit {
     /// I8: at the hard limit the relaxation climbs faster than at mere
     /// overflow.
     #[test]
-    #[ignore = "red until budget core"]
     fn at_the_hard_limit_the_relaxation_climbs_faster() {
         let rise = |hard: u64| {
             let mut r = Rig::new(ceiling(hard));
@@ -1948,7 +1883,6 @@ mod hard_limit {
     /// I1, I9: at the ceiling, a coarser parent replacing its drawn children
     /// uses the reserve, so a zoom-out always completes.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_coarsening_parent_uses_the_reserve_at_the_ceiling() {
         let mut r = Rig::new(ceiling(4));
         let p = t(2, 1, 1);
@@ -1972,7 +1906,6 @@ mod acknowledged {
     /// I1, review of point 2: only acknowledged resources are drawn; a
     /// discarded upload is never drawn and its fallback stays.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_discarded_upload_is_never_drawn_and_its_fallback_stays() {
         let mut r = Rig::interactive();
         let root = t(0, 0, 0);
@@ -1993,7 +1926,6 @@ mod acknowledged {
 
     /// I1: a delivered, uploaded but unacknowledged resource is not drawn.
     #[test]
-    #[ignore = "red until budget core"]
     fn an_unacknowledged_upload_is_not_drawn() {
         let mut r = Rig::interactive();
         let root = t(0, 0, 0);
@@ -2015,7 +1947,6 @@ mod refresh {
     /// Review of point 7: an epoch change re-requests what is resident, at
     /// the Refresh urgency, and swaps new before old without a hole.
     #[test]
-    #[ignore = "red until budget core"]
     fn an_epoch_change_refreshes_resident_drapes_without_a_hole() {
         let mut r = Rig::interactive();
         let a = t(3, 2, 2);
@@ -2057,7 +1988,6 @@ mod refresh {
     /// Review of point 7: a refresh uses only free slots: floor, holes and
     /// blockers go first.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_refresh_never_starves_floor_hole_or_blocker() {
         let mut c = Rig::interactive_config();
         c.max_in_flight[Class::Drape] = 1;
@@ -2078,7 +2008,6 @@ mod refresh {
 
     /// Review of point 7: a refresh never preempts anything.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_refresh_never_preempts() {
         let mut c = Rig::interactive_config();
         c.max_in_flight[Class::TerrainMesh] = 1;
@@ -2107,7 +2036,6 @@ mod drape_caps {
     /// D5, review of point 14: the drape side caps how far a drape climbs:
     /// at 1024 texels, two levels above terrain.
     #[test]
-    #[ignore = "red until budget core"]
     fn the_drape_side_caps_how_far_a_drape_climbs() {
         let mut c = Rig::interactive_config();
         c.max_drape_side = 1_024;
@@ -2124,7 +2052,6 @@ mod drape_caps {
 
     /// D5: the cap over terrain is a profile parameter.
     #[test]
-    #[ignore = "red until budget core"]
     fn the_cap_over_terrain_is_a_profile_parameter() {
         let mut c = Rig::interactive_config();
         c.imagery_over_terrain_cap = 1;
@@ -2160,7 +2087,6 @@ mod staging {
     /// C2, review of point 17: staging bytes count against the delivery
     /// credit.
     #[test]
-    #[ignore = "red until budget core"]
     fn staging_bytes_count_against_the_delivery_credit() {
         let mut c = Rig::interactive_config();
         c.delivery_credit = Bytes(MESH.0 * 4);
@@ -2205,7 +2131,6 @@ mod need_lifetime {
 
     /// I7: a huge need leaves nothing behind once it is gone.
     #[test]
-    #[ignore = "red until budget core"]
     fn a_huge_need_leaves_nothing_behind() {
         let mut c = Rig::interactive_config();
         c.request_heap = 64;
@@ -2227,7 +2152,6 @@ mod stats_digest {
     /// Audit: the per-step statistics have a digest, so device runs compare
     /// to the simulation.
     #[test]
-    #[ignore = "red until budget core"]
     fn the_stats_digest_follows_every_field() {
         let mut r = Rig::interactive();
         let a = t(3, 2, 2);

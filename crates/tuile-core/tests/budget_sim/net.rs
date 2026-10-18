@@ -87,6 +87,16 @@ impl NetProfile {
     }
 }
 
+/// What travels on the wire for a resource of `gpu` bytes: imagery comes
+/// as JPEG or WebP tiles (about 1/16 of RGBA with mips), meshes as
+/// quantized-mesh (about 1/4 of the vertex and index buffers).
+pub fn wire_bytes(r: ResourceId, gpu: u64) -> u64 {
+    match r {
+        ResourceId::Mesh(_) => gpu / 4,
+        ResourceId::Drape(..) => gpu / 16,
+    }
+}
+
 /// What came back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Arrival {
@@ -196,7 +206,7 @@ impl SimNet {
                 } else {
                     let ms = server.base_ms
                         + self.rng.exp(server.jitter_ms)
-                        + bytes.gpu.0 as f64 / server.bandwidth * 1_000.0;
+                        + wire_bytes(s.resource, bytes.gpu.0) as f64 / server.bandwidth * 1_000.0;
                     let out = if self.rng.permille(server.fail_permille) {
                         Outcome::Fail
                     } else {
@@ -241,7 +251,7 @@ impl SimNet {
                 Outcome::Ok => {
                     let local = self.store.held.contains(&r);
                     if !local {
-                        self.network_bytes += cost(r).gpu.0;
+                        self.network_bytes += wire_bytes(r, cost(r).gpu.0);
                         self.latencies
                             .push((at, at.since(f.started).0 as f64 / 1_000.0));
                     }

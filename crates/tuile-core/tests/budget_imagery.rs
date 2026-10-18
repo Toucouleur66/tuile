@@ -9,7 +9,7 @@
 use tuile_core::budget::imagery::{best_drape, ideal_level, needed_level, FootprintError};
 use tuile_core::budget::{DrapeCandidate, GeoRect, LevelClamp, TexelFootprint, UvTransform};
 
-const RED: &str = "red until budget core";
+const RED: &str = "the budget core regressed";
 
 /// A footprint at `distance` metres and `cos` of obliquity, through a
 /// 1000 px/rad lens, level-0 texels of 40 000 m, a 1 px target.
@@ -27,7 +27,6 @@ const OPEN: LevelClamp = LevelClamp {
 /// §4: the ideal level is the coarsest level whose texel is at most the
 /// target on screen.
 #[test]
-#[ignore = "red until budget core"]
 fn the_ideal_level_is_the_coarsest_sharp_enough() {
     // ratio = 1000 × 40 000 × √1 / (d × 1) = 4·10⁷ / d.
     assert_eq!(ideal_level(fp(4.0e7, 1.0)), 0, "ratio 1: level 0");
@@ -42,7 +41,6 @@ fn the_ideal_level_is_the_coarsest_sharp_enough() {
 
 /// I10: the need falls as distance grows.
 #[test]
-#[ignore = "red until budget core"]
 fn the_need_falls_as_distance_grows() {
     let levels: Vec<u32> = (0..40)
         .map(|i| ideal_level(fp(100.0 * 1.4f64.powi(i), 1.0)))
@@ -53,7 +51,6 @@ fn the_need_falls_as_distance_grows() {
 
 /// I10: the need falls as the view grows more oblique.
 #[test]
-#[ignore = "red until budget core"]
 fn the_need_falls_as_obliquity_grows() {
     let levels: Vec<u32> = (1..=100)
         .rev()
@@ -65,7 +62,6 @@ fn the_need_falls_as_obliquity_grows() {
 
 /// §4: the need does not flap within half a level of where it is.
 #[test]
-#[ignore = "red until budget core"]
 fn the_need_does_not_flap_within_half_a_level() {
     // Level 10 is ideal for ratios in (2^9, 2^10]; hysteresis keeps it over
     // (2^8.5, 2^10.5].
@@ -78,7 +74,6 @@ fn the_need_does_not_flap_within_half_a_level() {
 
 /// §4: past half a level, the need moves.
 #[test]
-#[ignore = "red until budget core"]
 fn past_half_a_level_the_need_moves() {
     let at = |ratio: f64| fp(4.0e7 / ratio, 1.0);
     assert_eq!(needed_level(Some(10), at(1500.0), OPEN), 11, "{RED}");
@@ -87,7 +82,6 @@ fn past_half_a_level_the_need_moves() {
 
 /// I10, C21, D5: imagery stays within three levels above terrain.
 #[test]
-#[ignore = "red until budget core"]
 fn imagery_stays_within_three_levels_above_terrain() {
     let clamp = LevelClamp {
         terrain_level: 7,
@@ -99,7 +93,6 @@ fn imagery_stays_within_three_levels_above_terrain() {
 
 /// §4: never below the pinned floor, never above the source.
 #[test]
-#[ignore = "red until budget core"]
 fn imagery_stays_between_the_floor_and_the_source_maximum() {
     let clamp = LevelClamp {
         floor: 4,
@@ -114,7 +107,6 @@ fn imagery_stays_between_the_floor_and_the_source_maximum() {
 /// C21, plan Step 2: a plain at a shallow terrain level wears imagery
 /// deeper than its terrain.
 #[test]
-#[ignore = "red until budget core"]
 fn a_plain_at_a_shallow_terrain_level_wears_imagery_deeper_than_its_terrain() {
     let plain = LevelClamp {
         terrain_level: 9,
@@ -128,7 +120,6 @@ fn a_plain_at_a_shallow_terrain_level_wears_imagery_deeper_than_its_terrain() {
 /// C21: the need comes from the footprint alone, not the terrain level
 /// (within the cap).
 #[test]
-#[ignore = "red until budget core"]
 fn the_need_does_not_depend_on_the_terrain_level() {
     let f = fp(5_000.0, 0.6);
     let levels: Vec<u32> = (11..20)
@@ -177,7 +168,6 @@ fn quad(level: u32, x: u32, y: u32) -> GeoRect {
 /// §4 fallback: a quadrant of its parent maps to half scale and offset;
 /// `v` grows southward.
 #[test]
-#[ignore = "red until budget core"]
 fn a_quadrant_maps_to_half_its_parents_drape() {
     let parent = quad(3, 2, 5);
     let se = quad(4, 5, 11);
@@ -190,7 +180,6 @@ fn a_quadrant_maps_to_half_its_parents_drape() {
 
 /// §4: a tile's own drape at another level needs no transform.
 #[test]
-#[ignore = "red until budget core"]
 fn a_tiles_own_drape_is_the_identity() {
     let r = quad(6, 17, 40);
     assert_eq!(
@@ -202,7 +191,6 @@ fn a_tiles_own_drape_is_the_identity() {
 
 /// §4: two levels down composes to a quarter.
 #[test]
-#[ignore = "red until budget core"]
 fn two_levels_down_is_a_quarter() {
     let uv = UvTransform::between(quad(5, 7, 2), quad(3, 1, 0)).expect(RED);
     assert_eq!(uv.scale, [0.25, 0.25]);
@@ -211,7 +199,6 @@ fn two_levels_down_is_a_quarter() {
 
 /// §4: a drape that does not contain the tile cannot dress it.
 #[test]
-#[ignore = "red until budget core"]
 fn a_drape_that_does_not_contain_the_tile_has_no_transform() {
     assert_eq!(UvTransform::between(quad(4, 0, 0), quad(3, 1, 1)), None);
     let r = quad(6, 17, 40);
@@ -234,7 +221,6 @@ fn c(level: u32, up: u32) -> DrapeCandidate {
 /// I9, C20: the best drape is never blurrier than necessary: the coarsest
 /// at or above the need, else the sharpest below it.
 #[test]
-#[ignore = "red until budget core"]
 fn the_best_drape_is_never_blurrier_than_necessary() {
     assert_eq!(
         best_drape(5, [c(3, 1), c(7, 0), c(6, 0)]),
@@ -248,7 +234,6 @@ fn the_best_drape_is_never_blurrier_than_necessary() {
 
 /// §4: at equal level the closest owner wins, the tile's own first.
 #[test]
-#[ignore = "red until budget core"]
 fn at_equal_level_the_own_drape_wins() {
     assert_eq!(
         best_drape(4, [c(4, 2), c(4, 0), c(4, 1)]),

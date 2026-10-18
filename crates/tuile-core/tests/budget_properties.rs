@@ -348,7 +348,11 @@ fn decided_something(tr: &[Record]) -> bool {
 }
 
 fn config() -> ProptestConfig {
-    ProptestConfig::default()
+    ProptestConfig {
+        // Integration tests have no lib.rs to anchor a regressions file.
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    }
 }
 
 proptest! {
@@ -357,7 +361,6 @@ proptest! {
     /// I11, C5, C6: nothing protected is ever evicted: not drawn (mesh or
     /// drape worn), not in transit, not the floor.
     #[test]
-    #[ignore = "red until budget core"]
     fn protected_resources_are_never_evicted(ops in script()) {
         let tr = trace(interactive(), &ops);
         for rec in &tr {
@@ -373,7 +376,6 @@ proptest! {
 
     /// I12, C11, C25: decisions are stable under any permutation of the need.
     #[test]
-    #[ignore = "red until budget core"]
     fn decisions_do_not_depend_on_need_order(ops in script()) {
         let a: Vec<u64> = Harness::new(interactive(), 7).run(&ops, false).iter().map(|r| r.d.digest()).collect();
         let tr = Harness::new(interactive(), 7).run(&ops, true);
@@ -384,7 +386,6 @@ proptest! {
 
     /// I12: the same script gives the same digest stream.
     #[test]
-    #[ignore = "red until budget core"]
     fn the_same_script_gives_the_same_digests(ops in script()) {
         let tr = trace(interactive(), &ops);
         prop_assume!(decided_something(&tr));
@@ -395,7 +396,6 @@ proptest! {
 
     /// I2, §8: the ledger equals the sum of the states, every step.
     #[test]
-    #[ignore = "red until budget core"]
     fn the_ledger_equals_the_sum_of_the_states(ops in script()) {
         let tr = trace(interactive(), &ops);
         prop_assert!(tr.iter().all(|r| r.audit));
@@ -404,7 +404,6 @@ proptest! {
 
     /// I5, C25: a cancelled or stale result is never delivered.
     #[test]
-    #[ignore = "red until budget core"]
     fn only_fresh_results_are_delivered(ops in script()) {
         let tr = trace(interactive(), &ops);
         for rec in &tr {
@@ -418,7 +417,6 @@ proptest! {
     /// I1, I9, C27: once the floor is drawable, every wanted tile is covered
     /// on the ground, every step, in both swap directions.
     #[test]
-    #[ignore = "red until budget core"]
     fn the_ground_is_always_covered_once_the_floor_is_in(ops in script()) {
         let tr = trace(interactive(), &ops);
         for rec in tr.iter().filter(|r| r.floor_in) {
@@ -433,7 +431,6 @@ proptest! {
     /// I14: no network request for anything held locally, no re-upload of
     /// anything on the GPU.
     #[test]
-    #[ignore = "red until budget core"]
     fn nothing_held_is_fetched_again(ops in script()) {
         let tr = trace(interactive(), &ops);
         for rec in &tr {
@@ -452,7 +449,6 @@ proptest! {
 
     /// C16, I15: quotas hold per class, and local reads have their own.
     #[test]
-    #[ignore = "red until budget core"]
     fn quotas_hold_per_class(ops in script()) {
         let cfg = interactive();
         let tr = trace(cfg.clone(), &ops);
@@ -469,7 +465,6 @@ proptest! {
     /// I2: what is not protected fits in the target after every step; the
     /// overflow is the protected set's alone.
     #[test]
-    #[ignore = "red until budget core"]
     fn only_the_protected_set_overflows(ops in script()) {
         let tr = trace(interactive(), &ops);
         for rec in &tr {
@@ -484,7 +479,6 @@ proptest! {
     /// I2, review of point 9: no class ever crosses its hard limit, whatever
     /// the urgency, the pressure or the arrivals.
     #[test]
-    #[ignore = "red until budget core"]
     fn no_class_ever_crosses_its_hard_limit(ops in script()) {
         let mut cfg = interactive();
         cfg.hard_limit[Class::TerrainMesh] = Bytes(MESH.0 * 6);
@@ -502,7 +496,6 @@ proptest! {
     /// C23, I7: the upload plan and the delivery respect their bytes, but for
     /// their first item; the wish list is bounded.
     #[test]
-    #[ignore = "red until budget core"]
     fn plans_and_queues_are_bounded(ops in script()) {
         let cfg = interactive();
         let tr = trace(cfg.clone(), &ops);
@@ -519,7 +512,6 @@ proptest! {
     /// C24: each mesh is drawn once, in one role, and a fallback never serves
     /// a tile drawn as itself.
     #[test]
-    #[ignore = "red until budget core"]
     fn each_mesh_is_drawn_once_in_one_role(ops in script()) {
         let tr = trace(interactive(), &ops);
         for rec in &tr {
@@ -535,8 +527,13 @@ proptest! {
     /// I13: under Batch, a ready frame is exact: every wanted tile drawn as
     /// itself with its needed drape; nothing it needs is evicted.
     #[test]
-    #[ignore = "red until budget core"]
-    fn a_ready_batch_frame_is_exact(ops in script()) {
+    fn a_ready_batch_frame_is_exact(ops in script(), view_seed in any::<u64>()) {
+        // A film holds its frame until complete: end on one view, completed.
+        // Failures end a film (tested by hand); here every load succeeds.
+        let mut ops: Vec<Op> = ops.into_iter().filter(|o| !matches!(o, Op::Fail(_) | Op::Wait(_))).collect();
+        for k in 0..16u64 {
+            ops.extend([Op::Step(view_seed), Op::Load(k), Op::Step(view_seed), Op::Upload(k)]);
+        }
         let tr = trace(batch(), &ops);
         for rec in &tr {
             let wanted: BTreeSet<ResourceId> = rec.need.drawn.iter().map(|(t, _)| ResourceId::Mesh(*t)).collect();
@@ -557,7 +554,6 @@ proptest! {
 /// The trace is not vacuous: over a long completing script the budget does
 /// decide, and the floor comes in.
 #[test]
-#[ignore = "red until budget core"]
 fn a_completing_script_brings_the_floor_in() {
     let mut ops = Vec::new();
     for k in 0..60u64 {

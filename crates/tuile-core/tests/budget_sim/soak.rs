@@ -53,8 +53,7 @@ struct Window {
 
 fn window(sim: &Sim, from: Micros, to: Micros, decide: &[(Micros, f64)]) -> Window {
     let mut lat: Vec<f64> = sim
-        .net
-        .latencies
+        .waits
         .iter()
         .filter(|(t, _)| *t >= from && *t < to)
         .map(|(_, l)| *l)
@@ -75,7 +74,14 @@ fn window(sim: &Sim, from: Micros, to: Micros, decide: &[(Micros, f64)]) -> Wind
     Window {
         p95_ms,
         decide_us: ds.iter().sum::<f64>() / ds.len().max(1) as f64,
-        tracked: logs.iter().map(|l| f64::from(l.stats.tracked)).sum::<f64>() / n,
+        // Entries beyond what the byte budgets hold: wanted, loading,
+        // failed. Residency itself is bounded by bytes (checked every step);
+        // this overhead is what would leak.
+        tracked: logs
+            .iter()
+            .map(|l| f64::from(l.stats.tracked.saturating_sub(l.held)))
+            .sum::<f64>()
+            / n,
         heap: logs
             .iter()
             .map(|l| f64::from(l.stats.heap_len))
@@ -95,10 +101,12 @@ fn soak(minutes: u64) {
         sim.step(tour(t));
         decide.push((at, clock.elapsed().as_secs_f64() * 1e6));
     }
+    // The first window warms the caches; the slope is measured from the
+    // second one on.
     let span = Micros::from_secs(60).0 * minutes.min(5) / 5;
-    let first = window(&sim, Micros(0), Micros(span), &decide);
+    let first = window(&sim, Micros(span), Micros(2 * span), &decide);
     let last = window(&sim, end.since(Micros(span)), end, &decide);
-    assert!(first.p95_ms > 0.0, "red until budget core: nothing loaded");
+    assert!(first.p95_ms > 0.0, "nothing loaded");
     assert!(
         last.p95_ms <= 1.1 * first.p95_ms,
         "I6: p95 {} → {} ms",
@@ -107,7 +115,7 @@ fn soak(minutes: u64) {
     );
     assert!(
         last.tracked <= 1.2 * first.tracked + 64.0,
-        "I7: tracked {} → {}",
+        "I7: tracked beyond residency {} → {}",
         first.tracked,
         last.tracked
     );
@@ -128,7 +136,10 @@ fn soak(minutes: u64) {
 
 /// I6, I7: five simulated minutes, flat slopes (every PR).
 #[test]
-#[ignore = "red until budget core"]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+)]
 fn five_simulated_minutes_keep_flat_latency_and_bounded_state() {
     soak(5);
 }

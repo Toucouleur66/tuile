@@ -99,7 +99,47 @@ impl BudgetStats {
                 h = h.wrapping_mul(0x0100_0000_01b3);
             }
         };
-        let _ = &mut put;
-        0
+        for per in [&self.gpu, &self.protected, &self.target, &self.overflow] {
+            for (_, b) in per.iter() {
+                put(b.0);
+            }
+        }
+        for v in [
+            self.decoded.0,
+            self.in_transit.0,
+            u64::from(self.sse_scale_milli),
+            u64::from(self.started_network),
+            u64::from(self.started_local),
+            u64::from(self.cancelled),
+            u64::from(self.completed),
+            u64::from(self.stale),
+            u64::from(self.delivered),
+            u64::from(self.evicted),
+            u64::from(self.released),
+            u64::from(self.failed),
+            u64::from(self.store_misses),
+            self.network_bytes_avoided.0,
+            u64::from(self.thrash),
+            u64::from(self.heap_len),
+            u64::from(self.local_reads),
+            u64::from(self.duplicates_in_flight),
+            u64::from(self.tracked),
+            u64::from(self.exact),
+            u64::from(self.held),
+            u64::from(self.fallback),
+            u64::from(self.lost),
+            u64::from(self.underdraped),
+            u64::from(self.rejected_inputs),
+            u64::from(self.converged),
+        ] {
+            put(v);
+        }
+        for (_, n) in self.in_flight.iter() {
+            put(u64::from(n));
+        }
+        for n in self.imagery_over_terrain.iter().chain(&self.latency_ms) {
+            put(u64::from(*n));
+        }
+        h
     }
 }

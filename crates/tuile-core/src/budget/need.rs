@@ -16,7 +16,9 @@ use super::types::{Class, TileId};
 pub struct NeedSet {
     /// The tiles the traversal wants drawn this step.
     pub drawn: Vec<(TileId, Need)>,
-    /// The children a held REPLACE parent waits on before it can refine.
+    /// The children a held REPLACE parent waits on before it can refine:
+    /// all of them, resident or not, so that the resident ones are kept
+    /// while their siblings load (a swap group).
     pub blockers: Vec<(TileId, Need)>,
     /// Ancestors preloaded so that a zoom-out finds them resident.
     pub ancestors: Vec<(TileId, Need)>,

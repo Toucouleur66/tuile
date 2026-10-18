@@ -315,7 +315,10 @@ fn visit(
         }
     } else {
         need.drawn.push((id, need_of(cam, id, tau)));
-        for k in missing {
+        // Every child the hold waits on, resident or not: a resident
+        // sibling evicted while the others load restarts the swap.
+        let _ = missing;
+        for k in visible_kids {
             need.blockers.push((k, need_of(cam, k, tau)));
         }
     }

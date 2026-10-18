@@ -141,7 +141,7 @@ impl BudgetConfig {
             upload_bytes_per_frame: Bytes::mib(8),
             delivery_credit: Bytes::mib(32),
             cancel_grace: Micros::from_millis(500),
-            load_timeout: Micros::from_secs(10),
+            load_timeout: Micros::from_secs(4),
             relax: Relaxation {
                 up_per_second: 1_000,
                 down_per_second: 250,

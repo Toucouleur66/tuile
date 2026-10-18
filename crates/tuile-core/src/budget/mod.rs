@@ -23,10 +23,12 @@
 pub mod config;
 pub mod cost;
 pub mod decisions;
+mod engine;
 pub mod error;
 pub mod imagery;
 pub mod need;
 pub mod priority;
+mod state;
 pub mod stats;
 pub mod tier;
 pub mod types;
@@ -97,10 +99,23 @@ pub struct Ledger {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Event {
     Loaded(ResourceId, Generation, cost::Cost),
-    Failed(ResourceId, Generation, bool),
+    Failed(ResourceId, Generation, Failure),
     StoreMiss(ResourceId, Generation),
     Drawable(ResourceId, Generation, Bytes),
     Discarded(ResourceId, Generation),
+}
+
+/// Recently evicted resources, for the thrash count, bounded.
+const RECENT_CAP: usize = 4_096;
+/// The thrash window.
+const THRASH_WINDOW: Micros = Micros::from_secs(10);
+
+/// What the budget knows of a tile's place in its tree.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TileInfo {
+    parent: Option<TileId>,
+    level: u32,
+    rect: Option<GeoRect>,
 }
 
 /// The budget. See the [module documentation](self).
@@ -109,7 +124,27 @@ pub struct Budget {
     cfg: BudgetConfig,
     pressure: Pressure,
     thermal: Thermal,
+    /// `retarget`: a factor `num / den` on targets, overflows, hard limits.
+    factor: (u64, u64),
     events: Vec<Event>,
+    entries: std::collections::BTreeMap<ResourceId, state::Entry>,
+    tiles: std::collections::BTreeMap<TileId, TileInfo>,
+    imagery_prev: std::collections::BTreeMap<TileId, u32>,
+    held_last: std::collections::BTreeSet<TileId>,
+    drawn_last: std::collections::BTreeSet<ResourceId>,
+    swap_last: std::collections::BTreeSet<ResourceId>,
+    chain_last: std::collections::BTreeSet<ResourceId>,
+    wanted_last: std::collections::BTreeSet<ResourceId>,
+    recent: std::collections::BTreeMap<ResourceId, Micros>,
+    epochs: PerClass<u64>,
+    next_gen: u64,
+    last_now: Option<Micros>,
+    scale: u32,
+    scale_fine: u64,
+    ledger: Ledger,
+    in_flight: PerClass<u32>,
+    local_reads: u32,
+    fatal: Option<SessionError>,
 }
 
 impl Budget {
@@ -120,7 +155,26 @@ impl Budget {
             cfg,
             pressure: Pressure::Normal,
             thermal: Thermal::Nominal,
+            factor: (1, 1),
             events: Vec::new(),
+            entries: Default::default(),
+            tiles: Default::default(),
+            imagery_prev: Default::default(),
+            held_last: Default::default(),
+            drawn_last: Default::default(),
+            swap_last: Default::default(),
+            chain_last: Default::default(),
+            wanted_last: Default::default(),
+            recent: Default::default(),
+            epochs: PerClass::splat(0),
+            next_gen: 1,
+            last_now: None,
+            scale: 1_000,
+            scale_fine: 1_000_000_000,
+            ledger: Ledger::default(),
+            in_flight: PerClass::splat(0),
+            local_reads: 0,
+            fatal: None,
         })
     }
 
@@ -131,12 +185,7 @@ impl Budget {
 
     /// One decision step: applies the recorded arrivals, then decides.
     pub fn decide(&mut self, input: FrameInput<'_>) -> Decisions {
-        let _ = (input, &self.pressure, &self.thermal);
-        self.events.clear();
-        Decisions {
-            sse_scale_milli: 1_000,
-            ..Decisions::default()
-        }
+        self.step(input)
     }
 
     /// A load finished decoding; `cost` is the estimator's
@@ -145,17 +194,9 @@ impl Budget {
         self.events.push(Event::Loaded(r, gen, cost));
     }
 
-    /// The content of `class` changed upstream (imagery epoch, radiometric
-    /// or source update): every resident resource of the class is refreshed
-    /// at the lowest urgency, new before old, without a hole.
-    pub fn new_epoch(&mut self, class: Class) {
-        let _ = class;
-    }
-
     /// A load failed.
     pub fn on_failed(&mut self, r: ResourceId, gen: Generation, why: Failure) {
-        self.events
-            .push(Event::Failed(r, gen, why == Failure::Transient));
+        self.events.push(Event::Failed(r, gen, why));
     }
 
     /// A local read found nothing despite a `Stored` hint: the resource
@@ -164,14 +205,23 @@ impl Budget {
         self.events.push(Event::StoreMiss(r, gen));
     }
 
-    /// The consumer uploaded a delivered resource; `actual` GPU bytes.
+    /// The consumer uploaded a delivered resource; `actual` GPU bytes. Only
+    /// from this acknowledgement on is the resource drawn.
     pub fn on_drawable(&mut self, r: ResourceId, gen: Generation, actual: Bytes) {
         self.events.push(Event::Drawable(r, gen, actual));
     }
 
-    /// The consumer dropped a delivered resource without uploading it.
+    /// The consumer dropped a delivered resource without uploading it (an
+    /// upload that failed): it stays undrawn, and is delivered again later.
     pub fn on_discarded(&mut self, r: ResourceId, gen: Generation) {
         self.events.push(Event::Discarded(r, gen));
+    }
+
+    /// The content of `class` changed upstream (imagery epoch, radiometric
+    /// or source update): every resident resource of the class is refreshed
+    /// at the lowest urgency, new before old, without a hole.
+    pub fn new_epoch(&mut self, class: Class) {
+        self.epochs[class] += 1;
     }
 
     /// The platform's memory signal; takes effect at the next step.
@@ -179,13 +229,21 @@ impl Budget {
         self.pressure = p;
     }
 
-    /// Re-derives every class's target and overflow from a new total, keeping
-    /// the configured split: the host calls it when the platform's available
-    /// memory changes (`os_proc_available_memory`, `VK_EXT_memory_budget`,
-    /// an Android `onTrimMemory` level, a browser's device-memory hint). The
-    /// budget itself knows no platform. Takes effect at the next step.
+    /// Re-derives every class's target, overflow and hard limit from a new
+    /// total, keeping the configured split: the host calls it when the
+    /// platform's available memory changes (`os_proc_available_memory`,
+    /// `VK_EXT_memory_budget`, an Android `onTrimMemory` level, a browser's
+    /// device-memory hint). The budget itself knows no platform. Takes effect
+    /// at the next step.
     pub fn retarget(&mut self, total: Bytes) {
-        let _ = total;
+        let den = self
+            .cfg
+            .hard_limit
+            .iter()
+            .fold(Bytes::ZERO, |a, (_, b)| a.plus(b))
+            .0
+            .max(1);
+        self.factor = (total.0, den);
     }
 
     /// The platform's thermal state; takes effect at the next step.
@@ -197,8 +255,7 @@ impl Budget {
     /// eviction order, until the GPU holds at most `target` bytes. Returns
     /// the GPU copies to drop. Deterministic.
     pub fn release_beyond(&mut self, target: Bytes) -> Vec<ResourceId> {
-        let _ = target;
-        Vec::new()
+        self.release_beyond_impl(target)
     }
 
     /// The traversal's residency: drawable (Interactive) or loaded (Batch).
@@ -208,23 +265,22 @@ impl Budget {
 
     /// One resource's state, if the budget tracks it.
     pub fn resource(&self, r: ResourceId) -> Option<ResourceView> {
-        let _ = r;
-        None
+        self.view(r)
     }
 
     /// The ledger.
     pub fn ledger(&self) -> Ledger {
-        Ledger::default()
+        self.ledger
     }
 
     /// Recomputes the ledger from the resource states and compares.
     pub fn audit(&self) -> Result<(), AuditError> {
-        Ok(())
+        self.audit_impl()
     }
 
     /// How many resources the budget tracks.
     pub fn tracked(&self) -> usize {
-        0
+        self.entries.len()
     }
 }
 
@@ -244,15 +300,19 @@ impl ResidencyView<'_> {
         }
     }
 
-    /// Whether `tile`'s mesh is on the GPU.
+    /// Whether `tile`'s mesh is on the GPU, acknowledged.
     pub fn drawable(&self, tile: TileId) -> bool {
-        let _ = tile;
-        false
+        self.budget
+            .entries
+            .get(&ResourceId::Mesh(tile))
+            .is_some_and(|e| e.gpu.is_some())
     }
 
     /// Whether `tile`'s mesh is decoded or on the GPU.
     pub fn loaded(&self, tile: TileId) -> bool {
-        let _ = tile;
-        false
+        self.budget
+            .entries
+            .get(&ResourceId::Mesh(tile))
+            .is_some_and(|e| e.gpu.is_some() || e.cpu.is_some())
     }
 }

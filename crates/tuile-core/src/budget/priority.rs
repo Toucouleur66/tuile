@@ -56,8 +56,24 @@ pub struct Quantised {
 impl Quantised {
     /// Quantises a need's floats.
     pub fn of(need: &Need) -> Self {
-        let _ = need;
-        Quantised::default()
+        let mut rejected = false;
+        let mut finite = |v: f32| {
+            if v.is_finite() {
+                v
+            } else {
+                rejected = true;
+                0.0
+            }
+        };
+        let sse = finite(need.sse_excess);
+        let centrality = finite(need.centrality);
+        let distance = finite(need.distance);
+        Quantised {
+            sse_excess: (sse.clamp(-16.0, 16.0) * 1000.0).round() as i32,
+            centrality: (centrality.clamp(0.0, 1.0) * 1000.0).round() as i32,
+            distance: distance.clamp(0.0, u32::MAX as f32) as u32,
+            rejected,
+        }
     }
 }
 
@@ -67,8 +83,14 @@ impl Quantised {
 /// integers: the age bonus grows linearly to 1000 over `age_full`, the cover
 /// bonus is 250 per waiting descendant, capped at 4000.
 pub fn score(q: Quantised, waited: Micros, age_full: Micros, waiting_descendants: u32) -> i64 {
-    let _ = (q, waited, age_full, waiting_descendants);
-    0
+    let sse = i64::from(q.sse_excess) * (500 + i64::from(q.centrality) / 2) / 1000;
+    let age = if age_full.0 == 0 {
+        1000
+    } else {
+        (waited.0.min(age_full.0) as u128 * 1000 / age_full.0 as u128) as i64
+    };
+    let cover = (i64::from(waiting_descendants) * 250).min(4000);
+    sse + age + cover
 }
 
 /// The full priority key; smaller sorts first.

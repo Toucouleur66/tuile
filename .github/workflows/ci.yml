@@ -42,6 +42,20 @@ jobs:
             libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
       - run: cargo test --workspace
 
+  # The graphics budget's simulation and properties, in release: the
+  # scenarios are too slow unoptimised (they are ignored in debug builds),
+  # and the properties run at 10 000 cases here. The golden decision digests
+  # are checked on Linux as on the Mac that recorded them.
+  budget-sim:
+    runs-on: ubuntu-latest
+    env:
+      PROPTEST_CASES: 10000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release -p tuile-core --test budget_sim --test budget_properties --test budget_core --test budget_imagery
+
   wasm-guard:
     runs-on: ubuntu-latest
     steps:

@@ -137,6 +137,8 @@ pub struct Rig {
     pub store: Store,
     /// Generations of the last delivery of each resource.
     pub delivered: BTreeMap<ResourceId, tuile_core::budget::Generation>,
+    /// Loads started and not yet completed by the rig.
+    pub pending: BTreeMap<ResourceId, tuile_core::budget::Generation>,
 }
 
 impl Rig {
@@ -149,6 +151,7 @@ impl Rig {
             dt: Micros(16_667),
             store: Store::default(),
             delivered: BTreeMap::new(),
+            pending: BTreeMap::new(),
         }
     }
 
@@ -178,6 +181,14 @@ impl Rig {
         for (r, g) in &d.deliver {
             self.delivered.insert(*r, *g);
         }
+        for (r, g) in &d.cancel {
+            if self.pending.get(r) == Some(g) {
+                self.pending.remove(r);
+            }
+        }
+        for s in &d.start {
+            self.pending.insert(s.resource, s.gen);
+        }
         self.now = self.now.plus(self.dt);
         self.frame += 1;
         d
@@ -186,7 +197,10 @@ impl Rig {
     /// Every load started by `d` completes, at its estimate.
     pub fn load(&mut self, d: &Decisions) {
         for s in &d.start {
-            self.b.on_loaded(s.resource, s.gen, est(s.resource));
+            if self.pending.get(&s.resource) == Some(&s.gen) {
+                self.pending.remove(&s.resource);
+                self.b.on_loaded(s.resource, s.gen, est(s.resource));
+            }
         }
     }
 
@@ -205,9 +219,12 @@ impl Rig {
         self.upload(d);
     }
 
-    /// Steps and completes until a step asks for nothing, at most `max`
-    /// steps; returns the last decisions.
+    /// Completes every load still pending, then steps and completes until a
+    /// step asks for nothing, at most `max` steps; returns the last decisions.
     pub fn settle(&mut self, need: &NeedSet, max: usize) -> Decisions {
+        for (r, g) in std::mem::take(&mut self.pending) {
+            self.b.on_loaded(r, g, est(r));
+        }
         let mut last = self.step(need);
         for _ in 0..max {
             let idle = last.start.is_empty()

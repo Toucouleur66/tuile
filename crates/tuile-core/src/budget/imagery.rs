@@ -77,13 +77,27 @@ impl TexelFootprint {
         if !(cos_obliquity.is_finite() && cos_obliquity > 0.0 && cos_obliquity <= 1.0) {
             return Err(FootprintError::Obliquity);
         }
-        // Stub until the budget core: the behaviour tests are the spec.
-        Ok(TexelFootprint { ratio: 1.0 })
+        let ratio =
+            focal_px * texel_l0_m * cos_obliquity.sqrt() / (distance_m * target_px_per_texel);
+        if !ratio.is_finite() {
+            return Err(FootprintError::NotPositive("ratio"));
+        }
+        Ok(TexelFootprint { ratio })
     }
 
     /// The ratio `2^L` must reach.
     pub fn ratio(self) -> f64 {
         self.ratio
+    }
+
+    /// The footprint under an LOD relaxation of `scale_milli` thousandths:
+    /// the target pixels per texel grow with it, so imagery coarsens under
+    /// pressure as terrain does (a global bias, never a hole).
+    pub fn relaxed(self, scale_milli: u32) -> Self {
+        let s = f64::from(scale_milli.max(1_000));
+        TexelFootprint {
+            ratio: self.ratio * 1_000.0 / s,
+        }
     }
 }
 
@@ -103,8 +117,19 @@ pub struct LevelClamp {
 /// The coarsest level sharp enough for `fp`, unclamped and without
 /// hysteresis.
 pub fn ideal_level(fp: TexelFootprint) -> u32 {
-    let _ = fp;
-    0
+    let mut level = 0;
+    while level < MAX_LEVEL && pow2(level) < fp.ratio {
+        level += 1;
+    }
+    level
+}
+
+/// The deepest level considered.
+const MAX_LEVEL: u32 = 40;
+
+/// `2^level`, exactly.
+fn pow2(level: u32) -> f64 {
+    f64::from_bits(u64::from(1023 + level.min(1000)) << 52)
 }
 
 /// The level a tile needs this step, given the level it needed last step:
@@ -112,8 +137,27 @@ pub fn ideal_level(fp: TexelFootprint) -> u32 {
 /// (±0.5 hysteresis), then it is clamped to
 /// `[floor, terrain_level + over_terrain_cap]` and to the source's maximum.
 pub fn needed_level(prev: Option<u32>, fp: TexelFootprint, clamp: LevelClamp) -> u32 {
-    let _ = (prev, fp);
-    clamp.floor
+    let ideal = ideal_level(fp);
+    let level = match prev {
+        // Keep `p` while the ideal level stays within (p − 1.5, p + 0.5]:
+        // `2^(p − 1.5) < ratio ≤ 2^(p + 0.5)`.
+        Some(p) if p > 0 => {
+            let low = pow2(p - 1) / std::f64::consts::SQRT_2;
+            let high = pow2(p) * std::f64::consts::SQRT_2;
+            if fp.ratio > low && fp.ratio <= high {
+                p
+            } else {
+                ideal
+            }
+        }
+        Some(0) if fp.ratio <= std::f64::consts::SQRT_2 => 0,
+        _ => ideal,
+    };
+    let ceiling = clamp
+        .terrain_level
+        .saturating_add(clamp.over_terrain_cap)
+        .min(clamp.source_max);
+    level.max(clamp.floor).min(ceiling)
 }
 
 /// Maps a tile's UV square into a drape that covers it (its own at another
@@ -138,8 +182,23 @@ impl UvTransform {
     /// The transform from `tile`'s UV square into `cover`'s, or `None` when
     /// `cover` does not contain `tile` or is degenerate.
     pub fn between(tile: GeoRect, cover: GeoRect) -> Option<UvTransform> {
-        let _ = (tile, cover);
-        None
+        let (w, h) = (cover.east - cover.west, cover.north - cover.south);
+        if !(w > 0.0 && h > 0.0) {
+            return None;
+        }
+        let inside = tile.west >= cover.west
+            && tile.east <= cover.east
+            && tile.south >= cover.south
+            && tile.north <= cover.north
+            && tile.east > tile.west
+            && tile.north > tile.south;
+        if !inside {
+            return None;
+        }
+        Some(UvTransform {
+            scale: [(tile.east - tile.west) / w, (tile.north - tile.south) / h],
+            offset: [(tile.west - cover.west) / w, (cover.north - tile.north) / h],
+        })
     }
 }
 
@@ -159,6 +218,27 @@ pub fn best_drape(
     need: u32,
     candidates: impl IntoIterator<Item = DrapeCandidate>,
 ) -> Option<DrapeCandidate> {
-    let _ = need;
-    candidates.into_iter().next()
+    let mut best: Option<DrapeCandidate> = None;
+    for c in candidates {
+        best = Some(match best {
+            None => c,
+            Some(b) => {
+                let key = |x: DrapeCandidate| {
+                    // At or above the need: coarsest first; below: sharpest.
+                    let rank = if x.level >= need {
+                        (0, x.level - need)
+                    } else {
+                        (1, need - x.level)
+                    };
+                    (rank, x.up)
+                };
+                if key(c) < key(b) {
+                    c
+                } else {
+                    b
+                }
+            }
+        });
+    }
+    best
 }
