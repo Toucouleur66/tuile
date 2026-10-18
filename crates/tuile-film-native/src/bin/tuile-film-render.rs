@@ -138,6 +138,9 @@
 //!                         0: none)
 //!   --shadow <0..1>       how much of the sun ground loses where other
 //!                         ground stands before it (default 0: no shadows)
+//!   --penumbra-scale <k>  the penumbrae of projected shadows cut to k
+//!                         times the sun's disc (1, the default: the sun's
+//!                         own; 0: hard)
 //!   --haze                air between the eye and the ground, and a sky
 //!                         from horizon to zenith: the look's clear day
 //!   --haze-density <per m>, --haze-height <m>
@@ -162,6 +165,9 @@
 //!   --ribbon-width <m>    its width (default 30)
 //!   --ribbon-depth <terrain|always>
 //!                         hidden by nearer ground (the default), or never
+//!   --ribbon-shadow <cast|project>
+//!                         its shadow drawn into the sun's map (the
+//!                         default), or projected, with its penumbra
 //!   --marker <point>      another: a marker standing at this point, never
 //!                         hidden
 //!   --marker-size <m>     its height (default 80)
@@ -251,7 +257,12 @@ fn place(point: &str) -> Result<(DVec3, DVec3), Error> {
 
 /// A band `width` metres across through `points`, level across at each: a
 /// path in the air, climbing and diving as its points do.
-fn ribbon(points: &str, width: f64, depth: OverlayDepth) -> Result<OverlayMesh, Error> {
+fn ribbon(
+    points: &str,
+    width: f64,
+    depth: OverlayDepth,
+    shadow: OverlayShadow,
+) -> Result<OverlayMesh, Error> {
     let path: Vec<(DVec3, DVec3)> = points
         .split_whitespace()
         .map(place)
@@ -263,10 +274,11 @@ fn ribbon(points: &str, width: f64, depth: OverlayDepth) -> Result<OverlayMesh, 
     let mut mesh = OverlayMesh {
         origin_ecef: origin.to_array(),
         depth,
-        // Opaque, in the sun's map and shaded by it: a path that casts its
-        // shadow on the ground and on itself, when the look has shadows.
+        // Opaque; by default in the sun's map and shaded by it: a path that
+        // casts its shadow on the ground and on itself, when the look has
+        // shadows.
         blend: OverlayBlend::Opaque,
-        shadow: OverlayShadow::CastAndReceive,
+        shadow,
         ..OverlayMesh::default()
     };
     // Display-linear, opaque: an orange no ground is, one edge deeper than
@@ -543,6 +555,9 @@ async fn main() -> Result<(), Error> {
     if let Some(glare) = value("--glare") {
         order.look.glare = glare.parse()?;
     }
+    if let Some(scale) = value("--penumbra-scale") {
+        order.look.penumbra_scale = scale.parse()?;
+    }
     if let Some(clock) = value("--clock") {
         order.clock = Some(tuile_tape::Clock::parse(&clock)?);
     }
@@ -669,6 +684,13 @@ async fn main() -> Result<(), Error> {
                 Some("terrain") | None => OverlayDepth::Terrain,
                 Some(other) => {
                     return Err(format!("a ribbon is tested terrain or always, not {other}").into())
+                }
+            },
+            match value("--ribbon-shadow").as_deref() {
+                Some("cast") | None => OverlayShadow::CastAndReceive,
+                Some("project") => OverlayShadow::ProjectAndReceive,
+                Some(other) => {
+                    return Err(format!("a ribbon's shadow is cast or project, not {other}").into())
                 }
             },
         )?);
