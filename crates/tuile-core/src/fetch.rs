@@ -12,6 +12,24 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use url::Url;
 
+/// Statuses worth trying again, for every transport — the desktop's and the
+/// browser's alike.
+///
+/// The list is short on purpose. Every status *not* here is treated as the
+/// origin's final answer, and that is the important half: a 404 retried five
+/// times is five times the latency for the same answer, and a 401 retried is a
+/// misconfiguration hidden behind a delay.
+pub fn is_retryable_status(status: u16) -> bool {
+    matches!(
+        status,
+        // Request Timeout, Too Early, Too Many Requests.
+        408 | 425 | 429
+        // Server-side: the request may well succeed unchanged. 501 and 505 are
+        // excluded — the server is saying it will never do this.
+        | 500 | 502 | 503 | 504 | 507 | 509
+    )
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
     #[error("not found: {0}")]

@@ -35,28 +35,11 @@ use http_cache::FoyerManager;
 use http_cache_reqwest::{Cache, CacheMode, HttpCache, HttpCacheOptions};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use tuile_cesium_ion::{HttpResponse, IonError, IonHttp};
-use tuile_core::fetch::{FetchError, Fetched, TileFetcher};
+use tuile_core::fetch::{is_retryable_status, FetchError, Fetched, TileFetcher};
 use url::Url;
 
 /// Host whose responses carry short-lived ion tokens — never cache them.
 const ION_API_HOST: &str = "api.cesium.com";
-
-/// Statuses worth trying again.
-///
-/// The list is short on purpose. Every status *not* here is treated as the
-/// origin's final answer, and that is the important half: a 404 retried five
-/// times is five times the latency for the same answer, and a 401 retried is a
-/// misconfiguration hidden behind a delay.
-fn is_retryable_status(status: u16) -> bool {
-    matches!(
-        status,
-        // Request Timeout, Too Early, Too Many Requests.
-        408 | 425 | 429
-        // Server-side: the request may well succeed unchanged. 501 and 505 are
-        // excluded — the server is saying it will never do this.
-        | 500 | 502 | 503 | 504 | 507 | 509
-    )
-}
 
 /// Whether a transport failure is worth trying again.
 ///

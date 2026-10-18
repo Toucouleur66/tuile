@@ -35,7 +35,9 @@
 //! # Three pieces
 //!
 //! - `WebFetcher` and `WebIonHttp`: the engine's two fetch seams over the
-//!   global `fetch`, the counterpart of `tuile-native-fetchers`.
+//!   global `fetch`, the counterpart of `tuile-native-fetchers` — each
+//!   request bounded in time, retried as [`patience`] says, and aborted when
+//!   the load that awaits it is dropped.
 //! - [`wire`]: [`ClientMessage`](tuile_core::protocol::ClientMessage) and
 //!   [`ServerMessage`](tuile_core::protocol::ServerMessage) as bytes. Pure
 //!   Rust, compiled and tested on every target.
@@ -46,6 +48,7 @@
 //!
 //! None of it knows what draws the tiles, or why.
 
+pub mod patience;
 pub mod wire;
 
 #[cfg(target_arch = "wasm32")]
