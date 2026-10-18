@@ -1,110 +1,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! The viewer, over the public connectors.
-//!
-//! The application itself — window, camera, controls, steering, scripting — is
-//! the `tuile-viewer` library. This binary is the one decision a host makes:
-//! **where terrain and imagery come from.** Here that is Cesium ion, with Bing
-//! imagery behind it, over a native HTTP transport; the choice is made in this
-//! file and nowhere deeper. Another host answers the same three questions with
-//! its own service and reuses everything else — see
-//! `docs/16-embedding-the-viewer.md`.
+//! The viewer, over the public connectors: see the library, which holds the
+//! host so that Android's build, a library, runs the very same one.
 //!
 //! ```text
 //! CESIUM_ION_TOKEN=... cargo run -p tuile-wgpu-viewer
 //! CESIUM_ION_TOKEN=... cargo run -p tuile-wgpu-viewer -- \
 //!     --lon 6.86 --lat 45.83 --altitude 6000 --heading 120 --pitch 25
 //! ```
-//!
-//! The access token is read from the environment, or — for a session started
-//! from an icon — from one file the person owns:
-//! `~/Library/Application Support/Tuile/token` on macOS.
-
-use std::sync::Arc;
-
-use tuile_cesium_ion::IonSources;
-use tuile_native_fetchers::{default_cache_dir, CacheConfig, NativeHttp};
-use tuile_viewer::{Identity, ImageryChoice, Sources, TerrainChoice, ViewerHost};
-
-/// The environment variable the access token is read from.
-const TOKEN_VARIABLE: &str = "CESIUM_ION_TOKEN";
-
-/// The ion asset of the terrain: Cesium World Terrain.
-const WORLD_TERRAIN: i64 = 1;
-
-/// The ion assets of the three imagery layers.
-const AERIAL: i64 = 2;
-const AERIAL_WITH_LABELS: i64 = 3;
-const SATELLITE_MOSAIC: i64 = 3954;
-
-/// Whose pictures the layers are: shown beside the layer's name for as long
-/// as it is on screen.
-const PHOTOGRAPHY: &str = "© Microsoft and its data suppliers";
-const MOSAIC: &str = "Contains modified Copernicus Sentinel data";
-
-/// The public host: the project's own application over ion.
-struct Public;
-
-#[async_trait::async_trait]
-impl ViewerHost for Public {
-    fn identity(&self) -> Identity {
-        tuile_viewer::renamed_by_environment(Identity {
-            // The store this viewer has always written, so that a session
-            // after this change starts as warm as the one before it.
-            store: tuile_bing::cache_name("Aerial"),
-            credentials: format!(
-                "The access token is read from {TOKEN_VARIABLE}, or from the file `token` \
-                 in the application's support directory."
-            ),
-            ..Identity::default()
-        })
-    }
-
-    fn terrain(&self) -> TerrainChoice {
-        TerrainChoice {
-            asset: WORLD_TERRAIN,
-            cache: "ion-cwt".into(),
-        }
-    }
-
-    fn imagery(&self) -> Vec<ImageryChoice> {
-        // The three the connector has. Neutral names: what a layer shows, not
-        // who serves it — the attribution says that.
-        vec![
-            // Asset 2, under the namespace its tiles have always been stored
-            // in, so a session after this change starts as warm as before.
-            ImageryChoice::new("aerial", "Aerial", AERIAL, PHOTOGRAPHY)
-                .cached_as(&tuile_bing::cache_namespace("Aerial")),
-            // The same photography with roads and place names drawn over it.
-            ImageryChoice::new(
-                "labels",
-                "Aerial with labels",
-                AERIAL_WITH_LABELS,
-                PHOTOGRAPHY,
-            ),
-            // One cloudless mosaic of the whole planet from a single
-            // instrument: coarser, and the same colour everywhere. Served on
-            // the geographic grid, where the two above are web-mercator.
-            ImageryChoice::new("satellite", "Satellite", SATELLITE_MOSAIC, MOSAIC),
-        ]
-    }
-
-    async fn connect(&self) -> Result<Arc<dyn Sources>, String> {
-        let token = tuile_viewer::credential(TOKEN_VARIABLE).map_err(|e| e.to_string())?;
-        // One pooled, cached native transport drives both ion and Bing — with
-        // a phone's smaller cache on a phone, where the viewer's own tile
-        // store already holds the tiles.
-        let http = if cfg!(target_os = "ios") {
-            NativeHttp::with_config(CacheConfig::handheld(default_cache_dir())).await
-        } else {
-            NativeHttp::shared().await
-        };
-        let http = Arc::new(http.map_err(|e| e.to_string())?);
-        Ok(Arc::new(IonSources::new(Arc::clone(&http), http, token)))
-    }
-}
 
 fn main() {
-    tuile_viewer::main(Public)
+    tuile_viewer::main(tuile_wgpu_viewer::Public)
 }

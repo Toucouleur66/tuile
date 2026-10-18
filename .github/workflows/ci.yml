@@ -97,6 +97,31 @@ jobs:
           npm install --no-audit --no-fund
           npm run build
 
+  # The Android shell, as the device builds it: no host build ever compiles
+  # that code. Clippy on the target, then the APK through the same script a
+  # developer runs — the runner image carries the SDK and the NDK.
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - run: cargo install cargo-ndk --locked
+      - name: cargo clippy (aarch64-linux-android, -D warnings)
+        run: >-
+          ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          cargo ndk -t arm64-v8a --platform 26
+          clippy -p tuile-viewer -p tuile-wgpu-viewer -- -D warnings
+      - name: the APK
+        run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" crates/tuile-viewer/android/build.sh
+
   docs:
     runs-on: ubuntu-latest
     env:

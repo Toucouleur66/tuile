@@ -40,9 +40,27 @@ pub(super) struct GpuOnItsWay(Rc<RefCell<Option<Result<Gpu, String>>>>);
 impl GpuOnItsWay {
     /// Asks for a GPU that can draw into `window`, and waits for it: a
     /// desktop and a phone have a thread they may block.
+    ///
+    /// Tried backend by backend, in the order [`attempts`] gives: on Android,
+    /// Vulkan and then OpenGL ES, for a device or an emulator whose Vulkan
+    /// driver will not give a surface, an adapter or a device.
     #[cfg(not(target_arch = "wasm32"))]
     fn start(window: Arc<Window>, backends: Option<wgpu::Backends>) -> Self {
-        let answer = pollster::block_on(bring_up(window, backends));
+        let mut refusals = Vec::new();
+        let mut answer = Err(String::from("no backend to try"));
+        for attempt in attempts(backends, cfg!(target_os = "android")) {
+            // Each attempt's surface is dropped before the next is made: a
+            // window takes one producer at a time.
+            answer = pollster::block_on(bring_up(Arc::clone(&window), attempt));
+            match &answer {
+                Ok(_) => break,
+                Err(why) => {
+                    tracing::warn!(?attempt, "no GPU through this backend: {why}");
+                    refusals.push(why.clone());
+                }
+            }
+        }
+        let answer = answer.map_err(|_| refusals.join("; "));
         Self(Rc::new(RefCell::new(Some(answer))))
     }
 
@@ -65,6 +83,45 @@ impl GpuOnItsWay {
     /// The answer, once it has come.
     fn take(&self) -> Option<Result<Gpu, String>> {
         self.0.borrow_mut().take()
+    }
+}
+
+/// The backends to bring the GPU up through, in order: what was asked for,
+/// or — with nothing asked — the platform's default, which on Android is
+/// Vulkan first and OpenGL ES after it.
+///
+/// wgpu's default instance there holds both, and takes the first adapter it
+/// finds: a Vulkan driver that enumerates and then fails to make a device or
+/// a surface would end the session where OpenGL ES would have drawn. So the
+/// two are tried one after the other, each in an instance of its own.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(super) fn attempts(
+    asked: Option<wgpu::Backends>,
+    gl_after_vulkan: bool,
+) -> Vec<Option<wgpu::Backends>> {
+    match asked {
+        Some(backends) => vec![Some(backends)],
+        None if gl_after_vulkan => vec![Some(wgpu::Backends::VULKAN), Some(wgpu::Backends::GL)],
+        None => vec![None],
+    }
+}
+
+/// A backend named in `TUILE_BACKEND` — `vulkan`, `gl`, `metal`, `dx12` — or
+/// an error naming the ones there are. Unset or empty is the platform's
+/// default.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(crate) fn backend_named(name: Option<&str>) -> Result<Option<wgpu::Backends>, String> {
+    let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) else {
+        return Ok(None);
+    };
+    match name.to_ascii_lowercase().as_str() {
+        "vulkan" => Ok(Some(wgpu::Backends::VULKAN)),
+        "gl" | "gles" | "opengl" => Ok(Some(wgpu::Backends::GL)),
+        "metal" => Ok(Some(wgpu::Backends::METAL)),
+        "dx12" => Ok(Some(wgpu::Backends::DX12)),
+        _ => Err(format!(
+            "TUILE_BACKEND={name:?} is not a backend: vulkan, gl, metal or dx12"
+        )),
     }
 }
 
@@ -137,7 +194,17 @@ async fn bring_up(window: Arc<Window>, backends: Option<wgpu::Backends>) -> Resu
         })
         .await
         .map_err(|e| format!("device: {e}"))?;
-    let format = tuile_wgpu::surface_format(&surface.get_capabilities(&adapter));
+    let format = tuile_wgpu::surface_format(
+        &surface.get_capabilities(&adapter),
+        adapter.get_downlevel_capabilities().flags,
+    );
+    if format.encode {
+        tracing::info!(
+            surface = ?format.surface,
+            render = ?format.render,
+            "a linear surface with no sRGB view: the frame is encoded by a pass"
+        );
+    }
     Ok(Gpu {
         window,
         instance,
@@ -252,7 +319,7 @@ impl App {
         // The render origin tracks the eye (set each frame); start there.
         let pump = ContentPump::new(self.controller.camera.position);
         let safe = safe_area(&window, size);
-        let targets = tuile_wgpu::FrameTargets::new(&gpu, surface_format, size);
+        let targets = tuile_wgpu::FrameTargets::for_surface(&gpu, format, size);
         // Built and uploaded once for the whole session.
         let shell = tuile_wgpu::prepare(&gpu, &crate::backdrop::shell_content(), DVec3::ZERO);
 
@@ -319,22 +386,37 @@ impl App {
 /// left, top, width, height.
 pub(super) fn safe_area(window: &Window, size: (u32, u32)) -> (f64, f64, f64, f64) {
     let whole = (0.0, 0.0, f64::from(size.0), f64::from(size.1));
-    let (Ok(inner), Ok(outer)) = (window.inner_position(), window.outer_position()) else {
-        return whole;
-    };
-    let inner_size = window.inner_size();
-    let (x, y) = (
-        f64::from(inner.x - outer.x).max(0.0),
-        f64::from(inner.y - outer.y).max(0.0),
-    );
-    let (w, h) = (
-        f64::from(inner_size.width).min(f64::from(size.0) - x),
-        f64::from(inner_size.height).min(f64::from(size.1) - y),
-    );
-    if w <= 0.0 || h <= 0.0 {
-        return whole;
+    // Android draws the window under its bars and says so only through the
+    // activity's insets; winit's positions there are not supported.
+    #[cfg(target_os = "android")]
+    {
+        let _ = window;
+        crate::native::android_signals::safe_area_of_insets(
+            crate::native::android::safe_insets(),
+            size.0,
+            size.1,
+        )
+        .unwrap_or(whole)
     }
-    (x, y, w, h)
+    #[cfg(not(target_os = "android"))]
+    {
+        let (Ok(inner), Ok(outer)) = (window.inner_position(), window.outer_position()) else {
+            return whole;
+        };
+        let inner_size = window.inner_size();
+        let (x, y) = (
+            f64::from(inner.x - outer.x).max(0.0),
+            f64::from(inner.y - outer.y).max(0.0),
+        );
+        let (w, h) = (
+            f64::from(inner_size.width).min(f64::from(size.0) - x),
+            f64::from(inner_size.height).min(f64::from(size.1) - y),
+        );
+        if w <= 0.0 || h <= 0.0 {
+            return whole;
+        }
+        (x, y, w, h)
+    }
 }
 
 pub(super) fn configure_surface(active: &Active) {
@@ -378,4 +460,38 @@ pub(super) fn configure(
             view_formats: format.view_formats(),
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Android tries Vulkan, then OpenGL ES; a backend asked for is the only
+    /// one tried; elsewhere the platform's default, once.
+    #[test]
+    fn android_falls_back_from_vulkan_to_gl() {
+        assert_eq!(
+            attempts(None, true),
+            [Some(wgpu::Backends::VULKAN), Some(wgpu::Backends::GL)]
+        );
+        assert_eq!(
+            attempts(Some(wgpu::Backends::GL), true),
+            [Some(wgpu::Backends::GL)]
+        );
+        assert_eq!(attempts(None, false), [None]);
+    }
+
+    #[test]
+    fn a_backend_is_named_or_refused() {
+        assert_eq!(backend_named(None), Ok(None));
+        assert_eq!(backend_named(Some(" ")), Ok(None));
+        assert_eq!(backend_named(Some("GL")), Ok(Some(wgpu::Backends::GL)));
+        assert_eq!(
+            backend_named(Some("vulkan")),
+            Ok(Some(wgpu::Backends::VULKAN))
+        );
+        assert!(backend_named(Some("glide"))
+            .unwrap_err()
+            .contains("vulkan, gl"));
+    }
 }

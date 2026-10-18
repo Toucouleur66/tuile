@@ -48,7 +48,10 @@ impl DeviceMemory {
 
 /// How hot the device is running, as the system grades it.
 // Only a phone's system reports anything but nominal.
-#[cfg_attr(not(all(target_os = "ios", feature = "application")), allow(dead_code))]
+#[cfg_attr(
+    not(any(all(target_os = "ios", feature = "application"), target_os = "android")),
+    allow(dead_code)
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub(crate) enum Thermal {
     #[default]
@@ -57,6 +60,23 @@ pub(crate) enum Thermal {
     /// The system is throttling: do less, visibly.
     Serious,
     /// Close to being shut down: as little as the picture allows.
+    Critical,
+}
+
+/// How short of memory the system says it is — the third thing a handset
+/// reports, beside its memory and its temperature. A desktop and a phone that
+/// tells the application through a warning event instead never say anything
+/// but nominal here.
+// Only Android reports anything but nominal.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub(crate) enum Pressure {
+    #[default]
+    Nominal,
+    /// Running low: let go of what the view does not need.
+    Warning,
+    /// The system is about to end applications: as little as the picture
+    /// allows.
     Critical,
 }
 
@@ -125,6 +145,11 @@ pub(crate) struct Profile {
     /// whose system purges caches from under it — rather than left alone for
     /// the session to run without.
     pub clear_damaged_store: bool,
+    /// Whether the system takes the window's surface away when the
+    /// application leaves the front — Android destroys it, and a GPU surface
+    /// must be let go of before the call that says so returns — rather than
+    /// only telling the application it is no longer in front.
+    pub suspend_takes_the_surface: bool,
 }
 
 impl Profile {
@@ -157,6 +182,7 @@ impl Profile {
             owns_its_window: true,
             metrics_endpoint: true,
             clear_damaged_store: false,
+            suspend_takes_the_surface: false,
         }
     }
 
@@ -195,6 +221,19 @@ impl Profile {
             owns_its_window: true,
             metrics_endpoint: false,
             clear_damaged_store: true,
+            suspend_takes_the_surface: false,
+        }
+    }
+
+    /// An Android phone or tablet, as [`Profile::current`] makes it there: the
+    /// handheld numbers, sized the same way from what the system leaves the
+    /// process, on a system that takes the surface away whenever the
+    /// application leaves the front.
+    #[cfg(test)]
+    pub(crate) fn android(memory: DeviceMemory, cores: usize) -> Self {
+        Self {
+            suspend_takes_the_surface: true,
+            ..Self::handheld(memory, cores)
         }
     }
 
@@ -248,6 +287,7 @@ impl Profile {
             owns_its_window: false,
             metrics_endpoint: false,
             clear_damaged_store: false,
+            suspend_takes_the_surface: false,
         }
     }
 
@@ -255,9 +295,14 @@ impl Profile {
     /// [`Profile::browser`], chosen by the page.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn current() -> Self {
-        if cfg!(target_os = "ios") {
-            let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
-            Self::handheld(crate::device::memory(), cores)
+        let cores = || std::thread::available_parallelism().map_or(2, |n| n.get());
+        if cfg!(target_os = "android") {
+            Self {
+                suspend_takes_the_surface: true,
+                ..Self::handheld(crate::device::memory(), cores())
+            }
+        } else if cfg!(target_os = "ios") {
+            Self::handheld(crate::device::memory(), cores())
         } else {
             Self::desktop()
         }
@@ -300,6 +345,13 @@ impl Profile {
     /// largest applications first.
     pub(crate) fn trim_in_background(&self) -> usize {
         self.resident_budget_bytes / 4
+    }
+
+    /// What the system's saying it is critically short asks for: as much as
+    /// the background — the view's tiles and their ancestors are kept all the
+    /// same, so the ground stays covered.
+    pub(crate) fn trim_on_critical_pressure(&self) -> usize {
+        self.trim_in_background()
     }
 }
 
@@ -366,6 +418,32 @@ mod tests {
             assert!(p.release_surface_in_background && !p.metrics_endpoint);
             assert!(p.pause_loads_when_hidden && p.owns_its_window);
         }
+    }
+
+    /// An Android handset is a phone in every number, and the one whose
+    /// surface goes when it leaves the front.
+    #[test]
+    fn an_android_handset_is_a_phone_that_loses_its_surface() {
+        let memory = DeviceMemory {
+            physical: 3 * GIB,
+            available: Some(GIB),
+        };
+        let android = Profile::android(memory, 8);
+        let phone = Profile::handheld(memory, 8);
+        assert!(android.suspend_takes_the_surface);
+        assert!(!phone.suspend_takes_the_surface);
+        assert!(!Profile::desktop().suspend_takes_the_surface);
+        assert!(!Profile::browser(true, None).suspend_takes_the_surface);
+        assert_eq!(
+            Profile {
+                suspend_takes_the_surface: false,
+                ..android.clone()
+            },
+            phone
+        );
+        // A low-end handset: 3 GiB, 1 GiB available → a fifth, above the floor.
+        assert_eq!(android.resident_budget_bytes, 1024 * MIB / 5);
+        assert!(android.trim_on_critical_pressure() < android.trim_on_warning());
     }
 
     /// The pinned level is the one the backdrop draws, or the backdrop could

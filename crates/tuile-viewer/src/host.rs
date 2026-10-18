@@ -128,7 +128,7 @@ impl Host for Machine {
     }
 
     fn is_handheld(&self) -> bool {
-        cfg!(target_os = "ios")
+        cfg!(any(target_os = "ios", target_os = "android"))
     }
 
     fn setting(&self, key: &str) -> Option<String> {

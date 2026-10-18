@@ -583,6 +583,51 @@ mod system {
     pub(super) fn view(_snapshot: &crate::snapshot::Snapshot) {}
 }
 
+/// Android: the caption, alerts and the clipboard are the activity's (see
+/// `native::android`); nothing steers the viewer from outside yet, and the
+/// embedder is the application itself.
+#[cfg(target_os = "android")]
+mod system {
+    use std::sync::mpsc::{channel, Receiver};
+
+    use crate::native::android;
+    use crate::steer::Request;
+
+    pub(super) fn listen() -> Receiver<Request> {
+        channel().1
+    }
+
+    pub(super) fn alert(title: &str, text: &str) {
+        if !try_alert(title, text) {
+            android::log_line(android::LogPriority::Error, &format!("{title}: {text}"));
+        }
+    }
+
+    pub(super) fn try_alert(title: &str, text: &str) -> bool {
+        android::alert(title, text)
+    }
+
+    pub(super) fn caption(text: &str) {
+        android::caption(text);
+    }
+
+    pub(super) fn copy(text: &str) -> bool {
+        android::copy(text)
+    }
+
+    pub(super) fn paste() -> super::Pasted {
+        super::Pasted::Now(android::paste())
+    }
+
+    pub(super) fn send(_request: Request) {}
+
+    pub(super) fn drawing(_outcome: Result<&str, &str>) {}
+
+    pub(super) fn loading(_shown: bool, _progress: Option<f32>) {}
+
+    pub(super) fn view(_snapshot: &crate::snapshot::Snapshot) {}
+}
+
 /// A page: everything goes to the host's script through the web shell.
 #[cfg(target_arch = "wasm32")]
 mod system {
@@ -594,6 +639,7 @@ mod system {
 #[cfg(not(any(
     all(target_os = "macos", feature = "application"),
     all(target_os = "ios", feature = "application"),
+    target_os = "android",
     target_arch = "wasm32"
 )))]
 mod system {

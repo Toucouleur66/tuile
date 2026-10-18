@@ -111,6 +111,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc7eb209b1518d6bb87b283c20095f5228ecda460da70b44f0802523dea6da04"
 
 [[package]]
+name = "android_log-sys"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84521a3cf562bc62942e294181d9eef17eb38ceb8c68677bc49f144e4c3d4f8d"
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6855,6 +6861,7 @@ dependencies = [
 name = "tuile-viewer"
 version = "0.8.1"
 dependencies = [
+ "android_log-sys",
  "anyhow",
  "async-trait",
  "console_error_panic_hook",
@@ -6862,6 +6869,7 @@ dependencies = [
  "futures-executor",
  "futures-util",
  "glam 0.33.1",
+ "jni",
  "js-sys",
  "muda 0.19.3",
  "objc2 0.6.4",
@@ -6872,6 +6880,7 @@ dependencies = [
  "objc2-ui-kit 0.3.2",
  "pollster",
  "rlimit",
+ "rustls-platform-verifier",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
@@ -6985,6 +6994,7 @@ dependencies = [
  "tuile-cesium-ion",
  "tuile-native-fetchers",
  "tuile-viewer",
+ "url",
 ]
 
 [[package]]

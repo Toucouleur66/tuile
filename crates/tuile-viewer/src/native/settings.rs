@@ -16,7 +16,7 @@
 /// Errors only, then — unless `RUST_LOG` says otherwise, as always.
 pub(crate) fn init_tracing(quiet: bool) {
     use tracing_subscriber::EnvFilter;
-    tracing_subscriber::fmt()
+    let subscriber = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             if quiet {
                 "error".into()
@@ -25,8 +25,15 @@ pub(crate) fn init_tracing(quiet: bool) {
             }
         }))
         .without_time()
-        .with_target(false)
+        .with_target(false);
+    // Android: no stderr anyone reads — logcat, a line at a time.
+    #[cfg(target_os = "android")]
+    subscriber
+        .with_ansi(false)
+        .with_writer(super::android::Logcat::new)
         .init();
+    #[cfg(not(target_os = "android"))]
+    subscriber.init();
 }
 
 /// The instant the scene is lit for, UTC seconds since the Unix epoch.

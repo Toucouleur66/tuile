@@ -94,6 +94,14 @@ use native as shell;
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::main;
 
+/// The Android entry: a host's `android_main` hands its activity and itself
+/// to [`android::main`]. See `android/README.md`.
+#[cfg(target_os = "android")]
+pub mod android {
+    pub use crate::native::android::main;
+    pub use winit::platform::android::activity::AndroidApp;
+}
+
 // The browser's options are read and checked on the host too, by its tests.
 #[cfg(any(target_arch = "wasm32", test))]
 mod web;

@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 # Copyright (c) lapoule.dev
 #
-# Try the viewer on this machine: in a browser, as the Mac application, or on
-# the iOS simulator. One command each.
+# Try the viewer on this machine: in a browser, as the Mac application, on
+# the iOS simulator, or on an Android emulator or phone. One command each.
 #
 #   scripts/try-viewer.sh web                 # http://localhost:8091/
 #   scripts/try-viewer.sh web --open          # … and open it in Chrome
@@ -14,13 +14,18 @@
 #   scripts/try-viewer.sh mac [flags]         # the Mac application; flags as
 #                                             #     `tuile-wgpu-viewer --help`
 #   scripts/try-viewer.sh ios                 # the iOS simulator
+#   scripts/try-viewer.sh android             # the Android emulator, or the
+#                                             #     phone on the cable
+#   scripts/try-viewer.sh android --gl        # … forcing OpenGL ES
 #
 # The token is read from the workspace's `.env` (the main checkout's, from a
 # worktree) — TUILE_ION_TOKEN for the web, CESIUM_ION_TOKEN (or
 # TUILE_ION_TOKEN) for the Mac and the simulator. It is never printed and never
 # put in a URL. In the browser it never reaches the page at all: the page asks
 # the catalog proxy this script starts, and the proxy holds the token. So the
-# LAN mode needs no token on the phone either.
+# LAN mode needs no token on the phone either. Android is the same: the APK
+# holds no token, and asks the proxy this script starts on this machine,
+# reached from the device through `adb reverse`.
 #
 # A phone over plain HTTP is not a secure page: Safari and Chrome then give it
 # WebGL2 but not WebGPU, nor the location or the clipboard. `--https` serves
@@ -167,12 +172,59 @@ ios() {
   SIMCTL_CHILD_CESIUM_ION_TOKEN="$token" xcrun simctl launch booted dev.lapoule.tuile.viewer
 }
 
+# The Android emulator (the AVD `TUILE_AVD`, by default `tuile-arm64`, booted
+# if no device is attached) or the phone on the cable: the APK built and
+# installed, the catalog proxy started here and mapped onto the device's own
+# loopback, the application started, and its log followed until Ctrl-C.
+android() {
+  local gl=0 port=8091
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --gl) gl=1 ;;
+      *) echo "android: unknown flag $1" >&2; exit 2 ;;
+    esac
+    shift
+  done
+  local sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}"
+  local adb="$sdk/platform-tools/adb"
+  local env
+  env="$(env_file)"
+  if [[ -z "$env" ]]; then
+    echo "no .env with TUILE_ION_TOKEN: the catalog proxy needs the token" >&2
+    exit 1
+  fi
+  if ! "$adb" get-state >/dev/null 2>&1; then
+    local avd="${TUILE_AVD:-tuile-arm64}"
+    echo "booting the emulator $avd"
+    "$sdk/emulator/emulator" -avd "$avd" -gpu host -no-snapshot-save -no-boot-anim \
+      >/dev/null 2>&1 &
+    "$adb" wait-for-device
+    until [[ "$("$adb" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" == 1 ]]; do
+      sleep 1
+    done
+  fi
+  "$root/crates/tuile-viewer/android/build.sh" --install
+  (cd "$root" && CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo build --release -p tuile-catalog-proxy)
+  "$adb" reverse "tcp:$port" "tcp:$port" >/dev/null
+  "$root/target/release/tuile-catalog-proxy" \
+    --env-file "$env" --assets 1,2,3,3954 --listen "127.0.0.1:$port" &
+  local proxy=$!
+  trap 'kill $proxy 2>/dev/null' EXIT
+  local extras=(-e RUST_LOG "${RUST_LOG:-warn,tuile_viewer=info}")
+  [[ $gl == 1 ]] && extras+=(-e TUILE_BACKEND gl)
+  "$adb" logcat -c
+  "$adb" shell am start -S -n dev.lapoule.tuile.viewer/dev.lapoule.tuile.TuileActivity "${extras[@]}" >/dev/null
+  echo "following the log (Ctrl-C ends it, and the proxy)"
+  "$adb" logcat -v brief -s tuile:V
+}
+
 case "$what" in
   web) web "$@" ;;
   mac) mac "$@" ;;
   ios) ios "$@" ;;
+  android) android "$@" ;;
   *)
-    sed -n '5,17p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '5,20p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
     ;;
 esac
