@@ -385,11 +385,16 @@ fn a_projected_shadow_holds_still_as_the_sun_moves() {
     assert!(f.d1 < 0.01, "change {:.4} of full shadow a frame", f.d1);
 }
 
-/// The same ribbon drawn into the sun's map: its shadow flickers, and it is
-/// what the projection is for. Kept as the bench's own reference — were it
-/// ever to hold still, the bench would no longer show anything.
+/// The same ribbon drawn into the sun's map, as any thin caster that does
+/// not project its shadow is — a mascot's strings, say. Its shadow is
+/// coarser and it flickers, but each sample of the picture reads a map of
+/// its own, its grid moved by a fraction of a texel, so that the picture's
+/// pixel, which averages them, sees a shadow four grids deep: its flicker
+/// is held to a bound. On one grid, d2 was 0.087; on four it is 0.055 —
+/// a safety net, not a cure: a shadow that must hold still is projected
+/// (0.008, above).
 #[test]
-fn a_thin_caster_in_the_map_is_the_benchs_reference() {
+fn a_thin_caster_in_the_map_flickers_within_a_bound() {
     let Some(pictures) = sequence(OverlayShadow::Cast, 12) else {
         eprintln!("no GPU adapter: skipped");
         return;
@@ -400,7 +405,7 @@ fn a_thin_caster_in_the_map_is_the_benchs_reference() {
         f.d1, f.d2, f.shaded
     );
     assert!(f.shaded > 300.0, "only {:.0} pixels in shadow", f.shaded);
-    assert!(f.d2 > 0.005, "the map's shadow held still: {:.4}", f.d2);
+    assert!(f.d2 < 0.065, "flicker {:.4} of full shadow a frame", f.d2);
 }
 
 /// Where a plate's projected shadow falls: `height` over the tangent of

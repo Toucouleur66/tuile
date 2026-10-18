@@ -21,6 +21,10 @@
 //! ([`tuile_film::Look::shadow`]): one more raster, of depth alone, of the
 //! frame's tiles as the sun sees them, which the resolve reads to take the
 //! sun — and only the sun — from ground that other ground stands before.
+//! A supersampled frame draws one such map for each sample of a pixel, up
+//! to four, each on its grid moved by a fraction of a texel, and each
+//! sample reads its own: a pixel sees a thin shadow averaged over as many
+//! grids, which holds down its flicker as the sun moves.
 //! **Air** ([`tuile_film::Look::haze`]): what a ray crosses on its way to
 //! the eye, in closed form in the resolve, and a sky that runs from the
 //! horizon's colour to the zenith's in `present`.
@@ -88,6 +92,17 @@ const PROJECTED_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 const OVERLAY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// The side of the sun's map, in texels, where the device allows it.
 const SHADOW_SIDE: u32 = 4096;
+/// The most maps of the sun a frame draws: one for each sample of a
+/// supersampled pixel, up to this many, each on its grid moved by a
+/// fraction of a texel (`SUN_MAP_JITTER` in `common.wgsl`), so that a
+/// pixel averages the shadow of a thin caster over as many grids. A frame
+/// drawn one sample a pixel draws one map, where it always was.
+const SUN_MAPS_MAX: u32 = 4;
+
+/// How many maps of the sun a film of `supersample` samples a side draws.
+fn sun_maps(supersample: u32) -> u32 {
+    (supersample.max(1) * supersample.max(1)).min(SUN_MAPS_MAX)
+}
 /// What `present` writes, and what a canvas or an encoder reads.
 pub const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const ALBEDO_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -343,8 +358,12 @@ pub struct FilmGpu {
     /// reads them.
     projected_corners: Growing,
     projected_bgl: wgpu::BindGroupLayout,
-    /// The sun's map and its side, for a look that has shadows.
-    shadow_map: Option<(wgpu::TextureView, u32)>,
+    /// The sun's maps, one view each, and their side, for a look that has
+    /// shadows.
+    shadow_map: Option<(Vec<wgpu::TextureView>, u32)>,
+    /// Which map a pass draws, one entry each at its dynamic offset.
+    sun_map_passes: wgpu::BindGroup,
+    sun_map_stride: u32,
     /// The map — a texel that shades nothing without shadows — and how it
     /// is read, for overlays that receive.
     shadow_view: wgpu::TextureView,
@@ -699,7 +718,14 @@ impl FilmGpu {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
-                texture(8, wgpu::TextureSampleType::Depth),
+                wgpu::BindGroupLayoutEntry {
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    ..texture(8, wgpu::TextureSampleType::Depth)
+                },
                 wgpu::BindGroupLayoutEntry {
                     binding: 9,
                     visibility: compute_only,
@@ -775,13 +801,22 @@ impl FilmGpu {
             cache: None,
         });
 
+        // Which of the sun's maps a pass draws: see `SUN_MAPS_MAX`.
+        let sun_map_pass_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("film sun map pass"),
+            entries: &[uniform(0, wgpu::ShaderStages::VERTEX, true)],
+        });
         let shadow_module = shader(&device, "film shadow", include_str!("shaders/shadow.wgsl"));
         let shadow = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("film shadow"),
             layout: Some(
                 &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: Some("film shadow"),
-                    bind_group_layouts: &[Some(&raster_bgl), Some(&tile_bgl)],
+                    bind_group_layouts: &[
+                        Some(&raster_bgl),
+                        Some(&tile_bgl),
+                        Some(&sun_map_pass_bgl),
+                    ],
                     immediate_size: 0,
                 }),
             ),
@@ -827,6 +862,11 @@ impl FilmGpu {
                 },
                 wgpu::BindGroupLayoutEntry {
                     visibility: fragment_only,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
                     ..texture(2, wgpu::TextureSampleType::Depth)
                 },
                 wgpu::BindGroupLayoutEntry {
@@ -856,7 +896,7 @@ impl FilmGpu {
         });
         let overlay_cast_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("film overlay cast"),
-            bind_group_layouts: &[Some(&overlay_cast_bgl)],
+            bind_group_layouts: &[Some(&overlay_cast_bgl), Some(&sun_map_pass_bgl)],
             immediate_size: 0,
         });
         let overlay_attributes =
@@ -1232,23 +1272,65 @@ impl FilmGpu {
         } else {
             1
         };
-        let shadow_view = device
-            .create_texture(&wgpu::TextureDescriptor {
-                label: Some("film shadow map"),
-                size: wgpu::Extent3d {
-                    width: shadow_side,
-                    height: shadow_side,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: DEPTH_FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
+        let maps = if settings.look.shadow > 0.0 {
+            sun_maps(settings.supersample)
+        } else {
+            1
+        };
+        let shadow_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("film shadow map"),
+            size: wgpu::Extent3d {
+                width: shadow_side,
+                height: shadow_side,
+                depth_or_array_layers: maps,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let shadow_view = shadow_texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let shadow_maps: Vec<wgpu::TextureView> = (0..maps)
+            .map(|layer| {
+                shadow_texture.create_view(&wgpu::TextureViewDescriptor {
+                    dimension: Some(wgpu::TextureViewDimension::D2),
+                    base_array_layer: layer,
+                    array_layer_count: Some(1),
+                    ..Default::default()
+                })
             })
-            .create_view(&Default::default());
+            .collect();
+        let sun_map_stride = device.limits().min_uniform_buffer_offset_alignment.max(16);
+        let sun_map_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("film sun map passes"),
+            size: u64::from(sun_map_stride * maps),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        for layer in 0..maps {
+            queue.write_buffer(
+                &sun_map_buffer,
+                u64::from(layer * sun_map_stride),
+                bytemuck::cast_slice(&[layer, 0, 0, 0]),
+            );
+        }
+        let sun_map_passes = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("film sun map passes"),
+            layout: &sun_map_pass_bgl,
+            entries: &[entry(
+                0,
+                wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &sun_map_buffer,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(16),
+                }),
+            )],
+        });
         let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("film shadow"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -1302,7 +1384,9 @@ impl FilmGpu {
             overlay_edges: Growing::default(),
             projected_corners: Growing::default(),
             projected_bgl,
-            shadow_map: (settings.look.shadow > 0.0).then(|| (shadow_view.clone(), shadow_side)),
+            shadow_map: (settings.look.shadow > 0.0).then_some((shadow_maps, shadow_side)),
+            sun_map_passes,
+            sun_map_stride,
             shadow_view,
             shadow_sampler,
             shadow_texel: None,
@@ -2432,7 +2516,13 @@ impl FilmGpu {
 
         encoder.clear_buffer(&self.counts, 0, None);
 
-        if let (Some(_), Some((map, _))) = (&sun, &self.shadow_map) {
+        // Each of the sun's maps, on its own grid: see `SUN_MAPS_MAX`.
+        let maps = match (&sun, &self.shadow_map) {
+            (Some(_), Some((maps, _))) => maps.as_slice(),
+            _ => &[],
+        };
+        for (layer, map) in maps.iter().enumerate() {
+            let at = [layer as u32 * self.sun_map_stride];
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("film shadow"),
                 color_attachments: &[],
@@ -2450,6 +2540,7 @@ impl FilmGpu {
             });
             pass.set_pipeline(&self.pipelines.shadow);
             pass.set_bind_group(0, &self.raster_bg, &[]);
+            pass.set_bind_group(2, &self.sun_map_passes, &at);
             for r in &drawn {
                 pass.set_bind_group(1, &r.bind, &[]);
                 pass.draw(0..r.index_count, r.slot..r.slot + 1);
@@ -2462,6 +2553,7 @@ impl FilmGpu {
                 &self.overlay_indices.0,
             ) {
                 pass.set_bind_group(0, &self.overlay_cast_bg, &[]);
+                pass.set_bind_group(1, &self.sun_map_passes, &at);
                 pass.set_vertex_buffer(0, vertices.slice(..));
                 pass.set_pipeline(&self.pipelines.overlay.cast);
                 pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);

@@ -15,7 +15,7 @@
 
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(0) @binding(1) var ground: texture_depth_2d;
-@group(0) @binding(2) var shadow_map: texture_depth_2d;
+@group(0) @binding(2) var shadow_map: texture_depth_2d_array;
 @group(0) @binding(3) var shadow_samp: sampler_comparison;
 
 // What a vertex's mesh asks for: `OverlayVertex::flags`.
@@ -90,7 +90,7 @@ fn fs(in: Out) -> @location(0) vec4f {
     if ((in.flags & RECEIVES) != 0u && frame.shadow.x > 0.0) {
         // Looked up from a little towards the sun, as ground is from off
         // its surface: a shape does not shade itself where it stands.
-        let sun = sunlit(in.at, frame.to_sun.xyz);
+        let sun = sunlit(in.at, frame.to_sun.xyz, vec2u(in.clip.xy));
         // A shadow takes the sun and leaves the dome: what is shaded keeps
         // the share of its light the dome gives ground, as ground does.
         let luma = vec3f(0.2126, 0.7152, 0.0722);
@@ -106,8 +106,13 @@ fn fs(in: Out) -> @location(0) vec4f {
 // The sun's map, as an overlay that casts is drawn into it: depth alone,
 // through the sun's view, laid on the near plane when nearer the sun than
 // it, as the ground is.
+// Which of the sun's maps this pass draws.
+struct SunMapPass { map: u32 }
+@group(1) @binding(0) var<uniform> sun_map_pass: SunMapPass;
+
 fn sun_clip(position: vec3f) -> vec4f {
     var clip = frame.sun_view_proj * vec4f(position, 1.0);
+    clip = vec4f(clip.xy + sun_map_shift(sun_map_pass.map, frame.size.z, frame.shadow.z) * clip.w, clip.zw);
     clip.z = max(clip.z, 0.0);
     return clip;
 }
