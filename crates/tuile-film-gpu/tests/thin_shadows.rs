@@ -778,7 +778,9 @@ fn a_raised_casters_projected_shadow_has_a_penumbra_as_wide_as_the_sun() {
         share_at(&low, 1.5),
         share_at(&high, 1.5)
     );
-    assert!(share_at(&low, 1.5) == 0.0);
+    // What a disc's wedges leave of nothing: a few millionths, as a GPU
+    // rounds them.
+    assert!(share_at(&low, 1.5) < 1e-3);
     assert!(share_at(&high, 1.5) > 0.2);
 
     // The disc cut eight times as wide: so is the penumbra.
@@ -873,7 +875,7 @@ fn a_projected_shadow_is_whole_seen_from_inside_its_volume() {
         green_at(&inside, 0.0),
         green_at(&lit, 0.0)
     );
-    assert!(share_at(&shares, 0.0) == 1.0, "no shadow under the eye");
-    assert!(share_at(&shares, 16.0) == 0.0);
+    assert!(share_at(&shares, 0.0) > 0.999, "no shadow under the eye");
+    assert!(share_at(&shares, 16.0) < 1e-3);
     assert!(green_at(&lit, 0.0) > 2.0 * green_at(&inside, 0.0));
 }
