@@ -23,12 +23,8 @@
 
 use std::sync::Arc;
 
-use tuile_bing::{BingImageryProvider, BingMetadata};
-use tuile_cesium_ion::tms::TmsImagery;
-use tuile_cesium_ion::{AssetEndpoint, IonClient, IonTerrainSource};
-use tuile_core::raster::ImageryProvider;
+use tuile_cesium_ion::IonSources;
 use tuile_native_fetchers::{default_cache_dir, CacheConfig, NativeHttp};
-use tuile_terrain::{LayerJson, TerrainSource};
 use tuile_viewer::{Identity, ImageryChoice, Sources, TerrainChoice, ViewerHost};
 
 /// The environment variable the access token is read from.
@@ -46,65 +42,6 @@ const SATELLITE_MOSAIC: i64 = 3954;
 /// as it is on screen.
 const PHOTOGRAPHY: &str = "© Microsoft and its data suppliers";
 const MOSAIC: &str = "Contains modified Copernicus Sentinel data";
-
-/// Terrain and imagery by ion asset number, resolved on demand.
-struct Ion {
-    http: Arc<NativeHttp>,
-    token: String,
-}
-
-impl Ion {
-    fn client(&self) -> IonClient<NativeHttp> {
-        IonClient::new(Arc::clone(&self.http), self.token.clone())
-    }
-}
-
-#[async_trait::async_trait]
-impl Sources for Ion {
-    async fn terrain(&self, asset: i64) -> Result<(LayerJson, Arc<dyn TerrainSource>), String> {
-        let asset = u64::try_from(asset).map_err(|_| format!("{asset} is not an asset"))?;
-        let source = IonTerrainSource::new(self.client(), asset);
-        let layer = source.layer().await.map_err(|e| e.to_string())?;
-        Ok((layer, Arc::new(source)))
-    }
-
-    /// What the endpoint *is*, not what one hopes it is: an asset ion serves
-    /// through Bing answers with a key and a map style, and one ion hosts
-    /// itself answers with a tile map resource. The two are cut on different
-    /// grids — web-mercator and geographic — and each provider says which.
-    async fn imagery(&self, asset: i64) -> Result<Arc<dyn ImageryProvider>, String> {
-        let id = u64::try_from(asset).map_err(|_| format!("{asset} is not an asset"))?;
-        let ion = self.client();
-        let endpoint = match ion.asset_endpoint(id).await.map_err(|e| e.to_string())? {
-            AssetEndpoint::Imagery(endpoint) => endpoint,
-            _ => return Err(format!("asset {asset} is not imagery")),
-        };
-        match endpoint.external_type.as_deref() {
-            None => Ok(Arc::new(
-                TmsImagery::from_endpoint(ion, id, endpoint)
-                    .await
-                    .map_err(|e| e.to_string())?,
-            )),
-            Some("BING") => {
-                let o = &endpoint.options;
-                let style = o.map_style.as_deref().unwrap_or("Aerial");
-                let metadata = BingMetadata::metadata_url(
-                    o.url.as_deref().ok_or("the endpoint names no URL")?,
-                    style,
-                    o.key.as_deref().ok_or("the endpoint carries no key")?,
-                );
-                Ok(Arc::new(
-                    BingImageryProvider::from_metadata_url(Arc::clone(&self.http), &metadata)
-                        .await
-                        .map_err(|e| e.to_string())?,
-                ))
-            }
-            Some(other) => Err(format!(
-                "asset {asset} is served as {other:?}, which is not handled"
-            )),
-        }
-    }
-}
 
 /// The public host: the project's own application over ion.
 struct Public;
@@ -164,7 +101,7 @@ impl ViewerHost for Public {
             NativeHttp::shared().await
         };
         let http = Arc::new(http.map_err(|e| e.to_string())?);
-        Ok(Arc::new(Ion { http, token }))
+        Ok(Arc::new(IonSources::new(Arc::clone(&http), http, token)))
     }
 }
 

@@ -626,6 +626,85 @@ impl Default for GlobeOptions {
     }
 }
 
+/// What every asker of one imagery tile is answered: the coord served and its
+/// texture, or why there is none.
+type ImageryAnswer = Result<(ImageryCoord, Arc<DecodedTexture>), String>;
+
+/// The imagery tiles being fetched, by imagery generation and coord, with
+/// whoever else is waiting for each.
+///
+/// Without it, every terrain tile under one imagery tile fetched that tile
+/// itself, at the same moment: a browser showed the same quadkeys two and
+/// three times over, each holding a connection, and serialised them behind
+/// its cache lock — the pending requests under which the page stopped.
+#[derive(Default)]
+struct ImageryInFlight(Mutex<HashMap<(u64, ImageryCoord), Vec<Waiter>>>);
+
+/// Where a waiting asker is told the answer.
+type Waiter = futures_channel::oneshot::Sender<ImageryAnswer>;
+
+/// Whether an asker fetches, or waits for the one that does.
+enum Turn {
+    Lead,
+    Wait(futures_channel::oneshot::Receiver<ImageryAnswer>),
+}
+
+impl ImageryInFlight {
+    fn join(&self, key: (u64, ImageryCoord)) -> Turn {
+        let mut flights = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match flights.get_mut(&key) {
+            Some(waiting) => {
+                let (tell, answer) = futures_channel::oneshot::channel();
+                waiting.push(tell);
+                Turn::Wait(answer)
+            }
+            None => {
+                flights.insert(key, Vec::new());
+                Turn::Lead
+            }
+        }
+    }
+
+    /// The tiles being fetched right now.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+}
+
+/// The asker that fetches. Dropped without [`Leading::finish`] — cancelled —
+/// it lets go of the tile, and its waiters' channels close: the next of them
+/// fetches.
+struct Leading<'a> {
+    flight: &'a ImageryInFlight,
+    key: (u64, ImageryCoord),
+}
+
+impl Leading<'_> {
+    fn finish(self, answer: &ImageryAnswer) {
+        let waiting = self
+            .flight
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.key);
+        for tell in waiting.into_iter().flatten() {
+            let _ = tell.send(answer.clone());
+        }
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for Leading<'_> {
+    fn drop(&mut self) {
+        self.flight
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.key);
+    }
+}
+
 /// Loads a terrain tile and drapes the imagery covering it, by reference.
 /// Generic over the terrain source `T` and imagery provider `I` — no ion, no
 /// Bing, no transport.
@@ -662,6 +741,9 @@ pub struct PlanetaryLoader<T: TerrainSource, I: ImageryProvider> {
     /// Shared with the host's camera: each decoded tile's relief, so the eye can
     /// be kept above the ground rather than above the ellipsoid.
     heights: Arc<TerrainHeights>,
+    /// The imagery tiles being fetched, so a tile several terrain tiles want
+    /// at once is fetched once: see [`ImageryInFlight`].
+    fetching: ImageryInFlight,
     /// Where decoding and resampling run.
     ///
     /// Not a detail of taste: the server is one future, so any CPU work left in
@@ -715,6 +797,42 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
     /// many terrain tiles that share a tile; persistence across runs is the
     /// provider's business, not this one's.
     async fn fetch_imagery(
+        &self,
+        c: ImageryCoord,
+    ) -> Result<(ImageryCoord, Arc<DecodedTexture>), LoadError> {
+        if let Some(tex) = self.decoded().get(&c) {
+            return Ok((c, tex));
+        }
+        // One fetch per tile at a time: an imagery tile spans several terrain
+        // tiles, and their loads ask for it together. Whoever asks first
+        // fetches; the others wait for its answer. If that first one is
+        // cancelled — its terrain tile left the view — the next in line
+        // fetches instead, so nobody waits on a fetch nobody makes.
+        let key = (self.imagery.generation(), c);
+        loop {
+            match self.fetching.join(key) {
+                Turn::Wait(answer) => match answer.await {
+                    Ok(answer) => return answer.map_err(LoadError::Failed),
+                    Err(futures_channel::oneshot::Canceled) => continue,
+                },
+                Turn::Lead => {
+                    let lead = Leading {
+                        flight: &self.fetching,
+                        key,
+                    };
+                    let answer = self.fetch_imagery_once(c).await.map_err(|e| match e {
+                        LoadError::Failed(why) => why,
+                        other => other.to_string(),
+                    });
+                    lead.finish(&answer);
+                    return answer.map_err(LoadError::Failed);
+                }
+            }
+        }
+    }
+
+    /// [`Self::fetch_imagery`], for the one asker that fetches.
+    async fn fetch_imagery_once(
         &self,
         c: ImageryCoord,
     ) -> Result<(ImageryCoord, Arc<DecodedTexture>), LoadError> {
@@ -1714,6 +1832,7 @@ where
         // Smaller than the real cache: these are approximations with a short
         // life, replaced the moment the tile they stand in for arrives.
         fill_meshes: Mutex::new(MeshCache::new(256)),
+        fetching: ImageryInFlight::default(),
         availability,
         provenance: Arc::clone(&provenance),
         detail: detail.clone(),
@@ -1780,6 +1899,7 @@ mod tests {
             cache: Mutex::new(ImageryCache::new(8)),
             meshes: Mutex::new(MeshCache::new(8)),
             fill_meshes: Mutex::new(MeshCache::new(8)),
+            fetching: ImageryInFlight::default(),
             availability: Arc::new(tuile_terrain::Availability::default()),
             provenance: Arc::default(),
             detail: ImageryDetail::default(),
@@ -1841,6 +1961,127 @@ mod tests {
         }
     }
 
+    /// Imagery that waits at a gate before it answers, and counts how often
+    /// it is asked.
+    struct GatedImagery {
+        asked: std::sync::atomic::AtomicUsize,
+        gate: Arc<futures_util::lock::Mutex<()>>,
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl raster::ImageryProvider for GatedImagery {
+        fn tiling_scheme(&self) -> raster::TilingScheme {
+            raster::TilingScheme::geographic()
+        }
+
+        async fn fetch_tile_bytes(
+            &self,
+            coord: ImageryCoord,
+        ) -> Result<tuile_core::fetch::Fetched<bytes::Bytes>, raster::RasterError> {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _open = self.gate.lock().await;
+            Painted(40).fetch_tile_bytes(coord).await
+        }
+    }
+
+    fn gated_loader(
+        gate: Arc<futures_util::lock::Mutex<()>>,
+    ) -> PlanetaryLoader<NoTerrain, GatedImagery> {
+        let scheme = GeographicTilingScheme::default();
+        PlanetaryLoader {
+            terrain: NoTerrain,
+            imagery: GatedImagery {
+                asked: std::sync::atomic::AtomicUsize::new(0),
+                gate,
+            },
+            scheme,
+            opts: GlobeOptions::default(),
+            cache: Mutex::new(ImageryCache::new(64)),
+            meshes: Mutex::new(MeshCache::new(8)),
+            fill_meshes: Mutex::new(MeshCache::new(8)),
+            fetching: ImageryInFlight::default(),
+            availability: Arc::new(tuile_terrain::Availability::default()),
+            provenance: Arc::default(),
+            detail: ImageryDetail::default(),
+            heights: Arc::new(TerrainHeights::new(scheme)),
+            offload: offload::inline(),
+        }
+    }
+
+    const SHARED: ImageryCoord = ImageryCoord {
+        level: 5,
+        x: 40,
+        y: 12,
+    };
+
+    /// **One imagery tile wanted by several terrain tiles at once is fetched
+    /// once.** The askers that come second wait for the first one's answer,
+    /// and all of them get the same texture.
+    #[test]
+    fn an_imagery_tile_asked_for_at_once_is_fetched_once() {
+        let gate = Arc::new(futures_util::lock::Mutex::new(()));
+        let loader = gated_loader(Arc::clone(&gate));
+        let answers = futures_executor::block_on(async {
+            let closed = gate.lock().await;
+            let askers =
+                futures_util::future::join_all((0..3).map(|_| loader.fetch_imagery(SHARED)));
+            // Polled after every asker has been once: they are all waiting.
+            let open = async {
+                assert_eq!(loader.fetching.len(), 1, "one tile in flight");
+                drop(closed);
+            };
+            futures_util::future::join(askers, open).await.0
+        });
+        assert_eq!(
+            loader
+                .imagery
+                .asked
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "fetched once for three askers"
+        );
+        let textures: Vec<_> = answers
+            .into_iter()
+            .map(|a| a.expect("an answer").1)
+            .collect();
+        assert!(textures.iter().all(|t| Arc::ptr_eq(t, &textures[0])));
+        assert_eq!(loader.fetching.len(), 0, "nothing left in flight");
+    }
+
+    /// **The asker that fetches may be cancelled; the others are not left
+    /// waiting on a fetch nobody makes.** The next one fetches instead.
+    #[test]
+    fn a_cancelled_fetch_hands_the_tile_to_the_next_asker() {
+        use futures_util::FutureExt;
+        let gate = Arc::new(futures_util::lock::Mutex::new(()));
+        let loader = gated_loader(Arc::clone(&gate));
+        let closed = futures_executor::block_on(gate.lock());
+        let mut first = Box::pin(loader.fetch_imagery(SHARED));
+        let mut second = Box::pin(loader.fetch_imagery(SHARED));
+        assert!(
+            first.as_mut().now_or_never().is_none(),
+            "the first one fetches"
+        );
+        assert!(
+            second.as_mut().now_or_never().is_none(),
+            "the second one waits"
+        );
+        // The first one's terrain tile left the view.
+        drop(first);
+        drop(closed);
+        let answer = futures_executor::block_on(second);
+        assert!(answer.is_ok(), "{answer:?}");
+        assert_eq!(
+            loader
+                .imagery
+                .asked
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the second asker fetched it itself"
+        );
+        assert_eq!(loader.fetching.len(), 0);
+    }
+
     /// **After a switch, a drape is the new imagery and says so.**
     ///
     /// Two things have to hold, and each was a way for a switch to show
@@ -1861,6 +2102,7 @@ mod tests {
             cache: Mutex::new(ImageryCache::new(64)),
             meshes: Mutex::new(MeshCache::new(8)),
             fill_meshes: Mutex::new(MeshCache::new(8)),
+            fetching: ImageryInFlight::default(),
             availability: Arc::new(tuile_terrain::Availability::default()),
             provenance: Arc::default(),
             detail: ImageryDetail::default(),

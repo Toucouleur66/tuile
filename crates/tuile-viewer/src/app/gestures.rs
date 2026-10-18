@@ -9,7 +9,7 @@
 //! [`super::touch`], [`super::lifecycle`], [`super::loading`],
 //! [`super::demand`] — and tested there. What is here carries them out.
 
-use std::time::Instant;
+use web_time::Instant;
 
 use tuile_core::protocol::{ClientMessage, GeometryStream};
 use winit::event::TouchPhase;
@@ -53,19 +53,23 @@ impl App {
     }
 
     /// Carries a gesture out on the camera, the control getting first refusal
-    /// on a press, exactly as it does for the mouse.
+    /// on a press, exactly as it does for the mouse. A hand on the globe ends
+    /// any glide.
     pub(super) fn gesture(&mut self, gesture: Gesture) {
+        self.flight = None;
         let viewport = self.viewport();
         let ui = self.ui_frame();
         match gesture {
             Gesture::Press(at) => {
                 self.pointer.cursor = at;
-                self.pointer.dragging = !self.nav.press(ui.to(at), ui.size, &mut self.controller);
+                self.pointer.dragging =
+                    !(self.controls && self.nav.press(ui.to(at), ui.size, &mut self.controller));
             }
             Gesture::Drag { from, to } => {
-                if self
-                    .nav
-                    .drag(ui.to(from), ui.to(to), ui.size, &mut self.controller)
+                if self.controls
+                    && self
+                        .nav
+                        .drag(ui.to(from), ui.to(to), ui.size, &mut self.controller)
                 {
                     // The control owns this gesture.
                 } else if self.pointer.dragging {
@@ -145,6 +149,7 @@ impl App {
             tracing::info!(seconds, "first view covered; the indicator fades");
             crate::journal::note(&format!("first view covered in {seconds:.1} s"));
         }
+        crate::desktop::loading(indicator.opacity > 0.0, indicator.progress);
         if indicator.opacity <= 0.0 {
             return None;
         }
@@ -184,7 +189,7 @@ impl App {
             || camera.direction.dot(target.direction) < 1.0 - 1e-12
             || camera.up.dot(target.up) < 1.0 - 1e-12;
         let busy = Busy {
-            moving,
+            moving: moving || self.flight.is_some(),
             touching: self.touches.any(),
             indicator: indicator.is_some(),
             uploaded: self.uploaded,
@@ -293,7 +298,7 @@ impl App {
 /// gate and stream, the surface, a frame. A trait so the wiring of each
 /// [`Step`] is tested against a recording stand-in rather than a window.
 pub(super) trait Carry {
-    fn gate(&self) -> Option<&crate::gate::Gate>;
+    fn gate(&self) -> Option<&crate::shell::Gate>;
     /// A message to the server, best effort.
     fn send(&mut self, message: ClientMessage);
     /// The current camera to the server again, so it runs a pass — the pass
@@ -335,7 +340,7 @@ pub(super) fn carry(steps: Vec<Step>, to: &mut impl Carry) {
 }
 
 impl Carry for App {
-    fn gate(&self) -> Option<&crate::gate::Gate> {
+    fn gate(&self) -> Option<&crate::shell::Gate> {
         self.session.as_ref().map(|s| &s.gate)
     }
 
@@ -369,32 +374,19 @@ impl Carry for App {
     }
 
     fn suspend_store(&mut self) {
-        if let Some(store) = self.session.as_ref().and_then(|s| s.store.clone()) {
-            self.runtime.spawn(async move {
-                match store.suspend().await {
-                    Ok(()) => tracing::info!("tile store written down and closed"),
-                    Err(e) => tracing::warn!("the tile store did not close ({e})"),
-                }
-            });
+        if let Some(session) = self.session.as_ref() {
+            session.suspend_store();
         }
     }
 
     fn resume_store(&mut self) {
-        if let Some(store) = self.session.as_ref().and_then(|s| s.store.clone()) {
-            self.runtime.spawn(async move {
-                match store.resume().await {
-                    Ok(()) => tracing::info!("tile store open again"),
-                    Err(e) => tracing::warn!("the tile store did not open again ({e})"),
-                }
-            });
+        if let Some(session) = self.session.as_ref() {
+            session.resume_store();
         }
     }
 
     fn redraw(&mut self) {
-        self.demand.poke();
-        if let Some(active) = self.active.as_ref() {
-            active.window.request_redraw();
-        }
+        self.draw_soon();
     }
 }
 

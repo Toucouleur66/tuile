@@ -49,6 +49,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       # Every crate that claims wasm, not only the core. `tuile-web` is
       # entirely gated on wasm32, so no native build ever compiled it: it
@@ -68,8 +69,33 @@ jobs:
           -p tuile-atmosphere
           -p tuile-film-gpu
           -p tuile-ui
-          -p tuile-wasm-globe
           -p tuile-film
+      # The viewer's web shell, its transport and its renderer, as the
+      # browser builds them: no native build ever compiles that code.
+      - run: cargo clippy --target wasm32-unknown-unknown -p tuile-viewer -p tuile-web -p tuile-wgpu -- -D warnings
+
+  # The package a page imports: the wasm build and its bindings, the
+  # typings checked by tsc, and a bundler that ships the worker and the wasm.
+  web-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: wasm-bindgen at the locked version
+        run: |
+          version=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/version = |"/, ""); print; exit }' Cargo.lock)
+          cargo install wasm-bindgen-cli --version "$version" --locked
+      - run: packages/tuile-viewer/build.sh --dev
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - working-directory: examples/web-viewer-vite
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
 
   docs:
     runs-on: ubuntu-latest

@@ -8,8 +8,6 @@
 //! command* while comparing — and a comparison whose two halves were launched
 //! differently is not a comparison.
 
-use tuile_storage_foyer::SuspendableStore as FoyerStore;
-
 /// Logs to stderr; `RUST_LOG` overrides. From a terminal the default shows
 /// tile streaming (`tuile_planetary=debug`) plus app-level info.
 ///
@@ -49,8 +47,8 @@ pub(crate) fn lit_at() -> anyhow::Result<f64> {
         tracing::info!("scene lit for the instant TUILE_LIT_AT={seconds}");
         return Ok(seconds);
     }
-    Ok(std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
+    Ok(web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)?
         .as_secs_f64())
 }
 
@@ -91,60 +89,5 @@ pub fn pinned_level(default: u32) -> Option<u32> {
             tracing::warn!("TUILE_PIN_LEVEL={setting:?} is not a level; keeping the default");
             Some(default)
         }
-    }
-}
-
-/// Flushes the tile store, and says what it cost if it could not.
-///
-/// Foyer buffers its disk writes, so **a store that is merely dropped leaves
-/// the disk exactly as cold as it found it** — a session killed without this
-/// keeps nothing, however long it ran. That is not a hypothetical: several
-/// sessions were killed today, and the next one re-fetched everything they had
-/// downloaded, at megabytes a second, which reads from the outside as a cache
-/// that does not work.
-///
-/// So it is reported either way, with the numbers that say whether the cache
-/// earned its keep this session. `SIGKILL` still takes the buffer with it and
-/// nothing can be done about that from inside the process.
-///
-/// `patience` bounds the wait: a phone on its way out has seconds, and a
-/// flush that outlives them is ended by the system with nothing written.
-pub(crate) fn close_the_store(
-    store: Option<std::sync::Arc<FoyerStore>>,
-    handle: &tokio::runtime::Handle,
-    patience: std::time::Duration,
-) {
-    let m = tuile_core::metrics::metrics();
-    let (hits, misses) = (m.store_hits.get(), m.store_misses.get());
-    let served = m.store_bytes_served.get();
-    let fetched = m.store_bytes_fetched.get();
-    let asked = hits + misses;
-    let hit_rate = if asked == 0 {
-        0.0
-    } else {
-        100.0 * hits as f64 / asked as f64
-    };
-    let Some(store) = store else {
-        tracing::warn!("no tile store this session; every tile came from the network");
-        return;
-    };
-    let closed = handle.block_on(async {
-        match tokio::time::timeout(patience, store.close()).await {
-            Ok(closed) => closed.map_err(|e| e.to_string()),
-            Err(_) => Err(format!("not closed within {patience:?}")),
-        }
-    });
-    match closed {
-        Ok(()) => tracing::info!(
-            "tile store flushed: {hits}/{asked} served from cache ({hit_rate:.0}%), \
-             {:.0} MiB served, {:.0} MiB fetched",
-            served as f64 / (1024.0 * 1024.0),
-            fetched as f64 / (1024.0 * 1024.0),
-        ),
-        Err(e) => tracing::error!(
-            "TILE STORE NOT FLUSHED ({e}): the {:.0} MiB fetched this session are lost \
-             and the next run starts cold",
-            fetched as f64 / (1024.0 * 1024.0),
-        ),
     }
 }

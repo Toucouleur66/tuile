@@ -18,8 +18,12 @@ thiserror = { workspace = true }
 tuile-atmosphere = { version = "0.8.1", path = "../tuile-atmosphere" }
 tuile-core = { version = "0.8.1", path = "../tuile-core" }
 wgpu = { workspace = true }
+web-time = { workspace = true }
 
 [dev-dependencies]
+# The shader translator wgpu itself uses, at its version: the WebGL2 test
+# writes every shader out as GLSL ES 3.00 the way the GL backend would.
+naga = { version = "29.0.3", features = ["wgsl-in", "glsl-out"] }
 futures-executor = { workspace = true }
 futures-util = { workspace = true }
 glam = { workspace = true }

@@ -17,7 +17,9 @@ glam = { workspace = true }
 tuile-camera = { version = "0.8.1", path = "../tuile-camera" }
 # A time-lapse's start, as a calendar says it.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
-mcap = "0.25"
+# Without its compressors in a browser: they are C, and a wasm32 module has no
+# C library to link them against. Everywhere else, as it always was.
+mcap = { version = "0.25", default-features = false }
 # Catmull–Rom, plutôt qu'écrit à la main.
 #
 # La construction — points de contrôle au tiers de la corde des voisins — tient
@@ -32,3 +34,6 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+mcap = "0.25"

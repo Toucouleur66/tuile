@@ -34,6 +34,8 @@ mod readback;
 mod renderer;
 mod surface;
 mod targets;
+#[cfg(test)]
+mod webgl2;
 
 pub use context::{ContextError, GpuContext, DEPTH_FORMAT, SAMPLES, TEXTURE_FORMAT};
 pub use overlay::{OverlayRenderer, OverlayVertex};
@@ -41,5 +43,7 @@ pub use prepare::{prepare, PreparedMesh, PreparedTile, Vertex, STITCH_ROWS};
 pub use pump::{ContentPump, Drawn, Resolution, STITCH_SLIDE_FRAMES, UPLOADS_PER_FRAME};
 pub use readback::Readback;
 pub use renderer::{LineVertex, TileRenderer, ViewUniform};
-pub use surface::{draw_to_surface, preferred_format, FrameOnSurface, Presented};
+pub use surface::{
+    draw_to_surface, preferred_format, surface_format, FrameOnSurface, Presented, SurfaceFormat,
+};
 pub use targets::FrameTargets;

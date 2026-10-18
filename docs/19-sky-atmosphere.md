@@ -326,7 +326,7 @@ développement n'est pas branchée : même courbe, moins de parité.
   passes LUT/sol/ciel/dev   DistantLight + DomeLight     (doc 18 : ne voit que
   (natif + WebGPU)          EXR + primvars exposition     des nombres, via
          │                       │                        ReferenceIllumination)
-  tuile-web worker ──LUT CPU──► façade three.js (DataTexture, NeutralToneMapping)
+  page web : tuile-viewer (coquille web) sur tuile-wgpu, mêmes passes — sans compute (WebGL2)
                                  │
                      tuile-hydra ABI C : tuile_develop_frame(rgb, z, cam, state)
                                  │

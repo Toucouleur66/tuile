@@ -7,6 +7,15 @@
 //! the features asked of the adapter — is a decision the rest of the session
 //! cannot revisit, so each one says out loud what it picked and why it might
 //! not have got it.
+//!
+//! The window comes first and at once; the GPU behind it is asked for
+//! asynchronously, because that is the only way a browser answers. A desktop
+//! and a phone wait for the answer on the spot, as they always did; a page
+//! collects it on a later turn of its loop ([`App::take_the_gpu`]), drawing
+//! nothing meanwhile — there is nothing yet to draw with.
+
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use super::{Active, App};
 use glam::DVec3;
@@ -15,13 +24,141 @@ use tuile_wgpu::{ContentPump, GpuContext, OverlayRenderer, TileRenderer, DEPTH_F
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
 
+/// Everything the device bring-up produces.
+pub(super) struct Gpu {
+    window: Arc<Window>,
+    instance: wgpu::Instance,
+    surface: wgpu::Surface<'static>,
+    format: tuile_wgpu::SurfaceFormat,
+    gpu: GpuContext,
+    backend: wgpu::Backend,
+}
+
+/// The GPU, asked for and not yet collected.
+pub(super) struct GpuOnItsWay(Rc<RefCell<Option<Result<Gpu, String>>>>);
+
+impl GpuOnItsWay {
+    /// Asks for a GPU that can draw into `window`, and waits for it: a
+    /// desktop and a phone have a thread they may block.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn start(window: Arc<Window>, backends: Option<wgpu::Backends>) -> Self {
+        let answer = pollster::block_on(bring_up(window, backends));
+        Self(Rc::new(RefCell::new(Some(answer))))
+    }
+
+    /// Asks for a GPU that can draw into `window`, and returns at once: a
+    /// browser answers on a later turn of its event loop.
+    #[cfg(target_arch = "wasm32")]
+    fn start(window: Arc<Window>, backends: Option<wgpu::Backends>) -> Self {
+        let slot = Rc::new(RefCell::new(None));
+        let answer = Rc::clone(&slot);
+        wasm_bindgen_futures::spawn_local(async move {
+            let up = bring_up(Arc::clone(&window), backends).await;
+            *answer.borrow_mut() = Some(up);
+            // The loop may be asleep, with nothing else to wake it: a frame
+            // asked for is a turn of the loop, which collects the answer.
+            window.request_redraw();
+        });
+        Self(slot)
+    }
+
+    /// The answer, once it has come.
+    fn take(&self) -> Option<Result<Gpu, String>> {
+        self.0.borrow_mut().take()
+    }
+}
+
+/// The instance, the surface on `window`, the adapter and the device.
+///
+/// `backends` narrows the instance — a page forcing WebGL2, say; `None` is
+/// the platform's default. A browser without WebGPU falls back to WebGL2 by
+/// itself: the instance is made with WebGPU detected rather than assumed.
+async fn bring_up(window: Arc<Window>, backends: Option<wgpu::Backends>) -> Result<Gpu, String> {
+    let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+    if let Some(backends) = backends {
+        descriptor.backends = backends;
+    }
+    let instance = wgpu::util::new_instance_with_webgpu_detection(descriptor).await;
+    let surface = instance
+        .create_surface(window.clone())
+        .map_err(|e| format!("create surface: {e}"))?;
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: Some(&surface),
+        })
+        .await
+        .map_err(|e| format!("adapter: {e}"))?;
+    // Which GPU, and through which API. Worth a line: every performance
+    // question that follows — what a present costs, what a buffer write
+    // costs, whether a timing tool applies at all — is answered differently
+    // per backend, and guessing which one is in play wastes the whole
+    // investigation.
+    let info = adapter.get_info();
+    tracing::info!(
+        backend = %info.backend,
+        device = %info.name,
+        kind = ?info.device_type,
+        driver = %info.driver_info,
+        "adapter"
+    );
+    // What the GPU costs, asked for only where it is on offer.
+    //
+    // Nothing was requested here at all, so there was no way to time a
+    // render pass: every performance question had to be answered from the
+    // CPU side, where a frame that is merely *waiting* for the GPU looks
+    // exactly like a frame that is idle. Timestamps are what tell those two
+    // apart.
+    //
+    // Intersected with what the adapter actually has rather than named
+    // outright, because a hard requirement here would turn a missing
+    // stopwatch into a viewer that refuses to start — on someone else's
+    // machine, over a diagnostic they were not using.
+    let wanted = wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+    let features = adapter.features() & wanted;
+    // Said out loud either way. A capability that is silently absent is one
+    // that gets reported later as a broken tool.
+    let missing = wanted - features;
+    if missing.is_empty() {
+        tracing::info!(?features, "gpu timing available");
+    } else {
+        tracing::info!(?features, ?missing, "gpu timing partly unavailable");
+    }
+    // Everything the adapter has, which is by definition what it supports: on
+    // WebGL2 that is the downlevel set raised to what the context reports, and
+    // the renderer fits its imagery slots to it.
+    let (device, queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some("viewer"),
+            required_limits: adapter.limits(),
+            required_features: features,
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| format!("device: {e}"))?;
+    let format = tuile_wgpu::surface_format(&surface.get_capabilities(&adapter));
+    Ok(Gpu {
+        window,
+        instance,
+        surface,
+        format,
+        gpu: GpuContext::new(device, queue),
+        backend: info.backend,
+    })
+}
+
 impl App {
     /// Creates the window and everything that hangs off it.
     pub(super) fn start_window(&mut self, event_loop: &ActiveEventLoop) {
         self.statusbar = super::readout::StatusBar::new();
         // Here and not earlier: a menu wants the application object the event
         // loop creates, and the main thread.
-        self.menu = crate::menu::Installed::install(self.imagery.layers);
+        // With the on-screen controls: a page that brings its own has its
+        // own menu too.
+        if self.controls {
+            self.menu = crate::menu::Installed::install(self.imagery.layers);
+        }
         if self.statusbar.is_none() {
             tracing::info!("no status-bar item on this platform; the readout is off");
         }
@@ -35,10 +172,49 @@ impl App {
         // A phone's window is the exception: the system ends an application
         // that shows nothing, so it opens at once on the globe's shell and the
         // loading indicator — see `loading`.
-        let attrs = Window::default_attributes()
+        let attrs = self
+            .window_attributes
+            .clone()
             .with_title(self.title.clone())
             .with_visible(!self.profile.hold_window_until_warm);
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
+        self.gpu_on_its_way = Some(GpuOnItsWay::start(window, self.backends));
+        self.take_the_gpu();
+    }
+
+    /// Finishes bringing the window up once its GPU has arrived; nothing
+    /// before then.
+    pub(super) fn take_the_gpu(&mut self) {
+        let Some(answer) = self.gpu_on_its_way.as_ref().and_then(GpuOnItsWay::take) else {
+            return;
+        };
+        self.gpu_on_its_way = None;
+        match answer {
+            Ok(gpu) => self.finish_window(gpu),
+            // Said the way a session that cannot start is: once, in the
+            // platform's own words. Nothing will ever be drawn, so an
+            // application whose window it is ends once that has been said.
+            Err(why) => {
+                tracing::error!("no GPU to draw with: {why}");
+                crate::desktop::drawing(Err(&why));
+                self.messages
+                    .say(format!("{} cannot draw", self.title), why);
+                self.ended_by = Some("no GPU could draw into the window");
+            }
+        }
+    }
+
+    /// Everything that hangs off a window and its device.
+    fn finish_window(&mut self, up: Gpu) {
+        let Gpu {
+            window,
+            instance,
+            surface,
+            format,
+            gpu,
+            backend,
+        } = up;
+        let surface_format = format.render;
         // The drawable is the whole window, edge to edge; on a phone the
         // inner size is only its safe area, which the controls keep to.
         let size = if self.profile.hold_window_until_warm {
@@ -62,69 +238,6 @@ impl App {
             scale,
             "display"
         );
-
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let surface = instance
-            .create_surface(window.clone())
-            .expect("create surface");
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
-            compatible_surface: Some(&surface),
-        }))
-        .expect("adapter");
-        // Which GPU, and through which API. Worth a line: every performance
-        // question that follows — what a present costs, what a buffer write
-        // costs, whether a timing tool applies at all — is answered differently
-        // per backend, and guessing which one is in play wastes the whole
-        // investigation.
-        let info = adapter.get_info();
-        tracing::info!(
-            backend = %info.backend,
-            device = %info.name,
-            kind = ?info.device_type,
-            driver = %info.driver_info,
-            "adapter"
-        );
-        // What the GPU costs, asked for only where it is on offer.
-        //
-        // Nothing was requested here at all, so there was no way to time a
-        // render pass: every performance question had to be answered from the
-        // CPU side, where a frame that is merely *waiting* for the GPU looks
-        // exactly like a frame that is idle. Timestamps are what tell those two
-        // apart.
-        //
-        // Intersected with what the adapter actually has rather than named
-        // outright, because a hard requirement here would turn a missing
-        // stopwatch into a viewer that refuses to start — on someone else's
-        // machine, over a diagnostic they were not using.
-        let wanted =
-            wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
-        let features = adapter.features() & wanted;
-        // Said out loud either way. A capability that is silently absent is one
-        // that gets reported later as a broken tool.
-        let missing = wanted - features;
-        if missing.is_empty() {
-            tracing::info!(?features, "gpu timing available");
-        } else {
-            tracing::info!(?features, ?missing, "gpu timing partly unavailable");
-        }
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("viewer"),
-            required_limits: adapter.limits(),
-            required_features: features,
-            ..Default::default()
-        }))
-        .expect("device");
-
-        let caps = surface.get_capabilities(&adapter);
-        let surface_format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| f.is_srgb())
-            .unwrap_or(caps.formats[0]);
-        let gpu = GpuContext::new(device, queue);
         // The loader has been running against the correctness floor since the
         // stream was built; this is the first moment anything knows what the
         // device will actually bind. On the WebGPU baseline it stays at the
@@ -147,7 +260,7 @@ impl App {
             window,
             instance,
             surface: Some(surface),
-            surface_format,
+            format,
             gpu,
             renderer,
             overlay,
@@ -166,6 +279,7 @@ impl App {
         // the first moment anything knows what the device will bind.
         self.fit_the_layer_budget();
         tracing::info!(slots = self.layer_budget.get(), "imagery layers per drape");
+        crate::desktop::drawing(Ok(backend.to_str()));
     }
 
     /// Lets go of the surface and shrinks the render targets to nothing: a
@@ -225,7 +339,7 @@ pub(super) fn safe_area(window: &Window, size: (u32, u32)) -> (f64, f64, f64, f6
 
 pub(super) fn configure_surface(active: &Active) {
     if let Some(surface) = active.surface.as_ref() {
-        configure(surface, &active.gpu, active.surface_format, active.size);
+        configure(surface, &active.gpu, active.format, active.size);
     }
 }
 
@@ -238,7 +352,7 @@ pub(super) fn configure_surface(active: &Active) {
 pub(super) fn configure(
     surface: &wgpu::Surface<'static>,
     gpu: &GpuContext,
-    format: wgpu::TextureFormat,
+    format: tuile_wgpu::SurfaceFormat,
     size: (u32, u32),
 ) {
     surface.configure(
@@ -253,13 +367,15 @@ pub(super) fn configure(
             } else {
                 wgpu::TextureUsages::RENDER_ATTACHMENT
             },
-            format,
+            format: format.surface,
             width: size.0,
             height: size.1,
             present_mode: wgpu::PresentMode::AutoVsync,
             desired_maximum_frame_latency: 2,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
-            view_formats: vec![],
+            // The sRGB view a browser's linear canvas is drawn through; empty
+            // everywhere the surface is sRGB itself.
+            view_formats: format.view_formats(),
         },
     );
 }

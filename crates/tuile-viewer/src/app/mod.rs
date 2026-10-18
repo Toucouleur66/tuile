@@ -7,6 +7,7 @@
 
 mod command;
 mod demand;
+mod flight;
 mod frame;
 mod gestures;
 mod imagery;
@@ -76,10 +77,17 @@ pub struct ViewerConfig {
     pub pinned_level: Option<u32>,
     /// How hard the session may push the machine.
     pub(crate) profile: crate::profile::Profile,
-    /// The session's async runtime, for flushing the store on the way out.
-    pub runtime: tokio::runtime::Handle,
     /// How a failed start-up is tried again; `None` where it is not.
     pub(crate) retries: Option<crate::launch::Retries>,
+    /// The window the shell wants: a desktop's or a phone's own, or a
+    /// browser page's canvas. The title and the visibility are the
+    /// application's to set.
+    pub(crate) window: winit::window::WindowAttributes,
+    /// Whether the on-screen controls are drawn and take the pointer first.
+    pub(crate) controls: bool,
+    /// The graphics backends to choose from; `None` is the platform's own
+    /// choice. A page may force WebGL2, say, to test it.
+    pub(crate) backends: Option<wgpu::Backends>,
 }
 
 /// Where the on-screen controls live: the part of the frame not under a
@@ -132,7 +140,8 @@ struct Active {
     instance: wgpu::Instance,
     /// `None` while released: see [`lifecycle`].
     surface: Option<wgpu::Surface<'static>>,
-    surface_format: wgpu::TextureFormat,
+    /// What the surface is configured with, and what the frame is drawn in.
+    format: tuile_wgpu::SurfaceFormat,
     gpu: GpuContext,
     renderer: TileRenderer,
     overlay: OverlayRenderer,
@@ -202,8 +211,8 @@ pub(crate) const DIAGNOSTICS: [(&str, &str); 4] = [
 
 pub struct App {
     controller: CameraController,
-    detail: tuile_planetary::ImageryDetail,
-    layer_budget: tuile_planetary::LayerBudget,
+    detail: crate::shell::Detail,
+    layer_budget: crate::shell::Budget,
     title: String,
     /// Where the sun is for the instant the scene is lit at. Resolved once: the
     /// hour is fixed for a session, so recomputing the ephemeris every frame
@@ -213,7 +222,7 @@ pub struct App {
     /// `resumed`, and that is the only reason this is an `Option`.
     active: Option<Active>,
     /// The session, once it is up: its stream and the globe's handles.
-    session: Option<crate::launch::Started>,
+    session: Option<crate::shell::Started>,
     /// The session on its way up; `None` once it has arrived or failed.
     launch: Option<crate::launch::Launch>,
     /// Why the session could not start, once that is known.
@@ -223,9 +232,14 @@ pub struct App {
     /// Trying a failed start-up again, on a phone.
     retries: Option<crate::launch::Retries>,
     /// When the start-up now under way began.
-    launching_since: Option<std::time::Instant>,
+    launching_since: Option<web_time::Instant>,
     profile: crate::profile::Profile,
-    runtime: tokio::runtime::Handle,
+    /// The window the shell asked for; see [`ViewerConfig::window`].
+    window_attributes: winit::window::WindowAttributes,
+    /// The GPU on its way up, where bringing it up cannot block: see `setup`.
+    gpu_on_its_way: Option<setup::GpuOnItsWay>,
+    /// See [`ViewerConfig::backends`].
+    backends: Option<wgpu::Backends>,
     lifecycle: lifecycle::Lifecycle,
     loading: loading::Loading,
     demand: demand::Demand,
@@ -239,7 +253,7 @@ pub struct App {
     /// The device's temperature and power saving, and when they were read.
     thermal: crate::profile::Thermal,
     low_power: bool,
-    device_read: Option<std::time::Instant>,
+    device_read: Option<web_time::Instant>,
 
     // The rest is grouped by the module that owns it, so that a field and the
     // code that reads it are never in different files. Each of these is defined
@@ -254,6 +268,9 @@ pub struct App {
     /// The on-screen navigation control. It sees pointer events first and, when
     /// it takes one, the globe must not also act on it.
     nav: NavWidget,
+    /// Whether it is drawn at all: a page embedding the globe may bring its
+    /// own.
+    controls: bool,
     /// The request for the current location, from the key press or `--here`
     /// to the frame the system's answer arrives on.
     locator: crate::location::Locator,
@@ -265,13 +282,15 @@ pub struct App {
     imagery: imagery::Imagery,
     /// Steering waiting to be carried out.
     requests: std::sync::mpsc::Receiver<crate::steer::Request>,
+    /// A glide under way, which any gesture ends.
+    flight: Option<flight::Flight>,
     /// Tiles drawn in the last frame, and whether all were the ones selected.
     drawn: (usize, bool),
     /// The last thing said to the person, and when.
-    notice: Option<(String, std::time::Instant)>,
+    notice: Option<(String, web_time::Instant)>,
     /// What the title bar shows, and when it was last looked at.
     title_shown: String,
-    title_at: std::time::Instant,
+    title_at: web_time::Instant,
     /// Why the session is ending, once something has decided that it is.
     pub(crate) ended_by: Option<&'static str>,
     /// Whether the view is written down at the end for the next start.
@@ -298,14 +317,15 @@ impl App {
         // system's question — if it has one — is up while the globe warms.
         let mut locator = crate::location::Locator::platform();
         if let Some(placement) = config.here {
-            locator.request(std::time::Instant::now(), placement);
+            locator.request(web_time::Instant::now(), placement);
         }
-        let now = std::time::Instant::now();
+        let now = web_time::Instant::now();
         let mut app = Self {
             imagery: imagery::Imagery::new(config.layers, config.layer),
             locator,
             located: false,
             requests,
+            flight: None,
             drawn: (0, false),
             notice: None,
             title_shown: String::new(),
@@ -313,8 +333,8 @@ impl App {
             ended_by: None,
             remembers: config.remembers,
             controller: config.controller.clone(),
-            detail: tuile_planetary::ImageryDetail::default(),
-            layer_budget: tuile_planetary::LayerBudget::default(),
+            detail: Default::default(),
+            layer_budget: Default::default(),
             title: config.title.clone(),
             sun: tuile_atmosphere::Sun::at_unix_seconds(config.lit_at_unix_seconds),
             active: None,
@@ -364,6 +384,7 @@ impl App {
                 last_log: now,
             },
             nav: NavWidget::new(),
+            controls: config.controls,
             occluded: false,
             // Built with the window rather than here: a status item wants the
             // main thread and an event loop already running.
@@ -374,7 +395,9 @@ impl App {
                 ..crate::session::Stats::default()
             },
             profile: config.profile,
-            runtime: config.runtime,
+            window_attributes: config.window,
+            gpu_on_its_way: None,
+            backends: config.backends,
         };
         app.retries = config.retries;
         // A desktop's launch has already arrived: adopt it before the first
@@ -386,7 +409,7 @@ impl App {
     /// Takes the session if it has arrived since the last turn of the loop,
     /// or the reason it never will. Never waits.
     fn take_the_session(&mut self) {
-        let now = std::time::Instant::now();
+        let now = web_time::Instant::now();
         // A start-up that failed, due again: on a phone, and only in front.
         if self.launch.is_none()
             && self.session.is_none()
@@ -435,7 +458,7 @@ impl App {
 
     /// What the caption says while the session is not up and is being tried
     /// again: the explicit "offline, retrying" state.
-    fn waiting_note(&self, now: std::time::Instant) -> Option<String> {
+    fn waiting_note(&self, now: web_time::Instant) -> Option<String> {
         self.failed.as_ref()?;
         let retries = self.retries.as_ref()?;
         Some(match retries.next() {
@@ -450,7 +473,7 @@ impl App {
     /// Takes over a session that has come up: its stream, the relief the
     /// camera stands on, the imagery detail the loader reads, how many layers
     /// a drape may carry.
-    fn adopt(&mut self, started: crate::launch::Started) {
+    fn adopt(&mut self, started: crate::shell::Started) {
         self.controller = self.controller.clone().with_ground(started.heights.clone());
         self.detail = started.detail.clone();
         self.layer_budget = started.layer_budget.clone();
@@ -487,37 +510,15 @@ impl App {
         );
     }
 
-    /// Closes the session down: the stream, then the store, then the server.
-    ///
-    /// The store is closed *before* the server is joined: the server thread
-    /// blocks on the runtime, and the runtime waits for the store's blocking
-    /// workers — so waiting for the thread first and only then asking the
-    /// store to close is a deadlock by construction. A phone, on its way out,
-    /// is given seconds for all of it, and does not wait for the server.
-    pub fn shut_down(&mut self, handle: &tokio::runtime::Handle) {
+    /// Closes the session down: the stream, the store, the server. A phone, on
+    /// its way out, is given seconds for all of it.
+    pub fn shut_down(&mut self) {
         let Some(session) = self.session.take() else {
             return;
         };
-        let crate::launch::Started {
-            stream,
-            server,
-            store,
-            ..
-        } = session;
-        drop(stream);
-        let patience = if self.profile.hold_window_until_warm {
-            std::time::Duration::from_secs(60)
-        } else {
-            std::time::Duration::from_secs(3)
-        };
-        crate::settings::close_the_store(store, handle, patience);
-        if self.profile.hold_window_until_warm {
-            if let Some(server) = server {
-                if server.join().is_err() {
-                    tracing::error!("the geometry server panicked; its last work is lost");
-                }
-            }
-        }
+        let desktop = self.profile.hold_window_until_warm;
+        let patience = std::time::Duration::from_secs(if desktop { 60 } else { 3 });
+        session.close(patience, desktop);
     }
 
     /// A one-line summary of the session, for the exit log.
@@ -528,7 +529,7 @@ impl App {
     /// Moves the view if the location that was asked for has arrived, and
     /// says how the request ended either way.
     fn take_the_location(&mut self) {
-        let now = std::time::Instant::now();
+        let now = web_time::Instant::now();
         if let Some(outcome) = self.locator.tick(now, &mut self.controller) {
             self.located |= matches!(outcome, crate::location::Outcome::Centred { .. });
             self.say(&outcome.to_string());
@@ -537,27 +538,19 @@ impl App {
 
     /// Leaves the view this session ends on for the next one to open on.
     ///
-    /// Only for a session started from an icon: from a terminal, the view a
-    /// command opens on is what the command says and nothing else. And never
-    /// a view centred on the current location — that one is not written
-    /// anywhere, and the file from before is removed so that the next start
-    /// does not pretend to return to it.
+    /// Only for a session that opens where the last one ended — a desktop's
+    /// started from an icon, a page's unless it says where to open: from a
+    /// terminal, the view a command opens on is what the command says and
+    /// nothing else. And never a view centred on the current location — that
+    /// one is not written anywhere, and the one from before is forgotten so
+    /// that the next start does not pretend to return to it.
     fn remember_the_view(&self) {
         if !self.remembers {
             return;
         }
-        let Some(file) = crate::host::last_view_file(&crate::host::Machine) else {
-            return;
-        };
-        if self.located {
-            let _ = std::fs::remove_file(&file);
-            return;
-        }
-        let link = crate::steer::link(&crate::steer::view_of(self.controller.target()));
-        if let Some(dir) = file.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = std::fs::write(&file, format!("{link}\n"));
+        let link = (!self.located)
+            .then(|| crate::steer::link(&crate::steer::view_of(self.controller.target())));
+        crate::shell::keep_the_view(link.as_deref());
     }
 
     /// Tells the person something they asked about, where they are looking.
@@ -568,10 +561,66 @@ impl App {
     /// stays a few seconds, or until the next one replaces it.
     fn say(&mut self, message: &str) {
         tracing::info!("{message}");
-        let now = std::time::Instant::now();
+        let now = web_time::Instant::now();
         self.notice = Some((message.to_owned(), now));
         // Shown on the next turn of the loop, not a quarter of a second on.
         self.title_at = now - std::time::Duration::from_secs(1);
+    }
+
+    /// Ends the session: says why, closes the tape, leaves the view for the
+    /// next start, and closes the session where the loop will not return to
+    /// do it — a phone's and a page's.
+    ///
+    /// Run as the loop unwinds, and by a page destroying its viewer, whose
+    /// loop goes on for the next one. Written here and not after the loop
+    /// returns: quitting from the application menu ends the process inside
+    /// the loop, and what follows `run_app` never runs.
+    pub(crate) fn end(&mut self) {
+        crate::journal::note(&format!(
+            "session ended: {}",
+            self.ended_by.unwrap_or("the application was asked to quit")
+        ));
+        self.close_the_tape();
+        self.remember_the_view();
+        if !self.profile.hold_window_until_warm {
+            self.shut_down();
+        }
+    }
+
+    /// The view has gone off screen, or come back: a covered window, a phone
+    /// in the background, a hidden tab.
+    pub(crate) fn hidden(&mut self, hidden: bool) {
+        // Possibly the last moment the application runs: a tab that is
+        // closed is hidden first, and a phone ends what it put away.
+        if hidden {
+            self.remember_the_view();
+        }
+        // Rendering while covered leaks GPU memory on Apple platforms (see
+        // `render`), and a covered surface does not block on vsync, so the
+        // loop would free-run and leak all the faster. Where the platform asks
+        // more of an application away — holding loads, trimming — the
+        // lifecycle says what that takes.
+        if self.profile.pause_loads_when_hidden {
+            let steps = if hidden {
+                self.lifecycle.background()
+            } else {
+                self.lifecycle.foreground()
+            };
+            self.carry_out(steps);
+        } else {
+            self.occluded = hidden;
+            if let Some(active) = self.active.as_ref() {
+                active.window.request_redraw();
+            }
+        }
+    }
+
+    /// Asks for a frame now, whatever the pacing was waiting for.
+    pub(crate) fn draw_soon(&mut self) {
+        self.demand.poke();
+        if let Some(active) = self.active.as_ref() {
+            active.window.request_redraw();
+        }
     }
 
     fn viewport(&self) -> (f64, f64) {
@@ -618,7 +667,7 @@ impl ApplicationHandler for App {
             // Back in front: a start-up that failed is tried at once — the
             // person may have just typed a token in the system's settings.
             if let Some(retries) = self.retries.as_mut() {
-                retries.foreground(std::time::Instant::now());
+                retries.foreground(web_time::Instant::now());
             }
             return;
         }
@@ -652,21 +701,7 @@ impl ApplicationHandler for App {
     /// first session recorded left a zero-byte file, because a container
     /// without its footer is not a file anything will open.
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        // Written here and not after the loop returns: quitting from the
-        // application menu ends the process inside the loop, and what follows
-        // `run_app` never runs.
-        crate::journal::note(&format!(
-            "session ended: {}",
-            self.ended_by.unwrap_or("the application was asked to quit")
-        ));
-        self.close_the_tape();
-        self.remember_the_view();
-        // A phone's loop never returns to `session`, so this is the last
-        // chance to flush the store.
-        if !self.profile.hold_window_until_warm {
-            let handle = self.runtime.clone();
-            self.shut_down(&handle);
-        }
+        self.end();
     }
 
     /// Drives the animation: one redraw per loop iteration while the window is
@@ -678,8 +713,15 @@ impl ApplicationHandler for App {
         // location is taken on whatever turn of the loop it arrives, hidden
         // and warming included.
         self.take_the_session();
-        self.messages
-            .offer(self.active.is_some(), crate::desktop::try_alert);
+        self.take_the_gpu();
+        self.messages.offer(
+            self.active.is_some() || self.ended_by.is_some(),
+            crate::desktop::try_alert,
+        );
+        if self.ended_by.is_some() && self.profile.owns_its_window {
+            event_loop.exit();
+            return;
+        }
         self.take_the_location();
         self.take_the_commands();
         self.take_the_imagery();

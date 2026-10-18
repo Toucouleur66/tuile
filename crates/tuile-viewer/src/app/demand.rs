@@ -14,7 +14,8 @@
 //!
 //! Pure: what the frame saw in, a [`Pace`] out, the clock passed in.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 /// Quiet for this long before the rate drops: an ease coming to rest, a
 /// finger lifting between two gestures.

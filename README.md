@@ -49,13 +49,12 @@ is whatever holds the other end of it.
   runtime, the window sends its camera and pumps tiles to the GPU as they
   arrive. A coarser tile is drawn until its replacement is resident, so the
   ground refines and never blinks out.
-- **In a browser.** `tuile-web` runs the *same* geometry server, traversal and
-  planetary loader inside a Web Worker, fetching with the page's own `fetch`;
-  `examples/web-viewer` only draws what the worker selects, with a JavaScript
-  scene library instead of wgpu. If the page and the native viewer disagree
-  about what is on screen, the disagreement is in a renderer, not in the
-  engine. `examples/wasm-globe` is the same engine with no renderer at all:
-  traversal, decoding and geometry in wasm, reported back to the page.
+- **In a browser.** The same application: `tuile-viewer`'s web shell draws on a
+  page's canvas with the same `tuile-wgpu` renderer — WebGPU, or WebGL2 where
+  there is none — while the *same* geometry server, traversal and planetary
+  loader run in a Web Worker, its messages crossing `postMessage` through
+  `tuile-web`. It ships as an ES module package (`packages/tuile-viewer`);
+  `examples/web-viewer` is a page that imports it.
 - **The camera** is its own crate. `tuile-camera` is a render-agnostic globe
   camera and input controller — drag anchored on the ellipsoid, zoom by
   altitude, tilt — that produces the view states the core consumes;
@@ -251,7 +250,7 @@ Routing, authentication and limits belong to whoever deploys it.
 | | `tuile-bing` | Connector: imagery metadata, quadkeys, tiles |
 | | `tuile-native-fetchers` | Pooled HTTP client with a browser-style cache |
 | | `tuile-storage-foyer` | A memory-over-disk content store |
-| | `tuile-web` | Browser transport and an in-worker geometry server |
+| | `tuile-web` | Browser transport: `fetch`, and the streaming protocol over `postMessage` |
 | Rendering | `tuile-wgpu` | The reference wgpu backend, native and wasm |
 | | `tuile-hydra` | C ABI over the geometry server, for a Hydra plugin |
 | | `tuile-usd` | A recorded camera path and a globe, as a USD stage |

@@ -219,6 +219,7 @@ pub(crate) fn log_file_of(host: &dyn Host, name: &str) -> Option<PathBuf> {
 
 /// Where a session started from an icon leaves the view it ended on, for the
 /// next one to open on: one line, a `goto` URL.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn last_view_file(host: &dyn Host) -> Option<PathBuf> {
     Some(support_dir(host)?.join("last-view"))
 }
@@ -302,6 +303,7 @@ pub(crate) fn token(host: &dyn Host, variable: &str) -> Result<(String, TokenFro
 /// Whether this executable sits inside an application bundle — which is to
 /// say, whether it was probably started from an icon, with no terminal to
 /// read its errors and no shell to have set its environment.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn is_bundled(executable: &Path) -> bool {
     let mut up = executable.ancestors().skip(1);
     let in_macos = up.next().and_then(Path::file_name) == Some("MacOS".as_ref());

@@ -32,6 +32,7 @@ impl App {
                     Ok(commands) => commands.into_iter().for_each(|c| self.apply(c)),
                     Err(why) => tracing::error!("steering URL ignored: {why}"),
                 },
+                Request::Pasted(text) => self.go_to_the_link(text),
             }
         }
     }
@@ -39,7 +40,22 @@ impl App {
     pub(super) fn apply(&mut self, command: Command) {
         match command {
             Command::Goto(goto) => {
-                steer::go(&mut self.controller, goto);
+                match goto.seconds.filter(|s| *s > 0.0) {
+                    Some(seconds) => {
+                        let from = steer::view_of(self.controller.target());
+                        let to = steer::destination(&self.controller, goto);
+                        self.flight = Some(super::flight::Flight::new(
+                            from,
+                            to,
+                            web_time::Instant::now(),
+                            seconds,
+                        ));
+                    }
+                    None => {
+                        self.flight = None;
+                        steer::go(&mut self.controller, goto);
+                    }
+                }
                 // A place somebody named is not a secret.
                 self.located = false;
             }
@@ -48,7 +64,7 @@ impl App {
                 steer::north_up(&mut self.controller, viewport);
             }
             Command::Here => self.locator.request(
-                std::time::Instant::now(),
+                web_time::Instant::now(),
                 crate::location::Placement::OVERHEAD,
             ),
             Command::Freeze(on) => {
@@ -66,9 +82,15 @@ impl App {
             }
             Command::CopyLink => self.copy_the_link(),
             Command::PasteLink => self.go_to_the_copied_link(),
-            Command::ShowKeys => crate::desktop::alert(
+            // An application that is its own window was started with flags;
+            // a page's viewer was started by its host's script, and has none.
+            Command::ShowKeys if self.profile.owns_its_window => crate::desktop::alert(
                 &format!("{} — keys and flags", self.title),
                 &crate::start::usage(),
+            ),
+            Command::ShowKeys => crate::desktop::alert(
+                &format!("{} — keys and gestures", self.title),
+                &crate::start::keys(),
             ),
             Command::Imagery(layer) => self.drape(layer),
             Command::NextImagery => {
@@ -95,7 +117,17 @@ impl App {
     /// in another session. Only a `goto`: what is pasted is a place, and a
     /// clipboard is not a way to flip switches.
     fn go_to_the_copied_link(&mut self) {
-        let goto = crate::desktop::paste()
+        match crate::desktop::paste() {
+            crate::desktop::Pasted::Now(text) => self.go_to_the_link(text),
+            // The text comes back on the queue: see `take_the_commands`.
+            crate::desktop::Pasted::Later => {}
+        }
+    }
+
+    /// Goes where `text`, from the clipboard, says — if it is a link to a
+    /// view and nothing else.
+    fn go_to_the_link(&mut self, text: Option<String>) {
+        let goto = text
             .and_then(|text| steer::parse_url(text.trim()).ok())
             .and_then(|commands| match commands.as_slice() {
                 [Command::Goto(goto)] => Some(*goto),
@@ -164,7 +196,7 @@ impl App {
         /// How long a message stays beside the position.
         const NOTICE: std::time::Duration = std::time::Duration::from_secs(8);
 
-        let now = std::time::Instant::now();
+        let now = web_time::Instant::now();
         if now.duration_since(self.title_at) < EVERY {
             return;
         }
@@ -206,6 +238,7 @@ impl App {
                 caption = format!("{caption} — {waiting}");
             }
             crate::desktop::caption(&caption);
+            crate::desktop::view(snapshot);
             self.title_shown = title;
         }
     }

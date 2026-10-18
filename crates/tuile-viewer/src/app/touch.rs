@@ -26,7 +26,8 @@
 //! [`CameraController::drag`]: tuile_camera::CameraController::drag
 
 use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 /// Pixels two fingers travel before what they are doing is decided.
 const DECIDE_AFTER_PX: f64 = 12.0;

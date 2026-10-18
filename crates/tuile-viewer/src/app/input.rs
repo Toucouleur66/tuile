@@ -100,7 +100,7 @@ impl App {
                             self.apply(command);
                         }
                     }
-                    Key::Named(NamedKey::Escape) => {
+                    Key::Named(NamedKey::Escape) if self.profile.owns_its_window => {
                         self.ended_by = Some("Esc was pressed");
                         event_loop.exit();
                     }
@@ -113,14 +113,18 @@ impl App {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
+                // A hand on the globe ends any glide.
+                if pressed {
+                    self.flight = None;
+                }
                 match button {
                     MouseButton::Left if pressed => {
                         // The control gets first refusal; only what it declines
                         // becomes a globe drag.
                         let ui = self.ui_frame();
                         let cursor = ui.to(self.pointer.cursor);
-                        self.pointer.dragging =
-                            !self.nav.press(cursor, ui.size, &mut self.controller);
+                        self.pointer.dragging = !(self.controls
+                            && self.nav.press(cursor, ui.size, &mut self.controller));
                     }
                     MouseButton::Left => {
                         self.pointer.dragging = false;
@@ -139,9 +143,10 @@ impl App {
                 let ui = self.ui_frame();
                 let prev = self.pointer.cursor;
                 let cur = (position.x, position.y);
-                if self
-                    .nav
-                    .drag(ui.to(prev), ui.to(cur), ui.size, &mut self.controller)
+                if self.controls
+                    && self
+                        .nav
+                        .drag(ui.to(prev), ui.to(cur), ui.size, &mut self.controller)
                 {
                     // The control owns this gesture.
                 } else if self.pointer.dragging {
@@ -156,6 +161,7 @@ impl App {
                 self.pointer.cursor = cur;
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                self.flight = None;
                 let amount = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y as f64,
                     MouseScrollDelta::PixelDelta(p) => p.y / 50.0,
@@ -202,26 +208,9 @@ impl App {
                 );
             }
             // The display slept, the window was minimized or another window
-            // covers it. Rendering anyway leaks GPU memory on Apple platforms
-            // (see `render`), and an occluded surface does not block on vsync,
-            // so the loop would free-run and leak all the faster.
-            //
-            // On a phone this is the application entering and leaving the
-            // background, and the lifecycle says what that takes.
-            WindowEvent::Occluded(occluded) if self.profile.release_surface_in_background => {
-                let steps = if occluded {
-                    self.lifecycle.background()
-                } else {
-                    self.lifecycle.foreground()
-                };
-                self.carry_out(steps);
-            }
-            WindowEvent::Occluded(occluded) => {
-                self.occluded = occluded;
-                if let Some(active) = self.active.as_ref() {
-                    active.window.request_redraw();
-                }
-            }
+            // covers it; on a phone, the application left the front; in a
+            // browser, the tab was hidden.
+            WindowEvent::Occluded(occluded) => self.hidden(occluded),
             WindowEvent::RedrawRequested => self.render(),
             _ => {}
         }

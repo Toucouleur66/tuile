@@ -66,7 +66,13 @@ pub(crate) struct Goto {
     pub altitude: Option<f64>,
     pub heading: Option<f64>,
     pub pitch: Option<f64>,
+    /// Glide there over this many seconds rather than jump: see
+    /// `app::flight`. `seconds=` in a URL, `flyTo` on a page.
+    pub seconds: Option<f64>,
 }
+
+/// The longest glide a URL may ask for, seconds.
+pub(crate) const LONGEST_GLIDE: f64 = 60.0;
 
 /// One thing the view can be told to do, whoever is telling it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -130,9 +136,22 @@ pub(crate) enum Request {
     /// A script's `set imagery to "…"`: a layer by key or name, still to be
     /// looked up in the host's list.
     Imagery(String),
+    /// The clipboard's text, read for "go to copied link" by a platform
+    /// whose clipboard answers later: see `crate::desktop::Pasted`.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    Pasted(Option<String>),
 }
 
 impl Goto {
+    /// Whether it says where, rather than only how long to take.
+    fn says_where(&self) -> bool {
+        *self
+            != Self {
+                seconds: self.seconds,
+                ..Self::default()
+            }
+    }
+
     /// A goto from numbers a script handed over, held to the flags' bounds
     /// like everything else: `(name, value)` pairs, names as in the URLs.
     #[cfg_attr(
@@ -151,7 +170,7 @@ impl Goto {
                 _ => goto.pitch = Some(value),
             }
         }
-        if goto == Self::default() {
+        if !goto.says_where() {
             return Err("go to says nowhere: give at least one parameter".to_owned());
         }
         Ok(goto)
@@ -210,6 +229,17 @@ pub(crate) fn parse_url_among(
         "goto" => {
             let mut goto = Goto::default();
             for (key, text) in &pairs {
+                if *key == "seconds" {
+                    goto.seconds = Some(
+                        text.parse::<f64>()
+                            .ok()
+                            .filter(|s| (0.0..=LONGEST_GLIDE).contains(s))
+                            .ok_or_else(|| {
+                                format!("seconds is between 0 and {LONGEST_GLIDE}, not {text:?}")
+                            })?,
+                    );
+                    continue;
+                }
                 let value = crate::start::value(key, text)?;
                 match *key {
                     "lon" => goto.lon = Some(value),
@@ -220,7 +250,7 @@ pub(crate) fn parse_url_among(
                     _ => goto.pitch = Some(value),
                 }
             }
-            if goto == Goto::default() {
+            if !goto.says_where() {
                 return Err("goto says nowhere: give at least one of lon, lat, \
                             altitude, heading, pitch"
                     .to_owned());
@@ -284,15 +314,20 @@ fn tidy_heading(degrees: f64) -> f64 {
 /// Puts the eye where `goto` says, keeping the present value of whatever it
 /// leaves out. A jump, not a glide: see [`jump`].
 pub(crate) fn go(controller: &mut CameraController, goto: Goto) {
+    jump(controller, destination(controller, goto).camera());
+}
+
+/// The view `goto` names from where the eye now is: what it leaves out keeps
+/// its present value.
+pub(crate) fn destination(controller: &CameraController, goto: Goto) -> StartView {
     let now = view_of(controller.target());
-    let view = StartView {
+    StartView {
         lon: goto.lon.unwrap_or(now.lon),
         lat: goto.lat.unwrap_or(now.lat),
         altitude: goto.altitude.unwrap_or(now.altitude),
         heading: goto.heading.unwrap_or(now.heading),
         pitch: goto.pitch.unwrap_or(now.pitch),
-    };
-    jump(controller, view.camera());
+    }
 }
 
 /// The URL that brings a viewer back to this view: a bookmark, and the
@@ -567,8 +602,27 @@ mod tests {
                 altitude: Some(1200.0),
                 heading: Some(0.0),
                 pitch: Some(30.0),
+                seconds: None,
             })
         );
+    }
+
+    /// `seconds=` makes a goto a glide; it is bounded, and alone it says
+    /// nowhere.
+    #[test]
+    fn a_goto_with_seconds_is_a_glide() {
+        assert_eq!(
+            one("tuile://goto?lon=6.86&lat=45.83&seconds=2.5"),
+            Command::Goto(Goto {
+                lon: Some(6.86),
+                lat: Some(45.83),
+                seconds: Some(2.5),
+                ..Goto::default()
+            })
+        );
+        assert!(parse_url("tuile://goto?seconds=3").is_err());
+        assert!(parse_url("tuile://goto?lat=1&seconds=61").is_err());
+        assert!(parse_url("tuile://goto?lat=1&seconds=soon").is_err());
     }
 
     #[test]

@@ -28,6 +28,12 @@
 //! A desktop only ever sees its window covered and uncovered, and does what it
 //! always did: stops drawing while covered.
 //!
+//! A browser tab sits between the two. Hidden, it holds its loads and trims
+//! like a phone — a tab in the background is still the user's memory — but
+//! keeps its surface, which a page cannot rebuild cheaply (a WebGL2 device is
+//! bound to its canvas), and comes straight back to the front when shown
+//! again: a page has no separate "activate".
+//!
 //! Pure: events in, [`Step`]s out. The window carries the steps out.
 
 /// Where the application stands.
@@ -64,8 +70,12 @@ pub(super) enum Step {
 #[derive(Debug)]
 pub(super) struct Lifecycle {
     phase: Phase,
-    /// A phone's rules, or a desktop's. See the module.
-    handheld: bool,
+    /// Whether loads are held and residency trimmed while away: a phone and a
+    /// browser tab. See the module.
+    pause_when_away: bool,
+    /// Whether the surface is let go of too, and the way back passes through
+    /// an activation: a phone.
+    release_surface: bool,
     surface_released: bool,
     store_suspended: bool,
     /// Bytes to trim to on a memory warning, and in the background.
@@ -77,7 +87,8 @@ impl Lifecycle {
     pub(super) fn new(profile: &crate::profile::Profile) -> Self {
         Self {
             phase: Phase::Active,
-            handheld: profile.release_surface_in_background,
+            pause_when_away: profile.pause_loads_when_hidden,
+            release_surface: profile.release_surface_in_background,
             surface_released: false,
             store_suspended: false,
             trim_on_warning: profile.trim_on_warning(),
@@ -100,7 +111,7 @@ impl Lifecycle {
             return Vec::new();
         }
         self.phase = Phase::Inactive;
-        if self.handheld {
+        if self.pause_when_away {
             vec![Step::PauseLoads]
         } else {
             Vec::new()
@@ -110,7 +121,7 @@ impl Lifecycle {
     /// The application, or its window, is no longer on screen.
     pub(super) fn background(&mut self) -> Vec<Step> {
         let was = std::mem::replace(&mut self.phase, Phase::Background);
-        if !self.handheld || was == Phase::Background {
+        if !self.pause_when_away || was == Phase::Background {
             return Vec::new();
         }
         let mut steps = Vec::new();
@@ -123,7 +134,7 @@ impl Lifecycle {
         if !std::mem::replace(&mut self.store_suspended, true) {
             steps.push(Step::SuspendStore);
         }
-        if !self.surface_released {
+        if self.release_surface && !self.surface_released {
             self.surface_released = true;
             steps.push(Step::ReleaseSurface);
         }
@@ -132,8 +143,12 @@ impl Lifecycle {
 
     /// The application is on its way back, not yet in front.
     pub(super) fn foreground(&mut self) -> Vec<Step> {
+        // A tab shown again is in front again, and resumes everything it held.
+        if self.phase == Phase::Background && self.pause_when_away && !self.release_surface {
+            return self.activate();
+        }
         if self.phase == Phase::Background {
-            self.phase = if self.handheld {
+            self.phase = if self.release_surface {
                 Phase::Inactive
             } else {
                 // A desktop's window uncovered is in front again.
@@ -157,7 +172,7 @@ impl Lifecycle {
         if std::mem::take(&mut self.store_suspended) {
             steps.push(Step::ResumeStore);
         }
-        if self.handheld && was != Phase::Active {
+        if self.pause_when_away && was != Phase::Active {
             steps.push(Step::ResumeLoads);
         }
         steps.push(Step::Redraw);
@@ -259,6 +274,31 @@ mod tests {
         assert!(!l.may_draw());
         assert_eq!(l.foreground(), [Step::Redraw]);
         assert!(l.may_draw());
+    }
+
+    /// A browser tab hidden and shown: loads held and residency trimmed while
+    /// hidden, the surface kept, and everything resumed the moment it is
+    /// shown — no activation to wait for.
+    #[test]
+    fn a_browser_tab_hidden_and_shown() {
+        let p = Profile::browser(false, None);
+        let mut l = Lifecycle::new(&p);
+        assert_eq!(
+            l.background(),
+            [
+                Step::PauseLoads,
+                Step::Trim(p.trim_in_background()),
+                Step::SuspendStore
+            ]
+        );
+        assert!(!l.may_draw(), "no frame while hidden");
+        assert!(l.background().is_empty(), "said twice, done once");
+        assert_eq!(
+            l.foreground(),
+            [Step::ResumeStore, Step::ResumeLoads, Step::Redraw]
+        );
+        assert!(l.may_draw());
+        assert_eq!(l.phase(), Phase::Active);
     }
 
     #[test]

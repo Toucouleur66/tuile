@@ -75,8 +75,8 @@ pub(crate) fn note(what: &str) {
         .write(true)
         .truncate(oversized)
         .open(&path);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let now = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     if let Ok(mut file) = file {
         let _ = writeln!(file, "{} [{}] {what}", timestamp(now), std::process::id());
@@ -85,6 +85,7 @@ pub(crate) fn note(what: &str) {
 
 /// Marks the start of a session, and makes a panic leave its line before the
 /// process goes.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn open() {
     note(&format!("started, version {}", env!("CARGO_PKG_VERSION")));
     let previous = std::panic::take_hook();

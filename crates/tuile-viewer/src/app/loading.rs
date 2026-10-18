@@ -20,7 +20,8 @@
 //! Pure: observations in, an [`Indicator`] out, the clock passed in. The
 //! window turns the indicator into a [`tuile_ui::Spinner`].
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 /// How long a fade takes, in or out.
 const FADE: Duration = Duration::from_millis(350);

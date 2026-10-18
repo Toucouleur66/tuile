@@ -69,7 +69,7 @@ impl App {
     /// depend on.
     fn start_the_frame(&mut self) -> std::time::Duration {
         let dt = self.pacing.last_frame.elapsed();
-        self.pacing.last_frame = std::time::Instant::now();
+        self.pacing.last_frame = web_time::Instant::now();
         let m = tuile_core::metrics::metrics();
         m.frames.inc();
         m.frame_seconds.record(dt);
@@ -82,6 +82,14 @@ impl App {
     fn ease_the_camera(&mut self, dt: std::time::Duration) {
         let before = self.controller.camera.position;
         self.controller.advance(dt.as_secs_f64());
+        // A glide puts the eye where it is due, frame by frame.
+        if let Some(flight) = self.flight {
+            let (view, over) = flight.at(web_time::Instant::now());
+            crate::steer::jump(&mut self.controller, view.camera());
+            if over {
+                self.flight = None;
+            }
+        }
         self.record_the_pacing(before, dt);
         // A tape, if one is running, overrides the camera the gestures produced
         // — so the render, the traversal and the log line all come from the
@@ -217,9 +225,12 @@ impl App {
         // The control reads the camera as it now stands, so the needle and the
         // horizon bar agree with the frame they are drawn over. Drawn in its
         // own units and placed in the safe area — see `UiFrame`.
-        let mut nav_mesh: Vec<OverlayVertex> = self
-            .nav
-            .mesh(ui.size, &self.controller)
+        let controls = if self.controls {
+            self.nav.mesh(ui.size, &self.controller)
+        } else {
+            Vec::new()
+        };
+        let mut nav_mesh: Vec<OverlayVertex> = controls
             .into_iter()
             .map(|v| OverlayVertex {
                 position: ui.from(v.position),
@@ -307,7 +318,7 @@ impl App {
                 },
                 trace: trace.then_some(&mut active.readback),
             },
-            || super::setup::configure(surface, &active.gpu, active.surface_format, active.size),
+            || super::setup::configure(surface, &active.gpu, active.format, active.size),
             || active.window.pre_present_notify(),
             |pass| {
                 active.renderer.paint(
@@ -354,7 +365,7 @@ impl App {
             // Captured before the reset below, because the rate printed further
             // down divides by it.
             let interval = self.watch.last_log.elapsed().as_secs_f64();
-            self.watch.last_log = std::time::Instant::now();
+            self.watch.last_log = web_time::Instant::now();
             if let Some(bar) = self.statusbar.as_ref() {
                 bar.refresh();
                 // Where the eye is, and how it is held. The second half is what
@@ -516,12 +527,20 @@ impl App {
         if self.session.is_none() {
             return;
         }
-        // The server's own pass counter, so a loop that has stopped turning
-        // is one glance away instead of an afternoon. Every server-sourced
-        // number below is a *last received* value: they all sit perfectly
-        // still when the server is dead, which is indistinguishable from a
-        // server with nothing to do. This one is not.
-        let traversals = tuile_core::metrics::metrics().traversals.get();
+        // The server's passes, so a loop that has stopped turning is one
+        // glance away instead of an afternoon. Every other server-sourced
+        // number is a *last received* value: they all sit perfectly still
+        // when the server is dead, which is indistinguishable from a server
+        // with nothing to do. This one is not.
+        //
+        // Counted as the selections that *arrived* — every pass ends in one —
+        // rather than off the server's own counter: a server in a browser's
+        // worker keeps its counters in the worker's memory, where the page
+        // would read zero for ever and cry wolf.
+        let traversals = self
+            .active
+            .as_ref()
+            .map_or(0, |active| active.pump.selects_seen());
         let moved = (cam.altitude() - self.watch.last_altitude.unwrap_or(f64::MIN)).abs() > 1.0;
         if moved && traversals == self.watch.last_traversals {
             self.watch.silent_passes += 1;

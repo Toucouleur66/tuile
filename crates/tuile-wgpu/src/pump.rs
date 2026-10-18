@@ -157,7 +157,7 @@ impl ContentPump {
         exact.sort_unstable();
         if exact != self.stitched_for {
             let m = tuile_core::metrics::metrics();
-            let began = std::time::Instant::now();
+            let began = web_time::Instant::now();
             let located: Vec<(TileId, (u32, u64, u64))> = exact
                 .iter()
                 .filter_map(|id| Some((*id, self.prepared.get(id)?.cell?)))
@@ -293,7 +293,7 @@ impl ContentPump {
         self.drain(stream);
 
         let mut uploaded = 0;
-        let began = std::time::Instant::now();
+        let began = web_time::Instant::now();
         while more(uploaded, began.elapsed()) {
             let Some((tile, content, is_fill)) = self.pending.pop_front() else {
                 break;
@@ -306,7 +306,7 @@ impl ContentPump {
                 continue;
             }
             let m = tuile_core::metrics::metrics();
-            let started = std::time::Instant::now();
+            let started = web_time::Instant::now();
             let prepared = prepare(gpu, &content, self.render_origin);
             m.upload_seconds.record(started.elapsed());
             m.uploads.inc();
