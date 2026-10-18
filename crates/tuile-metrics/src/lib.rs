@@ -32,7 +32,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
-use tuile_core::metrics::{ByLevel, Metrics, LEVELS};
+use tuile_core::metrics::{ByLevel, Metrics, Tally, Timer, LEVELS};
 
 /// Where the exporter listens unless `TUILE_METRICS_ADDR` says otherwise.
 ///
@@ -157,10 +157,96 @@ fn describe() {
         "tuile_tiles_filled",
         "Selected tiles drawn by a stand-in surface rather than their own geometry."
     );
+    let m = tuile_core::metrics::metrics();
+    for (name, help, _) in timers(m) {
+        describe_counter!(
+            format!("tuile_{name}_seconds_count"),
+            format!("{help} Samples.")
+        );
+        describe_gauge!(
+            format!("tuile_{name}_seconds_sum"),
+            format!("{help} Total seconds; only goes up, take its rate.")
+        );
+        describe_gauge!(
+            format!("tuile_{name}_seconds_peak"),
+            format!("{help} Longest single sample, seconds.")
+        );
+    }
+    for (name, help, _) in tallies(m) {
+        describe_counter!(
+            format!("tuile_{name}_count"),
+            format!("{help} Occurrences.")
+        );
+        describe_counter!(
+            format!("tuile_{name}_sum"),
+            format!("{help} Total carried.")
+        );
+        describe_gauge!(
+            format!("tuile_{name}_peak"),
+            format!("{help} Most carried by one.")
+        );
+    }
     describe_gauge!(
         "tuile_by_level",
         "Per-quadtree-level series; the `series` label says which."
     );
+}
+
+/// Every [`Timer`], by the name it is published under and what it measures.
+///
+/// A timer is three series: `_seconds_count` (a counter), `_seconds_sum` and
+/// `_seconds_peak` (gauges). The sum is a gauge only because the recorder's
+/// counters are integers; it never goes down, and `rate(sum) / rate(count)` is
+/// the mean over any window.
+fn timers(m: &Metrics) -> [(&'static str, &'static str, &Timer); 12] {
+    [
+        ("traversal", "The traversal walk.", &m.traversal_seconds),
+        (
+            "select",
+            "Building and sending the selection a pass ends with.",
+            &m.select_seconds,
+        ),
+        (
+            "arrival_wait",
+            "From a load resolving to the loop handling it.",
+            &m.arrival_wait_seconds,
+        ),
+        (
+            "load_wake_wait",
+            "From a load being woken to the loop polling it, per wake.",
+            &m.load_wake_wait_seconds,
+        ),
+        (
+            "load",
+            "A tile load, from start to content.",
+            &m.load_seconds,
+        ),
+        ("mesh_fetch", "A terrain fetch.", &m.mesh_fetch_seconds),
+        (
+            "texture_fetch",
+            "An imagery fetch.",
+            &m.texture_fetch_seconds,
+        ),
+        ("frame", "A frame, top to top.", &m.frame_seconds),
+        (
+            "rebase",
+            "Rewriting model matrices on an origin move.",
+            &m.rebase_seconds,
+        ),
+        ("present", "Waiting for a drawable.", &m.present_seconds),
+        ("upload", "A tile upload to the GPU.", &m.upload_seconds),
+        ("stitch", "Working out a stitching plan.", &m.stitch_seconds),
+    ]
+}
+
+/// Every [`Tally`], likewise: `_count`, `_sum` (counters) and `_peak` (a
+/// gauge).
+fn tallies(m: &Metrics) -> [(&'static str, &'static str, &Tally); 1] {
+    [(
+        "arrivals_per_pass",
+        "Load completions handled by each pass an arrival provoked.",
+        &m.arrivals_per_pass,
+    )]
 }
 
 /// Copies every atomic into the recorder.
@@ -209,6 +295,19 @@ fn publish(m: &Metrics) {
     gauge!("tuile_prepared_tiles").set(m.prepared_tiles.get() as f64);
     gauge!("tuile_tiles_filled").set(m.tiles_filled.get() as f64);
 
+    // The peak is read in place, not taken: a scrape must not reset what a
+    // status line in the same process reads as "the worst this window".
+    for (name, _, t) in timers(m) {
+        counter!(format!("tuile_{name}_seconds_count")).absolute(t.count());
+        gauge!(format!("tuile_{name}_seconds_sum")).set(t.total_seconds());
+        gauge!(format!("tuile_{name}_seconds_peak")).set(t.peak_millis() / 1000.0);
+    }
+    for (name, _, t) in tallies(m) {
+        counter!(format!("tuile_{name}_count")).absolute(t.count());
+        counter!(format!("tuile_{name}_sum")).absolute(t.sum());
+        gauge!(format!("tuile_{name}_peak")).set(t.peak() as f64);
+    }
+
     // One series name, two labels. The alternative — eight series names each
     // carrying a level label — makes `sum by (level)` across them impossible
     // without naming all eight.
@@ -227,5 +326,41 @@ fn publish(m: &Metrics) {
             gauge!("tuile_by_level", "series" => name, "level" => level.to_string())
                 .set(values.get(level) as f64);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The loop's instruments reach the endpoint, timers as three series and
+    /// tallies as three more.
+    #[test]
+    fn timers_and_tallies_are_published() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let m = tuile_core::metrics::metrics();
+        m.arrival_wait_seconds.record(Duration::from_millis(1500));
+        m.arrivals_per_pass.record(3);
+        metrics::with_local_recorder(&recorder, || publish(m));
+        let text = handle.render();
+        for series in [
+            "tuile_arrival_wait_seconds_count",
+            "tuile_arrival_wait_seconds_sum",
+            "tuile_arrival_wait_seconds_peak",
+            "tuile_select_seconds_count",
+            "tuile_load_wake_wait_seconds_count",
+            "tuile_traversal_seconds_sum",
+            "tuile_arrivals_per_pass_count",
+            "tuile_arrivals_per_pass_sum",
+            "tuile_arrivals_per_pass_peak 3",
+        ] {
+            assert!(text.contains(series), "{series} missing from:\n{text}");
+        }
+        // The peak is in seconds, like the sum.
+        assert!(
+            text.contains("tuile_arrival_wait_seconds_peak 1.5"),
+            "peak not in seconds:\n{text}"
+        );
     }
 }

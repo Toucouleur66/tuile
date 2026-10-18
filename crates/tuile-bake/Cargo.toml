@@ -62,6 +62,9 @@ tokio = { workspace = true, features = ["time", "sync"] }
 rayon = "1"
 thiserror = { workspace = true }
 tuile-core = { version = "0.8.2", path = "../tuile-core" }
+# The engine's metrics on a Prometheus endpoint, when `TUILE_METRICS_ADDR`
+# asks for one (`memory::export_metrics_if_asked`).
+tuile-metrics = { version = "0.8.2", path = "../tuile-metrics" }
 # The ground a film draws, for a camera kept over it (`Session::ground`).
 tuile-film = { version = "0.8.2", path = "../tuile-film" }
 tuile-pack = { version = "0.8.2", path = "../tuile-pack" }

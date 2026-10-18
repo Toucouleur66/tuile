@@ -1050,6 +1050,7 @@ fn same_plan(old: &Plan, new: &std::path::Path) -> Result<(), String> {
 }
 
 fn bake(args: Args) -> Result<(), String> {
+    tuile_bake::memory::export_metrics_if_asked();
     let tiles = tiles::Tiles::from_env()?;
     let result = bake_with(args, tiles.as_ref());
     // Whatever the bake fetched is published, even if it failed.

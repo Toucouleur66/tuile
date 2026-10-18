@@ -6373,6 +6373,7 @@ dependencies = [
  "tuile-cesium-ion",
  "tuile-core",
  "tuile-film",
+ "tuile-metrics",
  "tuile-native-fetchers",
  "tuile-pack",
  "tuile-planetary",
