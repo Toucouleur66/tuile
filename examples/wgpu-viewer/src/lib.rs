@@ -2,7 +2,8 @@
 // Copyright (c) lapoule.dev
 
 //! The viewer, over the public connectors — the host every platform's build
-//! runs: `main.rs` on a desktop and a phone, [`android_main`] on Android.
+//! runs: `main.rs` on a desktop and a phone, `android_main` on Android (named, not
+//! linked: like `DEVELOPMENT_CATALOG` below, it exists only in an Android build).
 //!
 //! The application itself — window, camera, controls, steering, scripting — is
 //! the `tuile-viewer` library. This crate is the one decision a host makes:
@@ -27,7 +28,7 @@
 //! an APK carries nothing that would let anyone who unpacks it use the
 //! account. The proxy's address is `TUILE_CATALOG_URL` — a launch setting,
 //! else the value it had when the library was built, else
-//! [`DEVELOPMENT_CATALOG`], which `scripts/try-viewer.sh android` serves.
+//! `DEVELOPMENT_CATALOG`, which `scripts/try-viewer.sh android` serves.
 
 use std::sync::Arc;
 
