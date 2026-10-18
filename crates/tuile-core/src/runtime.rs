@@ -325,9 +325,10 @@ impl GeometryServer {
         // single count. Client first starves the mirror image, since a viewer
         // sends a state every frame and completions would go unread.
         //
-        // Alternating costs a branch and needs no batching: traversal is cheap
-        // enough to run on every event, and running it on every event is what
-        // keeps the picture current.
+        // Alternating costs a branch. Within one side, what is already waiting
+        // is taken together: the camera's burst keeps only its last state, and
+        // the loads that have landed are delivered before the one traversal
+        // that answers them all (`drain_ready`).
         let mut client_first = true;
 
         loop {
@@ -401,12 +402,16 @@ impl GeometryServer {
                 Event::Load(Ok((msg, landed))) => {
                     let m = crate::metrics::metrics();
                     m.arrival_wait_seconds.record(landed.elapsed());
-                    match session.on_load_done(msg, &tx) {
+                    // Coalesce the arrivals, as the camera's burst is above:
+                    // every completion that is already ready is delivered
+                    // before the one traversal that answers them all.
+                    match session
+                        .on_load_done(msg, &tx)
+                        .and_then(|()| drain_ready(&mut session, &mut loads, &tx))
+                    {
                         Err(stop) => Some(stop.why("delivering a tile")),
-                        Ok(()) => {
-                            // One arrival, one pass: what coalescing would
-                            // raise above one.
-                            m.arrivals_per_pass.record(1);
+                        Ok(more) => {
+                            m.arrivals_per_pass.record(1 + more);
                             session
                                 .retraverse(&tx, &mut loads)
                                 .err()
@@ -428,6 +433,43 @@ impl GeometryServer {
             }
         }
     }
+}
+
+/// Delivers every load completion that is already ready, without waiting.
+///
+/// A traversal ran on every single arrival before this: a burst of tiles
+/// answered from memory or from a warm store cost one full walk from the
+/// roots each, and the walk is what the loop spends its time in. Each of
+/// those passes but the last was superseded before anything could act on
+/// it — a consumer drains every queued message before it draws, so it only
+/// ever saw the last `Select` of the burst anyway.
+///
+/// Bounded by the fetch cap: at most that many loads can be in flight, so
+/// a drain cannot outlast the burst it was called for, and the camera is
+/// read again after it. A batch counts as one event for the breather.
+/// Returns how many it delivered, for `arrivals_per_pass`.
+fn drain_ready(
+    session: &mut Session<'_>,
+    loads: &mut FuturesUnordered<LoadFuture>,
+    tx: &UnboundedSender<ServerMessage>,
+) -> Result<u64, Stop> {
+    use futures_util::{FutureExt, StreamExt};
+    let m = crate::metrics::metrics();
+    let mut delivered = 0;
+    for _ in 0..session.config.maximum_simultaneous_fetches {
+        match loads.next().now_or_never() {
+            Some(Some(Ok((msg, landed)))) => {
+                m.arrival_wait_seconds.record(landed.elapsed());
+                session.on_load_done(msg, tx)?;
+                delivered += 1;
+            }
+            // Cancelled: cleaned up at abort time, as in the loop.
+            Some(Some(Err(Aborted))) => {}
+            // Nothing in flight, or nothing ready yet.
+            Some(None) | None => break,
+        }
+    }
+    Ok(delivered)
 }
 
 /// Borrowed view of the server state for the message handlers.
@@ -1647,8 +1689,13 @@ mod tests {
 
     /// **A server answered from memory still hands its host a turn.** Every
     /// load here completes on its first poll, so the loop never has to wait;
-    /// with a breather every four events it pauses all the same, and the
+    /// with a breather every two events it pauses all the same, and the
     /// session goes on to deliver everything after each pause.
+    ///
+    /// Every two, not four: arrivals that are ready together are one event
+    /// (`drain_ready`), so this seven-tile session is a handful of events
+    /// in a row — the camera, the root, its children, their children — and
+    /// four of them back to back no longer happens without a wait between.
     #[test]
     fn a_busy_server_hands_its_host_a_turn() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1667,54 +1714,454 @@ mod tests {
             }
         }
 
+        let run = |every: usize| -> (usize, usize) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let url = write_deep_fixture(dir.path());
+            let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
+            let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
+            let pauses = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&pauses);
+            let (mut stream, server) = in_process(
+                tileset,
+                Arc::new(FsFetcher),
+                Config {
+                    pinned_level: None,
+                    ..Config::default()
+                },
+            );
+            let server = server.with_breather(
+                every,
+                Arc::new(move || {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(Yield(false))
+                }),
+            );
+            let mut server = Box::pin(server.run());
+            let waker = futures_util::task::noop_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+            stream
+                .send(ClientMessage::ViewerState {
+                    views: vec![near_view()],
+                    generation: 0,
+                })
+                .expect("send");
+            let mut delivered = 0usize;
+            for _ in 0..256 {
+                let _ = server.as_mut().poll(&mut cx);
+                while let Poll::Ready(Some(msg)) = stream.poll_message(&mut cx) {
+                    if let ServerMessage::Content { tile, .. } = msg {
+                        delivered += 1;
+                        let _ = stream.send(ClientMessage::Ack { tile });
+                    }
+                }
+            }
+            (pauses.load(Ordering::SeqCst), delivered)
+        };
+        let (pauses, delivered) = run(2);
+        assert!(pauses > 0, "the host never had a turn");
+        assert!(
+            delivered >= 7,
+            "the session stopped after a pause: {delivered}"
+        );
+        // A breather that never comes due takes no pause: the count is of
+        // events back to back, and this session has fewer than a thousand.
+        assert_eq!(run(1000).0, 0, "paused before its count was reached");
+    }
+
+    /// A load that waits behind a gate the test opens, for the tiles it holds.
+    struct Gate {
+        open: std::sync::atomic::AtomicBool,
+        wakers: Mutex<Vec<std::task::Waker>>,
+        waiting: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Gate {
+        fn closed() -> Arc<Self> {
+            Arc::new(Self {
+                open: std::sync::atomic::AtomicBool::new(false),
+                wakers: Mutex::new(Vec::new()),
+                waiting: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn open(&self) {
+            self.open.store(true, std::sync::atomic::Ordering::SeqCst);
+            for waker in self.wakers.lock().expect("wakers").drain(..) {
+                waker.wake();
+            }
+        }
+
+        async fn pass(&self) {
+            use std::sync::atomic::Ordering;
+            self.waiting.fetch_add(1, Ordering::SeqCst);
+            poll_fn(|cx| {
+                if self.open.load(Ordering::SeqCst) {
+                    Poll::Ready(())
+                } else {
+                    self.wakers.lock().expect("wakers").push(cx.waker().clone());
+                    Poll::Pending
+                }
+            })
+            .await;
+            self.waiting.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// **Loads that land together are answered by one traversal.**
+    ///
+    /// Four leaves are asked for at once and held behind a gate; when it opens
+    /// all four are ready on the same turn. One pass per arrival — what the
+    /// loop did before it drained them — walked the tree four times, and three
+    /// of those selections were superseded before a consumer, which drains
+    /// every queued message before it draws, could ever see them. In
+    /// production that was ~110 000 traversals per pod in ten minutes.
+    ///
+    /// What this does not cover: whether fewer intermediate passes change the
+    /// final selection of a real flight (the hysteresis reads the previous
+    /// pass). That is the bake goldens' job.
+    #[test]
+    fn loads_that_land_together_are_answered_by_one_traversal() {
+        use std::sync::atomic::Ordering;
+
         let dir = tempfile::tempdir().expect("tempdir");
         let url = write_deep_fixture(dir.path());
         let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
         let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
-        let pauses = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&pauses);
-        let (mut stream, server) = in_process(
-            tileset,
-            Arc::new(FsFetcher),
+        let root = tileset.root();
+        let leaves: HashSet<TileId> = tileset
+            .tile(root)
+            .children
+            .iter()
+            .flat_map(|m| tileset.tile(*m).children.clone())
+            .collect();
+        assert_eq!(leaves.len(), 4);
+
+        /// Real content, the leaves only once the gate is open.
+        struct Held(Arc<dyn TileLoader>, HashSet<TileId>, Arc<Gate>);
+
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        impl TileLoader for Held {
+            async fn load(&self, id: TileId) -> Result<Loaded, LoadError> {
+                if self.1.contains(&id) {
+                    self.2.pass().await;
+                }
+                self.0.load(id).await
+            }
+        }
+
+        let gate = Gate::closed();
+        let arena = Arc::new(RwLock::new(tileset));
+        let tree: Box<dyn TileTree> = Box::new(TilesetTree::new(Arc::clone(&arena)));
+        let inner: Arc<dyn TileLoader> = Arc::new(TilesetLoader::new(arena, Arc::new(FsFetcher)));
+        let (mut stream, server) = in_process_with(
+            tree,
+            Arc::new(Held(inner, leaves.clone(), Arc::clone(&gate))) as Arc<dyn TileLoader>,
             Config {
                 pinned_level: None,
                 ..Config::default()
             },
         );
-        let server = server.with_breather(
-            4,
-            Arc::new(move || {
-                counted.fetch_add(1, Ordering::SeqCst);
-                Box::pin(Yield(false))
-            }),
-        );
         let mut server = Box::pin(server.run());
-        let waker = futures_util::task::noop_waker();
-        let mut cx = std::task::Context::from_waker(&waker);
         stream
             .send(ClientMessage::ViewerState {
                 views: vec![near_view()],
                 generation: 0,
             })
             .expect("send");
-        let mut delivered = 0usize;
-        for _ in 0..256 {
-            let _ = server.as_mut().poll(&mut cx);
+
+        // Steps the session until it goes quiet, counting what it sent.
+        fn step(
+            server: &mut Pin<Box<impl Future<Output = ()>>>,
+            stream: &mut InProcessStream,
+        ) -> (usize, HashSet<TileId>) {
+            let waker = futures_util::task::noop_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+            let (mut selections, mut arrived) = (0usize, HashSet::new());
+            for _ in 0..32 {
+                assert!(server.as_mut().poll(&mut cx).is_pending(), "session ended");
+                while let Poll::Ready(Some(msg)) = stream.poll_message(&mut cx) {
+                    match msg {
+                        ServerMessage::Select { .. } => selections += 1,
+                        ServerMessage::Content { tile, .. } => {
+                            arrived.insert(tile);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            (selections, arrived)
+        }
+
+        let (_, before) = step(&mut server, &mut stream);
+        assert_eq!(
+            gate.waiting.load(Ordering::SeqCst),
+            4,
+            "every leaf is asked for before the gate opens (arrived: {before:?})"
+        );
+        assert!(before.is_disjoint(&leaves));
+
+        gate.open();
+        let (selections, arrived) = step(&mut server, &mut stream);
+        assert_eq!(arrived, leaves, "all four leaves landed");
+        assert_eq!(
+            selections, 1,
+            "four arrivals ready on the same turn are answered by one traversal"
+        );
+    }
+
+    /// Records the tiles whose load was dropped before it finished — what a
+    /// cancel does to a load.
+    struct Unfinished {
+        tile: TileId,
+        dropped: Arc<Mutex<Vec<TileId>>>,
+        finished: bool,
+    }
+
+    impl Drop for Unfinished {
+        fn drop(&mut self) {
+            if !self.finished {
+                self.dropped.lock().expect("dropped").push(self.tile);
+            }
+        }
+    }
+
+    /// Real content; the tiles in `held` only once the gate opens, and a
+    /// note of every load dropped unfinished.
+    struct Holding {
+        inner: Arc<dyn TileLoader>,
+        held: HashSet<TileId>,
+        gate: Arc<Gate>,
+        dropped: Arc<Mutex<Vec<TileId>>>,
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    impl TileLoader for Holding {
+        async fn load(&self, id: TileId) -> Result<Loaded, LoadError> {
+            let mut guard = Unfinished {
+                tile: id,
+                dropped: Arc::clone(&self.dropped),
+                finished: false,
+            };
+            if self.held.contains(&id) {
+                self.gate.pass().await;
+            }
+            let loaded = self.inner.load(id).await;
+            guard.finished = true;
+            loaded
+        }
+    }
+
+    /// A session over `tileset` whose loader holds `held` behind a gate.
+    #[allow(clippy::type_complexity)]
+    fn holding_session(
+        tileset: Tileset,
+        held: HashSet<TileId>,
+        config: Config,
+    ) -> (
+        InProcessStream,
+        Pin<Box<impl Future<Output = ()>>>,
+        Arc<Gate>,
+        Arc<Mutex<Vec<TileId>>>,
+    ) {
+        let gate = Gate::closed();
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let arena = Arc::new(RwLock::new(tileset));
+        let tree: Box<dyn TileTree> = Box::new(TilesetTree::new(Arc::clone(&arena)));
+        let inner: Arc<dyn TileLoader> = Arc::new(TilesetLoader::new(arena, Arc::new(FsFetcher)));
+        let loader = Holding {
+            inner,
+            held,
+            gate: Arc::clone(&gate),
+            dropped: Arc::clone(&dropped),
+        };
+        let (stream, server) = in_process_with(tree, Arc::new(loader), config);
+        (stream, Box::pin(server.run()), gate, dropped)
+    }
+
+    /// What one stretch of polling produced, in order.
+    #[derive(Debug, Default)]
+    struct Heard {
+        /// The generation of every `Select`, in order.
+        selections: Vec<u64>,
+        /// Content delivered, and how many selections had gone out before it.
+        contents: Vec<(TileId, usize)>,
+    }
+
+    fn listen(
+        server: &mut Pin<Box<impl Future<Output = ()>>>,
+        stream: &mut InProcessStream,
+        polls: usize,
+    ) -> Heard {
+        let waker = futures_util::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut heard = Heard::default();
+        for _ in 0..polls {
+            assert!(server.as_mut().poll(&mut cx).is_pending(), "session ended");
             while let Poll::Ready(Some(msg)) = stream.poll_message(&mut cx) {
-                if let ServerMessage::Content { tile, .. } = msg {
-                    delivered += 1;
-                    let _ = stream.send(ClientMessage::Ack { tile });
+                match msg {
+                    ServerMessage::Select { generation, .. } => heard.selections.push(generation),
+                    ServerMessage::Content { tile, .. } => {
+                        heard.contents.push((tile, heard.selections.len()));
+                    }
+                    ServerMessage::Error { message, .. } => unreachable!("error: {message}"),
+                    _ => {}
                 }
             }
         }
-        assert!(
-            pauses.load(Ordering::SeqCst) > 0,
-            "the host never had a turn"
+        heard
+    }
+
+    fn look(stream: &InProcessStream, view: ViewState, generation: u64) {
+        stream
+            .send(ClientMessage::ViewerState {
+                views: vec![view],
+                generation,
+            })
+            .expect("send");
+    }
+
+    /// The two-leaf fixture, its root and its leaves.
+    fn two_leaves(dir: &std::path::Path) -> (Tileset, TileId, HashSet<TileId>) {
+        let url = write_fixture(dir);
+        let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
+        let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
+        let root = tileset.root();
+        let leaves = tileset.tile(root).children.iter().copied().collect();
+        (tileset, root, leaves)
+    }
+
+    fn unpinned() -> Config {
+        Config {
+            pinned_level: None,
+            ..Config::default()
+        }
+    }
+
+    /// **The camera and the loads take turns.** A camera and two arrivals
+    /// are ready on the same turn; which is answered first follows the turn
+    /// order, which alternates. The same session started twice, the second
+    /// with one extra event before (an ack) — the order is flipped, so
+    /// across the two the arrivals are answered first once and the camera
+    /// once. A loop that always read the camera first never answers the
+    /// arrivals first; one that always read the loads never the camera.
+    #[test]
+    fn the_camera_and_the_arrivals_take_turns() {
+        let first_answered = |extra_event: bool| -> u64 {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (tileset, root, leaves) = two_leaves(dir.path());
+            let (mut stream, mut server, gate, _) = holding_session(tileset, leaves, unpinned());
+            look(&stream, near_view(), 1);
+            let before = listen(&mut server, &mut stream, 16);
+            assert!(before.contents.iter().any(|(t, _)| *t == root));
+            assert_eq!(gate.waiting.load(std::sync::atomic::Ordering::SeqCst), 2);
+            if extra_event {
+                stream.send(ClientMessage::Ack { tile: root }).expect("ack");
+                listen(&mut server, &mut stream, 4);
+            }
+            // Both sides ready on the same turn.
+            gate.open();
+            look(&stream, near_view(), 2);
+            let after = listen(&mut server, &mut stream, 16);
+            assert_eq!(after.contents.len(), 2, "both leaves landed: {after:?}");
+            // Answered by a pass still on generation 1: the arrivals went
+            // first. On generation 2: the camera did.
+            after.selections[0]
+        };
+        let firsts: HashSet<u64> = [first_answered(false), first_answered(true)].into();
+        assert_eq!(
+            firsts,
+            HashSet::from([1, 2]),
+            "the camera and the arrivals each went first once"
         );
+    }
+
+    /// **A camera state and an ack in one burst still move the picture.** The
+    /// burst is coalesced; the ack asks for nothing, the camera for a pass,
+    /// and the pass is owed if any message in it asked.
+    #[test]
+    fn a_camera_coalesced_with_an_ack_is_still_answered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (tileset, root, leaves) = two_leaves(dir.path());
+        let (mut stream, mut server, _gate, _) = holding_session(tileset, leaves, unpinned());
+        look(&stream, near_view(), 1);
+        listen(&mut server, &mut stream, 16);
+        look(&stream, far_view(), 2);
+        stream.send(ClientMessage::Ack { tile: root }).expect("ack");
+        let heard = listen(&mut server, &mut stream, 16);
+        assert_eq!(heard.selections, vec![2], "one pass, for the new camera");
+    }
+
+    /// **A camera move cancels the loads it no longer wants, and only
+    /// those.** Both leaves are in flight behind a gate. The same view again
+    /// still wants them: nothing is dropped. A view far enough that the root
+    /// alone suffices wants neither: both are.
+    #[test]
+    fn a_camera_move_cancels_only_what_it_stopped_wanting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (tileset, _root, leaves) = two_leaves(dir.path());
+        let (mut stream, mut server, gate, dropped) =
+            holding_session(tileset, leaves.clone(), unpinned());
+        look(&stream, near_view(), 1);
+        listen(&mut server, &mut stream, 16);
+        assert_eq!(gate.waiting.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        look(&stream, near_view(), 2);
+        listen(&mut server, &mut stream, 16);
         assert!(
-            delivered >= 7,
-            "the session stopped after a pause: {delivered}"
+            dropped.lock().expect("dropped").is_empty(),
+            "a camera that still wants the leaves kept them"
         );
+
+        look(&stream, far_view(), 3);
+        listen(&mut server, &mut stream, 16);
+        let gone: HashSet<TileId> = dropped.lock().expect("dropped").iter().copied().collect();
+        assert_eq!(gone, leaves, "a camera that wants neither dropped both");
+    }
+
+    /// **No more loads in flight than the cap, and up to it.** Every tile
+    /// is held, so nothing in flight ever finishes. With room for two, two
+    /// wait — not none, not more; with room for plenty, more than two do,
+    /// so it was the cap that stopped them. With the coarse pyramid and
+    /// without: its loads and the view's are capped alike.
+    #[test]
+    fn loads_in_flight_fill_the_cap_and_stop_there() {
+        let waiting = |pinned_level: Option<u32>, cap: usize, view: ViewState| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let url = write_deep_fixture(dir.path());
+            let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
+            let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
+            let every: HashSet<TileId> = tileset.tiles().map(|(id, _)| id).collect();
+            let (mut stream, mut server, gate, _) = holding_session(
+                tileset,
+                every,
+                Config {
+                    pinned_level,
+                    maximum_simultaneous_fetches: cap,
+                    ..Config::default()
+                },
+            );
+            look(&stream, view, 1);
+            listen(&mut server, &mut stream, 16);
+            gate.waiting.load(std::sync::atomic::Ordering::SeqCst)
+        };
+        for pinned_level in [Some(1), None] {
+            assert_eq!(
+                waiting(pinned_level, 2, near_view()),
+                2,
+                "pinned {pinned_level:?}"
+            );
+            assert!(
+                waiting(pinned_level, 64, near_view()) > 2,
+                "pinned {pinned_level:?}"
+            );
+        }
+        // From far off the view wants the root alone, so what fills the cap
+        // is the pyramid's own loads: the root and its two children.
+        assert_eq!(waiting(None, 64, far_view()), 1, "the view alone");
+        assert_eq!(waiting(Some(1), 2, far_view()), 2, "the pyramid, capped");
+        assert_eq!(waiting(Some(1), 64, far_view()), 3, "the whole pyramid");
     }
 
     /// **A request the network never answers costs one slot, not the
