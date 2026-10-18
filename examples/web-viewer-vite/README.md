@@ -14,5 +14,6 @@ npm install
 npm run build        # tsc --noEmit, then vite build
 ```
 
-The page fetches its token from `/api/catalog-token`, an endpoint of the host's own: a
-public page must not carry a secret.
+The page has no token: its catalog is `/catalog/`, the catalog proxy that holds the
+token on the server (`examples/catalog-proxy`). `npm run dev` passes `/catalog` to a proxy
+running on this machine (`scripts/try-viewer.sh web` starts one).

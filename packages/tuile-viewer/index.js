@@ -27,6 +27,9 @@ export class StartError extends Error {
   }
 }
 
+/** The phone's launch colour, the colour of the ground before any arrives. */
+const LAUNCH_COLOUR = "rgb(23, 38, 61)";
+
 const EVENTS = ["ready", "loading", "error", "viewChanged", "attributionChanged"];
 
 /** The viewer of the moment: one per page, and a new one replaces it. */
@@ -39,47 +42,12 @@ function load() {
   return loaded;
 }
 
-/** Whether this browser offers a WebGL2 context at all. */
-function hasWebgl2() {
-  try {
-    return !!document.createElement("canvas").getContext("webgl2");
-  } catch {
-    return false;
-  }
-}
-
 /** `auto` becomes `handheld` on a touch-first, small screen. */
 function resolveProfile(profile) {
   if (profile === "desktop" || profile === "handheld") return profile;
   const coarse = globalThis.matchMedia?.("(pointer: coarse)").matches ?? false;
   const small = Math.min(screen.width, screen.height) < 900;
   return coarse && small ? "handheld" : "desktop";
-}
-
-/** What the browser can draw with, checked before anything is loaded. */
-function checkSupport(backend) {
-  const webgpu = "gpu" in navigator;
-  const webgl2 = hasWebgl2();
-  if (backend === "webgpu" && !webgpu) {
-    return "this browser has no WebGPU, and the viewer was asked to use it";
-  }
-  if (backend === "webgl2" && !webgl2) {
-    return "this browser has no WebGL2, and the viewer was asked to use it";
-  }
-  if (!webgpu && !webgl2) {
-    return "this browser has neither WebGPU nor WebGL2";
-  }
-  return null;
-}
-
-function message(host, text) {
-  const note = document.createElement("div");
-  note.textContent = text;
-  note.style.cssText =
-    "position:absolute;inset:0;display:flex;align-items:center;justify-content:center;" +
-    "padding:16px;text-align:center;font:14px system-ui,sans-serif;color:#ddd;background:#000";
-  host.append(note);
-  return note;
 }
 
 /**
@@ -94,12 +62,12 @@ export async function createViewer(container, options) {
     throw new TypeError("createViewer: the container must be an element");
   }
   const o = options ?? {};
-  const backend = o.backend ?? "auto";
-  const hostElement = container instanceof HTMLCanvasElement ? container.parentElement : container;
-  const unsupported = checkSupport(backend);
-  if (unsupported) {
-    if (o.showUnsupportedMessage !== false && hostElement) message(hostElement, unsupported);
-    throw new UnsupportedError(unsupported);
+  // While the module loads, the container shows the colour the globe opens on,
+  // as the phone's launch screen does: never a black frame. A host's own
+  // background is left alone.
+  const host = container instanceof HTMLCanvasElement ? container.parentElement : container;
+  if (host && getComputedStyle(host).backgroundColor === "rgba(0, 0, 0, 0)") {
+    host.style.backgroundColor = LAUNCH_COLOUR;
   }
   await load();
   // Before the new canvas exists, so the two never share the page.
@@ -111,32 +79,26 @@ export async function createViewer(container, options) {
     canvas = document.createElement("canvas");
     canvas.style.cssText = "display:block;width:100%;height:100%;touch-action:none;outline:none";
     canvas.tabIndex = 0;
-    if (getComputedStyle(container).position === "static") container.style.position = "relative";
     container.append(canvas);
     ownCanvas = true;
   }
 
-  const placement = o.attribution ?? "bottom-right";
-  let credit = null;
-  if (placement !== "none" && hostElement) {
-    credit = document.createElement("div");
-    const side = placement === "bottom-left" ? "left" : "right";
-    credit.style.cssText =
-      `position:absolute;bottom:4px;${side}:6px;max-width:70%;pointer-events:none;` +
-      "font:11px system-ui,sans-serif;color:#fff;text-shadow:0 0 3px #000;white-space:nowrap;" +
-      "overflow:hidden;text-overflow:ellipsis";
-    hostElement.append(credit);
-  }
-
-  const token = o.token ?? (o.getToken ? await o.getToken() : undefined);
+  // The catalog proxy's address, resolved against the page: the worker that
+  // asks it has a base URL of its own.
+  const sources = o.sources?.catalog?.url
+    ? { ...o.sources, catalog: { ...o.sources.catalog, url: new URL(o.sources.catalog.url, location.href).href } }
+    : o.sources;
   const normalized = {
     name: o.name ?? "Globe",
-    sources: o.sources,
+    sources,
     profile: resolveProfile(o.profile ?? "auto"),
     deviceMemory: navigator.deviceMemory,
-    backend,
+    backend: o.backend ?? "auto",
     view: o.view,
     ui: o.ui ?? true,
+    attribution: o.attribution ?? "bottom-right",
+    showUnsupportedMessage: o.showUnsupportedMessage ?? true,
+    rememberView: o.rememberView ?? true,
   };
 
   const listeners = new Map(EVENTS.map((kind) => [kind, new Set()]));
@@ -144,19 +106,14 @@ export async function createViewer(container, options) {
   const drawing = new Promise((resolve, reject) => {
     settle = { resolve, reject };
   });
-  let ready = false;
   const onEvent = (kind, detail) => {
+    // A session that cannot start yet is said over the view and tried
+    // again, as on a phone: it is an `error` event, not a failed creation.
     if (kind === "ready") {
-      ready = true;
       settle.resolve();
     } else if (kind === "unsupported") {
-      if (o.showUnsupportedMessage !== false && hostElement) message(hostElement, detail.message);
       settle.reject(new UnsupportedError(detail.message));
       return;
-    } else if (kind === "error" && !ready) {
-      settle.reject(new StartError(detail.message));
-    } else if (kind === "attributionChanged" && credit) {
-      credit.textContent = `${detail.name} · ${detail.attribution}`;
     }
     for (const listener of listeners.get(kind) ?? []) {
       try {
@@ -173,15 +130,13 @@ export async function createViewer(container, options) {
 
   let handle;
   try {
-    handle = startViewer(canvas, normalized, makeWorker, token, onEvent);
+    handle = startViewer(canvas, normalized, makeWorker, onEvent);
   } catch (e) {
     if (ownCanvas) canvas.remove();
-    credit?.remove();
     throw new StartError(e?.message ?? String(e));
   }
   const viewer = new Viewer(handle, listeners, () => {
     if (ownCanvas) canvas.remove();
-    credit?.remove();
     if (current === viewer) current = null;
   });
   current = viewer;

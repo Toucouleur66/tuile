@@ -6,10 +6,27 @@
 A streaming terrain and imagery globe for any web page or application.
 
 The viewer is the same Rust application as the desktop and phone viewers, compiled to
-WebAssembly. It has the same renderer, controls, loading indicator and guarantees: the
-ground is never drawn black, and new tiles replace old ones without a gap. It draws with
-WebGPU, or with WebGL2 where the browser has no WebGPU. Its geometry server runs in a Web
-Worker, so decoding never blocks the page.
+WebAssembly. It has the same renderer, on-screen controls, menu, gestures, keys, loading
+indicator, caption and alerts, and the same guarantees: the ground is never drawn black,
+and new tiles replace old ones without a gap. It draws with WebGPU, or with WebGL2 where the
+browser has no WebGPU. Its geometry server runs in a Web Worker, so decoding never blocks
+the page. **The page never holds a token**: tiles come through a catalog proxy that keeps
+it on the server.
+
+## Try it
+
+From a checkout of the repository, with `TUILE_ION_TOKEN` in its `.env`:
+
+```sh
+scripts/try-viewer.sh web            # http://localhost:8091/examples/web-viewer/
+scripts/try-viewer.sh web --open     # … and open it in Chrome
+scripts/try-viewer.sh web --lan      # for a phone on the same Wi-Fi (WebGL2 over HTTP)
+scripts/try-viewer.sh web --lan --https   # … with WebGPU, location and clipboard (mkcert)
+```
+
+Add `?backend=webgl2` to the page's URL to force WebGL2. The script builds the package
+and starts `tuile-catalog-proxy`, which serves the page and holds the token; it never
+reaches the browser, on this machine or on a phone.
 
 ## Install
 
@@ -33,10 +50,9 @@ import { createViewer, UnsupportedError } from "@lapoule-dev/tuile-viewer";
 
 try {
   const viewer = await createViewer(document.querySelector("#globe"), {
-    getToken: () => fetch("/api/catalog-token").then((r) => r.text()),
     view: { lon: 6.86, lat: 45.83, altitude: 12000, heading: 120, pitch: 35 },
     sources: {
-      catalog: {},
+      catalog: { url: "/catalog/" },
       terrain: { asset: 1 },
       imagery: [{ key: "aerial", name: "Aerial", asset: 2, attribution: "© …" }],
     },
@@ -55,17 +71,17 @@ is a canvas. It resolves once the viewer draws.
 
 | Option | Meaning |
 |---|---|
-| `sources.catalog` | A catalog that resolves asset numbers to tile endpoints. `url` is its API base; the connector's own when left out. |
+| `sources.catalog` | `{ url }`: the catalog proxy that resolves asset numbers to tile endpoints and holds the catalog's token on the server. Relative to the page unless absolute. Required. |
 | `sources.terrain` | `{ asset }`: the terrain, from the catalog. |
 | `sources.imagery` | The layers, in order. Each has `key`, `name` and `attribution`, plus either a catalog `asset` or a URL `template` (`…/{z}/{x}/{y}.png`) with an optional `scheme` (`webmercator` or `geographic`) and `maxLevel`. |
-| `token` / `getToken` | The catalog's bearer, or a function that returns it. See below. |
 | `name` | Your application's name, used in messages. |
 | `profile` | `auto` (the default), `desktop` or `handheld`: memory budget, upload pacing and frame rate. |
 | `backend` | `auto` (the default: WebGPU, else WebGL2), `webgpu` or `webgl2`. |
-| `view` | Where the eye opens: `lon`, `lat`, `altitude`, and optionally `heading` and `pitch`. |
-| `ui` | Whether the compass and zoom controls are drawn (`true` by default). |
-| `attribution` | `bottom-right` (the default), `bottom-left`, or `none` if you show it yourself. You must show it somewhere. |
+| `view` | Where the eye opens: `lon`, `lat`, `altitude`, and optionally `heading` and `pitch`. Without it, where the last viewer of this `name` on this site was left. |
+| `ui` | Whether the compass, zoom controls and menu are drawn (`true` by default). |
+| `attribution` | The bottom corner of the caption — whose pictures are on screen, and the last thing the viewer said: `bottom-right` (the default) or `bottom-left`. |
 | `showUnsupportedMessage` | Whether a viewer that cannot draw says so in the container (`true` by default). |
+| `rememberView` | Whether a viewer created without `view` opens where the last one was left, kept in the site's local storage (`true` by default). |
 
 ## The viewer
 
@@ -89,15 +105,31 @@ readback, scripted moves). It is not available yet.
 |---|---|
 | `ready` | `{ backend }`: the viewer draws. |
 | `loading` | `{ shown, progress }`: the loading indicator came or went, or its progress moved. |
-| `error` | `{ title, message }`: something the person should hear about, such as a session that could not start. The viewer keeps retrying. |
+| `error` | `{ title, message }`: something the person should hear about, such as a session that could not start. It is also shown over the view, and the viewer keeps retrying. |
 | `viewChanged` | `{ lon, lat, altitude, heading, pitch }`, a few times a second at most. |
 | `attributionChanged` | `{ layer, name, attribution }`: whose pictures are on screen. |
 
 Errors:
 
 - `createViewer` rejects with `UnsupportedError` when the browser can draw with neither
-  WebGPU nor WebGL2, or not with the backend that was asked for;
+  WebGPU nor WebGL2, or not with the backend that was asked for; the container says why;
 - it rejects with `StartError` when the options are wrong.
+
+## What the person sees
+
+Everything is the viewer's own, drawn from the same Rust code as the desktop and the phone:
+
+- the compass, tilt handle and zoom buttons, in the safe area;
+- the menu, from a button in the top right corner: the desktop's View, Go and Imagery menus
+  item for item, with the key of each, plus Keys and About;
+- mouse and keys (drag, right-drag, wheel, N, L, C, V, I, W, D, F) and touch (one finger,
+  pinch, twist, two-finger tilt, double tap, hold for the current location);
+- the loading indicator while the first view is covered, and in a corner after a jump;
+- the caption along the bottom: whose pictures are on screen, and what was just said;
+- alerts over the view: a session that cannot start, a location refused, the keys.
+
+The current location uses the browser's Geolocation API, which asks the person first and
+needs a secure page (HTTPS, or `localhost`).
 
 ## Browser support
 
@@ -111,18 +143,31 @@ other, and so does Firefox. Known differences on WebGL2:
 
 The picture is otherwise the same: the same shaders, translated by wgpu.
 
-## Tokens
+## The catalog proxy and its token
 
-- Never put a secret token in a public page: anyone can read it.
-- Use `getToken` to fetch a short-lived, scoped token from your own server, or put a proxy
-  in front of the catalog.
-- The token stays in the page and its worker. It is sent only to the catalog, and never
-  logged or put in a URL.
+A page cannot keep a secret: any token it holds, anyone can read. So the package takes
+none. The page names a **catalog proxy** in `sources.catalog.url`; the proxy holds the
+token and answers the catalog's endpoints and tiles without it.
+
+- `tuile-catalog-proxy` (`examples/catalog-proxy`) is that proxy, the same binary for
+  development and production. It answers only for the assets it is given (`--assets`),
+  only three routes, and refuses to pass on any reply that would carry the token, an asset
+  token or an imagery key. The imagery tiles themselves carry no key and are fetched from
+  the imagery service directly.
+- It reads the token from the environment variable `TUILE_ION_TOKEN`.
+- **In production** the token is a secret of the deployment, never part of the front end:
+  declare it as a secret configuration value (for example `pulumi config set --secret
+  catalogToken …`), have the stack put it in the secret store of the platform (a secret
+  manager entry, or a Kubernetes secret), and expose it to the proxy's process as
+  `TUILE_ION_TOKEN`. Serve the proxy behind TLS, set `--public-url` to its public address
+  and `--allow-origin` to the pages that may use it.
 
 ## Not yet
 
 - No persistent tile cache in the browser. The worker keeps tiles in memory, and a browser
   store comes with the graphics budget.
+- No atmosphere's sky model beyond the shared aerial perspective, no overlays and no
+  stereo yet: they come with the shared layers.
 - One viewer per page at a time: a second `createViewer` destroys the first.
 
 ## License

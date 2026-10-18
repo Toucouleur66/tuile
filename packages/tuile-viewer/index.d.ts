@@ -36,11 +36,12 @@ export interface ImageryLayer {
 /** Where terrain and imagery come from. */
 export interface Sources {
   /**
-   * A catalog that resolves asset numbers to tile endpoints. `url` is its API
-   * base; the connector's own when left out. Its token is `token` or
-   * `getToken`, never part of `sources`.
+   * The catalog that resolves asset numbers to tile endpoints: `url` is the
+   * address of the catalog proxy, which holds the catalog's token on the server
+   * (`tuile-catalog-proxy`). Relative to the page unless absolute. The page
+   * never holds a token.
    */
-  catalog?: { url?: string };
+  catalog: { url: string };
   /** The terrain: an asset of the catalog. */
   terrain: { asset: number };
   /** The layers, in the order a person should meet them; the first is shown first. */
@@ -49,24 +50,32 @@ export interface Sources {
 
 export interface ViewerOptions {
   sources: Sources;
-  /** The catalog's token. Prefer `getToken` on a public page: see the README. */
-  token?: string;
-  /** Called once, before the viewer starts, for the catalog's token. */
-  getToken?: () => Promise<string>;
   /** The host application's name, used in messages. */
   name?: string;
   /** The numbers the session runs with. `auto` unless said. */
   profile?: "auto" | "desktop" | "handheld";
   /** The graphics backend. `auto`: WebGPU where there is one, else WebGL2. */
   backend?: "auto" | "webgpu" | "webgl2";
-  /** Where the eye opens. Straight down on western Europe from 2 000 km unless said. */
+  /**
+   * Where the eye opens. Without it, where the last viewer of this `name` on
+   * this site was left (see `rememberView`), else straight down on western
+   * Europe from 2 000 km.
+   */
   view?: View;
-  /** Whether the on-screen compass and zoom controls are drawn. `true` unless said. */
+  /** Whether the on-screen compass, zoom controls and menu are drawn. `true` unless said. */
   ui?: boolean;
-  /** Where the imagery's attribution is shown, or `none` if the host shows it itself. */
-  attribution?: "bottom-right" | "bottom-left" | "none";
+  /**
+   * The bottom corner the caption keeps to: whose pictures are on screen, and
+   * the last thing the viewer said. `bottom-right` unless said.
+   */
+  attribution?: "bottom-right" | "bottom-left";
   /** Whether a viewer that cannot draw says so in the container. `true` unless said. */
   showUnsupportedMessage?: boolean;
+  /**
+   * Whether a viewer created without `view` opens where the last one was left,
+   * kept in the site's local storage. `true` unless said.
+   */
+  rememberView?: boolean;
 }
 
 export interface ViewerEvents {
@@ -74,7 +83,10 @@ export interface ViewerEvents {
   ready: { backend: string };
   /** The loading indicator came or went, or its progress moved. */
   loading: { shown: boolean; progress: number | null };
-  /** Something went wrong that the person should hear about. */
+  /**
+   * Something went wrong that the person should hear about. It is also shown over
+   * the view; a session that cannot start is tried again.
+   */
   error: { title: string; message: string };
   /** The view, a few times a second at most while it moves. */
   viewChanged: Required<View>;
@@ -113,7 +125,7 @@ export class UnsupportedError extends Error {
   readonly name: "UnsupportedError";
 }
 
-/** The options are wrong, or the session failed before the first frame. */
+/** The options are wrong. */
 export class StartError extends Error {
   readonly name: "StartError";
 }
