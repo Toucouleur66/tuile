@@ -45,7 +45,7 @@ pub struct Watermarks {
     pub low_percent: u8,
 }
 
-/// The fractions of the configured targets kept under each [`Pressure`]
+/// The fractions of the configured targets kept under each [`Pressure`](super::Pressure)
 /// level, in percent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PressureFractions {

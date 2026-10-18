@@ -348,10 +348,16 @@ fn decided_something(tr: &[Record]) -> bool {
 }
 
 fn config() -> ProptestConfig {
+    let base = ProptestConfig::default();
     ProptestConfig {
         // Integration tests have no lib.rs to anchor a regressions file.
         failure_persistence: None,
-        ..ProptestConfig::default()
+        // About a third of random scripts never reach what a property
+        // checks (the floor never comes in, no frame completes) and are
+        // rejected as vacuous; the cap must grow with the case count, or
+        // 10 000 cases abort on rejects rather than on a counterexample.
+        max_global_rejects: base.cases.saturating_mul(4).max(1_024),
+        ..base
     }
 }
 

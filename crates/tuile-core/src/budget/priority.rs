@@ -10,7 +10,7 @@
 //! 3. the residency tier (cheaper first: it closes a hole sooner);
 //! 4. the resource id.
 //!
-//! No float is compared: [`Need`](super::Need)'s floats are quantised once.
+//! No float is compared: [`Need`]'s floats are quantised once.
 
 use std::cmp::Reverse;
 

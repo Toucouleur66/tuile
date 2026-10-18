@@ -201,7 +201,7 @@ impl Budget {
     }
 
     /// A load finished decoding; `cost` is the estimator's
-    /// ([`cost`](self::cost)), for the decoded copy, the GPU and staging.
+    /// ([`cost`]), for the decoded copy, the GPU and staging.
     pub fn on_loaded(&mut self, r: ResourceId, gen: Generation, cost: cost::Cost) {
         self.events.push(Event::Loaded(r, gen, cost));
     }
