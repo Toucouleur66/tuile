@@ -29,11 +29,21 @@ url = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 reqwest = { workspace = true, optional = true, features = ["gzip"] }
+# The catalog proxy's server: the web framework the workspace's other services
+# use, and its CORS layer.
+axum = { version = "0.8", optional = true }
+tower-http = { version = "0.6", optional = true, features = ["cors"] }
 
 [dev-dependencies]
 futures-executor = { workspace = true }
 image = { workspace = true }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+
 [features]
 default = []
 reqwest = ["dep:reqwest"]
+# The catalog proxy on axum: see `proxy`.
+proxy = ["reqwest", "dep:axum", "dep:tower-http"]

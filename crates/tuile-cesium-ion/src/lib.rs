@@ -25,6 +25,9 @@ use std::sync::Arc;
 use tuile_core::fetch::{FetchError, TileFetcher};
 use url::Url;
 
+// The catalog behind a proxy: a server's, never a page's.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod proxy;
 pub mod sources;
 mod terrain;
 #[cfg(test)]
@@ -385,6 +388,11 @@ impl IonHttp for ReqwestHttp {
             .await
             .map_err(|e| IonError::Transport(e.to_string()))?;
         let status = response.status().as_u16();
+        let max_age = response
+            .headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .and_then(max_age);
         let body = response
             .bytes()
             .await
@@ -392,15 +400,46 @@ impl IonHttp for ReqwestHttp {
         Ok(HttpResponse {
             status,
             body,
-            max_age: None,
+            max_age,
         })
     }
+}
+
+/// `max-age` of a `Cache-Control` value, unless the value forbids keeping
+/// the response at all.
+#[cfg_attr(not(feature = "reqwest"), allow(dead_code))]
+fn max_age(cache_control: &str) -> Option<std::time::Duration> {
+    let directives: Vec<&str> = cache_control.split(',').map(str::trim).collect();
+    if directives
+        .iter()
+        .any(|d| d.eq_ignore_ascii_case("no-store") || d.eq_ignore_ascii_case("no-cache"))
+    {
+        return None;
+    }
+    directives.iter().find_map(|d| {
+        let (name, value) = d.split_once('=')?;
+        name.trim()
+            .eq_ignore_ascii_case("max-age")
+            .then(|| value.trim().parse().ok())
+            .flatten()
+            .map(std::time::Duration::from_secs)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tests_support::MockHttp;
+
+    #[test]
+    fn max_age_is_read_and_no_store_wins() {
+        assert_eq!(
+            max_age("public, max-age=86400"),
+            Some(std::time::Duration::from_secs(86_400))
+        );
+        assert_eq!(max_age("max-age=60, no-store"), None);
+        assert_eq!(max_age("public"), None);
+    }
 
     const ENDPOINT_URL: &str = "https://api.cesium.com/v1/assets/1415/endpoint";
 
