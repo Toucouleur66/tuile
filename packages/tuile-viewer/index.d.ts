@@ -76,6 +76,12 @@ export interface ViewerOptions {
    * kept in the site's local storage. `true` unless said.
    */
   rememberView?: boolean;
+  /**
+   * The most Web Workers that decode imagery and terrain beside the geometry
+   * server's: one per core the browser reports, less one, up to this. `0`
+   * decodes on the geometry server's own worker. `4` unless said.
+   */
+  decodeWorkers?: number;
 }
 
 export interface ViewerEvents {

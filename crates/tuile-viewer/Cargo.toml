@@ -96,6 +96,7 @@ features = [
     "Storage",
     "Window",
     "Worker",
+    "WorkerNavigator",
 ]
 
 [dev-dependencies]

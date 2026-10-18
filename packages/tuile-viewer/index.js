@@ -99,6 +99,7 @@ export async function createViewer(container, options) {
     attribution: o.attribution ?? "bottom-right",
     showUnsupportedMessage: o.showUnsupportedMessage ?? true,
     rememberView: o.rememberView ?? true,
+    decodeWorkers: o.decodeWorkers,
   };
 
   const listeners = new Map(EVENTS.map((kind) => [kind, new Set()]));

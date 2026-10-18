@@ -7,7 +7,9 @@
 //! The same [`crate::globe::assemble`] over the page's sources, the same gate
 //! in front of the loader, the same `GeometryServer`, run by the worker's
 //! event loop. What differs is only what a worker has: no tile store, and one
-//! thread, so decoding runs inline. The stream to the page is
+//! thread — so decoding goes to the decode workers this one starts
+//! ([`super::decode`]), where a desktop hands it to a pool of threads. The
+//! stream to the page is
 //! [`tuile_web::post::serve`]; what the page asks beside it arrives as
 //! [`ToWorker`] and is done to the loader's own handles.
 
@@ -26,21 +28,35 @@ use crate::profile::Profile;
 
 /// The worker's entry point, called by the package's worker script once the
 /// module is loaded: waits for the page's `start`.
+///
+/// `make_decode_worker` returns a new worker running the package's decode
+/// worker script — written in the package, so a bundler sees the script and
+/// ships it. Without it, decoding stays on this worker's thread.
 #[wasm_bindgen(js_name = runWorker)]
-pub fn run_worker() {
+pub fn run_worker(make_decode_worker: Option<js_sys::Function>) {
     super::log::install();
     let on_start =
-        Closure::<dyn FnMut(web_sys::MessageEvent)>::new(|event: web_sys::MessageEvent| {
+        Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
             match serde_wasm_bindgen::from_value::<ToWorker>(event.data()) {
                 Ok(ToWorker::Start {
                     sources,
                     opening,
                     profile,
                     device_memory,
+                    decode_workers,
                 }) => {
                     // The page speaks no more until it hears back; nothing else
                     // is listened for until the session decides who listens.
                     scope().set_onmessage(None);
+                    if let Some(make) = make_decode_worker.clone() {
+                        let count = super::schedule::pool_size(
+                            decode_workers,
+                            super::decode::hardware_concurrency(),
+                        );
+                        if count > 0 {
+                            super::decode::start(make, count);
+                        }
+                    }
                     wasm_bindgen_futures::spawn_local(async move {
                         let profile =
                             Profile::browser(profile == ProfileChoice::Handheld, device_memory);
@@ -69,7 +85,7 @@ async fn start(spec: SourcesSpec, opening: usize, profile: Profile) -> Result<()
         &terrain,
         &layers,
         opening,
-        Arc::new(tuile_core::offload::Inline),
+        Arc::new(super::decode::WebDecode),
     )
     .await
     .map_err(|e| format!("{e:#}"))?;

@@ -19,6 +19,7 @@
 //! reprojected once onto its own rectangle and **shared** with every other
 //! terrain tile it drapes.
 
+pub mod jobs;
 mod provenance;
 mod sources;
 mod switch;
@@ -37,8 +38,8 @@ use tuile_core::offload::{self, Offload};
 use tuile_core::raster::{self, GeoRect, ImageryCoord, ImageryProvider, RasterError};
 use tuile_core::source::{LoadError, Loaded, TileId, TileLoader, TileTree};
 use tuile_terrain::{
-    decode, level_geometric_error, to_ground, Availability, AvailabilityRange,
-    GeographicTilingScheme, LayerJson, TerrainHeights, TerrainSource, TerrainTree, TileCoord,
+    level_geometric_error, to_ground, Availability, AvailabilityRange, GeographicTilingScheme,
+    LayerJson, TerrainHeights, TerrainSource, TerrainTree, TileCoord,
 };
 
 /// How coarse the guaranteed bottom layer is.
@@ -171,7 +172,7 @@ fn coarse_floor(
 /// every arrival, but a tile that is black at a hundred spread-out points and
 /// not elsewhere does not exist in aerial photography. One false negative in
 /// exchange for a check that costs nothing.
-fn is_opaque_black(tex: &DecodedTexture) -> bool {
+pub(crate) fn is_opaque_black(tex: &DecodedTexture) -> bool {
     const SAMPLES: usize = 100;
     let texels = tex.rgba8.len() / 4;
     if texels == 0 {
@@ -893,14 +894,19 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                 // Decode, resample and inspect in a single offloaded job. All
                 // three are pure CPU over the same buffer, so splitting them
                 // would only pay the hop three times and undo the locality.
+                //
+                // As data rather than a closure, so that in a browser it can
+                // cross to a decode worker: see `jobs`.
                 let off = Arc::clone(&self.offload);
-                let (tex, black) = offload::run(off.as_ref(), move || {
-                    let tex = raster::decode_and_reproject(&fetched.value, &scheme, c)?;
-                    let black = is_opaque_black(&tex);
-                    Ok::<_, RasterError>((Arc::new(tex), black))
-                })
-                .await
-                .map_err(|e| LoadError::Failed(format!("imagery {c:?}: {e}")))?;
+                let job = jobs::ImageryDecode {
+                    bytes: fetched.value,
+                    scheme,
+                    coord: c,
+                };
+                let (tex, black) = offload::run_portable(off.as_ref(), job)
+                    .await
+                    .map_err(|e| LoadError::Failed(format!("imagery {c:?}: {e}")))?;
+                let tex = Arc::new(tex);
                 // A provider's way of saying "no data here" is often an opaque
                 // black image. Draped on good geometry that is a clean black
                 // quad with sharp edges — visually identical to a rendering
@@ -1041,9 +1047,12 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                         // same reason: nothing in it awaits, and holding the
                         // poller for its duration stalls every other load.
                         let off = Arc::clone(&self.offload);
-                        let decoded = offload::run(off.as_ref(), move || decode(&fetched.value))
+                        let job = jobs::TerrainDecode {
+                            bytes: fetched.value,
+                        };
+                        let decoded = offload::run_portable(off.as_ref(), job)
                             .await
-                            .map_err(|e| LoadError::Failed(e.to_string()))?;
+                            .map_err(LoadError::Failed)?;
                         // Decoding is also what reveals which descendants exist —
                         // the source may have served these bytes from a cache, but
                         // the ranges still reach the shared availability, so

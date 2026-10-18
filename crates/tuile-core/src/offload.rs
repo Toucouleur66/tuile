@@ -52,6 +52,92 @@ pub trait Offload: Send + Sync {
     /// Must not block the caller for the job's duration — an implementation
     /// that does is [`Inline`], and should say so by being it.
     fn submit(&self, job: Job);
+
+    /// Where [`Portable`] work goes when it has to cross to something that
+    /// shares no memory with the caller — a Web Worker, which can be handed
+    /// bytes and nothing else.
+    ///
+    /// `None`, the default, is every native host: a closure crosses to a thread
+    /// for free, and turning the job into bytes would only cost a copy.
+    /// [`run_portable`] then takes the closure path through [`submit`](Self::submit).
+    fn remote(&self) -> Option<&dyn Remote> {
+        None
+    }
+}
+
+/// Work stated as data: a job written to bytes, run wherever the same code is
+/// loaded, and its value read back from bytes.
+///
+/// The form a job has to take to leave a browser's worker. A [`Job`] is a
+/// pointer into the caller's linear memory, and a second worker only shares
+/// that memory under `SharedArrayBuffer` — atomics, a nightly `build-std`, and
+/// COOP/COEP headers on whoever serves the page. Bytes cost a `postMessage`
+/// with a transferred buffer, on every browser, behind any server.
+///
+/// The far side finds the job by [`KIND`](Self::KIND) and runs it with
+/// [`serve`]. A job's own failure (a corrupt JPEG) belongs in its `Output`, so
+/// it travels as an answer like any other; the transport's `Err` is kept for
+/// the transport failing, which [`run_portable`] recovers from by running the
+/// job here.
+pub trait Portable: Sized + Send + 'static {
+    /// The name the far side dispatches on. Unique among a host's jobs.
+    const KIND: &'static str;
+    /// What the job computes.
+    type Output: Send + 'static;
+
+    /// Does the work: blocking, I/O-free, like [`Job`].
+    fn run(self) -> Self::Output;
+    /// The job as bytes.
+    fn encode(&self) -> Vec<u8>;
+    /// The job back from [`encode`](Self::encode)'s bytes.
+    fn decode(bytes: Vec<u8>) -> Result<Self, String>;
+    /// The value as bytes.
+    fn encode_output(output: Self::Output) -> Vec<u8>;
+    /// The value back from [`encode_output`](Self::encode_output)'s bytes.
+    fn decode_output(bytes: Vec<u8>) -> Result<Self::Output, String>;
+}
+
+/// Runs a [`Portable`] job from its bytes and answers in bytes: what the far
+/// side of a [`Remote`] calls, once it has found the job by its kind.
+pub fn serve<P: Portable>(input: Vec<u8>) -> Result<Vec<u8>, String> {
+    Ok(P::encode_output(P::decode(input)?.run()))
+}
+
+/// Accepts [`Portable`] work as bytes and answers through a [`Reply`].
+///
+/// Not `Send`: a browser's worker handle is not, and a remote is only ever
+/// reached through the [`Offload`] that lends it, on the thread that holds it.
+pub trait Remote {
+    /// Run the job of this kind from these bytes, somewhere; answer `reply`.
+    ///
+    /// Must return at once, like [`Offload::submit`].
+    fn submit_bytes(&self, kind: &'static str, input: Vec<u8>, reply: Reply);
+}
+
+/// Where a [`Remote`] puts its answer: the bytes of the value, or why the
+/// transport could not produce them.
+pub struct Reply(futures_channel::oneshot::Sender<Result<Vec<u8>, String>>);
+
+impl Reply {
+    /// Whether anyone still waits for the answer. A load the camera left is
+    /// dropped with its receiver, and a job still queued for it is worth
+    /// skipping rather than running for nobody.
+    pub fn wanted(&self) -> bool {
+        !self.0.is_canceled()
+    }
+
+    /// Answers. Silently nothing when the asker has gone.
+    pub fn send(self, answer: Result<Vec<u8>, String>) {
+        let _ = self.0.send(answer);
+    }
+}
+
+impl std::fmt::Debug for Reply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Reply")
+            .field("wanted", &self.wanted())
+            .finish()
+    }
 }
 
 /// Runs the job on the calling thread, before returning.
@@ -213,6 +299,37 @@ where
         .expect("the offload dropped a job without running it")
 }
 
+/// Runs a [`Portable`] job on `off` and awaits its value.
+///
+/// Through `off`'s [`Remote`] as bytes when it has one, and otherwise exactly
+/// as [`run`] — the closure, no serialisation — which is every native host and
+/// [`Inline`]. A remote that fails (its worker died, its answer is unreadable)
+/// costs the job a second run, here, through [`run`]: slower, never a missing
+/// tile. The job's own failure is not a transport failure and is not retried;
+/// it is in the `Output`.
+pub async fn run_portable<P: Portable>(off: &dyn Offload, job: P) -> P::Output {
+    // The remote is let go before the await: it is not `Send`, and a native
+    // load future that held it would stop being so.
+    let asked = off.remote().map(|remote| {
+        let (tx, rx) = futures_channel::oneshot::channel();
+        remote.submit_bytes(P::KIND, job.encode(), Reply(tx));
+        rx
+    });
+    if let Some(rx) = asked {
+        match rx.await {
+            Ok(Ok(bytes)) => match P::decode_output(bytes) {
+                Ok(output) => return output,
+                Err(why) => tracing::warn!(kind = P::KIND, "unreadable answer, run here: {why}"),
+            },
+            Ok(Err(why)) => tracing::warn!(kind = P::KIND, "the remote failed, run here: {why}"),
+            Err(futures_channel::oneshot::Canceled) => {
+                tracing::warn!(kind = P::KIND, "the remote dropped the job, run here");
+            }
+        }
+    }
+    run(off, move || job.run()).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,5 +457,126 @@ mod tests {
         }
         drop(pool);
         assert_eq!(DONE.load(Ordering::SeqCst), 8, "jobs were torn down");
+    }
+
+    /// A job small enough to check by hand: the sum of its bytes. Counts its
+    /// encodings, so a test can tell the bytes path from the closure path.
+    struct Sum(Vec<u8>);
+
+    static ENCODED: AtomicU32 = AtomicU32::new(0);
+
+    impl Portable for Sum {
+        const KIND: &'static str = "test.sum";
+        type Output = u64;
+        fn run(self) -> u64 {
+            self.0.iter().map(|b| u64::from(*b)).sum()
+        }
+        fn encode(&self) -> Vec<u8> {
+            ENCODED.fetch_add(1, Ordering::SeqCst);
+            self.0.clone()
+        }
+        fn decode(bytes: Vec<u8>) -> Result<Self, String> {
+            Ok(Self(bytes))
+        }
+        fn encode_output(output: u64) -> Vec<u8> {
+            output.to_le_bytes().to_vec()
+        }
+        fn decode_output(bytes: Vec<u8>) -> Result<u64, String> {
+            let bytes: [u8; 8] = bytes.try_into().map_err(|_| "not eight bytes".to_owned())?;
+            Ok(u64::from_le_bytes(bytes))
+        }
+    }
+
+    /// An offload whose remote is a closure over what it was handed.
+    struct WithRemote<F: Fn(&'static str, Vec<u8>, Reply) + Send + Sync>(F);
+
+    impl<F: Fn(&'static str, Vec<u8>, Reply) + Send + Sync> Offload for WithRemote<F> {
+        fn submit(&self, job: Job) {
+            job();
+        }
+        fn remote(&self) -> Option<&dyn Remote> {
+            Some(self)
+        }
+    }
+
+    impl<F: Fn(&'static str, Vec<u8>, Reply) + Send + Sync> Remote for WithRemote<F> {
+        fn submit_bytes(&self, kind: &'static str, input: Vec<u8>, reply: Reply) {
+            (self.0)(kind, input, reply);
+        }
+    }
+
+    /// The bytes path: the job leaves as bytes, is served by its kind on
+    /// another thread, and its value comes back read from bytes.
+    #[test]
+    fn a_portable_job_crosses_as_bytes_and_comes_back_as_its_value() {
+        let served = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&served);
+        let off = WithRemote(move |kind: &'static str, input: Vec<u8>, reply: Reply| {
+            assert_eq!(kind, Sum::KIND);
+            counted.fetch_add(1, Ordering::SeqCst);
+            std::thread::spawn(move || reply.send(serve::<Sum>(input)));
+        });
+        let sum = futures_executor::block_on(run_portable(&off, Sum(vec![1, 2, 3, 250])));
+        assert_eq!(sum, 256);
+        assert_eq!(served.load(Ordering::SeqCst), 1, "the remote was not used");
+    }
+
+    /// No remote, no bytes: a native host pays nothing for the seam.
+    #[test]
+    fn without_a_remote_the_job_runs_as_a_closure_and_is_never_encoded() {
+        let before = ENCODED.load(Ordering::SeqCst);
+        let sum = futures_executor::block_on(run_portable(&Inline, Sum(vec![7; 6])));
+        assert_eq!(sum, 42);
+        assert_eq!(
+            ENCODED.load(Ordering::SeqCst),
+            before,
+            "the job was encoded"
+        );
+    }
+
+    /// A remote that fails, answers garbage or drops the job costs a second
+    /// run here — never a value missing.
+    #[test]
+    fn a_failing_remote_falls_back_to_running_the_job_here() {
+        let failing = WithRemote(|_: &'static str, _: Vec<u8>, reply: Reply| {
+            reply.send(Err("the worker died".into()));
+        });
+        assert_eq!(
+            futures_executor::block_on(run_portable(&failing, Sum(vec![5, 5]))),
+            10
+        );
+        let garbled = WithRemote(|_: &'static str, _: Vec<u8>, reply: Reply| {
+            reply.send(Ok(vec![1, 2, 3]));
+        });
+        assert_eq!(
+            futures_executor::block_on(run_portable(&garbled, Sum(vec![5, 6]))),
+            11
+        );
+        let dropping = WithRemote(|_: &'static str, _: Vec<u8>, reply: Reply| drop(reply));
+        assert_eq!(
+            futures_executor::block_on(run_portable(&dropping, Sum(vec![5, 7]))),
+            12
+        );
+    }
+
+    /// A reply knows when its asker has gone, which is what lets a queue skip
+    /// work nobody waits for.
+    #[test]
+    fn a_reply_knows_when_nobody_waits() {
+        let (tx, rx) = futures_channel::oneshot::channel();
+        let reply = Reply(tx);
+        assert!(reply.wanted());
+        drop(rx);
+        assert!(!reply.wanted());
+        reply.send(Ok(Vec::new()));
+    }
+
+    /// Native loaders are `Send` futures: the seam must not make them less.
+    #[test]
+    fn a_portable_run_is_a_send_future() {
+        fn send<T: Send>(_: &T) {}
+        let future = run_portable(&Inline, Sum(vec![1]));
+        send(&future);
+        assert_eq!(futures_executor::block_on(future), 1);
     }
 }

@@ -82,6 +82,7 @@ is a canvas. It resolves once the viewer draws.
 | `attribution` | The bottom corner of the caption — whose pictures are on screen, and the last thing the viewer said: `bottom-right` (the default) or `bottom-left`. |
 | `showUnsupportedMessage` | Whether a viewer that cannot draw says so in the container (`true` by default). |
 | `rememberView` | Whether a viewer created without `view` opens where the last one was left, kept in the site's local storage (`true` by default). |
+| `decodeWorkers` | The most Web Workers that decode imagery and terrain beside the geometry server's: one per core less one, up to this (`4` by default). `0` decodes on the geometry server's own worker. They exchange transferred buffers: no `SharedArrayBuffer`, so no cross-origin isolation headers are needed. |
 
 ## The viewer
 

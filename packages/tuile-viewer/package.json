@@ -23,6 +23,7 @@
     "index.js",
     "index.d.ts",
     "worker.js",
+    "decode-worker.js",
     "wasm/tuile_viewer.js",
     "wasm/tuile_viewer_bg.wasm",
     "README.md"
