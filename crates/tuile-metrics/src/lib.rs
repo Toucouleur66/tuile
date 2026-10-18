@@ -198,7 +198,7 @@ fn describe() {
 /// `_seconds_peak` (gauges). The sum is a gauge only because the recorder's
 /// counters are integers; it never goes down, and `rate(sum) / rate(count)` is
 /// the mean over any window.
-fn timers(m: &Metrics) -> [(&'static str, &'static str, &Timer); 11] {
+fn timers(m: &Metrics) -> [(&'static str, &'static str, &Timer); 12] {
     [
         ("traversal", "The traversal walk.", &m.traversal_seconds),
         (
@@ -210,6 +210,11 @@ fn timers(m: &Metrics) -> [(&'static str, &'static str, &Timer); 11] {
             "arrival_wait",
             "From a load resolving to the loop handling it.",
             &m.arrival_wait_seconds,
+        ),
+        (
+            "load_wake_wait",
+            "From a load being woken to the loop polling it, per wake.",
+            &m.load_wake_wait_seconds,
         ),
         (
             "load",
@@ -344,6 +349,7 @@ mod tests {
             "tuile_arrival_wait_seconds_sum",
             "tuile_arrival_wait_seconds_peak",
             "tuile_select_seconds_count",
+            "tuile_load_wake_wait_seconds_count",
             "tuile_traversal_seconds_sum",
             "tuile_arrivals_per_pass_count",
             "tuile_arrivals_per_pass_sum",

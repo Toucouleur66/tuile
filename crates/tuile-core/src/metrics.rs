@@ -337,13 +337,21 @@ pub struct Metrics {
     /// arrivals one pass answers, the peak the largest burst it folded in.
     /// Passes provoked by the camera are not counted here.
     pub arrivals_per_pass: Tally,
-    /// From a load's own future resolving to the loop handling its result.
+    /// From the wake that let a load finish to the loop handling its result.
     ///
     /// The time a tile that has already arrived spends waiting for the loop to
     /// notice — behind a traversal, behind the camera, behind other arrivals.
     /// Zero would be a loop that is never busy; a peak in the hundreds of
     /// milliseconds is ground held back by the server rather than the network.
+    /// Measured from the wake, not from the future resolving: the loads are
+    /// polled by the loop alone, so a load resolves only once the loop gets
+    /// to it, and stamping there would always read nothing.
     pub arrival_wait_seconds: Timer,
+    /// Every wake of a load, to the poll that answered it — one sample per
+    /// wake, not per load. Loads advance only when the loop polls them, so
+    /// this is the time body reads, decode hand-offs and store lookups spend
+    /// waiting on the loop at every step, not only the last one.
+    pub load_wake_wait_seconds: Timer,
     pub tiles_visited: Gauge,
     pub tiles_culled: Gauge,
     pub tiles_selected: Gauge,

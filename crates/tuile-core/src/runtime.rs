@@ -47,6 +47,86 @@ type BoxLoadFut = Pin<Box<dyn Future<Output = Arrival> + Send>>;
 type BoxLoadFut = Pin<Box<dyn Future<Output = Arrival>>>;
 type LoadFuture = Abortable<BoxLoadFut>;
 
+/// A load future that notes when it was woken.
+///
+/// The loads live in one `FuturesUnordered` that only the loop polls, so a
+/// load whose data has arrived — woken by its socket, its decode pool, its
+/// store — makes no progress until the loop comes round to it, which may be
+/// after a whole traversal. Stamping when the future *resolves* would hide
+/// exactly that, since it resolves only once it is polled. So the waker is
+/// wrapped: every wake is stamped, the time from a wake to the poll that
+/// answers it goes to `waits`, and the future's output carries the last wake
+/// before it completed — what [`crate::metrics::Metrics::arrival_wait_seconds`]
+/// is measured from. A load that completes on a poll nothing woke (its first,
+/// or one the loop made on its own) carries the instant of that poll.
+///
+/// Wakes pass straight through to the loop's waker, and the same waker is
+/// handed over on every poll so `will_wake` keeps answering yes: nothing about
+/// when or how often the load is polled changes.
+struct Woken<F: Future> {
+    inner: Pin<Box<F>>,
+    hook: Arc<WakeHook>,
+    waits: &'static crate::metrics::Timer,
+}
+
+#[derive(Default)]
+struct WakeHook {
+    /// The waker of whoever polls us: the `FuturesUnordered`'s.
+    waker: std::sync::Mutex<Option<std::task::Waker>>,
+    /// The first wake since the last poll.
+    woke: std::sync::Mutex<Option<crate::metrics::Stamp>>,
+}
+
+impl std::task::Wake for WakeHook {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        if let Ok(mut woke) = self.woke.lock() {
+            woke.get_or_insert_with(crate::metrics::stamp);
+        }
+        if let Ok(waker) = self.waker.lock() {
+            if let Some(waker) = waker.as_ref() {
+                waker.wake_by_ref();
+            }
+        }
+    }
+}
+
+impl<F: Future> Woken<F> {
+    fn new(inner: F, waits: &'static crate::metrics::Timer) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            hook: Arc::new(WakeHook::default()),
+            waits,
+        }
+    }
+}
+
+impl<F: Future> Future for Woken<F> {
+    type Output = (F::Output, crate::metrics::Stamp);
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        if let Ok(mut waker) = self.hook.waker.lock() {
+            match waker.as_mut() {
+                Some(w) if w.will_wake(cx.waker()) => {}
+                _ => *waker = Some(cx.waker().clone()),
+            }
+        }
+        let woke = self.hook.woke.lock().ok().and_then(|mut w| w.take());
+        if let Some(woke) = woke {
+            self.waits.record(woke.elapsed());
+        }
+        let waker = std::task::Waker::from(Arc::clone(&self.hook));
+        let mut inner_cx = std::task::Context::from_waker(&waker);
+        match self.inner.as_mut().poll(&mut inner_cx) {
+            Poll::Ready(out) => Poll::Ready((out, woke.unwrap_or_else(crate::metrics::stamp))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 /// A pause the host's event loop gets to run in: see
 /// [`GeometryServer::with_breather`]. `Send` on native, like the loads, and
 /// not on wasm, where it is a JS timer.
@@ -873,10 +953,10 @@ impl Session<'_> {
         // refreshed once more than it needed.
         self.started.insert(tile, loader.epoch());
         let (handle, registration) = AbortHandle::new_pair();
-        let fut: BoxLoadFut = Box::pin(async move {
-            let result = loader.load(tile).await;
-            ((tile, result), crate::metrics::stamp())
-        });
+        let fut: BoxLoadFut = Box::pin(Woken::new(
+            async move { (tile, loader.load(tile).await) },
+            &crate::metrics::metrics().load_wake_wait_seconds,
+        ));
         loads.push(Abortable::new(fut, registration));
         self.in_flight.insert(tile, handle);
         let m = crate::metrics::metrics();
@@ -1195,6 +1275,77 @@ mod tests {
     use glam::{dvec2, dvec3};
     use std::sync::Mutex;
     use url::Url;
+
+    /// **A load that is woken carries the wake, not the poll.** The loop polls
+    /// the loads only when it gets round to them, so a load whose data arrived
+    /// during a traversal resolves after it — and the arrival wait is the time
+    /// in between, which a stamp taken on resolving would always read as zero.
+    #[test]
+    fn a_woken_load_carries_its_wake_not_its_poll() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        /// Pending until told otherwise, with its waker kept for the test.
+        struct Later {
+            ready: Arc<AtomicBool>,
+            waker: Arc<Mutex<Option<std::task::Waker>>>,
+        }
+        impl Future for Later {
+            type Output = u8;
+            fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<u8> {
+                if self.ready.load(Ordering::SeqCst) {
+                    return Poll::Ready(7);
+                }
+                *self.waker.lock().expect("lock") = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+        /// The loop's side: counts the wakes passed through to it.
+        struct Count(AtomicUsize);
+        impl std::task::Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let waits: &'static crate::metrics::Timer = Box::leak(Box::default());
+        let ready = Arc::new(AtomicBool::new(false));
+        let slot = Arc::new(Mutex::new(None));
+        let mut load = Box::pin(Woken::new(
+            Later {
+                ready: Arc::clone(&ready),
+                waker: Arc::clone(&slot),
+            },
+            waits,
+        ));
+        let count = Arc::new(Count(AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(Arc::clone(&count));
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        assert!(load.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(waits.count(), 0, "nothing woke it yet");
+
+        ready.store(true, Ordering::SeqCst);
+        slot.lock().expect("lock").take().expect("a waker").wake();
+        assert_eq!(
+            count.0.load(Ordering::SeqCst),
+            1,
+            "the wake reaches the loop"
+        );
+        // The loop is busy elsewhere.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+
+        let Poll::Ready((out, woke)) = load.as_mut().poll(&mut cx) else {
+            unreachable!("ready once woken");
+        };
+        assert_eq!(out, 7);
+        assert!(
+            woke.elapsed() >= std::time::Duration::from_millis(30),
+            "the stamp is the wake's, 30 ms ago, not the poll's: {:?}",
+            woke.elapsed()
+        );
+        assert_eq!(waits.count(), 1, "one wake, one wait");
+        assert!(waits.peak_millis() >= 30.0, "{}", waits.peak_millis());
+    }
 
     fn write_fixture(dir: &std::path::Path) -> Url {
         let glb = crate::content::tests::test_glb();

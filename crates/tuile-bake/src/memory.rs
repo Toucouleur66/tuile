@@ -228,6 +228,11 @@ pub fn watch(interval: Duration, watched: Vec<PathBuf>) {
                         m.arrival_wait_seconds.mean_millis(),
                         m.arrival_wait_seconds.peak_millis()
                     ),
+                    load_wake_wait_ms = format!(
+                        "{:.2}/{:.2}",
+                        m.load_wake_wait_seconds.mean_millis(),
+                        m.load_wake_wait_seconds.peak_millis()
+                    ),
                     source,
                     "MEMORY"
                 );
