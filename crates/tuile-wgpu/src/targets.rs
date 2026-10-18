@@ -20,6 +20,8 @@
 //! surface — the host owns those, and owns the resolve into them.
 
 use crate::context::{GpuContext, DEPTH_FORMAT, SAMPLES};
+use crate::encode::Encode;
+use crate::surface::SurfaceFormat;
 
 /// The multisampled colour target and its depth buffer.
 pub struct FrameTargets {
@@ -28,6 +30,10 @@ pub struct FrameTargets {
     pub depth: wgpu::TextureView,
     format: wgpu::TextureFormat,
     size: (u32, u32),
+    /// The surface's format, when the frame reaches it through an encoding
+    /// pass rather than straight from the resolve: see [`crate::encode`].
+    surface: Option<wgpu::TextureFormat>,
+    pub(crate) encode: Option<Encode>,
 }
 
 impl FrameTargets {
@@ -40,7 +46,27 @@ impl FrameTargets {
             depth: attachment(gpu, DEPTH_FORMAT, size, "tuile frame depth"),
             format,
             size,
+            surface: None,
+            encode: None,
         }
+    }
+
+    /// The targets for drawing onto a surface of `format`: those of
+    /// [`FrameTargets::new`], plus — where the surface can neither be sRGB
+    /// nor be viewed as sRGB — the texture the frame is resolved into and the
+    /// pass that encodes it into the surface.
+    pub fn for_surface(gpu: &GpuContext, format: SurfaceFormat, size: (u32, u32)) -> Self {
+        let mut targets = Self::new(gpu, format.render, size);
+        if format.encode {
+            targets.surface = Some(format.surface);
+            targets.encode = Some(Encode::new(
+                gpu,
+                format.render,
+                format.surface,
+                targets.size,
+            ));
+        }
+        targets
     }
 
     /// Rebuilds both targets for a new size, and says whether it had to.
@@ -53,7 +79,18 @@ impl FrameTargets {
         if size == self.size {
             return false;
         }
-        *self = Self::new(gpu, self.format, size);
+        *self = match self.surface {
+            Some(surface) => Self::for_surface(
+                gpu,
+                SurfaceFormat {
+                    surface,
+                    render: self.format,
+                    encode: true,
+                },
+                size,
+            ),
+            None => Self::new(gpu, self.format, size),
+        };
         true
     }
 

@@ -103,10 +103,25 @@ pub fn draw_to_surface(
     // Viewed in the format the frame is drawn in, which is the surface's own
     // format everywhere but a browser: there the canvas is linear and the
     // frame is resolved into an sRGB view of it. See [`surface_format`].
-    let drawable = frame.texture.create_view(&wgpu::TextureViewDescriptor {
-        format: Some(targets.format()),
-        ..Default::default()
+    //
+    // Where the surface can be neither, the frame is resolved into a texture
+    // of its own and encoded into the surface by one more pass.
+    let surface_view = targets.encode.as_ref().map(|_| {
+        frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default())
     });
+    let drawable_view;
+    let drawable = match targets.encode.as_ref() {
+        Some(encode) => &encode.resolved,
+        None => {
+            drawable_view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(targets.format()),
+                ..Default::default()
+            });
+            &drawable_view
+        }
+    };
 
     let mut encoder = gpu.device.create_command_encoder(&Default::default());
     {
@@ -117,7 +132,7 @@ pub fn draw_to_surface(
                 // drawable: the samples are averaged on the way out, which is
                 // where the staircase on the limb disappears.
                 view: &targets.colour,
-                resolve_target: Some(&drawable),
+                resolve_target: Some(drawable),
                 depth_slice: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(clear),
@@ -141,6 +156,9 @@ pub fn draw_to_surface(
             ..Default::default()
         });
         paint(&mut pass);
+    }
+    if let (Some(encode), Some(view)) = (targets.encode.as_ref(), surface_view.as_ref()) {
+        encode.encode(&mut encoder, view);
     }
     // Before the frame is handed to the compositor: afterwards the texture
     // belongs to the surface again and there is nothing left to copy.
@@ -175,15 +193,20 @@ pub struct SurfaceFormat {
     pub surface: wgpu::TextureFormat,
     /// What the frame is drawn in: the pipelines and [`FrameTargets`] are
     /// built for it. When it differs from [`SurfaceFormat::surface`] it is the
-    /// sRGB view of it, and the host must list it in the configuration's
-    /// `view_formats`.
+    /// sRGB counterpart of it: viewed as such through the configuration's
+    /// `view_formats`, or — when [`SurfaceFormat::encode`] — reached through
+    /// an encoding pass.
     pub render: wgpu::TextureFormat,
+    /// The surface is linear and cannot be viewed as sRGB: the frame is
+    /// resolved into a texture of its own and the transfer curve applied by
+    /// one more pass ([`FrameTargets::for_surface`] builds it).
+    pub encode: bool,
 }
 
 impl SurfaceFormat {
     /// The `view_formats` the surface configuration must carry.
     pub fn view_formats(&self) -> Vec<wgpu::TextureFormat> {
-        if self.render == self.surface {
+        if self.render == self.surface || self.encode {
             Vec::new()
         } else {
             vec![self.render]
@@ -197,12 +220,23 @@ impl SurfaceFormat {
 /// `rgba8unorm` and nothing else, and drawing into that linear format writes
 /// every colour without its transfer curve — the washed-out globe
 /// [`preferred_format`] exists to prevent. The answer there is to keep the
-/// linear surface and draw into its sRGB *view*, which every backend allows.
-pub fn surface_format(caps: &wgpu::SurfaceCapabilities) -> SurfaceFormat {
+/// linear surface and draw into its sRGB *view*.
+///
+/// A view in another format needs `SURFACE_VIEW_FORMATS`, which `downlevel`
+/// (the adapter's) says whether the device has. OpenGL ES without an sRGB
+/// colour space for its window (the Android emulator's) has neither an sRGB
+/// format nor the view: there the curve is applied by an encoding pass.
+pub fn surface_format(
+    caps: &wgpu::SurfaceCapabilities,
+    downlevel: wgpu::DownlevelFlags,
+) -> SurfaceFormat {
     let surface = preferred_format(caps);
+    let render = surface.add_srgb_suffix();
     SurfaceFormat {
         surface,
-        render: surface.add_srgb_suffix(),
+        render,
+        encode: render != surface
+            && !downlevel.contains(wgpu::DownlevelFlags::SURFACE_VIEW_FORMATS),
     }
 }
 
@@ -221,26 +255,59 @@ mod tests {
     /// the phone configure exactly what they always did.
     #[test]
     fn an_offered_srgb_format_is_drawn_in_directly() {
-        let chosen = surface_format(&caps(&[
-            wgpu::TextureFormat::Bgra8Unorm,
-            wgpu::TextureFormat::Bgra8UnormSrgb,
-        ]));
+        let chosen = surface_format(
+            &caps(&[
+                wgpu::TextureFormat::Bgra8Unorm,
+                wgpu::TextureFormat::Bgra8UnormSrgb,
+            ]),
+            wgpu::DownlevelFlags::empty(),
+        );
         assert_eq!(chosen.surface, wgpu::TextureFormat::Bgra8UnormSrgb);
         assert_eq!(chosen.render, chosen.surface);
         assert!(chosen.view_formats().is_empty());
+        assert!(!chosen.encode);
     }
 
     /// A canvas that only offers linear formats is drawn into through its
     /// sRGB view, never written linear.
     #[test]
     fn a_linear_only_surface_is_drawn_through_its_srgb_view() {
-        let chosen = surface_format(&caps(&[
-            wgpu::TextureFormat::Bgra8Unorm,
-            wgpu::TextureFormat::Rgba16Float,
-        ]));
+        let chosen = surface_format(
+            &caps(&[
+                wgpu::TextureFormat::Bgra8Unorm,
+                wgpu::TextureFormat::Rgba16Float,
+            ]),
+            wgpu::DownlevelFlags::SURFACE_VIEW_FORMATS,
+        );
         assert_eq!(chosen.surface, wgpu::TextureFormat::Bgra8Unorm);
         assert_eq!(chosen.render, wgpu::TextureFormat::Bgra8UnormSrgb);
         assert!(chosen.render.is_srgb());
         assert_eq!(chosen.view_formats(), [wgpu::TextureFormat::Bgra8UnormSrgb]);
+        assert!(!chosen.encode);
+    }
+
+    /// OpenGL ES without an sRGB window (the Android emulator's): no sRGB
+    /// format and no view of one. Still drawn in sRGB — through an encoding
+    /// pass, with nothing asked of the surface's configuration that the
+    /// device would refuse.
+    #[test]
+    fn a_linear_surface_without_views_is_encoded_by_a_pass() {
+        let chosen = surface_format(
+            &caps(&[
+                wgpu::TextureFormat::Rgba8Unorm,
+                wgpu::TextureFormat::Bgra8Unorm,
+            ]),
+            wgpu::DownlevelFlags::empty(),
+        );
+        assert_eq!(chosen.surface, wgpu::TextureFormat::Rgba8Unorm);
+        assert_eq!(chosen.render, wgpu::TextureFormat::Rgba8UnormSrgb);
+        assert!(chosen.encode);
+        assert!(chosen.view_formats().is_empty());
+        // An sRGB surface needs no pass, whatever the device lacks.
+        let srgb = surface_format(
+            &caps(&[wgpu::TextureFormat::Rgba8UnormSrgb]),
+            wgpu::DownlevelFlags::empty(),
+        );
+        assert!(!srgb.encode);
     }
 }

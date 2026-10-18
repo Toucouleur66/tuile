@@ -194,7 +194,17 @@ async fn bring_up(window: Arc<Window>, backends: Option<wgpu::Backends>) -> Resu
         })
         .await
         .map_err(|e| format!("device: {e}"))?;
-    let format = tuile_wgpu::surface_format(&surface.get_capabilities(&adapter));
+    let format = tuile_wgpu::surface_format(
+        &surface.get_capabilities(&adapter),
+        adapter.get_downlevel_capabilities().flags,
+    );
+    if format.encode {
+        tracing::info!(
+            surface = ?format.surface,
+            render = ?format.render,
+            "a linear surface with no sRGB view: the frame is encoded by a pass"
+        );
+    }
     Ok(Gpu {
         window,
         instance,
@@ -309,7 +319,7 @@ impl App {
         // The render origin tracks the eye (set each frame); start there.
         let pump = ContentPump::new(self.controller.camera.position);
         let safe = safe_area(&window, size);
-        let targets = tuile_wgpu::FrameTargets::new(&gpu, surface_format, size);
+        let targets = tuile_wgpu::FrameTargets::for_surface(&gpu, format, size);
         // Built and uploaded once for the whole session.
         let shell = tuile_wgpu::prepare(&gpu, &crate::backdrop::shell_content(), DVec3::ZERO);
 

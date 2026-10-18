@@ -27,6 +27,7 @@
 //! loop and the render pass.
 
 mod context;
+mod encode;
 mod overlay;
 mod prepare;
 mod pump;
