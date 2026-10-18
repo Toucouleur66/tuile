@@ -6401,7 +6401,7 @@ dependencies = [
 
 [[package]]
 name = "tuile-catalog-proxy"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -6928,21 +6928,6 @@ dependencies = [
  "tuile-planetary",
  "tuile-storage-foyer",
  "tuile-terrain",
-]
-
-[[package]]
-name = "tuile-wasm-globe"
-version = "0.8.1"
-dependencies = [
- "console_error_panic_hook",
- "glam 0.33.1",
- "serde",
- "serde-wasm-bindgen",
- "tuile-bing",
- "tuile-core",
- "tuile-terrain",
- "url",
- "wasm-bindgen",
 ]
 
 [[package]]
