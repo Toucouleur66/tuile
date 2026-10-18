@@ -66,6 +66,8 @@ The native viewer, meanwhile, carries every one of those guarantees:
   │  the phone's UIKit glue stay in  │   geometry server              │
   │  their platform `system` modules │  sources.rs, options.rs,       │
   │                                  │   control.rs, system.rs, log.rs│
+  │                                  │  screen.rs: caption, alerts    │
+  │                                  │  menu.rs: menus from a button  │
   └──────────────────────────────────┴────────────────────────────────┘
         tuile-wgpu, tuile-ui, tuile-camera, tuile-planetary, tuile-core: all targets
         tuile-web (fetch, and GeometryStream over postMessage): wasm32
@@ -172,9 +174,11 @@ How it resolves its files:
 
 - `createViewer(container, options)` resolves on the first `ready` event.
 - It rejects with `UnsupportedError` (neither backend, or not the forced one) or
-  `StartError` (wrong options).
-- Options: `sources` (catalog and/or URL templates), `token` or `getToken`, `name`,
-  `profile`, `backend`, `view`, `ui`, `attribution` placement, `showUnsupportedMessage`.
+  `StartError` (wrong options). A session that cannot start is not a rejection: the
+  viewer says it over the view and tries again, as the phone does.
+- Options: `sources` (the catalog proxy's `url`, and/or URL templates), `name`,
+  `profile`, `backend`, `view`, `ui`, `attribution` (the caption's corner),
+  `showUnsupportedMessage`, `rememberView`. No token: see §5.
 - Viewer: `backend`, `setView`, `flyTo` (a glide), `getView`, `on`, `resize`, `pause`,
   `resume`, `destroy`.
 - Events: `ready`, `loading`, `error`, `viewChanged`, `attributionChanged`.
@@ -195,8 +199,8 @@ How it resolves its files:
 - The package's API and README name no third-party service.
 - The catalog is "a catalog that resolves asset numbers to tile endpoints".
 - Its implementation is the connector's `IonSources`, now shared with the native host.
-- The example page, which is a host, is the one place that names the service and labels
-  the token field.
+- The example page, which is a host, and the proxy's binary are the places that name
+  the service.
 
 ### 2.5 Backends: WebGPU, then WebGL2
 
@@ -264,39 +268,89 @@ New in the shared application:
 - `examples/wasm-globe`: the fourth traversal driver. It is gone from the workspace, the
   README, the site pages and the CI.
 
-`examples/web-viewer` is now a page that imports the package, with `serve.py`.
+`examples/web-viewer` is now a page that imports the package, served with the catalog by
+`tuile-catalog-proxy` (`scripts/try-viewer.sh web`); its `serve.py` and its token field
+are gone.
 `examples/web-viewer-vite` imports it from a TypeScript Vite build.
 
-## 5. The token in the browser
+## 5. No token in the browser
 
-- Real users type the token into the host page's own field. It reaches the worker by
-  `postMessage`, never through a URL or a log line.
-- For development, `examples/web-viewer/serve.py` serves only the page and the package,
-  on 127.0.0.1.
-  - It answers `GET /dev-token` with `TUILE_ION_TOKEN`, read from `.env` at request time
-    (`--env PATH` for a worktree).
-  - The value is never printed and never written.
-  - Dotfiles and the rest of the repository are refused.
-- A public page must not embed a secret token: use `getToken` (a host endpoint minting a
-  scoped token) or a proxy.
+A page cannot keep a secret: any token it holds, anyone who opens it can read. So the
+browser never holds one — not the account token, not an asset token, not an imagery key.
+
+- The page names a **catalog proxy** in `sources.catalog.url`. The proxy holds the token
+  and speaks the subset of ion's API the connector speaks, so the worker runs the same
+  `IonSources` with another API base and no bearer (`tuile_cesium_ion::proxy`):
+
+  | The worker asks | The proxy does |
+  |---|---|
+  | `v1/assets/{id}/endpoint` | asks ion with the account token; answers with the URLs pointing back at itself, `accessToken` empty, the imagery key empty |
+  | `assets/{id}/{path}` | fetches under the asset's URL with its short-lived token, renewed on a refusal |
+  | `bing/{id}/REST/v1/Imagery/Metadata/{style}` | asks the imagery service with the key ion gave the asset |
+
+- The imagery tiles are fetched from the imagery service's CDN directly: the URLs the
+  metadata names carry no key, and passing megabytes of pictures through the proxy would
+  buy nothing.
+- **Not an open proxy:** the configured assets only, these three routes, relative paths
+  of a narrow alphabet, the two query parameters a terrain request carries. And no reply
+  leaves if it would carry the token, an asset token or the key, whatever the upstream
+  wrote.
+- Cache-Control follows the origin (a day for tiles it is silent about, `no-store` for
+  refusals); CORS is any origin for development, a list in production.
+- `examples/catalog-proxy` (`tuile-catalog-proxy`) is the binary, the same for a
+  developer's machine and production. It reads `TUILE_ION_TOKEN` from its environment.
+  In production that is a secret of the deployment (a Pulumi secret, e.g. config key
+  `catalogToken`, put by the stack into the platform's secret store and exposed to the
+  process as `TUILE_ION_TOKEN`), never a flag, a file in an image, or front-end
+  configuration. Deploying it is not part of this change.
+- `scripts/try-viewer.sh web` starts it with the token read from `.env` on the server side,
+  and serves the page beside it; `--lan` and `--https` do the same for a phone on the
+  local network, which needs no token either.
+- The native viewer is unchanged: it holds its own token, as an application on the
+  person's own machine may.
+
+Checked in Chrome over the DevTools protocol, page and worker: 829 responses from the
+proxy and the page read, none carrying the token; no URL carrying it; no request to the
+ion API from the browser.
 
 ## 6. Parity, after the change
 
-| Feature | Native | Web |
-|---|---|---|
-| Terrain and imagery mosaic | yes | yes, same shader |
-| Never-black ground (shell, ancestors, new before old) | yes | yes, same pump. The shell and the coarse level draw from the first frame, during the preload |
-| Stitching | yes | yes. The faint tile-edge lines seen on both are a shared renderer artefact, not a web one |
-| Camera controls, touch, keyboard, `tuile-ui` overlay | yes | yes, same `App` |
-| Glides | steering URL `seconds=` | `flyTo` |
-| Loading indicator | phone; a desktop holds its window instead | yes, plus `loading` events |
-| Attribution | title bar, caption | page overlay and `attributionChanged` |
-| Pause when hidden | phone lifecycle | hidden tab or off-screen canvas: loads held, trimmed, resumed on return |
-| Aerial perspective | yes | yes, shared shader |
-| Hillaire sky (PR #61) | when it lands in the shared layers | the same, under the no-compute constraint |
-| Overlays API, stereo | film path only | not yet; they come with the shared layers |
-| Persistent store | foyer | none; in memory, in the worker |
-| Steering URLs, scripting, tapes, metrics endpoint, menus, location | yes | no: platform services of the desktop |
+Done: the same, from the shared code. Adapted: the same function, in the platform's own
+terms. N/A: why it has no place there.
+
+| Feature | Desktop (macOS) | Phone (iOS) | Web |
+|---|---|---|---|
+| Terrain and imagery mosaic, aerial perspective | done | done | done, same shaders (WebGPU, or WebGL2: 15 slots instead of 25) |
+| Never-black ground: shell, ancestors, new before old | done | done | done, same pump; the container shows the phone's launch colour while the module loads |
+| On-screen controls: compass, tilt, zoom, atmosphere box, safe area | done | done | done, same `tuile-ui` widget at the display's scale |
+| Mouse: drag, right-drag, wheel toward the cursor | done | N/A, no mouse | done, same `App` |
+| Keys N L C V I W D F | done | N/A, no keyboard | done, same table (`menu::KEYS`) |
+| Esc quits | done | N/A | N/A: the page is not the viewer's to close |
+| Touch: pan, pinch, twist, two-finger tilt, double tap, hold for location | N/A | done | done, same `touch` module (winit's touch events) |
+| Loading indicator at launch, corner indicator after a jump | holds its window until warm | done | done, plus `loading` events |
+| Attribution | title bar | caption label | adapted: caption over the canvas, from the same text; `attributionChanged` |
+| Notices ("link copied", location, "trying again in N s") | title bar | caption | adapted: the same caption |
+| Alerts: cannot start, retrying, no GPU | NSAlert | UIAlertController | adapted: in-page alert, one at a time; `error` event |
+| No WebGPU nor WebGL2 | N/A | N/A | adapted: a note in the container, `UnsupportedError` |
+| Session retries with back-off | N/A (fails at once) | done | done, same `Retries` |
+| Menus: View, Go, Imagery with keys and check marks | menu bar | N/A, no menu bar | adapted: menus from a button over the view, same `menu::layout` |
+| About, Keys help | app menu, Help | N/A | adapted: menu items, in-page alert; the help lists keys and gestures, not the flags |
+| Window menu, Services, Hide, Quit | done | N/A | N/A: the browser's |
+| Current location | Core Location | Core Location | adapted: Geolocation API, permission question timed apart; needs a secure page |
+| Copy link / go to copied link | NSPasteboard | UIPasteboard | adapted: the browser's clipboard; paste answers later, through the steering queue |
+| Remember the last view | when started from its icon | done | adapted: local storage per application name, unless the page names a `view` |
+| Glides | steering URL `seconds=` | N/A | `flyTo` |
+| Steering URLs, AppleScript dictionary | done | N/A | adapted: the `setView`/`flyTo`/`getView` API and events |
+| Menu-bar readout (status item) | done | N/A | N/A: no tray in a page; `viewChanged` carries the view |
+| Pause when hidden | occlusion | lifecycle | hidden tab or off-screen canvas: loads held, trimmed, resumed |
+| Tapes, traces (`TUILE_RECORD`, `TUILE_REPLAY`, `TUILE_TRACE`) | done | done | N/A for now: environment variables and files; a page would need a download API (the reserved `debug` namespace) |
+| Picture snapshot | N/A | N/A | N/A: not in native either |
+| Metrics endpoint, journal file | done | journal | N/A: the console carries the log |
+| Persistent tile store | foyer | foyer | N/A for now: in memory in the worker; a browser store comes with the budget |
+| Credentials | token in its environment or support file | settings, bundle or Documents file | adapted: none — a catalog proxy holds it on the server (§5) |
+| Network bounds: timeout, retry, abort on cancel, one fetch per imagery tile | reqwest timeouts and retries; coalescing shared | same | done: per-attempt timeout and abort, bounded retries; coalescing shared (§11) |
+| Hillaire sky, Moon, night lights (PR #61) | film path | film path | not in the viewer path on any target yet; must stay compute-free for WebGL2 |
+| Overlays API, stereo | film path only | — | not yet; they come with the shared layers |
 
 ## 7. Out of scope
 
@@ -332,6 +386,12 @@ pipeline, not the interactive viewer.
 | `tuile-viewer` `launch` | retries and an abandoned launch |
 | `tuile-viewer` `web::options` | options read on the host |
 | `tuile-cesium-ion` `sources` | asset resolution |
+| `tuile-cesium-ion` `proxy` | endpoints rewritten with no credential; tiles with the asset token, renewed on a refusal; imagery metadata with the key; a reply carrying a credential withheld; unknown assets, paths and queries refused before anything goes upstream; CORS, preflight and cache headers |
+| `tuile-catalog-proxy` | flags; the token read from a `.env` |
+| `tuile-planetary` | one imagery tile asked for at once is fetched once; a cancelled fetch hands the tile to the next asker |
+| `tuile-core` `runtime` | a load the network never answers holds one slot: the rest arrive, the parent stays selected, views keep being answered (and with one slot, it stalls); a server answered from memory still hands its host a turn |
+| `tuile-web` `patience` | three attempts with growing pauses, final answers not retried, nothing waits more than ~40 s |
+| `tuile-viewer` `start` | a page's help is the keys and gestures; a remembered link is a whole view or none |
 
 - Each new test was seen failing against a broken implementation.
 - In CI:
@@ -340,9 +400,15 @@ pipeline, not the interactive viewer.
   - a `web-package` job builds the package, type-checks the Vite example with `tsc` and
     builds it with Vite.
 - **Not in CI:** a headless-browser smoke test. It was run locally, in Chrome 155 over
-  the DevTools protocol, on both backends:
+  the DevTools protocol, page and worker, on both backends:
   - zoom, drag, zoom out and destroy/recreate, with no console errors;
-  - `destroy()` terminated every worker the page created and removed the canvas.
+  - `destroy()` terminated every worker the page created and removed the canvas;
+  - the menu, the keys and about alerts, the caption, a layer switch, the copy notice;
+  - no response to the browser carrying the token (§5);
+  - the imagery service held unanswered for 50 s after the first view: never more than one
+    request per tile in flight, held requests aborted and retried, coarse imagery and the
+    indicator on screen throughout, frames and gestures going on, the picture recovering
+    once the service answers.
   - Running it in CI needs a browser with a GPU (or SwiftShader) and a token or recorded
     tiles. It is proposed, not added.
 
@@ -351,5 +417,44 @@ pipeline, not the interactive viewer.
 1. **WebGL2 fallback**: in. Keeping it once the budget adds GPU work means anything in the
    shared path must stay compute-free or carry a downlevel variant.
 2. npm name and publishing.
-3. Hosting a public demo and its token policy: scoped tokens via `getToken`, or a proxy.
+3. Hosting a public demo: where the catalog proxy runs, and the origins it allows.
 4. A CI headless-browser smoke test: GPU in CI, tiles without a token.
+
+## 11. The page that stopped
+
+Reported from Chrome: dozens of imagery requests pending for 50 s and more, the same
+quadkeys two and three times at once, a few patches of imagery and the rest bare, and a
+page that no longer progressed. Four causes, in the shared core and in the browser's
+transport and worker:
+
+1. **Duplicates.** `PlanetaryLoader::fetch_imagery` looked only in its decoded cache, not
+   at the fetches in flight. An imagery tile spans several terrain tiles; their loads
+   asked for it together and each fetched it. The browser serialises identical requests
+   behind its cache lock, and each held a connection. The desktop did the same, hidden by
+   HTTP/2 and a disk cache. Now one fetch per `(generation, coord)`: the first asker
+   fetches, the others wait for its answer, and a cancelled first asker hands the tile to
+   the next.
+2. **No bound.** The browser's `fetch` had no timeout. A request never answered held the
+   terrain load awaiting it (`join_all` over its imagery), and the load held one of the
+   server's 32 slots for good. Now every attempt is aborted after 12 s and retried twice
+   after 0.4 s and 0.8 s; a transient status likewise; then the tile is drawn from its
+   coarser floor. The desktop's client already had 30 s and retries.
+3. **No abort.** A load the server cancelled dropped its future, and the browser went on
+   fetching for nobody. Now dropping the future aborts the request.
+
+4. **No turn for the worker's messages.** Found while checking a phone-sized page: once
+   the residency is near its budget, loads are answered from the loader's memory and
+   complete on their first poll, and so does the traversal each one triggers. The server's
+   loop then never waits, and on the worker's one thread the page's messages — the camera,
+   the acks — are never delivered: the page drew on, but nothing refined, and the
+   stalled-server watch fired. The server now takes a breather every sixteen events
+   handled back to back (`GeometryServer::with_breather`); the worker's breather is a timer,
+   a macrotask, which lets its messages in. The desktop's server runs on a thread pool and
+   is given none. That the budget churns at all near its ceiling is the budget core's to
+   settle (PR #64).
+
+The imagery service and the catalog are HTTP/2, so the browser's six-connections-per-host
+limit of HTTP/1.1 is not what bound them; it does bind the catalog proxy on a machine's
+own HTTP, which `--https` lifts. Per-host quotas and priorities are the budget core's
+(PR #64), which formalises request deduplication and grace-time cancellation.
+
