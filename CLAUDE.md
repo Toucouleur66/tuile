@@ -30,7 +30,7 @@ The executable heart is a **logical geometry server**, not a network server. The
 
 ## Non-negotiable rules
 
-1. **`tuile-core` NEVER depends on wgpu, tokio, axum, or any backend.** All I/O and all rendering go through the traits (`TileFetcher`, `PrepareRenderResources`). If you are tempted to add a heavy dependency to the core, it means the abstraction is misplaced — stop and fix the abstraction.
+1. **`tuile-core` NEVER depends on wgpu, axum, or any backend, and never depends on tokio unconditionally: only through the optional native feature `rt-tokio`; the wasm build and the default build have none.** All I/O and all rendering go through the traits (`TileFetcher`, `PrepareRenderResources`); the runtime under `rt-tokio` is a handle the host passes in (`runtime::Spawn::Tokio`), never one the core builds. If you are tempted to add a heavy dependency to the core, it means the abstraction is misplaced — stop and fix the abstraction.
 2. **The core compiles to `wasm32-unknown-unknown`.** Verify on every PR (`cargo check --target wasm32-unknown-unknown -p tuile-core`).
 3. **No third-party brand** in crate names, modules, public types, or public documentation. The project defines itself by the OGC 3D Tiles standard, not relative to other products. Exception: connector crates name their service (nominative use, e.g. `tuile-cesium-ion`) — and only them.
 4. **No porting of third-party code.** Algorithmic inspiration is free and creates no obligation. Literal porting is the absolute exception: Apache-2.0 attribution (comment at the head of the item + entry in `NOTICE`), invisible from the public API.

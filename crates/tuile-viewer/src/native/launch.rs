@@ -212,6 +212,9 @@ async fn bring_up_now(plan: Plan, runtime: tokio::runtime::Handle) -> Outcome {
         gate: gate.clone(),
     });
     let (stream, server) = tuile_core::runtime::in_process_with(globe.tree, loader, plan.config);
+    // Every load a task on the runtime's workers, so tiles keep arriving
+    // while the server traverses.
+    let server = server.with_spawn(tuile_core::runtime::Spawn::Tokio(runtime.clone()));
     // Its own thread, blocking on the runtime: the server's session is one
     // long future that the window talks to over channels.
     let server_runtime = runtime.clone();

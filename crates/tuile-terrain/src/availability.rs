@@ -16,7 +16,8 @@
 //! `TileAvailability`.
 
 use std::collections::HashSet;
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, RwLock};
 
 use crate::layer::{AvailabilityRange, LayerJson};
 use crate::tiling::TileCoord;
@@ -34,6 +35,11 @@ pub struct Availability {
     /// tile, on every traversal — grow without bound, and the session slows to
     /// a halt long before memory becomes the complaint.
     seen: RwLock<HashSet<RangeKey>>,
+    /// Whether reveals are held for [`Availability::apply_held`] rather than
+    /// folded in as they arrive. See `TileTree::defer_edits`.
+    deferred: AtomicBool,
+    /// Reveals waiting for the gap between two passes.
+    held: Mutex<Vec<(u32, Vec<Vec<AvailabilityRange>>)>>,
 }
 
 impl Availability {
@@ -62,6 +68,8 @@ impl Availability {
         Self {
             levels: RwLock::new(levels),
             seen: RwLock::new(seen),
+            deferred: AtomicBool::new(false),
+            held: Mutex::new(Vec::new()),
         }
     }
 
@@ -87,7 +95,37 @@ impl Availability {
     /// Folds in a tile's `metadata` availability: `ranges[offset]` describes the
     /// existing tiles at level `base_level + offset + 1` (quantized-mesh
     /// `metadata` extension convention).
+    ///
+    /// Held instead, once [`defer`](Self::defer) has been called, until the
+    /// next [`apply_held`](Self::apply_held).
     pub fn add_descendant_ranges(&self, base_level: u32, ranges: &[Vec<AvailabilityRange>]) {
+        if self.deferred.load(Ordering::Acquire) {
+            self.held
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((base_level, ranges.to_vec()));
+            return;
+        }
+        self.fold(base_level, ranges);
+    }
+
+    /// From now on, hold every reveal until [`apply_held`](Self::apply_held):
+    /// a traversal reads this structure tile by tile, and a reveal landing
+    /// halfway through one gives a pass that saw two different trees.
+    pub fn defer(&self) {
+        self.deferred.store(true, Ordering::Release);
+    }
+
+    /// Folds in every reveal held since the last call. The result does not
+    /// depend on their order: availability is a union of ranges.
+    pub fn apply_held(&self) {
+        let held = std::mem::take(&mut *self.held.lock().unwrap_or_else(|e| e.into_inner()));
+        for (base_level, ranges) in held {
+            self.fold(base_level, &ranges);
+        }
+    }
+
+    fn fold(&self, base_level: u32, ranges: &[Vec<AvailabilityRange>]) {
         let before = {
             let levels = self.levels.read().expect("availability");
             levels.iter().map(Vec::len).sum::<usize>()
@@ -216,6 +254,40 @@ mod tests {
             "100 identical reveals should leave one range"
         );
         assert!(a.is_available(TileCoord::new(1, 3, 1)));
+    }
+
+    /// Deferred, a reveal changes nothing a traversal can read until it is
+    /// applied — and applied, it is the same availability as folded at once.
+    #[test]
+    fn deferred_reveals_wait_for_apply() {
+        let a = Availability::from_layer(&layer_with("[]", ""), 2, 1);
+        a.defer();
+        let ranges = vec![vec![AvailabilityRange {
+            start_x: 0,
+            start_y: 0,
+            end_x: 3,
+            end_y: 1,
+        }]];
+        a.add_descendant_ranges(0, &ranges);
+        assert!(
+            !a.is_available(TileCoord::new(1, 3, 1)),
+            "a held reveal is invisible"
+        );
+        a.apply_held();
+        assert!(a.is_available(TileCoord::new(1, 3, 1)));
+        // Still deferred after an apply: the next reveal waits as well.
+        a.add_descendant_ranges(
+            1,
+            &[vec![AvailabilityRange {
+                start_x: 0,
+                start_y: 0,
+                end_x: 7,
+                end_y: 3,
+            }]],
+        );
+        assert!(!a.is_available(TileCoord::new(2, 7, 3)));
+        a.apply_held();
+        assert!(a.is_available(TileCoord::new(2, 7, 3)));
     }
 
     #[test]

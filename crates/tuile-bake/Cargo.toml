@@ -61,7 +61,7 @@ tokio = { workspace = true, features = ["time", "sync"] }
 # bounded at the source rather than behind a semaphore.
 rayon = "1"
 thiserror = { workspace = true }
-tuile-core = { version = "0.8.2", path = "../tuile-core" }
+tuile-core = { version = "0.8.2", path = "../tuile-core", features = ["rt-tokio"] }
 # The engine's metrics on a Prometheus endpoint, when `TUILE_METRICS_ADDR`
 # asks for one (`memory::export_metrics_if_asked`).
 tuile-metrics = { version = "0.8.2", path = "../tuile-metrics" }

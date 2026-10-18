@@ -148,6 +148,17 @@ impl TerrainTree {
 }
 
 impl TileTree for TerrainTree {
+    /// Reveals are held in the shared availability until the gap between two
+    /// passes.
+    fn defer_edits(&self) {
+        self.availability.defer();
+    }
+
+    fn apply_deferred_edits(&self) -> Vec<(TileId, String)> {
+        self.availability.apply_held();
+        Vec::new()
+    }
+
     /// The planet, as the largest sphere that fits inside it.
     ///
     /// A quadtree over the whole ellipsoid is the one dataset where most of
@@ -272,6 +283,40 @@ mod tests {
     /// Written after the cull silently did nothing on a real frame: the test
     /// that was missing is not "does the maths work" — that one existed and
     /// passed — but "does the traversal ever get told there is a planet".
+    /// Through the tree, as the server holds it: deferred, a reveal waits for
+    /// the tree's own apply.
+    #[test]
+    fn the_tree_defers_and_applies_its_availability() {
+        let layer = LayerJson::from_slice(
+            br#"{ "format": "quantized-mesh-1.0", "tiles": ["{z}/{x}/{y}.terrain"],
+                  "maxzoom": 10, "metadataAvailability": 10, "available": [] }"#,
+        )
+        .expect("layer");
+        let boxed: Box<dyn TileTree> = Box::new(TerrainTree::new(layer.clone()));
+        let tree = TerrainTree::new(layer);
+        let availability = tree.availability();
+        let revealed = TileCoord::new(1, 3, 1);
+        let reveal = || {
+            availability.add_descendant_ranges(
+                0,
+                &[vec![crate::layer::AvailabilityRange {
+                    start_x: 0,
+                    start_y: 0,
+                    end_x: 3,
+                    end_y: 1,
+                }]],
+            );
+        };
+        tree.defer_edits();
+        reveal();
+        assert!(!availability.is_available(revealed), "held");
+        assert!(tree.apply_deferred_edits().is_empty());
+        assert!(availability.is_available(revealed), "applied");
+        // And the trait object forwards to the same.
+        boxed.defer_edits();
+        assert!(boxed.apply_deferred_edits().is_empty());
+    }
+
     #[test]
     fn the_tree_offers_its_planet_as_an_occluder() {
         let tree = TerrainTree::new(cwt_layer());
