@@ -15,11 +15,19 @@ use crate::profile::{DeviceMemory, Pressure, Thermal};
 /// `onTrimMemory`.
 mod trim {
     pub(super) const RUNNING_MODERATE: i32 = 5;
+    #[allow(
+        dead_code,
+        reason = "a level the ranges below cover; named for the reader and the tests"
+    )]
     pub(super) const RUNNING_LOW: i32 = 10;
     pub(super) const RUNNING_CRITICAL: i32 = 15;
     pub(super) const UI_HIDDEN: i32 = 20;
     pub(super) const BACKGROUND: i32 = 40;
     pub(super) const MODERATE: i32 = 60;
+    #[allow(
+        dead_code,
+        reason = "a level the ranges below cover; named for the reader and the tests"
+    )]
     pub(super) const COMPLETE: i32 = 80;
 }
 
@@ -53,6 +61,32 @@ pub(crate) fn unpack_trim(signal: i64) -> (u64, Pressure) {
     let count = (signal >> 32) as u64 & 0xffff_ffff;
     let level = (signal & 0xffff_ffff) as u32 as i32;
     (count, pressure_of_trim(level))
+}
+
+/// The safe area of a `width` × `height` drawable, in device pixels (left,
+/// top, width, height), from the activity's packed insets: left, top, right
+/// and bottom, sixteen bits each from the low end.
+///
+/// From Android 15 an application's window is drawn edge to edge, under the
+/// status bar and the navigation bar, and winit reports the whole window as
+/// its inner size; the bars' insets are the only word of what the system
+/// covers. `None` when the activity has none yet (`-1`) or they leave nothing
+/// — the controls then use the whole drawable.
+pub(crate) fn safe_area_of_insets(
+    packed: i64,
+    width: u32,
+    height: u32,
+) -> Option<(f64, f64, f64, f64)> {
+    if packed < 0 {
+        return None;
+    }
+    let side = |shift: u32| f64::from(((packed >> shift) & 0xffff) as u16);
+    let (left, top, right, bottom) = (side(0), side(16), side(32), side(48));
+    let (w, h) = (
+        f64::from(width) - left - right,
+        f64::from(height) - top - bottom,
+    );
+    (w > 0.0 && h > 0.0).then_some((left, top, w, h))
 }
 
 /// `PowerManager`'s thermal status, 0 (none) to 6 (shutdown), as the grades
@@ -171,6 +205,32 @@ mod tests {
         assert_eq!(unpack_trim(0), (0, Pressure::Nominal));
         assert_eq!(unpack_trim((3 << 32) | 15), (3, Pressure::Critical));
         assert_eq!(unpack_trim((1 << 32) | 5), (1, Pressure::Warning));
+    }
+
+    /// A Pixel-sized window, drawn edge to edge: the status bar above, the
+    /// gesture bar below; the controls keep between them.
+    #[test]
+    fn insets_give_the_area_the_bars_leave() {
+        let packed = |l: i64, t: i64, r: i64, b: i64| l | (t << 16) | (r << 32) | (b << 48);
+        assert_eq!(
+            safe_area_of_insets(packed(0, 128, 0, 66), 1080, 2400),
+            Some((0.0, 128.0, 1080.0, 2206.0))
+        );
+        // Landscape, the cutout on the left and the navigation bar on the right.
+        assert_eq!(
+            safe_area_of_insets(packed(110, 0, 126, 63), 2400, 1080),
+            Some((110.0, 0.0, 2164.0, 1017.0))
+        );
+        assert_eq!(
+            safe_area_of_insets(packed(0, 0, 0, 0), 800, 600),
+            Some((0.0, 0.0, 800.0, 600.0))
+        );
+        // Not known yet, or nothing left: the whole drawable is the caller's.
+        assert_eq!(safe_area_of_insets(-1, 1080, 2400), None);
+        assert_eq!(
+            safe_area_of_insets(packed(600, 0, 600, 0), 1080, 2400),
+            None
+        );
     }
 
     #[test]

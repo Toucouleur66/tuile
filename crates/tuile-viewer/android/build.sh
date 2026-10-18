@@ -16,15 +16,16 @@
 #      icons, written and tested in Rust;
 #   2. `cargo ndk … rustc --crate-type cdylib`: the host's library
 #      (`examples/wgpu-viewer` by default) for aarch64-linux-android;
-#   3. `javac` + `d8`: the activity (`java/`) and the TLS verifier's Java half
-#      (shipped inside the `rustls-platform-verifier-android` crate) as
-#      `classes.dex`;
+#   3. `javac` + R8: the activity (`java/`), the TLS verifier's Kotlin half
+#      (shipped inside the `rustls-platform-verifier-android` crate) and the
+#      part of Kotlin's standard library it uses, as `classes.dex`;
 #   4. `aapt2 compile` and `aapt2 link`: the resources and the manifest;
 #   5. `zip`, `zipalign -P 16`, `apksigner`: the library stored uncompressed
 #      on 16 KiB pages, then signed.
 #
 # Needs: ANDROID_HOME (or ~/Library/Android/sdk) with platforms;android-35,
-# build-tools and an NDK; a JDK 17 or newer; `cargo install cargo-ndk`;
+# build-tools and an NDK; a JDK 17 or newer (found by /usr/libexec/java_home
+# on macOS when JAVA_HOME is unset); network access to Maven Central once; `cargo install cargo-ndk`;
 # `rustup target add aarch64-linux-android`.
 #
 # NO TOKEN GOES INTO THE APK. The catalog is asked through the catalog proxy
@@ -62,8 +63,21 @@ if [[ -z "$tools" || -z "$ndk" ]]; then
   exit 2
 fi
 export ANDROID_HOME="$sdk" ANDROID_NDK_HOME="$ndk"
+# d8 and apksigner need a JDK 17 or newer; the first `java` on the PATH may be
+# an older one. On macOS the system's chooser finds a recent one.
+if [[ -z "${JAVA_HOME:-}" && -x /usr/libexec/java_home ]]; then
+  JAVA_HOME="$(/usr/libexec/java_home -v 17+ 2>/dev/null || true)"
+fi
+if [[ -n "${JAVA_HOME:-}" ]]; then
+  export JAVA_HOME PATH="$JAVA_HOME/bin:$PATH"
+fi
 android_jar="$sdk/platforms/android-$platform/android.jar"
-strip="$(find "$ndk/toolchains/llvm/prebuilt" -name llvm-strip -type f | head -n 1)"
+# The NDK ships llvm-strip as a link to llvm-objcopy.
+strip="$(find "$ndk/toolchains/llvm/prebuilt" -name llvm-strip \( -type f -o -type l \) | head -n 1)"
+if [[ -z "$strip" ]]; then
+  echo "error: no llvm-strip in the NDK at $ndk" >&2
+  exit 2
+fi
 
 rm -rf "$build"
 mkdir -p "$build/classes" "$build/dex" "$build/apk/lib/arm64-v8a"
@@ -81,7 +95,14 @@ built="$workspace/target/aarch64-linux-android/release/$library"
 # for reading a native crash's stack.
 "$strip" --strip-unneeded -o "$build/apk/lib/arm64-v8a/$library" "$built"
 
-# 3. The activity and the verifier's Java half, as one dex.
+# 3. The activity, the verifier's half and what it runs on, as one dex.
+#
+# The verifier's half is written in Kotlin and calls into Kotlin's standard
+# library, which a Gradle build adds on its own and this one fetches: the
+# release below from Maven Central, checked against its digest, kept in the
+# user's cache. R8 (the SDK's shrinker, inside build-tools) then keeps only
+# what the activity and the verifier reach — a few hundred methods of the
+# library's tens of thousands.
 verifier="$(cd "$workspace" && cargo metadata --format-version 1 --filter-platform aarch64-linux-android \
   | python3 -c '
 import json, os, sys
@@ -96,11 +117,36 @@ if [[ -z "$aar" ]]; then
   exit 2
 fi
 (cd "$build" && unzip -q -o "$aar" classes.jar -d verifier)
+kotlin_version=2.0.21
+kotlin_sha256=f31cc53f105a7e48c093683bbd5437561d1233920513774b470805641bedbc09
+kotlin="${XDG_CACHE_HOME:-$HOME/.cache}/tuile/kotlin-stdlib-$kotlin_version.jar"
+if [[ ! -f "$kotlin" ]] || ! echo "$kotlin_sha256  $kotlin" | shasum -a 256 -c --status; then
+  mkdir -p "$(dirname "$kotlin")"
+  curl -sfL -o "$kotlin.part" \
+    "https://repo1.maven.org/maven2/org/jetbrains/kotlin/kotlin-stdlib/$kotlin_version/kotlin-stdlib-$kotlin_version.jar"
+  if ! echo "$kotlin_sha256  $kotlin.part" | shasum -a 256 -c --status; then
+    rm -f "$kotlin.part"
+    echo "error: Kotlin's standard library did not match its digest" >&2
+    exit 2
+  fi
+  mv "$kotlin.part" "$kotlin"
+fi
 javac -source 8 -target 8 -Xlint:-options \
   -bootclasspath "$android_jar" -classpath "$build/verifier/classes.jar" \
   -d "$build/classes" $(find "$here/java" -name '*.java')
-"$tools/d8" --release --min-api "$minimum" --lib "$android_jar" --output "$build/dex" \
-  $(find "$build/classes" -name '*.class') "$build/verifier/classes.jar"
+(cd "$build/classes" && jar cf "$build/activity.jar" .)
+# Both are entered from native code, by name: nothing in the dex refers to
+# them, so the shrinker is told to keep them whole.
+cat >"$build/keep.pro" <<'RULES'
+-keep class dev.lapoule.tuile.** { *; }
+-keep class org.rustls.platformverifier.** { *; }
+-dontobfuscate
+-dontwarn kotlin.**
+-dontwarn org.jetbrains.annotations.**
+RULES
+java -cp "$tools/lib/d8.jar" com.android.tools.r8.R8 --release --min-api "$minimum" \
+  --lib "$android_jar" --pg-conf "$build/keep.pro" --output "$build/dex" \
+  "$build/activity.jar" "$build/verifier/classes.jar" "$kotlin"
 
 # 4. Resources and manifest.
 "$tools/aapt2" compile --dir "$build/generated/res" -o "$build/resources.zip"

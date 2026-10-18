@@ -22,19 +22,28 @@ crates/tuile-viewer/android/build.sh  # the APK alone → build/Tuile.apk
 
 | what | why | size on disk |
 |---|---|---|
-| `cmdline-tools` | `sdkmanager`, `avdmanager` | ~0.2 GB |
-| `platform-tools` | `adb` | ~0.03 GB |
-| `platforms;android-35` | `android.jar`, to compile the activity and link the resources | ~0.06 GB |
-| `build-tools;35.0.0` | `aapt2`, `d8`, `zipalign`, `apksigner` | ~0.15 GB |
-| `ndk;27.x` | the C toolchain and linker for `aarch64-linux-android` | ~2 GB |
-| `emulator` + `system-images;android-35;default;arm64-v8a` | only to try it without a phone | ~1 + ~3 GB |
-| a JDK 17+ | `javac`, `keytool` | (already there) |
+| `cmdline-tools;latest` | `sdkmanager`, `avdmanager` | 0.17 GB |
+| `platform-tools` | `adb` | 0.04 GB |
+| `platforms;android-35` | `android.jar`, to compile the activity and link the resources | 0.13 GB |
+| `build-tools;35.0.0` | `aapt2`, `d8` and R8, `zipalign`, `apksigner` | 0.19 GB |
+| `ndk;27.2.12479018` | the C toolchain and linker for `aarch64-linux-android` | 2.5 GB |
+| `emulator` + `system-images;android-35;default;arm64-v8a` | only to try it without a phone | 1.3 + 1.7 GB, and ~0.8 GB for the AVD |
+| a JDK 17+ | `javac`, `keytool`, `d8` | (already there) |
+| Kotlin's standard library 2.0.21 | what the TLS verifier's Kotlin half calls; fetched from Maven Central by `build.sh`, checked against its SHA-256, kept in `~/.cache/tuile` | 1.7 MB (a few KB after R8) |
 | `cargo install cargo-ndk`, `rustup target add aarch64-linux-android` | the Rust side | small |
 
+The first `sdkmanager` comes from Homebrew (`brew install --cask
+android-commandlinetools`) or Google's zip; it installs `cmdline-tools;latest`
+into the SDK, after which the Homebrew copy can go. `sdkmanager --licenses`
+accepts the SDK's licences once.
+
 ```text
-sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
+sdkmanager --sdk_root="$ANDROID_HOME" "cmdline-tools;latest" "platform-tools" \
+    "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
 sdkmanager "emulator" "system-images;android-35;default;arm64-v8a"
 avdmanager create avd -n tuile-arm64 -k "system-images;android-35;default;arm64-v8a" -d pixel_6
+# then, in ~/.android/avd/tuile-arm64.avd/config.ini:
+#   hw.gpu.enabled=yes  hw.gpu.mode=host  hw.ramSize=4096M
 ```
 
 The AOSP image (`default`), not the Google APIs or Play Store ones: the
@@ -46,7 +55,7 @@ viewer needs none of Google's services, and the image is the smallest.
 |---|---|---|
 | resources | `tuile-viewer-bundle android` | `AndroidManifest.xml`, the launch theme (the globe's blue), the launcher icon at every density — written and tested in Rust |
 | native library | `cargo ndk … rustc --crate-type cdylib` | the host's crate as `libtuile_wgpu_viewer.so`, whose `android_main` the activity calls |
-| code | `javac`, `d8` | `TuileActivity` and the TLS verifier's Java half, as one `classes.dex` |
+| code | `javac`, R8 | `TuileActivity`, the TLS verifier's Kotlin half and the few Kotlin classes it reaches, shrunk into one `classes.dex` (~20 KB) |
 | package | `aapt2`, `zip`, `zipalign -P 16`, `apksigner` | linked, the library stored uncompressed on 16 KiB pages, signed with the SDK's debug key |
 
 - **winit's Android backend over `android-activity`'s `NativeActivity`**: the
@@ -111,7 +120,16 @@ The log is logcat, under the tag `tuile`: `adb logcat -s tuile`.
   adapter or device, OpenGL ES 3 in an instance of its own
   (`app::setup::attempts`). `TUILE_BACKEND=gl` forces it. The viewer path
   has no compute pipeline, so the WebGL2 constraints already make it fit
-  OpenGL ES.
+  OpenGL ES. Where the window has no sRGB colour space (no
+  `EGL_KHR_gl_colorspace`: the emulator, older devices) and so neither an
+  sRGB surface nor an sRGB view of one, the frame is resolved into an sRGB
+  texture and encoded into the surface by one full-screen pass
+  (`tuile_wgpu::SurfaceFormat::encode`); the adapter line and
+  "the frame is encoded by a pass" say which path a session took.
+- **Edge to edge**: from Android 15 the window is drawn under the status
+  and navigation bars. The activity reports the bars' and the cutout's
+  insets (`safeInsets`), and the controls keep inside them, clear of the
+  gesture bar (`android_signals::safe_area_of_insets`).
 - **Lifecycle**: Android destroys the window's surface whenever the activity
   leaves the front (winit's `suspended`). Before that call returns, loads are
   held at the gate, the residency is trimmed to a quarter, the tile store is
@@ -127,6 +145,11 @@ The log is logcat, under the tag `tuile`: `adb logcat -s tuile`.
   `onLowMemory` arrives as winit's memory warning, trimming to half. The
   view's tiles and their ancestors are never let go of: the ground stays
   covered.
+  To try it: `adb shell am send-trim-memory dev.lapoule.tuile.viewer RUNNING_LOW`
+  (then `RUNNING_CRITICAL`: the system refuses a level lower than the last),
+  with `-e RUST_LOG warn,tuile_viewer=info,tuile_core::runtime=info` at
+  launch; the log says `residency trimmed to the budget budget_mib=…` and the
+  server's `trimmed the residency released=… kept=…`.
 - **Tile store** in the application's cache directory (`getCacheDir`), which
   the system may clear; a damaged one is started afresh. The HTTP cache is
   beside it.

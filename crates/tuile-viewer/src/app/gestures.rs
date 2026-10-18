@@ -351,6 +351,10 @@ pub(super) fn carry(steps: Vec<Step>, to: &mut impl Carry) {
                 }
             }
             Step::Trim(budget_bytes) => {
+                tracing::info!(
+                    budget_mib = budget_bytes >> 20,
+                    "residency trimmed to the budget"
+                );
                 to.send(ClientMessage::Trim { budget_bytes });
                 to.resend_view();
             }

@@ -209,6 +209,16 @@ pub(crate) fn trim_signal() -> i64 {
     .unwrap_or(0)
 }
 
+/// What the system's bars and the cutout cover of the window, packed; `-1`
+/// when unknown. See `android_signals::safe_area_of_insets`.
+pub(crate) fn safe_insets() -> i64 {
+    with_activity(|env, activity| {
+        env.call_method(activity, jni_str!("safeInsets"), jni_sig!("()J"), &[])?
+            .j()
+    })
+    .unwrap_or(-1)
+}
+
 /// `PowerManager`'s thermal status, 0 when unknown.
 pub(crate) fn thermal_status() -> i32 {
     with_activity(|env, activity| {

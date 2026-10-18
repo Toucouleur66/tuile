@@ -17,6 +17,7 @@ import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowInsets;
 import android.widget.PopupWindow;
 import android.widget.TextView;
 
@@ -76,6 +77,41 @@ public class TuileActivity extends NativeActivity {
     public boolean powerSave() {
         PowerManager power = (PowerManager) getSystemService(Context.POWER_SERVICE);
         return power != null && power.isPowerSaveMode();
+    }
+
+    /**
+     * What the system's bars and the display's cutout cover of the window, in
+     * pixels: left, top, right and bottom, sixteen bits each from the low
+     * end. The window is drawn edge to edge (the rule from Android 15 on), so
+     * the controls keep inside these. -1 while the window has no insets yet.
+     */
+    public long safeInsets() {
+        View decor = getWindow().getDecorView();
+        WindowInsets insets = decor.getRootWindowInsets();
+        if (insets == null) {
+            return -1L;
+        }
+        int left;
+        int top;
+        int right;
+        int bottom;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            android.graphics.Insets bars = insets.getInsets(
+                    WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+            left = bars.left;
+            top = bars.top;
+            right = bars.right;
+            bottom = bars.bottom;
+        } else {
+            left = insets.getSystemWindowInsetLeft();
+            top = insets.getSystemWindowInsetTop();
+            right = insets.getSystemWindowInsetRight();
+            bottom = insets.getSystemWindowInsetBottom();
+        }
+        return (left & 0xffffL)
+                | ((top & 0xffffL) << 16)
+                | ((right & 0xffffL) << 32)
+                | ((bottom & 0xffffL) << 48);
     }
 
     /** The application's cache directory, which the system may clear. */

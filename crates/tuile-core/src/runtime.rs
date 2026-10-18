@@ -454,6 +454,12 @@ impl Session<'_> {
                     self.acked.remove(tile);
                     self.filled.remove(tile);
                 }
+                tracing::info!(
+                    budget_mib = budget_bytes >> 20,
+                    released = released.len(),
+                    kept = self.residency.len(),
+                    "trimmed the residency"
+                );
                 false
             }
         }

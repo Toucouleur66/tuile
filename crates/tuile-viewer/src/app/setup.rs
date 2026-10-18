@@ -386,22 +386,37 @@ impl App {
 /// left, top, width, height.
 pub(super) fn safe_area(window: &Window, size: (u32, u32)) -> (f64, f64, f64, f64) {
     let whole = (0.0, 0.0, f64::from(size.0), f64::from(size.1));
-    let (Ok(inner), Ok(outer)) = (window.inner_position(), window.outer_position()) else {
-        return whole;
-    };
-    let inner_size = window.inner_size();
-    let (x, y) = (
-        f64::from(inner.x - outer.x).max(0.0),
-        f64::from(inner.y - outer.y).max(0.0),
-    );
-    let (w, h) = (
-        f64::from(inner_size.width).min(f64::from(size.0) - x),
-        f64::from(inner_size.height).min(f64::from(size.1) - y),
-    );
-    if w <= 0.0 || h <= 0.0 {
-        return whole;
+    // Android draws the window under its bars and says so only through the
+    // activity's insets; winit's positions there are not supported.
+    #[cfg(target_os = "android")]
+    {
+        let _ = window;
+        crate::native::android_signals::safe_area_of_insets(
+            crate::native::android::safe_insets(),
+            size.0,
+            size.1,
+        )
+        .unwrap_or(whole)
     }
-    (x, y, w, h)
+    #[cfg(not(target_os = "android"))]
+    {
+        let (Ok(inner), Ok(outer)) = (window.inner_position(), window.outer_position()) else {
+            return whole;
+        };
+        let inner_size = window.inner_size();
+        let (x, y) = (
+            f64::from(inner.x - outer.x).max(0.0),
+            f64::from(inner.y - outer.y).max(0.0),
+        );
+        let (w, h) = (
+            f64::from(inner_size.width).min(f64::from(size.0) - x),
+            f64::from(inner_size.height).min(f64::from(size.1) - y),
+        );
+        if w <= 0.0 || h <= 0.0 {
+            return whole;
+        }
+        (x, y, w, h)
+    }
 }
 
 pub(super) fn configure_surface(active: &Active) {
