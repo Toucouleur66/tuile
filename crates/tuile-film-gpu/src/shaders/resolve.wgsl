@@ -21,8 +21,10 @@ const RESOLVE_ROW: u32 = 1024u;
 @group(0) @binding(5) var vis: texture_2d<u32>;
 @group(0) @binding(6) var hdr: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(7) var samp: sampler;
-@group(0) @binding(8) var shadow_map: texture_depth_2d;
+@group(0) @binding(8) var shadow_map: texture_depth_2d_array;
 @group(0) @binding(9) var shadow_samp: sampler_comparison;
+// Where the ground is in a projected shadow: see `projected.wgsl`.
+@group(0) @binding(10) var projected: texture_2d<f32>;
 
 @group(1) @binding(0) var<storage, read> positions: array<f32>;
 @group(1) @binding(1) var<storage, read> normals: array<f32>;
@@ -170,7 +172,10 @@ fn resolve(@builtin(global_invocation_id) id: vec3u) {
         if (known && frame.shadow.x > 0.0 && cos > 0.0) {
             // A shadow takes the sun, and only the sun: the dome lights
             // shadowed ground as it lights any other.
-            lit = 1.0 - frame.shadow.x * (1.0 - sunlit(p, normal));
+            // And the shadows shapes project, worked out for this very
+            // sample: the darker of the two.
+            let open = 1.0 - textureLoad(projected, xy, 0).r;
+            lit = 1.0 - frame.shadow.x * (1.0 - min(sunlit(p, normal, xy), open));
             radiance = base * (ambient + frame.sun.xyz * cos * lit);
         }
         if (known && physical) {

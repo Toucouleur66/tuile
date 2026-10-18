@@ -64,3 +64,37 @@ fn mean_thinning(d: f32) -> f32 {
     if (abs(d) < 2e-2) { return 1.0 - d * (0.5 - d / 6.0); }
     return (1.0 - exp(-d)) / d;
 }
+
+// A supersampled frame draws a map of the sun for each sample of a pixel,
+// up to four (`SUN_MAPS_MAX`), each on its grid moved by these fractions of
+// a texel: a thin caster's shadow, which a grid alone draws on whichever
+// texels its centres fall in, is averaged over four grids in each pixel.
+// Stratified across, and spread along, so that no two maps share a row or
+// a column of offsets.
+const SUN_MAP_JITTER = array<vec2f, 4>(
+    vec2f(-0.375, 0.0),
+    vec2f(-0.125, -0.382),
+    vec2f(0.125, 0.236),
+    vec2f(0.375, -0.146),
+);
+
+// How many maps of the sun a frame of `k` samples a side draws.
+fn sun_maps(k: u32) -> u32 {
+    return min(max(k, 1u) * max(k, 1u), 4u);
+}
+
+// How far map `map` is moved, in its clip space, for a frame of `k`
+// samples a side and maps `side` texels across: nowhere for a frame of one.
+fn sun_map_shift(map: u32, k: u32, side: f32) -> vec2f {
+    if (sun_maps(k) <= 1u) {
+        return vec2f(0.0);
+    }
+    return SUN_MAP_JITTER[map % 4u] * 2.0 / side;
+}
+
+// The map the sample at `xy` of the supersampled picture reads: one for
+// each sample of its pixel.
+fn sun_map_of(xy: vec2u, k: u32) -> u32 {
+    let kk = max(k, 1u);
+    return ((xy.x % kk) + kk * (xy.y % kk)) % sun_maps(kk);
+}
