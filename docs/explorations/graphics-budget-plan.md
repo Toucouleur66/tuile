@@ -135,6 +135,11 @@ CI and 1 000 000 nightly.
 
 **Exit:** all scenarios green; soak slopes flat; the Batch film exact.
 
+**Done on `feat/budget-core`** (spec §11 lists what changed): every invariant checked at
+every step; the scenarios run in release on CI (ignored in debug, where they are too slow),
+the properties at 10 000 cases; the goldens are platform-independent. The cold-phone
+scenario stays red and tagged until the Step 6 decision (spec §11.7).
+
 ### Step 4 — The cut-over commit (L)
 In one commit, which is reviewed in pieces on the branch beforehand:
 - **Protocol:**
@@ -144,6 +149,11 @@ In one commit, which is reviewed in pieces on the branch beforehand:
   - drapes as their own content;
   - `Select` carrying the `DrawSet` and the swap groups;
   - the `InProcessStream` credit and the coalesced `Select`.
+- **Traversal:** a held REPLACE parent lists **all** its children as blockers, resident or
+  not; the walked chain is listed as ancestors (spec §11.1).
+- **Timeouts:** the budget's `load_timeout` (4 s) owns load timeouts. The transport's own
+  (native reqwest, and the web's 12 s × 3 retries from #70) are removed, the budget
+  retrying with backoff.
 - **Runtime:**
   - `GeometryServer` owns `Budget`; `decide()` runs once per coalesced client step, or per
     frame in Batch;
@@ -181,6 +191,9 @@ crate that claims wasm); all tests green; the iOS sim and device targets build.
 - The owner accepts the imagery difference by eye.
 
 ### Step 6 — Tuning per profile (S)
+- **Findings to settle first** (spec §11.7): the cold-phone target (4 s is below what the
+  simulated cellular network allows); the desktop Drape class, full with the view alone at
+  +3 / 2048²; the per-step cost toward O(changes · log N).
 - **Desktop and iOS fractions** from simulated pressure:
   - target, overflow, credit;
   - per-class quotas;

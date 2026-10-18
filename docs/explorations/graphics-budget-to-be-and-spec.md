@@ -22,7 +22,7 @@ owner's decisions of 2026-10-17:
 | ID | Invariant | Measure |
 |---|---|---|
 | I1 | Ground always covered | `lost == 0` every frame; headless clear-colour scan finds none |
-| I2 | Drawn bytes never exceed the budget except by bounded, visible-only overflow | `ledger.bytes(class) ≤ target(class) + overflow(class)`; every overflow byte belongs to the protected set P |
+| I2 | Drawn bytes never exceed the budget except by bounded, visible-only overflow | unprotected bytes ≤ `target(class)`, so every overflow byte belongs to the protected set P; and no class ever crosses `hard_limit(class)` (§11.2) |
 | I3 | Convergence | camera still ⇒ within T seconds of simulated time (desktop 2 s, iOS 4 s at p95 simulated latency): `exact == selected`, `underdraped == 0`, `stand_ins == 0`, and the decision digest is constant afterwards |
 | I4 | No oscillation | camera still ⇒ no tile, terrain or imagery, changes level more than once in 10 s |
 | I5 | No stale work | a request whose tile left the need set is dropped from the queue in the same decision step; an in-flight load is cancelled within the grace *time*; its decode is skipped or discarded |
@@ -31,10 +31,10 @@ owner's decisions of 2026-10-17:
 | I8 | Adapt without holes | memory pressure ⇒ bytes ≤ new target within a bounded time, I1 holds throughout; thermal ⇒ upload budget and target fps shrink |
 | I9 | Atomic swaps, both directions | refining: the parent stops being drawn only in the decision step where all its visible children are drawable; coarsening (zoom-out): the children stop being drawn only when the parent is drawable. Same for imagery: the old drape is released only after the new one is drawn |
 | I10 | Imagery matches need | after convergence, for every drawn tile, `|draped_imagery_level − needed_imagery_level| ≤ 1`, independently of the tile's terrain level (within the cap of §4) |
-| I11 | Protected set is never evicted | P = drawn ∪ the fallback chain (terrain **and** imagery) of every needed-but-absent tile ∪ in transit to the GPU ∪ the pinned floor |
+| I11 | Protected set is never evicted | P = drawn ∪ the fallback chain (terrain **and** imagery) of every needed-but-absent tile ∪ in transit to the GPU ∪ the pinned floor ∪ the drawn cut's ancestor chain ∪ the drawable half of a swap in progress (§11.1) |
 | I12 | Determinism | the same sequence of inputs (camera states, arrivals with their generation, pressure, thermal) ⇒ the same decision stream, bit for bit (digest); no decision reads a wall clock or a hash-map iteration order |
 | I13 | Batch exactness (films) | under `Policy::Batch`, each frame is drawn only once every tile and drape it needs is drawable; nothing it needs is ever evicted; the frame is a function of the frame's inputs only |
-| I14 | Nothing already held is fetched again | no network request is ever issued for a resource present in a local tier (GPU, CPU-decoded, local store); a resource present on the GPU is never re-uploaded; a resource decoded in memory is never re-decoded |
+| I14 | Nothing already held is fetched again | no network request is ever issued for a resource present in a local tier (GPU, CPU-decoded, local store); a resource present on the GPU is never re-uploaded; a resource decoded in memory is never re-decoded; an eviction demotes to a local tier, so what comes back within 10 s comes from it (`thrash` counts network refetches of the evicted, `rereads` local ones) |
 | I15 | Local before remote | a resource held in the local store is served from it within its own quota, without consuming a network slot; local reads never wait behind network work |
 
 ## 2. Where it lives
@@ -86,7 +86,7 @@ pub enum Thermal { Nominal, Fair, Serious, Critical }
 /// Built from the traversal each decision step; the only input about the view.
 pub struct NeedSet {
     pub drawn: Vec<(TileId, Need)>,      // terrain/3D tiles the traversal wants drawn
-    pub blockers: Vec<(TileId, Need)>,   // what a held REPLACE waits on
+    pub blockers: Vec<(TileId, Need)>,   // ALL the children a held REPLACE waits on, resident or not (§11.1)
     pub preload: Vec<(TileId, Need)>,    // ancestors, ring
 }
 pub struct Need {
@@ -142,8 +142,10 @@ pub struct Decisions {
 
 **Priority**
 - An integer lexicographic key, fully deterministic:
-  1. tier: Floor, Hole (no drawable fallback), Blocker, Drawn-refine, Drape-up, Ring,
-     Preload-ancestor, Refresh;
+  1. urgency: Floor, Hole (a wanted tile not drawable: it shows a fallback or finer
+     descendants, so its absence forces blur or over-detail), Blocker, Drape (one tier for
+     the drape a drawn tile needs: "Drawn-refine" and "Drape-up" merged), Ring, Ancestor,
+     Refresh (lowest: free slots and budget only, never preempts, new before old);
   2. score: `sse_excess × (0.5 + 0.5 × centrality) + age_bonus(time waiting) +
      cover_bonus(waiting descendants)`, quantised to an integer;
   3. resource id.
@@ -157,15 +159,19 @@ pub struct Decisions {
 - Sweep to `target` with high/low watermarks.
 
 **Overflow and relaxation (Interactive)**
-- When P alone exceeds `target + overflow`, `sse_scale` rises at `relax.up` per second.
+- When P alone exceeds `target + overflow`, or admission is *strained* (wanted work
+  displaces wanted work, or is refused), `sse_scale` rises at `relax.up` per second; four
+  times faster at the hard limit (§11.2).
+- The imagery need relaxes with it: the texel target grows with `sse_scale` (§11.4).
 - Under `target`, it decays at `relax.down` per second back to 1, with hysteresis between
   the two thresholds.
 - It is never per frame, so it does not depend on the frame rate.
 
 **Costs**
 - Charged from a deterministic estimator that both sides share, in GPU bytes:
-  - mesh: vertices × stride + indices × 4 + the per-tile uniform + the CPU copy kept for
-    stitching;
+  - mesh: vertex and index buffers aligned to 4, the per-tile uniform aligned to 256, the
+    CPU copy kept for stitching (resident, not staged); staging rows of textures aligned to
+    256 bytes (`COPY_BYTES_PER_ROW_ALIGNMENT`), mip by mip;
   - drape: w × h × 4 × 4/3, compressed sizes when a GPU format is used.
 - Staging and in-transit bytes are counted against `delivery_credit`.
 - Actual bytes come back in the ack. Invariant: drift < 5 %, otherwise the estimator is
@@ -493,3 +499,76 @@ What must stay identical, and is tested:
 | **D4** | Later | Imagery texture arrays or atlases (phase 2) |
 | **D5** | Open | iOS budget fractions, credit size, imagery-over-terrain cap (3 proposed) |
 | **Skirts** | Deferred | Skirts are deferred (see the header) |
+
+## 11. Amendments from the implementation (Steps 1–3)
+
+The module and its simulation (`feat/budget-core`) changed these points. Each was forced by
+a test that failed, mostly a livelock the simulation found. Spec and code now agree.
+
+### 11.1 The protected set
+- **The drawn cut's ancestor chain is protected** (`Protection::Chain`). The traversal
+  refines a tile only through resident ancestors, so evicting a refined parent made the cut
+  flip back and forth at a tight budget, each step re-requesting what the last one evicted.
+  The chain costs about a third of the frontier, as the reference engines keep it.
+- **The drawable half of a swap in progress is protected** (`Protection::Swap`): a missing
+  tile's drape waiting for its mesh, a held parent's resident children waiting for their
+  siblings. Evicting either restarted the swap for ever.
+- **Blockers are all the children a hold waits on, resident or not.** Listing only the
+  missing ones made the resident siblings unwanted, hence evictable: the same livelock. The
+  traversal must list them so (Step 4).
+
+### 11.2 Hard limit and admission
+- `hard_limit` per class, set by the profile from the device: the guard against a jetsam
+  or out-of-memory kill. No delivery ever crosses it, whatever its urgency.
+- `hard_reserve_percent` (15 %) is kept for swaps that shrink the set: a coarser parent
+  replacing its drawn children may use it, nothing else. Urgent work stops at
+  `hard_limit − reserve`, non-urgent work at the target, preload at the low watermark.
+- **Admission preempts lower-value residents rather than refusing work** (checklist C15):
+  to fit, a delivery evicts unprotected residents worth less (unneeded, or wanted at a lower
+  urgency). Preload never displaces anything wanted, and is not fetched when the decoded
+  tier could not keep it.
+
+### 11.3 Requests
+- `load_timeout` (4 s interactive, 120 s Batch) is the single owner of load timeouts: a load
+  unanswered that long is cancelled and retried with backoff (Batch: the session ends).
+  Transport-level timeouts are removed at the cut-over, or kept at least as long (§5).
+- An urgent request (Floor, Hole) takes a slot from in-flight Ring, Ancestor or Refresh
+  work of its class; nothing else is preempted.
+
+### 11.4 Imagery
+- The footprint is relaxed with `sse_scale`: under pressure imagery coarsens as terrain
+  does. Without it the low clamp (160 MiB) never converged.
+- When the level asked is held nowhere locally, a level held on the GPU, decoded or in a
+  store, within one level of the window between the relaxed and the unrelaxed need, is
+  taken instead: a relaxation never sends to the network what a local tier can show (I15).
+  Batch takes the exact level, with no hysteresis, so a frame is a function of its inputs.
+- A finer drape already worn is kept; under pressure the downgrade wins.
+- The decoded tier releases copies of protected GPU residents first, then of evictable
+  ones, then demoted ones, so an eviction demotes rather than drops.
+
+### 11.5 Time and determinism
+- Time is `Micros(u64)`; no float enters a decision. The imagery level uses only
+  `+ − × ÷ √` and exact powers of two. The simulation's inputs avoid `libm` as well, so the
+  golden decision digests hold on every platform, checked on the Linux CI.
+
+### 11.6 The zoom-out-at-the-ceiling scenario
+The review asked for a zoom-out at the hard ceiling where the needed parent is **not
+resident**, asserting that the children stay drawn until it is. With the chain protected
+(§11.1), that state cannot arise in the interactive traversal: every parent of the drawn cut
+is resident by construction, which is the stronger guarantee. The simulation scenario
+therefore asserts that guarantee at every step of a zoom-out on a small phone at its ceiling
+(every drawn tile's parent drawable), that no class crosses its hard limit, that nothing is
+lost, and that the budget settles, with nothing churning, within 10 s. The held-children
+path itself (a parent missing, then wanted on a zoom-out) is covered by the unit tests
+`on_zoom_out_the_children_stay_until_the_parent_is_drawable` and
+`a_coarsening_parent_uses_the_reserve_at_the_ceiling`.
+
+### 11.7 Measurements that bear on Step 6
+- A cold phone converges 6.4 s after the camera stops. The simulated cellular network allows
+  6.3 s at best (740 loads of about 0.24 s each, 8 + 8 in flight). 4 s is not reachable
+  under that model: the target or the quotas must change.
+- On a desktop back-and-forth the Drape class is full with the view alone (+3 / 2048²
+  drapes, about 22 MB each): about 1 200 drapes come back from the store in 48 s, none from
+  the network.
+- Per step, `decide` costs about 0.6 ms (release, about 500 drawn tiles): O(view · log N),
+  not yet the O(changes · log N) of I6. An incremental need is the follow-up.
