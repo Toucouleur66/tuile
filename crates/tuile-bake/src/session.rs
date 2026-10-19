@@ -65,6 +65,26 @@ pub struct SessionConfig {
     /// frame's. `None` keeps everything, as a session always did.
     /// `TUILE_BAKE_KEEP_GIB` when the environment says.
     pub trim_between_frames: Option<usize>,
+    /// Whether every load is polled by the server's own future — nothing
+    /// advances while the server traverses — rather than run as a task on
+    /// the session's runtime.
+    ///
+    /// **On by default**, and `TUILE_LOADS=tasks` turns it off. Tasks are
+    /// several times faster on a globe, and they select the same tiles as
+    /// inline loads only where the selection does not depend on the order
+    /// tiles arrive in. With the traversal's refine hysteresis on, it does:
+    /// a pass keeps what the previous pass drew, so how many passes ran on
+    /// the way to convergence, and over which residency, decides the frame.
+    /// Measured on a made-up globe flight (`tests/ground_memory.rs`'s
+    /// sources, twelve frames): with hysteresis off, inline and tasks gave
+    /// identical frames on every run; with it on, neither mode repeats
+    /// itself run to run, and tasks vary more. Until that is settled the
+    /// bake keeps the mode it had.
+    ///
+    /// Not a [`Config`] field on purpose: the traversal config's `Debug`
+    /// names every pack's scene, and where a load runs is not a fact about
+    /// the scene.
+    pub inline_loads: bool,
 }
 
 /// What a session makes of a tile once its content has arrived.
@@ -133,6 +153,7 @@ impl Default for SessionConfig {
                 .ok()
                 .and_then(|gib| gib.parse::<f64>().ok())
                 .map(|gib| (gib * f64::from(1u32 << 30)) as usize),
+            inline_loads: std::env::var("TUILE_LOADS").as_deref() != Ok("tasks"),
         }
     }
 }
@@ -1052,11 +1073,16 @@ impl Live {
             occluder = ?tree.occluder(),
             "traversal culling"
         );
+        let spawn = loads_spawn(config.inline_loads, runtime.handle());
+        tracing::info!(loads = ?spawn, "where the session's loads run");
         let (stream, server) = in_process_with(tree, loader, traversal);
+        let server = server.with_spawn(spawn);
 
         // The server runs on its own runtime handle so a frame call can block
         // the calling thread — which is what Hydra's cook wants — without
-        // deadlocking against the loads it is waiting for.
+        // deadlocking against the loads it is waiting for. The loads
+        // themselves are tasks on the same runtime's workers (`loads_spawn`),
+        // so they advance while this thread traverses.
         let handle = runtime.handle().clone();
         let server_thread = std::thread::Builder::new()
             .name("tuile-hydra-server".into())
@@ -1643,6 +1669,17 @@ pub fn exact_traversal(mut config: Config) -> Config {
         config.uniform_detail_radius = radius;
     }
     config
+}
+
+/// Where a session's loads run: polled by the server's own future when
+/// [`SessionConfig::inline_loads`] says so (the default), else as tasks on
+/// the session's runtime, advancing while the server traverses.
+fn loads_spawn(inline: bool, runtime: &tokio::runtime::Handle) -> tuile_core::runtime::Spawn {
+    if inline {
+        tuile_core::runtime::Spawn::Inline
+    } else {
+        tuile_core::runtime::Spawn::Tokio(runtime.clone())
+    }
 }
 
 /// One decoded tile, made boundary-ready.
@@ -2902,7 +2939,12 @@ pub(crate) mod tests {
     /// tiles, under which drape, with which mesh and which encoded picture —
     /// and how many tiles were fetched to get there.
     fn quad_flight() -> (Vec<Vec<Handed>>, usize) {
-        let (frames, loads) = quad_flight_finished(Finish::Pictures);
+        quad_flight_loading(SessionConfig::default().inline_loads)
+    }
+
+    /// [`quad_flight`], with its loads inline or as tasks.
+    fn quad_flight_loading(inline_loads: bool) -> (Vec<Vec<Handed>>, usize) {
+        let (frames, loads) = quad_flight_finished_with(Finish::Pictures, inline_loads);
         let frames = frames
             .into_iter()
             .map(|(frame, tiles)| {
@@ -2939,12 +2981,21 @@ pub(crate) mod tests {
     /// it names with their drapes, in order.
     #[allow(clippy::type_complexity)]
     fn quad_flight_finished(finish: Finish) -> (Vec<(Frame, Vec<(u64, u64)>)>, usize) {
+        quad_flight_finished_with(finish, SessionConfig::default().inline_loads)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn quad_flight_finished_with(
+        finish: Finish,
+        inline_loads: bool,
+    ) -> (Vec<(Frame, Vec<(u64, u64)>)>, usize) {
         let loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut session = Session::new(
             Box::new(Quad),
             Arc::new(QuadLoader(Arc::clone(&loads))),
             SessionConfig {
                 finish,
+                inline_loads,
                 ..SessionConfig::default()
             },
         )
@@ -3066,7 +3117,50 @@ pub(crate) mod tests {
     /// difference can be read rather than guessed.
     #[test]
     fn a_flight_over_the_quad_resolves_as_it_always_has() {
-        let (frames, loads) = quad_flight();
+        let (loads, summary) = quad_summary(quad_flight());
+        println!("QUAD-FLIGHT loads={loads} frames={summary:?}");
+        assert_eq!(
+            (loads, summary.as_slice()),
+            QUAD_FLIGHT,
+            "the flight no longer resolves as it did"
+        );
+    }
+
+    /// The same flight with every load polled by the server's own future —
+    /// the mode a session had before loads ran as tasks — resolves as it
+    /// always has too. Both modes are held to the one golden.
+    #[test]
+    fn a_flight_over_the_quad_with_loads_inline_resolves_as_it_always_has() {
+        let (loads, summary) = quad_summary(quad_flight_loading(true));
+        assert_eq!(
+            (loads, summary.as_slice()),
+            QUAD_FLIGHT,
+            "inline, the flight no longer resolves as it did"
+        );
+    }
+
+    /// Loads as tasks on a multi-thread runtime land in whatever order the
+    /// workers finish them. Ten flights, ten times the golden: what a frame
+    /// selects does not depend on that order.
+    ///
+    /// What this does not cover: a loader that reshapes the tree (the quad's
+    /// does not), whose deferred edits are tested in `tuile-core` and
+    /// `tuile-terrain`; and arrival orders a real network produces that ten
+    /// runs of an instant loader happen not to.
+    #[test]
+    fn ten_flights_with_loads_as_tasks_resolve_alike() {
+        for run in 0..10 {
+            let (loads, summary) = quad_summary(quad_flight_loading(false));
+            assert_eq!(
+                (loads, summary.as_slice()),
+                QUAD_FLIGHT,
+                "run {run}: the flight resolved otherwise"
+            );
+        }
+    }
+
+    /// A flight's frames, each as its tile count and one digest.
+    fn quad_summary((frames, loads): (Vec<Vec<Handed>>, usize)) -> (usize, Vec<(usize, u64)>) {
         let summary: Vec<(usize, u64)> = frames
             .iter()
             .map(|tiles| {
@@ -3081,12 +3175,7 @@ pub(crate) mod tests {
                 (tiles.len(), fnv(&bytes))
             })
             .collect();
-        println!("QUAD-FLIGHT loads={loads} frames={summary:?}");
-        assert_eq!(
-            (loads, summary.as_slice()),
-            QUAD_FLIGHT,
-            "the flight no longer resolves as it did"
-        );
+        (loads, summary)
     }
 
     /// A pack that refers to the tile store holds no mesh and no picture: a

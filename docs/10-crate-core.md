@@ -19,7 +19,10 @@ tuile_core
 ├── protocol     # streaming mode IS this module: ClientMessage / ServerMessage,
 │                #   TileContent { Raw, Decoded }, GeometryStream trait + InProcessStream,
 │                #   HttpPullStream (the network bindings live in tuile-server/tuile-wgpu)
-├── runtime      # GeometryServer: state (residency, in-flight), orchestration
+├── runtime      # GeometryServer: state (residency, in-flight), orchestration ;
+│                #   loads inline (default, wasm) or as tasks on a host tokio handle
+│                #   (native feature "rt-tokio", `Spawn::Tokio`; tree edits deferred
+│                #   to the top of each pass — `TileTree::defer_edits`)
 ├── fetch        # TileFetcher trait + FsFetcher ; HttpFetcher behind a feature
 ├── cache        # ResidentCache LRU (byte budget)
 └── render       # PrepareRenderResources trait + TileContent/DecodedTileContent

@@ -9,9 +9,12 @@
 //! middleware (M2, `tuile-server`) drives the same loop and serializes the
 //! protocol — glb on the wire.
 //!
-//! Runtime-agnostic: no tokio, no spawning. The whole server is one future
-//! ([`GeometryServer::run`]) multiplexing client messages and in-flight
-//! fetches through `FuturesUnordered`; the caller decides where it runs.
+//! Runtime-agnostic by default: no tokio, no spawning. The whole server is
+//! one future ([`GeometryServer::run`]) multiplexing client messages and
+//! in-flight fetches through `FuturesUnordered`; the caller decides where it
+//! runs. On native, with the optional `rt-tokio` feature, the host can hand
+//! it a runtime handle instead and every load runs as a task of its own —
+//! see [`Spawn`].
 
 use crate::cache::ResidentCache;
 use crate::content::TileContent;
@@ -127,6 +130,171 @@ impl<F: Future> Future for Woken<F> {
     }
 }
 
+/// Where a session's loads run.
+///
+/// # Inline — the default, and the only mode on wasm
+///
+/// Every load is a future inside the server's own, polled by the loop
+/// between two traversals. Nothing advances while a pass runs: no body is
+/// read, no next request is sent, no decode is submitted. It is also the
+/// mode in which a session can be stepped by hand, one poll at a time, which
+/// is what every test of the loop does.
+///
+/// A browser worker gains nothing from anything else: it has one thread, so
+/// a load spawned beside the server still waits for the server to yield.
+///
+/// # Tokio — native, behind the `rt-tokio` feature
+///
+/// Every load is spawned on the host's runtime — a handle passed in, never a
+/// runtime built here — and reports back through a channel the loop drains
+/// in batches. Loads then advance on the other workers while a traversal
+/// runs, which is where an arrival used to wait. Cancelling still goes
+/// through the load's abort handle, and a result that lands after its load
+/// was cancelled is recognised as such and dropped.
+///
+/// A load that changes the tree's shape (a reveal, a graft) could then land
+/// in the middle of a pass; the server therefore asks the tree to
+/// [defer its edits](TileTree::defer_edits) and applies them at the top of
+/// every pass.
+#[derive(Clone, Default)]
+pub enum Spawn {
+    /// Loads polled by the server's own future.
+    #[default]
+    Inline,
+    /// Loads spawned as tasks on this runtime.
+    #[cfg(all(feature = "rt-tokio", not(target_arch = "wasm32")))]
+    Tokio(tokio::runtime::Handle),
+}
+
+impl std::fmt::Debug for Spawn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Inline => f.write_str("Inline"),
+            #[cfg(all(feature = "rt-tokio", not(target_arch = "wasm32")))]
+            Self::Tokio(_) => f.write_str("Tokio"),
+        }
+    }
+}
+
+/// A load's result, or the news that it was cancelled.
+type Done = Result<Arrival, Aborted>;
+
+/// The loads in flight, wherever they run. See [`Spawn`].
+enum Loads {
+    Inline(FuturesUnordered<LoadFuture>),
+    #[cfg(all(feature = "rt-tokio", not(target_arch = "wasm32")))]
+    Tasks(tasks::Tasks),
+}
+
+impl Loads {
+    fn new(spawn: &Spawn) -> Self {
+        match spawn {
+            Spawn::Inline => Self::Inline(FuturesUnordered::new()),
+            #[cfg(all(feature = "rt-tokio", not(target_arch = "wasm32")))]
+            Spawn::Tokio(handle) => Self::Tasks(tasks::Tasks::new(handle.clone())),
+        }
+    }
+
+    /// Whether loads run beside the server rather than inside it.
+    fn spawns(&self) -> bool {
+        !matches!(self, Self::Inline(_))
+    }
+
+    fn push(&mut self, load: LoadFuture, _handle: &AbortHandle) {
+        match self {
+            Self::Inline(loads) => loads.push(load),
+            #[cfg(all(feature = "rt-tokio", not(target_arch = "wasm32")))]
+            Self::Tasks(tasks) => tasks.spawn(load, _handle.clone()),
+        }
+    }
+
+    /// The next result, waiting for it. `Pending` when there is nothing in
+    /// flight as well as when nothing has landed yet.
+    fn poll_next(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Done> {
+        match self {
+            Self::Inline(loads) => match Pin::new(loads).poll_next(cx) {
+                Poll::Ready(Some(done)) => Poll::Ready(done),
+                Poll::Ready(None) | Poll::Pending => Poll::Pending,
+            },
+            #[cfg(all(feature = "rt-tokio", not(target_arch = "wasm32")))]
+            Self::Tasks(tasks) => tasks.poll_next(cx),
+        }
+    }
+
+    /// The next result that has already landed, without waiting.
+    fn try_next(&mut self) -> Option<Done> {
+        use futures_util::{FutureExt, StreamExt};
+        match self {
+            Self::Inline(loads) => loads.next().now_or_never().flatten(),
+            #[cfg(all(feature = "rt-tokio", not(target_arch = "wasm32")))]
+            Self::Tasks(tasks) => tasks.try_next(),
+        }
+    }
+}
+
+/// Loads as tokio tasks. See [`Spawn::Tokio`].
+#[cfg(all(feature = "rt-tokio", not(target_arch = "wasm32")))]
+mod tasks {
+    use super::{AbortHandle, Aborted, Arrival, Done, LoadFuture};
+    use std::task::{Context, Poll};
+    use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+
+    /// A result, with the handle of the load that produced it.
+    type Landed = (Arrival, AbortHandle);
+
+    pub(super) struct Tasks {
+        runtime: tokio::runtime::Handle,
+        tx: UnboundedSender<Landed>,
+        pub(super) rx: UnboundedReceiver<Landed>,
+    }
+
+    impl Tasks {
+        pub(super) fn new(runtime: tokio::runtime::Handle) -> Self {
+            let (tx, rx) = unbounded_channel();
+            Self { runtime, tx, rx }
+        }
+
+        /// Runs `load` as a task of its own. Its abort handle travels with
+        /// the result, because aborting a task that has already sent cannot
+        /// take the message back.
+        pub(super) fn spawn(&self, load: LoadFuture, handle: AbortHandle) {
+            let tx = self.tx.clone();
+            // Detached: the abort handle is the only way to stop it, and a
+            // cancelled load wakes, sees it, and ends.
+            drop(self.runtime.spawn(async move {
+                if let Ok(msg) = load.await {
+                    // The server may have gone: nobody left to tell.
+                    let _ = tx.send((msg, handle));
+                }
+            }));
+        }
+
+        /// A result whose load was cancelled after it finished — the loop
+        /// cancels only from its own thread, before it reads the next
+        /// result, so the flag is never late — is the news of that cancel,
+        /// exactly as an inline load would have reported it.
+        pub(super) fn screen((msg, handle): Landed) -> Done {
+            if handle.is_aborted() {
+                Err(Aborted)
+            } else {
+                Ok(msg)
+            }
+        }
+
+        pub(super) fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Done> {
+            match self.rx.poll_recv(cx) {
+                Poll::Ready(Some(landed)) => Poll::Ready(Self::screen(landed)),
+                // Never: the sender lives as long as this.
+                Poll::Ready(None) | Poll::Pending => Poll::Pending,
+            }
+        }
+
+        pub(super) fn try_next(&mut self) -> Option<Done> {
+            self.rx.try_recv().ok().map(Self::screen)
+        }
+    }
+}
+
 /// A pause the host's event loop gets to run in: see
 /// [`GeometryServer::with_breather`]. `Send` on native, like the loads, and
 /// not on wasm, where it is a JS timer.
@@ -200,6 +368,7 @@ pub fn in_process_with(
             frame: 0,
             primed: false,
             breather: None,
+            spawn: Spawn::Inline,
         },
     )
 }
@@ -256,9 +425,18 @@ pub struct GeometryServer {
     /// Handing the host its turn: after this many events in a row with no
     /// wait between them, the pause. See [`GeometryServer::with_breather`].
     breather: Option<(usize, Breather)>,
+    /// Where the loads run. See [`Spawn`].
+    spawn: Spawn,
 }
 
 impl GeometryServer {
+    /// Runs this session's loads as given. Default: [`Spawn::Inline`].
+    #[must_use]
+    pub fn with_spawn(mut self, spawn: Spawn) -> Self {
+        self.spawn = spawn;
+        self
+    }
+
     /// Hands the host its turn after every `every` events handled back to
     /// back, by awaiting `pause()`.
     ///
@@ -277,11 +455,16 @@ impl GeometryServer {
 
     /// Runs the session until the consumer goes away.
     pub async fn run(mut self) {
-        let breather = self.breather.take();
+        let mut loads = Loads::new(&self.spawn);
+        if loads.spawns() {
+            // A load landing on another thread must not reshape the tree under
+            // a pass: its edits wait for the top of the next one.
+            self.tree.defer_edits();
+        }
+        let breather = self.breather.take().or_else(|| default_breather(&loads));
         let mut busy = 0usize;
         let mut rx = self.endpoint.rx;
         let tx = self.endpoint.tx.clone();
-        let mut loads: FuturesUnordered<LoadFuture> = FuturesUnordered::new();
         let mut session = Session {
             tree: self.tree.as_ref(),
             loader: &self.loader,
@@ -346,12 +529,9 @@ impl GeometryServer {
                     if let Poll::Ready(Some(event)) = poll_client(cx) {
                         return Poll::Ready(event);
                     }
-                    match Pin::new(&mut loads).poll_next(cx) {
-                        Poll::Ready(Some(done)) => Poll::Ready(Event::Load(done)),
-                        Poll::Ready(None) | Poll::Pending => Poll::Pending,
-                    }
+                    loads.poll_next(cx).map(Event::Load)
                 } else {
-                    if let Poll::Ready(Some(done)) = Pin::new(&mut loads).poll_next(cx) {
+                    if let Poll::Ready(done) = loads.poll_next(cx) {
                         return Poll::Ready(Event::Load(done));
                     }
                     match poll_client(cx) {
@@ -432,6 +612,10 @@ impl GeometryServer {
                 break;
             }
         }
+        // Spawned loads outlive the loop otherwise: nobody would read them.
+        for handle in session.in_flight.values() {
+            handle.abort();
+        }
     }
 }
 
@@ -450,26 +634,38 @@ impl GeometryServer {
 /// Returns how many it delivered, for `arrivals_per_pass`.
 fn drain_ready(
     session: &mut Session<'_>,
-    loads: &mut FuturesUnordered<LoadFuture>,
+    loads: &mut Loads,
     tx: &UnboundedSender<ServerMessage>,
 ) -> Result<u64, Stop> {
-    use futures_util::{FutureExt, StreamExt};
     let m = crate::metrics::metrics();
     let mut delivered = 0;
     for _ in 0..session.config.maximum_simultaneous_fetches {
-        match loads.next().now_or_never() {
-            Some(Some(Ok((msg, landed)))) => {
+        match loads.try_next() {
+            Some(Ok((msg, landed))) => {
                 m.arrival_wait_seconds.record(landed.elapsed());
                 session.on_load_done(msg, tx)?;
                 delivered += 1;
             }
             // Cancelled: cleaned up at abort time, as in the loop.
-            Some(Some(Err(Aborted))) => {}
+            Some(Err(Aborted)) => {}
             // Nothing in flight, or nothing ready yet.
-            Some(None) | None => break,
+            None => break,
         }
     }
     Ok(delivered)
+}
+
+/// The pause a session takes when its host gave none: for spawned loads, a
+/// turn handed back to the runtime every so often, so a server answering a
+/// long burst from memory does not keep its worker from the tasks queued on
+/// it. Inline, none — the host decides, as it always has.
+fn default_breather(_loads: &Loads) -> Option<(usize, Breather)> {
+    #[cfg(all(feature = "rt-tokio", not(target_arch = "wasm32")))]
+    if _loads.spawns() {
+        let pause: Breather = Arc::new(|| Box::pin(tokio::task::yield_now()));
+        return Some((16, pause));
+    }
+    None
 }
 
 /// Borrowed view of the server state for the message handlers.
@@ -701,13 +897,20 @@ impl Session<'_> {
     fn retraverse(
         &mut self,
         tx: &UnboundedSender<ServerMessage>,
-        loads: &mut FuturesUnordered<LoadFuture>,
+        loads: &mut Loads,
     ) -> Result<(), Stop> {
         // Whether this pass was provoked by the camera or by a tile arriving.
         // It decides one thing only: whether in-flight loads may be cancelled
         // below. Consumed here, so a pass provoked by an arrival does not
         // inherit the last camera move's licence to cancel.
         let camera_moved = std::mem::take(self.view_moved);
+        // What loads changed in the tree's shape since the last pass, applied
+        // before anything reads it — so the whole pass walks one tree. Nothing
+        // is held unless loads run as tasks (`Spawn`); inline, the edits have
+        // already landed, between passes, as they always did.
+        if let Some((tile, why)) = self.tree.apply_deferred_edits().into_iter().next() {
+            return self.fail(tile, why, tx);
+        }
         *self.frame += 1;
         self.prime();
         // Open a new pass before anything is touched: from here on, every tile
@@ -985,7 +1188,7 @@ impl Session<'_> {
     }
 
     /// Starts loading `tile`, and notes the epoch it was started under.
-    fn start(&mut self, tile: TileId, loads: &mut FuturesUnordered<LoadFuture>) {
+    fn start(&mut self, tile: TileId, loads: &mut Loads) {
         let loader = Arc::clone(self.loader);
         // Read here and not when the load lands: the loader may move on while
         // the load is in flight, and content begun under the old epoch must be
@@ -999,7 +1202,7 @@ impl Session<'_> {
             async move { (tile, loader.load(tile).await) },
             &crate::metrics::metrics().load_wake_wait_seconds,
         ));
-        loads.push(Abortable::new(fut, registration));
+        loads.push(Abortable::new(fut, registration), &handle);
         self.in_flight.insert(tile, handle);
         let m = crate::metrics::metrics();
         m.loads_started.inc();
@@ -1036,7 +1239,7 @@ impl Session<'_> {
     /// Refreshes take only the fetch slots the view's own requests left free:
     /// ground that has no picture at all outranks ground that has last
     /// epoch's.
-    fn refresh(&mut self, loads: &mut FuturesUnordered<LoadFuture>) {
+    fn refresh(&mut self, loads: &mut Loads) {
         let now = self.loader.epoch();
         if *self.settled_epoch == now {
             return;
@@ -2162,6 +2365,308 @@ mod tests {
         assert_eq!(waiting(None, 64, far_view()), 1, "the view alone");
         assert_eq!(waiting(Some(1), 2, far_view()), 2, "the pyramid, capped");
         assert_eq!(waiting(Some(1), 64, far_view()), 3, "the whole pyramid");
+    }
+
+    /// A tileset whose root is an external tileset: the load grafts, and the
+    /// grafted root is the content.
+    #[cfg(all(feature = "rt-tokio", not(target_arch = "wasm32")))]
+    fn write_external_fixture(dir: &std::path::Path) -> Url {
+        let glb = crate::content::tests::test_glb();
+        std::fs::write(dir.join("a.glb"), &glb).expect("write a");
+        std::fs::write(
+            dir.join("sub.json"),
+            r#"{ "asset": { "version": "1.1" }, "geometricError": 50,
+                 "root": { "boundingVolume": { "sphere": [0, 0, 0, 100] },
+                           "geometricError": 0, "content": { "uri": "a.glb" } } }"#,
+        )
+        .expect("write sub");
+        let path = dir.join("tileset.json");
+        std::fs::write(
+            &path,
+            r#"{ "asset": { "version": "1.1" }, "geometricError": 200,
+                 "root": { "boundingVolume": { "sphere": [0, 0, 0, 100] },
+                           "geometricError": 50, "refine": "REPLACE",
+                           "content": { "uri": "sub.json" } } }"#,
+        )
+        .expect("write tileset");
+        Url::from_file_path(&path).expect("url")
+    }
+
+    /// **Loads as tasks: a graft waits for the top of a pass.** The server
+    /// asks its tree to hold edits once, before anything is spawned, and
+    /// applies them at the top of every pass; the external tileset grafted by
+    /// a load running on another worker is then walked by the next pass whole,
+    /// and its content arrives, on a multi-thread runtime, with the server
+    /// itself a task on it.
+    #[cfg(all(feature = "rt-tokio", not(target_arch = "wasm32")))]
+    #[test]
+    fn loads_as_tasks_graft_between_passes_and_converge() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Counts what the server asks of the tree's edits.
+        struct Recording {
+            inner: TilesetTree,
+            deferred: Arc<AtomicUsize>,
+            applied: Arc<AtomicUsize>,
+        }
+        impl TileTree for Recording {
+            fn roots(&self) -> Vec<TileId> {
+                self.inner.roots()
+            }
+            fn children(&self, id: TileId) -> Vec<TileId> {
+                self.inner.children(id)
+            }
+            fn properties(&self, id: TileId) -> crate::source::TileProperties {
+                self.inner.properties(id)
+            }
+            fn parent(&self, id: TileId) -> Option<TileId> {
+                self.inner.parent(id)
+            }
+            fn level(&self, id: TileId) -> u32 {
+                self.inner.level(id)
+            }
+            fn defer_edits(&self) {
+                self.deferred.fetch_add(1, Ordering::SeqCst);
+                self.inner.defer_edits();
+            }
+            fn apply_deferred_edits(&self) -> Vec<(TileId, String)> {
+                self.applied.fetch_add(1, Ordering::SeqCst);
+                self.inner.apply_deferred_edits()
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = write_external_fixture(dir.path());
+        let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
+        let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
+        let root = tileset.root();
+        let arena = Arc::new(RwLock::new(tileset));
+        let (deferred, applied) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let tree: Box<dyn TileTree> = Box::new(Recording {
+            inner: TilesetTree::new(Arc::clone(&arena)),
+            deferred: Arc::clone(&deferred),
+            applied: Arc::clone(&applied),
+        });
+        let loader: Arc<dyn TileLoader> =
+            Arc::new(TilesetLoader::new(Arc::clone(&arena), Arc::new(FsFetcher)));
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .build()
+            .expect("runtime");
+        let (mut stream, server) = in_process_with(
+            tree,
+            loader,
+            Config {
+                pinned_level: None,
+                ..Config::default()
+            },
+        );
+        let server = server.with_spawn(Spawn::Tokio(runtime.handle().clone()));
+        let running = runtime.spawn(server.run());
+
+        // A session that never walks the graft goes quiet rather than failing:
+        // a watchdog turns that into a failure instead of a hang.
+        let watchdog =
+            runtime.spawn_blocking(|| std::thread::sleep(std::time::Duration::from_secs(20)));
+        let (grafted, passes) = runtime.block_on(async {
+            let session = async {
+                stream
+                    .send(ClientMessage::ViewerState {
+                        views: vec![near_view()],
+                        generation: 0,
+                    })
+                    .expect("send");
+                let mut passes = 0usize;
+                let mut grafted = None;
+                while let Some(msg) = stream.next_message().await {
+                    match msg {
+                        ServerMessage::Content { tile, .. } => grafted = Some(tile),
+                        ServerMessage::Select { tiles, .. } => {
+                            passes += 1;
+                            if grafted.is_some_and(|g| tiles.iter().any(|(t, _)| *t == g)) {
+                                break;
+                            }
+                        }
+                        ServerMessage::Error { message, .. } => {
+                            unreachable!("unexpected error: {message}")
+                        }
+                        _ => {}
+                    }
+                }
+                (grafted, passes)
+            };
+            tokio::select! {
+                outcome = session => outcome,
+                _ = watchdog => panic!("the grafted tileset was never walked"),
+            }
+        });
+        drop(stream);
+        let grafted = grafted.expect("the grafted root's content arrived");
+        assert_eq!(
+            arena.read().expect("arena").parent(grafted),
+            Some(root),
+            "the content is the grafted root's"
+        );
+        assert_eq!(
+            deferred.load(Ordering::SeqCst),
+            1,
+            "edits held once, up front"
+        );
+        assert!(
+            applied.load(Ordering::SeqCst) >= passes,
+            "held edits applied at the top of every pass: {} for {passes}",
+            applied.load(Ordering::SeqCst)
+        );
+        runtime
+            .block_on(running)
+            .expect("the server ends when the client goes");
+        // Not waiting on the watchdog's sleep.
+        runtime.shutdown_background();
+    }
+
+    /// **A result that lands after its load was cancelled is the news of the
+    /// cancel.** A task cannot take back what it has sent; the abort handle
+    /// that travels with the result says whether the loop still wants it.
+    #[cfg(all(feature = "rt-tokio", not(target_arch = "wasm32")))]
+    #[test]
+    fn a_task_cancelled_after_it_finished_reports_a_cancel() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .expect("runtime");
+        let mut loads = Loads::new(&Spawn::Tokio(runtime.handle().clone()));
+        let mut start = |tile: TileId| {
+            let (handle, registration) = AbortHandle::new_pair();
+            let fut: BoxLoadFut =
+                Box::pin(async move { ((tile, Ok(Loaded::Expanded)), crate::metrics::stamp()) });
+            loads.push(Abortable::new(fut, registration), &handle);
+            handle
+        };
+        let kept = start(TileId(1));
+        let cancelled = start(TileId(2));
+        // Both have finished and sent: wait until both are in the channel.
+        let mut landed = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let Loads::Tasks(tasks) = &mut loads else {
+            unreachable!("tasks")
+        };
+        while landed.len() < 2 {
+            assert!(std::time::Instant::now() < deadline, "the tasks never sent");
+            if let Ok(item) = tasks.rx.try_recv() {
+                landed.push(item);
+            }
+            std::thread::yield_now();
+        }
+        cancelled.abort();
+        let mut outcomes: Vec<(u64, bool)> = landed
+            .into_iter()
+            .map(|(msg, handle)| (msg.0 .0 .0, tasks::Tasks::screen((msg, handle)).is_ok()))
+            .collect();
+        outcomes.sort_unstable();
+        assert_eq!(outcomes, vec![(1, true), (2, false)]);
+        drop(kept);
+    }
+
+    /// The mode names itself, for the log line a host writes.
+    #[test]
+    fn a_spawn_says_which_it_is() {
+        assert_eq!(format!("{:?}", Spawn::default()), "Inline");
+        #[cfg(all(feature = "rt-tokio", not(target_arch = "wasm32")))]
+        {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime");
+            assert_eq!(
+                format!("{:?}", Spawn::Tokio(runtime.handle().clone())),
+                "Tokio"
+            );
+        }
+    }
+
+    /// **Inline, nothing is deferred and no pause is added.** The edits of a
+    /// load have landed between two passes by construction, as they always
+    /// did, and the host keeps the only say over pauses.
+    #[test]
+    fn inline_loads_neither_defer_edits_nor_pause() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counting(Arc<AtomicUsize>);
+        impl TileTree for Counting {
+            fn roots(&self) -> Vec<TileId> {
+                vec![TileId(0)]
+            }
+            fn children(&self, _id: TileId) -> Vec<TileId> {
+                Vec::new()
+            }
+            fn properties(&self, _id: TileId) -> crate::source::TileProperties {
+                crate::source::TileProperties {
+                    bounding_volume: crate::math::BoundingVolume::Sphere(crate::math::Sphere {
+                        center: glam::DVec3::ZERO,
+                        radius: 1.0,
+                    }),
+                    geometric_error: 1.0,
+                    refine: crate::tileset::Refine::Replace,
+                    has_content: false,
+                }
+            }
+            fn defer_edits(&self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct Never;
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        impl TileLoader for Never {
+            async fn load(&self, _id: TileId) -> Result<Loaded, LoadError> {
+                futures_util::future::pending().await
+            }
+        }
+        let deferred = Arc::new(AtomicUsize::new(0));
+        let (mut stream, server) = in_process_with(
+            Box::new(Counting(Arc::clone(&deferred))),
+            Arc::new(Never),
+            unpinned(),
+        );
+        let mut server = Box::pin(server.run());
+        look(&stream, near_view(), 1);
+        listen(&mut server, &mut stream, 4);
+        assert_eq!(deferred.load(Ordering::SeqCst), 0, "inline defers nothing");
+        assert!(default_breather(&Loads::new(&Spawn::Inline)).is_none());
+    }
+
+    /// Spawned loads defer, and pause for the runtime by default; a result
+    /// that has landed is taken without waiting.
+    #[cfg(all(feature = "rt-tokio", not(target_arch = "wasm32")))]
+    #[test]
+    fn spawned_loads_land_without_waiting_and_pause_by_default() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .expect("runtime");
+        let mut loads = Loads::new(&Spawn::Tokio(runtime.handle().clone()));
+        assert!(loads.spawns());
+        assert!(default_breather(&loads).is_some());
+        for tile in [TileId(1), TileId(2)] {
+            let (handle, registration) = AbortHandle::new_pair();
+            let fut: BoxLoadFut =
+                Box::pin(async move { ((tile, Ok(Loaded::Expanded)), crate::metrics::stamp()) });
+            loads.push(Abortable::new(fut, registration), &handle);
+        }
+        let mut landed = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while landed.len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "try_next never handed over what had landed"
+            );
+            if let Some(Ok(((tile, _), _))) = loads.try_next() {
+                landed.push(tile.0);
+            }
+            std::thread::yield_now();
+        }
+        landed.sort_unstable();
+        assert_eq!(landed, vec![1, 2]);
+        assert!(loads.try_next().is_none(), "nothing more");
     }
 
     /// **A request the network never answers costs one slot, not the

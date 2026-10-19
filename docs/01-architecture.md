@@ -29,7 +29,8 @@ Future crates (planned, not created in v1): three **specialized façades** — `
 ```
 tuile-b3dm  → serde_json, thiserror (pure codec, zero I/O)
 tuile-core  → tuile-b3dm, serde, serde_json, glam (f64), gltf, thiserror, bytes
-                async-trait OR futures-core (async traits), NO runtime
+                async-trait OR futures-core (async traits), NO runtime ;
+                tokio (rt + sync) only behind the optional native feature "rt-tokio"
 tuile-cesium-ion → tuile-core (TileFetcher), reqwest behind a feature ;
                 the core does not know that ion exists
 tuile-wgpu  → tuile-core, wgpu, bytemuck ; reqwest+tokio behind the "native" feature,
@@ -40,7 +41,7 @@ tuile-server→ tuile-core (parsing/validation), axum+tokio ("native" feature),
 tuile-usd   → tuile-core, gltf, zip (stored/uncompressed writing), image (re-encode if needed)
 ```
 
-Forbidden in the core: tokio, wgpu, axum, reqwest, std::fs in production paths (OK in tests). The core is async-runtime-agnostic: it exposes async traits and pure structures; it is the caller who supplies the execution.
+Forbidden in the core: wgpu, axum, reqwest (outside its own optional `http` feature), std::fs in production paths (OK in tests), and tokio unconditionally — tokio only through the optional native feature `rt-tokio`; the wasm build and the default build have none. The core is async-runtime-agnostic: it exposes async traits and pure structures; it is the caller who supplies the execution. Under `rt-tokio` the caller supplies it as a runtime handle (`runtime::Spawn::Tokio`) on which the geometry server spawns its loads; the core never builds a runtime. On wasm the loads stay in the server's own `FuturesUnordered` (`Spawn::Inline`): a single-threaded worker gains nothing from `spawn_local`, since a spawned load still waits for the server to yield.
 
 ## The foundational traits
 

@@ -36,6 +36,8 @@ winit = { workspace = true }
 # disk, the counters on a local endpoint, the signals. None of it exists in a
 # browser, and none of it is reached from the shared application.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Loads as tasks on the viewer's runtime (`Spawn::Tokio`); native only.
+tuile-core = { version = "0.8.2", path = "../tuile-core", features = ["rt-tokio"] }
 pollster = { workspace = true }
 # `time` for the bounded flush of the tile store on the way out.
 tokio = { workspace = true, features = ["sync", "time"] }

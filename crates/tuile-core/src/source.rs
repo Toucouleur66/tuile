@@ -150,6 +150,31 @@ pub trait TileTree: Send + Sync {
         None
     }
 
+    /// From now on, hold every change a load makes to this tree's shape until
+    /// [`apply_deferred_edits`](TileTree::apply_deferred_edits) is called.
+    ///
+    /// A load can grow the tree: a terrain tile reveals which of its
+    /// descendants exist, an external tileset is grafted under its host. While
+    /// the loads are driven by the same future as the traversal those changes
+    /// land between two passes by construction. Once loads run as tasks of
+    /// their own — see [`crate::runtime::Spawn`] — they land whenever the
+    /// task does, which can be halfway through a pass: one subtree walked
+    /// before a reveal and its sibling after it, a selection that belongs to
+    /// no state the tree was ever in. The server calls this when it starts
+    /// spawning, and applies what was held at the top of every pass.
+    ///
+    /// Default: nothing, for a tree no load ever changes. A tree whose loader
+    /// does change it and that does not implement this keeps the race.
+    fn defer_edits(&self) {}
+
+    /// Applies every edit held since the last call, in an order that does not
+    /// depend on which load finished first. Returns the tiles whose edit
+    /// could not be applied, with why — the session ends on them as it does
+    /// on a failed load.
+    fn apply_deferred_edits(&self) -> Vec<(TileId, String)> {
+        Vec::new()
+    }
+
     /// How deep this tile sits, roots at 0.
     ///
     /// **Only the tree can answer this, and that is the whole point.** A
@@ -302,6 +327,25 @@ impl TileTree for CompositeTileTree {
             .then_some(first)
     }
 
+    fn defer_edits(&self) {
+        for source in &self.sources {
+            source.defer_edits();
+        }
+    }
+
+    fn apply_deferred_edits(&self) -> Vec<(TileId, String)> {
+        self.sources
+            .iter()
+            .enumerate()
+            .flat_map(|(i, s)| {
+                let tag = i as u8;
+                s.apply_deferred_edits()
+                    .into_iter()
+                    .map(move |(id, why)| (id.with_tag(tag), why))
+            })
+            .collect()
+    }
+
     fn roots(&self) -> Vec<TileId> {
         self.sources
             .iter()
@@ -433,6 +477,62 @@ mod tests {
                 has_content: true,
             }
         }
+    }
+
+    /// A tree whose edits are a count of calls and one failure.
+    struct Editing {
+        deferred: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        failing: TileId,
+    }
+    impl TileTree for Editing {
+        fn roots(&self) -> Vec<TileId> {
+            vec![TileId(0)]
+        }
+        fn children(&self, _id: TileId) -> Vec<TileId> {
+            Vec::new()
+        }
+        fn properties(&self, id: TileId) -> TileProperties {
+            StubTree { ge: 1.0 }.properties(id)
+        }
+        fn defer_edits(&self) {
+            self.deferred
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn apply_deferred_edits(&self) -> Vec<(TileId, String)> {
+            vec![(self.failing, "no".into())]
+        }
+    }
+
+    /// Deferral reaches every source of a composition, and a source's
+    /// failed edit comes back under the tag that source's tiles carry.
+    #[test]
+    fn composite_tree_forwards_its_sources_edits() {
+        let counts = [
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        ];
+        let editing = |i: usize, failing| -> Box<dyn TileTree> {
+            Box::new(Editing {
+                deferred: std::sync::Arc::clone(&counts[i]),
+                failing: TileId(failing),
+            })
+        };
+        let composite = CompositeTileTree::new(vec![editing(0, 3), editing(1, 5)]);
+        composite.defer_edits();
+        for count in &counts {
+            assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+        assert_eq!(
+            composite.apply_deferred_edits(),
+            vec![
+                (TileId(3).with_tag(0), "no".to_string()),
+                (TileId(5).with_tag(1), "no".to_string())
+            ]
+        );
+        // The stub tree has nothing to defer and nothing to apply.
+        let plain = StubTree { ge: 1.0 };
+        plain.defer_edits();
+        assert!(plain.apply_deferred_edits().is_empty());
     }
 
     #[test]

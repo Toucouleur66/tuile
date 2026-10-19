@@ -35,6 +35,10 @@ url = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 reqwest = { workspace = true, optional = true }
+# Native only, and only when a host asks for it (`rt-tokio`): loads spawned on
+# the host's runtime, results through a channel. The default build and the
+# wasm build have none — see `runtime::Spawn`.
+tokio = { workspace = true, optional = true, features = ["sync"] }
 
 [dev-dependencies]
 futures-executor = { workspace = true }
@@ -46,3 +50,6 @@ tempfile = { workspace = true }
 [features]
 default = []
 http = ["dep:reqwest"]
+# Loads as tokio tasks on a host-provided runtime handle (`runtime::Spawn::Tokio`).
+# Native only: on wasm32 the feature compiles to nothing.
+rt-tokio = ["dep:tokio"]

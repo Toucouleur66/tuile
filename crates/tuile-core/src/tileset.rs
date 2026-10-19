@@ -169,6 +169,19 @@ pub struct Tileset {
     /// Root tileset geometric error (screen-space error of not rendering
     /// anything at all).
     pub geometric_error: f64,
+    /// Whether grafts are held for [`Tileset::apply_held_grafts`] rather than
+    /// applied as they arrive. See [`TileTree::defer_edits`].
+    deferred: bool,
+    /// The external tilesets fetched but not yet grafted.
+    held: Vec<HeldGraft>,
+}
+
+/// An external tileset waiting for the gap between two passes.
+#[derive(Debug, Clone)]
+struct HeldGraft {
+    host: TileId,
+    json: TilesetJson,
+    base_url: Url,
 }
 
 impl Tileset {
@@ -201,6 +214,8 @@ impl Tileset {
             tiles,
             root: TileId(0),
             geometric_error: json.geometric_error,
+            deferred: false,
+            held: Vec::new(),
         })
     }
 
@@ -286,6 +301,51 @@ impl Tileset {
     ///
     /// `base_url` is the URL of the external tileset.json (its own contents
     /// resolve against it, not against the parent tileset's URL).
+    /// From now on, hold every [`graft_or_hold`](Self::graft_or_hold) until
+    /// [`apply_held_grafts`](Self::apply_held_grafts).
+    pub fn defer_grafts(&mut self) {
+        self.deferred = true;
+    }
+
+    /// Whether any graft is waiting.
+    pub fn has_held_grafts(&self) -> bool {
+        !self.held.is_empty()
+    }
+
+    /// [`graft`](Self::graft)s now, or holds it when grafts are deferred.
+    pub fn graft_or_hold(
+        &mut self,
+        host: TileId,
+        json: TilesetJson,
+        base_url: &Url,
+    ) -> Result<(), TilesetError> {
+        if self.deferred {
+            self.held.push(HeldGraft {
+                host,
+                json,
+                base_url: base_url.clone(),
+            });
+            Ok(())
+        } else {
+            self.graft(host, json, base_url).map(|_| ())
+        }
+    }
+
+    /// Grafts everything held, hosts in id order — so the ids the new tiles
+    /// get depend on which tilesets had arrived, never on which arrived first.
+    /// Returns the hosts whose graft failed, with why.
+    pub fn apply_held_grafts(&mut self) -> Vec<(TileId, String)> {
+        let mut held = std::mem::take(&mut self.held);
+        held.sort_by_key(|g| g.host.0);
+        held.into_iter()
+            .filter_map(|g| {
+                self.graft(g.host, g.json, &g.base_url)
+                    .err()
+                    .map(|e| (g.host, e.to_string()))
+            })
+            .collect()
+    }
+
     pub fn graft(
         &mut self,
         host: TileId,
@@ -551,6 +611,41 @@ mod tests {
         assert_eq!(c.url.as_str(), "file:///data/demo/sub/leaf.glb");
         // World transform composes through the host.
         assert_eq!(grafted.bounding_volume.center(), dvec3(100.0, 200.0, 300.0));
+    }
+
+    /// Held grafts change nothing until applied, and applied they give the
+    /// new tiles the same ids whichever external tileset arrived first.
+    #[test]
+    fn held_grafts_wait_and_land_in_host_order() {
+        let external = || -> TilesetJson {
+            serde_json::from_str(
+                r#"{ "asset": { "version": "1.1" }, "geometricError": 4,
+                     "root": { "boundingVolume": { "sphere": [0,0,0, 2] },
+                               "geometricError": 1, "content": { "uri": "leaf.glb" } } }"#,
+            )
+            .expect("external json")
+        };
+        let ext_base = Url::parse("file:///data/demo/sub/external.json").expect("url");
+        let grafted = |order: [usize; 2]| {
+            let mut ts = Tileset::from_json_bytes(MINI.as_bytes(), &base()).expect("parse");
+            let hosts = ts.tile(ts.root()).children.clone();
+            ts.defer_grafts();
+            for i in order {
+                ts.graft_or_hold(hosts[i], external(), &ext_base)
+                    .expect("held");
+            }
+            assert_eq!(ts.len(), 3, "nothing grafted while held");
+            assert!(ts.tile(hosts[0]).content.is_some(), "host untouched");
+            assert!(ts.apply_held_grafts().is_empty());
+            assert!(!ts.has_held_grafts());
+            hosts
+                .iter()
+                .map(|h| ts.tile(*h).children.clone())
+                .collect::<Vec<_>>()
+        };
+        let forwards = grafted([0, 1]);
+        assert_eq!(forwards.iter().map(Vec::len).sum::<usize>(), 2);
+        assert_eq!(forwards, grafted([1, 0]), "the same ids either way");
     }
 
     #[test]
