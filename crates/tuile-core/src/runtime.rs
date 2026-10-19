@@ -2,7 +2,7 @@
 // Copyright (c) lapoule.dev
 
 //! The geometry server: traversal + scheduling + fetch + decode,
-//! orchestrated around the pure [`traverse`] function.
+//! orchestrated around the pure [`traverse`](crate::traversal::traverse) function.
 //!
 //! This is a LOGICAL server, not a network server: [`in_process`] binds it
 //! to a consumer over channels (the fully decoded liaison). Network
