@@ -12,6 +12,7 @@
 
 #![allow(clippy::unwrap_used, clippy::panic)]
 
+mod architecture;
 mod detmath;
 mod gpu;
 mod net;

@@ -117,7 +117,7 @@ fn ten_still_minutes_cancel_nothing_flap_nothing_and_hold_the_digest() {
     assert!(rest.len() > 30_000, "at rest for most of the ten minutes");
 }
 
-fn turn(t: f64) -> Camera {
+pub fn turn(t: f64) -> Camera {
     let k = ((t - 6.0) / 1.0).clamp(0.0, 1.0);
     Camera {
         heading: std::f64::consts::PI * k,
@@ -148,7 +148,7 @@ fn a_half_turn_in_one_second_converges() {
     assert!(took <= Micros::from_secs(2), "converged after {took:?}");
 }
 
-fn zoom(t: f64) -> Camera {
+pub fn zoom(t: f64) -> Camera {
     // 0–5 s approach; 5–10 s climb to 200 km; 10–12 s hold; 12–17 s back.
     let h = if t < 5.0 {
         2_000.0
@@ -225,7 +225,7 @@ fn over_the_plain_imagery_is_deeper_than_terrain() {
     assert_eq!(last.stats.underdraped, 0);
 }
 
-fn back_and_forth(t: f64) -> Camera {
+pub fn back_and_forth(t: f64) -> Camera {
     let phase = (t / 8.0).floor() as u64 % 2;
     let k = (t % 8.0 / 4.0).min(1.0);
     let k = if phase == 0 { k } else { 1.0 - k };
