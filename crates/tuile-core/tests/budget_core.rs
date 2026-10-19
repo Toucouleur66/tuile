@@ -91,6 +91,25 @@ mod config {
         assert!(sum <= total);
         assert!(c.target.iter().all(|(_, b)| b > Bytes::ZERO));
     }
+
+    /// D-A3 (interim) and D3, spec §15.1: the ground's pool is 82 % of the
+    /// device, split 40/60 between terrain (33 %) and imagery (49 %); the
+    /// stand-ins' class is gone, its 2 % folded into the pool.
+    #[test]
+    #[ignore = "red until the stand-ins' class goes and the pool is split 40/60 (D3, D-A3 interim)"]
+    fn the_interactive_split_gives_imagery_sixty_percent_of_the_ground_pool() {
+        let total = Bytes::gib(1);
+        let c = BudgetConfig::interactive(total);
+        assert_eq!(
+            c.hard_limit[Class::TerrainMesh],
+            total.scaled(33, 100),
+            "{RED}"
+        );
+        assert_eq!(c.hard_limit[Class::Drape], total.scaled(49, 100));
+        let all = c.hard_limit.iter().fold(Bytes::ZERO, |a, (_, b)| a.plus(b));
+        assert_eq!(all, total, "the four classes share the whole device");
+        assert_eq!(Class::ALL.len(), 4, "no class for stand-ins");
+    }
 }
 
 mod ledger {
