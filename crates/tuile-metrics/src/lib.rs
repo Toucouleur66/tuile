@@ -31,7 +31,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use metrics_exporter_prometheus::PrometheusBuilder;
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use tuile_core::metrics::{ByLevel, Metrics, Tally, Timer, LEVELS};
 
 /// Where the exporter listens unless `TUILE_METRICS_ADDR` says otherwise.
@@ -68,7 +68,12 @@ pub fn serve(handle: &tokio::runtime::Handle) {
     };
 
     let _guard = handle.enter();
-    if let Err(e) = PrometheusBuilder::new().with_http_listener(addr).install() {
+    let builder = PrometheusBuilder::new().set_buckets_for_metric(
+        Matcher::Full("tuile_tiles_fetch_seconds".to_owned()),
+        &tuile_core::metrics::TILE_FETCH_SECONDS_BUCKETS,
+    );
+    let installed = builder.and_then(|b| b.with_http_listener(addr).install());
+    if let Err(e) = installed {
         tracing::warn!("no metrics endpoint on {addr}: {e}");
         return;
     }

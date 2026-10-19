@@ -641,6 +641,17 @@ impl Metrics {
     }
 }
 
+/// The buckets of `tuile_tiles_fetch_seconds`, the histogram of what reading
+/// a tile costs by where it was found (recorded by the native tile store and
+/// the native HTTP transport, through the `metrics` facade): half a
+/// millisecond to half a minute, doubling — a projection's read is a
+/// fraction of a millisecond, a cold zone's first range read from a bucket
+/// seconds. A recorder sets them; the facade cannot.
+pub const TILE_FETCH_SECONDS_BUCKETS: [f64; 17] = [
+    0.0005, 0.001, 0.002, 0.004, 0.008, 0.016, 0.032, 0.064, 0.128, 0.256, 0.512, 1.024, 2.048,
+    4.096, 8.192, 16.384, 32.768,
+];
+
 /// The process's metrics.
 pub fn metrics() -> &'static Metrics {
     static METRICS: std::sync::OnceLock<Metrics> = std::sync::OnceLock::new();

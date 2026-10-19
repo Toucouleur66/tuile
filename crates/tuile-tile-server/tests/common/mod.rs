@@ -327,10 +327,17 @@ pub fn catalog() -> tuile_tile_server::Catalog {
 /// thread for as long as this lives (a `#[tokio::test]` runs on one thread).
 pub struct Recorded {
     snapshotter: metrics_util::debugging::Snapshotter,
-    /// Counters as read so far: a snapshot hands a counter's increments
-    /// since the last one, so they are added up here.
-    seen: std::sync::Mutex<Vec<(metrics::Key, u64)>>,
+    /// Counters as read so far, and how many values each histogram took: a
+    /// snapshot hands what came since the last one, so they are added up
+    /// here.
+    seen: std::sync::Mutex<Seen>,
     _set: metrics::LocalRecorderGuard<'static>,
+}
+
+#[derive(Default)]
+struct Seen {
+    counters: Vec<(metrics::Key, u64)>,
+    histograms: Vec<(metrics::Key, u64)>,
 }
 
 impl Recorded {
@@ -346,17 +353,33 @@ impl Recorded {
 
     /// The value of counter `name` among those carrying `labels`, summed.
     pub fn counter(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
+        Self::sum(&self.absorbed().counters, name, labels)
+    }
+
+    /// How many values histogram `name` took among those carrying `labels`.
+    pub fn histogram(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
+        Self::sum(&self.absorbed().histograms, name, labels)
+    }
+
+    fn absorbed(&self) -> std::sync::MutexGuard<'_, Seen> {
         use metrics_util::debugging::DebugValue;
         let mut seen = self.seen.lock().expect("seen");
         for (key, _, _, value) in self.snapshotter.snapshot().into_vec() {
-            if let DebugValue::Counter(n) = value {
-                let key = key.key().clone();
-                match seen.iter_mut().find(|(k, _)| *k == key) {
-                    Some((_, total)) => *total += n,
-                    None => seen.push((key, n)),
-                }
+            let key = key.key().clone();
+            let (into, n) = match value {
+                DebugValue::Counter(n) => (&mut seen.counters, n),
+                DebugValue::Histogram(values) => (&mut seen.histograms, values.len() as u64),
+                DebugValue::Gauge(_) => continue,
+            };
+            match into.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, total)) => *total += n,
+                None => into.push((key, n)),
             }
         }
+        seen
+    }
+
+    fn sum(seen: &[(metrics::Key, u64)], name: &str, labels: &[(&str, &str)]) -> u64 {
         seen.iter()
             .filter(|(key, _)| key.name() == name)
             .filter(|(key, _)| {

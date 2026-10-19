@@ -44,6 +44,7 @@ use tokio::io::AsyncReadExt;
 use crate::archive::{self, LocalReader, RemoteReader};
 use crate::catalog::ABSENT_SUFFIX;
 use crate::disk::{ArchiveCache, DiskCacheConfig};
+use crate::fetched::{Asked, Outcome};
 use crate::index::{self, ArchiveIndex, ZoneIndex};
 use crate::layer::{Layer, Zone};
 use crate::lru::Lru;
@@ -423,6 +424,24 @@ impl TileStore {
         self.layers.values()
     }
 
+    /// What a layer's tiles are, for the metrics ([`crate::fetched`]): an
+    /// image layer's — or its absence sibling's — `texture`, any other's
+    /// `mesh`.
+    fn kind_of(&self, l: &Layer) -> &'static str {
+        let base = l
+            .name
+            .strip_suffix(ABSENT_SUFFIX)
+            .and_then(|base| self.layers.get(base))
+            .unwrap_or(l);
+        match base.tile_type {
+            pmtiles::TileType::Png
+            | pmtiles::TileType::Jpeg
+            | pmtiles::TileType::Webp
+            | pmtiles::TileType::Avif => "texture",
+            _ => "mesh",
+        }
+    }
+
     pub fn object_store(&self) -> &Arc<dyn ObjectStore> {
         &self.store
     }
@@ -769,14 +788,24 @@ impl TileStore {
         let (l, zone, id) = self.locate(layer, level, x, y)?;
 
         if let Some((absences, base)) = self.absences_of(layer) {
-            let absent = absences
-                .absent(base, id, (self.clock)())
-                .await
-                .map_err(StoreError::Remote)?;
+            let asked = Asked::now(self.kind_of(l));
+            let absent = match absences.absent(base, id, (self.clock)()).await {
+                Ok(absent) => absent,
+                Err(e) => {
+                    asked.answered("absences", Outcome::Error, 0);
+                    return Err(StoreError::Remote(e));
+                }
+            };
             if absent {
                 self.stats.absent.fetch_add(1, Ordering::Relaxed);
                 metrics::counter!("tuile_tiles_hits_total", "layer" => l.name.clone(), "from" => "absences").increment(1);
             }
+            let outcome = if absent {
+                Outcome::Absent
+            } else {
+                Outcome::Miss
+            };
+            asked.answered("absences", outcome, 0);
             return Ok(absent.then(|| Bytes::from_static(crate::catalog::ABSENT_MARKER)));
         }
 
@@ -822,9 +851,12 @@ impl TileStore {
         (layer, level, x, y): (&str, u8, u32, u32),
     ) -> Result<Option<Bytes>, StoreError> {
         let key = (l.name.clone(), zone);
+        let kind = self.kind_of(l);
+        let asked = Asked::now(kind);
         if let Some(bytes) = self.buffered(&key, id) {
             self.stats.buffer.fetch_add(1, Ordering::Relaxed);
             metrics::counter!("tuile_tiles_hits_total", "layer" => l.name.clone(), "from" => "buffer").increment(1);
+            asked.answered("buffer", Outcome::Hit, bytes.len());
             return Ok(Some(bytes));
         }
 
@@ -834,10 +866,23 @@ impl TileStore {
             .ok()
             .and_then(|p| p.get(&key).cloned());
         if let Some(local) = projection {
-            if let Some(bytes) = local.get_tile(pmtiles::TileId::new(id)?).await? {
-                self.stats.projection.fetch_add(1, Ordering::Relaxed);
-                metrics::counter!("tuile_tiles_hits_total", "layer" => l.name.clone(), "from" => "projection").increment(1);
-                return Ok(Some(bytes));
+            let asked = Asked::now(kind);
+            let read = match pmtiles::TileId::new(id) {
+                Ok(tile) => local.get_tile(tile).await.map_err(StoreError::from),
+                Err(e) => Err(StoreError::from(e)),
+            };
+            match read {
+                Ok(Some(bytes)) => {
+                    self.stats.projection.fetch_add(1, Ordering::Relaxed);
+                    metrics::counter!("tuile_tiles_hits_total", "layer" => l.name.clone(), "from" => "projection").increment(1);
+                    asked.answered("projection", Outcome::Hit, bytes.len());
+                    return Ok(Some(bytes));
+                }
+                Ok(None) => asked.answered("projection", Outcome::Miss, 0),
+                Err(e) => {
+                    asked.answered("projection", Outcome::Error, 0);
+                    return Err(e);
+                }
             }
             // Not in the projection: the footprint left it out, or it is
             // truly absent. The bucket decides.
@@ -847,13 +892,43 @@ impl TileStore {
         Ok(None)
     }
 
+    /// [`Self::archived_in`], recorded under the place that answered: the
+    /// zone's local copies when it was them, the bucket otherwise.
     async fn archived_at(
         &self,
         l: &Layer,
         zone: Zone,
         id: u64,
-        (layer, level, x, y): (&str, u8, u32, u32),
+        at: (&str, u8, u32, u32),
     ) -> Result<Option<Bytes>, StoreError> {
+        let asked = Asked::now(self.kind_of(l));
+        let read = self.archived_in(l, zone, id, at).await;
+        let found = match &read {
+            Ok(Some((bytes, local))) => {
+                let outcome = if l.name.ends_with(ABSENT_SUFFIX) {
+                    Outcome::Absent
+                } else {
+                    Outcome::Hit
+                };
+                (*local, outcome, bytes.len())
+            }
+            Ok(None) => (false, Outcome::Miss, 0),
+            Err(_) => (false, Outcome::Error, 0),
+        };
+        let (local, outcome, bytes) = found;
+        asked.answered(if local { "disk" } else { "bucket" }, outcome, bytes);
+        read.map(|found| found.map(|(bytes, _)| bytes))
+    }
+
+    /// A tile from the zone's archives, and whether it was a local copy that
+    /// had it.
+    async fn archived_in(
+        &self,
+        l: &Layer,
+        zone: Zone,
+        id: u64,
+        (layer, level, x, y): (&str, u8, u32, u32),
+    ) -> Result<Option<(Bytes, bool)>, StoreError> {
         let key = (l.name.clone(), zone);
         let now = (self.clock)();
         let manifest = self.manifest(&key, l).await?;
@@ -900,7 +975,7 @@ impl TileStore {
                         "archive"
                     };
                     metrics::counter!("tuile_tiles_hits_total", "layer" => l.name.clone(), "from" => from).increment(1);
-                    return Ok(Some(bytes));
+                    return Ok(Some((bytes, local)));
                 }
                 Ok((None, _)) => {}
                 Err(e) => {
