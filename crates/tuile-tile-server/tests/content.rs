@@ -265,3 +265,114 @@ async fn a_tile_held_is_read_without_asking_the_absence_store() {
     assert_eq!(cache.get(&key(X0 + 2)).await, Some(ABSENT));
     assert_eq!(absences.asked(), 2);
 }
+
+/// Each place a tile is read from records what it answered, under its own
+/// name and the tile's kind: the absence store and the bucket for a tile not
+/// held, the projection for one projected — and its miss for one it left
+/// out — the buffer for one just put; the bytes of what each had.
+#[tokio::test]
+async fn each_place_a_tile_is_read_from_is_recorded_under_its_name() {
+    let recorded = Recorded::start();
+    let clock = TestClock::new();
+    let objects = memory();
+    let on = |objects: &Arc<dyn object_store::ObjectStore>| {
+        let layers = catalog::layers(&common::catalog()).expect("layers");
+        TileStore::with_clock(objects.clone(), layers, eager(), clock.clock())
+    };
+    let writer = on(&objects);
+    let tile = body(LEVEL, X0, Y0, 1);
+    writer
+        .put(IMAGERY, LEVEL, X0, Y0, tile.clone())
+        .await
+        .expect("put");
+    let mesh = Bytes::from_static(b"a terrain tile");
+    writer
+        .put(TERRAIN, 0, 1, 0, mesh.clone())
+        .await
+        .expect("put");
+    writer.flush_all().await.expect("flush");
+
+    let store = Arc::new(on(&objects).with_absences(Arc::new(Counted::default())));
+    let cache = StoreContent::new(store.clone());
+    let key = |x: u32| format!("img/{IMAGERY}/{LEVEL}/{x}/{Y0}");
+    let fetches = |source: &str, kind: &str, outcome: &str| {
+        recorded.counter(
+            "tuile_tiles_fetch_total",
+            &[("source", source), ("kind", kind), ("outcome", outcome)],
+        )
+    };
+    let timed = |source: &str, kind: &str| {
+        recorded.histogram(
+            "tuile_tiles_fetch_seconds",
+            &[("source", source), ("kind", kind)],
+        )
+    };
+    let bytes = |source: &str, kind: &str| {
+        recorded.counter(
+            "tuile_tiles_fetch_bytes_total",
+            &[("source", source), ("kind", kind)],
+        )
+    };
+
+    // Not held: the absence store does not know it, the bucket has it.
+    assert_eq!(cache.get(&key(X0)).await, Some(tile.clone()));
+    assert_eq!(fetches("absences", "texture", "miss"), 1);
+    assert_eq!(fetches("bucket", "texture", "hit"), 1);
+    assert_eq!(bytes("bucket", "texture"), tile.len() as u64);
+    assert_eq!(
+        (timed("absences", "texture"), timed("bucket", "texture")),
+        (1, 1)
+    );
+
+    // A terrain tile is a mesh.
+    assert_eq!(
+        cache.get(&format!("mesh/{TERRAIN}/0/1/0")).await,
+        Some(mesh.clone())
+    );
+    assert_eq!(fetches("bucket", "mesh", "hit"), 1);
+    assert_eq!(bytes("bucket", "mesh"), mesh.len() as u64);
+
+    // Projected: read from the projection, nobody else asked.
+    let [w, s, e, n] =
+        tuile_tile_server::projection::bounds(tuile_tile_server::Grid::WebMercator, LEVEL, X0, Y0);
+    let eye = tuile_tile_server::Eye {
+        lon: (w + e) / 2.0,
+        lat: (s + n) / 2.0,
+        height: 5_800.0,
+    };
+    let fp = tuile_tile_server::Footprint::from_eyes(
+        [eye],
+        tuile_tile_server::projection::DEFAULT_TILE_FACTOR,
+    );
+    let dir = tempfile::tempdir().expect("dir");
+    store.project(&fp, dir.path()).await.expect("project");
+    assert_eq!(cache.get(&key(X0)).await, Some(tile.clone()));
+    assert_eq!(fetches("projection", "texture", "hit"), 1);
+    assert_eq!(bytes("projection", "texture"), tile.len() as u64);
+    assert_eq!(timed("projection", "texture"), 1);
+    assert_eq!(
+        fetches("bucket", "texture", "hit"),
+        1,
+        "the bucket not asked again"
+    );
+
+    // In the projected zone but not in the projection: its miss, then the
+    // absence store and the bucket, which has nothing either.
+    assert_eq!(cache.get(&key(X0 + 3)).await, None);
+    assert_eq!(fetches("projection", "texture", "miss"), 1);
+    assert_eq!(fetches("absences", "texture", "miss"), 2);
+    assert_eq!(fetches("bucket", "texture", "miss"), 1);
+
+    // Buffered: the buffer answers.
+    let put = body(LEVEL, X0 + 1, Y0, 1);
+    cache.put(&key(X0 + 1), put.clone(), None).await;
+    assert_eq!(cache.get(&key(X0 + 1)).await, Some(put.clone()));
+    assert_eq!(fetches("buffer", "texture", "hit"), 1);
+    assert_eq!(bytes("buffer", "texture"), put.len() as u64);
+
+    // An absence: the absence store says so, and the archives are not read.
+    cache.put(&key(X0 + 2), ABSENT, None).await;
+    assert_eq!(cache.get(&key(X0 + 2)).await, Some(ABSENT));
+    assert_eq!(fetches("absences", "texture", "absent"), 1);
+    assert_eq!(fetches("bucket", "texture", "miss"), 1);
+}

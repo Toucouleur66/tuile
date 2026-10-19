@@ -147,3 +147,9 @@ pmtiles = { git = "https://github.com/lapoule-dev/pmtiles-rs.git", branch = "tui
 # each atmosphere it makes. Its arithmetic is the same at any level.
 [profile.dev.package.tuile-atmosphere]
 opt-level = 3
+
+# A ground's heights are checked against reading every triangle of every
+# tile, tens of thousands of times: unoptimised, that test alone takes four
+# minutes, optimised a few seconds. Its arithmetic is the same at any level.
+[profile.dev.package.tuile-film]
+opt-level = 3

@@ -54,6 +54,7 @@ pub mod content;
 pub mod disk;
 pub mod due;
 pub mod extract;
+pub mod fetched;
 pub mod grid;
 pub mod index;
 mod knob;

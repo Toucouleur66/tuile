@@ -25,9 +25,15 @@ reqwest-middleware = { workspace = true }
 http-cache-reqwest = { workspace = true }
 http-cache = { workspace = true }
 foyer = { workspace = true }
+# The tiles' fetches by source, as the tile store records its own.
+metrics = "0.24"
 
 [dev-dependencies]
+# Counters and histograms read back in the tests, from a recorder of the
+# test's own thread.
+metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
+tempfile = { workspace = true }
 # Constructing the middleware error the cache layer actually produces, and a
 # real transport error to hide inside it.
 anyhow = { workspace = true }
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "macros", "net", "io-util"] }

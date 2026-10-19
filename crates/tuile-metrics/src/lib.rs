@@ -31,7 +31,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use metrics_exporter_prometheus::PrometheusBuilder;
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use tuile_core::metrics::{ByLevel, Metrics, Tally, Timer, LEVELS};
 
 /// Where the exporter listens unless `TUILE_METRICS_ADDR` says otherwise.
@@ -68,7 +68,12 @@ pub fn serve(handle: &tokio::runtime::Handle) {
     };
 
     let _guard = handle.enter();
-    if let Err(e) = PrometheusBuilder::new().with_http_listener(addr).install() {
+    let builder = PrometheusBuilder::new().set_buckets_for_metric(
+        Matcher::Full("tuile_tiles_fetch_seconds".to_owned()),
+        &tuile_core::metrics::TILE_FETCH_SECONDS_BUCKETS,
+    );
+    let installed = builder.and_then(|b| b.with_http_listener(addr).install());
+    if let Err(e) = installed {
         tracing::warn!("no metrics endpoint on {addr}: {e}");
         return;
     }
@@ -161,6 +166,10 @@ fn describe() {
     describe_counter!(
         "tuile_height_queries",
         "Height queries against a frame's ground."
+    );
+    describe_counter!(
+        "tuile_ground_tiles",
+        "Tiles cut into cells for a ground's heights: once a tile, again when its stitching moves it."
     );
 
     describe_gauge!("tuile_tiles_visited", "Nodes the last pass walked.");
@@ -343,6 +352,7 @@ fn publish(m: &Metrics) {
     counter!("tuile_stitch_overflows").absolute(m.stitch_overflows.get());
     counter!("tuile_drapes_withheld").absolute(m.drapes_withheld.get());
     counter!("tuile_height_queries").absolute(m.height_queries.get());
+    counter!("tuile_ground_tiles").absolute(m.ground_tiles.get());
 
     gauge!("tuile_tiles_visited").set(m.tiles_visited.get() as f64);
     gauge!("tuile_tiles_culled").set(m.tiles_culled.get() as f64);
@@ -445,6 +455,7 @@ mod tests {
         m.bake_frame_seconds.record(Duration::from_millis(2));
         m.pose_seconds.record(Duration::from_millis(30));
         m.height_queries.inc();
+        m.ground_tiles.inc();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
@@ -465,6 +476,7 @@ mod tests {
             "tuile_ground_seconds_count",
             "tuile_height_query_seconds_count",
             "tuile_height_queries",
+            "tuile_ground_tiles",
             "tuile_drapes_withheld",
             "tuile_priming_total",
             "tuile_priming_pending",

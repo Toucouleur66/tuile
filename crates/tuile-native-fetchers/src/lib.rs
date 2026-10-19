@@ -511,15 +511,25 @@ impl NativeHttp {
 #[async_trait]
 impl IonHttp for NativeHttp {
     async fn get(&self, url: &Url, bearer: Option<&str>) -> Result<HttpResponse, IonError> {
-        let response = NativeHttp::get(self, url, bearer)
-            .await
-            .map_err(|e| IonError::Transport(e.to_string()))?;
+        let asked = Asked::now(url);
+        let response = match NativeHttp::get(self, url, bearer).await {
+            Ok(response) => response,
+            Err(e) => {
+                asked.failed();
+                return Err(IonError::Transport(e.to_string()));
+            }
+        };
         let status = response.status().as_u16();
         let max_age = max_age(response.headers());
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| IonError::Transport(e.to_string()))?;
+        let answer = Answer::of(&response);
+        let body = match response.bytes().await {
+            Ok(body) => body,
+            Err(e) => {
+                asked.failed();
+                return Err(IonError::Transport(e.to_string()));
+            }
+        };
+        asked.answered(answer, &body);
         Ok(HttpResponse {
             status,
             body,
@@ -531,51 +541,163 @@ impl IonHttp for NativeHttp {
 #[async_trait]
 impl TileFetcher for NativeHttp {
     async fn fetch(&self, url: &Url) -> Result<Bytes, FetchError> {
-        let response = NativeHttp::get(self, url, None)
-            .await
-            .map_err(|e| FetchError::Io {
-                url: url.clone(),
-                message: e.to_string(),
-            })?;
-        let status = response.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return Err(FetchError::NotFound(url.clone()));
-        }
-        if !status.is_success() {
-            return Err(FetchError::Status {
-                status: status.as_u16(),
-                url: url.clone(),
-            });
-        }
-        response.bytes().await.map_err(|e| FetchError::Io {
-            url: url.clone(),
-            message: e.to_string(),
-        })
+        self.fetch_cacheable(url).await.map(|fetched| fetched.value)
     }
 
     async fn fetch_cacheable(&self, url: &Url) -> Result<Fetched<Bytes>, FetchError> {
-        let response = NativeHttp::get(self, url, None)
-            .await
-            .map_err(|e| FetchError::Io {
-                url: url.clone(),
-                message: e.to_string(),
-            })?;
+        let asked = Asked::now(url);
+        let response = match NativeHttp::get(self, url, None).await {
+            Ok(response) => response,
+            Err(e) => {
+                asked.failed();
+                return Err(FetchError::Io {
+                    url: url.clone(),
+                    message: e.to_string(),
+                });
+            }
+        };
         let status = response.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return Err(FetchError::NotFound(url.clone()));
-        }
+        let answer = Answer::of(&response);
         if !status.is_success() {
+            asked.answered(answer, &[]);
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Err(FetchError::NotFound(url.clone()));
+            }
             return Err(FetchError::Status {
                 status: status.as_u16(),
                 url: url.clone(),
             });
         }
         let ttl = max_age(response.headers());
-        let value = response.bytes().await.map_err(|e| FetchError::Io {
-            url: url.clone(),
-            message: e.to_string(),
-        })?;
+        let value = match response.bytes().await {
+            Ok(value) => value,
+            Err(e) => {
+                asked.failed();
+                return Err(FetchError::Io {
+                    url: url.clone(),
+                    message: e.to_string(),
+                });
+            }
+        };
+        asked.answered(answer, &value);
         Ok(Fetched { value, ttl })
+    }
+}
+
+/// What fetching a tile over HTTP costs, by where it came from — this
+/// transport's cache, or `upstream`, the origin — under the names the tile
+/// store records its own places under (`tuile_tile_server::fetched`):
+///
+/// - `tuile_tiles_fetch_seconds{source, kind}`: the request, retries and body
+///   included, under the place that answered it;
+/// - `tuile_tiles_fetch_total{source, kind, outcome}`: `hit`; `absent`, a 404
+///   or an empty body — how an origin says it has no such tile; `error`,
+///   any other status or a transport failure, counted upstream; and `miss`
+///   for the cache when upstream answered instead, whose lookup is in
+///   upstream's time;
+/// - `tuile_tiles_fetch_bytes_total{source, kind}`: the bodies of the hits.
+///
+/// Only tiles are recorded: a request whose address or answer says neither
+/// a mesh nor an image — an endpoint, a layer's description — is not.
+struct Asked {
+    started: std::time::Instant,
+    kind: Option<&'static str>,
+}
+
+/// Where a response came from and what it said, read off it before its body
+/// is.
+struct Answer {
+    from_cache: bool,
+    status: u16,
+    kind: Option<&'static str>,
+}
+
+impl Answer {
+    fn of(response: &reqwest::Response) -> Self {
+        let headers = response.headers();
+        let content = headers
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        let kind = if content.starts_with("image/") {
+            Some("texture")
+        } else if content.contains("quantized-mesh") {
+            Some("mesh")
+        } else {
+            None
+        };
+        Self {
+            from_cache: headers
+                .get(http_cache::XCACHE)
+                .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"HIT")),
+            status: response.status().as_u16(),
+            kind,
+        }
+    }
+}
+
+impl Asked {
+    fn now(url: &Url) -> Self {
+        let path = url.path().to_ascii_lowercase();
+        let kind = if path.ends_with(".terrain") {
+            Some("mesh")
+        } else if [".jpeg", ".jpg", ".png", ".webp", ".avif"]
+            .iter()
+            .any(|ext| path.ends_with(ext))
+        {
+            Some("texture")
+        } else {
+            None
+        };
+        Self {
+            started: std::time::Instant::now(),
+            kind,
+        }
+    }
+
+    fn record(kind: &'static str, source: &'static str, outcome: &'static str) {
+        metrics::counter!(
+            "tuile_tiles_fetch_total",
+            "source" => source,
+            "kind" => kind,
+            "outcome" => outcome
+        )
+        .increment(1);
+    }
+
+    /// The origin could not be reached, or its body read.
+    fn failed(self) {
+        let Some(kind) = self.kind else {
+            return;
+        };
+        metrics::histogram!("tuile_tiles_fetch_seconds", "source" => "upstream", "kind" => kind)
+            .record(self.started.elapsed().as_secs_f64());
+        Self::record(kind, "upstream", "error");
+    }
+
+    fn answered(self, answer: Answer, body: &[u8]) {
+        let Some(kind) = self.kind.or(answer.kind) else {
+            return;
+        };
+        let source = if answer.from_cache {
+            "cache"
+        } else {
+            Self::record(kind, "cache", "miss");
+            "upstream"
+        };
+        let outcome = match answer.status {
+            200..=299 if body.is_empty() => "absent",
+            200..=299 => "hit",
+            404 => "absent",
+            _ => "error",
+        };
+        metrics::histogram!("tuile_tiles_fetch_seconds", "source" => source, "kind" => kind)
+            .record(self.started.elapsed().as_secs_f64());
+        Self::record(kind, source, outcome);
+        if outcome == "hit" {
+            metrics::counter!("tuile_tiles_fetch_bytes_total", "source" => source, "kind" => kind)
+                .increment(body.len() as u64);
+        }
     }
 }
 
@@ -628,6 +750,187 @@ async fn build_cache(cfg: &CacheConfig) -> Result<HybridCache<String, Vec<u8>>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An origin on a local port: each path answers as its name says, once
+    /// a connection, and is counted.
+    async fn origin() -> (Url, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let at = listener.local_addr().expect("address");
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = served.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&request);
+                    let path = request.split(' ').nth(1).unwrap_or("/").to_string();
+                    let (status, kind, body): (&str, &str, &[u8]) = match path.as_str() {
+                        "/a.png" => ("200 OK", "image/png", b"an image"),
+                        "/1/2/3.terrain" => (
+                            "200 OK",
+                            "application/vnd.quantized-mesh",
+                            b"a terrain tile",
+                        ),
+                        "/empty.jpeg" => ("200 OK", "image/jpeg", b""),
+                        "/layer.json" => ("200 OK", "application/json", b"{}"),
+                        _ => ("404 Not Found", "text/plain", b""),
+                    };
+                    let head = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: {kind}\r\n\
+                         cache-control: max-age=3600\r\ncontent-length: {}\r\n\
+                         connection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(body).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (Url::parse(&format!("http://{at}/")).expect("url"), served)
+    }
+
+    /// A tile fetched twice comes from upstream, then from the cache — and
+    /// each is recorded so: under its source and its kind, timed, its bytes
+    /// counted, its cache's miss counted when upstream answered. A 404 and
+    /// an empty body are absences; a request for anything but a tile is
+    /// not recorded.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_tile_s_fetch_is_recorded_under_the_place_that_answered() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder: &'static DebuggingRecorder = Box::leak(Box::new(DebuggingRecorder::new()));
+        let snapshotter = recorder.snapshotter();
+        let _set = metrics::set_default_local_recorder(recorder);
+        let dir = tempfile::tempdir().expect("dir");
+        let http = NativeHttp::with_transport(TransportConfig::over(CacheConfig {
+            dir: dir.path().to_path_buf(),
+            memory_bytes: 16 << 20,
+            disk_bytes: 64 << 20,
+        }))
+        .await
+        .expect("transport");
+        let (base, served) = origin().await;
+        let at = |path: &str| base.join(path).expect("url");
+
+        let image = http.fetch_cacheable(&at("a.png")).await.expect("image");
+        let again = http.fetch_cacheable(&at("a.png")).await.expect("cached");
+        assert_eq!(
+            (image.value.as_ref(), again.value.as_ref()),
+            (&b"an image"[..], &b"an image"[..])
+        );
+        assert_eq!(
+            served.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second from the cache"
+        );
+        let mesh = IonHttp::get(&http, &at("1/2/3.terrain"), None)
+            .await
+            .expect("mesh");
+        assert_eq!(mesh.body.as_ref(), b"a terrain tile");
+        assert!(matches!(
+            http.fetch_cacheable(&at("none.png")).await,
+            Err(FetchError::NotFound(_))
+        ));
+        let empty = http
+            .fetch_cacheable(&at("empty.jpeg"))
+            .await
+            .expect("empty");
+        assert!(empty.value.is_empty());
+        http.fetch(&at("layer.json")).await.expect("not a tile");
+
+        let mut counters = std::collections::HashMap::new();
+        let mut timed = std::collections::HashMap::new();
+        for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+            let key = key.key().clone();
+            let label = |name: &str| {
+                key.labels()
+                    .find(|l| l.key() == name)
+                    .map(|l| l.value().to_string())
+                    .unwrap_or_default()
+            };
+            let id = (
+                key.name().to_string(),
+                label("source"),
+                label("kind"),
+                label("outcome"),
+            );
+            match value {
+                DebugValue::Counter(n) => *counters.entry(id).or_insert(0) += n,
+                DebugValue::Histogram(v) => *timed.entry(id).or_insert(0) += v.len() as u64,
+                DebugValue::Gauge(_) => {}
+            }
+        }
+        let count = |name: &str, source: &str, kind: &str, outcome: &str| {
+            counters
+                .get(&(name.into(), source.into(), kind.into(), outcome.into()))
+                .copied()
+                .unwrap_or(0)
+        };
+        let fetches =
+            |source, kind, outcome| count("tuile_tiles_fetch_total", source, kind, outcome);
+        let seconds = |source: &str, kind: &str| {
+            timed
+                .get(&(
+                    "tuile_tiles_fetch_seconds".into(),
+                    source.into(),
+                    kind.into(),
+                    String::new(),
+                ))
+                .copied()
+                .unwrap_or(0)
+        };
+        assert_eq!(fetches("upstream", "texture", "hit"), 1);
+        assert_eq!(fetches("cache", "texture", "hit"), 1);
+        assert_eq!(
+            fetches("cache", "texture", "miss"),
+            3,
+            "the image, the 404, the empty one"
+        );
+        assert_eq!(
+            fetches("upstream", "texture", "absent"),
+            2,
+            "the 404 and the empty body"
+        );
+        assert_eq!(fetches("upstream", "mesh", "hit"), 1);
+        assert_eq!(fetches("cache", "mesh", "miss"), 1);
+        assert_eq!(
+            (seconds("upstream", "texture"), seconds("cache", "texture")),
+            (3, 1)
+        );
+        assert_eq!(seconds("upstream", "mesh"), 1);
+        assert_eq!(
+            count("tuile_tiles_fetch_bytes_total", "upstream", "texture", ""),
+            8
+        );
+        assert_eq!(
+            count("tuile_tiles_fetch_bytes_total", "cache", "texture", ""),
+            8
+        );
+        assert_eq!(
+            count("tuile_tiles_fetch_bytes_total", "upstream", "mesh", ""),
+            14
+        );
+        let recorded: u64 = counters
+            .iter()
+            .filter(|((name, ..), _)| name == "tuile_tiles_fetch_total")
+            .map(|(_, n)| n)
+            .sum();
+        assert_eq!(recorded, 9, "nothing else, and not the description");
+    }
 
     #[test]
     fn a_count_falls_back_to_its_default_unless_set_to_a_positive_number() {
