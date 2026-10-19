@@ -10,7 +10,6 @@
 //! backdrop is drawn before the selection so that ground is never bare.
 
 use super::{App, AMBIENT, ATMOSPHERE_STRENGTH, DIAGNOSTICS};
-use glam::DVec2;
 use std::fmt;
 use tuile_wgpu::OverlayVertex;
 
@@ -42,7 +41,6 @@ impl App {
         if self.active.is_none() {
             return;
         }
-        self.choose_the_imagery_detail();
         self.take_this_frames_share_of_the_stream();
         self.upload_the_view();
         let indicator = self.the_loading_indicator();
@@ -64,7 +62,7 @@ impl App {
         // pump.
         self.note_what_could_not_be_drawn(resolution);
         self.record_the_traced_frame();
-        self.publish_the_view(Some((rendered, resolution.stand_ins == 0)));
+        self.publish_the_view(Some((rendered, resolution.coarser == 0 && resolution.lost == 0)));
         self.report_once_a_second(rendered, resolution);
     }
 
@@ -103,31 +101,6 @@ impl App {
         self.watch_for_a_sudden_turn();
     }
 
-    /// Tells the loader how sharp the ground should be.
-    fn choose_the_imagery_detail(&mut self) {
-        let cam = self.controller.camera;
-        let (_, height) = self.viewport();
-        let Some(active) = self.active.as_mut() else {
-            return;
-        };
-        let viewport = DVec2::new(active.size.0 as f64, height);
-        // Drive imagery resolution by altitude: the ground metres that map to
-        // one screen point ≈ 2·altitude·tan(fovy/2) / viewport_height. The
-        // loader drapes imagery at (at least) that texel spacing — a giant fine
-        // mosaic up close, coarse from orbit.
-        //
-        // Points, not device pixels. A map tile is authored for points: its type
-        // and its line weights are sized the way a stylesheet sizes them, to be
-        // read at that scale. Dividing by the device height instead asks for one
-        // level deeper on a Retina panel — four times the tiles, carrying labels
-        // at half the size they were drawn to be legible at, which is how they
-        // became unreadable. Geometry is unaffected and keeps every device pixel:
-        // it is the *mesh* that is rasterised, and its silhouette shows.
-        let points_high = (viewport.y / active.scale).max(1.0);
-        let target_texel = 2.0 * cam.altitude() * (cam.fovy * 0.5).tan() / points_high;
-        self.detail.set_target_texel_spacing(target_texel);
-    }
-
     /// Sends the camera, takes whatever the server has produced up to this
     /// frame's upload budget, and counts what that cost.
     fn take_this_frames_share_of_the_stream(&mut self) {
@@ -153,28 +126,21 @@ impl App {
             return;
         };
         let before = active.pump.prepared_count();
-        let budget = self.profile.uploads;
+        // This frame's upload deadline, from the display's refresh (I18):
+        // only the render side knows its frame.
+        let deadline = active.pump.deadline(self.refresh_hz);
         // The frame's streaming step, shared with the headless tests — send the
         // camera, take this frame's share of uploads, rebase. Freezing simply
         // withholds the camera, which is what makes `F` a test of the renderer
         // against a fixed selection.
-        //
-        // The upload budget is the profile's: a count on a desktop, a count
-        // and a share of the frame's time on a phone.
         let uploaded = if self.views.freeze {
             active
                 .pump
-                .pump_while(&mut session.stream, &active.gpu, |done, spent| {
-                    budget.allows(done, spent)
-                })
+                .pump(&mut session.stream, &active.gpu, deadline)
         } else {
-            active.pump.advance_while(
-                &mut session.stream,
-                &active.gpu,
-                &views,
-                origin,
-                |done, spent| budget.allows(done, spent),
-            )
+            active
+                .pump
+                .advance(&mut session.stream, &active.gpu, &views, origin, deadline)
         };
         self.uploaded = uploaded;
         self.stats.uploads += uploaded as u64;
@@ -290,7 +256,7 @@ impl App {
         // fallback chain at all** — every unready tile reported lost, which is
         // the black square. The tree is the only thing that can answer, so the
         // server sends it and the pump reads it. Nothing here to get wrong.
-        let (drawn, resolution) = active.pump.resolve(&active.gpu.queue);
+        let (drawn, resolution) = active.pump.resolve(&active.gpu);
         let rendered = drawn.exact.len() + drawn.fallback.len();
         let old_imagery = drawn
             .exact
@@ -298,26 +264,10 @@ impl App {
             .chain(drawn.fallback.iter())
             .filter(|tile| tile.imagery_source.is_some_and(|source| source != serving))
             .count();
-        // `resolve` has already brought the selection onto the current render
-        // origin. The coarse layer behind it is drawn without going through
-        // `resolve`, so it asks for itself.
-        if crate::backdrop::shell_enabled() {
-            tuile_core::metrics::metrics().rebase_seconds.time(|| {
-                active.pump.rebase_for_drawing(
-                    &active.gpu.queue,
-                    active.pump.at_level(crate::backdrop::BASE_LEVEL),
-                );
-            });
-        }
+        // The floor behind the draw set, each tile in its own drape: `resolve`
+        // has brought it onto the render origin with everything else.
         let backdrop = crate::backdrop::shell_enabled();
-        // Collected rather than lazily iterated, because the paint closure and
-        // the trace's `&mut readback` are handed to the same call: a live
-        // iterator over `pump` would hold a borrow across it.
-        let coarse: Vec<&tuile_wgpu::PreparedTile> = if backdrop {
-            active.pump.at_level(crate::backdrop::BASE_LEVEL).collect()
-        } else {
-            Vec::new()
-        };
+        let coarse: Vec<&tuile_wgpu::PreparedTile> = drawn.backdrop.clone();
         let wireframe = self.views.wireframe;
         let trace = self.recording.trace.is_some();
         // Space black.
@@ -444,6 +394,7 @@ impl App {
             let s = &active.pump.stats;
             let (_imagery_textures, imagery_bytes) =
                 active.gpu.imagery.lock().expect("imagery textures").live();
+            let budget = BudgetLine::of(tuile_core::metrics::budget().as_ref());
             // One line, and only what a person watching a globe would ask:
             // where am I, is the picture complete, is it sharp, and is the
             // engine still turning. Everything else — visited, culled, bytes,
@@ -489,13 +440,12 @@ impl App {
             );
             tracing::info!(
                 "alt {:.0} km | ground {:.0} m | {} tiles, {complete}, {sharpness} | \
-                 {} stand-ins, {} coplanar | \
-                 {} loading | {:.0} MiB | near {:.0} m far {:.0} km{pacing}{view}",
+                 {} bare | {} loading | {:.0} MiB | {budget} | \
+                 near {:.0} m far {:.0} km{pacing}{view}",
                 cam.altitude() / 1000.0,
                 self.controller.height_above_ground(),
                 rendered,
-                resolution.stand_ins,
-                resolution.coplanar,
+                resolution.bare,
                 s.requested,
                 (active.pump.gpu_bytes as f32 + imagery_bytes as f32) / (1024.0 * 1024.0),
                 near,
@@ -619,6 +569,40 @@ impl App {
         }
         self.watch.last_traversals = traversals;
         self.watch.last_altitude = Some(cam.altitude());
+    }
+}
+
+/// The budget's signals in one clause of the status line: what the GPU holds
+/// against its target, how many loads are in flight, the relaxation, and
+/// whether the view has converged — the numbers the overlay shows, read from
+/// the same published snapshot as the metrics endpoint.
+struct BudgetLine(Option<tuile_core::budget::BudgetSignals>);
+
+impl BudgetLine {
+    fn of(signals: Option<&tuile_core::budget::BudgetSignals>) -> Self {
+        Self(signals.cloned())
+    }
+}
+
+impl fmt::Display for BudgetLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Some(s) = &self.0 else {
+            return f.write_str("budget: not yet");
+        };
+        let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+        let held: u64 = s.bytes.iter().map(|(_, [d, t])| d + t).sum();
+        let target: u64 = s.target_bytes.iter().map(|(_, t)| t).sum();
+        let flight: u32 = s.in_flight.iter().map(|(_, n)| n).sum();
+        write!(
+            f,
+            "budget {:.0}/{:.0} MiB, {} in flight + {} local, scale {:.2}, {}",
+            mib(held),
+            mib(target),
+            flight,
+            s.local_reads,
+            f64::from(s.sse_scale_milli) / 1000.0,
+            if s.converged { "converged" } else { "settling" }
+        )
     }
 }
 

@@ -18,7 +18,7 @@ use std::sync::Arc;
 use tuile_core::protocol::InProcessStream;
 use tuile_core::source::TileLoader;
 use tuile_core::storage::ContentStore;
-use tuile_planetary::{ImageryDetail, LayerBudget};
+use tuile_planetary::LayerBudget;
 use tuile_storage_foyer::SuspendableStore as FoyerStore;
 use tuile_terrain::TerrainHeights;
 
@@ -27,8 +27,6 @@ use crate::gate::Gated;
 use crate::globe::{Layers, Switched};
 use crate::launch::{Launch, Outcome};
 
-/// What the window sets the imagery detail through: the loader's own handle.
-pub(crate) type Detail = ImageryDetail;
 /// What the window declares the device's imagery slots through.
 pub(crate) type Budget = LayerBudget;
 /// What the session's loads wait on while the application is away.
@@ -40,7 +38,8 @@ pub(crate) struct Started {
     pub stream: InProcessStream,
     /// The thread the geometry server runs on, to be joined on the way out.
     pub server: Option<std::thread::JoinHandle<()>>,
-    pub detail: Detail,
+    /// The budget's signals, shared with the window's pump.
+    pub meter: tuile_core::runtime::SharedMeter,
     pub heights: Arc<TerrainHeights>,
     pub layer_budget: Budget,
     pub switcher: Switcher,
@@ -53,6 +52,11 @@ pub(crate) struct Started {
 }
 
 impl Started {
+    /// The budget's signals, shared with the session.
+    pub(crate) fn meter(&self) -> Option<tuile_core::runtime::SharedMeter> {
+        Some(std::sync::Arc::clone(&self.meter))
+    }
+
     /// Closes the session down: the stream, then the store, then the server.
     ///
     /// The store is closed *before* the server is joined: the server thread
@@ -151,6 +155,8 @@ pub(crate) struct Plan {
     /// Where the tile store lives on disk.
     pub store: std::path::PathBuf,
     pub config: tuile_core::traversal::Config,
+    /// The graphics budget the session runs on.
+    pub budget: tuile_core::budget::BudgetConfig,
     pub profile: crate::profile::Profile,
     /// See [`crate::launch::START_TIMEOUT`].
     pub timeout: std::time::Duration,
@@ -212,7 +218,10 @@ async fn bring_up_now(plan: Plan, runtime: tokio::runtime::Handle) -> Outcome {
         inner: globe.loader,
         gate: gate.clone(),
     });
-    let (stream, server) = tuile_core::runtime::in_process_with(globe.tree, loader, plan.config);
+    let (stream, server) =
+        tuile_core::runtime::in_process_with(globe.tree, loader, plan.config, plan.budget)
+            .map_err(|e| format!("the graphics budget cannot run: {e}"))?;
+    let meter = server.meter();
     // Every load a task on the runtime's workers, so tiles keep arriving
     // while the server traverses.
     let server = server.with_spawn(tuile_core::runtime::Spawn::Tokio(runtime.clone()));
@@ -226,7 +235,7 @@ async fn bring_up_now(plan: Plan, runtime: tokio::runtime::Handle) -> Outcome {
     Ok(Started {
         stream,
         server: Some(server),
-        detail: globe.detail,
+        meter,
         heights: globe.heights,
         layer_budget: globe.budget,
         switcher: Switcher {

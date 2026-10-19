@@ -103,6 +103,28 @@ pub fn publish_every(handle: &tokio::runtime::Handle, period: Duration) {
     });
 }
 
+/// The graphics budget's signals as the session last published them, under
+/// `tuile_budget_*` (spec §16.3, §16.6): names and closed label sets from
+/// [`tuile_core::budget::BudgetSignals::series`], counters for the totals,
+/// gauges for the rest. Nothing until a session has published.
+fn publish_budget() {
+    let Some(signals) = tuile_core::metrics::budget() else {
+        return;
+    };
+    for (name, labels, value) in signals.series() {
+        let labels: Vec<metrics::Label> = labels
+            .into_iter()
+            .map(|(k, v)| metrics::Label::new(k, v))
+            .collect();
+        let full = format!("tuile_budget_{name}");
+        if name.ends_with("_total") || name.ends_with("_count") {
+            metrics::counter!(full, labels).absolute(value.max(0.0) as u64);
+        } else {
+            metrics::gauge!(full, labels).set(value);
+        }
+    }
+}
+
 /// The help text, stated once. A series nobody can interpret is a series nobody
 /// reads.
 fn describe() {
@@ -191,10 +213,6 @@ fn describe() {
     );
     describe_gauge!("tuile_prepared_tiles", "Tiles resident on the GPU.");
     describe_gauge!(
-        "tuile_tiles_filled",
-        "Selected tiles drawn by a stand-in surface rather than their own geometry."
-    );
-    describe_gauge!(
         "tuile_frame_exact",
         "Selected tiles the last frame drew with their own surface."
     );
@@ -205,10 +223,6 @@ fn describe() {
     describe_gauge!(
         "tuile_frame_lost",
         "Selected tiles the last frame drew with nothing at all: holes."
-    );
-    describe_gauge!(
-        "tuile_frame_stand_ins",
-        "Selected tiles the last frame drew with a stand-in."
     );
     describe_gauge!(
         "tuile_frame_digest",
@@ -390,11 +404,9 @@ fn publish(m: &Metrics) {
     gauge!("tuile_imagery_textures").set(m.imagery_textures.get() as f64);
     gauge!("tuile_pending_uploads").set(m.pending_uploads.get() as f64);
     gauge!("tuile_prepared_tiles").set(m.prepared_tiles.get() as f64);
-    gauge!("tuile_tiles_filled").set(m.tiles_filled.get() as f64);
     gauge!("tuile_frame_exact").set(m.frame_exact.get() as f64);
     gauge!("tuile_frame_coarser").set(m.frame_coarser.get() as f64);
     gauge!("tuile_frame_lost").set(m.frame_lost.get() as f64);
-    gauge!("tuile_frame_stand_ins").set(m.frame_stand_ins.get() as f64);
     // Forty-eight bits, which a float carries exactly: a fingerprint to see
     // the picture change by, not a number to do arithmetic on.
     gauge!("tuile_frame_digest").set((m.frame_digest.get() & ((1 << 48) - 1)) as f64);
@@ -405,6 +417,7 @@ fn publish(m: &Metrics) {
         gauge!("tuile_eye_pixels", "series" => "black", "eye" => label)
             .set(m.eye_black_pixels.get(eye) as f64);
     }
+    publish_budget();
     gauge!("tuile_priming_total").set(m.priming_total.get() as f64);
     gauge!("tuile_priming_pending").set(m.priming_pending.get() as f64);
     gauge!("tuile_priming_unavailable").set(m.priming_unavailable.get() as f64);
@@ -528,6 +541,27 @@ mod tests {
         }
     }
 
+    /// The budget's signals, once a session has published them, reach the
+    /// endpoint under `tuile_budget_*`, with their closed labels.
+    #[test]
+    fn the_budget_s_signals_are_published() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let mut signals = tuile_core::budget::BudgetSignals::default();
+        signals.lost_tile_steps_total = 3;
+        signals.sse_scale_milli = 1500;
+        tuile_core::metrics::publish_budget(signals);
+        metrics::with_local_recorder(&recorder, || publish(tuile_core::metrics::metrics()));
+        let text = handle.render();
+        for series in [
+            "tuile_budget_lost_tile_steps_total 3",
+            "tuile_budget_sse_scale 1.5",
+            "tuile_budget_bytes{class=\"terrain_mesh\",state=\"drawable\"}",
+        ] {
+            assert!(text.contains(series), "{series} missing from:\n{text}");
+        }
+    }
+
     /// What a frame drew, and what its eyes saw, reach the endpoint — and
     /// move when the numbers do.
     #[test]
@@ -543,7 +577,6 @@ mod tests {
             "tuile_frame_lost 7",
             "tuile_frame_exact",
             "tuile_frame_coarser",
-            "tuile_frame_stand_ins",
             "tuile_frame_digest",
             "tuile_eye_pixels{series=\"black\",eye=\"1\"} 42",
             "tuile_eye_pixels{series=\"ground\",eye=\"0\"}",

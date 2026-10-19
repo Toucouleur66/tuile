@@ -45,13 +45,13 @@ mod trim {
 /// A level the platform adds later is read by where it falls between these.
 pub(crate) fn pressure_of_trim(level: i32) -> Pressure {
     match level {
-        trim::UI_HIDDEN => Pressure::Nominal,
+        trim::UI_HIDDEN => Pressure::Normal,
         l if l >= trim::MODERATE => Pressure::Critical,
         l if l >= trim::BACKGROUND => Pressure::Warning,
         l if l > trim::UI_HIDDEN => Pressure::Warning,
         l if l >= trim::RUNNING_CRITICAL => Pressure::Critical,
         l if l >= trim::RUNNING_MODERATE => Pressure::Warning,
-        _ => Pressure::Nominal,
+        _ => Pressure::Normal,
     }
 }
 
@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn the_trim_signal_unpacks_into_a_count_and_a_level() {
-        assert_eq!(unpack_trim(0), (0, Pressure::Nominal));
+        assert_eq!(unpack_trim(0), (0, Pressure::Normal));
         assert_eq!(unpack_trim((3 << 32) | 15), (3, Pressure::Critical));
         assert_eq!(unpack_trim((1 << 32) | 5), (1, Pressure::Warning));
     }

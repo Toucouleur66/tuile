@@ -332,8 +332,7 @@ fn carry(run: &mut Headless, request: Request) -> Result<Value, String> {
             let l = run.limits();
             Ok(json!({
                 "resident_bytes": l.resident_bytes,
-                "resident_tiles": l.resident_tiles,
-                "uploads_per_frame": l.uploads_per_frame,
+                "pinned_level": l.pinned_level,
             }))
         }
         Request::Step { frames } => Ok(run.steps(frames).to_json()),

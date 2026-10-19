@@ -1541,8 +1541,11 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
                 self.mesh_held(TileCoord::new(z, x, y))
             }
             ResourceId::Drape { tile, level, .. } => {
+                // The coords first: choosing the floor reads the cache under
+                // its own lock, which must not be held here yet.
+                let coords = self.drape_coords(tile, level);
                 let cache = self.decoded();
-                self.drape_coords(tile, level)
+                coords
                     .into_iter()
                     .all(|c| cache.has(&c) || self.imagery.holds(c))
             }
@@ -1818,6 +1821,27 @@ mod tests {
             heights: Arc::new(TerrainHeights::new(scheme)),
             offload: offload::inline(),
         }
+    }
+
+    /// **Asking whether a drape is held never waits on the loader's own
+    /// cache.** The budget asks the presence oracle from inside its step,
+    /// synchronously; choosing a drape's floor reads the decoded-imagery cache
+    /// under its lock, and the question once held that same lock around it —
+    /// a session that hung on its first step, with nothing in its log.
+    #[test]
+    fn asking_whether_a_drape_is_held_does_not_deadlock() {
+        let gate = Arc::new(futures_util::lock::Mutex::new(()));
+        let loader = Arc::new(gated_loader(gate));
+        let asking = Arc::clone(&loader);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let answer = asking.holds(ResourceId::drape(ground_id(), LayerId(0), 9));
+            let _ = tx.send(answer);
+        });
+        let answer = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the presence query never returned");
+        assert_eq!(answer, Presence::Absent, "nothing is stored anywhere");
     }
 
     const SHARED: ImageryCoord = ImageryCoord {
