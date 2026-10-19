@@ -28,6 +28,7 @@ mod engine;
 pub mod error;
 pub mod imagery;
 pub mod need;
+pub mod observe;
 pub mod priority;
 mod state;
 pub mod stats;
@@ -45,6 +46,10 @@ pub use decisions::{
 pub use error::{AuditError, ConfigError, SessionError};
 pub use imagery::{DrapeCandidate, GeoRect, LevelClamp, TexelFootprint, UvTransform};
 pub use need::{ImageryNeed, LayerReach, Membership, Need, NeedSet};
+pub use observe::{
+    check, BudgetEvent, BudgetMeter, BudgetObserver, BudgetSignals, EyeCoverage, FrameRecord,
+    Histogram, StepRecord, Violations,
+};
 pub use priority::{PriorityKey, Quantised, Urgency};
 pub use stats::{BudgetStats, CancelReason, EvictReason};
 pub use tier::{NoStore, Presence, PresenceOracle, Source, Tier};
