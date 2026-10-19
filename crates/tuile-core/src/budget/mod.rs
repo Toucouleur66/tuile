@@ -22,6 +22,7 @@
 
 pub mod config;
 pub mod cost;
+pub mod deadline;
 pub mod decisions;
 mod engine;
 pub mod error;
@@ -35,6 +36,7 @@ pub mod types;
 pub mod view;
 
 pub use config::{BudgetConfig, FailurePolicy, PressureFractions, Relaxation, Watermarks};
+pub use deadline::FrameDeadline;
 pub use decisions::{
     Decisions, DrapeChoice, DrawItem, DrawSet, Role, Start, SwapGroup, UploadPlan,
 };

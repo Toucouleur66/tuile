@@ -2476,3 +2476,71 @@ mod stats_digest {
         assert_ne!(other.digest(), d1.stats.digest());
     }
 }
+
+mod deadline {
+    use super::*;
+    use tuile_core::budget::{FrameDeadline, SwapGroup};
+
+    /// I18 (D-A8): a frame deadline is its share of the display period, at
+    /// the executor's throughput: a quarter of 13.9, 11.1 and 8.3 ms at 72,
+    /// 90 and 120 Hz.
+    #[test]
+    #[ignore = "red until FrameDeadline derives from the display (I18)"]
+    fn a_frame_deadline_is_its_share_of_the_display_period() {
+        for (hz, period_us) in [(72u32, 13_888u64), (90, 11_111), (120, 8_333)] {
+            let d = FrameDeadline::from_refresh(hz, 250, 1_000_000);
+            assert_eq!(d.time, Micros(period_us * 250 / 1_000), "{hz} Hz {RED}");
+            assert_eq!(d.bytes, Bytes(d.time.0 * 1_000), "{hz} Hz: 1 MB per ms");
+        }
+        let at = |hz| FrameDeadline::from_refresh(hz, 250, 1_000_000).bytes;
+        assert!(
+            at(120) < at(90) && at(90) < at(72),
+            "a faster display, less per frame"
+        );
+        let whole = FrameDeadline::from_refresh(60, 1_000, 1_000);
+        assert_eq!(whole.time, Micros(16_666));
+        assert_eq!(whole.bytes, Bytes(16_666));
+    }
+
+    /// I18, I9: the first item of a frame always goes, a swap group goes
+    /// whole when it fits and waits whole when it does not.
+    #[test]
+    #[ignore = "red until FrameDeadline::take caps a frame's uploads (I18)"]
+    fn the_first_item_always_goes_and_a_swap_group_goes_whole() {
+        let cap = |b| FrameDeadline {
+            bytes: Bytes(b),
+            time: Micros(1_000),
+        };
+        let (a, b, c, e) = (
+            mesh(t(3, 0, 0)),
+            mesh(t(3, 1, 0)),
+            mesh(t(3, 2, 0)),
+            mesh(t(3, 3, 0)),
+        );
+        let cost = |_| Bytes(100);
+        let queue = [a, b, c, e];
+        let groups = [SwapGroup {
+            members: vec![b, c],
+        }];
+        let none: &[ResourceId] = &[];
+        // a fits; the group b + c would make 300 > 250: it waits, whole.
+        assert_eq!(
+            cap(250).take(&queue, &groups, Bytes::ZERO, cost),
+            &[a],
+            "{RED}"
+        );
+        // Without the group, b goes alone.
+        assert_eq!(cap(250).take(&queue, &[], Bytes::ZERO, cost), &[a, b]);
+        // A group that fits goes whole.
+        assert_eq!(
+            cap(300).take(&queue, &groups, Bytes::ZERO, cost),
+            &[a, b, c]
+        );
+        // First in a frame and larger than the deadline: its first item goes.
+        assert_eq!(cap(50).take(&[b, c, e], &groups, Bytes::ZERO, cost), &[b]);
+        assert_eq!(cap(50).take(&[e], &[], Bytes::ZERO, cost), &[e]);
+        // Not first in the frame: nothing over the deadline goes.
+        assert_eq!(cap(50).take(&[e], &[], Bytes(10), cost), none);
+        assert_eq!(cap(250).take(&queue, &[], Bytes(100), cost), &[a]);
+    }
+}
