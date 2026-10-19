@@ -192,7 +192,7 @@ fn count(request: &Value, key: &str, or: u64) -> Result<u64, String> {
     }
 }
 
-/// One request, read and checked: what [`answer`] carries out.
+/// One request, read and checked: what the socket carries out.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Request {
     Version,

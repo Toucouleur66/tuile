@@ -29,6 +29,21 @@
 //! account. The proxy's address is `TUILE_CATALOG_URL` — a launch setting,
 //! else the value it had when the library was built, else
 //! `DEVELOPMENT_CATALOG`, which `scripts/try-viewer.sh android` serves.
+//!
+//! **Headless, on demand.** `examples/headless` plays the graphics budget's
+//! motion patterns on this application without a window, over the real
+//! catalog, tile store and clock, and holds each run to the specification's
+//! obligations. It needs the network, a GPU and the token, read from
+//! `TUILE_ION_TOKEN` by a catalog proxy served in its own process — the
+//! application never sees it, and it is never printed:
+//!
+//! ```text
+//! TUILE_ION_TOKEN=… cargo run --release -p tuile-wgpu-viewer --example headless -- run all
+//! ```
+//!
+//! Session logs (MCAP) and a JSON summary go to `target/headless/`; the
+//! runner exits 1 when an obligation is violated. See the example's own
+//! documentation for the patterns and the flags.
 
 use std::sync::Arc;
 

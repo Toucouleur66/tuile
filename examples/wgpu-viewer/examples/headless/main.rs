@@ -233,10 +233,13 @@ fn device_name(device: Device) -> String {
 }
 
 fn main() {
+    // The engine's own lines on stderr, errors only unless `RUST_LOG` says
+    // more: the runner's lines are the obligations.
     let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "warn,foyer_storage=off".into()),
+                .unwrap_or_else(|_| "error,foyer_storage=off".into()),
         )
         .try_init();
     let args: Vec<String> = std::env::args().skip(1).collect();
