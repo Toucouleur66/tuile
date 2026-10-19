@@ -148,6 +148,12 @@ pub enum ServerMessage {
         /// Every wanted tile is drawn exactly, wearing the drapes it needs,
         /// with no work left for the view (I3).
         converged: bool,
+        /// Wanted tiles the draw set covers with nothing (must be 0 once the
+        /// floor is in, I1): ground left black.
+        lost: u32,
+        /// Drawn items that do not wear every layer they need (must be 0,
+        /// I1 as D-A1 extends it): ground left bare.
+        bare: u32,
         /// The [`ClientMessage::ViewerState::generation`] this answers.
         generation: u64,
     },

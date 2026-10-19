@@ -1431,6 +1431,8 @@ impl State {
             hard_limit: d.stats.hard_limit,
             frame_ready: d.frame_ready,
             converged: d.stats.converged,
+            lost: d.stats.lost,
+            bare: d.stats.bare,
             generation: self.view_generation,
         });
         m.select_seconds.record(selecting.elapsed());

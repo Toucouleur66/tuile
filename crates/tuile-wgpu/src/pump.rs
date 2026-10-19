@@ -1,66 +1,107 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! The async→frame bridge: drains a [`GeometryStream`] each frame, spreads
-//! GPU uploads over frames (no hitches), acknowledges materialized tiles
-//! and frees evicted ones.
+//! The async→frame bridge, and the graphics budget's executor: drains a
+//! [`GeometryStream`] each frame, uploads what the budget delivered in its
+//! plan's order within the frame's deadline, acknowledges each upload with
+//! its actual bytes, draws the budget's draw set and frees what it evicts —
+//! after the draw that stops using it.
 //!
 //! The pump does not know which binding feeds it — in-process, WebSocket
 //! or HTTP pull — that's the point of the trait (`docs/11-crate-wgpu.md`).
+//!
+//! # New before old, by construction
+//!
+//! Nothing is drawn that the budget has not seen acknowledged: a draw set is
+//! built from drawable resources only, and a step's evictions name nothing
+//! its draw set uses. The pump applies a step's draw set before its
+//! evictions, so between two frames the ground goes from one complete
+//! picture to the next, and never through a frame with a hole.
 
 use crate::context::GpuContext;
-use crate::prepare::{prepare, PreparedTile};
+use crate::prepare::{prepare, prepare_drape, PreparedDrape, PreparedTile};
 use glam::DVec3;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::task::{Context, Poll};
-use tuile_core::content::{DecodedTileContent, TileContent};
-use tuile_core::protocol::{Ancestry, ClientMessage, GeometryStream, Priming, ServerMessage};
+use tuile_core::budget::{
+    Bytes, Class, DrawSet, EyeCoverage, FrameDeadline, FrameRecord, Generation, LayerId,
+    PerClass, ResourceId, Role, UploadPlan,
+};
+use tuile_core::protocol::{
+    Ancestry, ClientMessage, GeometryStream, Priming, ResourceContent, ServerMessage,
+};
+use tuile_core::runtime::SharedMeter;
 use tuile_core::source::TileId;
 use tuile_core::traversal::TraversalStats;
 use tuile_core::traversal::ViewState;
+
+/// A delivery waiting for its frame.
+struct Queued {
+    gen: Generation,
+    class: Class,
+    content: ResourceContent,
+}
+
+/// What an upload is charged, and to which class, for the refund when it
+/// leaves.
+#[derive(Clone, Copy)]
+struct Held {
+    class: Class,
+    bytes: u64,
+}
+
+/// The share of a frame's period the uploads may take, thousandths.
+pub const UPLOAD_SHARE_PERMILLE: u16 = 250;
+
+/// The upload throughput assumed before any upload was measured, bytes per
+/// millisecond (400 MB/s): the deadline's starting point, which the pump's
+/// own measure replaces from the first upload on.
+const ASSUMED_BYTES_PER_MS: f64 = 400_000.0;
 
 pub struct ContentPump {
     /// The f64 world point all tiles and the view matrix are relative to.
     pub render_origin: DVec3,
     prepared: HashMap<TileId, PreparedTile>,
-    /// Decoded tiles awaiting a frame's upload budget. The flag says whether
-    /// the entry is a stand-in — see [`ServerMessage::Fill`].
-    pending: VecDeque<(TileId, DecodedTileContent, bool)>,
-    /// Which prepared tiles are stand-ins rather than real geometry.
-    fills: HashSet<TileId>,
-    /// Current selection, as sent by the geometry server.
-    pub selection: Vec<(TileId, f64)>,
+    drapes: HashMap<ResourceId, PreparedDrape>,
+    /// Delivered, not yet uploaded, keyed by resource: uploaded in the
+    /// plan's order, the rest after it.
+    queue: BTreeMap<ResourceId, Queued>,
+    /// What each upload is charged, per resource.
+    held: HashMap<ResourceId, Held>,
+    /// Bytes held per class, actual.
+    held_bytes: PerClass<u64>,
+    /// The last step's draw set, upload plan and hard limits.
+    draw: DrawSet,
+    plan: UploadPlan,
+    hard_limit: PerClass<Bytes>,
+    /// The last step's verdicts: complete (batch), converged, and the wanted
+    /// ground it left black or bare.
+    pub frame_ready: bool,
+    pub converged: bool,
+    lost: u32,
+    bare: u32,
+    /// The level whose meshes are drawn as a backdrop behind the draw set,
+    /// each in its own drape: see [`Self::set_backdrop_level`].
+    backdrop_level: Option<u32>,
     /// How many `Select` messages this pump has applied.
     selects_seen: u64,
     /// The generation this pump last sent with a `ViewerState` — monotone,
     /// one per send.
     generation_sent: u64,
-    /// The generation the current selection answers, echoed by the server.
-    /// `generation_selected() >= generation_sent()` is the correlation a
-    /// deterministic consumer renders on: the selection is for the LAST
-    /// camera this pump sent — by construction, not by heuristic.
+    /// The generation the current draw set answers, echoed by the server.
     generation_selected: u64,
     /// What the server has said about the shape of the tree, accumulated.
     ///
     /// **The consumer cannot derive this and must not try.** A `TileId` is an
-    /// opaque handle whose payload only the owning tree can read; this crate
-    /// used to shift its bits, which is right for terrain and answers level 0
-    /// for every 3D Tiles arena index — so such a session had no fallback chain
-    /// at all and reported every unready tile as lost.
-    ///
-    /// Grows with every message that names a tile and is **not** pruned by
-    /// `Evict`, unlike everything else here: the link to a tile's parent is
-    /// exactly what lets a walk climb *past* it once it is no longer resident,
-    /// so dropping it would cut the chain at the first evicted ancestor. Twelve
-    /// bytes per tile the session has ever heard of. See [`Ancestry`].
+    /// opaque handle whose payload only the owning tree can read.
     ancestry: HashMap<TileId, Ancestry>,
     pub stats: TraversalStats,
-    /// Sum of GPU bytes of prepared tiles.
+    /// Sum of GPU bytes of prepared meshes (drapes not included).
     pub gpu_bytes: usize,
     /// True once the server side hung up.
     pub closed: bool,
-    /// The coarse pyramid, as last reported by the server. `None` until it has
-    /// said anything at all — which is not the same as "nothing to wait for".
+    /// The floor, as last reported by the server. `None` until it has said
+    /// anything at all — which is not the same as "nothing to wait for".
     pub priming: Option<Priming>,
     /// Non-fatal errors reported by the server (drain freely).
     pub errors: Vec<String>,
@@ -72,21 +113,19 @@ pub struct ContentPump {
     frame: u64,
     stitched_for: Vec<TileId>,
     sliding: Vec<TileId>,
+    /// The upload throughput this pump measured, bytes per millisecond: what
+    /// a frame's deadline is made of.
+    throughput: f64,
+    /// Where each frame's record goes: the session's meter.
+    meter: Option<SharedMeter>,
+    /// Drapes evicted since the last resolve: their wearers let go of them
+    /// there, where the device is.
+    undress_wearers: Vec<ResourceId>,
 }
 
 /// Frames a tile takes to slide to its new edge when what is drawn beside it
 /// changes: a fifth of a second at sixty frames a second.
 pub const STITCH_SLIDE_FRAMES: u32 = 12;
-
-/// Tiles uploaded per frame by an interactive session.
-///
-/// Shared rather than written into the host, for the reason the whole
-/// `Config::interactive_globe` exists: a headless test that picks its own
-/// number is testing a renderer nobody runs. Uploading is a stall — buffers are
-/// created and written on the frame's own thread — so this is deliberately
-/// small, and it is why a stand-in must jump the queue rather than wait behind
-/// real content.
-pub const UPLOADS_PER_FRAME: usize = 8;
 
 /// How many levels the sharpest draped imagery may sit above a tile before
 /// the tile counts as smeared in [`Resolution::smeared_drawn`]. Two levels is
@@ -98,9 +137,18 @@ impl ContentPump {
         Self {
             render_origin,
             prepared: HashMap::new(),
-            pending: VecDeque::new(),
-            fills: HashSet::new(),
-            selection: Vec::new(),
+            drapes: HashMap::new(),
+            queue: BTreeMap::new(),
+            held: HashMap::new(),
+            held_bytes: PerClass::splat(0),
+            draw: DrawSet::default(),
+            plan: UploadPlan::default(),
+            hard_limit: PerClass::splat(Bytes::MAX),
+            frame_ready: false,
+            converged: false,
+            lost: 0,
+            bare: 0,
+            backdrop_level: None,
             selects_seen: 0,
             generation_sent: 0,
             generation_selected: 0,
@@ -114,7 +162,24 @@ impl ContentPump {
             frame: 0,
             stitched_for: Vec::new(),
             sliding: Vec::new(),
+            throughput: ASSUMED_BYTES_PER_MS,
+            meter: None,
+            undress_wearers: Vec::new(),
         }
+    }
+
+    /// Records every frame into `meter`, the session's: what the budget's
+    /// signals say of the uploads, the deadline and the coverage (§16.2).
+    pub fn observe(&mut self, meter: SharedMeter) {
+        self.meter = Some(meter);
+    }
+
+    /// Draws every mesh at `level` the pump holds behind the draw set, each
+    /// in its own drape: a complete coarse layer that covers ground the draw
+    /// set does not yet reach — a camera turned faster than the server
+    /// answered. `None`, the default, draws none.
+    pub fn set_backdrop_level(&mut self, level: Option<u32>) {
+        self.backdrop_level = level;
     }
 
     /// How the tiles drawn are stitched to one another
@@ -142,16 +207,18 @@ impl ContentPump {
     fn restitch(&mut self, gpu: &GpuContext) {
         self.frame += 1;
         let (frame, slide) = (self.frame, self.stitching);
-        let mut exact = match slide {
-            Some(_) => {
-                walk(
-                    &self.selection,
-                    |id| self.prepared.contains_key(&id),
-                    |id| self.ancestry.get(&id).and_then(|a| a.parent),
-                    |id| self.level(id),
-                )
-                .0
-            }
+        // The tiles that hold their own ground in the draw set: exact, and
+        // the finer tiles held on a zoom-out. A fallback ancestor stands in
+        // for ground that is not its own and is nobody's neighbour.
+        let mut exact: Vec<TileId> = match slide {
+            Some(_) => self
+                .draw
+                .items
+                .iter()
+                .filter(|i| i.role != Role::Fallback)
+                .map(|i| i.mesh.tile())
+                .filter(|t| self.prepared.contains_key(t))
+                .collect(),
             None => Vec::new(),
         };
         exact.sort_unstable();
@@ -250,27 +317,23 @@ impl ContentPump {
         }
     }
 
-    /// Call once per frame: drains every queued server message, then
-    /// performs at most `max_uploads` GPU uploads. Returns the number of
-    /// tiles uploaded this call.
-    pub fn pump<S: GeometryStream>(
-        &mut self,
-        stream: &mut S,
-        gpu: &GpuContext,
-        max_uploads: usize,
-    ) -> usize {
-        self.pump_while(stream, gpu, |done, _| done < max_uploads)
+    /// This frame's upload deadline on a display refreshing at `hz` (I18):
+    /// the frame's period, its upload share, and the throughput this pump
+    /// has measured. Only the render side knows its frame; the budget never
+    /// reads this.
+    pub fn deadline(&self, hz: u32) -> FrameDeadline {
+        FrameDeadline::from_refresh(hz, UPLOAD_SHARE_PERMILLE, self.throughput as u64)
     }
 
-    /// Takes every message the server has sent — selections, evictions,
+    /// Takes every message the server has sent — draw sets, evictions,
     /// content into the upload queue — and touches nothing on the GPU: no
     /// upload, no stitch, no buffer write. An evicted surface is dropped, which
     /// releases its memory without submitting any work.
     ///
     /// For a host that may not use the GPU at all — a phone's application in
     /// the background, where the system ends anything that submits — and
-    /// still wants the memory a trim lets go of back now rather than on its
-    /// next frame. Returns how many messages were taken.
+    /// still wants the memory an eviction lets go of back now rather than on
+    /// its next frame. Returns how many messages were taken.
     pub fn drain<S: GeometryStream>(&mut self, stream: &mut S) -> usize {
         let waker = futures_util::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
@@ -292,8 +355,8 @@ impl ContentPump {
     }
 
     /// Sends the camera, one generation on from the last: the first half of
-    /// [`Self::advance_while`], for a host that wants the server to run a pass
-    /// — and answer it — without drawing anything.
+    /// [`Self::advance`], for a host that wants the server to run a step —
+    /// and answer it — without drawing anything.
     pub fn send_view<S: GeometryStream>(&mut self, stream: &mut S, views: &[ViewState]) {
         // Best effort: a closed stream means the session is over, and a frame is
         // not the place to discover it.
@@ -304,150 +367,214 @@ impl ContentPump {
         });
     }
 
-    /// [`Self::pump`], with the upload budget as a rule rather than a count:
-    /// `more(done, spent)` is asked before each upload, with how many this
-    /// call has made and how long they took, and the uploads stop at the first
-    /// `false`.
-    ///
-    /// For a host whose frame cannot afford a fixed number: one tile is a few
-    /// kilobytes of mesh and the next megabytes of imagery, so a phone stops
-    /// on time spent as well as on count. Messages are drained whatever the
-    /// rule says — only uploads wait.
-    pub fn pump_while<S: GeometryStream>(
+    /// One frame of the executor: drains every message, uploads what the
+    /// deadline allows in the plan's order, acknowledges each upload with its
+    /// bytes (or refuses one that would cross its class's hard limit), and
+    /// stitches the tiles about to be drawn. Returns how many resources
+    /// reached the GPU.
+    pub fn pump<S: GeometryStream>(
         &mut self,
         stream: &mut S,
         gpu: &GpuContext,
-        mut more: impl FnMut(usize, std::time::Duration) -> bool,
+        deadline: FrameDeadline,
     ) -> usize {
         self.drain(stream);
-
-        let mut uploaded = 0;
-        let began = web_time::Instant::now();
-        while more(uploaded, began.elapsed()) {
-            let Some((tile, content, is_fill)) = self.pending.pop_front() else {
-                break;
-            };
-            // The real tile may have landed while this stand-in waited its turn
-            // in the queue. Uploading it now would overwrite geometry with an
-            // approximation, and the frame after would look *worse* than the one
-            // before — the one failure mode a stand-in must never have.
-            if is_fill && self.prepared.contains_key(&tile) && !self.fills.contains(&tile) {
-                continue;
-            }
-            let m = tuile_core::metrics::metrics();
-            let started = web_time::Instant::now();
-            let prepared = prepare(gpu, &content, self.render_origin);
-            m.upload_seconds.record(started.elapsed());
-            m.uploads.inc();
-            let level = self.level(tile);
-            m.meshes_by_level.inc(level);
-            m.mesh_bytes_by_level.add(level, prepared.gpu_bytes as u64);
-            // Imagery is shared, so it is counted where it is actually held —
-            // once per texture, at the *imagery* level, which is not this tile's.
-            m.textures_by_level.clear();
-            m.texture_bytes_by_level.clear();
-            for held in gpu
-                .imagery
-                .lock()
-                .expect("imagery textures")
-                .live_by_level()
-            {
-                m.textures_by_level.inc(held.0);
-                m.texture_bytes_by_level.add(held.0, held.1 as u64);
-            }
-            self.gpu_bytes += prepared.gpu_bytes;
-            // A re-upload replaces its predecessor: charge for the new one,
-            // refund the old, or the total drifts up until it is fiction.
-            if let Some(replaced) = self.prepared.insert(tile, prepared) {
-                self.gpu_bytes -= replaced.gpu_bytes;
-                m.meshes_by_level.sub(level, 1);
-                m.mesh_bytes_by_level.sub(level, replaced.gpu_bytes as u64);
-            }
-            m.prepared_tiles.set(self.prepared.len() as u64);
-            m.pending_uploads.set(self.pending.len() as u64);
-            // Best effort: a closed stream just means the session is over.
-            if is_fill {
-                self.fills.insert(tile);
-            } else {
-                self.fills.remove(&tile);
-            }
-            // Only real geometry is acknowledged. Acking a stand-in would tell
-            // the server the consumer holds the tile, and it would stop sending
-            // the very thing everyone is waiting for.
-            if !is_fill {
-                // Best effort: a closed stream just means the session is over.
-                let _ = stream.send(ClientMessage::Ack { tile });
-            }
-            uploaded += 1;
-        }
-        // What is drawn may have changed — a selection, an upload: the
-        // tiles are stitched for this frame before anyone draws it.
+        let uploaded = self.upload(stream, gpu, deadline);
+        // What is drawn may have changed — a draw set, an upload: the tiles
+        // are stitched for this frame before anyone draws it.
         self.restitch(gpu);
         uploaded
     }
 
-    /// Re-bases every prepared tile onto a new render origin — call with the
-    /// camera position each frame so the f32 coordinates the GPU sees stay
-    /// near zero (sub-meter precise) however far the camera is from the
-    /// geocenter. Skips the work when the origin hasn't meaningfully moved.
-    /// One frame of the streaming loop, exactly as an interactive host runs it.
+    /// One frame of the streaming loop, exactly as an interactive host runs
+    /// it: send the camera, take this frame's share of the uploads, and move
+    /// the render origin — in that order. Rebasing before the uploads would
+    /// leave the tiles that arrived this frame holding a model matrix for the
+    /// *previous* origin, and at planetary scale that draws them somewhere
+    /// else entirely.
     ///
-    /// Send the camera, take whatever the server has produced up to this
-    /// frame's upload budget, and rebase what is resident onto the new origin —
-    /// in that order, which is the order that matters. Rebasing before the
-    /// uploads would leave the tiles that arrived this frame holding a model
-    /// matrix for the *previous* origin, and at planetary scale that draws them
-    /// somewhere else entirely.
+    /// Several views at once (stereo, a slice of a camera path) are one
+    /// need: the traversal's union, one charge per resource (I16).
     ///
-    /// Extracted from `tuile-wgpu-viewer` so a headless test can run the host's own
-    /// loop rather than an approximation of it. Everything after this — the
-    /// resolve and the draw — is immutable and belongs to whoever owns a
-    /// surface.
-    ///
-    /// Returns how many tiles reached the GPU.
+    /// Returns how many resources reached the GPU.
     pub fn advance<S: GeometryStream>(
         &mut self,
         stream: &mut S,
-        gpu: &crate::context::GpuContext,
-        view: ViewState,
-        render_origin: DVec3,
-    ) -> usize {
-        self.advance_with(stream, gpu, &[view], render_origin)
-    }
-
-    /// [`Self::advance`] with several views at once.
-    ///
-    /// The traversal's multi-view contract does the work: selection is the
-    /// **union** over views, refinement depth is the max, fetch priority the
-    /// best view per tile (see `tuile_core::traversal`). That is what lets a
-    /// headless consumer load a whole slice of camera path eagerly — send the
-    /// slice's views together and [`Self::missing`] gates on all of them —
-    /// while the previous slice is still being rendered from residency.
-    pub fn advance_with<S: GeometryStream>(
-        &mut self,
-        stream: &mut S,
-        gpu: &crate::context::GpuContext,
+        gpu: &GpuContext,
         views: &[ViewState],
         render_origin: DVec3,
-    ) -> usize {
-        self.advance_while(stream, gpu, views, render_origin, |done, _| {
-            done < UPLOADS_PER_FRAME
-        })
-    }
-
-    /// [`Self::advance_with`], with the upload budget of [`Self::pump_while`].
-    pub fn advance_while<S: GeometryStream>(
-        &mut self,
-        stream: &mut S,
-        gpu: &crate::context::GpuContext,
-        views: &[ViewState],
-        render_origin: DVec3,
-        more: impl FnMut(usize, std::time::Duration) -> bool,
+        deadline: FrameDeadline,
     ) -> usize {
         self.send_view(stream, views);
-        let uploaded = self.pump_while(stream, gpu, more);
+        let uploaded = self.pump(stream, gpu, deadline);
         self.rebase(&gpu.queue, render_origin);
         uploaded
+    }
+
+    /// The order this frame uploads in: the plan's items first, as the plan
+    /// has them, then whatever else is queued — coarse before fine, by id.
+    fn upload_order(&self) -> Vec<ResourceId> {
+        let mut order: Vec<ResourceId> = self
+            .plan
+            .items
+            .iter()
+            .copied()
+            .filter(|r| self.queue.contains_key(r))
+            .collect();
+        let planned: std::collections::BTreeSet<ResourceId> = order.iter().copied().collect();
+        order.extend(self.queue.keys().copied().filter(|r| !planned.contains(r)));
+        order
+    }
+
+    /// The uploads of one frame, within `deadline`.
+    fn upload<S: GeometryStream>(
+        &mut self,
+        stream: &mut S,
+        gpu: &GpuContext,
+        deadline: FrameDeadline,
+    ) -> usize {
+        let order = self.upload_order();
+        let estimate = |r: ResourceId| match self.queue.get(&r).map(|q| &q.content) {
+            Some(ResourceContent::Mesh(m)) => m.cost().gpu,
+            Some(ResourceContent::Drape(d)) => d.cost().gpu,
+            None => Bytes::ZERO,
+        };
+        let taken: Vec<ResourceId> = deadline
+            .take(&order, &self.plan.groups, Bytes::ZERO, estimate)
+            .to_vec();
+        let deferred = (order.len() - taken.len()) as u32;
+        let began = web_time::Instant::now();
+        let mut uploaded: Vec<(ResourceId, Bytes)> = Vec::with_capacity(taken.len());
+        for r in taken {
+            let Some(q) = self.queue.remove(&r) else {
+                continue;
+            };
+            if let Some(bytes) = self.upload_one(stream, gpu, r, q) {
+                uploaded.push((r, Bytes(bytes)));
+            }
+        }
+        let wall = began.elapsed();
+        let bytes: u64 = uploaded.iter().map(|(_, b)| b.0).sum();
+        // The throughput a frame's deadline is made of, measured: a moving
+        // average, so one slow upload does not halve the next frame's share.
+        let ms = wall.as_secs_f64() * 1000.0;
+        if bytes > 0 && ms > 0.05 {
+            let measured = bytes as f64 / ms;
+            self.throughput = (0.8 * self.throughput + 0.2 * measured).max(50_000.0);
+        }
+        let m = tuile_core::metrics::metrics();
+        m.pending_uploads.set(self.queue.len() as u64);
+        if let Some(meter) = &self.meter {
+            if let Ok(mut meter) = meter.lock() {
+                use tuile_core::budget::BudgetObserver;
+                meter.frame(&FrameRecord {
+                    frame: self.frame,
+                    generation: self.generation_selected,
+                    deadline,
+                    uploaded: &uploaded,
+                    deferred,
+                    upload_wall: tuile_core::budget::Micros(wall.as_micros() as u64),
+                    eyes: &[EyeCoverage {
+                        lost: self.lost,
+                        bare: self.bare,
+                    }],
+                });
+            }
+        }
+        uploaded.len()
+    }
+
+    /// Uploads one delivery and acknowledges it with its actual bytes —
+    /// or, when it would cross its class's hard limit, refuses it
+    /// (`Discarded`). Returns the bytes acknowledged.
+    fn upload_one<S: GeometryStream>(
+        &mut self,
+        stream: &mut S,
+        gpu: &GpuContext,
+        r: ResourceId,
+        q: Queued,
+    ) -> Option<u64> {
+        let m = tuile_core::metrics::metrics();
+        let started = web_time::Instant::now();
+        // What this would replace leaves with it: a redelivery after a change
+        // of epoch is new before old, in place.
+        let replaced = self.held.get(&r).map_or(0, |h| h.bytes);
+        let limit = self.hard_limit[q.class];
+        let (bytes, store): (u64, Box<dyn FnOnce(&mut Self)>) = match &q.content {
+            ResourceContent::Mesh(content) => {
+                let tile = r.tile();
+                let prepared = prepare(gpu, content, self.render_origin);
+                let bytes = mesh_bytes(&prepared, content);
+                (
+                    bytes,
+                    Box::new(move |pump: &mut Self| {
+                        let level = pump.level(tile);
+                        m.meshes_by_level.inc(level);
+                        m.mesh_bytes_by_level.add(level, prepared.gpu_bytes as u64);
+                        pump.gpu_bytes += prepared.gpu_bytes;
+                        if let Some(old) = pump.prepared.insert(tile, prepared) {
+                            pump.gpu_bytes -= old.gpu_bytes;
+                            m.meshes_by_level.sub(level, 1);
+                            m.mesh_bytes_by_level.sub(level, old.gpu_bytes as u64);
+                        }
+                    }),
+                )
+            }
+            ResourceContent::Drape(drape) => {
+                let prepared = prepare_drape(gpu, drape);
+                let bytes = prepared.gpu_bytes;
+                (
+                    bytes,
+                    Box::new(move |pump: &mut Self| {
+                        // Every mesh wearing the drape it replaces is dressed
+                        // again at its next draw.
+                        pump.drapes.insert(r, prepared);
+                    }),
+                )
+            }
+        };
+        let after = self.held_bytes[q.class].saturating_sub(replaced) + bytes;
+        if limit != Bytes::MAX && after > limit.0 {
+            // Past the class's hard limit: the guard against the system ending
+            // the process. Refused, and delivered again later.
+            let _ = stream.send(ClientMessage::Discarded {
+                resource: r,
+                gen: q.gen,
+            });
+            return None;
+        }
+        store(self);
+        self.held_bytes[q.class] = after;
+        self.held.insert(
+            r,
+            Held {
+                class: q.class,
+                bytes,
+            },
+        );
+        m.upload_seconds.record(started.elapsed());
+        m.uploads.inc();
+        m.prepared_tiles.set(self.prepared.len() as u64);
+        if matches!(r, ResourceId::Drape { .. }) {
+            if let Ok(imagery) = gpu.imagery.lock() {
+                m.textures_by_level.clear();
+                m.texture_bytes_by_level.clear();
+                for held in imagery.live_by_level() {
+                    m.textures_by_level.inc(held.0);
+                    m.texture_bytes_by_level.add(held.0, held.1 as u64);
+                }
+                let (count, bytes) = imagery.live();
+                m.imagery_textures.set(count as u64);
+                let _ = bytes;
+            }
+        }
+        // Best effort: a closed stream just means the session is over.
+        let _ = stream.send(ClientMessage::Ack {
+            resource: r,
+            gen: q.gen,
+            bytes,
+        });
+        Some(bytes)
     }
 
     /// Moves the render origin. Tiles follow when they are drawn, not now.
@@ -487,105 +614,96 @@ impl ContentPump {
     fn on_message(&mut self, msg: ServerMessage) {
         match msg {
             ServerMessage::Select {
-                tiles,
+                draw,
+                plan,
                 ancestry,
                 stats,
+                hard_limit,
+                frame_ready,
+                converged,
+                lost,
+                bare,
                 generation,
             } => {
                 self.ancestry.extend(ancestry);
-                self.selection = tiles;
+                self.draw = draw;
+                self.plan = plan;
                 self.stats = stats;
+                self.hard_limit = hard_limit;
+                self.frame_ready = frame_ready;
+                self.converged = converged;
+                self.lost = lost;
+                self.bare = bare;
                 self.selects_seen += 1;
                 self.generation_selected = generation;
             }
             ServerMessage::Content {
-                tile,
-                ancestry,
-                content,
-            } => match content {
-                TileContent::Decoded(decoded) => {
-                    self.ancestry.insert(tile, ancestry);
-                    self.pending.push_back((tile, decoded, false));
-                }
-                TileContent::Raw { .. } => self
-                    .errors
-                    .push(format!("tile {tile:?}: raw content reached the renderer")),
-            },
-            // A stand-in, refused whenever the real thing is already here or on
-            // its way. Both are filed under the same tile, so accepting a late
-            // one would replace real geometry with an approximation — the exact
-            // failure the separate variant exists to make impossible to miss.
-            ServerMessage::Fill {
-                tile,
+                resource,
+                gen,
+                class,
                 ancestry,
                 content,
             } => {
-                let already = self.prepared.contains_key(&tile) && !self.fills.contains(&tile)
-                    || self.pending.iter().any(|(t, _, fill)| *t == tile && !*fill);
-                if !already {
-                    self.ancestry.insert(tile, ancestry);
-                    // Ahead of real content, and deliberately. A stand-in is
-                    // twenty-five vertices and it is what keeps the ground
-                    // covered; a real tile is orders of magnitude larger and
-                    // its absence is invisible while a stand-in holds its
-                    // place. Queued behind, they would arrive frames late and
-                    // the hole they exist to fill would be on screen the whole
-                    // time.
-                    self.pending.push_front((tile, content, true));
+                self.ancestry.insert(resource.tile(), ancestry);
+                self.queue.insert(
+                    resource,
+                    Queued {
+                        gen,
+                        class,
+                        content,
+                    },
+                );
+                tuile_core::metrics::metrics()
+                    .pending_uploads
+                    .set(self.queue.len() as u64);
+            }
+            // Delivered, not yet uploaded: dropped. A later delivery of the
+            // same resource — another generation — is kept.
+            ServerMessage::Cancel { resources } => {
+                for (r, g) in resources {
+                    if self.queue.get(&r).is_some_and(|q| q.gen == g) {
+                        self.queue.remove(&r);
+                    }
                 }
             }
-            // A take-back of stand-ins, and of nothing else. The narrow scope
-            // is the whole point of the variant: `Content` is sent once per
-            // residency, so purging a queued real upload here — which `Evict`
-            // rightly does — would destroy the only delivery there will ever
-            // be, and this ground would wear its stand-in until the server's
-            // cache let the tile go. That was measured, at length, before this
-            // message existed.
-            ServerMessage::Retire { tiles } => {
+            ServerMessage::Evict { resources } => {
                 let m = tuile_core::metrics::metrics();
-                for tile in &tiles {
-                    // Only a surface held *as a stand-in*. Real content — the
-                    // fill that was already replaced, or a tile never filled —
-                    // is not ours to touch on this message.
-                    if self.fills.contains(tile) {
-                        if let Some(p) = self.prepared.remove(tile) {
-                            self.fills.remove(tile);
-                            self.gpu_bytes -= p.gpu_bytes;
-                            let level = self.level(*tile);
-                            m.meshes_by_level.sub(level, 1);
-                            m.mesh_bytes_by_level.sub(level, p.gpu_bytes as u64);
+                let mut drapes_gone = Vec::new();
+                for r in &resources {
+                    if let Some(h) = self.held.remove(r) {
+                        self.held_bytes[h.class] = self.held_bytes[h.class].saturating_sub(h.bytes);
+                    }
+                    match r {
+                        ResourceId::Mesh(tile) => {
+                            if let Some(p) = self.prepared.remove(tile) {
+                                self.gpu_bytes -= p.gpu_bytes;
+                                let level = self.level(*tile);
+                                m.meshes_by_level.sub(level, 1);
+                                m.mesh_bytes_by_level.sub(level, p.gpu_bytes as u64);
+                            }
+                        }
+                        ResourceId::Drape { .. } => {
+                            if self.drapes.remove(r).is_some() {
+                                drapes_gone.push(*r);
+                            }
                         }
                     }
+                    // A copy still queued goes too: uploaded after its own
+                    // eviction it would be held for ever, the server no
+                    // longer counting it.
+                    self.queue.remove(r);
                 }
-                // Queued *fill* uploads go too; queued real content stays,
-                // whatever else this message names.
-                self.pending
-                    .retain(|(t, _, is_fill)| !(*is_fill && tiles.contains(t)));
-                m.prepared_tiles.set(self.prepared.len() as u64);
-            }
-            ServerMessage::Evict { tiles } => {
-                let m = tuile_core::metrics::metrics();
-                for tile in &tiles {
-                    if let Some(p) = self.prepared.remove(tile) {
-                        self.fills.remove(tile);
-                        self.gpu_bytes -= p.gpu_bytes;
-                        let level = self.level(*tile);
-                        m.meshes_by_level.sub(level, 1);
-                        m.mesh_bytes_by_level.sub(level, p.gpu_bytes as u64);
-                    }
+                // A mesh dressed with an evicted drape lets go of its
+                // textures: it is dressed again when it is next drawn.
+                if !drapes_gone.is_empty() {
+                    self.undress_wearers.extend(drapes_gone);
                 }
                 m.prepared_tiles.set(self.prepared.len() as u64);
-                // Uploads are spread over frames, so a tile can still be
-                // queued when its eviction arrives. Dropping it here is what
-                // keeps that from leaking: uploaded after its own `Evict`, it
-                // would enter `prepared` with the server no longer considering
-                // it resident — so no further `Evict` would ever name it, and
-                // its GPU memory would be held until the session ends.
-                self.pending.retain(|(t, _, _)| !tiles.contains(t));
+                m.pending_uploads.set(self.queue.len() as u64);
             }
-            ServerMessage::Error { tile, message } => {
-                self.errors.push(match tile {
-                    Some(t) => format!("tile {t:?}: {message}"),
+            ServerMessage::Error { resource, message } => {
+                self.errors.push(match resource {
+                    Some(r) => format!("{r:?}: {message}"),
                     None => message,
                 });
             }
@@ -593,158 +711,170 @@ impl ContentPump {
         }
     }
 
-    /// Selected tiles whose GPU resources are ready to draw.
-    pub fn visible(&self) -> impl Iterator<Item = &PreparedTile> {
-        self.selection
-            .iter()
-            .filter_map(|(t, _)| self.prepared.get(t))
-    }
-
-    /// What the selection resolved to, and what it failed to resolve to.
+    /// What to draw this frame: the budget's draw set, each mesh dressed
+    /// with the drapes it wears, and how that went.
     ///
-    /// Three outcomes per selected tile, and only the third is a bug:
-    ///
-    /// | outcome | on screen |
-    /// |---|---|
-    /// | the tile itself is prepared | the intended detail |
-    /// | an ancestor is prepared | coarser ground — degraded, not broken |
-    /// | the walk reached a root with nothing | **nothing at all: the black square** |
-    ///
-    /// The three used to be one number. `missing` counts the first against the
-    /// other two, which says how *sharp* the picture is and nothing about
-    /// whether it is there; and it is computed against the last selection
-    /// received, so a stale one reports `missing 0` while describing ground
-    /// nobody is looking at. Black ground was therefore invisible in the logs
-    /// for two days — the count that mattered was never taken.
-    /// Takes the queue because resolving is also what brings the chosen tiles
-    /// onto the current render origin.
-    ///
-    /// Those were two calls for one afternoon, and the second one was forgotten
-    /// exactly where it mattered: a harness that resolved and drew without
-    /// rebasing put **60 % of a frame bare** during a zoom, because every tile
-    /// was still positioned against an origin the eye had left. Nothing in the
-    /// type system objected. Deciding what to draw and making it drawable are
-    /// one act, so they are one call, and the mistake is no longer available.
-    ///
-    /// # No parent function is asked for, and that is the change
-    ///
-    /// This used to take a `parent_of` closure, and every host wrote the same
-    /// one: shift the id, halve the coordinates. That is the terrain encoding,
-    /// and a `TileId` from any other tree does not carry it — a 3D Tiles arena
-    /// index answered level 0, so the closure returned `None` at the first step
-    /// and **the fallback chain did not exist**. Every unready tile counted as
-    /// lost, which is the black square, silently, in a configuration that
-    /// looked exactly like a working one.
-    ///
-    /// The tree is the only thing that can answer, so the tree answers: the
-    /// server sends [`Ancestry`] with every message that names a tile and this
-    /// walks the table it has accumulated. A host can no longer get it wrong
-    /// because it is no longer asked.
-    pub fn resolve(&self, queue: &wgpu::Queue) -> (Drawn<'_>, Resolution) {
-        let (drawn, counts, _) = self.resolve_reporting(queue);
-        (drawn, counts)
-    }
-
-    /// [`Self::resolve`], and the tiles it could not draw exactly.
-    ///
-    /// Those are the fill candidates, and naming them is the point: a tile drawn
-    /// by its ancestor is not a hole — it is *worse than a hole in one specific
-    /// way*, because the ancestor also covers the siblings that did arrive, so
-    /// two surfaces end up over the same ground and the depth test picks a
-    /// winner per pixel. Giving each of these its own stand-in over its own
-    /// rectangle is what removes both the black and the shimmer.
-    pub fn resolve_reporting(&self, queue: &wgpu::Queue) -> (Drawn<'_>, Resolution, Vec<TileId>) {
-        let (exact, fallback, counts, unresolved) = walk(
-            &self.selection,
-            |id| self.prepared.contains_key(&id),
-            |id| self.ancestry.get(&id).and_then(|a| a.parent),
-            |id| self.level(id),
-        );
-        let surfaces = |ids: Vec<TileId>| -> Vec<&PreparedTile> {
-            ids.into_iter()
-                .filter_map(|id| self.prepared.get(&id))
-                .collect()
+    /// Exact and held meshes own their ground and compete for the depth
+    /// buffer; a fallback ancestor stands in for ground that is not its own
+    /// and is drawn after them, testing depth and never writing it (see
+    /// [`Drawn`]). Dressing binds the drapes' textures and uploads nothing;
+    /// a mesh already dressed so is left as it is. Resolving is also what
+    /// brings the chosen tiles onto the current render origin: deciding what
+    /// to draw and making it drawable are one act.
+    pub fn resolve(&mut self, gpu: &GpuContext) -> (Drawn<'_>, Resolution) {
+        let mut counts = Resolution {
+            lost: self.lost as usize,
+            bare: self.bare as usize,
+            ..Resolution::default()
         };
-        let stand_ins = exact.iter().filter(|id| self.fills.contains(id)).count();
-        let is_ancestor = |a: TileId, b: TileId| {
-            let mut cur = self.ancestry.get(&b).and_then(|x| x.parent);
-            while let Some(id) = cur {
-                if id == a {
-                    return true;
+        let mut exact: Vec<TileId> = Vec::new();
+        let mut fallback: Vec<TileId> = Vec::new();
+        let mut dressed: std::collections::HashSet<TileId> = std::collections::HashSet::new();
+        for item in &self.draw.items {
+            let tile = item.mesh.tile();
+            let Some(mesh) = self.prepared.get_mut(&tile) else {
+                // The budget draws only what was acknowledged; a mesh missing
+                // here is a fault of this side, and the ground it was to cover
+                // is black.
+                counts.lost += item.serves.len().max(1);
+                continue;
+            };
+            let mut wear: Vec<(ResourceId, &PreparedDrape, tuile_core::budget::UvTransform)> =
+                Vec::with_capacity(item.drapes.len());
+            for choice in &item.drapes {
+                match self.drapes.get(&choice.resource) {
+                    Some(drape) => wear.push((choice.resource, drape, choice.uv)),
+                    None => counts.bare += 1,
                 }
-                cur = self.ancestry.get(&id).and_then(|x| x.parent);
             }
-            false
-        };
-        // The smear count: a drawn surface whose sharpest imagery sits more
-        // than SMEAR_GAP levels above its own level is one texel stretched
-        // over its whole ground — the flat-colour wall a recorder must refuse.
-        let smeared_drawn = exact
+            mesh.dress(gpu, &wear);
+            dressed.insert(tile);
+            let level = self.ancestry.get(&tile).map_or(0, |a| a.level);
+            match item.role {
+                Role::Exact => {
+                    counts.exact += item.serves.len().max(1);
+                    exact.push(tile);
+                }
+                Role::Held => {
+                    counts.coarser += item.serves.len();
+                    exact.push(tile);
+                }
+                Role::Fallback => {
+                    counts.coarser += item.serves.len();
+                    for s in &item.serves {
+                        let wanted = self.ancestry.get(s).map_or(0, |a| a.level);
+                        let gap = wanted.saturating_sub(level);
+                        if gap > counts.worst_gap {
+                            counts.worst_gap = gap;
+                            counts.worst_gap_drawn = level;
+                            counts.worst_gap_wanted = wanted;
+                        }
+                    }
+                    fallback.push(tile);
+                }
+            }
+        }
+        // A tile both drawn as itself and standing in for another is real
+        // geometry: it is not demoted to the backdrop pass.
+        fallback.retain(|t| !exact.contains(t));
+        // The backdrop: every mesh of its level in its own drape, behind it all.
+        let mut backdrop: Vec<TileId> = Vec::new();
+        if let Some(level) = self.backdrop_level {
+            let floor: Vec<TileId> = self
+                .prepared
+                .keys()
+                .copied()
+                .filter(|t| self.ancestry.get(t).is_some_and(|a| a.level == level))
+                .collect();
+            for tile in floor {
+                if !dressed.contains(&tile) {
+                    let own: Vec<(ResourceId, &PreparedDrape)> = self
+                        .drapes
+                        .iter()
+                        .filter(|(r, d)| r.tile() == tile && d.level == level)
+                        .map(|(r, d)| (*r, d))
+                        .collect();
+                    if own.is_empty() {
+                        continue;
+                    }
+                    let wear: Vec<(ResourceId, &PreparedDrape, tuile_core::budget::UvTransform)> =
+                        own.into_iter()
+                            .map(|(r, d)| (r, d, tuile_core::budget::UvTransform::IDENTITY))
+                            .collect();
+                    if let Some(mesh) = self.prepared.get_mut(&tile) {
+                        mesh.dress(gpu, &wear);
+                    }
+                    dressed.insert(tile);
+                }
+                backdrop.push(tile);
+            }
+        }
+        // Wearers of an evicted drape that nothing dressed again this frame
+        // let go of its textures.
+        if !self.undress_wearers.is_empty() {
+            let gone = std::mem::take(&mut self.undress_wearers);
+            for (tile, mesh) in self.prepared.iter_mut() {
+                if !dressed.contains(tile) && gone.iter().any(|r| mesh.wears(*r)) {
+                    mesh.undress(gpu);
+                }
+            }
+        }
+        let level_of = |t: &TileId| self.ancestry.get(t).map_or(0, |a| a.level);
+        counts.smeared_drawn = exact
             .iter()
             .chain(fallback.iter())
             .filter(|id| {
                 self.prepared.get(id).is_some_and(|p| {
-                    p.sharpest_imagery_level.is_none_or(|sharpest| {
-                        self.level(**id).saturating_sub(sharpest) > SMEAR_GAP
-                    })
+                    p.sharpest_imagery_level
+                        .is_none_or(|sharpest| level_of(id).saturating_sub(sharpest) > SMEAR_GAP)
                 })
             })
             .count();
-        let coplanar = fallback
-            .iter()
-            .flat_map(|f| {
-                exact
-                    .iter()
-                    .filter(move |e| self.fills.contains(e) && is_ancestor(*f, **e))
-            })
-            .count();
-        let counts = Resolution {
-            stand_ins,
-            coplanar,
-            smeared_drawn,
-            ..counts
-        };
-        // What this frame could draw of the selection, where everything else
+        if counts.lost > 0 {
+            counts.deepest_lost = self
+                .draw
+                .items
+                .iter()
+                .filter(|i| !self.prepared.contains_key(&i.mesh.tile()))
+                .map(|i| level_of(&i.mesh.tile()))
+                .max()
+                .unwrap_or(0);
+        }
+        // What this frame could draw of the draw set, where everything else
         // the engine counts is published — see `tuile_core::metrics`.
         let m = tuile_core::metrics::metrics();
         m.frame_exact.set(counts.exact as u64);
         m.frame_coarser.set(counts.coarser as u64);
         m.frame_lost.set(counts.lost as u64);
-        m.frame_stand_ins.set(stand_ins as u64);
         m.frame_digest.set(
             tuile_core::determinism::digest(exact.iter().map(|t| t.0))
                 ^ tuile_core::determinism::digest(fallback.iter().map(|t| t.0)).rotate_left(29),
         );
+        let surfaces = |ids: &[TileId]| -> Vec<&PreparedTile> {
+            ids.iter().filter_map(|id| self.prepared.get(id)).collect()
+        };
         let drawn = Drawn {
-            exact: surfaces(exact),
-            fallback: surfaces(fallback),
+            exact: surfaces(&exact),
+            fallback: surfaces(&fallback),
+            backdrop: surfaces(&backdrop),
         };
         self.rebase_for_drawing(
-            queue,
-            drawn.exact.iter().chain(drawn.fallback.iter()).copied(),
+            &gpu.queue,
+            drawn
+                .exact
+                .iter()
+                .chain(drawn.fallback.iter())
+                .chain(drawn.backdrop.iter())
+                .copied(),
         );
-        (drawn, counts, unresolved)
+        (drawn, counts)
     }
 
-    /// Number of selected tiles still waiting for content or upload.
-    ///
-    /// Says how sharp the picture is, not whether it is there — see
-    /// [`ContentPump::resolve`].
-    pub fn missing(&self) -> usize {
-        self.selection
-            .iter()
-            .filter(|(t, _)| !self.prepared.contains_key(t))
-            .count()
+    /// The draw set the pump is drawing: the last step's.
+    pub fn draw_set(&self) -> &DrawSet {
+        &self.draw
     }
 
-    /// Selected tiles whose ground is not the real thing yet: absent
-    /// entirely, or held by a stand-in.
-    ///
-    /// [`Self::missing`] cannot see a stand-in — a stand-in **is** prepared;
-    /// covering the ground while the real tile travels is its whole job, and
-    /// an interactive viewer wants exactly that. A recorder does not: its
-    /// eager gate must refuse to encode while any selected ground is a flat
-    /// approximation, and this is the count it gates on.
     /// See the field: the Select counter a consumer correlates on.
     pub fn selects_seen(&self) -> u64 {
         self.selects_seen
@@ -755,31 +885,21 @@ impl ContentPump {
         self.generation_sent
     }
 
-    /// The generation the current selection answers. When this has caught up
-    /// with [`Self::generation_sent`], the selection is the last camera's —
+    /// The generation the current draw set answers. When this has caught up
+    /// with [`Self::generation_sent`], the draw set is the last camera's —
     /// the render-purity property, by construction.
     pub fn generation_selected(&self) -> u64 {
         self.generation_selected
     }
 
-    pub fn provisional(&self) -> usize {
-        self.selection
-            .iter()
-            .filter(|(t, _)| !self.prepared.contains_key(t) || self.fills.contains(t))
-            .count()
-    }
-
-    /// Whether the GPU holds a surface for `tile` — **its own**, real or
-    /// stand-in.
-    ///
-    /// The question `resolve` asks of every selected tile, and the one that
-    /// decides whether an ancestor is drawn over it. Exposed because it is the
-    /// only honest way to observe the stand-in path from outside: a stand-in
-    /// and the real tile are deliberately indistinguishable here, and a test
-    /// that could tell them apart would be testing something the renderer does
-    /// not know.
+    /// Whether the GPU holds `tile`'s mesh.
     pub fn has(&self, tile: TileId) -> bool {
         self.prepared.contains_key(&tile)
+    }
+
+    /// Whether the GPU holds `drape`.
+    pub fn has_drape(&self, drape: ResourceId) -> bool {
+        self.drapes.contains_key(&drape)
     }
 
     /// How deep a tile sits, as the *server* said — never decoded from the id.
@@ -794,39 +914,54 @@ impl ContentPump {
         self.prepared.len()
     }
 
-    /// How many tiles at or above `level` are on the GPU.
-    ///
-    /// What a host gates its first frame on: the coarse pyramid is the floor
-    /// every fallback lands on, and showing a globe before it is there is
-    /// showing the one state the whole design exists to avoid.
-    /// Every prepared tile at exactly `level`, in no particular order.
-    ///
-    /// For drawing a complete coarse layer **behind** the selection. The tiles
-    /// are already here — pinned, uploaded, and protected from eviction — and
-    /// the only thing missing was an instruction to draw them: `resolve` walks
-    /// up from *selected* tiles, so ground the traversal never selected asks
-    /// nothing of the coarse tile sitting ready beside it.
-    ///
-    /// One level, not the pyramid: a single complete level covers the globe on
-    /// its own, and level 3 is 128 tiles — a background pass that costs a
-    /// hundred draw calls rather than three thousand.
-    pub fn at_level(&self, level: u32) -> impl Iterator<Item = &PreparedTile> {
-        self.prepared
-            .iter()
-            .filter(move |(id, _)| self.level(**id) == level)
-            .map(|(_, tile)| tile)
+    /// Drapes on the GPU.
+    pub fn drape_count(&self) -> usize {
+        self.drapes.len()
     }
 
+    /// Bytes on the GPU, as acknowledged, per class.
+    pub fn held_bytes(&self) -> PerClass<u64> {
+        self.held_bytes
+    }
+
+    /// How many meshes at or above `level` are on the GPU with a drape of
+    /// their own of `layer`: what a host gates its first frame on, since the
+    /// floor is what every fallback lands on, and a floor mesh without its
+    /// drape is bare.
     pub fn prepared_through_level(&self, level: u32) -> usize {
         self.prepared
             .keys()
             .filter(|t| self.level(**t) <= level)
+            .filter(|t| {
+                self.drapes
+                    .keys()
+                    .any(|r| r.tile() == **t && r.layer() == Some(LayerId(0)))
+                    || !self.drapes.keys().any(|r| r.layer().is_some())
+            })
             .count()
     }
 
     pub fn pending_uploads(&self) -> usize {
-        self.pending.len()
+        self.queue.len()
     }
+}
+
+/// What one mesh holds once uploaded, by the measure its estimate uses:
+/// its buffers and uniform, the textures it owns, and the CPU copy kept for
+/// stitching (which unified memory pays for).
+fn mesh_bytes(prepared: &PreparedTile, content: &tuile_core::DecodedTileContent) -> u64 {
+    let copy: u64 = content
+        .meshes
+        .iter()
+        .map(|m| {
+            m.positions.len() as u64 * tuile_core::content::VERTEX_STRIDE + m.indices.len() as u64 * 4
+        })
+        .sum();
+    // The tile's uniform, at the alignment a uniform offset needs.
+    let uniform = tuile_core::budget::cost::TILE_UNIFORM_BYTES
+        .div_ceil(tuile_core::budget::cost::UNIFORM_ALIGNMENT)
+        * tuile_core::budget::cost::UNIFORM_ALIGNMENT;
+    prepared.gpu_bytes as u64 + uniform + copy
 }
 
 impl Drop for ContentPump {
@@ -853,7 +988,7 @@ impl Drop for ContentPump {
     }
 }
 
-/// The surfaces a frame draws, in the two kinds that must not be mixed.
+/// The surfaces a frame draws, in the kinds that must not be mixed.
 ///
 /// # Why they are separated
 ///
@@ -861,84 +996,52 @@ impl Drop for ContentPump {
 /// that ancestor's descendants — including the siblings that did arrive. Drawn
 /// as ordinary geometry it therefore competes with them for the depth buffer,
 /// and over real relief a coarse tessellation crosses a fine one repeatedly: the
-/// winner changes from pixel to pixel along the crossing curve. On screen that
-/// is sharp imagery and blurry imagery interleaved in ragged outlines that
-/// follow the terrain rather than the tile grid — measured at 100 % of the
-/// pixels over a tile that had its own surface, in
-/// `tests/no_two_surfaces.rs`.
+/// winner changes from pixel to pixel along the crossing curve.
 ///
-/// So a fallback is not geometry, it is **backdrop**: it is drawn without
-/// touching depth, before everything, exactly like the whole-planet shell. It
-/// still colours every pixel nothing else covers — no coverage is refused, which
-/// is what the two earlier attempts at this got wrong — but it can never win a
-/// pixel from a surface that owns that ground.
-///
-/// What it costs, stated: a fallback does not depth-test against *itself*
-/// either, so relief inside one cannot occlude relief behind it. At a grazing
-/// angle a far ridge of a stand-in ancestor can paint over a near one, for the
-/// few frames the real tile takes to arrive. That is a wrong-but-plausible
-/// picture of ground that is coarse anyway, against a per-pixel flicker over
-/// ground that is already correct.
+/// So a fallback is drawn after the surfaces that own their ground, testing
+/// depth and never writing it, and the backdrop before everything, taking no
+/// part in depth: it colours every pixel nothing else covers — no coverage is
+/// refused — but it can never win a pixel from a surface that owns it.
 pub struct Drawn<'a> {
-    /// Tiles the traversal chose, holding their own ground.
+    /// Tiles drawn as themselves, and finer tiles held on a zoom-out: each
+    /// holding its own ground.
     pub exact: Vec<&'a PreparedTile>,
     /// Ancestors standing in for ground that is not their own.
     pub fallback: Vec<&'a PreparedTile>,
+    /// A complete coarse level behind it all (see
+    /// [`ContentPump::set_backdrop_level`]).
+    pub backdrop: Vec<&'a PreparedTile>,
 }
 
-/// How a selection resolved onto what the GPU actually holds.
+/// How the draw set resolved onto what the GPU actually holds.
 ///
-/// See [`ContentPump::resolve`]. `lost` is the only one of the three that is a
-/// defect: it is ground the traversal asked for, with not one tile on its
-/// ancestor chain resident to stand in — which on screen is the clear colour,
-/// and the clear colour here is black.
+/// `lost` and `bare` are the defects: ground the view wants with nothing on
+/// its ancestor chain to cover it — the clear colour, black — and ground
+/// drawn without the drapes it needs.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Resolution {
-    /// Drawn at the level the traversal chose.
+    /// Wanted tiles drawn as themselves.
     pub exact: usize,
     /// Drawn surfaces whose sharpest draped imagery sits more than
     /// `SMEAR_GAP` levels above the tile — one texel stretched over the
     /// ground: the flat-colour smear, counted at the only honest place, the
     /// draw list itself. Tiles with no imagery at all count too.
     pub smeared_drawn: usize,
-    /// Drawn by a coarser ancestor while the chosen tile streams in.
+    /// Wanted tiles drawn by a coarser ancestor, or by finer tiles held on a
+    /// zoom-out, while their own streams in.
     pub coarser: usize,
-    /// Drawn by nothing.
+    /// Wanted tiles drawn by nothing.
     pub lost: usize,
+    /// Drawn items missing a drape they need.
+    pub bare: usize,
     /// The deepest level that was lost, which says whether the hole is a
     /// detail tile at the horizon or a whole coarse region.
     pub deepest_lost: u32,
     /// The largest number of levels any fallback had to climb.
-    ///
-    /// A stand-in one or two levels up is a softer patch of ground. One eight
-    /// levels up is a mesh spanning a whole region, interpolated straight
-    /// through the relief — and a camera near the surface is then *underneath*
-    /// it, seeing only its back faces, which the pipeline discards. That draws
-    /// nothing while counting as a success, which is why the gap is measured
-    /// and not just the fact of falling back.
     pub worst_gap: u32,
     /// The level actually drawn, and the level asked for, at that worst gap.
     pub worst_gap_drawn: u32,
     pub worst_gap_wanted: u32,
-    /// Drawn surfaces that are a stand-in rather than the tile's own content.
-    ///
-    /// Counted apart because **no other number here can see them**: a stand-in
-    /// satisfies [`ContentPump::has`], so the walk stops at it and the tile is
-    /// reported `exact` — a selection reads *complete* while the ground on
-    /// screen is an upsample of something coarser. See that method's doc, which
-    /// says the indistinguishability is deliberate.
-    pub stand_ins: usize,
-    /// Drawn (stand-in, drawn ancestor of it) pairs: **the same surface twice**.
-    ///
-    /// A stand-in is `tuile_terrain::upsample` of an ancestor — "a mesh of
-    /// exactly the same surface over exactly the child's ground". So when that
-    /// ancestor is *also* drawn, because some sibling has nothing, the two are
-    /// not two guesses at one hillside: they are one surface submitted twice,
-    /// once writing depth and once testing `Less` after it. Which one wins a
-    /// pixel is then decided by float equality, and that is z-fighting.
-    ///
-    /// Zero on `main`, which has no stand-ins at all.
-    pub coplanar: usize,
 }
 
 impl Resolution {
@@ -948,405 +1051,13 @@ impl Resolution {
     }
 }
 
-/// Which tiles to draw for a selection, and what that cost in sharpness.
-///
-/// Pure, and separated from the GPU so the invariant it encodes can be tested
-/// without a device, an adapter and a texture format.
-///
-/// # The rule, and the two ways it has been broken
-///
-/// For each selected tile: draw its own surface, or the nearest ancestor that
-/// has one. **The climb is never refused.** Coverage is the whole job, and
-/// every refusal is a hole — black ground, which the project forbids outright
-/// (see `CLAUDE.md`).
-///
-/// Two attempts to be cleverer both had to be undone, and they are recorded
-/// here so they are not attempted a third time:
-///
-/// 1. *Stop climbing once the server sends stand-ins.* An ancestor spans all of
-///    its descendants, so drawing one for a tile that lacks a surface also
-///    covers siblings that have one — two surfaces over one patch of ground,
-///    which shimmers. Removing the climb removed the shimmer and replaced it
-///    with large black rectangles wherever a stand-in had not yet arrived.
-/// 2. *Refuse only the ancestors that would overlap something already drawn.*
-///    Surgical in principle, holes in practice: refusing is still refusing, and
-///    the ground it declines to cover is black until something else arrives.
-///
-/// The overlap is real and it is the lesser evil. Removing it means giving every
-/// selected tile a surface of its own **before** the ancestor stops being drawn
-/// — new active, then old inactive, never a gap — not withholding the fallback
-/// and hoping.
-///
-/// `parent_of` and `level_of` are lookups into what the server has said, not
-/// arithmetic on the handle. See [`ContentPump::resolve`] for why that
-/// distinction is the difference between a fallback chain and a black screen.
-fn walk(
-    selection: &[(TileId, f64)],
-    has: impl Fn(TileId) -> bool,
-    parent_of: impl Fn(TileId) -> Option<TileId>,
-    level_of: impl Fn(TileId) -> u32,
-) -> (Vec<TileId>, Vec<TileId>, Resolution, Vec<TileId>) {
-    let mut out = Vec::new();
-    let mut fallback = Vec::new();
-    let mut seen = HashSet::new();
-    let mut counts = Resolution::default();
-    let mut unresolved = Vec::new();
-    for (tile, _) in selection {
-        let mut cur = Some(*tile);
-        let mut exact = true;
-        loop {
-            let Some(id) = cur else {
-                // Off the top of the tree with nothing anywhere on the way: this
-                // ground is drawn by nothing, and that is the one number worth
-                // shouting about.
-                counts.lost += 1;
-                counts.deepest_lost = counts.deepest_lost.max(level_of(*tile));
-                unresolved.push(*tile);
-                break;
-            };
-            if has(id) {
-                if seen.insert(id) {
-                    if exact {
-                        out.push(id);
-                    } else {
-                        fallback.push(id);
-                    }
-                }
-                if exact {
-                    counts.exact += 1;
-                } else {
-                    counts.coarser += 1;
-                    unresolved.push(*tile);
-                    let gap = level_of(*tile).saturating_sub(level_of(id));
-                    if gap > counts.worst_gap {
-                        counts.worst_gap = gap;
-                        counts.worst_gap_drawn = level_of(id);
-                        counts.worst_gap_wanted = level_of(*tile);
-                    }
-                }
-                break;
-            }
-            exact = false;
-            cur = parent_of(id);
-        }
-    }
-    // A tile can be both: chosen by the traversal *and* the nearest resident
-    // ancestor of some other tile. It is then real geometry and must not be
-    // demoted — the fallback list is only for surfaces standing in for ground
-    // that is not their own.
-    let exact: HashSet<TileId> = out.iter().copied().collect();
-    fallback.retain(|id| !exact.contains(id));
-    (out, fallback, counts, unresolved)
-}
-
 #[cfg(test)]
-mod coverage_tests {
-    use super::*;
-
-    /// The terrain encoding, read out of the handle.
-    ///
-    /// Legitimate **here and nowhere else**: every fixture in this module builds
-    /// its ids with [`TileId::from_terrain`], so a parent really is derivable
-    /// from them. Production reads what the server said — see
-    /// [`ContentPump::resolve`], and the black screen that came of guessing.
-    fn parent_of(id: TileId) -> Option<TileId> {
-        let (z, x, y) = id.terrain_coord();
-        (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2))
-    }
-
-    fn level_of(id: TileId) -> u32 {
-        id.terrain_coord().0
-    }
-
-    fn sel(tiles: &[TileId]) -> Vec<(TileId, f64)> {
-        tiles.iter().map(|t| (*t, 0.0)).collect()
-    }
-
-    /// How many of `drawn` sit over ground another of them already covers.
-    ///
-    /// An ancestor spans every one of its descendants, so an ancestor and a
-    /// descendant both being drawn *into the same depth buffer* is two surfaces
-    /// over one patch of ground: both write depth, and over real relief a coarse
-    /// tessellation crosses a fine one repeatedly, so the winner changes from
-    /// pixel to pixel along the crossing curve.
-    ///
-    /// Counting it is the point. "Two surfaces over the same ground" was
-    /// described in a comment for months and never measured, which is why it
-    /// survived three wrong explanations before
-    /// `tests/no_two_surfaces.rs` put a number on it.
-    fn overlapping_surfaces(drawn: &[TileId]) -> usize {
-        let is_ancestor_of = |a: TileId, b: TileId| {
-            let (az, ax, ay) = a.terrain_coord();
-            let (bz, bx, by) = b.terrain_coord();
-            let up = match bz.checked_sub(az) {
-                Some(0) | None => return false,
-                Some(up) => up,
-            };
-            bx >> up == ax && by >> up == ay
-        };
-        drawn
-            .iter()
-            .flat_map(|a| drawn.iter().map(move |b| (*a, *b)))
-            .filter(|(a, b)| is_ancestor_of(*a, *b))
-            .count()
-    }
-
-    /// **Coverage is never traded away.** A selected tile with no surface of its
-    /// own is still covered by its nearest resident ancestor.
-    ///
-    /// Two attempts to remove the overlap by *withholding* that ancestor — stop
-    /// climbing entirely, then refuse only the ancestors that overlap — each
-    /// replaced the shimmer with large black rectangles at both zoom-in and
-    /// zoom-out. Black ground is forbidden (`CLAUDE.md`); shimmer is not.
-    #[test]
-    fn an_ancestor_still_covers_a_tile_that_has_not_arrived() {
-        let here = TileId::from_terrain(3, 4, 4);
-        let neighbour = TileId::from_terrain(3, 5, 4);
-        let grandparent = TileId::from_terrain(1, 1, 1);
-        let selection = sel(&[here, neighbour]);
-        let has = |id: TileId| id == here || id == grandparent;
-
-        let (exact, fallback, counts, unresolved) = walk(&selection, has, parent_of, level_of);
-        assert_eq!(
-            exact,
-            vec![here],
-            "the tile that arrived is the only one holding its own ground"
-        );
-        assert_eq!(
-            fallback,
-            vec![grandparent],
-            "the fallback was withheld, which is a hole — black ground is never \
-             the lesser evil"
-        );
-        assert_eq!(counts.lost, 0, "nothing may be left uncovered");
-        assert_eq!(counts.exact, 1);
-        assert_eq!(counts.coarser, 1);
-        assert_eq!(
-            unresolved,
-            vec![neighbour],
-            "a tile drawn only by an ancestor must still be reported as wanting \
-             its own surface"
-        );
-    }
-
-    /// **Nothing that competes for the depth buffer overlaps anything else.**
-    ///
-    /// This is the invariant, and it holds for *every* selection rather than for
-    /// the lucky ones. The two kinds are separated at the source: tiles holding
-    /// their own ground go to `exact` and compete normally; ancestors standing in
-    /// for ground that is not theirs go to `fallback` and are drawn as backdrop,
-    /// without touching depth. So an ancestor can never win a pixel from a
-    /// surface that owns it, whatever the relief does.
-    ///
-    /// The fixture is the one that used to z-fight: a tile, a neighbour that has
-    /// not arrived, and the grandparent covering both.
-    #[test]
-    fn the_depth_buffer_never_sees_two_surfaces_on_one_patch() {
-        let here = TileId::from_terrain(3, 4, 4);
-        let neighbour = TileId::from_terrain(3, 5, 4);
-        let grandparent = TileId::from_terrain(1, 1, 1);
-        let selection = sel(&[here, neighbour]);
-
-        let (exact, fallback, _, _) = walk(
-            &selection,
-            |id| id == here || id == grandparent,
-            parent_of,
-            level_of,
-        );
-        assert_eq!(
-            overlapping_surfaces(&exact),
-            0,
-            "two competing surfaces over one patch of ground — exact: {exact:?}"
-        );
-        assert!(
-            !exact.contains(&grandparent),
-            "the ancestor is standing in for ground that is not its own and must \
-             not compete for it — exact: {exact:?}, fallback: {fallback:?}"
-        );
-    }
-
-    /// **A tile that is both chosen and an ancestor stays real geometry.**
-    ///
-    /// The demotion is per *role*, not per tile: a coarse tile the traversal
-    /// selected in its own right owns its ground, and it may simultaneously be
-    /// the nearest resident ancestor of some deeper tile that has not arrived.
-    /// Demoting it then would take a chosen surface out of the depth buffer and
-    /// let anything drawn later paint over it.
-    #[test]
-    fn a_selected_tile_is_not_demoted_because_something_else_leans_on_it() {
-        let coarse = TileId::from_terrain(1, 1, 1);
-        let deep = TileId::from_terrain(3, 4, 4);
-        let selection = sel(&[coarse, deep]);
-
-        let (exact, fallback, counts, _) = walk(&selection, |id| id == coarse, parent_of, level_of);
-        assert_eq!(
-            exact,
-            vec![coarse],
-            "the selected coarse tile owns its ground"
-        );
-        assert!(
-            fallback.is_empty(),
-            "the same surface must not be drawn twice — fallback: {fallback:?}"
-        );
-        assert_eq!(counts.lost, 0);
-        assert_eq!(counts.coarser, 1, "the deep tile is still standing in");
-    }
-
-    /// **A stand-in moves a tile out of the fallback set entirely.**
-    ///
-    /// A stand-in *is* that tile's surface, so the walk stops there and no
-    /// ancestor is named at all. Nothing is refused — which is the difference
-    /// between this and the two attempts that withheld the fallback.
-    #[test]
-    fn a_stand_in_leaves_nothing_to_fall_back_to() {
-        let here = TileId::from_terrain(3, 4, 4);
-        let neighbour = TileId::from_terrain(3, 5, 4);
-        let grandparent = TileId::from_terrain(1, 1, 1);
-        let selection = sel(&[here, neighbour]);
-        // To the consumer a stand-in is indistinguishable from the real tile,
-        // which is the design: `resolve` asks "do I have a surface for this?".
-        let has = |id: TileId| id == here || id == neighbour || id == grandparent;
-
-        let (exact, fallback, counts, _) = walk(&selection, has, parent_of, level_of);
-        assert_eq!(exact.len(), 2, "one surface per selected tile — {exact:?}");
-        assert!(
-            fallback.is_empty(),
-            "nothing left to stand in — {fallback:?}"
-        );
-        assert_eq!(counts.coarser, 0);
-        assert_eq!(counts.lost, 0);
-    }
-
-    /// **A tileset gets a fallback chain too.**
-    ///
-    /// The walk climbs by asking what the server said, not by taking the handle
-    /// apart. A 3D Tiles `TileId` is an arena index: shifting it right by 54
-    /// answers level 0 for every tile, so a host that derived the parent got
-    /// `None` at the first step and the chain did not exist. Every unready tile
-    /// counted as lost — the black square — in a configuration that from the
-    /// outside looked exactly like a working one.
-    ///
-    /// The ids here are small consecutive integers, which is what
-    /// [`crate::ContentPump`] receives from a `Tileset`-backed session, and the
-    /// ancestry is stated rather than computed.
-    #[test]
-    fn an_arena_backed_selection_still_falls_back_to_its_ancestor() {
-        let root = TileId(1);
-        let mid = TileId(2);
-        let leaf = TileId(3);
-        let chain = |id: TileId| match id {
-            t if t == leaf => Ancestry {
-                level: 2,
-                parent: Some(mid),
-            },
-            t if t == mid => Ancestry {
-                level: 1,
-                parent: Some(root),
-            },
-            _ => Ancestry {
-                level: 0,
-                parent: None,
-            },
-        };
-        let selection = vec![(leaf, 0.0)];
-
-        let (exact, fallback, counts, unresolved) = walk(
-            &selection,
-            |id| id == root,
-            |id| chain(id).parent,
-            |id| chain(id).level,
-        );
-        assert!(exact.is_empty(), "the leaf has no surface of its own");
-        assert_eq!(
-            fallback,
-            vec![root],
-            "the walk must climb an arena chain: {counts:?}"
-        );
-        assert_eq!(
-            counts.lost, 0,
-            "ground drawn by nothing is the black square"
-        );
-        assert_eq!(counts.coarser, 1);
-        assert_eq!(counts.worst_gap, 2, "two levels of sharpness given up");
-        assert_eq!(unresolved, vec![leaf]);
-    }
-
-    /// **A `Retire` takes back stand-ins and leaves real content alone** — in
-    /// the queue above all, because that is where the original defect lived:
-    /// `Content` is sent once per residency, and an `Evict` purging it from the
-    /// upload queue destroyed the only delivery there would ever be. The tile
-    /// then wore its stand-in for the rest of the session.
-    #[test]
-    fn a_retire_spares_queued_real_content() {
-        fn empty() -> tuile_core::content::DecodedTileContent {
-            tuile_core::content::DecodedTileContent {
-                withheld_drape: None,
-                meshes: Vec::new(),
-                textures: Vec::new(),
-                imagery: Vec::new(),
-                local_origin_ecef: glam::DVec3::ZERO,
-                transform_local: glam::Mat4::IDENTITY,
-            }
-        }
-        let anc = |level| Ancestry {
-            level,
-            parent: None,
-        };
-        let real = TileId(7);
-        let filled = TileId(8);
-        let mut pump = ContentPump::new(glam::DVec3::ZERO);
-        pump.on_message(ServerMessage::Content {
-            tile: real,
-            ancestry: anc(3),
-            content: tuile_core::content::TileContent::Decoded(empty()),
-        });
-        pump.on_message(ServerMessage::Fill {
-            tile: filled,
-            ancestry: anc(3),
-            content: empty(),
-        });
-        assert_eq!(pump.pending_uploads(), 2);
-
-        // Retire names both. Only the fill may go.
-        pump.on_message(ServerMessage::Retire {
-            tiles: vec![real, filled],
-        });
-        assert_eq!(
-            pump.pending_uploads(),
-            1,
-            "the queued fill goes, the queued real content stays"
-        );
-        // And what stays is the real one: an Evict for it still finds it.
-        pump.on_message(ServerMessage::Evict { tiles: vec![real] });
-        assert_eq!(
-            pump.pending_uploads(),
-            0,
-            "the survivor was the real content, which a true Evict may take"
-        );
-    }
-
-    /// Nothing anywhere on the chain is the one case that is genuinely bare, and
-    /// it must be counted rather than hidden — it is the number that says the
-    /// picture is broken.
-    #[test]
-    fn a_chain_with_nothing_on_it_is_counted_as_lost() {
-        let orphan = TileId::from_terrain(3, 4, 4);
-        let (exact, fallback, counts, unresolved) =
-            walk(&sel(&[orphan]), |_| false, parent_of, level_of);
-        assert!(exact.is_empty() && fallback.is_empty());
-        assert_eq!(counts.lost, 1);
-        assert_eq!(counts.deepest_lost, 3);
-        assert_eq!(unresolved, vec![orphan]);
-    }
-}
-
-#[cfg(test)]
-mod drain_tests {
+mod tests {
     use super::*;
     use std::collections::VecDeque;
-    use std::sync::Mutex;
-    use tuile_core::content::TileContent;
-    use tuile_core::protocol::{Ancestry, StreamError};
+    use std::sync::{Arc, Mutex};
+    use tuile_core::budget::{DrapeChoice, DrawItem, SwapGroup, UvTransform};
+    use tuile_core::protocol::StreamError;
 
     /// A stream that hands out a script of server messages, and keeps what
     /// was sent to it.
@@ -1370,32 +1081,49 @@ mod drain_tests {
         }
     }
 
-    fn content(tile: TileId) -> ServerMessage {
+    fn mesh(tile: TileId, gen: u64) -> ServerMessage {
         ServerMessage::Content {
-            tile,
+            resource: ResourceId::Mesh(tile),
+            gen: Generation(gen),
+            class: Class::TerrainMesh,
             ancestry: Ancestry {
                 level: 0,
                 parent: None,
             },
-            content: TileContent::Decoded(DecodedTileContent {
+            content: ResourceContent::Mesh(Arc::new(tuile_core::DecodedTileContent {
                 meshes: Vec::new(),
                 textures: Vec::new(),
                 imagery: Vec::new(),
                 withheld_drape: None,
                 local_origin_ecef: DVec3::ZERO,
                 transform_local: glam::Mat4::IDENTITY,
-            }),
+            })),
+        }
+    }
+
+    fn select(draw: DrawSet, plan: UploadPlan) -> ServerMessage {
+        ServerMessage::Select {
+            draw,
+            plan,
+            ancestry: Vec::new(),
+            stats: TraversalStats::default(),
+            hard_limit: PerClass::splat(Bytes::MAX),
+            frame_ready: false,
+            converged: false,
+            lost: 0,
+            bare: 0,
+            generation: 1,
         }
     }
 
     /// Draining takes every message and uploads nothing: content waits in
     /// the queue for a frame, and nothing is acknowledged — the server must
-    /// not believe a tile is on the GPU when no frame has run.
+    /// not believe a resource is on the GPU when no frame has run.
     #[test]
     fn draining_takes_messages_and_does_no_gpu_work() {
         let mut stream = Scripted::default();
-        stream.inbox.push_back(content(TileId(1)));
-        stream.inbox.push_back(content(TileId(2)));
+        stream.inbox.push_back(mesh(TileId(1), 1));
+        stream.inbox.push_back(mesh(TileId(2), 2));
         let mut pump = ContentPump::new(DVec3::ZERO);
         assert_eq!(pump.drain(&mut stream), 2);
         assert_eq!(pump.pending_uploads(), 2);
@@ -1426,5 +1154,101 @@ mod drain_tests {
             .collect();
         assert_eq!(generations, [1, 2]);
         assert_eq!(pump.generation_sent(), 2);
+    }
+
+    /// **Uploads follow the plan's order, then the rest.** The plan names the
+    /// fine tile before the coarse one; the queue's own order (by id) is the
+    /// other way round, and loses.
+    #[test]
+    fn the_queue_uploads_in_the_plans_order() {
+        let mut stream = Scripted::default();
+        let (coarse, fine, other) = (TileId(1), TileId(9), TileId(5));
+        stream.inbox.push_back(mesh(coarse, 1));
+        stream.inbox.push_back(mesh(fine, 2));
+        stream.inbox.push_back(mesh(other, 3));
+        stream.inbox.push_back(select(
+            DrawSet::default(),
+            UploadPlan {
+                items: vec![ResourceId::Mesh(fine), ResourceId::Mesh(coarse)],
+                bytes: Bytes::ZERO,
+                groups: vec![SwapGroup::default()],
+            },
+        ));
+        let mut pump = ContentPump::new(DVec3::ZERO);
+        pump.drain(&mut stream);
+        assert_eq!(
+            pump.upload_order(),
+            vec![
+                ResourceId::Mesh(fine),
+                ResourceId::Mesh(coarse),
+                ResourceId::Mesh(other)
+            ]
+        );
+    }
+
+    /// **A cancel drops only its own generation**, and an eviction takes a
+    /// queued copy too: uploaded after its own eviction it would be held for
+    /// ever, the server no longer counting it.
+    #[test]
+    fn a_cancel_drops_its_generation_and_an_evict_its_queued_copy() {
+        let mut stream = Scripted::default();
+        stream.inbox.push_back(mesh(TileId(1), 1));
+        stream.inbox.push_back(mesh(TileId(2), 2));
+        stream.inbox.push_back(ServerMessage::Cancel {
+            resources: vec![(ResourceId::Mesh(TileId(1)), Generation(7))],
+        });
+        let mut pump = ContentPump::new(DVec3::ZERO);
+        pump.drain(&mut stream);
+        assert_eq!(pump.pending_uploads(), 2, "another generation's cancel took it");
+        stream.inbox.push_back(ServerMessage::Cancel {
+            resources: vec![(ResourceId::Mesh(TileId(1)), Generation(1))],
+        });
+        stream.inbox.push_back(ServerMessage::Evict {
+            resources: vec![ResourceId::Mesh(TileId(2))],
+        });
+        pump.drain(&mut stream);
+        assert_eq!(pump.pending_uploads(), 0);
+    }
+
+    /// **A layer worn through an ancestor's transform lands where the
+    /// ancestor's pixels are.** A child's south-east quarter, worn from its
+    /// parent's drape: its uv origin is the parent's middle, and a layer
+    /// covering only the parent's north-west quarter does not reach it.
+    #[test]
+    fn a_drape_worn_from_an_ancestor_lands_on_its_pixels() {
+        let quarter = UvTransform {
+            scale: [0.5, 0.5],
+            offset: [0.5, 0.5],
+        };
+        let whole = tuile_core::raster::Placement {
+            coverage: [0.0, 0.0, 1.0, 1.0],
+            translation: [0.0, 0.0],
+            scale: [1.0, 1.0],
+        };
+        let through = whole.through(quarter).expect("it covers the child");
+        // The child's uv 0 is the parent's 0.5, its uv 1 the parent's 1.
+        assert_eq!(through.translation, [0.5, 0.5]);
+        assert_eq!(through.scale, [0.5, 0.5]);
+        let north_west = tuile_core::raster::Placement {
+            coverage: [0.0, 0.0, 0.5, 0.5],
+            ..whole
+        };
+        assert!(
+            north_west
+                .through(quarter)
+                .is_none_or(|p| p.coverage[2] <= 0.0 || p.coverage[3] <= 0.0),
+            "a layer over another quarter reaches the child"
+        );
+        let _ = (DrapeChoice {
+            resource: ResourceId::drape(TileId(1), LayerId(0), 3),
+            layer: LayerId(0),
+            level: 3,
+            uv: quarter,
+        }, DrawItem {
+            mesh: ResourceId::Mesh(TileId(2)),
+            role: Role::Exact,
+            drapes: Vec::new(),
+            serves: vec![TileId(2)],
+        });
     }
 }
