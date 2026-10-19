@@ -13,7 +13,7 @@ use web_time::Instant;
 
 use tuile_core::protocol::{ClientMessage, GeometryStream};
 use winit::event::TouchPhase;
-use winit::event_loop::{ActiveEventLoop, ControlFlow};
+use winit::event_loop::ControlFlow;
 
 use super::demand::{Busy, Pace, IDLE_WAKE};
 use super::lifecycle::Step;
@@ -45,8 +45,13 @@ impl App {
             TouchPhase::Ended => Phase::Ended,
             TouchPhase::Cancelled => Phase::Cancelled,
         };
-        let at = (touch.location.x, touch.location.y);
-        for gesture in self.touches.on(Instant::now(), touch.id, phase, at) {
+        self.finger(touch.id, phase, (touch.location.x, touch.location.y));
+    }
+
+    /// One finger event, in device pixels: through the recognizer, then
+    /// carried out.
+    pub(crate) fn finger(&mut self, id: u64, phase: Phase, at: (f64, f64)) {
+        for gesture in self.touches.on(Instant::now(), id, phase, at) {
             self.gesture(gesture);
         }
         self.demand.poke();
@@ -201,14 +206,14 @@ impl App {
 
     /// A phone's turn of the loop: a frame when one is due, and otherwise a
     /// sleep until it is — never a spin.
-    pub(super) fn pace_the_frames(&mut self, event_loop: &ActiveEventLoop) {
+    pub(super) fn pace_the_frames(&mut self) -> ControlFlow {
         let now = Instant::now();
         self.read_the_pressure(now);
         // In front with no surface: the one made on the way back failed. Made
         // again on every turn until it exists — a screen that stays empty is
         // not an option.
         if self.lifecycle.phase() == super::lifecycle::Phase::Active
-            && self.active.as_ref().is_some_and(|a| a.surface.is_none())
+            && self.active.as_ref().is_some_and(|a| a.screen.is_released())
         {
             self.restore_the_surface();
         }
@@ -220,12 +225,11 @@ impl App {
             if let (Some(active), Some(session)) = (self.active.as_mut(), self.session.as_mut()) {
                 active.pump.drain(&mut session.stream);
             }
-            event_loop.set_control_flow(if self.session.is_some() {
+            return if self.session.is_some() {
                 ControlFlow::WaitUntil(now + IDLE_WAKE)
             } else {
                 ControlFlow::Wait
-            });
-            return;
+            };
         }
         self.read_the_device(now);
         if let Some(held) = self.touches.tick(now) {
@@ -243,11 +247,11 @@ impl App {
         let due = self.pacing.last_frame + interval;
         if now >= due {
             if let Some(active) = self.active.as_ref() {
-                active.window.request_redraw();
+                active.screen.request_redraw();
             }
-            event_loop.set_control_flow(ControlFlow::Wait);
+            ControlFlow::Wait
         } else {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(due));
+            ControlFlow::WaitUntil(due)
         }
     }
 
@@ -380,13 +384,9 @@ impl Carry for App {
     }
 
     fn resend_view(&mut self) {
-        let (width, height) = self.viewport();
-        let view = self
-            .controller
-            .camera
-            .view_state(glam::DVec2::new(width, height));
+        let views = self.eye_views();
         if let (Some(active), Some(session)) = (self.active.as_mut(), self.session.as_mut()) {
-            active.pump.send_view(&mut session.stream, &[view]);
+            active.pump.send_view(&mut session.stream, &views);
         }
     }
 

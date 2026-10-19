@@ -148,7 +148,8 @@ pub(crate) struct Plan {
     pub terrain: TerrainChoice,
     pub layers: &'static [ImageryChoice],
     pub opening: usize,
-    pub store: String,
+    /// Where the tile store lives on disk.
+    pub store: std::path::PathBuf,
     pub config: tuile_core::traversal::Config,
     pub profile: crate::profile::Profile,
     /// See [`crate::launch::START_TIMEOUT`].
@@ -181,7 +182,7 @@ async fn bring_up(plan: Plan, runtime: tokio::runtime::Handle) -> Outcome {
 
 async fn bring_up_now(plan: Plan, runtime: tokio::runtime::Handle) -> Outcome {
     let sources = plan.host.connect().await?;
-    let store = crate::native::store::open(
+    let store = crate::native::store::open_at(
         &plan.store,
         plan.profile.store_memory_bytes,
         plan.profile.store_disk_bytes,
@@ -294,7 +295,7 @@ mod tests {
             terrain: Stalled.terrain(),
             layers: LAYERS.get_or_init(|| Stalled.imagery()),
             opening: 0,
-            store: "launch-test".into(),
+            store: std::env::temp_dir().join("launch-test"),
             config: tuile_core::traversal::Config::default(),
             profile: crate::profile::Profile::desktop(),
             timeout: crate::launch::START_TIMEOUT,

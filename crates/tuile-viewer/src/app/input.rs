@@ -61,27 +61,10 @@ impl App {
             // how many device pixels a point is worth, and so how deep the
             // imagery should go. Winit sends the new size straight after, so
             // there is nothing to rebuild here.
-            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                if let Some(active) = self.active.as_mut() {
-                    active.scale = scale_factor.max(1.0);
-                    tracing::info!(scale = active.scale, "display density changed");
-                }
-            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => self.rescaled(scale_factor),
             // On a phone, a rotation: the drawable turns, and with it the
             // safe area the controls keep to.
-            WindowEvent::Resized(new) => {
-                if let Some(active) = self.active.as_mut() {
-                    active.size = (new.width.max(1), new.height.max(1));
-                    active.safe = super::setup::safe_area(&active.window, active.size);
-                    // A released surface is configured when it is made again.
-                    if active.surface.is_some() {
-                        configure_surface(active);
-                        active.targets.resize(&active.gpu, active.size);
-                    }
-                    active.window.request_redraw();
-                }
-                self.demand.poke();
-            }
+            WindowEvent::Resized(new) => self.resized((new.width, new.height)),
             WindowEvent::Touch(touch) => self.on_touch(touch),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 match event.logical_key {
@@ -161,51 +144,11 @@ impl App {
                 self.pointer.cursor = cur;
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                self.flight = None;
                 let amount = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y as f64,
                     MouseScrollDelta::PixelDelta(p) => p.y / 50.0,
                 };
-                // Instrumented on request: a view that turns under a zoom has
-                // survived two rounds of tests that reproduce the gesture and
-                // pass, so the gesture being reproduced is evidently not the one
-                // being made. Log the input and the camera, per wheel event, and
-                // read it rather than reason about it.
-                let before = *self.controller.target();
-                let picked = self.controller.pick(self.pointer.cursor, self.viewport());
-                self.controller
-                    .zoom(amount, self.pointer.cursor, self.viewport());
-                let after = *self.controller.target();
-                let turn = {
-                    let d = (after.heading() - before.heading()).abs();
-                    d.min(std::f64::consts::TAU - d).to_degrees()
-                };
-                let at = |c: &tuile_camera::GlobeCamera| {
-                    let g = tuile_core::geo::ecef_to_geodetic(c.position);
-                    (g.lat.to_degrees(), g.lon.to_degrees(), g.height)
-                };
-                let (lat0, lon0, alt0) = at(&before);
-                let (lat1, lon1, alt1) = at(&after);
-                tracing::info!(
-                    "WHEEL {amount:+.2} at cursor {:.0},{:.0} of {:?} | picked {} | \
-                     alt {alt0:.0} -> {alt1:.0} m | pos {lat0:.5},{lon0:.5} -> \
-                     {lat1:.5},{lon1:.5} | heading {:.2} -> {:.2} (TURN {turn:.2} deg) | \
-                     pitch {:.2} -> {:.2}",
-                    self.pointer.cursor.0,
-                    self.pointer.cursor.1,
-                    self.viewport(),
-                    match picked {
-                        Some(p) => {
-                            let g = tuile_core::geo::ecef_to_geodetic(p);
-                            format!("{:.5},{:.5}", g.lat.to_degrees(), g.lon.to_degrees())
-                        }
-                        None => "NOTHING — fell back to the point below the eye".to_owned(),
-                    },
-                    before.heading().to_degrees(),
-                    after.heading().to_degrees(),
-                    before.pitch().to_degrees(),
-                    after.pitch().to_degrees(),
-                );
+                self.wheel(amount);
             }
             // The display slept, the window was minimized or another window
             // covers it; on a phone, the application left the front; in a
@@ -214,5 +157,84 @@ impl App {
             WindowEvent::RedrawRequested => self.render(),
             _ => {}
         }
+    }
+
+    /// The display's density changed: how many device pixels a point is
+    /// worth, and so how deep the imagery should go. A window is sent its
+    /// new size straight after, so there is nothing to rebuild here.
+    pub(crate) fn rescaled(&mut self, scale_factor: f64) {
+        if let Some(active) = self.active.as_mut() {
+            active.scale = scale_factor.max(1.0);
+            tracing::info!(scale = active.scale, "display density changed");
+        }
+    }
+
+    /// The drawable has a new size, in device pixels — on a phone, a
+    /// rotation, which turns the safe area the controls keep to with it.
+    pub(crate) fn resized(&mut self, size: (u32, u32)) {
+        if let Some(active) = self.active.as_mut() {
+            active.size = (size.0.max(1), size.1.max(1));
+            active.safe = active.screen.safe_area(active.size);
+            // A released surface is configured when it is made again.
+            if !active.screen.is_released() {
+                configure_surface(active);
+                active.targets.resize(&active.gpu, active.size);
+            }
+            active.screen.request_redraw();
+        }
+        self.demand.poke();
+    }
+
+    /// The wheel turned by `amount` lines, at the pointer: a zoom about the
+    /// ground under it. A hand on the globe ends any glide.
+    pub(crate) fn wheel(&mut self, amount: f64) {
+        self.flight = None;
+        // Instrumented on request: a view that turns under a zoom has
+        // survived two rounds of tests that reproduce the gesture and
+        // pass, so the gesture being reproduced is evidently not the one
+        // being made. Log the input and the camera, per wheel event, and
+        // read it rather than reason about it.
+        let before = *self.controller.target();
+        let picked = self.controller.pick(self.pointer.cursor, self.viewport());
+        self.controller
+            .zoom(amount, self.pointer.cursor, self.viewport());
+        let after = *self.controller.target();
+        let turn = {
+            let d = (after.heading() - before.heading()).abs();
+            d.min(std::f64::consts::TAU - d).to_degrees()
+        };
+        let at = |c: &tuile_camera::GlobeCamera| {
+            let g = tuile_core::geo::ecef_to_geodetic(c.position);
+            (g.lat.to_degrees(), g.lon.to_degrees(), g.height)
+        };
+        let (lat0, lon0, alt0) = at(&before);
+        let (lat1, lon1, alt1) = at(&after);
+        tracing::info!(
+            "WHEEL {amount:+.2} at cursor {:.0},{:.0} of {:?} | picked {} | \
+                     alt {alt0:.0} -> {alt1:.0} m | pos {lat0:.5},{lon0:.5} -> \
+                     {lat1:.5},{lon1:.5} | heading {:.2} -> {:.2} (TURN {turn:.2} deg) | \
+                     pitch {:.2} -> {:.2}",
+            self.pointer.cursor.0,
+            self.pointer.cursor.1,
+            self.viewport(),
+            match picked {
+                Some(p) => {
+                    let g = tuile_core::geo::ecef_to_geodetic(p);
+                    format!("{:.5},{:.5}", g.lat.to_degrees(), g.lon.to_degrees())
+                }
+                None => "NOTHING — fell back to the point below the eye".to_owned(),
+            },
+            before.heading().to_degrees(),
+            after.heading().to_degrees(),
+            before.pitch().to_degrees(),
+            after.pitch().to_degrees(),
+        );
+    }
+
+    /// Puts the pointer at `at`, in device pixels, as a mouse moving there
+    /// with no button held does.
+    #[cfg(feature = "control")]
+    pub(crate) fn point_at(&mut self, at: (f64, f64)) {
+        self.pointer.cursor = at;
     }
 }

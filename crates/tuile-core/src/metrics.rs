@@ -521,6 +521,36 @@ pub struct Metrics {
     /// notice.
     pub tiles_filled: Gauge,
 
+    // --- The frame, as drawn ---
+    //
+    // What the consumer's last resolve made of the selection. The server's
+    // `tiles_selected` says what was asked for; these say what the frame could
+    // draw of it, which is the half a person sees. `frame_lost` is the one that
+    // matters most: ground the traversal asked for with nothing on its
+    // ancestor chain to stand in — held up only by the backstop shell, and
+    // black where there is none.
+    /// Selected tiles the last frame drew with their own surface.
+    pub frame_exact: Gauge,
+    /// Selected tiles the last frame drew with a coarser ancestor standing in:
+    /// soft ground, still covered.
+    pub frame_coarser: Gauge,
+    /// Selected tiles the last frame drew with nothing at all: a hole.
+    pub frame_lost: Gauge,
+    /// Selected tiles the last frame drew with a stand-in rather than their
+    /// own content — counted as exact by every other number here.
+    pub frame_stand_ins: Gauge,
+    /// A digest of what the last frame drew: the tiles drawn exactly and the
+    /// ancestors drawn in fallback, each set sorted
+    /// ([`crate::determinism::digest`]). Constant while the picture is; two
+    /// runs that draw the same ground read the same number.
+    pub frame_digest: Gauge,
+    /// Per eye of the last frame read back, the pixels whose ray meets the
+    /// globe, and how many of those came out the clear colour. Set by whoever
+    /// reads a frame back — a headless run, a traced session — and left alone
+    /// by a session that never does.
+    pub eye_ground_pixels: ByEye,
+    pub eye_black_pixels: ByEye,
+
     // --- Bake ---
     //
     // A bake is a loop over frames on one thread: ask for a pose, resolve the
@@ -652,6 +682,155 @@ pub const TILE_FETCH_SECONDS_BUCKETS: [f64; 17] = [
     4.096, 8.192, 16.384, 32.768,
 ];
 
+/// How many eyes a per-eye series covers: a stereo pair, with room for a
+/// rig of four.
+pub const EYES: usize = 4;
+
+/// One series broken down by eye — the views a frame is drawn for, one for a
+/// window and two for a headset.
+///
+/// An eye past the end is folded into the last one, as [`ByLevel`] folds a
+/// level: a miscounted eye is a bug, a silently missing one is a mystery.
+#[derive(Debug)]
+pub struct ByEye([AtomicU64; EYES]);
+
+impl Default for ByEye {
+    fn default() -> Self {
+        Self([const { AtomicU64::new(0) }; EYES])
+    }
+}
+
+impl ByEye {
+    fn slot(eye: usize) -> usize {
+        eye.min(EYES - 1)
+    }
+
+    pub fn set(&self, eye: usize, v: u64) {
+        self.0[Self::slot(eye)].store(v, ORDER);
+    }
+    pub fn get(&self, eye: usize) -> u64 {
+        self.0[Self::slot(eye)].load(ORDER)
+    }
+    pub fn clear(&self) {
+        for slot in &self.0 {
+            slot.store(0, ORDER);
+        }
+    }
+    fn all(&self) -> [u64; EYES] {
+        std::array::from_fn(|eye| self.get(eye))
+    }
+}
+
+/// Declares [`Snapshot`] once, from the two lists of fields it copies, so the
+/// struct, the copy and the difference cannot disagree about which field is a
+/// counter.
+macro_rules! snapshot {
+    (counters: [$($c:ident),* $(,)?], gauges: [$($g:ident),* $(,)?] $(,)?) => {
+        /// The engine's numbers at one instant, as plain values: every counter
+        /// and gauge of [`Metrics`] that counts or weighs something, under the
+        /// name it is published by (`tuile_<name>`), the per-level series as
+        /// their totals and the per-eye series as arrays.
+        ///
+        /// No timer is here, deliberately: a duration is the one thing two
+        /// runs of the same script never agree on, and a snapshot is made to
+        /// be compared. Durations stay behind the exporter.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+        pub struct Snapshot {
+            $(pub $c: u64,)*
+            $(pub $g: u64,)*
+            /// Mesh bytes on the GPU, all levels.
+            pub mesh_bytes: u64,
+            /// Imagery bytes on the GPU, all levels, each texture once.
+            pub texture_bytes: u64,
+            /// Meshes on the GPU, all levels.
+            pub meshes: u64,
+            /// Imagery textures on the GPU, all levels.
+            pub textures: u64,
+            pub eye_ground_pixels: [u64; EYES],
+            pub eye_black_pixels: [u64; EYES],
+        }
+
+        impl Metrics {
+            /// Every number a [`Snapshot`] holds, read now.
+            pub fn snapshot(&self) -> Snapshot {
+                Snapshot {
+                    $($c: self.$c.get(),)*
+                    $($g: self.$g.get(),)*
+                    mesh_bytes: self.mesh_bytes_by_level.total(),
+                    texture_bytes: self.texture_bytes_by_level.total(),
+                    meshes: self.meshes_by_level.total(),
+                    textures: self.textures_by_level.total(),
+                    eye_ground_pixels: self.eye_ground_pixels.all(),
+                    eye_black_pixels: self.eye_black_pixels.all(),
+                }
+            }
+        }
+
+        impl Snapshot {
+            /// What happened since `earlier`: each counter as the difference,
+            /// each gauge as it is now. Two sessions run one after the other
+            /// in one process then read alike — the counters are the
+            /// process's, and only their difference is the session's.
+            #[must_use]
+            pub fn since(&self, earlier: &Snapshot) -> Snapshot {
+                Snapshot {
+                    $($c: self.$c.saturating_sub(earlier.$c),)*
+                    ..*self
+                }
+            }
+        }
+    };
+}
+
+snapshot! {
+    counters: [
+        traversals,
+        loads_started,
+        loads_completed,
+        loads_failed,
+        loads_cancelled,
+        mesh_fetches,
+        texture_fetches,
+        tiles_upsampled,
+        tiles_without_imagery,
+        drapes_withheld,
+        imagery_absent,
+        terrain_absent,
+        black_textures,
+        store_hits,
+        store_misses,
+        store_bytes_served,
+        store_bytes_fetched,
+        tiles_evicted,
+        frames,
+        uploads,
+    ],
+    gauges: [
+        tiles_visited,
+        tiles_culled,
+        tiles_selected,
+        gaps,
+        loads_in_flight,
+        meshes_in_flight,
+        textures_in_flight,
+        priming_total,
+        priming_pending,
+        priming_unavailable,
+        priming_done,
+        resident_bytes,
+        imagery_bytes,
+        imagery_textures,
+        pending_uploads,
+        prepared_tiles,
+        tiles_filled,
+        frame_exact,
+        frame_coarser,
+        frame_lost,
+        frame_stand_ins,
+        frame_digest,
+    ],
+}
+
 /// The process's metrics.
 pub fn metrics() -> &'static Metrics {
     static METRICS: std::sync::OnceLock<Metrics> = std::sync::OnceLock::new();
@@ -751,6 +930,42 @@ mod tests {
         t.record(std::time::Duration::from_millis(250));
         t.record(std::time::Duration::from_millis(750));
         assert!((t.total_seconds() - 1.0).abs() < 1e-9);
+    }
+
+    /// A snapshot reads every series it names, the per-level ones as totals
+    /// and the per-eye ones eye by eye; and what a session did is the
+    /// counters' difference, with every gauge as it now reads.
+    #[test]
+    fn a_snapshot_reads_the_numbers_and_a_difference_keeps_the_gauges() {
+        let m = Metrics::default();
+        m.uploads.add(5);
+        m.frame_lost.set(3);
+        m.mesh_bytes_by_level.add(2, 100);
+        m.mesh_bytes_by_level.add(7, 20);
+        m.eye_black_pixels.set(1, 9);
+        let before = m.snapshot();
+        assert_eq!(before.uploads, 5);
+        assert_eq!(before.frame_lost, 3);
+        assert_eq!(before.mesh_bytes, 120);
+        assert_eq!(before.eye_black_pixels, [0, 9, 0, 0]);
+
+        m.uploads.add(2);
+        m.frame_lost.set(1);
+        let after = m.snapshot().since(&before);
+        assert_eq!(after.uploads, 2, "a counter is what happened since");
+        assert_eq!(after.frame_lost, 1, "a gauge is what it reads now");
+        assert_eq!(after.mesh_bytes, 120);
+        assert_eq!(after.eye_black_pixels, [0, 9, 0, 0]);
+    }
+
+    /// An eye past the rig's end is counted on the last one, not dropped.
+    #[test]
+    fn an_eye_past_the_end_folds_into_the_last() {
+        let eyes = ByEye::default();
+        eyes.set(EYES + 3, 4);
+        assert_eq!(eyes.get(EYES - 1), 4);
+        eyes.clear();
+        assert_eq!(eyes.get(EYES - 1), 0);
     }
 
     #[test]

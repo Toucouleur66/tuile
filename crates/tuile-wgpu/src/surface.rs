@@ -111,18 +111,86 @@ pub fn draw_to_surface(
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default())
     });
+    let mut encoder = encode_frame(
+        gpu,
+        targets,
+        &frame.texture,
+        surface_view.as_ref(),
+        clear,
+        paint,
+    );
+    // Before the frame is handed to the compositor: afterwards the texture
+    // belongs to the surface again and there is nothing left to copy.
+    if let Some(trace) = trace {
+        trace.capture(gpu, &mut encoder, &frame.texture, targets.size());
+    }
+    gpu.queue.submit([encoder.finish()]);
+    before_present();
+    frame.present();
+    Presented::Yes
+}
+
+/// Where a frame drawn off screen goes: a texture the host owns.
+///
+/// The same frame as [`FrameOnSurface`]'s, pass for pass — the multisampled
+/// target, its depth, the resolve — with a texture in place of the drawable.
+/// That is the whole difference between a window and a headless run, and it
+/// is meant to be: a test that draws through a renderer of its own is testing
+/// a renderer nobody runs.
+pub struct FrameOnTexture<'a> {
+    pub gpu: &'a GpuContext,
+    /// Resolved into: one sample, the targets' size and
+    /// [format](FrameTargets::format), `RENDER_ATTACHMENT` — and `COPY_SRC`
+    /// when it is to be read back.
+    pub texture: &'a wgpu::Texture,
+    pub targets: &'a FrameTargets,
+    pub clear: wgpu::Color,
+    /// When given, the drawn frame is copied into it before the submit; the
+    /// caller reads it back with [`Readback::take`].
+    pub capture: Option<&'a mut Readback>,
+}
+
+/// Draws one frame into a texture: [`draw_to_surface`] without a surface to
+/// acquire, so without the ways acquiring one fails — and without a present.
+/// `paint` receives the same pass.
+pub fn draw_to_texture(into: FrameOnTexture<'_>, paint: impl FnOnce(&mut wgpu::RenderPass<'_>)) {
+    let FrameOnTexture {
+        gpu,
+        texture,
+        targets,
+        clear,
+        capture,
+    } = into;
+    let mut encoder = encode_frame(gpu, targets, texture, None, clear, paint);
+    if let Some(capture) = capture {
+        capture.capture(gpu, &mut encoder, texture, targets.size());
+    }
+    gpu.queue.submit([encoder.finish()]);
+}
+
+/// The frame's one render pass, into `targets` and resolved into `drawable`
+/// — or into the targets' own resolve texture and encoded into `encoded`,
+/// where the drawable can be neither sRGB nor viewed as sRGB. Returns the
+/// encoder, for whatever the host copies before submitting it.
+fn encode_frame(
+    gpu: &GpuContext,
+    targets: &FrameTargets,
+    drawable: &wgpu::Texture,
+    encoded: Option<&wgpu::TextureView>,
+    clear: wgpu::Color,
+    paint: impl FnOnce(&mut wgpu::RenderPass<'_>),
+) -> wgpu::CommandEncoder {
     let drawable_view;
-    let drawable = match targets.encode.as_ref() {
+    let resolve = match targets.encode.as_ref() {
         Some(encode) => &encode.resolved,
         None => {
-            drawable_view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
+            drawable_view = drawable.create_view(&wgpu::TextureViewDescriptor {
                 format: Some(targets.format()),
                 ..Default::default()
             });
             &drawable_view
         }
     };
-
     let mut encoder = gpu.device.create_command_encoder(&Default::default());
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -132,7 +200,7 @@ pub fn draw_to_surface(
                 // drawable: the samples are averaged on the way out, which is
                 // where the staircase on the limb disappears.
                 view: &targets.colour,
-                resolve_target: Some(drawable),
+                resolve_target: Some(resolve),
                 depth_slice: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(clear),
@@ -157,18 +225,10 @@ pub fn draw_to_surface(
         });
         paint(&mut pass);
     }
-    if let (Some(encode), Some(view)) = (targets.encode.as_ref(), surface_view.as_ref()) {
+    if let (Some(encode), Some(view)) = (targets.encode.as_ref(), encoded) {
         encode.encode(&mut encoder, view);
     }
-    // Before the frame is handed to the compositor: afterwards the texture
-    // belongs to the surface again and there is nothing left to copy.
-    if let Some(trace) = trace {
-        trace.capture(gpu, &mut encoder, &frame.texture, targets.size());
-    }
-    gpu.queue.submit([encoder.finish()]);
-    before_present();
-    frame.present();
-    Presented::Yes
+    encoder
 }
 
 /// The surface format to configure with: the first sRGB one on offer.

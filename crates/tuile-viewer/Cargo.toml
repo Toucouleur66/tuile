@@ -50,6 +50,10 @@ ctrlc = { version = "3.5", features = ["termination"] }
 # nothing about publishing the engine's counters is specific to a wgpu window:
 # the headless probes and the warm-up job want exactly the same endpoint.
 tuile-metrics = { version = "0.8.5", path = "../tuile-metrics" }
+# The control API's, and only with its feature: the socket speaks JSON, and
+# writes an eye's picture as PNG.
+serde_json = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
 
 # The browser: the page and the worker are one wasm module (see `web`). Each
 # crate below is the wasm-bindgen project's own or the workspace's:
@@ -102,6 +106,11 @@ features = [
 ]
 
 [dev-dependencies]
+# The crate itself with its control API, so that its own tests build and run
+# that module too. A development dependency: no build of the application
+# ever has it — see the `control` feature. The headless runs themselves need a
+# host's sources, and live with the host: `examples/wgpu-viewer/tests`.
+tuile-viewer = { path = ".", features = ["control"] }
 futures-executor = { workspace = true }
 futures-util = { workspace = true }
 # The browser's options, read on the host by their tests.
@@ -167,3 +176,10 @@ current-location = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-core-locatio
 # On a phone: the message over the window, the clipboard, and the device's
 # memory and temperature. macOS and iOS; elsewhere it compiles to nothing.
 application = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-app-kit", "dep:muda", "dep:objc2-ui-kit", "dep:objc2-core-foundation"]
+# The control API (`control`): the viewer headless — offscreen eyes read
+# back every frame, on the host's real sources, store and session — the
+# commands that drive it and a localhost socket that speaks them. For tests
+# and for debug builds a device is driven through; never in a build that
+# ships, and refused outright in an iOS release build. A build feature and
+# never a runtime switch: a binary either has it or does not.
+control = ["dep:serde_json", "dep:image"]

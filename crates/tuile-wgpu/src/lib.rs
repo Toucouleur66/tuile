@@ -22,6 +22,8 @@
 //! - [`Readback`] — a drawn frame back on the CPU, rows correctly unpadded
 //! - [`draw_to_surface`] — one frame onto a surface the host created, with the
 //!   four ways acquiring a drawable can fail already handled
+//! - [`draw_to_texture`] — the same frame into a texture of the host's, for a
+//!   headless run
 //!
 //! The crate never creates a window or a surface; the host owns the event
 //! loop and the render pass.
@@ -45,6 +47,7 @@ pub use pump::{ContentPump, Drawn, Resolution, STITCH_SLIDE_FRAMES, UPLOADS_PER_
 pub use readback::Readback;
 pub use renderer::{LineVertex, TileRenderer, ViewUniform};
 pub use surface::{
-    draw_to_surface, preferred_format, surface_format, FrameOnSurface, Presented, SurfaceFormat,
+    draw_to_surface, draw_to_texture, preferred_format, surface_format, FrameOnSurface,
+    FrameOnTexture, Presented, SurfaceFormat,
 };
 pub use targets::FrameTargets;

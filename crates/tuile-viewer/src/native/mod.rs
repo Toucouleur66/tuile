@@ -236,7 +236,7 @@ fn session(embedder: Arc<dyn ViewerHost>) -> anyhow::Result<()> {
         terrain: embedder.terrain(),
         layers,
         opening,
-        store: embed::identity().store.clone(),
+        store: tuile_storage_foyer::default_cache_dir().join(&embed::identity().store),
         config,
         profile: profile.clone(),
         timeout: crate::launch::START_TIMEOUT,

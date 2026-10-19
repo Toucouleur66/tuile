@@ -7,6 +7,9 @@
 
 mod command;
 mod demand;
+#[cfg(feature = "control")]
+mod driven;
+mod eyes;
 mod flight;
 mod frame;
 mod gestures;
@@ -15,8 +18,11 @@ mod input;
 mod lifecycle;
 mod loading;
 mod messages;
+#[cfg(feature = "control")]
+pub(crate) mod offscreen;
 mod pacing;
 mod readout;
+mod screen;
 mod script;
 mod setup;
 #[cfg(not(target_arch = "wasm32"))]
@@ -26,14 +32,17 @@ mod tape;
 mod touch;
 mod warmup;
 
-use std::sync::Arc;
+pub(crate) use eyes::Rig;
+#[cfg(feature = "control")]
+pub(crate) use touch::Phase as Finger;
+
 use tuile_camera::CameraController;
 use tuile_ui::NavWidget;
 use tuile_wgpu::{ContentPump, GpuContext, OverlayRenderer, TileRenderer};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
-use winit::window::{Window, WindowId};
+use winit::window::WindowId;
 
 /// How much air to put between the eye and the ground.
 ///
@@ -136,12 +145,9 @@ impl UiFrame {
 }
 
 struct Active {
-    window: Arc<Window>,
-    /// Kept to build the surface again when the application comes back from
-    /// the background, where a phone's surface is let go of.
-    instance: wgpu::Instance,
-    /// `None` while released: see [`lifecycle`].
-    surface: Option<wgpu::Surface<'static>>,
+    /// Where the frame goes: a window's surface, or a headless run's
+    /// textures. See [`screen`].
+    screen: screen::Screen,
     /// What the surface is configured with, and what the frame is drawn in.
     format: tuile_wgpu::SurfaceFormat,
     gpu: GpuContext,
@@ -311,6 +317,24 @@ pub struct App {
     menu: Option<crate::menu::Installed>,
     /// Running totals, reported once per second and again on the way out.
     stats: crate::session::Stats,
+    /// The eyes a frame is drawn for: one, unless a headless run asks for a
+    /// headset's pair. See [`eyes`].
+    rig: Rig,
+    /// How a message for the person is shown: an alert, or — for a headless
+    /// run, which has nobody to dismiss one — a line in the log.
+    speaker: fn(&str, &str) -> bool,
+    /// Frames that reached the screen, which a headless run counts its
+    /// frames by.
+    #[cfg(feature = "control")]
+    presented: u64,
+}
+
+/// What a turn of the loop leaves the loop to do.
+pub(crate) enum Turn {
+    /// The session is over: leave the loop.
+    End,
+    /// Wait as this says, for the next turn.
+    Flow(ControlFlow),
 }
 
 impl App {
@@ -406,6 +430,10 @@ impl App {
             window_attributes: config.window,
             gpu_on_its_way: None,
             backends: config.backends,
+            rig: Rig::MONO,
+            speaker: crate::desktop::try_alert,
+            #[cfg(feature = "control")]
+            presented: 0,
         };
         app.retries = config.retries;
         // A desktop's launch has already arrived: adopt it before the first
@@ -618,7 +646,7 @@ impl App {
         } else {
             self.occluded = hidden;
             if let Some(active) = self.active.as_ref() {
-                active.window.request_redraw();
+                active.screen.request_redraw();
             }
         }
     }
@@ -627,8 +655,127 @@ impl App {
     pub(crate) fn draw_soon(&mut self) {
         self.demand.poke();
         if let Some(active) = self.active.as_ref() {
-            active.window.request_redraw();
+            active.screen.request_redraw();
         }
+    }
+
+    /// The eyes this frame is drawn for, each a camera of its own: the
+    /// camera itself, for a window.
+    fn eyes(&self) -> Vec<tuile_camera::GlobeCamera> {
+        self.rig.cameras(&self.controller.camera)
+    }
+
+    /// Each eye's view, for the traversal: what it is asked to select for.
+    fn eye_views(&self) -> Vec<tuile_core::traversal::ViewState> {
+        let (width, height) = self.viewport();
+        let viewport = glam::DVec2::new(width, height);
+        self.eyes()
+            .iter()
+            .map(|eye| eye.view_state(viewport))
+            .collect()
+    }
+
+    /// The application is back in front: the lifecycle's way back.
+    pub(crate) fn come_back(&mut self) {
+        let steps = self.lifecycle.activate();
+        self.carry_out(steps);
+        // Back in front: a start-up that failed is tried at once — the
+        // person may have just typed a token in the system's settings.
+        if let Some(retries) = self.retries.as_mut() {
+            retries.foreground(web_time::Instant::now());
+        }
+    }
+
+    /// The application is about to leave the front — and on Android, its
+    /// surface is being destroyed.
+    pub(crate) fn step_away(&mut self) {
+        let steps = if self.profile.suspend_takes_the_surface {
+            self.lifecycle.surface_lost()
+        } else {
+            self.lifecycle.resign()
+        };
+        self.carry_out(steps);
+    }
+
+    /// The system says it is short of memory.
+    pub(crate) fn short_of_memory(&mut self) {
+        tracing::warn!("memory warning; trimming the residency");
+        crate::journal::note("memory warning");
+        let steps = self.lifecycle.memory_warning();
+        self.carry_out(steps);
+    }
+
+    /// The system says how short of memory it is, as Android grades it.
+    #[cfg(feature = "control")]
+    pub(crate) fn under_pressure(&mut self, pressure: crate::profile::Pressure) {
+        let steps = self.lifecycle.memory_pressure(pressure);
+        self.carry_out(steps);
+    }
+
+    /// One turn of the loop, short of drawing: what has arrived is taken,
+    /// what is due is done, and a frame is asked for when one is due. What
+    /// the loop should do next is the answer.
+    ///
+    /// The window's loop runs this from `about_to_wait`, and draws on the
+    /// redraw it asks for; a headless run runs it on every step, and draws
+    /// the same way.
+    pub(crate) fn turn(&mut self) -> Turn {
+        // Before anything that can return early: an answer about the current
+        // location is taken on whatever turn of the loop it arrives, hidden
+        // and warming included.
+        self.take_the_session();
+        self.take_the_gpu();
+        self.messages.offer(
+            self.active.is_some() || self.ended_by.is_some(),
+            self.speaker,
+        );
+        if self.ended_by.is_some() && self.profile.owns_its_window {
+            return Turn::End;
+        }
+        self.take_the_location();
+        self.take_the_commands();
+        self.take_the_imagery();
+        // Also on the turns that draw nothing — hidden and warming, or
+        // occluded — so a script always has a view to read.
+        self.publish_the_view(None);
+        // A flown tape ends the session. Without this a replay leaves a window
+        // sitting on its last frame, and the run has to be closed by hand —
+        // which is exactly what stops anyone from putting it in a script.
+        if self.recording.finished {
+            self.ended_by = Some("the replayed tape reached its end");
+            tracing::info!("{}", self.report());
+            self.close_the_tape();
+            return Turn::End;
+        }
+        // Ctrl-C or `kill`: unwind rather than die, so the recording is closed.
+        if crate::signals::INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+            self.ended_by = Some("a signal asked it to stop (interrupt, terminate or hang-up)");
+            tracing::info!("interrupted; closing the session");
+            self.close_the_tape();
+            return Turn::End;
+        }
+        // Hidden and warming: the window is not drawing, so nothing else is
+        // draining the stream — and the uploads being waited for happen in the
+        // pump. Driving it from here is what keeps the wait from being a
+        // deadlock.
+        if self.warmup.holding {
+            self.pump_while_hidden();
+            return Turn::Flow(ControlFlow::Poll);
+        }
+        // A phone draws on demand, and only in the foreground.
+        if self.profile.render_on_demand {
+            return Turn::Flow(self.pace_the_frames());
+        }
+        if !self.occluded {
+            if let Some(active) = self.active.as_ref() {
+                active.screen.request_redraw();
+            }
+        }
+        Turn::Flow(if self.occluded {
+            ControlFlow::Wait
+        } else {
+            ControlFlow::Poll
+        })
     }
 
     fn viewport(&self) -> (f64, f64) {
@@ -670,13 +817,7 @@ impl ApplicationHandler for App {
     /// application comes back to the front — the lifecycle's way back.
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.active.is_some() {
-            let steps = self.lifecycle.activate();
-            self.carry_out(steps);
-            // Back in front: a start-up that failed is tried at once — the
-            // person may have just typed a token in the system's settings.
-            if let Some(retries) = self.retries.as_mut() {
-                retries.foreground(web_time::Instant::now());
-            }
+            self.come_back();
             return;
         }
         self.start_window(event_loop);
@@ -686,21 +827,13 @@ impl ApplicationHandler for App {
     /// its surface is being destroyed: everything drawn into it must be let
     /// go of before this returns.
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
-        let steps = if self.profile.suspend_takes_the_surface {
-            self.lifecycle.surface_lost()
-        } else {
-            self.lifecycle.resign()
-        };
-        self.carry_out(steps);
+        self.step_away();
     }
 
     /// The system is short of memory: the server lets go of what the view
     /// does not draw. Never what it draws, nor its ancestors.
     fn memory_warning(&mut self, _event_loop: &ActiveEventLoop) {
-        tracing::warn!("memory warning; trimming the residency");
-        crate::journal::note("memory warning");
-        let steps = self.lifecycle.memory_warning();
-        self.carry_out(steps);
+        self.short_of_memory();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -723,66 +856,9 @@ impl ApplicationHandler for App {
     /// handler is what lets an occluded window stop cleanly — the loop parks on
     /// `Wait` until the next event instead of spinning.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Before anything that can return early: an answer about the current
-        // location is taken on whatever turn of the loop it arrives, hidden
-        // and warming included.
-        self.take_the_session();
-        self.take_the_gpu();
-        self.messages.offer(
-            self.active.is_some() || self.ended_by.is_some(),
-            crate::desktop::try_alert,
-        );
-        if self.ended_by.is_some() && self.profile.owns_its_window {
-            event_loop.exit();
-            return;
-        }
-        self.take_the_location();
-        self.take_the_commands();
-        self.take_the_imagery();
-        // Also on the turns that draw nothing — hidden and warming, or
-        // occluded — so a script always has a view to read.
-        self.publish_the_view(None);
-        // A flown tape ends the session. Without this a replay leaves a window
-        // sitting on its last frame, and the run has to be closed by hand —
-        // which is exactly what stops anyone from putting it in a script.
-        if self.recording.finished {
-            self.ended_by = Some("the replayed tape reached its end");
-            tracing::info!("{}", self.report());
-            self.close_the_tape();
-            event_loop.exit();
-            return;
-        }
-        // Ctrl-C or `kill`: unwind rather than die, so the recording is closed.
-        if crate::signals::INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
-            self.ended_by = Some("a signal asked it to stop (interrupt, terminate or hang-up)");
-            tracing::info!("interrupted; closing the session");
-            self.close_the_tape();
-            event_loop.exit();
-            return;
-        }
-        // Hidden and warming: the window is not drawing, so nothing else is
-        // draining the stream — and the uploads being waited for happen in the
-        // pump. Driving it from here is what keeps the wait from being a
-        // deadlock.
-        if self.warmup.holding {
-            self.pump_while_hidden();
-            event_loop.set_control_flow(ControlFlow::Poll);
-            return;
-        }
-        // A phone draws on demand, and only in the foreground.
-        if self.profile.render_on_demand {
-            self.pace_the_frames(event_loop);
-            return;
-        }
-        event_loop.set_control_flow(if self.occluded {
-            ControlFlow::Wait
-        } else {
-            ControlFlow::Poll
-        });
-        if !self.occluded {
-            if let Some(active) = self.active.as_ref() {
-                active.window.request_redraw();
-            }
+        match self.turn() {
+            Turn::End => event_loop.exit(),
+            Turn::Flow(flow) => event_loop.set_control_flow(flow),
         }
     }
 }

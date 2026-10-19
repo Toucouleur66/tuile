@@ -45,8 +45,7 @@ impl App {
         self.warmup.holding = false;
         self.paint_before_showing();
         if let Some(active) = self.active.as_ref() {
-            active.window.set_visible(true);
-            active.window.request_redraw();
+            active.screen.show();
         }
     }
 

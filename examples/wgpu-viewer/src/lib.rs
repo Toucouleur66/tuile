@@ -29,6 +29,21 @@
 //! account. The proxy's address is `TUILE_CATALOG_URL` — a launch setting,
 //! else the value it had when the library was built, else
 //! `DEVELOPMENT_CATALOG`, which `scripts/try-viewer.sh android` serves.
+//!
+//! **Headless, on demand.** `examples/headless` plays the graphics budget's
+//! motion patterns on this application without a window, over the real
+//! catalog, tile store and clock, and holds each run to the specification's
+//! obligations. It needs the network, a GPU and the token, read from
+//! `TUILE_ION_TOKEN` by a catalog proxy served in its own process — the
+//! application never sees it, and it is never printed:
+//!
+//! ```text
+//! TUILE_ION_TOKEN=… cargo run --release -p tuile-wgpu-viewer --example headless -- run all
+//! ```
+//!
+//! Session logs (MCAP) and a JSON summary go to `target/headless/`; the
+//! runner exits 1 when an obligation is violated. See the example's own
+//! documentation for the patterns and the flags.
 
 use std::sync::Arc;
 
@@ -126,9 +141,7 @@ impl ViewerHost for Public {
         {
             let catalog = catalog_url()?;
             tracing::info!(%catalog, "catalog proxy");
-            Ok(Arc::new(
-                IonSources::new(Arc::clone(&http), http, "").with_api_base(catalog),
-            ))
+            Ok(through_catalog(http, catalog))
         }
         #[cfg(not(target_os = "android"))]
         {
@@ -136,6 +149,13 @@ impl ViewerHost for Public {
             Ok(Arc::new(IonSources::new(Arc::clone(&http), http, token)))
         }
     }
+}
+
+/// The sources through a catalog proxy that holds the token, at `catalog`
+/// (ending in `/`): what a device that holds no token asks — Android, and a
+/// headless run of this application, which serves the proxy beside it.
+pub fn through_catalog(http: Arc<NativeHttp>, catalog: url::Url) -> Arc<dyn Sources> {
+    Arc::new(IonSources::new(Arc::clone(&http), http, "").with_api_base(catalog))
 }
 
 /// The catalog proxy's address, ending in `/` so the catalog's paths are

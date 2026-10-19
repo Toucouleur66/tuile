@@ -182,24 +182,38 @@ impl ContentPump {
                 // A tile that was not drawn the frame before appears where
                 // it belongs; one that was slides there.
                 let fresh = self.stitched_for.binary_search(id).is_err();
+                let level = self.level(*id);
+                let mut resized = None;
                 if let Some(tile) = self.prepared.get_mut(id) {
+                    let before = tile.gpu_bytes;
                     if tile.restitch(gpu, plan, frame, slide, fresh) {
                         m.restitched.inc();
                         if !fresh && slide > 0 && !self.sliding.contains(id) {
                             self.sliding.push(*id);
                         }
                     }
+                    resized = Some((before, tile.gpu_bytes));
+                }
+                if let Some((before, after)) = resized {
+                    self.recharge(level, before, after);
                 }
             }
             // A tile no longer holding its own ground is nobody's neighbour:
             // it goes back to its own edges, at once.
             let nothing = tuile_core::stitch::Stitch::default();
+            let mut resized = Vec::new();
             for id in &self.stitched_for {
                 if exact.binary_search(id).is_err() {
                     if let Some(tile) = self.prepared.get_mut(id) {
+                        let before = tile.gpu_bytes;
                         tile.restitch(gpu, &nothing, frame, 0, true);
+                        resized.push((*id, before, tile.gpu_bytes));
                     }
                 }
+            }
+            for (id, before, after) in resized {
+                let level = self.level(id);
+                self.recharge(level, before, after);
             }
             self.stitched_for = exact;
             m.stitch_plans.inc();
@@ -219,6 +233,21 @@ impl ContentPump {
     /// Tiles still sliding to the edge their neighbourhood gave them.
     pub fn sliding(&self) -> usize {
         self.sliding.len()
+    }
+
+    /// A tile's surface grew or shrank where it is — stitched to its
+    /// neighbours, or let go of them — from `before` bytes to `after`: the
+    /// totals follow it. They used not to, so every stitch moved the real
+    /// figure away from the counted one, and a pump that went away took back
+    /// less than it had added.
+    fn recharge(&mut self, level: u32, before: usize, after: usize) {
+        let m = tuile_core::metrics::metrics();
+        self.gpu_bytes = (self.gpu_bytes + after).saturating_sub(before);
+        if after >= before {
+            m.mesh_bytes_by_level.add(level, (after - before) as u64);
+        } else {
+            m.mesh_bytes_by_level.sub(level, (before - after) as u64);
+        }
     }
 
     /// Call once per frame: drains every queued server message, then
@@ -675,6 +704,17 @@ impl ContentPump {
             smeared_drawn,
             ..counts
         };
+        // What this frame could draw of the selection, where everything else
+        // the engine counts is published — see `tuile_core::metrics`.
+        let m = tuile_core::metrics::metrics();
+        m.frame_exact.set(counts.exact as u64);
+        m.frame_coarser.set(counts.coarser as u64);
+        m.frame_lost.set(counts.lost as u64);
+        m.frame_stand_ins.set(stand_ins as u64);
+        m.frame_digest.set(
+            tuile_core::determinism::digest(exact.iter().map(|t| t.0))
+                ^ tuile_core::determinism::digest(fallback.iter().map(|t| t.0)).rotate_left(29),
+        );
         let drawn = Drawn {
             exact: surfaces(exact),
             fallback: surfaces(fallback),
@@ -786,6 +826,30 @@ impl ContentPump {
 
     pub fn pending_uploads(&self) -> usize {
         self.pending.len()
+    }
+}
+
+impl Drop for ContentPump {
+    /// Takes back what this pump added to the process's numbers.
+    ///
+    /// The per-level series are added to on upload and subtracted from on
+    /// eviction, so a pump that simply went away left its whole residency
+    /// counted for ever: a page that destroys its viewer and mounts another,
+    /// or a second headless run in one process, then reads the first one's
+    /// meshes as its own.
+    fn drop(&mut self) {
+        let m = tuile_core::metrics::metrics();
+        for (tile, prepared) in &self.prepared {
+            let level = self.level(*tile);
+            m.meshes_by_level.sub(level, 1);
+            m.mesh_bytes_by_level.sub(level, prepared.gpu_bytes as u64);
+        }
+        // Counted from what the GPU holds, at the next upload; until then,
+        // nothing this pump held is held.
+        m.textures_by_level.clear();
+        m.texture_bytes_by_level.clear();
+        m.prepared_tiles.set(0);
+        m.pending_uploads.set(0);
     }
 }
 

@@ -10,29 +10,6 @@ use std::sync::Arc;
 
 use tuile_storage_foyer::SuspendableStore as FoyerStore;
 
-/// The tile store an application keeps between runs, or `None` with a line
-/// saying so.
-///
-/// One store, several callers: the terrain source and each imagery layer keep
-/// their own bytes in it, keyed by tile rather than by URL. The server evicts
-/// decoded tiles to stay inside its GPU budget, and this is what makes coming
-/// back to them cheap. A store that fails to open is not worth failing the
-/// application over.
-pub(crate) async fn open(
-    name: &str,
-    memory_bytes: usize,
-    disk_bytes: usize,
-    clear_when_damaged: bool,
-) -> Option<Arc<FoyerStore>> {
-    open_at(
-        &tuile_storage_foyer::default_cache_dir().join(name),
-        memory_bytes,
-        disk_bytes,
-        clear_when_damaged,
-    )
-    .await
-}
-
 /// Whether a store that would not open is to be cleared and opened afresh.
 ///
 /// Only when the platform allows it — a phone, whose system purges caches and
@@ -44,8 +21,15 @@ pub(crate) fn clear(clear_when_damaged: bool, error: &tuile_storage_foyer::Store
     clear_when_damaged && !error.is_transient()
 }
 
-/// [`open`], in `dir`. Without a store the session still runs; every
-/// tile is fetched again.
+/// The tile store an application keeps between runs, in `dir`, or `None`
+/// with a line saying so.
+///
+/// One store, several callers: the terrain source and each imagery layer keep
+/// their own bytes in it, keyed by tile rather than by URL. The server evicts
+/// decoded tiles to stay inside its GPU budget, and this is what makes coming
+/// back to them cheap. A store that fails to open is not worth failing the
+/// application over: without one the session still runs, and every tile is
+/// fetched again.
 pub(crate) async fn open_at(
     dir: &std::path::Path,
     memory_bytes: usize,

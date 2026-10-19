@@ -437,6 +437,40 @@ pub struct GeometryServer {
     spawn: Spawn,
 }
 
+/// Takes back what a session said of itself, once it has gone.
+///
+/// A session's gauges are set as it works and were left as they last read
+/// when it went: a second session in one process — a page that mounts
+/// another viewer, a headless run after another — then read the first one's
+/// residency and selection as its own until its first pass. A session that
+/// has gone holds nothing and selects nothing. Held by [`GeometryServer::run`]
+/// for as long as the session runs, so it is let go of however the future
+/// ends: finished, or dropped.
+struct Gone;
+
+impl Drop for Gone {
+    fn drop(&mut self) {
+        let m = crate::metrics::metrics();
+        for gauge in [
+            &m.tiles_visited,
+            &m.tiles_culled,
+            &m.tiles_selected,
+            &m.gaps,
+            &m.resident_bytes,
+            &m.imagery_bytes,
+            &m.imagery_textures,
+            &m.loads_in_flight,
+            &m.tiles_filled,
+            &m.priming_total,
+            &m.priming_pending,
+            &m.priming_unavailable,
+            &m.priming_done,
+        ] {
+            gauge.set(0);
+        }
+    }
+}
+
 impl GeometryServer {
     /// Runs this session's loads as given. Default: [`Spawn::Inline`].
     #[must_use]
@@ -463,6 +497,7 @@ impl GeometryServer {
 
     /// Runs the session until the consumer goes away.
     pub async fn run(mut self) {
+        let _gone = Gone;
         let mut loads = Loads::new(&self.spawn);
         if loads.spawns() {
             // A load landing on another thread must not reshape the tree under
