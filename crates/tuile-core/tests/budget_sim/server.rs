@@ -575,11 +575,19 @@ impl Sim {
                 self.fail(&format!("I2: {c:?} unprotected bytes over target"));
             }
         }
-        // I2: no class ever crosses its hard limit.
+        // I2: no class ever crosses its hard limit (the effective one), and
+        // the device's total never crosses the configured total.
         for c in Class::ALL {
-            if s.gpu[c] > cfg.hard_limit[c] || self.gpu.bytes[c] > cfg.hard_limit[c] {
+            let hard = s.hard_limit[c];
+            if s.gpu[c] > hard || self.gpu.bytes[c] > hard {
                 self.fail(&format!("I2: {c:?} over its hard limit"));
             }
+        }
+        let total = |p: &tuile_core::budget::PerClass<Bytes>| {
+            Class::ALL.iter().fold(Bytes::ZERO, |a, c| a.plus(p[*c]))
+        };
+        if total(&s.gpu) > total(&cfg.hard_limit) {
+            self.fail("I2: the device's total over the hard limits' sum");
         }
         // I5: only the fresh generation is delivered.
         for (r, g) in &d.deliver {

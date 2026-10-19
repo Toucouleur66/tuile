@@ -57,6 +57,22 @@ pub struct PressureFractions {
     pub background_percent: u8,
 }
 
+/// D-A3, under study: the terrain and imagery classes share one pool, each
+/// between a floor and a ceiling of it, so that the split follows the view
+/// instead of a fixed ratio. A class's effective target is what the pool
+/// leaves once the other members' protected bytes are counted, clamped to
+/// its floor and ceiling; its overflow follows in proportion, and its hard
+/// limit is what the pool's hard limit leaves once the other members' bytes
+/// are counted, clamped the same way. Compiled only for the experiments.
+#[cfg(feature = "budget-experiments")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Pool {
+    /// Each member's floor, percent of the pool; 0 for a class outside it.
+    pub floor_percent: PerClass<u8>,
+    /// Each member's ceiling, percent of the pool; 0 for a class outside it.
+    pub ceiling_percent: PerClass<u8>,
+}
+
 /// Every number the budget runs on.
 ///
 /// Built from [`BudgetConfig::interactive`] or [`BudgetConfig::batch`], then
@@ -118,6 +134,9 @@ pub struct BudgetConfig {
     pub failure: FailurePolicy,
     /// A load that has waited this long gets the full age bonus.
     pub age_full: Micros,
+    /// D-A3's pooled ledger, under study.
+    #[cfg(feature = "budget-experiments")]
+    pub pool: Option<Pool>,
 }
 
 impl BudgetConfig {
@@ -168,6 +187,8 @@ impl BudgetConfig {
                 max: Micros::from_secs(30),
             },
             age_full: Micros::from_secs(2),
+            #[cfg(feature = "budget-experiments")]
+            pool: None,
         }
     }
 
@@ -207,6 +228,8 @@ impl BudgetConfig {
             imagery_tile_px: 256,
             failure: FailurePolicy::EndSession,
             age_full: Micros::from_secs(2),
+            #[cfg(feature = "budget-experiments")]
+            pool: None,
         }
     }
 

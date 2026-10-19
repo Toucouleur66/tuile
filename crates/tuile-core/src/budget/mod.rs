@@ -35,6 +35,8 @@ pub mod tier;
 pub mod types;
 pub mod view;
 
+#[cfg(feature = "budget-experiments")]
+pub use config::Pool;
 pub use config::{BudgetConfig, FailurePolicy, PressureFractions, Relaxation, Watermarks};
 pub use deadline::FrameDeadline;
 pub use decisions::{
@@ -44,7 +46,7 @@ pub use error::{AuditError, ConfigError, SessionError};
 pub use imagery::{DrapeCandidate, GeoRect, LevelClamp, TexelFootprint, UvTransform};
 pub use need::{ImageryNeed, LayerReach, Membership, Need, NeedSet};
 pub use priority::{PriorityKey, Quantised, Urgency};
-pub use stats::BudgetStats;
+pub use stats::{BudgetStats, CancelReason, EvictReason};
 pub use tier::{NoStore, Presence, PresenceOracle, Source, Tier};
 pub use types::{
     Bytes, Class, Failure, Generation, LayerId, Micros, PerClass, Policy, Pressure, ResourceId,

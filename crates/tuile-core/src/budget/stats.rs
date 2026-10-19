@@ -15,6 +15,46 @@ pub const LATENCY_BUCKETS: usize = 18;
 /// Span of the imagery-over-terrain histogram: index `gap + 8`, clamped.
 pub const GAP_BUCKETS: usize = 17;
 
+/// Why a load or a delivery was cancelled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CancelReason {
+    /// Out of the need for longer than the grace (I5).
+    Grace,
+    /// Unanswered past the load timeout (§11.3).
+    Timeout,
+    /// Its slot taken by urgent work (§11.3).
+    Preempted,
+}
+
+impl CancelReason {
+    /// Every reason, in index order.
+    pub const ALL: [CancelReason; 3] = [
+        CancelReason::Grace,
+        CancelReason::Timeout,
+        CancelReason::Preempted,
+    ];
+}
+
+/// Why a GPU copy was evicted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EvictReason {
+    /// The sweep to the low watermark.
+    Sweep,
+    /// The sweep, under a memory signal.
+    Pressure,
+    /// Room made for a delivery (admission preempts lower-value residents).
+    Admission,
+}
+
+impl EvictReason {
+    /// Every reason, in index order.
+    pub const ALL: [EvictReason; 3] = [
+        EvictReason::Sweep,
+        EvictReason::Pressure,
+        EvictReason::Admission,
+    ];
+}
+
 /// One step's statistics. Counters count this step only.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -27,6 +67,36 @@ pub struct BudgetStats {
     pub target: PerClass<Bytes>,
     /// The effective overflow per class, after pressure.
     pub overflow: PerClass<Bytes>,
+    /// The effective hard limit per class, after `retarget`.
+    pub hard_limit: PerClass<Bytes>,
+    /// The part of `gpu` in transit to the GPU (delivered, not yet
+    /// acknowledged), per class.
+    pub transit: PerClass<Bytes>,
+    /// Loads started per class, from a local store (`[0]`) or the network
+    /// (`[1]`).
+    pub starts: PerClass<[u32; 2]>,
+    /// Loads started, then cancelled for leaving the need before they were
+    /// delivered (P2.2).
+    pub wasted_starts: PerClass<u32>,
+    /// Stored resources left unstarted while a lower-priority network load
+    /// started (must be 0, I15).
+    pub local_waits: u32,
+    /// Cancels by reason, in [`CancelReason::ALL`]'s order.
+    pub cancels: [u32; 3],
+    /// GPU evictions per class, by reason in [`EvictReason::ALL`]'s order.
+    pub evictions: PerClass<[u32; 3]>,
+    /// Decoded copies released per class.
+    pub releases: PerClass<u32>,
+    /// Failures per class, transient (`[0]`) and permanent (`[1]`).
+    pub failures: PerClass<[u32; 2]>,
+    /// Acknowledgements more than 5 % off their estimate, per class.
+    pub drift_exceeded: PerClass<u32>,
+    /// The deepest climb this step from a wanted tile to the ancestor that
+    /// stands for it, in levels (P2, P4.1).
+    pub fallback_depth_max: u32,
+    /// Resources the step visited: need entries, wants, ranked work and
+    /// tracked entries scanned. Deterministic: P6.4's work counter.
+    pub work: u32,
     /// Decoded CPU bytes held.
     pub decoded: Bytes,
     /// Bytes delivered and not yet acknowledged.
@@ -110,7 +180,14 @@ impl BudgetStats {
                 h = h.wrapping_mul(0x0100_0000_01b3);
             }
         };
-        for per in [&self.gpu, &self.protected, &self.target, &self.overflow] {
+        for per in [
+            &self.gpu,
+            &self.protected,
+            &self.target,
+            &self.overflow,
+            &self.hard_limit,
+            &self.transit,
+        ] {
             for (_, b) in per.iter() {
                 put(b.0);
             }
@@ -151,6 +228,29 @@ impl BudgetStats {
         for (_, n) in self.in_flight.iter() {
             put(u64::from(n));
         }
+        for (_, [a, b]) in self.starts.iter().chain(self.failures.iter()) {
+            put(u64::from(a));
+            put(u64::from(b));
+        }
+        for (_, n) in self
+            .wasted_starts
+            .iter()
+            .chain(self.releases.iter())
+            .chain(self.drift_exceeded.iter())
+        {
+            put(u64::from(n));
+        }
+        for (_, e) in self.evictions.iter() {
+            for n in e {
+                put(u64::from(n));
+            }
+        }
+        for n in self.cancels {
+            put(u64::from(n));
+        }
+        put(u64::from(self.local_waits));
+        put(u64::from(self.fallback_depth_max));
+        put(u64::from(self.work));
         for n in self.imagery_over_terrain.iter().chain(&self.latency_ms) {
             put(u64::from(*n));
         }

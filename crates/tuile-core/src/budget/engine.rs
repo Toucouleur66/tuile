@@ -27,6 +27,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::config::FailurePolicy;
+use super::cost::within_drift;
 use super::decisions::{
     Decisions, DrapeChoice, DrawItem, DrawSet, Role, Start, SwapGroup, UploadPlan,
 };
@@ -35,7 +36,7 @@ use super::imagery::{best_drape, needed_level, DrapeCandidate, LevelClamp, UvTra
 use super::need::{ImageryNeed, LayerReach, Membership, Need};
 use super::priority::{score, PriorityKey, Quantised, Urgency};
 use super::state::{CpuCopy, Entry, Gpu, Load, Transit};
-use super::stats::{BudgetStats, GAP_BUCKETS, LATENCY_BUCKETS};
+use super::stats::{BudgetStats, CancelReason, EvictReason, GAP_BUCKETS, LATENCY_BUCKETS};
 use super::tier::{Presence, PresenceOracle, Source, Tier};
 use super::types::{
     Bytes, Class, Failure, Generation, LayerId, Micros, PerClass, Policy, Pressure, ResourceId,
@@ -55,6 +56,36 @@ struct Eff {
     local: u32,
     upload: Bytes,
     batch: bool,
+    /// D-A3's pooled ledger, under study.
+    #[cfg(feature = "budget-experiments")]
+    pool: Option<PoolEff>,
+}
+
+/// The pool's numbers for a step (D-A3, under study).
+#[cfg(feature = "budget-experiments")]
+#[derive(Clone, Copy)]
+struct PoolEff {
+    members: PerClass<bool>,
+    target: Bytes,
+    overflow: Bytes,
+    hard: Bytes,
+    floor: PerClass<u8>,
+    ceiling: PerClass<u8>,
+}
+
+#[cfg(feature = "budget-experiments")]
+impl PoolEff {
+    /// A member's target given what the other members use: what the pool
+    /// leaves, between its floor and its ceiling.
+    fn share(&self, c: Class, of: Bytes, used: &PerClass<Bytes>) -> Bytes {
+        let others = Class::ALL
+            .iter()
+            .filter(|o| **o != c && self.members[**o])
+            .fold(Bytes::ZERO, |a, o| a.plus(used[*o]));
+        let lo = of.scaled(u64::from(self.floor[c]), 100);
+        let hi = of.scaled(u64::from(self.ceiling[c]), 100);
+        of.minus(others).max(lo).min(hi)
+    }
 }
 
 /// One wanted resource this step.
@@ -82,6 +113,7 @@ struct Selection {
     exact: u32,
     fallback: u32,
     lost: u32,
+    depth: u32,
 }
 
 /// Work on a wanted resource.
@@ -185,10 +217,22 @@ impl Budget {
                 Thermal::Critical => 4,
             }
         };
-        let hard = PerClass::from_fn(|c| scale(self.cfg.hard_limit[c], 100));
+        #[allow(unused_mut)]
+        let mut hard = PerClass::from_fn(|c| scale(self.cfg.hard_limit[c], 100));
+        #[allow(unused_mut)]
+        let mut target = PerClass::from_fn(|c| scale(self.cfg.target[c], pct));
+        #[allow(unused_mut)]
+        let mut overflow = PerClass::from_fn(|c| scale(self.cfg.overflow[c], pct));
+        #[cfg(feature = "budget-experiments")]
+        let pool = match (self.cfg.pool, batch) {
+            (Some(pool), false) => Some(self.pool(pool, &mut target, &mut overflow, &mut hard)),
+            _ => None,
+        };
         Eff {
-            target: PerClass::from_fn(|c| scale(self.cfg.target[c], pct)),
-            overflow: PerClass::from_fn(|c| scale(self.cfg.overflow[c], pct)),
+            #[cfg(feature = "budget-experiments")]
+            pool,
+            target,
+            overflow,
             reserve: PerClass::from_fn(|c| {
                 if hard[c] == Bytes::MAX {
                     Bytes::ZERO
@@ -211,6 +255,40 @@ impl Budget {
             },
             batch,
         }
+    }
+
+    /// D-A3's pooled ledger, under study: each member's target, overflow
+    /// and hard limit from what the pool leaves once the others are counted.
+    #[cfg(feature = "budget-experiments")]
+    fn pool(
+        &self,
+        pool: super::config::Pool,
+        target: &mut PerClass<Bytes>,
+        overflow: &mut PerClass<Bytes>,
+        hard: &mut PerClass<Bytes>,
+    ) -> PoolEff {
+        let members = PerClass::from_fn(|c| pool.ceiling_percent[c] > 0);
+        let sum = |p: &PerClass<Bytes>| {
+            Class::ALL
+                .iter()
+                .filter(|c| members[**c])
+                .fold(Bytes::ZERO, |a, c| a.plus(p[*c]))
+        };
+        let p = PoolEff {
+            members,
+            target: sum(target),
+            overflow: sum(overflow),
+            hard: sum(hard),
+            floor: pool.floor_percent,
+            ceiling: pool.ceiling_percent,
+        };
+        for c in Class::ALL.into_iter().filter(|c| members[*c]) {
+            let t = p.share(c, p.target, &self.ledger.gpu);
+            overflow[c] = p.overflow.scaled(t.0, p.target.0.max(1));
+            target[c] = t;
+            hard[c] = p.share(c, p.hard, &self.ledger.gpu).max(t);
+        }
+        p
     }
 
     // 1. Arrivals.
@@ -269,6 +347,7 @@ impl Budget {
                                 Source::Local => self.local_reads -= 1,
                             }
                             st.failed += 1;
+                            st.failures[e.class][usize::from(why == Failure::Permanent)] += 1;
                             if self.cfg.policy == Policy::Batch {
                                 self.fatal.get_or_insert(SessionError::LoadFailed(r));
                             } else {
@@ -304,6 +383,9 @@ impl Budget {
                     };
                     if e.transit.is_some_and(|t| t.gen == g) {
                         if let Some(t) = e.take_transit(&mut self.ledger) {
+                            if !within_drift(t.cost.gpu, actual) {
+                                st.drift_exceeded[e.class] += 1;
+                            }
                             e.put_gpu(
                                 &mut self.ledger,
                                 Gpu {
@@ -655,6 +737,8 @@ impl Budget {
             let anc = self.ancestors(*t).into_iter().find(|a| shown(*a, &layers));
             if let Some(a) = anc {
                 add(&mut sel.items, a, Role::Fallback, *t);
+                let level = |x: TileId| self.tiles.get(&x).map_or(0, |i| i.level);
+                sel.depth = sel.depth.max(level(*t).saturating_sub(level(a)));
                 if held.is_empty() {
                     sel.fallback += 1;
                 }
@@ -685,6 +769,7 @@ impl Budget {
         st.exact += sel.exact;
         st.fallback += sel.fallback;
         st.lost += sel.lost;
+        st.fallback_depth_max = st.fallback_depth_max.max(sel.depth);
         let Selection {
             items, coarsening, ..
         } = sel;
@@ -909,6 +994,7 @@ impl Budget {
 
         self.apply_events(now, &mut st);
         let tiles = self.read_need(&input, &mut st);
+        st.work = st.work.saturating_add(input.need.entries().count() as u32);
         let drapes = self.drape_needs(&tiles, input.presence);
         st.floor_in = self.floor_in(&tiles);
         let (draw, coarsening) = self.build_draw(&tiles, &drapes, st.floor_in, &mut st);
@@ -1044,6 +1130,10 @@ impl Budget {
             }
         }
         jobs.sort_by_key(|j| j.0);
+        st.work = st
+            .work
+            .saturating_add(wants.len() as u32)
+            .saturating_add(jobs.len() as u32);
         self.ranked_last = jobs.iter().map(|j| j.1).collect();
         for (k, r, _, w) in &jobs {
             if let Some(e) = self.entries.get_mut(r) {
@@ -1108,6 +1198,8 @@ impl Budget {
 
         // 8. The upload plan.
         d.upload_plan = self.plan(&eff, &keys, &tiles, &drapes);
+        // The plan scans every tracked entry for those in transit.
+        st.work = st.work.saturating_add(self.entries.len() as u32);
 
         // 9. Eviction and release.
         if !eff.batch {
@@ -1169,18 +1261,36 @@ impl Budget {
             .copied()
             .chain(drawn_res.iter().copied())
             .collect();
-        self.prune(now, &tiles, &wants, &drapes);
+        let pruned = self.prune(now, &tiles, &wants, &drapes);
+        st.work = st.work.saturating_add(pruned);
 
         // Statistics.
         st.gpu = self.ledger.gpu;
         st.target = eff.target;
         st.overflow = eff.overflow;
+        st.hard_limit = eff.hard;
+        #[cfg(feature = "budget-experiments")]
+        if let Some(p) = eff.pool {
+            // The pool's shares as the step leaves them.
+            for c in Class::ALL.into_iter().filter(|c| p.members[*c]) {
+                let t = p.share(c, p.target, &self.ledger.gpu);
+                st.target[c] = t;
+                st.overflow[c] = p.overflow.scaled(t.0, p.target.0.max(1));
+            }
+        }
         st.decoded = self.ledger.decoded;
         st.in_transit = self.ledger.in_transit;
         st.sse_scale_milli = d.sse_scale_milli;
         st.in_flight = self.in_flight;
         st.local_reads = self.local_reads;
         st.tracked = self.entries.len() as u32;
+        for r in &self.active {
+            if let Some(e) = self.entries.get(r) {
+                if let Some(t) = e.transit {
+                    st.transit[e.class] = st.transit[e.class].plus(t.cost.gpu);
+                }
+            }
+        }
         st.protected = protected;
         d.draw = draw;
         d.stats = st;
@@ -1241,6 +1351,12 @@ impl Budget {
                     }
                     d.cancel.push((*r, gen));
                     st.cancelled += 1;
+                    if unneeded && !batch {
+                        st.cancels[CancelReason::Grace as usize] += 1;
+                        st.wasted_starts[e.class] += 1;
+                    } else {
+                        st.cancels[CancelReason::Timeout as usize] += 1;
+                    }
                     if timed_out && !unneeded {
                         if batch {
                             fatal.get_or_insert(SessionError::LoadFailed(*r));
@@ -1258,6 +1374,8 @@ impl Budget {
                     {
                         e.take_transit(&mut self.ledger);
                         d.cancel.push((*r, t.gen));
+                        st.cancelled += 1;
+                        st.cancels[CancelReason::Grace as usize] += 1;
                     }
                 }
             }
@@ -1280,11 +1398,18 @@ impl Budget {
         st: &mut BudgetStats,
     ) {
         let decoded_full = self.ledger.decoded >= eff.decoded;
+        // Stored resources left unstarted for any reason but their own
+        // quota: a network load of lower priority starting after them is a
+        // local wait (I15).
+        let mut skipped_stored = 0u32;
         for (key, r, _, w) in loads {
             let class = self.class_of(*r, w.class);
             if decoded_full && w.urgency >= Urgency::Ring {
                 // Backpressure: preload that could neither be delivered nor
                 // kept decoded is not fetched.
+                if key.tier == Tier::Stored {
+                    skipped_stored += 1;
+                }
                 continue;
             }
             let source = if key.tier == Tier::Stored {
@@ -1301,9 +1426,13 @@ impl Budget {
                 Source::Network => {
                     if self.in_flight[class] >= eff.quota[class] {
                         if w.urgency > Urgency::Hole {
+                            if key.tier == Tier::Stored {
+                                skipped_stored += 1;
+                            }
                             continue;
                         }
                         // Preempt the least urgent in-flight preload.
+                        st.work = st.work.saturating_add(self.entries.len() as u32);
                         let victim = self
                             .entries
                             .iter()
@@ -1338,6 +1467,7 @@ impl Budget {
                                 self.in_flight[class] -= 1;
                                 d.cancel.push((vr, gen));
                                 st.cancelled += 1;
+                                st.cancels[CancelReason::Preempted as usize] += 1;
                             }
                         }
                     }
@@ -1376,10 +1506,14 @@ impl Budget {
                 Source::Network => {
                     self.in_flight[class] += 1;
                     st.started_network += 1;
+                    st.starts[class][1] += 1;
+                    st.local_waits += skipped_stored;
+                    skipped_stored = 0;
                 }
                 Source::Local => {
                     self.local_reads += 1;
                     st.started_local += 1;
+                    st.starts[class][0] += 1;
                 }
             }
             if let Some(t) = self.recent.remove(r) {
@@ -1422,6 +1556,7 @@ impl Budget {
         if self.ledger.gpu[class].plus(bytes) <= limit {
             return true;
         }
+        st.work = st.work.saturating_add(self.entries.len() as u32);
         let mut victims: Vec<_> = self
             .entries
             .iter()
@@ -1462,6 +1597,7 @@ impl Budget {
                 e.take_gpu(&mut self.ledger);
                 d.evict.push(r);
                 st.evicted += 1;
+                st.evictions[class][EvictReason::Admission as usize] += 1;
                 self.recent.insert(r, now);
             }
         }
@@ -1698,13 +1834,22 @@ impl Budget {
         st: &mut BudgetStats,
     ) {
         let w = self.cfg.watermarks;
+        #[cfg(feature = "budget-experiments")]
+        if let Some(p) = eff.pool {
+            self.evict_pooled(now, p, drawn, d, st);
+        }
         for class in Class::ALL {
+            #[cfg(feature = "budget-experiments")]
+            if eff.pool.is_some_and(|p| p.members[class]) {
+                continue;
+            }
             let used = self.ledger.gpu[class];
             let high = eff.target[class].scaled(u64::from(w.high_percent), 100);
             if used <= high {
                 continue;
             }
             let low = eff.target[class].scaled(u64::from(w.low_percent), 100);
+            st.work = st.work.saturating_add(self.entries.len() as u32);
             let mut cands: Vec<_> = self
                 .entries
                 .iter()
@@ -1731,11 +1876,18 @@ impl Budget {
                     e.take_gpu(&mut self.ledger);
                     d.evict.push(r);
                     st.evicted += 1;
+                    let why = if self.pressure == Pressure::Normal {
+                        EvictReason::Sweep
+                    } else {
+                        EvictReason::Pressure
+                    };
+                    st.evictions[class][why as usize] += 1;
                     self.recent.insert(r, now);
                 }
             }
         }
         if self.ledger.decoded > eff.decoded {
+            st.work = st.work.saturating_add(self.entries.len() as u32);
             let mut cands: Vec<_> = self
                 .entries
                 .iter()
@@ -1772,7 +1924,83 @@ impl Budget {
                     e.take_cpu(&mut self.ledger);
                     d.release.push(r);
                     st.released += 1;
+                    st.releases[e.class] += 1;
                 }
+            }
+        }
+    }
+
+    /// D-A3, under study: one sweep over the pool's members, in the one
+    /// eviction order, down to the low watermark of the pool's target, no
+    /// member below its floor, none left above its ceiling.
+    #[cfg(feature = "budget-experiments")]
+    fn evict_pooled(
+        &mut self,
+        now: Micros,
+        p: PoolEff,
+        drawn: &BTreeSet<ResourceId>,
+        d: &mut Decisions,
+        st: &mut BudgetStats,
+    ) {
+        let w = self.cfg.watermarks;
+        let used = |l: &Ledger| {
+            Class::ALL
+                .iter()
+                .filter(|c| p.members[**c])
+                .fold(Bytes::ZERO, |a, c| a.plus(l.gpu[*c]))
+        };
+        let ceil = |c: Class| p.target.scaled(u64::from(p.ceiling[c]), 100);
+        let floor = |c: Class| p.target.scaled(u64::from(p.floor[c]), 100);
+        let over_ceiling = |l: &Ledger| {
+            Class::ALL
+                .iter()
+                .any(|c| p.members[*c] && l.gpu[*c] > ceil(*c))
+        };
+        let high = p.target.scaled(u64::from(w.high_percent), 100);
+        if used(&self.ledger) <= high && !over_ceiling(&self.ledger) {
+            return;
+        }
+        let low = p.target.scaled(u64::from(w.low_percent), 100);
+        st.work = st.work.saturating_add(self.entries.len() as u32);
+        let mut cands: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|(r, e)| {
+                p.members[e.class]
+                    && e.gpu.is_some()
+                    && !drawn.contains(r)
+                    && e.transit.is_none()
+                    && !self.is_floor(e.level)
+            })
+            .map(|(r, e)| {
+                (
+                    (e.last_needed, Reverse(e.level), Reverse(e.distance), *r),
+                    *r,
+                    e.class,
+                )
+            })
+            .collect();
+        cands.sort();
+        for (_, r, class) in cands {
+            let pool_low = used(&self.ledger) <= low;
+            let class_over = self.ledger.gpu[class] > ceil(class);
+            if pool_low && !over_ceiling(&self.ledger) {
+                break;
+            }
+            if !class_over && (pool_low || self.ledger.gpu[class] <= floor(class)) {
+                continue;
+            }
+            if let Some(e) = self.entries.get_mut(&r) {
+                e.take_gpu(&mut self.ledger);
+                d.evict.push(r);
+                st.evicted += 1;
+                let why = if self.pressure == Pressure::Normal {
+                    EvictReason::Sweep
+                } else {
+                    EvictReason::Pressure
+                };
+                st.evictions[class][why as usize] += 1;
+                self.recent.insert(r, now);
             }
         }
     }
@@ -1794,10 +2022,24 @@ impl Budget {
             .map(|l| now.since(l))
             .unwrap_or(Micros::ZERO)
             .0;
-        let over = strained
+        #[allow(unused_mut)]
+        let mut over = strained
             || Class::ALL
                 .iter()
                 .any(|&c| protected[c] > eff.target[c].plus(eff.overflow[c]));
+        #[cfg(feature = "budget-experiments")]
+        if let Some(p) = eff.pool {
+            // The pool's members relax on the pool's protected bytes.
+            let pooled = Class::ALL
+                .iter()
+                .filter(|c| p.members[**c])
+                .fold(Bytes::ZERO, |a, c| a.plus(protected[*c]));
+            over = strained
+                || pooled > p.target.plus(p.overflow)
+                || Class::ALL
+                    .iter()
+                    .any(|&c| !p.members[c] && protected[c] > eff.target[c].plus(eff.overflow[c]));
+        }
         let at_hard = blocked
             || Class::ALL.iter().any(|&c| {
                 eff.hard[c] != Bytes::MAX && self.ledger.gpu[c] >= eff.hard[c].minus(eff.reserve[c])
@@ -1832,15 +2074,20 @@ impl Budget {
         tiles: &BTreeMap<TileId, TileNeed>,
         wants: &BTreeMap<ResourceId, Want>,
         drapes: &BTreeMap<(TileId, LayerId), u32>,
-    ) {
+    ) -> u32 {
         // Amortised: emptied entries and unreferenced tiles go every eighth
-        // step, so a step does not scan all it tracks.
+        // step, so a step does not scan all it tracks. Returns the entries
+        // visited.
+        let visited = self.imagery_prev.len() as u32;
         if !self.steps.is_multiple_of(8) {
             let held = &self.held_last;
             self.imagery_prev
                 .retain(|k, _| drapes.contains_key(k) || held.contains(&k.0));
-            return;
+            return visited;
         }
+        let visited = visited
+            .saturating_add(self.entries.len() as u32)
+            .saturating_add(self.tiles.len() as u32);
         let entries = &self.entries;
         self.active.retain(|r| {
             entries
@@ -1890,6 +2137,7 @@ impl Budget {
         let held = &self.held_last;
         self.imagery_prev
             .retain(|k, _| drapes.contains_key(k) || held.contains(&k.0));
+        visited
     }
 
     pub(super) fn release_beyond_impl(&mut self, target: Bytes) -> Vec<ResourceId> {

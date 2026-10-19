@@ -56,3 +56,8 @@ http = ["dep:reqwest"]
 # Loads as tokio tasks on a host-provided runtime handle (`runtime::Spawn::Tokio`).
 # Native only: on wasm32 the feature compiles to nothing.
 rt-tokio = ["dep:tokio"]
+# Budget policies under study, compiled only for the experiments that weigh
+# them (D-A3's pooled ledger): never a runtime switch, absent from every
+# product build. `cargo test --release -p tuile-core --features
+# budget-experiments --test budget_sim -- --ignored pooled --nocapture`.
+budget-experiments = []

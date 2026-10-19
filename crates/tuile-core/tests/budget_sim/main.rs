@@ -18,6 +18,8 @@ mod gpu;
 mod motion;
 mod net;
 mod patterns;
+#[cfg(feature = "budget-experiments")]
+mod pooled;
 mod rng;
 mod scenarios;
 mod server;
