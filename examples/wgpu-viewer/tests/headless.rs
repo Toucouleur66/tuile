@@ -161,7 +161,8 @@ fn the_session_log_holds_the_camera_the_states_and_the_pictures() {
         scale: 1.0,
         ..place.start()
     });
-    run.run_for(2.0);
+    assert!(run.settle(COMING_UP).settled);
+    run.run_for(1.0);
     let steps = run.history().len();
     let drawn = run.history().iter().filter(|s| s.drew).count();
     let support::Run { run, turn: _turn } = run;
@@ -374,14 +375,20 @@ fn a_run_that_ends_leaves_none_of_its_residency_counted() {
 // --- The patterns -----------------------------------------------------------
 
 /// Runs `pattern` from a fresh place: up and settled, then the motion, then
-/// its bound to settle. Returns the states from the motion on, how the
-/// settling went, and the report — printed either way.
+/// watched settling for as long as it takes, up to a cap — so a run that
+/// misses its bound says by how much. Returns the states from the motion
+/// on, how the settling went, and the report — printed either way.
+///
+/// For a pattern whose coming up is the pattern (P1), the settling is
+/// counted from before the run starts: the session's launch is part of it.
 fn run(pattern: &Pattern) -> (Vec<State>, Settled, Report) {
     let place = Place::new();
+    let launched = std::time::Instant::now();
     let mut run = support::start(tuile_viewer::control::Start {
         log: Some(log_for(pattern.name)),
         ..pattern.start(place.host(), place.store())
     });
+    let launch = launched.elapsed().as_secs_f64();
     if pattern.warm > 0.0 {
         let up = run.settle(pattern.warm);
         assert!(
@@ -394,29 +401,34 @@ fn run(pattern: &Pattern) -> (Vec<State>, Settled, Report) {
     }
     let first = run.history().len();
     run.play(&pattern.motion);
-    let settled = run.settle(pattern.settle);
+    let mut settled = run.settle(patterns::WATCHED_SECONDS);
+    if pattern.warm == 0.0 {
+        settled.seconds += launch;
+    }
     let states = run.history()[first..].to_vec();
     let r = report(&states, run.limits().resident_bytes);
     said(pattern.name, (&settled, &r));
     (states, settled, r)
 }
 
-/// What every pattern is held to: see the module.
-fn holds(name: &str, settled: Settled, r: &Report) {
+/// What every pattern is held to: see the module. `bound` is the
+/// specification's, in seconds.
+fn holds(name: &str, bound: f64, settled: Settled, r: &Report) {
     assert!(r.drawn > 0, "{name}: nothing drawn");
     assert_eq!(r.black_frames, 0, "{name}: ground left black: {r:?}");
     assert_eq!(r.lost_frames, 0, "{name}: holes in the selection: {r:?}");
     assert_eq!(r.over_budget_frames, 0, "{name}: over the budget: {r:?}");
     assert!(
-        settled.settled,
-        "{name}: not settled within {:.1} s: {settled:?} {r:?}",
-        settled.seconds
+        settled.settled && settled.seconds <= bound,
+        "{name}: settled in {:.1} s (settled: {}), against {bound} s: {r:?}",
+        settled.seconds,
+        settled.settled
     );
 }
 
 fn check(pattern: Pattern) {
     let (_, settled, r) = run(&pattern);
-    holds(pattern.name, settled, &r);
+    holds(pattern.name, pattern.settle, settled, &r);
 }
 
 #[test]
@@ -438,8 +450,11 @@ fn p1_a_warm_start_is_served_by_the_store_and_settles_in_time() {
     // What the cold run settled on has been fetched; let what it was still
     // fetching land before it is put away.
     let _ = cold.wait_until(10.0, State::idle);
+    let launched = std::time::Instant::now();
     let mut warm = relaunch(cold, Some(log_for("P1 warm start")));
-    let settled = warm.settle(pattern.settle);
+    let launch = launched.elapsed().as_secs_f64();
+    let mut settled = warm.settle(patterns::WATCHED_SECONDS);
+    settled.seconds += launch;
     let r = report(warm.history(), warm.limits().resident_bytes);
     said("P1 warm start", (&settled, &r));
     assert_eq!(
@@ -447,7 +462,7 @@ fn p1_a_warm_start_is_served_by_the_store_and_settles_in_time() {
         "the network was asked for what the store holds: {r:?}"
     );
     assert!(r.store_hits > 0, "the store served nothing: {r:?}");
-    holds("P1 warm start", settled, &r);
+    holds("P1 warm start", pattern.settle, settled, &r);
 }
 
 #[test]
@@ -523,5 +538,5 @@ fn p6_two_eyes_at_90_hz_never_uncover_the_ground_in_either() {
     let pattern = patterns::stereo_head_motion();
     let (states, settled, r) = run(&pattern);
     assert!(states.iter().all(|s| s.eyes.len() == 2));
-    holds(pattern.name, settled, &r);
+    holds(pattern.name, pattern.settle, settled, &r);
 }

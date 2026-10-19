@@ -30,8 +30,13 @@ pub const DESKTOP_SECONDS: f64 = 2.0;
 pub const PHONE_SECONDS: f64 = 4.0;
 
 /// How long a run is given to come up and settle before its motion: far
-/// beyond any bound, since what is measured is the motion.
-pub const COMING_UP_SECONDS: f64 = 60.0;
+/// beyond any bound, since what is measured is the motion. A desktop at
+/// 2 km over a city has hundreds of tiles to upload, eight a frame.
+pub const COMING_UP_SECONDS: f64 = 180.0;
+
+/// How long a run is watched settling after its motion, whatever its bound:
+/// long enough to say how long it took when it misses the bound.
+pub const WATCHED_SECONDS: f64 = 120.0;
 
 /// A headset: Android, and roomier than a phone.
 pub const HEADSET: Device = Device::Android {
