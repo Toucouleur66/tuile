@@ -46,10 +46,10 @@ Acceptance criteria:
 
 ## M2 — Network middleware: WebSocket streaming + static mode + pluggable cache
 
-Scope: `tuile-server`, client `WsStream` binding, `tuile-wgpu-viewer --remote`.
+Scope: `tuile-server` (its storage and cache side, `tuile-tile-server`, already exists), client `WsStream` binding, `tuile-wgpu-viewer --remote`.
 
 Deliverables:
-1. **Network binding of streaming mode**: WebSocket endpoint (one session = one core `GeometryServer`), envelope serialization (versioned from the first byte), geometry as glb on the wire. Client `WsStream` binding (decodes on the client side) + `tuile-wgpu-viewer --remote ws://…`.
+1. **Network binding of streaming mode**: WebSocket endpoint (one session = one core `GeometryServer` and its graphics budget, for a consumer that declares its budget; interactive devices run theirs locally — D-A5, 2026-10-19; the transport is open, D-T1 in `docs/12-crate-server.md`), envelope serialization (versioned from the first byte), geometry as glb on the wire. Client `WsStream` binding (decodes on the client side) + `tuile-wgpu-viewer --remote ws://…`.
 2. `tuile` native binary (axum): `tuile serve <dir|s3://|gs://>` via `object_store`. Routes: WS streaming, tileset.json, contents, health, basic metrics.
 3. `TileCache` trait + impls: `NoopCache`, `MemoryLruCache` (byte budget), `DiskCache`. Selection by config/CLI — the cache is removable depending on the environment.
 4. Correct HTTP headers (static mode): ETag, immutable Cache-Control on contents, configurable CORS, Range requests on glb.
@@ -61,6 +61,7 @@ Acceptance criteria:
 - [ ] The main open source 3D Tiles web viewers (including three.js 3DTilesRenderer) consume a tileset served by `tuile serve` without error (manual test documented in `docs/`, test HTML pages committed).
 - [ ] The M1 wgpu viewer works against the server in static mode (`HttpPullStream` — full homemade loop).
 - [ ] Integration tests: end-to-end WS session (+ cancellation, timeout, malformed messages → Error), ETag/304, immutability, LRU respects the budget, NoopCache = passthrough.
+- [ ] A session's budget stays within the memory its consumer declared, its ledger exact from the `Ack` bytes.
 - [ ] Workers build OK (`worker-build`), deployment documented step by step.
 
 ## M2.5 — Raster imagery (`core::raster` module)
