@@ -7003,11 +7003,8 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tuile-bing",
- "tuile-camera",
  "tuile-cesium-ion",
- "tuile-core",
  "tuile-native-fetchers",
- "tuile-tape",
  "tuile-viewer",
  "url",
 ]

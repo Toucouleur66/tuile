@@ -192,80 +192,69 @@ fn count(request: &Value, key: &str, or: u64) -> Result<u64, String> {
     }
 }
 
-/// The answer to one request.
-pub(super) fn answer(run: &mut Headless, request: &Value) -> Value {
+/// One request, read and checked: what [`answer`] carries out.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Request {
+    Version,
+    State,
+    Metrics,
+    Limits,
+    Step { frames: u64 },
+    Settle { seconds: f64 },
+    Act(Action),
+    Picture { eye: usize, path: String },
+    Close,
+}
+
+/// Reads a request: its version, its command and the command's arguments,
+/// or says what is wrong with it. Nothing is done.
+pub fn read(request: &Value) -> Result<Request, String> {
     match request.get("v").and_then(Value::as_u64) {
         Some(VERSION) => {}
         other => {
-            return failure(&format!(
+            return Err(format!(
                 "this is version {VERSION} of the protocol; the request said {other:?}"
             ))
         }
     }
-    match carry(run, request) {
-        Ok(ok) => json!({"v": VERSION, "ok": ok}),
-        Err(why) => failure(&why),
-    }
-}
-
-fn carry(run: &mut Headless, request: &Value) -> Result<Value, String> {
     let cmd = request
         .get("cmd")
         .and_then(Value::as_str)
         .ok_or("a request names its cmd")?;
-    let act = |run: &mut Headless, action: Action| {
-        run.act(&action);
-        Ok(Value::Null)
+    let view = || -> Result<View, String> {
+        Ok(View {
+            lon: number(request, "lon")?,
+            lat: number(request, "lat")?,
+            altitude: number(request, "altitude")?,
+            heading: number(request, "heading")?,
+            pitch: number(request, "pitch")?,
+        })
     };
-    match cmd {
-        "version" => Ok(json!({"v": VERSION, "commands": COMMANDS})),
-        "state" => Ok(run.state().to_json()),
-        "metrics" => serde_json::to_value(tuile_core::metrics::metrics().snapshot())
-            .map_err(|e| e.to_string()),
-        "limits" => {
-            let l = run.limits();
-            Ok(json!({
-                "resident_bytes": l.resident_bytes,
-                "resident_tiles": l.resident_tiles,
-                "uploads_per_frame": l.uploads_per_frame,
-            }))
-        }
-        "step" => {
-            let frames = count(request, "frames", 1)?.max(1);
-            Ok(run.steps(frames).to_json())
-        }
-        "settle" => {
-            let bound = match request.get("seconds") {
+    Ok(match cmd {
+        "version" => Request::Version,
+        "state" => Request::State,
+        "metrics" => Request::Metrics,
+        "limits" => Request::Limits,
+        "step" => Request::Step {
+            frames: count(request, "frames", 1)?.max(1),
+        },
+        "settle" => Request::Settle {
+            seconds: match request.get("seconds") {
                 None => 10.0,
                 Some(v) => v.as_f64().ok_or("seconds is a number")?,
-            };
-            let settled = run.settle(bound);
-            Ok(json!({
-                "frames": settled.frames,
-                "seconds": settled.seconds,
-                "settled": settled.settled,
-            }))
-        }
-        "go" => {
-            let view = View {
-                lon: number(request, "lon")?,
-                lat: number(request, "lat")?,
-                altitude: number(request, "altitude")?,
-                heading: number(request, "heading")?,
-                pitch: number(request, "pitch")?,
-            };
-            match request.get("seconds").and_then(Value::as_f64) {
-                Some(seconds) => act(run, Action::Glide(view, seconds)),
-                None => act(run, Action::Go(view)),
-            }
-        }
-        "url" => {
-            let url = request
+            },
+        },
+        "go" => Request::Act(match request.get("seconds").and_then(Value::as_f64) {
+            Some(seconds) => Action::Glide(view()?, seconds),
+            None => Action::Go(view()?),
+        }),
+        "url" => Request::Act(Action::Url(
+            request
                 .get("url")
                 .and_then(Value::as_str)
-                .ok_or("url is a steering URL")?;
-            act(run, Action::Url(url.to_owned()))
-        }
+                .ok_or("url is a steering URL")?
+                .to_owned(),
+        )),
         "touch" => {
             let finger = match request.get("finger").and_then(Value::as_str) {
                 Some("down") => Finger::Down,
@@ -274,48 +263,99 @@ fn carry(run: &mut Headless, request: &Value) -> Result<Value, String> {
                 Some("cancelled") => Finger::Cancelled,
                 _ => return Err("finger is down, moved, up or cancelled".into()),
             };
-            let id = count(request, "id", 0)?;
-            let at = (number(request, "x")?, number(request, "y")?);
-            act(run, Action::Touch { id, finger, at })
+            Request::Act(Action::Touch {
+                id: count(request, "id", 0)?,
+                finger,
+                at: (number(request, "x")?, number(request, "y")?),
+            })
         }
-        "wheel" => {
-            let amount = number(request, "amount")?;
-            let at = (number(request, "x")?, number(request, "y")?);
-            act(run, Action::Wheel { amount, at })
-        }
+        "wheel" => Request::Act(Action::Wheel {
+            amount: number(request, "amount")?,
+            at: (number(request, "x")?, number(request, "y")?),
+        }),
         "resize" => {
-            let width = count(request, "width", 0)? as u32;
-            let height = count(request, "height", 0)? as u32;
-            if width == 0 || height == 0 {
-                return Err("width and height are device pixels, above zero".into());
-            }
-            act(run, Action::Resize { width, height })
+            let side = |key| -> Result<u32, String> {
+                u32::try_from(count(request, key, 0)?)
+                    .ok()
+                    .filter(|v| *v > 0)
+                    .ok_or_else(|| format!("{key} is device pixels, above zero"))
+            };
+            Request::Act(Action::Resize {
+                width: side("width")?,
+                height: side("height")?,
+            })
         }
-        "rescale" => act(run, Action::Rescale(number(request, "scale")?)),
-        "memory_warning" => act(run, Action::MemoryWarning),
-        "pressure" => match request.get("level").and_then(Value::as_str) {
-            Some("warning") => act(run, Action::Pressure(Pressure::Warning)),
-            Some("critical") => act(run, Action::Pressure(Pressure::Critical)),
-            _ => Err("level is warning or critical".into()),
-        },
-        "background" => act(run, Action::Background),
-        "foreground" => act(run, Action::Foreground),
-        "picture" => picture(run, request),
-        "close" => Ok(Value::Null),
-        other => Err(format!(
-            "{other:?} is not a command; the commands are {}",
-            COMMANDS.join(", ")
+        "rescale" => Request::Act(Action::Rescale(number(request, "scale")?)),
+        "memory_warning" => Request::Act(Action::MemoryWarning),
+        "pressure" => Request::Act(Action::Pressure(
+            match request.get("level").and_then(Value::as_str) {
+                Some("warning") => Pressure::Warning,
+                Some("critical") => Pressure::Critical,
+                _ => return Err("level is warning or critical".into()),
+            },
         )),
+        "background" => Request::Act(Action::Background),
+        "foreground" => Request::Act(Action::Foreground),
+        "picture" => Request::Picture {
+            eye: usize::try_from(count(request, "eye", 0)?).map_err(|e| e.to_string())?,
+            path: request
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or("path is where the PNG goes")?
+                .to_owned(),
+        },
+        "close" => Request::Close,
+        other => {
+            return Err(format!(
+                "{other:?} is not a command; the commands are {}",
+                COMMANDS.join(", ")
+            ))
+        }
+    })
+}
+
+/// The answer to one request.
+pub(super) fn answer(run: &mut Headless, request: &Value) -> Value {
+    match read(request).and_then(|request| carry(run, request)) {
+        Ok(ok) => json!({"v": VERSION, "ok": ok}),
+        Err(why) => failure(&why),
     }
 }
 
-/// Writes eye `eye`'s last picture to the PNG `path` names.
-fn picture(run: &mut Headless, request: &Value) -> Result<Value, String> {
-    let eye = count(request, "eye", 0)? as usize;
-    let path = request
-        .get("path")
-        .and_then(Value::as_str)
-        .ok_or("path is where the PNG goes")?;
+fn carry(run: &mut Headless, request: Request) -> Result<Value, String> {
+    match request {
+        Request::Version => Ok(json!({"v": VERSION, "commands": COMMANDS})),
+        Request::State => Ok(run.state().to_json()),
+        Request::Metrics => serde_json::to_value(tuile_core::metrics::metrics().snapshot())
+            .map_err(|e| e.to_string()),
+        Request::Limits => {
+            let l = run.limits();
+            Ok(json!({
+                "resident_bytes": l.resident_bytes,
+                "resident_tiles": l.resident_tiles,
+                "uploads_per_frame": l.uploads_per_frame,
+            }))
+        }
+        Request::Step { frames } => Ok(run.steps(frames).to_json()),
+        Request::Settle { seconds } => {
+            let settled = run.settle(seconds);
+            Ok(json!({
+                "frames": settled.frames,
+                "seconds": settled.seconds,
+                "settled": settled.settled,
+            }))
+        }
+        Request::Act(action) => {
+            run.act(&action);
+            Ok(Value::Null)
+        }
+        Request::Picture { eye, path } => picture(run, eye, &path),
+        Request::Close => Ok(Value::Null),
+    }
+}
+
+/// Writes eye `eye`'s last picture to the PNG at `path`.
+fn picture(run: &mut Headless, eye: usize, path: &str) -> Result<Value, String> {
     let (pixels, (width, height)) = run
         .picture(eye)
         .ok_or_else(|| format!("eye {eye} has drawn nothing"))?;
@@ -355,5 +395,85 @@ impl Headless {
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(text: &str) -> Result<Request, String> {
+        read(&serde_json::from_str(text).expect("JSON"))
+    }
+
+    /// Each command reads into what it asks, with its defaults.
+    #[test]
+    fn a_request_reads_into_its_command() {
+        assert_eq!(parse(r#"{"v":1,"cmd":"version"}"#), Ok(Request::Version));
+        assert_eq!(
+            parse(r#"{"v":1,"cmd":"step"}"#),
+            Ok(Request::Step { frames: 1 })
+        );
+        assert_eq!(
+            parse(r#"{"v":1,"cmd":"settle","seconds":2.5}"#),
+            Ok(Request::Settle { seconds: 2.5 })
+        );
+        assert_eq!(
+            parse(
+                r#"{"v":1,"cmd":"go","lon":2,"lat":48,"altitude":5000,"heading":0,"pitch":60,"seconds":1.5}"#
+            ),
+            Ok(Request::Act(Action::Glide(
+                View {
+                    lon: 2.0,
+                    lat: 48.0,
+                    altitude: 5000.0,
+                    heading: 0.0,
+                    pitch: 60.0
+                },
+                1.5
+            )))
+        );
+        assert_eq!(
+            parse(r#"{"v":1,"cmd":"touch","id":3,"finger":"moved","x":0.5,"y":0.25}"#),
+            Ok(Request::Act(Action::Touch {
+                id: 3,
+                finger: Finger::Moved,
+                at: (0.5, 0.25)
+            }))
+        );
+        assert_eq!(
+            parse(r#"{"v":1,"cmd":"pressure","level":"critical"}"#),
+            Ok(Request::Act(Action::Pressure(Pressure::Critical)))
+        );
+        assert_eq!(
+            parse(r#"{"v":1,"cmd":"picture","path":"/tmp/eye.png"}"#),
+            Ok(Request::Picture {
+                eye: 0,
+                path: "/tmp/eye.png".into()
+            })
+        );
+    }
+
+    /// What is not version 1, not a command, or not complete is refused in
+    /// words that say why — and nothing is done.
+    #[test]
+    fn a_bad_request_is_refused_with_its_reason() {
+        assert!(parse(r#"{"v":2,"cmd":"state"}"#).is_err_and(|e| e.contains("version 1")));
+        assert!(parse(r#"{"cmd":"state"}"#).is_err());
+        assert!(parse(r#"{"v":1,"cmd":"teleport"}"#).is_err_and(|e| e.contains("teleport")));
+        assert!(parse(r#"{"v":1,"cmd":"go","lon":2}"#).is_err_and(|e| e.contains("lat")));
+        assert!(parse(r#"{"v":1,"cmd":"resize","width":0,"height":10}"#)
+            .is_err_and(|e| e.contains("width")));
+        assert!(parse(r#"{"v":1,"cmd":"touch","finger":"pinch","x":0,"y":0}"#).is_err());
+        assert!(parse(r#"{"v":1,"cmd":"pressure","level":"mild"}"#).is_err());
+    }
+
+    /// The socket opens on loopback only, and refuses anything else before
+    /// it opens.
+    #[test]
+    fn the_socket_listens_on_loopback_only() {
+        assert!(listen("0.0.0.0:0".parse().expect("an address")).is_err());
+        let listener = listen("127.0.0.1:0".parse().expect("an address")).expect("listens");
+        assert!(listener.address.ip().is_loopback());
     }
 }

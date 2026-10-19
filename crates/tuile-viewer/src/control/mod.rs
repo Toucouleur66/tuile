@@ -51,7 +51,10 @@
 //! memory pressure, the background — one at a time with [`Headless::act`],
 //! or as a [`Series`] timed in seconds ([`Headless::play`]); a tape with
 //! [`Headless::fly`]. [`patterns`] holds the motion patterns of the budget's
-//! specification.
+//! specification, and [`verdict`] holds a run — live, or read back from its
+//! session log — to the specification's obligations. The runner that plays
+//! the patterns on the real catalog is the host's: `examples/wgpu-viewer`,
+//! `cargo run --example headless`.
 //!
 //! # The socket
 //!
@@ -65,6 +68,7 @@ mod log;
 pub mod patterns;
 mod series;
 pub mod socket;
+pub mod verdict;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -78,6 +82,7 @@ use web_time::Instant;
 pub use log::{Observer, Pictures};
 pub use series::{Action, Finger, Pressure, Series};
 pub use tuile_core::metrics::Snapshot;
+pub use verdict::{Obligations, Report, Verdict};
 
 use crate::app::{App, Rig, Turn, ViewerConfig};
 use crate::embed::ViewerHost;
