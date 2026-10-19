@@ -281,7 +281,6 @@ impl App {
             gpu,
             backend,
         } = up;
-        let surface_format = format.render;
         // The drawable is the whole window, edge to edge; on a phone the
         // inner size is only its safe area, which the controls keep to.
         let size = if self.profile.hold_window_until_warm {
@@ -305,6 +304,53 @@ impl App {
             scale,
             "display"
         );
+        let safe = safe_area(&window, size);
+        let screen = super::screen::Screen::Window(super::screen::Windowed {
+            window,
+            instance,
+            surface: Some(surface),
+        });
+        self.finish_screen(screen, format, gpu, size, scale, safe);
+        crate::desktop::drawing(Ok(backend.to_str()));
+    }
+
+    /// Opens the headless viewer's screen: `eyes` textures of `size` device
+    /// pixels at `scale` device pixels per point, on `gpu`. Everything the
+    /// frame draws with is built as a window's is.
+    #[cfg(feature = "control")]
+    pub(crate) fn start_offscreen(
+        &mut self,
+        gpu: GpuContext,
+        size: (u32, u32),
+        scale: f64,
+        rig: super::Rig,
+    ) {
+        let size = (size.0.max(1), size.1.max(1));
+        let format = tuile_wgpu::SurfaceFormat {
+            surface: super::offscreen::FORMAT,
+            render: super::offscreen::FORMAT,
+            encode: false,
+        };
+        let screen = super::screen::Screen::Offscreen(super::offscreen::Offscreen::new(
+            &gpu, size, rig.eyes,
+        ));
+        self.rig = rig;
+        let safe = (0.0, 0.0, f64::from(size.0), f64::from(size.1));
+        self.finish_screen(screen, format, gpu, size, scale.max(1.0), safe);
+    }
+
+    /// The renderer, the controls, the pump, the targets and the shell, over
+    /// `screen`: everything a frame is drawn with, whatever it is drawn into.
+    fn finish_screen(
+        &mut self,
+        screen: super::screen::Screen,
+        format: tuile_wgpu::SurfaceFormat,
+        gpu: GpuContext,
+        size: (u32, u32),
+        scale: f64,
+        safe: (f64, f64, f64, f64),
+    ) {
+        let surface_format = format.render;
         // The loader has been running against the correctness floor since the
         // stream was built; this is the first moment anything knows what the
         // device will actually bind. On the WebGPU baseline it stays at the
@@ -318,15 +364,12 @@ impl App {
         let overlay = OverlayRenderer::new(&gpu, surface_format, Some(DEPTH_FORMAT));
         // The render origin tracks the eye (set each frame); start there.
         let pump = ContentPump::new(self.controller.camera.position);
-        let safe = safe_area(&window, size);
         let targets = tuile_wgpu::FrameTargets::for_surface(&gpu, format, size);
         // Built and uploaded once for the whole session.
         let shell = tuile_wgpu::prepare(&gpu, &crate::backdrop::shell_content(), DVec3::ZERO);
 
-        let active = Active {
-            window,
-            instance,
-            surface: Some(surface),
+        let mut active = Active {
+            screen,
             format,
             gpu,
             renderer,
@@ -339,14 +382,13 @@ impl App {
             readback: tuile_wgpu::Readback::default(),
             shell,
         };
-        configure_surface(&active);
-        active.window.request_redraw();
+        configure_surface(&mut active);
+        active.screen.request_redraw();
         self.active = Some(active);
         // The loader has been running against the correctness floor; this is
         // the first moment anything knows what the device will bind.
         self.fit_the_layer_budget();
         tracing::info!(slots = self.layer_budget.get(), "imagery layers per drape");
-        crate::desktop::drawing(Ok(backend.to_str()));
     }
 
     /// Lets go of the surface and shrinks the render targets to nothing: a
@@ -355,7 +397,7 @@ impl App {
         let Some(active) = self.active.as_mut() else {
             return;
         };
-        active.surface = None;
+        active.screen.release();
         active.targets.resize(&active.gpu, (1, 1));
         tracing::info!("surface released");
     }
@@ -365,12 +407,11 @@ impl App {
         let Some(active) = self.active.as_mut() else {
             return;
         };
-        if active.surface.is_some() {
+        if !active.screen.is_released() {
             return;
         }
-        match active.instance.create_surface(active.window.clone()) {
-            Ok(surface) => {
-                active.surface = Some(surface);
+        match active.screen.restore(&active.gpu, active.size) {
+            Ok(()) => {
                 active.targets.resize(&active.gpu, active.size);
                 configure_surface(active);
                 tracing::info!("surface restored");
@@ -381,7 +422,6 @@ impl App {
         }
     }
 }
-
 /// The window's safe area in device pixels, relative to the drawable:
 /// left, top, width, height.
 pub(super) fn safe_area(window: &Window, size: (u32, u32)) -> (f64, f64, f64, f64) {
@@ -419,10 +459,10 @@ pub(super) fn safe_area(window: &Window, size: (u32, u32)) -> (f64, f64, f64, f6
     }
 }
 
-pub(super) fn configure_surface(active: &Active) {
-    if let Some(surface) = active.surface.as_ref() {
-        configure(surface, &active.gpu, active.format, active.size);
-    }
+pub(super) fn configure_surface(active: &mut Active) {
+    active
+        .screen
+        .configure(&active.gpu, active.format, active.size);
 }
 
 /// The same, by parts.

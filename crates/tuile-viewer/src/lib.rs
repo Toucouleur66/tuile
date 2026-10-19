@@ -58,9 +58,13 @@
 //! person before it answers; elsewhere `--here` and L say it is not available
 //! and change nothing. The coordinates are never logged or written anywhere.
 //!
-//! `TUILE_RECORD=path.jsonl` writes the camera path; `TUILE_REPLAY=path.jsonl`
+//! `TUILE_RECORD=path.mcap` writes the camera path; `TUILE_REPLAY=path.mcap`
 //! flies it again exactly. The format and the replay live in the `tuile-tape`
 //! crate.
+//!
+//! With the `control` feature — tests and debug builds only — [`control`] runs
+//! the same application headless, steps it frame by frame and reads it back:
+//! see that module.
 
 mod app;
 mod backdrop;
@@ -86,6 +90,21 @@ mod signals;
 mod snapshot;
 mod start;
 mod steer;
+
+/// The headless viewer and its control API: see the module.
+#[cfg(feature = "control")]
+pub mod control;
+
+// The control API is native: a page is driven through its own debug
+// namespace, and has no thread a socket could be served from.
+#[cfg(all(feature = "control", target_arch = "wasm32"))]
+compile_error!("the `control` feature is native; a browser's viewer is driven from its page");
+
+// Never in an application that ships to a phone: a socket that moves the view
+// is a debug build's, and an iOS release build that has one is refused here
+// rather than found later.
+#[cfg(all(feature = "control", target_os = "ios", not(debug_assertions)))]
+compile_error!("the `control` feature is for tests and debug builds; an iOS release has none");
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native;

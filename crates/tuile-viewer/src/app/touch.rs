@@ -68,7 +68,7 @@ pub(super) enum Gesture {
 
 /// How the window reports a finger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Phase {
+pub(crate) enum Phase {
     Started,
     Moved,
     Ended,

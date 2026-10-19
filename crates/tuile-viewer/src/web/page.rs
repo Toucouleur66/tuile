@@ -151,6 +151,7 @@ pub fn start_viewer(
             .with_prevent_default(true),
         controls: options.ui,
         backends: Some(options.backend.backends()),
+        clock: crate::app::Clock::default(),
     };
     let app = App::new(config, launch);
     let id = CURRENT.with(|c| c.get()) + 1;

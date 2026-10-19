@@ -13,7 +13,7 @@ use web_time::Instant;
 
 use tuile_core::protocol::{ClientMessage, GeometryStream};
 use winit::event::TouchPhase;
-use winit::event_loop::{ActiveEventLoop, ControlFlow};
+use winit::event_loop::ControlFlow;
 
 use super::demand::{Busy, Pace, IDLE_WAKE};
 use super::lifecycle::Step;
@@ -45,8 +45,13 @@ impl App {
             TouchPhase::Ended => Phase::Ended,
             TouchPhase::Cancelled => Phase::Cancelled,
         };
-        let at = (touch.location.x, touch.location.y);
-        for gesture in self.touches.on(Instant::now(), touch.id, phase, at) {
+        self.finger(touch.id, phase, (touch.location.x, touch.location.y));
+    }
+
+    /// One finger event, in device pixels: through the recognizer, then
+    /// carried out.
+    pub(crate) fn finger(&mut self, id: u64, phase: Phase, at: (f64, f64)) {
+        for gesture in self.touches.on(self.clock.now(), id, phase, at) {
             self.gesture(gesture);
         }
         self.demand.poke();
@@ -113,7 +118,7 @@ impl App {
         if self.profile.hold_window_until_warm {
             return None;
         }
-        let now = Instant::now();
+        let now = self.clock.now();
         let ready = self.session.is_some();
         // Asked only until the launch is over: it drains the server's errors
         // and reports, which the status line does after that.
@@ -154,10 +159,9 @@ impl App {
             return None;
         }
         let ui = self.ui_frame();
-        let turn = self
-            .stats
-            .started
-            .map_or(0.0, |t| t.elapsed().as_secs_f64() / TURN_SECONDS);
+        let turn = self.stats.started.map_or(0.0, |t| {
+            now.saturating_duration_since(t).as_secs_f64() / TURN_SECONDS
+        });
         Some(match indicator.style {
             Style::Launch => tuile_ui::Spinner {
                 centre: ui.centre(),
@@ -196,19 +200,19 @@ impl App {
             pending_uploads: self.active.as_ref().map_or(0, |a| a.pump.pending_uploads()),
             sliding: self.active.as_ref().map_or(0, |a| a.pump.sliding()),
         };
-        self.demand.saw(Instant::now(), busy);
+        self.demand.saw(self.clock.now(), busy);
     }
 
     /// A phone's turn of the loop: a frame when one is due, and otherwise a
     /// sleep until it is — never a spin.
-    pub(super) fn pace_the_frames(&mut self, event_loop: &ActiveEventLoop) {
-        let now = Instant::now();
+    pub(super) fn pace_the_frames(&mut self) -> ControlFlow {
+        let now = self.clock.now();
         self.read_the_pressure(now);
         // In front with no surface: the one made on the way back failed. Made
         // again on every turn until it exists — a screen that stays empty is
         // not an option.
         if self.lifecycle.phase() == super::lifecycle::Phase::Active
-            && self.active.as_ref().is_some_and(|a| a.surface.is_none())
+            && self.active.as_ref().is_some_and(|a| a.screen.is_released())
         {
             self.restore_the_surface();
         }
@@ -220,12 +224,11 @@ impl App {
             if let (Some(active), Some(session)) = (self.active.as_mut(), self.session.as_mut()) {
                 active.pump.drain(&mut session.stream);
             }
-            event_loop.set_control_flow(if self.session.is_some() {
+            return if self.session.is_some() {
                 ControlFlow::WaitUntil(now + IDLE_WAKE)
             } else {
                 ControlFlow::Wait
-            });
-            return;
+            };
         }
         self.read_the_device(now);
         if let Some(held) = self.touches.tick(now) {
@@ -243,11 +246,11 @@ impl App {
         let due = self.pacing.last_frame + interval;
         if now >= due {
             if let Some(active) = self.active.as_ref() {
-                active.window.request_redraw();
+                active.screen.request_redraw();
             }
-            event_loop.set_control_flow(ControlFlow::Wait);
+            ControlFlow::Wait
         } else {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(due));
+            ControlFlow::WaitUntil(due)
         }
     }
 
@@ -380,13 +383,9 @@ impl Carry for App {
     }
 
     fn resend_view(&mut self) {
-        let (width, height) = self.viewport();
-        let view = self
-            .controller
-            .camera
-            .view_state(glam::DVec2::new(width, height));
+        let views = self.eye_views();
         if let (Some(active), Some(session)) = (self.active.as_mut(), self.session.as_mut()) {
-            active.pump.send_view(&mut session.stream, &[view]);
+            active.pump.send_view(&mut session.stream, &views);
         }
     }
 

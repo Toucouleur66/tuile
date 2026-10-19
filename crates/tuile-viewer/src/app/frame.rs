@@ -52,6 +52,11 @@ impl App {
         let Some((rendered, resolution, old_imagery)) = drew else {
             return;
         };
+        #[cfg(feature = "control")]
+        {
+            self.presented += 1;
+        }
+        self.read_the_eyes();
         self.resolution = Some(resolution);
         self.note_the_turn_over(old_imagery);
         // After the draw, and deliberately: neither of these is drawing, and
@@ -68,8 +73,9 @@ impl App {
     /// Returns the interval, which is the only number the easing is allowed to
     /// depend on.
     fn start_the_frame(&mut self) -> std::time::Duration {
-        let dt = self.pacing.last_frame.elapsed();
-        self.pacing.last_frame = web_time::Instant::now();
+        let now = self.clock.now();
+        let dt = now.saturating_duration_since(self.pacing.last_frame);
+        self.pacing.last_frame = now;
         let m = tuile_core::metrics::metrics();
         m.frames.inc();
         m.frame_seconds.record(dt);
@@ -84,7 +90,7 @@ impl App {
         self.controller.advance(dt.as_secs_f64());
         // A glide puts the eye where it is due, frame by frame.
         if let Some(flight) = self.flight {
-            let (view, over) = flight.at(web_time::Instant::now());
+            let (view, over) = flight.at(self.clock.now());
             crate::steer::jump(&mut self.controller, view.camera());
             if over {
                 self.flight = None;
@@ -127,8 +133,9 @@ impl App {
     /// frame's upload budget, and counts what that cost.
     fn take_this_frames_share_of_the_stream(&mut self) {
         let cam = self.controller.camera;
-        let (width, height) = self.viewport();
-        let viewport = DVec2::new(width, height);
+        // One view per eye: the traversal selects the union, at the detail the
+        // most demanding eye needs, and every eye is drawn from it.
+        let views = self.eye_views();
         self.uploaded = 0;
         // Anti-jitter: render origin = eye, so the f32 the GPU sees is small.
         let origin = cam.position;
@@ -165,7 +172,7 @@ impl App {
             active.pump.advance_while(
                 &mut session.stream,
                 &active.gpu,
-                &[cam.view_state(viewport)],
+                &views,
                 origin,
                 |done, spent| budget.allows(done, spent),
             )
@@ -182,37 +189,51 @@ impl App {
         }
     }
 
-    /// Uploads the view matrix, the sun and the air.
+    /// Uploads the view matrix, the sun and the air — the first eye's, which
+    /// is a window's only one.
     fn upload_the_view(&mut self) {
-        let cam = self.controller.camera;
-        let origin = cam.position;
-        let view_proj = self.controller.view_proj(origin, self.aspect());
-        let sun = self.sun.light_travel_direction().as_vec3();
+        let views = self.view_uniforms();
         let Some(active) = self.active.as_mut() else {
             return;
         };
+        if let Some(view) = views.first() {
+            active.renderer.set_view(&active.gpu.queue, view);
+        }
+    }
 
-        active.renderer.set_view(
-            &active.gpu.queue,
-            &tuile_wgpu::ViewUniform {
-                view_proj,
+    /// Each eye's view matrix, sun and air, against the one render origin
+    /// every tile is rebased onto: the camera's.
+    fn view_uniforms(&self) -> Vec<tuile_wgpu::ViewUniform> {
+        let cam = self.controller.camera;
+        let origin = cam.position;
+        let aspect = self.aspect();
+        let clearance = self.controller.height_above_ground();
+        let sun = self.sun.light_travel_direction().as_vec3();
+        let strength = if self.nav.atmosphere_enabled() {
+            ATMOSPHERE_STRENGTH
+        } else {
+            0.0
+        };
+        self.eyes()
+            .iter()
+            .map(|eye| tuile_wgpu::ViewUniform {
+                // The controller's own projection, which places the near plane
+                // against the ground; an eye is the camera moved sideways, at
+                // the same clearance.
+                view_proj: eye.view_proj_with_clearance(origin, aspect, clearance),
                 sun_dir: [sun.x, sun.y, sun.z, 0.0],
                 params: [AMBIENT, self.views.diagnostic as f32, 0.0, 0.0],
                 // Strength 0 is what turns it off, so the checkbox needs no
                 // second path through the renderer — the shader already
                 // short-circuits on it.
                 atmosphere: tuile_atmosphere::AerialPerspective::new(
-                    cam.position,
+                    eye.position,
                     origin,
                     &self.sun,
-                    if self.nav.atmosphere_enabled() {
-                        ATMOSPHERE_STRENGTH
-                    } else {
-                        0.0
-                    },
+                    strength,
                 ),
-            },
-        );
+            })
+            .collect()
     }
 
     /// Builds the on-screen control's geometry for the camera as it now stands,
@@ -258,6 +279,7 @@ impl App {
     /// layer now being served, which is how far a switch has left to go.
     fn draw_and_present(&mut self) -> Option<(usize, tuile_wgpu::Resolution, usize)> {
         let serving = self.imagery.generation;
+        let views = self.view_uniforms();
         let active = self.active.as_mut()?;
         // For any selected tile not yet uploaded, fall back to its nearest ready
         // ancestor so refinement never flashes the background.
@@ -299,50 +321,77 @@ impl App {
         };
         let wireframe = self.views.wireframe;
         let trace = self.recording.trace.is_some();
-        let surface = active.surface.as_ref()?;
-        // The acquire, the pass, the submit and the present — including the four
-        // ways a drawable can fail to arrive — belong to the backend now. What
-        // is left here is the one winit call in the sequence, and the choice of
-        // what goes into the frame.
-        let outcome = tuile_wgpu::draw_to_surface(
-            tuile_wgpu::FrameOnSurface {
-                gpu: &active.gpu,
-                surface,
-                targets: &active.targets,
-                // Space black.
-                clear: wgpu::Color {
-                    r: 0.0,
-                    g: 0.0,
-                    b: 0.0,
-                    a: 1.0,
-                },
-                trace: trace.then_some(&mut active.readback),
-            },
-            || super::setup::configure(surface, &active.gpu, active.format, active.size),
-            || active.window.pre_present_notify(),
-            |pass| {
-                active.renderer.paint(
-                    pass,
-                    // The shell first — the only thing that can cover ground
-                    // before any tile has arrived at all — then the complete
-                    // coarse level, which turns a flat patch into blurry
-                    // imagery, then the fallback ancestors: each stands in for
-                    // ground that is not its own and must never win a pixel
-                    // from a surface that owns it. See `tuile_wgpu::Drawn`.
-                    backdrop
-                        .then_some(&active.shell)
-                        .into_iter()
-                        .chain(coarse.iter().copied()),
-                    drawn.exact.iter().copied(),
-                    // Last, testing depth and never writing it: an ancestor
-                    // borrowing ground it does not own must be occluded by the
-                    // planet in front of it. See `TileRenderer::render_fallback`.
-                    drawn.fallback.iter().copied(),
-                    Some(&active.overlay),
-                    wireframe,
+        // Space black.
+        let clear = wgpu::Color {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        };
+        let renderer = &active.renderer;
+        let overlay = &active.overlay;
+        let shell = &active.shell;
+        let paint = |pass: &mut wgpu::RenderPass<'_>| {
+            renderer.paint(
+                pass,
+                // The shell first — the only thing that can cover ground
+                // before any tile has arrived at all — then the complete
+                // coarse level, which turns a flat patch into blurry
+                // imagery, then the fallback ancestors: each stands in for
+                // ground that is not its own and must never win a pixel
+                // from a surface that owns it. See `tuile_wgpu::Drawn`.
+                backdrop
+                    .then_some(shell)
+                    .into_iter()
+                    .chain(coarse.iter().copied()),
+                drawn.exact.iter().copied(),
+                // Last, testing depth and never writing it: an ancestor
+                // borrowing ground it does not own must be occluded by the
+                // planet in front of it. See `TileRenderer::render_fallback`.
+                drawn.fallback.iter().copied(),
+                Some(overlay),
+                wireframe,
+            );
+        };
+        let outcome = match &mut active.screen {
+            super::screen::Screen::Window(windowed) => {
+                let surface = windowed.surface.as_ref()?;
+                let window = &windowed.window;
+                // The acquire, the pass, the submit and the present — including
+                // the four ways a drawable can fail to arrive — belong to the
+                // backend now. What is left here is the one winit call in the
+                // sequence, and the choice of what goes into the frame.
+                tuile_wgpu::draw_to_surface(
+                    tuile_wgpu::FrameOnSurface {
+                        gpu: &active.gpu,
+                        surface,
+                        targets: &active.targets,
+                        clear,
+                        trace: trace.then_some(&mut active.readback),
+                    },
+                    || super::setup::configure(surface, &active.gpu, active.format, active.size),
+                    || window.pre_present_notify(),
+                    paint,
+                )
+            }
+            // Every eye, from the one resolved set of tiles, each with its own
+            // view: what one eye sees, the other is not left without.
+            #[cfg(feature = "control")]
+            super::screen::Screen::Offscreen(offscreen) => {
+                let _ = trace;
+                let gpu = &active.gpu;
+                offscreen.draw(
+                    gpu,
+                    &active.targets,
+                    &views,
+                    |view| renderer.set_view(&gpu.queue, view),
+                    clear,
+                    paint,
                 );
-            },
-        );
+                tuile_wgpu::Presented::Yes
+            }
+        };
+        let _ = &views;
         if outcome == tuile_wgpu::Presented::Invalid {
             tracing::warn!("the surface refused the frame");
         }
@@ -350,6 +399,20 @@ impl App {
             return None;
         }
         Some((rendered, resolution, old_imagery))
+    }
+
+    /// Reads a headless frame back, eye by eye, and scans it: see the
+    /// `offscreen` module. A window's frame is on screen and is not.
+    fn read_the_eyes(&mut self) {
+        #[cfg(feature = "control")]
+        {
+            let eyes = self.eyes();
+            if let Some(active) = self.active.as_mut() {
+                if let super::screen::Screen::Offscreen(offscreen) = &mut active.screen {
+                    offscreen.read(&active.gpu, &eyes);
+                }
+            }
+        }
     }
 
     /// The one line a person watching a globe wants, at most once a second.

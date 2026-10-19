@@ -239,6 +239,43 @@ async fn bring_up_now(plan: Plan, runtime: tokio::runtime::Handle) -> Outcome {
     })
 }
 
+/// A session whose geometry server is handed back rather than run.
+///
+/// The headless viewer polls it between two of its frames, on the frame's
+/// own thread, with every load inline: what reaches a frame is then a
+/// function of the frames before it, and two runs of one script draw the
+/// same frames. Everything else — the stream, the gate, the switcher — is a
+/// desktop's.
+#[cfg(feature = "control")]
+pub(crate) fn in_lockstep(
+    globe: crate::globe::Globe,
+    config: tuile_core::traversal::Config,
+    runtime: tokio::runtime::Handle,
+) -> (Started, tuile_core::runtime::GeometryServer) {
+    let gate = Gate::default();
+    let loader: Arc<dyn TileLoader> = Arc::new(Gated {
+        inner: globe.loader,
+        gate: gate.clone(),
+    });
+    let (stream, server) = tuile_core::runtime::in_process_with(globe.tree, loader, config);
+    let started = Started {
+        stream,
+        server: None,
+        detail: globe.detail,
+        heights: globe.heights,
+        layer_budget: globe.budget,
+        switcher: Switcher {
+            layers: globe.layers,
+            runtime: runtime.clone(),
+            done: channel(),
+        },
+        store: None,
+        gate,
+        runtime,
+    };
+    (started, server)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

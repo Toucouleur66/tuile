@@ -312,6 +312,7 @@ fn session(embedder: Arc<dyn ViewerHost>) -> anyhow::Result<()> {
         // `TUILE_BACKEND=gl` forces one — a launch setting on Android.
         backends: crate::app::backend_named(std::env::var("TUILE_BACKEND").ok().as_deref())
             .map_err(anyhow::Error::msg)?,
+        clock: crate::app::Clock::default(),
     };
 
     // Everything the engine counts, scrapeable, so the log can stop being a
