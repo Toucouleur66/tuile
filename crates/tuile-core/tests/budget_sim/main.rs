@@ -15,6 +15,7 @@
 mod architecture;
 mod detmath;
 mod gpu;
+mod motion;
 mod net;
 mod patterns;
 mod rng;

@@ -8,13 +8,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use tuile_core::budget::{
-    Budget, BudgetConfig, BudgetStats, Bytes, Class, Decisions, FrameInput, Generation, LayerId,
-    Micros, NeedSet, Policy, Pressure, ResourceId, Role, Source, Thermal, TileId,
+    Budget, BudgetConfig, BudgetStats, Bytes, Class, Decisions, FrameDeadline, FrameInput,
+    Generation, LayerId, Micros, NeedSet, Policy, Pressure, ResourceId, Role, Source, Thermal,
+    TileId,
 };
 
 use super::gpu::SimGpu;
 use super::net::{Arrival, NetProfile, SimNet};
-use super::world::{children, parent, traverse, Camera, Lens, Residency, View};
+use super::world::{children, parent, sight, traverse, Camera, Lens, Residency, View};
 
 /// One eye of a profile's rig: where it sits along the camera's right
 /// vector, metres, and its lens.
@@ -65,6 +66,12 @@ pub struct Profile {
     pub converge_within: Micros,
     /// The eyes: one, or a stereo rig.
     pub eyes: Vec<Eye>,
+    /// The executor's upload cap per render frame (I18).
+    pub deadline: FrameDeadline,
+    /// How many steps the executor runs behind the budget: 0 in-process,
+    /// 1 for a web page whose budget runs in a worker (a decision arrives
+    /// one message late).
+    pub lag: usize,
 }
 
 impl Profile {
@@ -73,6 +80,10 @@ impl Profile {
         let mut b = BudgetConfig::interactive(Bytes::gib(2));
         // Today's desktop viewer runs 64 fetches; the same, split by class.
         b.max_in_flight = tuile_core::budget::PerClass([32, 16, 32, 4]);
+        // And reads its local store as widely: at the default 8, a warm
+        // start reads at most 8 resources a step and converges later than a
+        // cold one on a good network (P1.3).
+        b.max_local_reads = 32;
         b.imagery_over_terrain_cap = 3;
         b.max_drape_side = 2_048;
         Profile {
@@ -82,6 +93,9 @@ impl Profile {
             dt: Micros(16_667),
             converge_within: Micros::from_secs(2),
             eyes: Eye::mono(Lens::desktop()),
+            // A quarter of a 60 Hz frame at 4 MiB/ms: above the plan's cap.
+            deadline: FrameDeadline::from_refresh(60, 250, 4 << 20),
+            lag: 0,
         }
     }
 
@@ -100,6 +114,9 @@ impl Profile {
             dt: Micros(16_667),
             converge_within: Micros::from_secs(4),
             eyes: Eye::mono(Lens::portrait()),
+            // A quarter of a 60 Hz frame at 1 MiB/ms: just above the cap.
+            deadline: FrameDeadline::from_refresh(60, 250, 1 << 20),
+            lag: 0,
         }
     }
 
@@ -128,7 +145,22 @@ impl Profile {
             dt: Micros(16_667),
             converge_within: Micros::NEVER,
             eyes: Eye::mono(Lens::desktop()),
+            deadline: FrameDeadline::UNBOUNDED,
+            lag: 0,
         }
+    }
+
+    /// A browser: a desktop's memory and network, its budget in a worker a
+    /// message away from the page that executes (one step of lag), a
+    /// 1280 × 720 canvas at a `devicePixelRatio` of 2; its bound, the
+    /// desktop's plus one step.
+    pub fn web() -> Self {
+        let mut p = Profile::desktop();
+        p.name = "web";
+        p.eyes = Eye::mono(Lens::horizontal(2560.0, 1440.0, 2.0, 60.0));
+        p.lag = 1;
+        p.converge_within = p.converge_within.plus(p.dt);
+        p
     }
 
     /// A stereo headset at `hz`: a phone's memory and a desktop's network
@@ -146,6 +178,9 @@ impl Profile {
         p.dt = Micros(1_000_000 / u64::from(hz));
         p.converge_within = Micros::from_secs(2);
         p.eyes = Eye::pair(0.063, Lens::headset_left());
+        // The plan may ask more than a frame can take: the deadline binds.
+        p.budget.upload_bytes_per_frame = Bytes::mib(8);
+        p.deadline = FrameDeadline::from_refresh(hz, 250, 1 << 20);
         p
     }
 }
@@ -190,6 +225,8 @@ pub struct Sim {
     pub frame: u64,
     /// Every step's log.
     pub log: Vec<StepLog>,
+    /// Decisions on their way to a lagging executor.
+    pipeline: std::collections::VecDeque<Decisions>,
     /// The eyes now: the profile's, until a resize or a rotation changes
     /// their lenses.
     pub eyes: Vec<Eye>,
@@ -223,12 +260,17 @@ impl Sim {
         Sim {
             budget: Budget::new(profile.budget.clone()).expect("a valid profile"),
             net: SimNet::new(profile.net, seed),
-            gpu: SimGpu::default(),
+            gpu: {
+                let mut g = SimGpu::new(profile.deadline, profile.eyes.len());
+                g.lagging = profile.lag > 0;
+                g
+            },
             now: Micros::ZERO,
             frame: 0,
             log: Vec::new(),
             eyes: profile.eyes.clone(),
             last_views: Vec::new(),
+            pipeline: std::collections::VecDeque::new(),
             decoded: BTreeSet::new(),
             fresh: BTreeMap::new(),
             drawn_last: BTreeSet::new(),
@@ -310,7 +352,21 @@ impl Sim {
         let d = self.budget.decide(input);
         self.decide_us
             .push((self.now, clock.elapsed().as_secs_f64() * 1e6));
-        self.check(&need, &d);
+        // The executor: in step, or `lag` steps behind. Either way it has
+        // applied every decision before this one when this one is checked.
+        let lagged = (self.profile.lag > 0).then(|| {
+            self.pipeline.push_back(d.clone());
+            if self.pipeline.len() > self.profile.lag {
+                self.pipeline.pop_front()
+            } else {
+                None
+            }
+        });
+        let mut acks = Vec::new();
+        if let Some(Some(old)) = &lagged {
+            acks = self.execute(old, self.frame - self.profile.lag as u64);
+        }
+        self.check(&need, &d, &views);
         for (r, g) in &d.cancel {
             self.net.cancel(*r, *g);
         }
@@ -320,10 +376,10 @@ impl Sim {
         for r in &d.release {
             self.decoded.remove(r);
         }
-        let acks = self
-            .gpu
-            .apply(&d)
-            .unwrap_or_else(|e| panic!("{} frame {}: {e}", self.profile.name, self.frame));
+        if lagged.is_none() {
+            acks = self.execute(&d, self.frame);
+            self.check_executor(&d);
+        }
         let mut seen = BTreeSet::new();
         for (t, _) in need.drawn.iter().chain(&need.blockers) {
             let r = ResourceId::Mesh(*t);
@@ -409,6 +465,51 @@ impl Sim {
         })
     }
 
+    /// The executor applies the decisions of step `frame`, as one render
+    /// frame; checks I17 and I18 for it; returns its acknowledgements.
+    fn execute(&mut self, d: &Decisions, frame: u64) -> Vec<(ResourceId, Generation, Bytes)> {
+        let acks = self
+            .gpu
+            .apply(d, frame)
+            .unwrap_or_else(|e| panic!("{} frame {}: {e}", self.profile.name, self.frame));
+        // I18: a frame uploads at most its deadline, but for a lone first item.
+        if self.gpu.frame_items > 1 && self.gpu.frame_bytes > self.gpu.deadline.bytes {
+            self.fail(&format!(
+                "I18: {} bytes in {} uploads, deadline {}",
+                self.gpu.frame_bytes.0, self.gpu.frame_items, self.gpu.deadline.bytes.0
+            ));
+        }
+        // I17: every eye drew the draw set of the step being executed.
+        if self.gpu.eye_drew.iter().any(|e| *e != frame) {
+            self.fail(&format!(
+                "I17: eyes drew {:?}, not frame {frame}",
+                self.gpu.eye_drew
+            ));
+        }
+        acks
+    }
+
+    /// I16, in step with the executor: the budget charges what the executor
+    /// holds, each resource once — its drawable bytes plus what it was
+    /// handed and has not uploaded yet, class by class.
+    fn check_executor(&self, d: &Decisions) {
+        for c in Class::ALL {
+            let pending = self
+                .gpu
+                .pending
+                .keys()
+                .filter(|r| class_of(**r) == c)
+                .fold(Bytes::ZERO, |a, r| a.plus(super::world::cost(*r).gpu));
+            let held = self.gpu.bytes[c].plus(pending);
+            if d.stats.gpu[c] != held {
+                self.fail(&format!(
+                    "I16: the budget charges {c:?} {} bytes, the executor holds {}",
+                    d.stats.gpu[c].0, held.0
+                ));
+            }
+        }
+    }
+
     fn fail(&self, what: &str) -> ! {
         panic!(
             "{} frame {} t={:?}: {what}",
@@ -417,7 +518,7 @@ impl Sim {
     }
 
     /// The per-step invariants.
-    fn check(&self, need: &NeedSet, d: &Decisions) {
+    fn check(&self, need: &NeedSet, d: &Decisions, views: &[View]) {
         let s = &d.stats;
         let cfg = &self.profile.budget;
         // I1 (D-A1): every drawn item wears its drapes, from the first step.
@@ -455,6 +556,16 @@ impl Sim {
             for (t, _) in &need.drawn {
                 if !covered(d, *t) {
                     self.fail(&format!("I1: {t:?} uncovered"));
+                }
+            }
+            // I17: and in each eye, against that eye's own frustum.
+            if views.len() > 1 {
+                for (e, v) in views.iter().enumerate() {
+                    for (t, _) in &need.drawn {
+                        if sight(v, *t, 0.0).visible && !covered(d, *t) {
+                            self.fail(&format!("I17: eye {e}: {t:?} uncovered"));
+                        }
+                    }
                 }
             }
         }
@@ -697,4 +808,11 @@ fn down(d: &Decisions, t: TileId, depth: u32) -> bool {
         && children(t)
             .iter()
             .all(|&k| d.draw.draws(k) || down(d, k, depth - 1))
+}
+
+fn class_of(r: ResourceId) -> Class {
+    match r {
+        ResourceId::Mesh(_) => Class::TerrainMesh,
+        ResourceId::Drape { .. } => Class::Drape,
+    }
 }

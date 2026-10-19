@@ -367,3 +367,281 @@ fn a_cold_start_draws_no_bare_ground() {
         assert_eq!(bare, 0, "{name}: {bare} bare item-steps at start-up");
     }
 }
+
+// P6 — stereo, and the display's deadline.
+
+const DEG: f64 = std::f64::consts::PI / 180.0;
+
+fn sin(x: f64) -> f64 {
+    super::detmath::sin_cos(x).0
+}
+
+/// A head held still, with sensor jitter: ±1 mm, ±0.05°.
+pub fn jitter(t: f64) -> Camera {
+    let tau = std::f64::consts::TAU;
+    Camera {
+        x: home().x + 0.001 * sin(tau * 7.3 * t),
+        y: home().y + 0.001 * sin(tau * 5.1 * t),
+        heading: home().heading + 0.05 * DEG * sin(tau * 3.7 * t),
+        pitch: home().pitch + 0.05 * DEG * sin(tau * 6.1 * t),
+        ..home()
+    }
+}
+
+/// Looking around: yaw ±30° at 0.5 Hz.
+pub fn look_around(t: f64) -> Camera {
+    Camera {
+        heading: 30.0 * DEG * sin(std::f64::consts::TAU * 0.5 * t),
+        ..home()
+    }
+}
+
+/// Flicks at head rate: 90° in 0.3 s (300°/s), a second's hold, and back.
+pub fn flicks(t: f64) -> Camera {
+    let u = t % 2.6;
+    let yaw = if u < 0.3 {
+        300.0 * u
+    } else if u < 1.3 {
+        90.0
+    } else if u < 1.6 {
+        90.0 - 300.0 * (u - 1.3)
+    } else {
+        0.0
+    };
+    Camera {
+        heading: yaw * DEG,
+        ..home()
+    }
+}
+
+/// Walking at 0.5 m/s, two metres above the ground, looking 30° down.
+pub fn walking(t: f64) -> Camera {
+    Camera {
+        x: home().x + 0.5 * t,
+        h: 2.0,
+        ..home()
+    }
+}
+
+/// A headset session: jitter, looking around, flicks, then a walk.
+fn head(profile: Profile, seed: u64) -> Sim {
+    let mut sim = Sim::new(quiet(profile), seed);
+    sim.run(4.0, &jitter);
+    sim.run(4.0, &look_around);
+    sim.run(3.0, &flicks);
+    sim.run(4.0, &walking);
+    sim
+}
+
+/// I17, P6.2: a stereo head — still, looking around, flicking at 300°/s,
+/// walking — never shows a hole in either eye, at 72, 90 and 120 Hz. Each
+/// eye's frustum is checked against the one draw set every step, and every
+/// eye draws the step's draw set (`Sim::check`, `Sim::execute`).
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+)]
+fn a_stereo_head_never_shows_a_hole_in_either_eye() {
+    for (hz, seed) in [(72, 51), (90, 52), (120, 53)] {
+        let sim = head(Profile::headset(hz), seed);
+        assert!(
+            sim.floor_at.is_some(),
+            "{RED}: {hz} Hz, the floor never came in"
+        );
+        assert!(sim.log.iter().any(|l| l.stats.exact > 0), "{RED}");
+    }
+}
+
+fn session_bytes(profile: Profile, seed: u64, script: &dyn Fn(f64) -> Camera) -> (Vec<u64>, u64) {
+    let mut sim = Sim::new(quiet(profile), seed);
+    sim.run(6.0, script);
+    (
+        sim.log.iter().map(|l| l.digest).collect(),
+        sim.net.network_bytes,
+    )
+}
+
+/// I16, P6.1: a stereo pair costs its union. Two eyes at the same place
+/// through the same lens decide what one eye does, step for step, bit for
+/// bit; a 63 mm pair costs little more than either of its eyes alone, and
+/// never as much as both; and every step of every run the budget charges
+/// what the executor holds, each resource once (`Sim::check_executor`).
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+)]
+fn a_stereo_pair_costs_its_union() {
+    use super::server::Eye;
+    let with = |eyes: Vec<Eye>| {
+        let mut p = Profile::headset(90);
+        p.eyes = eyes;
+        p
+    };
+    let lens = Lens::headset_left();
+    let twin = Eye {
+        offset_m: 0.0,
+        lens,
+    };
+    let (one, _) = session_bytes(with(vec![twin]), 54, &look_around);
+    let (two, _) = session_bytes(with(vec![twin, twin]), 54, &look_around);
+    let first = one.iter().zip(&two).position(|(a, b)| a != b);
+    assert_eq!(
+        first, None,
+        "I16: two identical eyes decided otherwise at step {first:?}"
+    );
+    let (_, pair) = session_bytes(Profile::headset(90), 55, &look_around);
+    let (_, left) = session_bytes(with(Eye::mono(lens)), 55, &look_around);
+    let (_, right) = session_bytes(with(Eye::mono(lens.mirrored())), 55, &look_around);
+    assert!(left > 0 && right > 0, "{RED}");
+    assert!(
+        pair < left + right,
+        "I16: the pair fetched {pair} bytes, its eyes alone {left} and {right}"
+    );
+    assert!(
+        pair * 4 <= 5 * left.max(right),
+        "I16: the pair fetched {pair} bytes, more than a quarter over its larger eye ({})",
+        left.max(right)
+    );
+}
+
+/// I16, I17, P6.1, P6.2 on a desktop with two eyes far apart
+/// (hyperstereo: 6.3 m, then 630 m): the union is charged once, never as
+/// much as both eyes alone, and covers both eyes every step.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+)]
+fn hyperstereo_costs_its_union_and_covers_both_eyes() {
+    use super::server::Eye;
+    for (ipd, seed) in [(6.3, 56), (630.0, 57)] {
+        let mut pair = Profile::desktop();
+        pair.eyes = Eye::pair(ipd, Lens::desktop());
+        let (_, both) = session_bytes(pair, seed, &approach);
+        let alone = |offset_m: f64| {
+            let mut p = Profile::desktop();
+            p.eyes = vec![Eye {
+                offset_m,
+                lens: Lens::desktop(),
+            }];
+            session_bytes(p, seed, &approach).1
+        };
+        let (left, right) = (alone(-ipd / 2.0), alone(ipd / 2.0));
+        assert!(
+            both < left + right,
+            "I16 at {ipd} m: the pair fetched {both} bytes, its eyes alone {left} and {right}"
+        );
+    }
+}
+
+/// I18, P6.3: at 72, 90 and 120 Hz every render frame uploads at most its
+/// deadline, but for a lone first item (`Sim::execute`, every frame); the
+/// deadline does bind (frames defer part of the plan); and the ground stays
+/// covered whatever is deferred.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+)]
+fn uploads_fit_the_refresh_deadline_at_72_90_and_120_hz() {
+    for (hz, seed) in [(72, 58), (90, 59), (120, 60)] {
+        let mut sim = Sim::new(quiet(Profile::headset(hz)), seed);
+        sim.run(6.0, &look_around);
+        assert!(
+            sim.gpu.deferred > 0,
+            "{hz} Hz: the deadline never bound, the test proves nothing"
+        );
+        assert!(sim.floor_at.is_some(), "{RED}: {hz} Hz");
+    }
+}
+
+/// P6.5: a stereo head converges within the headset's bound (2 s) of
+/// stopping after looking around.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+)]
+fn a_stereo_head_converges_after_it_stops() {
+    let profile = quiet(Profile::headset(90));
+    let within = profile.converge_within;
+    let mut sim = Sim::new(profile, 61);
+    settle(&mut sim, 6.0);
+    sim.run(4.0, &look_around);
+    let stop = sim.now;
+    sim.run(6.0, &|_| home());
+    let took = converged_within(&sim, stop);
+    assert!(
+        took <= within,
+        "P6.5: converged {took:?} after the head stopped"
+    );
+}
+
+/// I13, I16: a stereo film (two eyes 63 mm apart) is exact in both eyes:
+/// each frame drawn only complete, every item dressed, both eyes covered
+/// (`Sim::check`).
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+)]
+fn a_stereo_film_is_exact_in_both_eyes() {
+    use super::server::Eye;
+    let mut p = Profile::film();
+    p.eyes = Eye::pair(0.063, Lens::desktop());
+    let mut sim = Sim::new(p, 62);
+    for f in 0..60 {
+        let (drawn, _) = sim.film_frame(super::scenarios::film_cam(f), 2_000);
+        assert!(!drawn.is_empty(), "{RED}");
+        assert!(
+            drawn.iter().all(|(_, drape)| drape.is_some()),
+            "frame {f} bare"
+        );
+    }
+}
+
+/// P1.3 on the web: the budget a message away from its executor converges
+/// within the desktop's bound plus one step.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+)]
+fn a_web_cold_start_converges_one_message_late() {
+    super::scenarios::converges(Profile::web());
+}
+
+/// P5.2 and P5.5 on the web: a resize decides on the new canvas the same
+/// step, and a `devicePixelRatio` change alone decides nothing new, with
+/// the executor a step behind.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+)]
+fn a_web_resize_and_a_device_pixel_ratio_change() {
+    let mut sim = Sim::new(quiet(Profile::web()), 63);
+    settle(&mut sim, 6.0);
+    let (wide, _) = sim.step(home());
+    sim.set_lens(Lens::horizontal(2560.0, 1440.0, 2.0, 60.0).narrowed(1.0, 2.0));
+    let (narrow, _) = sim.step(home());
+    for (t, _) in &narrow.drawn {
+        assert!(seen(&sim.last_views, *t, CULL_MARGIN), "P5.2: {t:?}");
+    }
+    assert!(
+        listed(&wide).difference(&listed(&narrow)).count() > 0,
+        "P5.2"
+    );
+    let digests = |change: bool| {
+        let mut sim = Sim::new(quiet(Profile::web()), 64);
+        sim.run(6.0, &approach);
+        if change {
+            sim.set_lens(Lens::horizontal(2560.0, 1440.0, 2.0, 60.0).at_scale(1.0));
+        }
+        sim.run(3.0, &|_| home());
+        sim.log.iter().map(|l| l.digest).collect::<Vec<_>>()
+    };
+    assert_eq!(digests(false), digests(true), "P5.5 on the web");
+}

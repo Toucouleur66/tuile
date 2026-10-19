@@ -253,7 +253,7 @@ impl Run {
             terrain,
             imagery,
             net: SimNet::new(profile.net, seed),
-            gpu: SimGpu::default(),
+            gpu: SimGpu::new(tuile_core::budget::FrameDeadline::UNBOUNDED, 1),
             dgpu: DrapeGpu::default(),
             mirror_pending: BTreeMap::new(),
             mirror_delivered: BTreeMap::new(),
@@ -474,7 +474,7 @@ impl Run {
         // GPUs. Terrain (or the shared one) through SimGpu.
         let acks = self
             .gpu
-            .apply(&dt)
+            .apply(&dt, self.frame)
             .unwrap_or_else(|e| panic!("{} frame {}: {e}", self.arch.name(), self.frame));
         for (r, g, b) in acks {
             self.terrain.on_drawable(r, g, b);

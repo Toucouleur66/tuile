@@ -39,7 +39,7 @@ pub fn settle(sim: &mut Sim, secs: f64) -> Micros {
     stop
 }
 
-fn converges(mut profile: Profile) {
+pub fn converges(mut profile: Profile) {
     // I3 holds at the p95 latency: no host stalls here (they are the lossy
     // scenario's), failures still retried.
     for s in [&mut profile.net.meshes, &mut profile.net.imagery] {
@@ -407,7 +407,7 @@ fn a_lying_store_index_costs_one_miss_per_lie() {
     assert!(misses as usize <= lies.len());
 }
 
-fn film_cam(frame: u64) -> Camera {
+pub fn film_cam(frame: u64) -> Camera {
     let t = frame as f64 / 30.0;
     Camera {
         x: home().x + 300.0 * t,
