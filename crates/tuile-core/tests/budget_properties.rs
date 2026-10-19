@@ -437,6 +437,29 @@ proptest! {
         prop_assume!(tr.iter().any(|r| r.floor_in));
     }
 
+    /// I1 (D-A1): every drawn item wears its drapes, from the first step:
+    /// an item standing for a tile that asks for imagery wears a drape on
+    /// the GPU, and the budget counts nothing bare.
+    #[test]
+    fn every_drawn_item_wears_its_drapes_once_the_floor_is_in(ops in script()) {
+        let tr = trace(interactive(), &ops);
+        for rec in &tr {
+            prop_assert_eq!(rec.d.stats.bare, 0);
+            let draped: BTreeSet<TileId> = rec.need.drawn.iter().filter(|(_, n)| n.imagery.is_some()).map(|(t, _)| *t).collect();
+            for i in &rec.d.draw.items {
+                if i.serves.iter().any(|t| draped.contains(t)) {
+                    prop_assert!(!i.drapes.is_empty(), "{:?} drawn bare", i.mesh);
+                }
+                // Drawn and worn only once acknowledged on the GPU.
+                prop_assert!(rec.gpu_before.contains(&i.mesh), "{:?} drawn, not uploaded", i.mesh);
+                for x in &i.drapes {
+                    prop_assert!(rec.gpu_before.contains(&x.resource), "{:?} worn, not uploaded", x.resource);
+                }
+            }
+        }
+        prop_assume!(tr.iter().any(|r| !r.d.draw.items.is_empty()));
+    }
+
     /// I14: no network request for anything held locally, no re-upload of
     /// anything on the GPU.
     #[test]

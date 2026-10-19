@@ -541,6 +541,61 @@ mod requests {
         let worn: Vec<_> = d.draw.items[0].drapes.iter().map(|x| x.resource).collect();
         assert_eq!(worn, vec![dl(a, 0, 4), dl(a, 1, 4)], "in stacking order");
     }
+    /// P2.3 (a): a drape change never reloads its mesh.
+    #[test]
+    fn a_drape_change_never_reloads_its_mesh() {
+        let mut r = Rig::interactive();
+        let a = t(3, 2, 2);
+        r.settle(&drawn_draped(&[a], 3), 20);
+        let mut drapes = 0;
+        for level in [5, 2, 6] {
+            for _ in 0..10 {
+                let d = r.step(&drawn_draped(&[a], level));
+                assert!(
+                    d.start.iter().all(|s| s.resource != mesh(a)),
+                    "{RED}: the mesh reloaded for a drape"
+                );
+                drapes += d.start.len();
+                r.complete(&d);
+            }
+        }
+        assert!(drapes > 0, "the drapes were asked for");
+    }
+
+    /// P4.1 (c): a ring tile entering the view is asked for as a hole, and
+    /// takes a slot from the ring's in-flight work.
+    #[test]
+    fn a_ring_tile_entering_the_view_is_requested_as_a_hole() {
+        let mut c = Rig::interactive_config();
+        c.max_in_flight[Class::TerrainMesh] = 1;
+        let mut r = Rig::new(c);
+        let (g1, g2) = (t(3, 1, 1), t(3, 6, 6));
+        let ring = NeedSet {
+            ring: vec![(g1, need(g1)), (g2, need(g2))],
+            ..NeedSet::new()
+        };
+        let d = r.step(&ring);
+        assert_eq!(
+            d.start.iter().map(|s| s.resource).collect::<Vec<_>>(),
+            vec![mesh(g1)],
+            "{RED}"
+        );
+        let entered = NeedSet {
+            drawn: vec![(g2, need(g2))],
+            ring: vec![(g1, need(g1))],
+            ..NeedSet::new()
+        };
+        let d = r.step(&entered);
+        assert!(d.start.iter().any(|s| s.resource == mesh(g2)));
+        assert!(
+            d.cancel.iter().any(|(x, _)| *x == mesh(g1)),
+            "the ring gave its slot"
+        );
+        assert_eq!(
+            r.b.resource(mesh(g2)).and_then(|v| v.urgency),
+            Some(Urgency::Hole)
+        );
+    }
 }
 
 mod cancellation {
@@ -1808,6 +1863,41 @@ mod draw {
         let d = r.settle(&need, 10);
         assert_eq!(d.draw.get(mesh(p)).map(|i| i.role), Some(Role::Exact));
         assert!(kids.iter().all(|&k| !d.draw.draws(k)));
+    }
+    /// P1.2: a still need never draws coarser than it drew: whatever
+    /// arrives, a tile drawn exactly stays drawn with a drape no coarser,
+    /// until the need moves.
+    #[test]
+    fn a_still_need_never_draws_coarser_than_it_drew() {
+        let mut r = Rig::interactive();
+        let root = t(0, 0, 0);
+        let kids = children(root);
+        let mut need = drawn_draped(&kids, 3);
+        need.ancestors.push((root, draped(root, 1)));
+        r.settle(&drawn_draped(&[root], 1), 20);
+        let mut was: std::collections::BTreeMap<_, u32> = Default::default();
+        for k in 0..40 {
+            let d = r.step(&need);
+            // Arrivals trickle in: one load in two, every other upload.
+            if k % 2 == 0 {
+                r.load(&d);
+            }
+            if k % 3 == 0 {
+                r.upload(&d);
+            }
+            for (tile, img) in &was {
+                let item = d.draw.get(mesh(*tile)).expect("still drawn");
+                assert_eq!(item.role, Role::Exact, "{tile:?} gave way");
+                let now = base_drape(item).expect("dressed").level;
+                assert!(now >= *img, "{tile:?}: drape {img} → {now}");
+            }
+            for i in d.draw.items.iter().filter(|i| i.role == Role::Exact) {
+                if let Some(x) = base_drape(i) {
+                    was.insert(i.mesh.tile(), x.level);
+                }
+            }
+        }
+        assert!(!was.is_empty(), "{RED}");
     }
 }
 
