@@ -62,7 +62,7 @@
 //! flies it again exactly. The format and the replay live in the `tuile-tape`
 //! crate.
 //!
-//! With the `control` feature — tests and debug builds only — [`control`] runs
+//! With the `control` feature — tests and debug builds only — `control` runs
 //! the same application headless, steps it frame by frame and reads it back:
 //! see that module.
 
@@ -91,7 +91,6 @@ mod snapshot;
 mod start;
 mod steer;
 
-/// The headless viewer and its control API: see the module.
 #[cfg(feature = "control")]
 pub mod control;
 

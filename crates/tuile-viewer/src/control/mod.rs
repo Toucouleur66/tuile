@@ -26,7 +26,7 @@
 //!
 //! Through the numbers the engine publishes — `tuile_core::metrics`, the
 //! series `tuile-metrics` exports — never through accessors of its own. A
-//! [`State`] is one step's: the view a script reads ([`crate::snapshot`]),
+//! [`State`] is one step's: the view a script reads (the scripting snapshot),
 //! the metrics as a [`Snapshot`] since the run began, what each eye's scan
 //! found, what the network was asked, and what every [`Observer`] added.
 //!
