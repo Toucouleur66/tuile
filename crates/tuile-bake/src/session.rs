@@ -2822,6 +2822,12 @@ pub(crate) mod tests {
         fn roots(&self) -> Vec<TileId> {
             vec![quad_id(0, 0, 0)]
         }
+        /// The quad never changes shape, and says so: the flight's golden
+        /// then holds with the session keeping its nearest-content distance
+        /// from pass to pass, as it does over a real terrain globe.
+        fn revision(&self) -> Option<u64> {
+            Some(0)
+        }
         fn children(&self, id: TileId) -> Vec<TileId> {
             let (level, x, y) = quad_coord(id);
             if level + 1 >= QUAD_LEVELS {

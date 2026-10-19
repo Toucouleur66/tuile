@@ -25,7 +25,9 @@ use crate::protocol::{
 use crate::source::{LoadError, Loaded, TileId, TileLoader, TileTree};
 use crate::tiles3d::{TilesetLoader, TilesetTree};
 use crate::tileset::Tileset;
-use crate::traversal::{traverse, Config, ResidencyView, TraversalOutput, ViewState};
+use crate::traversal::{
+    traverse_with, Config, NearestContent, ResidencyView, TraversalOutput, ViewState,
+};
 use futures_channel::mpsc::UnboundedSender;
 use futures_core::Stream;
 use futures_util::future::{poll_fn, AbortHandle, Abortable, Aborted};
@@ -364,6 +366,7 @@ pub fn in_process_with(
             out: TraversalOutput::default(),
             selected: HashSet::new(),
             rendered_last: HashSet::new(),
+            near: NearestContent::default(),
             view_moved: false,
             frame: 0,
             primed: false,
@@ -417,6 +420,9 @@ pub struct GeometryServer {
     out: TraversalOutput,
     selected: HashSet<TileId>,
     rendered_last: HashSet<TileId>,
+    /// The scene-wide distance a uniform-detail pass is priced at, kept from
+    /// one pass to the next while the camera and the tree's shape hold still.
+    near: NearestContent,
     view_moved: bool,
     frame: u64,
     /// Whether the coarse pyramid has been asked for yet. See
@@ -485,6 +491,7 @@ impl GeometryServer {
             out: &mut self.out,
             selected: &mut self.selected,
             rendered_last: &mut self.rendered_last,
+            near: &mut self.near,
             acked: &mut self.acked,
             filled: &mut self.filled,
             view_moved: &mut self.view_moved,
@@ -703,6 +710,7 @@ struct Session<'a> {
     /// What the previous pass drew. Consulted by the descendant limit — see
     /// [`crate::traversal::Config::loading_descendant_limit`].
     rendered_last: &'a mut HashSet<TileId>,
+    near: &'a mut NearestContent,
     acked: &'a mut HashSet<TileId>,
     filled: &'a mut HashSet<TileId>,
     /// Set when the camera moved, which is the only time in-flight loads may be
@@ -917,16 +925,21 @@ impl Session<'_> {
         // this traversal reaches is off limits to the sweep at the end of it.
         self.cache.start_pass();
         let started = crate::metrics::stamp();
-        traverse(
+        traverse_with(
             self.tree,
             self.residency,
             self.views,
             self.config,
             *self.frame,
             self.rendered_last,
+            self.near,
             self.out,
         );
         let walked = started.elapsed();
+        // Every pass of every session these tests drive is checked against
+        // the reference pass, which works everything out from scratch.
+        #[cfg(test)]
+        tests::matches_the_reference_pass(self);
         // What this pass actually put on screen, for the next one to consult.
         // A held REPLACE only cuts its subtree loose when it has nothing of its
         // own drawn yet — once it is on screen there is no black to avoid, and
@@ -1520,6 +1533,95 @@ mod tests {
     use glam::{dvec2, dvec3};
     use std::sync::Mutex;
     use url::Url;
+
+    thread_local! {
+        /// Uniform-detail passes checked against the reference on this
+        /// thread, and the descents the session's memo had run by the last.
+        static CHECKED: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+    }
+
+    /// The pass the session just ran, run again from scratch with
+    /// [`crate::traversal::traverse`], and the two compared. Called on every
+    /// pass of every session the tests in this module drive.
+    pub(super) fn matches_the_reference_pass(s: &Session<'_>) {
+        let mut fresh = TraversalOutput::default();
+        crate::traversal::traverse(
+            s.tree,
+            s.residency,
+            s.views,
+            s.config,
+            *s.frame,
+            s.rendered_last,
+            &mut fresh,
+        );
+        let at = format!("pass {}", *s.frame);
+        assert_eq!(s.out.selected, fresh.selected, "{at}: selection");
+        assert_eq!(s.out.requests, fresh.requests, "{at}: requests");
+        assert_eq!(s.out.awaiting, fresh.awaiting, "{at}: awaiting");
+        assert_eq!(s.out.stats, fresh.stats, "{at}: stats");
+        if s.config.uniform_detail {
+            CHECKED.with(|c| c.set((c.get().0 + 1, s.near.descents())));
+        }
+    }
+
+    /// **A session prices a still camera once, and selects as a fresh pass
+    /// would on every pass.**
+    ///
+    /// Every arrival is answered by a pass, and under uniform detail every
+    /// pass used to repeat the descent along the line of sight. Here the
+    /// session runs to convergence twice — one camera, then another — with
+    /// each of its passes checked against the reference by
+    /// `matches_the_reference_pass`, and it may descend once per camera.
+    #[test]
+    fn a_still_camera_is_priced_once_per_camera() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = write_deep_fixture(dir.path());
+        let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
+        let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
+        let config = Config {
+            uniform_detail: true,
+            pinned_level: None,
+            ..Config::default()
+        };
+        let (mut stream, server) = in_process(tileset, Arc::new(FsFetcher), config);
+        let mut server = Box::pin(server.run());
+        CHECKED.with(|c| c.set((0, 0)));
+
+        stream
+            .send(ClientMessage::ViewerState {
+                views: vec![near_view()],
+                generation: 0,
+            })
+            .expect("send");
+        let (loaded, _) = settle(&mut server, &mut stream).expect("first view settles");
+        let (first, descents) = CHECKED.with(|c| c.get());
+        assert!(
+            loaded >= 3,
+            "only {loaded} tiles: nothing arrived to answer"
+        );
+        // Siblings answered from disk land together and share a pass, so
+        // two is the least: the camera's, and the arrivals'.
+        assert!(first >= 2, "{first} passes: the arrivals were not answered");
+        assert_eq!(descents, 1, "{first} passes under one camera");
+
+        let farther = ViewState::perspective(
+            dvec3(0.0, 0.0, 400.0),
+            dvec3(0.0, 0.0, -1.0),
+            dvec3(0.0, 1.0, 0.0),
+            dvec2(1024.0, 768.0),
+            std::f64::consts::FRAC_PI_3,
+        );
+        stream
+            .send(ClientMessage::ViewerState {
+                views: vec![farther],
+                generation: 1,
+            })
+            .expect("send");
+        settle(&mut server, &mut stream).expect("second view settles");
+        let (total, descents) = CHECKED.with(|c| c.get());
+        assert!(total > first, "the second camera was never traversed");
+        assert_eq!(descents, 2, "{total} passes under two cameras");
+    }
 
     /// **A load that is woken carries the wake, not the poll.** The loop polls
     /// the loads only when it gets round to them, so a load whose data arrived

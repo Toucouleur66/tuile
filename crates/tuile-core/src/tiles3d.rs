@@ -57,6 +57,10 @@ impl TileTree for TilesetTree {
         self.arena.read().expect("tileset lock").level(id)
     }
 
+    fn revision(&self) -> Option<u64> {
+        self.arena.read().expect("tileset lock").revision()
+    }
+
     /// Grafts are held in the arena until the gap between two passes.
     fn defer_edits(&self) {
         self.arena.write().expect("tileset lock").defer_grafts();
