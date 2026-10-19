@@ -57,6 +57,11 @@ impl TileTree for TilesetTree {
         self.arena.read().expect("tileset lock").level(id)
     }
 
+    /// A tileset's content is 3D Tiles content, charged to its own class.
+    fn mesh_class(&self, _id: TileId) -> crate::budget::Class {
+        crate::budget::Class::Tiles3dMesh
+    }
+
     fn revision(&self) -> Option<u64> {
         self.arena.read().expect("tileset lock").revision()
     }

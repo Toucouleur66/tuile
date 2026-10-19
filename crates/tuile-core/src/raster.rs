@@ -997,6 +997,47 @@ impl ImageryLayer {
         self
     }
 
+    /// The same layer, placed in a descendant tile's uv square rather than
+    /// its owner's: `uv` maps the descendant's uv into the owner's
+    /// (`owner = offset + uv × scale`, the budget's
+    /// [`UvTransform`](crate::budget::UvTransform)). How a tile wears an
+    /// ancestor's drape while its own is not drawable yet — the same
+    /// textures, no copy, each layer masked to what it covers of the tile.
+    /// `None` when the layer covers none of it.
+    pub fn through(&self, uv: crate::budget::UvTransform) -> Option<Self> {
+        let (s, o) = (uv.scale, uv.offset);
+        if !(s[0] > 0.0 && s[1] > 0.0) {
+            return None;
+        }
+        let c = self.coverage;
+        let u = |x: f32| ((f64::from(x) - o[0]) / s[0]) as f32;
+        let v = |y: f32| ((f64::from(y) - o[1]) / s[1]) as f32;
+        let coverage = [u(c[0]), v(c[1]), u(c[2]), v(c[3])];
+        let reaches = coverage[2] >= 0.0
+            && coverage[0] <= 1.0
+            && coverage[3] >= 0.0
+            && coverage[1] <= 1.0
+            && coverage[2] > coverage[0]
+            && coverage[3] > coverage[1];
+        if !reaches {
+            return None;
+        }
+        Some(Self {
+            coord: self.coord,
+            source: self.source,
+            texture: Arc::clone(&self.texture),
+            coverage,
+            translation: [
+                (o[0] * f64::from(self.scale[0]) + f64::from(self.translation[0])) as f32,
+                (o[1] * f64::from(self.scale[1]) + f64::from(self.translation[1])) as f32,
+            ],
+            scale: [
+                (s[0] * f64::from(self.scale[0])) as f32,
+                (s[1] * f64::from(self.scale[1])) as f32,
+            ],
+        })
+    }
+
     /// Whether this layer covers any of the geometry tile at all.
     ///
     /// A degenerate coverage rectangle means the two rectangles only touched at
@@ -1370,6 +1411,14 @@ pub trait ImageryProvider: Send + Sync {
         crate::storage::Stamp::Unknown
     }
 
+    /// Whether a local store holds the tile, asked of its index without
+    /// reading it, synchronously: see [`ContentStore::holds`]. The default
+    /// knows of no store.
+    fn holds(&self, coord: ImageryCoord) -> bool {
+        let _ = coord;
+        false
+    }
+
     /// The decoded tile. Provided: every provider decodes the same way.
     async fn fetch_tile(
         &self,
@@ -1465,6 +1514,10 @@ impl<P: ImageryProvider> ImageryProvider for CachedImagery<P> {
     /// asked — it would have to fetch the bytes to say anything.
     async fn fetch_tile_stamp(&self, coord: ImageryCoord) -> crate::storage::Stamp {
         self.store.stamp(&self.key(coord)).await
+    }
+
+    fn holds(&self, coord: ImageryCoord) -> bool {
+        self.store.holds(&self.key(coord))
     }
 
     async fn fetch_tile_bytes(&self, coord: ImageryCoord) -> Result<Fetched<Bytes>, RasterError> {

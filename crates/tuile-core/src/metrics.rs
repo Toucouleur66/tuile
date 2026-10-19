@@ -512,14 +512,6 @@ pub struct Metrics {
     /// it looks from the outside exactly like a slow network.
     pub pending_uploads: Gauge,
     pub prepared_tiles: Gauge,
-    /// Selected tiles currently drawn by a stand-in rather than their own
-    /// geometry.
-    ///
-    /// A session where this stays high is one whose real tiles are not
-    /// arriving — and it looks plausible throughout, because a stand-in is a
-    /// surface at roughly the right height. This count is the only way to
-    /// notice.
-    pub tiles_filled: Gauge,
 
     // --- The frame, as drawn ---
     //
@@ -536,9 +528,6 @@ pub struct Metrics {
     pub frame_coarser: Gauge,
     /// Selected tiles the last frame drew with nothing at all: a hole.
     pub frame_lost: Gauge,
-    /// Selected tiles the last frame drew with a stand-in rather than their
-    /// own content — counted as exact by every other number here.
-    pub frame_stand_ins: Gauge,
     /// A digest of what the last frame drew: the tiles drawn exactly and the
     /// ancestors drawn in fallback, each set sorted
     /// ([`crate::determinism::digest`]). Constant while the picture is; two
@@ -822,13 +811,34 @@ snapshot! {
         imagery_textures,
         pending_uploads,
         prepared_tiles,
-        tiles_filled,
         frame_exact,
         frame_coarser,
         frame_lost,
-        frame_stand_ins,
         frame_digest,
     ],
+}
+
+/// The graphics budget's signals as a session last published them (spec
+/// §16.6): what the metrics endpoint exposes under `tuile_budget_*`, and
+/// what an overlay or a test reads. `None` until a session has published.
+///
+/// Behind a lock rather than atomics, unlike the numbers above: the session
+/// copies one snapshot every half second, and the readers are as rare.
+pub fn budget() -> Option<crate::budget::BudgetSignals> {
+    budget_slot().lock().ok().and_then(|s| s.clone())
+}
+
+/// Publishes a session's budget signals: see [`budget`].
+pub fn publish_budget(signals: crate::budget::BudgetSignals) {
+    if let Ok(mut slot) = budget_slot().lock() {
+        *slot = Some(signals);
+    }
+}
+
+fn budget_slot() -> &'static std::sync::Mutex<Option<crate::budget::BudgetSignals>> {
+    static SLOT: std::sync::OnceLock<std::sync::Mutex<Option<crate::budget::BudgetSignals>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(None))
 }
 
 /// The process's metrics.

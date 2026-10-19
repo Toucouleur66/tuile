@@ -4,44 +4,48 @@
 //! Render-agnostic consumer-side driving of a [`GeometryStream`].
 //!
 //! Every façade (wgpu, USD/Hydra, web, headless snapshot) consumes the same
-//! stream, so the selection/residency bookkeeping and the two driving policies
-//! live here — **not** in any renderer. A renderer only needs to turn the
-//! [`ServerMessage::Content`] it routes into GPU resources; everything about
-//! *what is selected and ready* is [`SceneState`].
+//! stream, so the bookkeeping of what is drawn and what is held lives here —
+//! **not** in any renderer. A renderer only needs to turn the
+//! [`ServerMessage::Content`] it routes into GPU resources, acknowledge each
+//! with its bytes, and draw the draw set; everything about *what is drawn
+//! and what it wears* is the budget's, carried by [`ServerMessage::Select`].
 //!
 //! - **Progressive** (interactive viewers): feed each [`ServerMessage`] to
-//!   [`SceneState::apply`], route `Content` to your renderer, and draw
-//!   [`SceneState::renderable`] every frame — tiles stream in one by one.
-//! - **Bulk** (high-quality snapshots): [`drive_until_complete`] pumps the
-//!   stream until the selection is stable and fully resident, then hands back
-//!   every decoded tile at once.
+//!   [`SceneState::apply`], route `Content` to your renderer, acknowledge,
+//!   and draw [`SceneState::draw`] every frame.
+//! - **Bulk** (high-quality snapshots): [`drive_until_complete`] holds every
+//!   delivery as uploaded, acknowledges it, and pumps the stream until the
+//!   frame is complete, then hands back every drawn mesh with its drapes.
 
-use crate::content::TileContent;
-use crate::protocol::{ClientMessage, GeometryStream, ServerMessage, StreamError};
+use crate::budget::{DrawSet, ResourceId, Role};
+use crate::content::{DecodedTileContent, DrapeContent};
+use crate::protocol::{
+    ClientMessage, GeometryStream, ResourceContent, ServerMessage, StreamError,
+};
 use crate::source::TileId;
 use crate::traversal::{TraversalStats, ViewState};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 /// The consumer's view of the scene, rebuilt from the server's messages.
 /// Pure bookkeeping — no content payloads, no GPU — so it is identical across
 /// renderers.
 #[derive(Debug, Clone, Default)]
 pub struct SceneState {
-    selected: Vec<(TileId, f64)>,
-    resident: HashSet<TileId>,
+    draw: DrawSet,
+    resident: HashSet<ResourceId>,
     stats: TraversalStats,
-    /// Outstanding loads the server still intends to fulfil (its `Select`'s
-    /// request count, already net of tiles it gave up on).
-    pending: u32,
     started: bool,
+    frame_ready: bool,
+    converged: bool,
     /// The generation the last `Select` answered.
     ///
     /// A consumer that drives frame after frame on one stream needs this: the
-    /// server keeps traversing as tiles land, so a `Select` for the *previous*
-    /// camera can arrive — and satisfy [`is_complete`](Self::is_complete) —
-    /// after a new camera was sent. Comparing this against what was sent is
-    /// what makes "the selection answers the current camera" a fact rather
-    /// than a hope.
+    /// server keeps deciding as resources land, so a `Select` for the
+    /// *previous* camera can arrive — and satisfy
+    /// [`is_complete`](Self::is_complete) — after a new camera was sent.
+    /// Comparing this against what was sent is what makes "the selection
+    /// answers the current camera" a fact rather than a hope.
     generation: u64,
 }
 
@@ -50,56 +54,50 @@ impl SceneState {
     pub fn apply(&mut self, msg: &ServerMessage) {
         match msg {
             ServerMessage::Select {
-                tiles,
+                draw,
                 stats,
+                frame_ready,
+                converged,
                 generation,
                 ..
             } => {
-                self.selected = tiles.clone();
+                self.draw = draw.clone();
                 self.stats = *stats;
-                self.pending = stats.requested;
+                self.frame_ready = *frame_ready;
+                self.converged = *converged;
                 self.started = true;
                 self.generation = *generation;
             }
-            // A stand-in is not residency: the tile it covers for has still
-            // not arrived, and counting it here would make a scene look
-            // complete while it is being held together by approximations.
-            ServerMessage::Fill { .. } => {}
-            ServerMessage::Content { tile, .. } => {
-                self.resident.insert(*tile);
+            ServerMessage::Content { resource, .. } => {
+                self.resident.insert(*resource);
             }
-            ServerMessage::Evict { tiles } => {
-                for t in tiles {
-                    self.resident.remove(t);
+            ServerMessage::Cancel { resources } => {
+                for (r, _) in resources {
+                    self.resident.remove(r);
                 }
             }
-            // Stand-ins were never counted into residency (see `Fill` above),
-            // so taking them back changes nothing here either.
-            ServerMessage::Retire { .. } => {}
-            ServerMessage::Error { tile, .. } => {
-                if let Some(t) = tile {
-                    self.resident.remove(t);
+            ServerMessage::Evict { resources } => {
+                for r in resources {
+                    self.resident.remove(r);
                 }
             }
-            // Startup accounting for a host that holds a first frame back. A
-            // bulk driver holds nothing back, so it has nothing to do with it.
-            ServerMessage::Priming(_) => {}
+            ServerMessage::Error { .. } | ServerMessage::Priming(_) => {}
         }
     }
 
-    /// True once the server has reported a stable selection with no pending
-    /// loads — the steady state a bulk render waits for.
+    /// Whether the server has reported a complete frame: every mesh and
+    /// drape it needs drawable (batch), or converged (interactive).
     pub fn is_complete(&self) -> bool {
-        self.started && self.pending == 0
+        self.started && (self.frame_ready || self.converged)
     }
 
-    /// The current selection (tile + its SSE), regardless of residency.
-    pub fn selected(&self) -> &[(TileId, f64)] {
-        &self.selected
+    /// What to draw: the last draw set.
+    pub fn draw(&self) -> &DrawSet {
+        &self.draw
     }
 
-    pub fn is_resident(&self, tile: TileId) -> bool {
-        self.resident.contains(&tile)
+    pub fn is_resident(&self, r: ResourceId) -> bool {
+        self.resident.contains(&r)
     }
 
     pub fn stats(&self) -> TraversalStats {
@@ -110,52 +108,77 @@ impl SceneState {
     pub fn generation(&self) -> u64 {
         self.generation
     }
+}
 
-    /// Tiles to draw *this frame*: the selection intersected with what has
-    /// actually arrived. During progressive loading this grows as content
-    /// streams in; at steady state it equals the full selection.
-    pub fn renderable(&self) -> impl Iterator<Item = (TileId, f64)> + '_ {
-        self.selected
-            .iter()
-            .copied()
-            .filter(move |(t, _)| self.resident.contains(t))
+/// A fully-loaded frame: every drawn mesh, decoded, with the drapes it wears.
+pub struct BulkFrame {
+    /// What the frame draws, sorted by mesh.
+    ///
+    /// **This is what a consumer iterates**, looking each mesh and drape up in
+    /// [`meshes`](Self::meshes) and [`drapes`](Self::drapes) — not the other
+    /// way round: a map's order is a per-process accident, and output that
+    /// is kept must not depend on it.
+    pub draw: DrawSet,
+    /// Decoded meshes, by tile.
+    pub meshes: HashMap<TileId, Arc<DecodedTileContent>>,
+    /// Decoded drapes, by resource.
+    pub drapes: HashMap<ResourceId, Arc<DrapeContent>>,
+    pub stats: TraversalStats,
+    /// Load failures encountered while converging. A failure the budget
+    /// retried and got past leaves no hole, but anything keeping its output
+    /// should treat a non-empty `errors` as worth a look.
+    pub errors: Vec<(Option<ResourceId>, String)>,
+}
+
+impl BulkFrame {
+    /// Each drawn mesh, dressed: its content with the drapes it wears placed
+    /// in its own uv square (an ancestor's through its uv transform), as
+    /// [`DecodedTileContent::imagery`] — the composed form an offline
+    /// renderer or a pack consumes. In draw-set order; exact and held items
+    /// only (a fallback ancestor stands in for ground that is not its own).
+    pub fn dressed(&self) -> Vec<(TileId, DecodedTileContent)> {
+        let mut out = Vec::new();
+        for item in &self.draw.items {
+            if item.role == Role::Fallback {
+                continue;
+            }
+            let tile = item.mesh.tile();
+            let Some(mesh) = self.meshes.get(&tile) else {
+                continue;
+            };
+            out.push((tile, dress(mesh, item, &self.drapes)));
+        }
+        out
     }
 }
 
-/// A fully-loaded frame: every selected tile, decoded and resident.
-pub struct BulkFrame {
-    /// The stable selection (tile + SSE), in traversal order.
-    ///
-    /// **This is what a consumer iterates**, looking each tile up in
-    /// [`contents`](Self::contents) — not the other way round. See that field.
-    pub selected: Vec<(TileId, f64)>,
-    /// Decoded content for every resident selected tile.
-    ///
-    /// A lookup table, not a sequence. `HashMap` iteration order depends on a
-    /// per-process random seed, so anything that walks this map emits its
-    /// results in a different order on every run. That is invisible in a viewer
-    /// and corrosive anywhere output is kept: two renders of the same frame on
-    /// two machines differ by prim ordering alone, and a farm comparing them
-    /// reports a change that is not there. Iterate
-    /// [`selected`](Self::selected), which is ordered.
-    pub contents: HashMap<TileId, TileContent>,
-    pub stats: TraversalStats,
-    /// Load failures encountered while converging. Non-fatal *to the frame* —
-    /// it still returns — but not harmless: a failed tile leaves no hole,
-    /// because its ancestor stands in, so the frame renders plausibly at the
-    /// wrong level of detail. Anything keeping its output should treat a
-    /// non-empty `errors` as a failed frame rather than a warning.
-    pub errors: Vec<(Option<TileId>, String)>,
+/// A mesh's content wearing a draw item's drapes, as layers in its own uv
+/// square. Shared by every consumer that composes on the CPU.
+pub fn dress(
+    mesh: &DecodedTileContent,
+    item: &crate::budget::DrawItem,
+    drapes: &HashMap<ResourceId, Arc<DrapeContent>>,
+) -> DecodedTileContent {
+    let mut content = mesh.clone();
+    content.imagery.clear();
+    for choice in &item.drapes {
+        let Some(drape) = drapes.get(&choice.resource) else {
+            continue;
+        };
+        content
+            .imagery
+            .extend(drape.tiles.iter().filter_map(|l| l.through(choice.uv)));
+    }
+    content
 }
 
-/// Bulk policy: send `views` once, then pump the stream until the selection is
-/// stable and fully resident, and return all decoded tiles together. Renderer-
-/// independent — a snapshot tool uploads `contents` in one batch; the WebSocket
-/// and static-HTTP bindings drive the very same loop.
+/// Bulk policy: send `views` once, then pump the stream until the frame is
+/// complete, acknowledging every delivery as held, and return every drawn
+/// mesh and drape together. Renderer-independent — a snapshot tool uploads
+/// them in one batch; the WebSocket and static-HTTP bindings drive the very
+/// same loop.
 ///
-/// Terminates because the server stops counting tiles it has given up on (see
-/// `runtime::Session::retraverse`), so `pending` reaches zero even when some
-/// tiles fail. Returns [`StreamError::Closed`] if the server drops first.
+/// Returns [`StreamError::Closed`] if the server drops first.
 pub async fn drive_until_complete<S: GeometryStream + Unpin>(
     stream: &mut S,
     views: Vec<ViewState>,
@@ -165,40 +188,86 @@ pub async fn drive_until_complete<S: GeometryStream + Unpin>(
         generation: 1,
     })?;
     let mut state = SceneState::default();
-    let mut contents: HashMap<TileId, TileContent> = HashMap::new();
-    let mut errors: Vec<(Option<TileId>, String)> = Vec::new();
+    let mut meshes: HashMap<TileId, Arc<DecodedTileContent>> = HashMap::new();
+    let mut drapes: HashMap<ResourceId, Arc<DrapeContent>> = HashMap::new();
+    let mut errors: Vec<(Option<ResourceId>, String)> = Vec::new();
+    // The generation each held resource came with: what a cancel names.
+    let mut held: BTreeMap<ResourceId, crate::budget::Generation> = BTreeMap::new();
 
     while let Some(msg) = stream.next_message().await {
         state.apply(&msg);
         match msg {
-            ServerMessage::Content { tile, content, .. } => {
-                contents.insert(tile, content);
+            ServerMessage::Content {
+                resource,
+                gen,
+                content,
+                ..
+            } => {
+                // Held as uploaded: acknowledged with the estimator's bytes,
+                // which is what a consumer that keeps the decoded content
+                // holds.
+                let bytes = match &content {
+                    ResourceContent::Mesh(m) => m.cost().gpu,
+                    ResourceContent::Drape(d) => d.cost().gpu,
+                };
+                match content {
+                    ResourceContent::Mesh(m) => {
+                        meshes.insert(resource.tile(), m);
+                    }
+                    ResourceContent::Drape(d) => {
+                        drapes.insert(resource, d);
+                    }
+                }
+                held.insert(resource, gen);
+                stream.send(ClientMessage::Ack {
+                    resource,
+                    gen,
+                    bytes: bytes.0,
+                })?;
             }
-            // This driver collects finished content for inspection; a stand-in
-            // is by definition unfinished and would only dilute the answer.
-            ServerMessage::Fill { .. } => {}
-            // And since no stand-in was kept, there is none to take back.
-            ServerMessage::Retire { .. } => {}
-            ServerMessage::Evict { tiles } => {
-                for t in tiles {
-                    contents.remove(&t);
+            ServerMessage::Cancel { resources } => {
+                for (r, g) in resources {
+                    if held.get(&r) == Some(&g) {
+                        held.remove(&r);
+                        forget(&mut meshes, &mut drapes, r);
+                    }
                 }
             }
-            ServerMessage::Error { tile, message } => errors.push((tile, message)),
+            ServerMessage::Evict { resources } => {
+                for r in resources {
+                    held.remove(&r);
+                    forget(&mut meshes, &mut drapes, r);
+                }
+            }
+            ServerMessage::Error { resource, message } => errors.push((resource, message)),
             ServerMessage::Select { .. } | ServerMessage::Priming(_) => {}
         }
         if state.is_complete() {
-            // Keep only what is still selected & resident.
-            contents.retain(|t, _| state.is_resident(*t));
             return Ok(BulkFrame {
-                selected: state.selected().to_vec(),
-                contents,
+                draw: state.draw().clone(),
+                meshes,
+                drapes,
                 stats: state.stats(),
                 errors,
             });
         }
     }
     Err(StreamError::Closed)
+}
+
+fn forget(
+    meshes: &mut HashMap<TileId, Arc<DecodedTileContent>>,
+    drapes: &mut HashMap<ResourceId, Arc<DrapeContent>>,
+    r: ResourceId,
+) {
+    match r {
+        ResourceId::Mesh(t) => {
+            meshes.remove(&t);
+        }
+        ResourceId::Drape { .. } => {
+            drapes.remove(&r);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -257,7 +326,13 @@ mod tests {
         let root = tileset.root();
         let leaves: HashSet<TileId> = tileset.tile(root).children.iter().copied().collect();
 
-        let (mut stream, server) = in_process(tileset, Arc::new(FsFetcher), Config::default());
+        let (mut stream, server) = in_process(
+            tileset,
+            Arc::new(FsFetcher),
+            Config::default(),
+            crate::budget::BudgetConfig::interactive(crate::budget::Bytes::mib(256)),
+        )
+        .expect("a valid budget");
         let mut pool = futures_executor::LocalPool::new();
         pool.spawner().spawn_local(server.run()).expect("spawn");
 
@@ -265,15 +340,21 @@ mod tests {
             .run_until(drive_until_complete(&mut stream, vec![near_view()]))
             .expect("bulk frame");
 
-        // The stable selection is exactly the two leaves (REPLACE displaced
-        // the root), and every selected tile arrived decoded.
-        let selected: HashSet<TileId> = frame.selected.iter().map(|(t, _)| *t).collect();
-        assert_eq!(selected, leaves);
-        assert!(!selected.contains(&root), "REPLACE: leaves displaced root");
-        for tile in &selected {
+        // The converged frame draws exactly the two leaves (REPLACE displaced
+        // the root), each as itself, and every one arrived decoded.
+        let drawn: HashSet<TileId> = frame
+            .draw
+            .items
+            .iter()
+            .filter(|i| i.role == Role::Exact)
+            .map(|i| i.mesh.tile())
+            .collect();
+        assert_eq!(drawn, leaves);
+        assert!(!drawn.contains(&root), "REPLACE: leaves displaced root");
+        for tile in &drawn {
             assert!(
-                matches!(frame.contents.get(tile), Some(TileContent::Decoded(_))),
-                "selected tile {tile:?} must be decoded and resident"
+                frame.meshes.contains_key(tile),
+                "drawn tile {tile:?} must be decoded and held"
             );
         }
         assert!(frame.errors.is_empty());

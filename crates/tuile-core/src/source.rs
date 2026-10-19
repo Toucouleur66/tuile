@@ -18,7 +18,8 @@
 //! loader implements `TileLoader`. [`CompositeTileTree`]/[`CompositeLoader`]
 //! combine several of each by tag — so a terrain (draped with imagery) and a
 //! 3D Tiles building set (with its own glb textures) traverse and load
-//! together, each tile carrying the textures that correspond to its source.
+//! together, each tile carrying the textures that correspond to its source
+//! — a terrain tile's imagery as drapes of its own ([`TileLoader::load_drape`]).
 
 use crate::content::DecodedTileContent;
 use crate::math::BoundingVolume;
@@ -216,6 +217,14 @@ pub trait TileTree: Send + Sync {
         }
         level
     }
+
+    /// The budget class a tile's mesh is charged to: a terrain mesh unless
+    /// the tree says otherwise (a 3D Tiles tileset's content is a
+    /// [`Class::Tiles3dMesh`](crate::budget::Class::Tiles3dMesh)), so that
+    /// one kind of content cannot starve the other.
+    fn mesh_class(&self, _id: TileId) -> crate::budget::Class {
+        crate::budget::Class::TerrainMesh
+    }
 }
 
 /// Outcome of a [`TileLoader::load`].
@@ -239,34 +248,34 @@ pub enum Loaded {
 pub trait TileLoader: Send + Sync {
     async fn load(&self, id: TileId) -> Result<Loaded, LoadError>;
 
-    /// A stand-in surface for a tile whose real content has not arrived, built
-    /// from what is already in memory. **Synchronous, and never any I/O.**
-    ///
-    /// Synchronous because it exists to answer *now*: the selection names ground
-    /// the camera is looking at this instant, and a stand-in that arrives after
-    /// a fetch would arrive alongside the real tile and be pointless.
-    ///
-    /// # Why the engine needs this at all
-    ///
-    /// A consumer that lacks a selected tile draws its nearest ready ancestor.
-    /// That works and it has a defect: the ancestor also covers the siblings
-    /// that *did* arrive, so two approximations of the same hillside end up
-    /// over the same ground, interpenetrating within a few metres, and the
-    /// depth test picks a winner per pixel. The reference implementation builds
-    /// a fill mesh for exactly this reason (`TerrainFillMesh`), and so does
-    /// this: one surface per patch of ground, always.
-    ///
-    /// # Why here and not in a renderer
-    ///
-    /// It is pure geometry over a tile rectangle — no device, no pipeline, no
-    /// texture. Putting it in a backend would mean every backend reimplementing
-    /// it, and eventually disagreeing about where the ground is. Emitted by the
-    /// server, it reaches wgpu, a browser and a USD renderer identically, and
-    /// each one draws it through the path it already has for content.
-    ///
-    /// Default: `None`, for the many sources with nothing coarse to build from.
-    fn fill(&self, _id: TileId) -> Option<crate::content::DecodedTileContent> {
+    /// The imagery that drapes `id`, or `None` for content that carries its
+    /// own textures (a glb's). **Synchronous, and never any I/O**: the
+    /// session asks it of every tile it lists, every step, to tell the budget
+    /// which drapes each tile needs (the need's imagery, chosen per tile and
+    /// independently of the terrain level, I10).
+    fn drapes(&self, _id: TileId) -> Option<DrapeReach> {
         None
+    }
+
+    /// Composes `id`'s drape of `layer` at the budget's imagery `level`: the
+    /// drape is a resource of its own, loaded beside the tile's mesh, at the
+    /// level the budget asks for (D-A2).
+    async fn load_drape(
+        &self,
+        id: TileId,
+        layer: crate::budget::LayerId,
+        level: u32,
+    ) -> Result<crate::content::DrapeContent, LoadError> {
+        let _ = (id, layer, level);
+        Err(LoadError::Failed("this source drapes nothing".into()))
+    }
+
+    /// Whether a local store holds what loading `r` would read, asked of
+    /// its index without reading the payload (spec §4b): the budget's
+    /// presence oracle. A hint, never a promise. **Synchronous, and never
+    /// any I/O.** Default: nothing is held locally.
+    fn holds(&self, _r: crate::budget::ResourceId) -> crate::budget::Presence {
+        crate::budget::Presence::Absent
     }
 
     /// Fetches everything down to `through_level` into whatever store sits
@@ -305,6 +314,21 @@ pub trait TileLoader: Send + Sync {
     fn epoch(&self) -> u64 {
         0
     }
+}
+
+/// What drapes a tile: the ground size of one imagery texel at level 0, which
+/// a view turns into the tile's texel footprint, and each layer that drapes
+/// it with how deep it reaches there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DrapeReach {
+    /// Metres of ground under one texel of a level-0 imagery tile of 256
+    /// texels: level `L` halves it `L` times.
+    pub texel_l0_m: f64,
+    /// The tile's footprint in longitude and latitude: what places one
+    /// tile's drape over another's ground.
+    pub rect: crate::budget::GeoRect,
+    /// The layers that drape the tile, in stacking order.
+    pub layers: Vec<crate::budget::LayerReach>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -419,6 +443,14 @@ impl TileTree for CompositeTileTree {
             .get(id.tag() as usize)
             .map_or(0, |s| s.level(id.payload()))
     }
+
+    fn mesh_class(&self, id: TileId) -> crate::budget::Class {
+        self.sources
+            .get(id.tag() as usize)
+            .map_or(crate::budget::Class::TerrainMesh, |s| {
+                s.mesh_class(id.payload())
+            })
+    }
 }
 
 /// Routes [`TileLoader::load`] to the sub-loader matching the tile's tag, so
@@ -447,6 +479,37 @@ impl TileLoader for CompositeLoader {
             Some(l) => l.load(id.payload()).await,
             None => Err(LoadError::BadTag(tag)),
         }
+    }
+
+    fn drapes(&self, id: TileId) -> Option<DrapeReach> {
+        self.loaders.get(id.tag() as usize)?.drapes(id.payload())
+    }
+
+    async fn load_drape(
+        &self,
+        id: TileId,
+        layer: crate::budget::LayerId,
+        level: u32,
+    ) -> Result<crate::content::DrapeContent, LoadError> {
+        let tag = id.tag();
+        match self.loaders.get(tag as usize) {
+            Some(l) => l.load_drape(id.payload(), layer, level).await,
+            None => Err(LoadError::BadTag(tag)),
+        }
+    }
+
+    fn holds(&self, r: crate::budget::ResourceId) -> crate::budget::Presence {
+        use crate::budget::ResourceId;
+        let tile = r.tile();
+        let local = match r {
+            ResourceId::Mesh(_) => ResourceId::Mesh(tile.payload()),
+            ResourceId::Drape { layer, level, .. } => {
+                ResourceId::drape(tile.payload(), layer, level)
+            }
+        };
+        self.loaders
+            .get(tile.tag() as usize)
+            .map_or(crate::budget::Presence::Absent, |l| l.holds(local))
     }
 }
 

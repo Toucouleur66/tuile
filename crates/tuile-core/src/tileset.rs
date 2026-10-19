@@ -253,6 +253,11 @@ impl TileTree for Tileset {
         vec![self.root]
     }
 
+    /// A tileset's content is 3D Tiles content, charged to its own class.
+    fn mesh_class(&self, _id: TileId) -> crate::budget::Class {
+        crate::budget::Class::Tiles3dMesh
+    }
+
     fn children(&self, id: TileId) -> Vec<TileId> {
         self.tile(id).children.clone()
     }

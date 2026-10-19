@@ -296,39 +296,6 @@ pub struct Config {
     pub maximum_screen_space_error: f64,
     /// REPLACE hold-until-ready: never show holes during refinement.
     pub forbid_holes: bool,
-    /// Whether the server sends stand-in surfaces for selected tiles the
-    /// consumer has not acknowledged.
-    ///
-    /// On, and what follows is why it was off twice before.
-    ///
-    /// A consumer draws the nearest ancestor it holds for a tile that has not
-    /// arrived, and that ancestor spans *all* its descendants — including the
-    /// siblings that did arrive. Two surfaces over one patch of ground, both
-    /// writing depth, winner chosen per pixel. Giving each missing tile a
-    /// surface over its own rectangle is what removes it: the consumer's walk
-    /// stops there and no ancestor is drawn. Nothing is refused, no fallback is
-    /// withheld — the climb simply has nothing left to climb for.
-    ///
-    /// **The trap is the shape of the stand-in, not the idea.** It used to be a
-    /// plane through four corner heights. Where some tiles get a stand-in and
-    /// others do not — which happens whenever the loader declines — the
-    /// ancestor's real relief and the neighbours' flat stand-ins occupy the same
-    /// ground, and the relief *punches through the plane*. Measured twice, on
-    /// Mediterranean terrain at about 15 km: large flat patches of coarse colour
-    /// with ridges showing through them in ragged outlines that follow the
-    /// terrain rather than the tile grid. Worse than the shimmer it replaced,
-    /// and the reason this sat at `false` for months.
-    ///
-    /// A stand-in is now an **upsample of the nearest ancestor already in
-    /// memory** — "a mesh of exactly the same surface over exactly the child's
-    /// ground". There is no plane, so there is nothing for relief to punch
-    /// through; and where an ancestor is still drawn beside one, the two are the
-    /// same surface carrying the same mosaic rather than two different guesses
-    /// at it.
-    ///
-    /// A consumer that ignores [`crate::protocol::ServerMessage::Fill`] is
-    /// unaffected: it keeps climbing, exactly as before.
-    pub stand_ins: bool,
     /// Refine every visible tile as finely as the **nearest** one.
     ///
     /// Off (the default) is the interactive contract: detail follows distance,
@@ -418,39 +385,6 @@ pub struct Config {
     /// already there. The reference implementation does exactly this, at the
     /// same default of 20.
     pub loading_descendant_limit: u32,
-    /// Resident-content budget in bytes (CPU side). Default 512 MiB.
-    ///
-    /// A consumer that uploads this content pays more than this for it: mip
-    /// chains, interleaved vertices and format padding all land on its side of
-    /// the wire. Budget for the consumer's memory, not for this number.
-    pub resident_budget_bytes: usize,
-    /// Maximum simultaneous content fetches.
-    pub maximum_simultaneous_fetches: usize,
-    /// A level that is never evicted, geometry and imagery both.
-    ///
-    /// Everything at or above it stays resident for the life of the session,
-    /// whatever the ceilings say. That is the guarantee the fallback chain
-    /// needs: an ancestor walk that reaches this level always finds something,
-    /// so ground can be soft but never bare.
-    ///
-    /// The level is a memory decision and the numbers are unforgiving, because
-    /// the count is `4^level`:
-    ///
-    /// | level | tiles over the globe | imagery if every one were held |
-    /// |---|---|---|
-    /// | 3 | 64 | 21 MiB |
-    /// | 5 | 1 024 | 341 MiB |
-    /// | 6 | 4 096 | 1.3 GiB |
-    /// | 8 | 65 536 | 21 GiB |
-    ///
-    /// Level 8 is not an option on a machine with 16 GiB shared between the CPU
-    /// and the GPU. Level 5 is, and in practice costs a fraction of that figure:
-    /// only tiles under ground the camera has visited are ever fetched, and the
-    /// ocean is most of the planet.
-    ///
-    /// `None` disables the pin — the ceilings then govern everything, which is
-    /// right for a bulk render that visits each view once.
-    pub pinned_level: Option<u32>,
     /// Whether tiles the traversal refines *past* are fetched speculatively.
     ///
     /// A refinement walks through a tile on its way to the detail it wants, and
@@ -469,17 +403,6 @@ pub struct Config {
     /// What a rotation turns onto. Off by default, again as in the reference:
     /// the cost is real and constant, the benefit only shows on movement.
     pub preload_siblings: bool,
-    /// How many tiles may stay resident, whatever they weigh.
-    ///
-    /// A second budget rather than a redundant one, because bytes and relevance
-    /// are different questions and a byte budget only answers the first. A tile
-    /// at level 19 seen from five hundred kilometres is useless and costs no
-    /// more than a level-3 tile covering a continent — nothing about its size
-    /// says it should go first, and a byte budget will not touch it until the
-    /// whole residency is under pressure. A count says "this many, the most
-    /// recently used", which is the reference implementation's `tileCacheSize`
-    /// and is what actually bounds a long session.
-    pub resident_tile_limit: usize,
 }
 
 impl Config {
@@ -491,44 +414,12 @@ impl Config {
     /// while the real globe went black. A test that does not run the host's
     /// configuration is not testing the host.
     ///
-    /// `pinned_level` is left to the caller: the viewer takes it from
-    /// `TUILE_PIN_LEVEL` so two runs of one binary can be compared minutes
-    /// apart, and a test wants it fixed.
-    ///
-    /// The reasoning behind each number, which is not obvious from the number:
-    ///
-    /// - **Two ceilings, and the count does the work.** Measured before it
-    ///   existed: 3386 MiB of imagery, ten thousand textures, a thousand of
-    ///   them at level 19 while the eye was in orbit, and not one eviction all
-    ///   session — because a level-19 texture nobody is looking at weighs
-    ///   exactly what a level-3 texture covering a continent weighs, so bytes
-    ///   alone never singled it out.
-    /// - **Sized above the working set.** `forbid_holes` loads a whole subtree
-    ///   before selecting any of it, and a tile loaded but not yet selected is
-    ///   protected by nothing: squeeze the budget below what a view needs and
-    ///   those tiles are evicted and re-requested for ever. At 768 MiB a
-    ///   motionless camera still churned twenty tiles a second, and that reads
-    ///   as the app hanging.
-    /// - **The budget counts decoded CPU bytes**; the GPU copy is about 1.35×
-    ///   that once mip chains and interleaved vertices are paid for. Four
-    ///   gibibytes here is therefore roughly **5.4 GiB on the GPU** — which
-    ///   unified memory carries, and which a discrete card with 8 GB would find
-    ///   tight once a compositor and a browser have taken their share.
-    /// - **Both ceilings moved together**, and they have to. The count is what
-    ///   actually bites — it was raised from 12 000 alongside the bytes — so
-    ///   lifting the byte budget alone would have changed nothing at all: the
-    ///   sweep would still have stopped at twelve thousand tiles, and a session
-    ///   would have reported three quarters of its new budget unused while
-    ///   evicting exactly as often as before.
-    pub fn interactive_globe(pinned_level: Option<u32>) -> Self {
+    /// What the session may hold, load and upload is the graphics budget's
+    /// ([`crate::budget::BudgetConfig`]): the traversal only says what the
+    /// view wants.
+    pub fn interactive_globe() -> Self {
         Self {
             maximum_screen_space_error: 2.0,
-            maximum_simultaneous_fetches: 64,
-            // Saturates on wasm32, where 4 GiB does not fit in a usize — and
-            // is the whole address space anyway.
-            resident_budget_bytes: 4usize.saturating_mul(1024 * 1024 * 1024),
-            resident_tile_limit: 16_000,
-            pinned_level,
             ..Self::default()
         }
     }
@@ -540,35 +431,40 @@ impl Default for Config {
             maximum_screen_space_error: 16.0,
             refine_hysteresis: 0.15,
             forbid_holes: true,
-            stand_ins: true,
             uniform_detail: false,
             uniform_detail_radius: 8.0,
             cull: true,
             horizon_culling: true,
             loading_descendant_limit: 20,
-            resident_budget_bytes: 512 * 1024 * 1024,
-            maximum_simultaneous_fetches: 20,
-            // Roughly a screenful at a demanding SSE, several times over, so a
-            // camera can turn and come back without paying twice.
-            resident_tile_limit: 4_096,
-            pinned_level: Some(5),
             preload_ancestors: true,
             preload_siblings: false,
         }
     }
 }
 
-/// What the traversal needs to know about content residency. Owned by the
-/// `GeometryServer`, read-only here.
+/// What the traversal needs to know about content residency: whether a
+/// tile may be treated as resident. The graphics budget answers it in a
+/// session ([`crate::budget::ResidencyView`]: drawable when interactive,
+/// loaded in a batch); read-only here.
+pub trait Residency {
+    /// Whether `t` may be treated as resident.
+    fn is_resident(&self, t: TileId) -> bool;
+}
+
+impl Residency for crate::budget::ResidencyView<'_> {
+    fn is_resident(&self, t: TileId) -> bool {
+        self.resident(t)
+    }
+}
+
+/// A plain set of resident tiles: a [`Residency`] for tests and tools that
+/// hold no budget.
 #[derive(Debug, Clone, Default)]
-pub struct ResidencyView {
+pub struct ResidentSet {
     resident: HashSet<TileId>,
 }
 
-impl ResidencyView {
-    pub fn is_resident(&self, t: TileId) -> bool {
-        self.resident.contains(&t)
-    }
+impl ResidentSet {
     pub fn insert(&mut self, t: TileId) {
         self.resident.insert(t);
     }
@@ -578,13 +474,17 @@ impl ResidencyView {
     pub fn iter(&self) -> impl Iterator<Item = TileId> + '_ {
         self.resident.iter().copied()
     }
-    /// How much content is held. Read by the pass trace, where the residency
-    /// at the moment of a traversal is half the explanation of its outcome.
     pub fn len(&self) -> usize {
         self.resident.len()
     }
     pub fn is_empty(&self) -> bool {
         self.resident.is_empty()
+    }
+}
+
+impl Residency for ResidentSet {
+    fn is_resident(&self, t: TileId) -> bool {
+        self.resident.contains(&t)
     }
 }
 
@@ -654,6 +554,13 @@ pub struct TraversalOutput {
     /// marks these children rendered at exactly this point, for exactly this
     /// reason.
     pub awaiting: Vec<TileId>,
+    /// Everything a held REPLACE waits on, resident or not: the descendants
+    /// moved to [`Self::awaiting`] and those still requested beneath the
+    /// hold. The graphics budget keeps the resident ones while their siblings
+    /// load (a swap group) — listing only the missing ones would make their
+    /// resident siblings unwanted, and evicting them restarts the swap for
+    /// ever. A tile may appear more than once.
+    pub blockers: Vec<TileId>,
     /// Tiles this pass chose at their own level: fine enough, with content —
     /// drawn if resident, wanted if not. Never a stand-in held for its
     /// children. Fed back as the next views' `chosen_before`.
@@ -672,7 +579,7 @@ pub struct TraversalOutput {
 #[allow(clippy::too_many_arguments)]
 pub fn traverse(
     tree: &dyn TileTree,
-    residency: &ResidencyView,
+    residency: &dyn Residency,
     views: &[ViewState],
     config: &Config,
     frame: FrameNumber,
@@ -699,7 +606,7 @@ pub fn traverse(
 #[allow(clippy::too_many_arguments)]
 pub fn traverse_with(
     tree: &dyn TileTree,
-    residency: &ResidencyView,
+    residency: &dyn Residency,
     views: &[ViewState],
     config: &Config,
     _frame: FrameNumber,
@@ -711,6 +618,7 @@ pub fn traverse_with(
     out.selected.clear();
     out.requests.clear();
     out.awaiting.clear();
+    out.blockers.clear();
     out.chosen.clear();
     out.stats = TraversalStats::default();
     let roots = tree.roots();
@@ -1048,7 +956,7 @@ fn deepest_content_along(
 #[allow(clippy::too_many_arguments)]
 fn visit(
     tree: &dyn TileTree,
-    residency: &ResidencyView,
+    residency: &dyn Residency,
     views: &[ViewState],
     config: &Config,
     rendered_last: &HashSet<TileId>,
@@ -1381,8 +1289,17 @@ fn visit(
             // Hold: drop descendant selections, stand in with this tile. The
             // descendants are still wanted — they are what the hold is waiting
             // for — so they are moved aside rather than forgotten.
+            let held_from = out.awaiting.len();
             out.awaiting
                 .extend(out.selected.drain(mark..).map(|(tile, _)| tile));
+            // What the hold waits on, before a cut below drops the requests:
+            // the descendants it moved aside, and those still asked for.
+            out.blockers.extend_from_slice(&out.awaiting[held_from..]);
+            let waited_on: Vec<TileId> = out.requests[request_mark..]
+                .iter()
+                .filter(|r| r.group != PriorityGroup::Preload)
+                .map(|r| r.tile)
+                .collect();
 
             // Waiting on heaps of descendants, with nothing of our own on
             // screen yet: ask for THIS tile and cancel the whole subtree's
@@ -1403,6 +1320,9 @@ fn visit(
             let on_screen_already = rendered_last.contains(&id);
             let cut_the_subtree_loose =
                 !on_screen_already && waiting > config.loading_descendant_limit;
+            if !cut_the_subtree_loose {
+                out.blockers.extend(waited_on);
+            }
             if cut_the_subtree_loose {
                 for dropped in out.requests.drain(request_mark..) {
                     requested.remove(&dropped.tile);
@@ -1549,7 +1469,7 @@ mod tests {
         let tree = PlanetTree { radius: R };
         // Both resident: a tile that is not resident is *requested*, never
         // selected, and the question here is which ground gets drawn.
-        let mut residency = ResidencyView::default();
+        let mut residency = ResidentSet::default();
         residency.insert(TileId(0));
         residency.insert(TileId(1));
         // Eye 5 km up, looking straight down through the planet, so that BOTH
@@ -1653,8 +1573,8 @@ mod tests {
     /// It is the only state where speculation means anything: with an empty
     /// residency every tile is wanted *now*, so a preload is immediately
     /// upgraded to urgent and there is nothing speculative left to observe.
-    fn residency_at_depth(ts: &Tileset, depth: u32) -> ResidencyView {
-        fn walk(ts: &Tileset, id: TileId, at: u32, want: u32, out: &mut ResidencyView) {
+    fn residency_at_depth(ts: &Tileset, depth: u32) -> ResidentSet {
+        fn walk(ts: &Tileset, id: TileId, at: u32, want: u32, out: &mut ResidentSet) {
             if at == want {
                 out.insert(id);
                 return;
@@ -1663,7 +1583,7 @@ mod tests {
                 walk(ts, child, at + 1, want, out);
             }
         }
-        let mut residency = ResidencyView::default();
+        let mut residency = ResidentSet::default();
         walk(ts, ts.root(), 0, depth, &mut residency);
         residency
     }
@@ -1848,7 +1768,7 @@ mod tests {
         let ts = deep_tileset(3);
         let out = run_with(
             &ts,
-            &ResidencyView::default(),
+            &ResidentSet::default(),
             &[camera_at(120.0)],
             &Config {
                 preload_ancestors: true,
@@ -1888,7 +1808,7 @@ mod tests {
             dvec2(1024.0, 768.0),
             std::f64::consts::FRAC_PI_3,
         );
-        let out = run(&ts, &ResidencyView::default(), &[off_centre]);
+        let out = run(&ts, &ResidentSet::default(), &[off_centre]);
         assert!(
             out.requests.len() > 1,
             "the near view has to want more than one tile"
@@ -1938,7 +1858,7 @@ mod tests {
         per_round: usize,
         before: &HashSet<TileId>,
     ) -> Vec<TileId> {
-        let mut residency = ResidencyView::default();
+        let mut residency = ResidentSet::default();
         let mut rendered_last = before.clone();
         for _ in 0..2000 {
             let mut out = TraversalOutput::default();
@@ -2134,7 +2054,7 @@ mod tests {
         );
 
         let mut near = NearestContent::default();
-        let mut residency = ResidencyView::default();
+        let mut residency = ResidentSet::default();
         let mut rendered_last: HashSet<TileId> = HashSet::new();
         let mut passes = 0;
         for (c, view) in cameras.iter().enumerate() {
@@ -2212,7 +2132,7 @@ mod tests {
             uniform_detail: true,
             ..Config::default()
         };
-        let residency = ResidencyView::default();
+        let residency = ResidentSet::default();
         let nothing = HashSet::new();
         let mut near = NearestContent::default();
 
@@ -2280,7 +2200,7 @@ mod tests {
             let mut out = TraversalOutput::default();
             traverse_with(
                 &tree,
-                &ResidencyView::default(),
+                &ResidentSet::default(),
                 &views,
                 &config,
                 0,
@@ -2305,7 +2225,7 @@ mod tests {
     #[test]
     fn a_hold_stops_asking_for_a_subtree_it_cannot_get_soon() {
         let ts = deep_tileset(5);
-        let nothing = ResidencyView::default();
+        let nothing = ResidentSet::default();
         let views = [camera_at(120.0)];
         let config = Config {
             loading_descendant_limit: 20,
@@ -2365,7 +2285,7 @@ mod tests {
 
         // Everything resident except the last child, and the three that are
         // resident were on screen at the previous pass.
-        let mut residency = ResidencyView::default();
+        let mut residency = ResidentSet::default();
         residency.insert(root);
         for child in &children[..3] {
             residency.insert(*child);
@@ -2408,7 +2328,7 @@ mod tests {
         let ts = mini_tileset();
         let root = ts.root();
         let children = ts.tile(root).children.clone();
-        let mut residency = ResidencyView::default();
+        let mut residency = ResidentSet::default();
         residency.insert(root);
         for child in &children {
             residency.insert(*child);
@@ -2471,7 +2391,7 @@ mod tests {
         let ts = mini_tileset();
         let root = ts.root();
         let children = ts.tile(root).children.clone();
-        let mut residency = ResidencyView::default();
+        let mut residency = ResidentSet::default();
         residency.insert(root);
         for child in &children {
             residency.insert(*child);
@@ -2513,7 +2433,7 @@ mod tests {
         );
     }
 
-    fn run(ts: &Tileset, residency: &ResidencyView, views: &[ViewState]) -> TraversalOutput {
+    fn run(ts: &Tileset, residency: &ResidentSet, views: &[ViewState]) -> TraversalOutput {
         run_with(ts, residency, views, &Config::default(), &HashSet::new())
     }
 
@@ -2523,7 +2443,7 @@ mod tests {
     /// settled.
     fn run_with(
         ts: &Tileset,
-        residency: &ResidencyView,
+        residency: &dyn Residency,
         views: &[ViewState],
         config: &Config,
         rendered_last: &HashSet<TileId>,
@@ -2590,7 +2510,7 @@ mod tests {
             dvec2(1000.0, 1000.0),
             100f64.to_radians(),
         );
-        let residency = ResidencyView::default();
+        let residency = ResidentSet::default();
         let last = HashSet::new();
 
         let wants = |config: &Config| -> Vec<TileId> {
@@ -2803,7 +2723,7 @@ mod tests {
             dvec2(1000.0, 1000.0),
             40f64.to_radians(),
         );
-        let residency = ResidencyView::default();
+        let residency = ResidentSet::default();
         let last = HashSet::new();
         let uniform = Config {
             uniform_detail: true,
@@ -2816,7 +2736,7 @@ mod tests {
     #[test]
     fn far_camera_selects_root_only() {
         let ts = mini_tileset();
-        let mut residency = ResidencyView::default();
+        let mut residency = ResidentSet::default();
         residency.insert(ts.root());
         let out = run(&ts, &residency, &[camera_at(1.0e6)]);
         assert_eq!(ids(&out.selected), vec![ts.root()]);
@@ -2826,7 +2746,7 @@ mod tests {
     #[test]
     fn near_camera_requests_children_ordered_by_distance() {
         let ts = mini_tileset();
-        let out = run(&ts, &ResidencyView::default(), &[camera_at(150.0)]);
+        let out = run(&ts, &ResidentSet::default(), &[camera_at(150.0)]);
         // Nothing resident: hold keeps the screen empty but all four leaves
         // are urgently requested, nearest first (all equidistant here, so
         // tie-broken by id) plus the root as the stand-in.
@@ -2860,7 +2780,7 @@ mod tests {
         let children = ts.tile(root).children.clone();
 
         // Parent resident, children missing → parent shown, children urgent.
-        let mut residency = ResidencyView::default();
+        let mut residency = ResidentSet::default();
         residency.insert(root);
         let out = run(&ts, &residency, &[camera_at(150.0)]);
         assert_eq!(ids(&out.selected), vec![root]);
@@ -2912,7 +2832,7 @@ mod tests {
             dvec2(1024.0, 1024.0),
             0.86,
         );
-        let out = run(&ts, &ResidencyView::default(), &[strict]);
+        let out = run(&ts, &ResidentSet::default(), &[strict]);
         let selected: Vec<TileId> = out.selected.iter().map(|(t, _)| *t).collect();
         let requested: Vec<TileId> = out.requests.iter().map(|r| r.tile).collect();
         assert!(
@@ -2936,7 +2856,7 @@ mod tests {
             dvec2(1024.0, 1024.0),
             std::f64::consts::FRAC_PI_3,
         );
-        let out = run(&ts, &ResidencyView::default(), &[view]);
+        let out = run(&ts, &ResidentSet::default(), &[view]);
         let touched: Vec<TileId> = out.requests.iter().map(|r| r.tile).collect();
         assert!(
             !touched.contains(&children[0]),
@@ -2966,7 +2886,7 @@ mod tests {
             dvec2(1024.0, 1024.0),
             std::f64::consts::FRAC_PI_3,
         );
-        let out = run(&ts, &ResidencyView::default(), &[v1, v2]);
+        let out = run(&ts, &ResidentSet::default(), &[v1, v2]);
         let touched: Vec<TileId> = out.requests.iter().map(|r| r.tile).collect();
         assert!(touched.contains(&children[0]));
         assert!(touched.contains(&children[3]));
@@ -2994,7 +2914,7 @@ mod tests {
         let root = ts.root();
         let child = ts.tile(root).children[0];
 
-        let mut residency = ResidencyView::default();
+        let mut residency = ResidentSet::default();
         residency.insert(root);
         residency.insert(child);
         let out = run(&ts, &residency, &[camera_at(150.0)]);
@@ -3028,7 +2948,7 @@ mod tests {
         let root = ts.root();
         let leaf = ts.tile(root).children[0];
 
-        let mut residency = ResidencyView::default();
+        let mut residency = ResidentSet::default();
         residency.insert(root);
         residency.insert(leaf);
         let out = run(&ts, &residency, &[camera_at(120.0)]);
@@ -3138,7 +3058,7 @@ mod tests {
     fn two_eyes_list_a_shared_tile_once_with_its_largest_need() {
         let ts = mini_tileset();
         let root = ts.root();
-        let mut residency = ResidencyView::default();
+        let mut residency = ResidentSet::default();
         residency.insert(root);
         let left = eye(
             dvec3(-3.0, 0.0, 150.0),
@@ -3206,7 +3126,7 @@ mod tests {
         let leaf = ts.tile(mid).children[0];
 
         // Leaf not resident: root stands in, leaf urgently requested.
-        let mut residency = ResidencyView::default();
+        let mut residency = ResidentSet::default();
         residency.insert(root);
         let out = run(&ts, &residency, &[camera_at(150.0)]);
         assert_eq!(ids(&out.selected), vec![root]);
@@ -3226,7 +3146,7 @@ mod tests {
         // close view must drive refinement — max SSE over views.
         let ts = mini_tileset();
         let root = ts.root();
-        let mut residency = ResidencyView::default();
+        let mut residency = ResidentSet::default();
         residency.insert(root);
 
         let far = camera_at(1.0e6);
