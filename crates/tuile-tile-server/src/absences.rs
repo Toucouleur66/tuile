@@ -15,7 +15,9 @@
 //! fetched: a tile said absent and later delivered is present, and a tile
 //! present and later said absent is absent. An absence store answers
 //! [`Absences::absent`] true only for an absence newer than any copy the
-//! store holds; a store with one asks it **first**.
+//! store holds; a store with one asks it **before its archives** — but not
+//! about a tile the process already holds, in its buffer or a projection
+//! ([`TileStore::held`](crate::TileStore::held)): that one exists.
 //!
 //! An absence expires with its layer's expiry, counted from when it was
 //! fetched; an expired one is not absent.

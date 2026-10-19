@@ -70,23 +70,41 @@ impl ContentStore for StoreContent {
     async fn get(&self, key: &str) -> Option<Bytes> {
         let (layer, z, x, y) = parse(key)?;
         let absent = format!("{layer}{ABSENT_SUFFIX}");
-        // An absence store answers only absences newer than any copy: asked
-        // first, it is the newer of the two.
+        let read = |e: crate::StoreError| {
+            tracing::debug!(key, error = %e, "tile store read failed; treated as a miss");
+        };
         if self.store.absences_first() {
+            // What this process holds — its buffer, a projection — exists:
+            // there is no absence store to ask about it. A projection is the
+            // bake's view of the store when it was made, as its stamps are.
+            match self.store.held(layer, z, x, y).await {
+                Ok(Some(bytes)) => return Some(bytes),
+                Ok(None) => {}
+                Err(e) => {
+                    read(e);
+                    return None;
+                }
+            }
+            // An absence store answers only absences newer than any copy:
+            // asked before the archives, it is the newer of the two.
             if let Ok(Some(_)) = self.store.get(&absent, z, x, y).await {
                 return Some(ABSENT);
             }
+            return match self.store.get_unheld(layer, z, x, y).await {
+                Ok(found) => found,
+                Err(e) => {
+                    read(e);
+                    None
+                }
+            };
         }
         match self.store.get(layer, z, x, y).await {
             Ok(Some(bytes)) => return Some(bytes),
             Ok(None) => {}
             Err(e) => {
-                tracing::debug!(key, error = %e, "tile store read failed; treated as a miss");
+                read(e);
                 return None;
             }
-        }
-        if self.store.absences_first() {
-            return None;
         }
         match self.store.get(&absent, z, x, y).await {
             Ok(Some(_)) => Some(ABSENT),

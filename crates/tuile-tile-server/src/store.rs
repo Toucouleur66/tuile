@@ -767,7 +767,6 @@ impl TileStore {
         y: u32,
     ) -> Result<Option<Bytes>, StoreError> {
         let (l, zone, id) = self.locate(layer, level, x, y)?;
-        let key = (l.name.clone(), zone);
 
         if let Some((absences, base)) = self.absences_of(layer) {
             let absent = absences
@@ -781,6 +780,48 @@ impl TileStore {
             return Ok(absent.then(|| Bytes::from_static(crate::catalog::ABSENT_MARKER)));
         }
 
+        if let Some(bytes) = self.held_at(l, zone, id, (layer, level, x, y)).await? {
+            return Ok(Some(bytes));
+        }
+        self.archived_at(l, zone, id, (layer, level, x, y)).await
+    }
+
+    /// A tile this process holds — in its buffer, or in a projection — and
+    /// nothing else: never a request. `None` is not "absent": the archives
+    /// may still hold it ([`TileStore::get_unheld`]).
+    pub async fn held(
+        &self,
+        layer: &str,
+        level: u8,
+        x: u32,
+        y: u32,
+    ) -> Result<Option<Bytes>, StoreError> {
+        let (l, zone, id) = self.locate(layer, level, x, y)?;
+        self.held_at(l, zone, id, (layer, level, x, y)).await
+    }
+
+    /// A tile from the zone's archives, local copies or the bucket, without
+    /// looking at what this process holds: what [`TileStore::get`] reads
+    /// once [`TileStore::held`] said `None`.
+    pub async fn get_unheld(
+        &self,
+        layer: &str,
+        level: u8,
+        x: u32,
+        y: u32,
+    ) -> Result<Option<Bytes>, StoreError> {
+        let (l, zone, id) = self.locate(layer, level, x, y)?;
+        self.archived_at(l, zone, id, (layer, level, x, y)).await
+    }
+
+    async fn held_at(
+        &self,
+        l: &Layer,
+        zone: Zone,
+        id: u64,
+        (layer, level, x, y): (&str, u8, u32, u32),
+    ) -> Result<Option<Bytes>, StoreError> {
+        let key = (l.name.clone(), zone);
         if let Some(bytes) = self.buffered(&key, id) {
             self.stats.buffer.fetch_add(1, Ordering::Relaxed);
             metrics::counter!("tuile_tiles_hits_total", "layer" => l.name.clone(), "from" => "buffer").increment(1);
@@ -803,7 +844,17 @@ impl TileStore {
             self.stats.projection_misses.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(layer, level, x, y, "TILES-PROJECTION-MISS");
         }
+        Ok(None)
+    }
 
+    async fn archived_at(
+        &self,
+        l: &Layer,
+        zone: Zone,
+        id: u64,
+        (layer, level, x, y): (&str, u8, u32, u32),
+    ) -> Result<Option<Bytes>, StoreError> {
+        let key = (l.name.clone(), zone);
         let now = (self.clock)();
         let manifest = self.manifest(&key, l).await?;
         let live: Vec<&ArchiveRef> = manifest
