@@ -463,6 +463,9 @@ pub struct Headless {
     began: Instant,
     /// When the next refresh is due.
     due: Instant,
+    /// How long bringing the run up took, seconds: the GPU, and — on a
+    /// desktop, which waits for it — the session.
+    launched: f64,
     frame: u64,
     baseline: Snapshot,
     start: Start,
@@ -488,6 +491,7 @@ impl Headless {
     }
 
     fn bring_up(start: Start, claim: Claim) -> Result<Self, Refused> {
+        let launching = Instant::now();
         let gpu = pollster::block_on(tuile_wgpu::GpuContext::headless())
             .map_err(|e| Refused::NoGpu(e.to_string()))?;
         // The process's identity and layers, as `main` adopts the host's: the
@@ -572,6 +576,7 @@ impl Headless {
             interval: Duration::from_secs_f64(1.0 / start.refresh_hz.max(1.0)),
             began,
             due: began,
+            launched: launching.elapsed().as_secs_f64(),
             frame: 0,
             baseline: m.snapshot(),
             limits,
@@ -604,6 +609,13 @@ impl Headless {
     /// What the run started from.
     pub fn started_from(&self) -> &Start {
         &self.start
+    }
+
+    /// How long bringing the run up took, seconds: the GPU, and — on a
+    /// desktop, which waits for it before its first frame, as its window
+    /// does — the session: the host's sources, the store, the globe.
+    pub fn launched(&self) -> f64 {
+        self.launched
     }
 
     /// Seconds since the run began.

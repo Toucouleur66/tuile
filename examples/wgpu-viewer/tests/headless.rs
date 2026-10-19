@@ -261,7 +261,10 @@ fn an_observer_plugged_in_is_read_every_step_and_logged() {
 /// A phone in the background draws nothing and holds its loads; back in
 /// front it draws again at once, covered.
 #[test]
-#[ignore = "needs the network, an ion token (TUILE_ION_TOKEN) and a GPU: see the module"]
+/// Red on today's viewer, three runs on 2026-10-19 (M-series Mac, Metal,
+/// home fibre): the first frame back in front has `frame_lost` 2 in every
+/// run; no black pixel, the shell covers them.
+#[ignore = "needs the network, an ion token and a GPU; red until budget cut-over: back in front, a phone draws 2 selected tiles with nothing under them (3 of 3 runs)"]
 fn the_background_draws_nothing_and_the_way_back_draws_at_once() {
     let place = Place::new();
     let mut run = support::start(tuile_viewer::control::Start {
@@ -383,12 +386,11 @@ fn a_run_that_ends_leaves_none_of_its_residency_counted() {
 /// counted from before the run starts: the session's launch is part of it.
 fn run(pattern: &Pattern) -> (Vec<State>, Settled, Report) {
     let place = Place::new();
-    let launched = std::time::Instant::now();
     let mut run = support::start(tuile_viewer::control::Start {
         log: Some(log_for(pattern.name)),
         ..pattern.start(place.host(), place.store())
     });
-    let launch = launched.elapsed().as_secs_f64();
+    let launch = run.launched();
     if pattern.warm > 0.0 {
         let up = run.settle(pattern.warm);
         assert!(
@@ -432,7 +434,10 @@ fn check(pattern: Pattern) {
 }
 
 #[test]
-#[ignore = "needs the network, an ion token (TUILE_ION_TOKEN) and a GPU: see the module"]
+/// Red today: settled 5.0–5.9 s after the start, launch included, over
+/// three runs — the window is held shut until the 682 coarse tiles are on
+/// the GPU, 64 a hidden frame; no black pixel, no hole.
+#[ignore = "needs the network, an ion token and a GPU; red until budget cut-over: settles in 5.0-5.9 s with its launch, against 2 s (3 of 3 runs)"]
 fn p1_a_cold_start_covers_the_ground_and_settles_in_time() {
     check(patterns::cold_start());
 }
@@ -440,7 +445,11 @@ fn p1_a_cold_start_covers_the_ground_and_settles_in_time() {
 /// Started again over the store a cold run filled: nothing it holds is asked
 /// of the network again, and the picture settles in time.
 #[test]
-#[ignore = "needs the network, an ion token (TUILE_ION_TOKEN) and a GPU: see the module"]
+/// Red today, three runs: the relaunch over a store the cold run flushed
+/// still misses 1535–1537 lookups — the same count every run — and settles
+/// in 4.5–5.1 s, no faster than cold: the wait is the uploads, not the
+/// network.
+#[ignore = "needs the network, an ion token and a GPU; red until budget cut-over: a warm relaunch asks the network 1535-1537 times, and settles in 4.5-5.1 s (3 of 3 runs)"]
 fn p1_a_warm_start_is_served_by_the_store_and_settles_in_time() {
     let pattern = patterns::cold_start();
     let place = Place::new();
@@ -450,9 +459,8 @@ fn p1_a_warm_start_is_served_by_the_store_and_settles_in_time() {
     // What the cold run settled on has been fetched; let what it was still
     // fetching land before it is put away.
     let _ = cold.wait_until(10.0, State::idle);
-    let launched = std::time::Instant::now();
     let mut warm = relaunch(cold, Some(log_for("P1 warm start")));
-    let launch = launched.elapsed().as_secs_f64();
+    let launch = warm.launched();
     let mut settled = warm.settle(patterns::WATCHED_SECONDS);
     settled.seconds += launch;
     let r = report(warm.history(), warm.limits().resident_bytes);
@@ -466,25 +474,37 @@ fn p1_a_warm_start_is_served_by_the_store_and_settles_in_time() {
 }
 
 #[test]
-#[ignore = "needs the network, an ion token (TUILE_ION_TOKEN) and a GPU: see the module"]
+/// Red today, three runs: a phone draws from its first frame, before its
+/// floor is up — `frame_lost` on 10–33 frames (worst 2 tiles); the server
+/// holds 180–432 MB against a 160 MiB budget on 2–138 frames; settled in
+/// 3.0–11.9 s against 4 s. No black pixel.
+#[ignore = "needs the network, an ion token and a GPU; red until budget cut-over: frame_lost on 10-33 frames, over the 160 MiB budget on 2-138 frames, settles in 3.0-11.9 s (3 of 3 runs)"]
 fn p1_a_cold_start_at_low_memory_covers_the_ground_and_settles_in_time() {
     check(patterns::cold_start_at_low_memory());
 }
 
 #[test]
-#[ignore = "needs the network, an ion token (TUILE_ION_TOKEN) and a GPU: see the module"]
+/// Red today, three runs: no black pixel and no hole, but up to 829–928
+/// tiles drawn coarser during the zoom, and settled 3.9–14.1 s after it
+/// against 2 s — uploads, eight a frame.
+#[ignore = "needs the network, an ion token and a GPU; red until budget cut-over: settles 3.9-14.1 s after the zoom, against 2 s (3 of 3 runs)"]
 fn p2_a_slow_zoom_in_never_uncovers_the_ground() {
     check(patterns::zoom_in_slow());
 }
 
 #[test]
-#[ignore = "needs the network, an ion token (TUILE_ION_TOKEN) and a GPU: see the module"]
+/// Red today, three runs: no black pixel and no hole; up to 838–932
+/// tiles drawn coarser; settled 4.7–14.8 s after the zoom against 2 s.
+#[ignore = "needs the network, an ion token and a GPU; red until budget cut-over: settles 4.7-14.8 s after the zoom, against 2 s (3 of 3 runs)"]
 fn p2_a_fast_zoom_in_never_uncovers_the_ground() {
     check(patterns::zoom_in_fast());
 }
 
 #[test]
-#[ignore = "needs the network, an ion token (TUILE_ION_TOKEN) and a GPU: see the module"]
+/// Red today, three runs: no black pixel and no hole; up to 784–851
+/// tiles drawn coarser; settled 1.7–5.0 s after the zoom, over 2 s in two
+/// runs of three.
+#[ignore = "needs the network, an ion token and a GPU; red until budget cut-over: settles 1.7-5.0 s after the zoom, against 2 s (2 of 3 runs over)"]
 fn p2_a_zoom_to_the_deepest_level_never_uncovers_the_ground() {
     check(patterns::zoom_in_to_the_deepest_level());
 }
@@ -496,31 +516,42 @@ fn p3_a_zoom_out_to_200_km_and_back_never_uncovers_the_ground() {
 }
 
 #[test]
-#[ignore = "needs the network, an ion token (TUILE_ION_TOKEN) and a GPU: see the module"]
+/// Red today, three runs: no black pixel and no hole; settled 0.1–2.0 s
+/// after the turn, at the bound in one run of three.
+#[ignore = "needs the network, an ion token and a GPU; red until budget cut-over: settles 0.1-2.0 s after the turn, at the 2 s bound in 1 of 3 runs"]
 fn p4_a_yaw_in_place_never_uncovers_the_ground() {
     check(patterns::yaw_in_place());
 }
 
 #[test]
-#[ignore = "needs the network, an ion token (TUILE_ION_TOKEN) and a GPU: see the module"]
+/// Red today, three runs: no black pixel and no hole; settled 0.4–2.5 s
+/// after the turn, over 2 s in one run of three.
+#[ignore = "needs the network, an ion token and a GPU; red until budget cut-over: settles 0.4-2.5 s after the turn, over 2 s in 1 of 3 runs"]
 fn p4_a_yaw_at_head_rate_never_uncovers_the_ground() {
     check(patterns::yaw_at_head_rate());
 }
 
 #[test]
-#[ignore = "needs the network, an ion token (TUILE_ION_TOKEN) and a GPU: see the module"]
+/// Red today, three runs: no black pixel and no hole; up to 88–142 tiles
+/// coarser; settled 0.7–12.8 s after the orbit, over 2 s in two runs.
+#[ignore = "needs the network, an ion token and a GPU; red until budget cut-over: settles 0.7-12.8 s after the orbit, over 2 s in 2 of 3 runs"]
 fn p4_an_orbit_about_a_target_never_uncovers_the_ground() {
     check(patterns::orbit());
 }
 
 #[test]
-#[ignore = "needs the network, an ion token (TUILE_ION_TOKEN) and a GPU: see the module"]
+/// Red today, three runs: no black pixel and no hole; settled 3.8–5.0 s
+/// after the tilt against 2 s, the server holding 2.97 GB.
+#[ignore = "needs the network, an ion token and a GPU; red until budget cut-over: settles 3.8-5.0 s after the tilt, against 2 s (3 of 3 runs)"]
 fn p4_a_tilt_toward_the_horizon_never_uncovers_the_ground() {
     check(patterns::tilt());
 }
 
 #[test]
-#[ignore = "needs the network, an ion token (TUILE_ION_TOKEN) and a GPU: see the module"]
+/// Red today, three runs: no black pixel and no hole; settled 0.7–5.6 s
+/// after the last turn against 4 s (over in two runs), and over the
+/// phone's 614 MiB budget on one frame in the third.
+#[ignore = "needs the network, an ion token and a GPU; red until budget cut-over: settles 0.7-5.6 s after the turns against 4 s, over the budget on one frame (3 of 3 runs)"]
 fn p5_portrait_and_landscape_never_uncover_the_ground() {
     check(patterns::portrait_and_landscape());
 }
@@ -533,7 +564,12 @@ fn p5_a_resize_and_a_change_of_density_never_uncover_the_ground() {
 
 /// Both eyes, every frame: neither is left a hole the other lacks.
 #[test]
-#[ignore = "needs the network, an ion token (TUILE_ION_TOKEN) and a GPU: see the module"]
+/// Red today, three runs: the server holds 1.4–1.8 GB against the
+/// headset's 768 MiB on 222–588 frames, and churns — tens of thousands
+/// of evictions and reloads a minute; settled 17.9–38.9 s after the head
+/// stopped against 4 s; in one run a frame left 131 pixels black in an eye
+/// and 27 frames drew selected ground with nothing (worst 6 tiles).
+#[ignore = "needs the network, an ion token and a GPU; red until budget cut-over: over the 768 MiB budget on 222-588 frames, settles in 17.9-38.9 s, a black frame and frame_lost in 1 of 3 runs"]
 fn p6_two_eyes_at_90_hz_never_uncover_the_ground_in_either() {
     let pattern = patterns::stereo_head_motion();
     let (states, settled, r) = run(&pattern);
