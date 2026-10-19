@@ -242,3 +242,52 @@ fn at_equal_level_the_own_drape_wins() {
     );
     assert_eq!(best_drape(9, [c(3, 2), c(3, 1)]), Some(c(3, 1)));
 }
+
+/// A view through `viewport` at `scale`, a symmetric 60° vertical lens,
+/// looking down.
+fn lens_view(w: f64, h: f64, scale: f64) -> tuile_core::traversal::ViewState {
+    use glam::{dvec2, dvec3};
+    tuile_core::traversal::ViewState::perspective(
+        dvec3(0.0, 0.0, 1_000.0),
+        dvec3(0.0, 0.0, -1.0),
+        dvec3(0.0, 1.0, 0.0),
+        dvec2(w, h),
+        std::f64::consts::FRAC_PI_3,
+    )
+    .with_scale(scale)
+}
+
+/// The footprint a view gives one tile: 2 km away, seen at 60° from the
+/// vertical, 40 km level-0 texels, one logical pixel per texel.
+fn seen_by(v: &tuile_core::traversal::ViewState) -> TexelFootprint {
+    TexelFootprint::new(2_000.0, 0.5, v.focal_px(), 40_000.0, 1.0).unwrap()
+}
+
+/// Spec §13.2: the texel footprint takes the lens's focal, not a fixed one:
+/// a phone turned from portrait to landscape at a fixed vertical field of
+/// view sees each texel smaller (its focal is the landscape's), and a
+/// physically denser screen at the same logical size sees it the same.
+#[test]
+#[ignore = "red until the focal is the lens's, in logical pixels"]
+fn the_footprint_follows_the_lens_not_a_fixed_focal() {
+    let portrait = seen_by(&lens_view(1170.0, 2532.0, 3.0));
+    let landscape = seen_by(&lens_view(2532.0, 1170.0, 3.0));
+    // Fixed vertical field of view: the focal follows the height.
+    let ratio = portrait.ratio() / landscape.ratio();
+    assert!((ratio - 2532.0 / 1170.0).abs() < 1e-9, "{ratio}");
+    // In logical pixels: 2532 physical pixels at scale 3 are 844 points.
+    let focal = 2532.0 / 3.0 / (2.0 * (std::f64::consts::FRAC_PI_6).tan());
+    let want = TexelFootprint::new(2_000.0, 0.5, focal, 40_000.0, 1.0).unwrap();
+    assert!((portrait.ratio() - want.ratio()).abs() < 1e-9 * want.ratio());
+    assert!(ideal_level(portrait) > ideal_level(landscape), "{RED}");
+}
+
+/// P5.5, D-L1: a scale change at constant logical size (a window moved from
+/// a 2× display to a 1× one) changes no footprint, bit for bit.
+#[test]
+#[ignore = "red until the focal is the lens's, in logical pixels"]
+fn a_scale_change_at_constant_logical_size_changes_no_footprint() {
+    let retina = seen_by(&lens_view(3840.0, 2160.0, 2.0));
+    let plain = seen_by(&lens_view(1920.0, 1080.0, 1.0));
+    assert_eq!(retina.ratio().to_bits(), plain.ratio().to_bits());
+}
