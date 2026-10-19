@@ -72,7 +72,7 @@ impl Profile {
     pub fn desktop() -> Self {
         let mut b = BudgetConfig::interactive(Bytes::gib(2));
         // Today's desktop viewer runs 64 fetches; the same, split by class.
-        b.max_in_flight = tuile_core::budget::PerClass([32, 16, 32, 4, 4]);
+        b.max_in_flight = tuile_core::budget::PerClass([32, 16, 32, 4]);
         b.imagery_over_terrain_cap = 3;
         b.max_drape_side = 2_048;
         Profile {
@@ -88,7 +88,7 @@ impl Profile {
     /// A phone: 512 MiB, cellular, 60 fps, 4 s to converge.
     pub fn handheld() -> Self {
         let mut b = BudgetConfig::interactive(Bytes::mib(512));
-        b.max_in_flight = tuile_core::budget::PerClass([8, 4, 8, 2, 2]);
+        b.max_in_flight = tuile_core::budget::PerClass([8, 4, 8, 2]);
         b.upload_bytes_per_frame = Bytes::mib(4);
         b.delivery_credit = Bytes::mib(16);
         b.imagery_over_terrain_cap = 2;

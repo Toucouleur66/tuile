@@ -27,19 +27,19 @@ pub enum Class {
     Drape,
     /// Any other overlay texture.
     Overlay,
-    /// A synthesised stand-in for a tile not yet loaded (decision D3: kept as
-    /// a cheap class until the simulation shows it is unneeded).
-    StandIn,
 }
+
+// Decision D3 (spec §10): no class for stand-ins. A wanted tile that is not
+// drawable is shown by the draw set's roles — `Role::Fallback` (coarser
+// ground under it) and `Role::Held` (finer ground kept on a zoom-out).
 
 impl Class {
     /// Every class, in index order.
-    pub const ALL: [Class; 5] = [
+    pub const ALL: [Class; 4] = [
         Class::TerrainMesh,
         Class::Tiles3dMesh,
         Class::Drape,
         Class::Overlay,
-        Class::StandIn,
     ];
 
     /// The class's slot in a [`PerClass`].
@@ -49,19 +49,18 @@ impl Class {
             Class::Tiles3dMesh => 1,
             Class::Drape => 2,
             Class::Overlay => 3,
-            Class::StandIn => 4,
         }
     }
 }
 
 /// One value per [`Class`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct PerClass<T>(pub [T; 5]);
+pub struct PerClass<T>(pub [T; 4]);
 
 impl<T: Copy> PerClass<T> {
     /// The same value for every class.
     pub const fn splat(v: T) -> Self {
-        PerClass([v; 5])
+        PerClass([v; 4])
     }
 
     /// Builds each class's value from a function of the class.

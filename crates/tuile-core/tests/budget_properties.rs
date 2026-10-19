@@ -302,7 +302,7 @@ impl Harness {
 fn interactive() -> BudgetConfig {
     let mut c = BudgetConfig::interactive(Bytes(MESH.0 * 24 + drape().0 * 24));
     c.pinned_level = Some(0);
-    c.max_in_flight = tuile_core::budget::PerClass([4, 2, 4, 1, 1]);
+    c.max_in_flight = tuile_core::budget::PerClass([4, 2, 4, 1]);
     c.max_local_reads = 2;
     c.request_heap = 32;
     c.upload_bytes_per_frame = Bytes(MESH.0 * 3);

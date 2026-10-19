@@ -123,11 +123,14 @@ pub struct BudgetConfig {
 impl BudgetConfig {
     /// A viewer's budget for `gpu` bytes in total, split between classes.
     ///
-    /// The split and every other number are first proposals (decision D5);
-    /// Step 6 of the plan tunes them per profile from simulated curves.
+    /// The ground's pool — terrain and imagery — is 82 % of the device,
+    /// split 40/60: terrain 33 %, imagery 49 % (the interim split of D-A3,
+    /// spec §15.1, until a pooled ledger is decided on evidence). 3D Tiles
+    /// keep 15 % and overlays 3 %. Every other number is a first proposal
+    /// (decision D5), tuned per profile from simulated curves.
     pub fn interactive(gpu: Bytes) -> Self {
         let share = |pct: u64| gpu.scaled(pct, 100);
-        let hard_limit = PerClass([share(35), share(15), share(45), share(3), share(2)]);
+        let hard_limit = PerClass([share(33), share(15), share(49), share(3)]);
         BudgetConfig {
             policy: Policy::Interactive,
             target: PerClass::from_fn(|c| hard_limit[c].scaled(70, 100)),
@@ -135,7 +138,7 @@ impl BudgetConfig {
             hard_limit,
             hard_reserve_percent: 15,
             decoded_target: gpu.scaled(1, 4),
-            max_in_flight: PerClass([16, 8, 16, 4, 4]),
+            max_in_flight: PerClass([16, 8, 16, 4]),
             max_local_reads: 8,
             request_heap: 256,
             upload_bytes_per_frame: Bytes::mib(8),
@@ -177,7 +180,7 @@ impl BudgetConfig {
             hard_limit: PerClass::splat(Bytes::MAX),
             hard_reserve_percent: 0,
             decoded_target: Bytes::MAX,
-            max_in_flight: PerClass([64, 32, 64, 8, 8]),
+            max_in_flight: PerClass([64, 32, 64, 8]),
             max_local_reads: 32,
             request_heap: 4_096,
             upload_bytes_per_frame: Bytes::MAX,
