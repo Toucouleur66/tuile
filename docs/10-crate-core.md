@@ -18,9 +18,7 @@ tuile_core
 ├── traversal    # SSE selection, refinement, prioritization — PURE FUNCTIONS
 ├── protocol     # streaming mode IS this module: ClientMessage / ServerMessage,
 │                #   TileContent { Raw, Decoded }, GeometryStream trait + InProcessStream,
-│                #   HttpPullStream (the cross-process bindings live with their hosts:
-│                #   WorkerStream in tuile-web, WsStream with the renderers that cannot
-│                #   link the core; tuile-server only resolves what a geometry server fetches)
+│                #   HttpPullStream (the network bindings live in tuile-server/tuile-wgpu)
 ├── runtime      # GeometryServer: state (residency, in-flight), orchestration ;
 │                #   loads inline (default, wasm) or as tasks on a host tokio handle
 │                #   (native feature "rt-tokio", `Spawn::Tokio`; tree edits deferred
@@ -85,9 +83,9 @@ pub struct TraversalOutput {
 ## Decisions made
 
 - **Rebasing lives in the core**, not in the backends: `DecodedTileContent` comes out in local f32 coordinates + f64 origin. All backends benefit, none can get it wrong.
-- **The traversal is synchronous and pure — but the system IS NOT stateless.** State exists (residency, in-flight requests, selection history for hold-until-ready): it lives in the `GeometryServer` and ENTERS the traversal as explicit inputs (`ResidencyView` — which includes the previous frame's selection —, `frame: FrameNumber`), instead of being stored on the tiles (`_visitedFrame`/`_selectedFrame`-style fields of legacy engines). Decisive reason: N sessions of one process share ONE immutable tile arena — several views or renderers fed by one local geometry server, a farm process baking several films — and any per-tile state would make the tree non-shareable without locks or copies. (No session runs on the remote server: the geometry server lives on the consumer's side, D-A5.) The reference engines are themselves migrating in this direction (selection state extracted from tiles into per-consumer "view groups"); we start directly from the destination. Perf: no per-frame allocations — `TraversalScratch` reused (arrays indexed by `TileId`, which replace the per-object caches of legacy engines).
+- **The traversal is synchronous and pure — but the system IS NOT stateless.** State exists (residency, in-flight requests, selection history for hold-until-ready): it lives in the `GeometryServer` and ENTERS the traversal as explicit inputs (`ResidencyView` — which includes the previous frame's selection —, `frame: FrameNumber`), instead of being stored on the tiles (`_visitedFrame`/`_selectedFrame`-style fields of legacy engines). Decisive reason: on the streaming server side, N sessions share ONE immutable tile arena — any per-tile state would make the tree non-shareable without locks or copies. The reference engines are themselves migrating in this direction (selection state extracted from tiles into per-consumer "view groups"); we start directly from the destination. Perf: no per-frame allocations — `TraversalScratch` reused (arrays indexed by `TileId`, which replace the per-object caches of legacy engines).
 - **Config**: names and defaults aligned with the reference implementations — `maximum_screen_space_error` (16.0), `forbid_holes` (our REPLACE hold-until-ready), `loading_descendant_limit` (20), `preload_ancestors`/`preload_siblings` — behavior comparable to the pixel.
-- **Streaming mode is a core trait** (`protocol::GeometryStream`), not a network matter: `InProcessStream` (decoded, channels) and `HttpPullStream` (static pull) live here; the cross-process bindings live with their hosts (`WorkerStream` in `tuile-web`, `WsStream` with the renderers that cannot link the core), and `tuile-server` only resolves, statelessly, what a geometry server fetches. On the consumer side, `Content` is always `TileContent::Decoded`; on a wire between processes, always `TileContent::Raw` (glb).
+- **Streaming mode is a core trait** (`protocol::GeometryStream`), not a network matter: `InProcessStream` (decoded, channels) and `HttpPullStream` (static pull) live here; the WebSocket binding lives in `tuile-server`/the clients. On the consumer side, `Content` is always `TileContent::Decoded`; on a wire, always `TileContent::Raw` (glb).
 - **Errors**: `thiserror`, one enum per module, `#[from]` conversion. `UnsupportedContent(String)` for i3dm/pnts/cmpt.
 - **IDs**: `TileId` = index into an arena (flattened `Vec<Tile>` + parent/child indices), no Rc/RefCell, no pointer graph. External tilesets graft into the same arena.
 - **Decode off-frame**: `content::decode(TileContent::Raw, ContentHints) -> DecodedTileContent` is a free, blocking function, with no I/O — the caller puts it wherever they want (spawn_blocking, wasm worker, rayon).
@@ -105,7 +103,7 @@ pub struct TraversalOutput {
   3. REPLACE: non-resident children → parent stays selected; all resident → parent deselected;
   4. tile outside the frustum never selected nor requested.
 - `cache`: budget respected to the byte; selected tile never evicted.
-- `protocol`: end-to-end `InProcessStream` session on the mini-tileset (Hello → ViewerState → Select/Content/Evict consistent with the pure traversal on the same camera); determinism: same `ViewerState` sequence → same `Select` sequence (this is what will make it possible to test the parity of the other bindings, and of the remote fetch, in M2).
+- `protocol`: end-to-end `InProcessStream` session on the mini-tileset (Hello → ViewerState → Select/Content/Evict consistent with the pure traversal on the same camera); determinism: same `ViewerState` sequence → same `Select` sequence (this is what will make it possible to test the parity of the network bindings in M2).
 
 ## What NOT to do in the core
 

@@ -14,7 +14,7 @@ tuile/
 │   ├── tuile-core/          # M1 — 3D Tiles logic, zero backend
 │   ├── tuile-cesium-ion/    # ion source connector (endpoint, bearer, refresh ; 3D Tiles + imagery)
 │   ├── tuile-wgpu/          # M1 — wgpu rendering backend (native + wasm)
-│   ├── tuile-server/        # M2, not built yet — stateless HTTP + WebSocket front over tuile-tile-server (native axum / workers-rs)
+│   ├── tuile-server/        # M2, not built yet — HTTP server (native axum / workers-rs); its storage and cache side is tuile-tile-server
 │   └── tuile-usd/           # M3 — USD/USDZ export (lib + standalone CLI, outside the server)
 ├── examples/
 │   └── wgpu-viewer/           # M1 — the viewer binary: `tuile-viewer` (crates/) over the public connectors — see 16-embedding-the-viewer.md
@@ -35,7 +35,7 @@ tuile-cesium-ion → tuile-core (TileFetcher), reqwest behind a feature ;
                 the core does not know that ion exists
 tuile-wgpu  → tuile-core, wgpu, bytemuck ; reqwest+tokio behind the "native" feature,
                 wasm-bindgen/web-sys behind the "web" feature
-tuile-server→ tuile-core (parsing/validation), tuile-tile-server (the store it fronts), axum+tokio ("native" feature),
+tuile-server→ tuile-core (parsing/validation), tuile-tile-server (storage and cache), axum+tokio ("native" feature),
                 worker ("cloudflare" feature), object_store (S3/GCS).
                 FORBIDDEN : tuile-usd. The tile server does not know USD.
 tuile-usd   → tuile-core, gltf, zip (stored/uncompressed writing), image (re-encode if needed)
@@ -100,17 +100,17 @@ pub enum TileContent {
 }
 ```
 
-The bindings guarantee the form: a consumer (renderer, façade) always receives `Decoded`; a wire between two processes always carries `Raw` (glb). Decoding (`content::decode : Raw → Decoded`) lives in the binding, on the consumer side. (A worker's `postMessage` is not such a wire: both ends are the same wasm module, and the decoded messages cross it as transferred buffers.)
+The bindings guarantee the form: a consumer (renderer, façade) always receives `Decoded`; a wire always carries `Raw` (glb). Decoding (`content::decode : Raw → Decoded`) lives in the binding, on the consumer side.
 
-Three implementations, a single protocol. In all three the `GeometryServer` — and the graphics budget it owns — runs on the consumer's machine, because what the budget decides from lives there: GPU memory and its hard limit, memory pressure, the local store, the display rate (`explorations/graphics-budget-architecture.md`, D-A5, 2026-10-19).
+Three implementations, a single protocol:
 
 1. **`InProcessStream` — the logical version, decoded end to end.** A `GeometryServer` (module `runtime`) runs in the consumer's process; messages pass through channels, zero serialization. First consumer: `tuile-wgpu`.
-2. **Across a boundary, on the consumer's machine.** The `GeometryServer` runs beside the renderer rather than inside it. In a browser it runs in a Web Worker (`WorkerStream`, `tuile-web`), its messages crossing `postMessage`. For a renderer that cannot link Rust it runs in a local process, and the protocol is serialized over a local socket (`WsStream`): **on the wire, geometry is serialized as glb** (standard, compact, Draco/meshopt/KTX2 compressions preserved — no homegrown format), which any glTF loader reads; a Rust client binding decodes with the same `content::decode()` of the core before yielding. Second consumer: USD, notably the Hydra renderer, via the specialized façade `tuile-hydra` — which today links the geometry server in its own process through a C ABI (`14-crate-hydra.md`), and takes this binding wherever the core cannot be linked.
+2. **`WsStream` — the network binding.** The remote server (`tuile-server`, the network middleware) runs the `GeometryServer` and serializes the protocol over WebSocket. **On the wire, geometry is serialized as glb** (standard, compact, Draco/meshopt/KTX2 compressions preserved — no homegrown format). The client binding decodes (the same `content::decode()` of the core) before yielding. Second consumer: USD, notably the Hydra renderer, via the specialized façade `tuile-hydra`.
 3. **`HttpPullStream` — the "static mode" as seen from the consumer.** No remote geometry server: the `GeometryServer` runs on the consumer side with an HTTP `TileFetcher` that pulls static files (`tuile serve` in static mode, S3, nginx…). This is what makes Tuile compatible with the entire existing 3D Tiles ecosystem — and it is merely one particular implementation of the same trait.
 
-Under every binding, the network is a fetch. The geometry server's `TileFetcher` reads local files, pulls static files from any host or CDN, or asks `tuile-server`, which resolves each request statelessly — a tileset's contents, a source tile as its store keeps it — over HTTP GET or a WebSocket used as a multiplexed fetch (`12-crate-server.md`). Each reply is a function of its key, so it caches like a static file, and no session lives on the server. `tuile-server` is not built yet; the store it will front is, `tuile-tile-server`. The decision changed no code: every consumer that exists already runs its geometry server on its own side.
+**Where the `GeometryServer` runs** (decided on 2026-10-19, `explorations/graphics-budget-architecture.md` D-A5). It owns the graphics budget, and runs where that budget's inputs are. On an interactive device — desktop, phone, headset, browser — it runs locally (`InProcessStream`, or a Web Worker on the web): memory pressure must act at once, the local store's presence index is synchronous, and a head-rate rotation cannot wait a round trip. For a consumer that declares its budget — a render node, a farm, a simulator cluster, a consumer that cannot link the core — it can run in a `tuile-server` session (`WsStream`), its budget fed by the declared memory and the consumer's `Ack { resource, gen, bytes }`. The transport of `WsStream` is an open decision (D-T1, `12-crate-server.md`); the protocol does not depend on it.
 
-A renderer written against `GeometryStream` works in all three cases without modification. Absolute invariant: what travels over a network is standard 3D Tiles (glb) and the sources' own tiles; `DecodedTileContent` exists only in memory, on the consumer side.
+A renderer written against `GeometryStream` works in all three cases without modification. Absolute invariant: what travels over a network is standard 3D Tiles (glb); `DecodedTileContent` exists only in memory, on the consumer side.
 
 ## Data flow (geometry server, in-process binding)
 

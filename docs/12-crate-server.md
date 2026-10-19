@@ -1,42 +1,37 @@
 # 12 — `tuile-server` spec
 
-`tuile-server` is the **network middleware** for the core's logical geometry server (see `01-architecture.md`) — the geometry server is not a network server, and it does not run here: it runs on the consumer's side, and this crate serves it what it fetches — plus a static "Martin of 3D Tiles" mode for interop and CDN. One binary, multiple sources, a removable cache, deployable from the laptop to the Cloudflare Worker.
+`tuile-server` is the **network middleware** for the core's logical geometry server (see `01-architecture.md`) — the geometry server is not a network server, it is this crate that exposes it on the network — plus a static "Martin of 3D Tiles" mode for interop and CDN. One binary, multiple sources, a removable cache, deployable from the laptop to the Cloudflare Worker.
 
 ## The two modes
 
 ### Streaming mode (the primary mode)
 
-Streaming mode is NOT defined here: it is defined in the core, as a trait (`GeometryStream`, see `01-architecture.md`). The `GeometryServer` that drives it — traversal, the graphics budget, loads — **runs on the client**, whenever the client runs the core: the native viewers (desktop, iOS, Android, a headset), the web viewer's worker, Hydra through the C ABI, the film and bake sessions. This crate implements the **network transport underneath it**: a WebSocket over which the client's core requests the resources it has decided to load, and a **stateless resolver** that answers each one. A renderer that cannot link Rust is no exception: its geometry server runs in a local process beside it (`01-architecture.md`, the cross-boundary binding), and that process fetches from here like any other client.
+Streaming mode is NOT defined here: it is defined in the core, as a trait (`GeometryStream`, see `01-architecture.md`). This crate only implements its **network binding**: one WebSocket session per viewer — the client sends `Hello` / `ViewerState` / `Ack` / `Cancel`; the middleware runs one core `GeometryServer` per session and serializes its outputs (`Select` / `Content` / `Evict` / `Error`).
 
-**Decided on 2026-10-19** (`docs/explorations/graphics-budget-architecture.md`, D-A5): the per-session server-side `GeometryServer` this section used to describe is **replaced by a stateless resolver**. Why:
+**Where the geometry server runs** (decided on 2026-10-19, `docs/explorations/graphics-budget-architecture.md` D-A5): the `GeometryServer` owns the graphics budget, and runs where that budget's inputs are.
 
-- the graphics budget decides what is loaded, uploaded, drawn and evicted, and its inputs live on the client: the GPU's memory and its hard limit (the guard against a jetsam or out-of-memory kill), memory pressure and the thermal state, the synchronous presence index of the local store (nothing held locally is fetched again), and the display rate that bounds uploads per frame;
-- a budget in a server session decides one round trip late, and the hard limit would need a second enforcer on the client; a headset cannot afford decisions a round trip old;
-- a stateless server scales out and caches: each response is a function of its key, so a CDN or a Cloudflare Worker serves it as it serves the static mode;
-- every consumer that exists already runs the core.
+- **Interactive devices** — desktop, phone, headset, browser — run it locally, in-process or in a worker: memory pressure must act at once, the presence index of the local store is synchronous, and a head-rate rotation cannot wait a round trip. They use the static mode, or this server's sources through their own loaders, not a session.
+- **Consumers that declare their budget** — a USD/Cycles render node, a farm, a simulator cluster whose image-generator channels declare their memory, a consumer that cannot link the core — can run it here, one session each. The session's budget runs on the declared memory (`Retarget { total_bytes }` at the start, and whenever it changes) and on the consumer's `Ack { resource, gen, bytes }`; for a batch or a LAN the latency is tolerable. The consumer's executor still never uploads past its own hard limit: it acks `Discarded` instead.
+- **Open:** whether a remote consumer reports what it already holds locally (`ClientMessage::Held { resources }`). It is needed only if such a consumer has local tiers, and optional for a declared-budget consumer; not decided.
 
-None of this is built yet, so the decision changed no code and no current consumer.
-
-How the transport works:
-
-- **Requests, not a session.** The client sends `Request { id, key }` and `Cancel { id }`; the server answers `Reply { id, payload }` or `Error { id, … }`. A key names a resource the way a static `GET` would: a tileset's content by its path, a source tile — terrain, imagery — by its layer and address, as `tuile-tile-server` keeps it. Drapes are composed on the client, by its planetary loader, from those tiles. No `Hello` handshake beyond the envelope's version, no `ViewerState`, no `Ack`, no `Select`, no `Evict`: the client's own `GeometryServer` and its renderer exchange those — in-process, across a worker, or over a local socket — and they never leave the consumer's machine.
-- **The serialization format for geometry on the wire is glb**: standard, compact, compressions (Draco/meshopt/KTX2) preserved. No homegrown binary format. Imagery travels as its source delivered it (PNG, JPEG, WebP, KTX2), as stored. The client decodes with the core's `content::decode()` — decoding always lives on the consumer side.
+- **The serialization format for geometry on the wire is glb**: standard, compact, compressions (Draco/meshopt/KTX2) preserved. No homegrown binary format. The client binding (`WsStream`) decodes with the core's `content::decode()` — decoding always lives on the consumer side.
 - The message envelope is minimal and versioned from the first byte (compact header + payload; exact format frozen in M2).
-- Transport v1: WebSocket (axum/tokio-tungstenite native; web-sys on wasm clients — stable crates only). WebTransport/Connect = post-v1 tracks. The socket buys multiplexing and cancellation over one connection; the same keys stay reachable as plain `GET`s.
-- Consumers, in order: 1) `tuile-wgpu-viewer --remote ws://…` — end-to-end proof and test tool: the viewer's own core, over this transport instead of HTTP; 2) **USD, notably the Hydra renderer** via the `tuile-hydra` facade, which runs the core through its C ABI — the server still does not know USD: it serves 3D Tiles resources, the client materializes.
-- **Connections, not sessions.** Per connection, the server keeps only the ids of the requests in flight, bounded by a configurable maximum; an inactivity timeout and a maximum number of connections remain. A dropped connection loses nothing the client cannot re-ask.
-- The server cache remains a source-bytes cache, shared with the static mode, and keyed like it: the same key, the same bytes, whichever transport asked.
-- Workers: no session state, so no Durable Object is needed to hold one. A Worker answers each key from R2 and the Cache API as the static mode does; whether it also terminates the WebSocket or the client falls back to `GET` for the same keys is a deployment choice, not a protocol one.
+- Transport v1: WebSocket (axum/tokio-tungstenite native; web-sys on wasm clients — stable crates only). WebTransport/Connect = post-v1 tracks.
+- **Open decision D-T1: the transport.** Under discussion: QUIC (`quinn`) / WebTransport first — multiplexed streams, so priorities and a cancel per content, no TCP head-of-line blocking behind a 22 MB drape, and connection migration between Wi-Fi and cellular; shared-memory IPC on the same machine (zero-copy glb); WebSocket as the fallback. Workers keep the static mode; whether WebTransport is available on Workers is to verify. The protocol stays transport-agnostic, whatever D-T1 decides.
+- Consumers, in order: 1) `tuile-wgpu-viewer --remote ws://…` — end-to-end proof and test tool; 2) **USD, notably the Hydra renderer** via the `tuile-hydra` facade (post-v1) — the server still does not know USD: it pushes 3D Tiles, the client materializes.
+- Sessions: state bounded per session (client-side residency tracked via `Ack`/`Evict`; the session's budget is that state, bounded by the declared memory), inactivity timeout, configurable max number of sessions.
+- The server cache remains a source-bytes cache, shared with the static mode (the server decodes nothing in this mode: traversal + byte shuffling — a session costs little, it scales).
+- Workers: streaming requires persistent sessions → Durable Objects track, non-blocking. Streaming may be native-only in M2; Workers serve the static mode.
 
 ### Static mode
 
-Cacheable HTTP GET: tileset.json + contents. This is interop (any OGC 3D Tiles client: existing web viewers, three.js 3DTilesRenderer…) and CDN/Workers deployment. From the Tuile consumer's point of view, this mode is just the pull implementation of the same protocol (`HttpPullStream`: the `GeometryServer` runs on the client side and pulls the files via GET — exactly as it does over the WebSocket transport, which differs only in being one connection for many requests). Philosophy of THIS mode: **the server does nothing the CDN could do — except when there is no CDN.**
+Cacheable HTTP GET: tileset.json + contents. This is interop (any OGC 3D Tiles client: existing web viewers, three.js 3DTilesRenderer…) and CDN/Workers deployment. From the Tuile consumer's point of view, this mode is just the pull implementation of the same protocol (`HttpPullStream`: the `GeometryServer` runs on the client side and pulls the files via GET). Philosophy of THIS mode: **the server does nothing the CDN could do — except when there is no CDN.**
 
 ## Internal architecture
 
 ```
 Router (axum native | worker cloudflare)
-   ├── GET /ws/{id} (streaming) ──► Connection { requests in flight } ──► Resolver (stateless: key → glb | texture)
+   ├── GET /ws/{id} (streaming) ──► Session { GeometryServer (core) + glb serialization }
    ▼
 Static service (shared logic, independent of the HTTP framework)
    ├── TilesetRegistry: id → Source (resolution, lazy validation of tileset.json via core)
@@ -44,7 +39,7 @@ Static service (shared logic, independent of the HTTP framework)
    └── Storage (trait): LocalFs | ObjectStore (S3/GCS/R2 via the object_store crate)
 ```
 
-Where the pieces already are: `tuile-tile-server` keeps the source tiles once (PMTiles archives per zone and per layer, on object storage), and its `service` fetches upstream once, stores, serves, and keeps the hot tiles and the source's absences in memory — the source-bytes cache this crate shares between its modes. `tuile-repository` already writes an API as a function from a request to a reply, and `tuile-pack-api` hosts it natively. `tuile-server` is the HTTP and WebSocket front planned over them: the 3D Tiles routes, the stateless resolver, the WebSocket transport, the axum and Workers adapters.
+`tuile-server` is not built yet. Its storage and cache side exists: `tuile-tile-server`, the source-tile store — PMTiles archives per zone and per layer on object storage, its `service` fetching upstream once, storing, serving, keeping the hot tiles and the absences in memory — already used by `tuile-bake`.
 
 The service logic is written ONCE, framework-agnostic: `async fn get_tileset_json(...)`, `async fn get_content(...)` functions taking `&dyn Storage`, `&dyn TileCache` and returning a `ServiceResponse { status, headers, body }` type. axum and worker are only adapters. This is what makes the Workers target trivial instead of a fork.
 
@@ -97,7 +92,7 @@ The server NEVER depends on `tuile-usd` and exposes no USD route. It serves the 
 
 ## Tests
 
-- Streaming: end-to-end over a WS connection on a fixture — the client's core (traversal + budget) drives the requests, and its selection and decisions equal those of the same core over the static HTTP mode on the same camera (parity tested programmatically); every reply equals the static `GET` of the same key, byte for byte (cacheability); a reply depends on its key alone (two connections, any order, the same bytes); cancellation; connection timeout; malformed messages → clean Error, never a panic.
+- Streaming: end-to-end WS session on a fixture (Hello → ViewerState → reception of Select/Content consistent with the local traversal on the same camera — parity tested programmatically); the session's budget within the declared memory, its ledger exact from the `Ack` bytes; cancellation; session timeout; malformed messages → clean Error, never a panic.
 - Integration (native): ephemeral server on the fixtures, assertions on status/headers/ETag/304/Range/CORS/path traversal.
 - Consumer conformance: `tests/html/` pages (a reference 3D Tiles web viewer + three.js 3DTilesRenderer, via CDN) pointing at localhost — documented manual verification, to run before each release.
 - Cache: exact LRU budget, hit/miss, Noop passthrough, key includes the tileset's ETag (invalidation if the source changes).
