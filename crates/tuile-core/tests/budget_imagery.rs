@@ -268,7 +268,6 @@ fn seen_by(v: &tuile_core::traversal::ViewState) -> TexelFootprint {
 /// view sees each texel smaller (its focal is the landscape's), and a
 /// physically denser screen at the same logical size sees it the same.
 #[test]
-#[ignore = "red until the focal is the lens's, in logical pixels"]
 fn the_footprint_follows_the_lens_not_a_fixed_focal() {
     let portrait = seen_by(&lens_view(1170.0, 2532.0, 3.0));
     let landscape = seen_by(&lens_view(2532.0, 1170.0, 3.0));
@@ -285,7 +284,6 @@ fn the_footprint_follows_the_lens_not_a_fixed_focal() {
 /// P5.5, D-L1: a scale change at constant logical size (a window moved from
 /// a 2× display to a 1× one) changes no footprint, bit for bit.
 #[test]
-#[ignore = "red until the focal is the lens's, in logical pixels"]
 fn a_scale_change_at_constant_logical_size_changes_no_footprint() {
     let retina = seen_by(&lens_view(3840.0, 2160.0, 2.0));
     let plain = seen_by(&lens_view(1920.0, 1080.0, 1.0));
