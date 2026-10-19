@@ -61,6 +61,10 @@ impl TerrainSource for Held<dyn TerrainSource> {
     ) -> Result<tuile_core::fetch::Fetched<Vec<u8>>, tuile_terrain::TerrainSourceError> {
         self.0.fetch_tile(coord).await
     }
+
+    fn holds(&self, coord: tuile_terrain::TileCoord) -> bool {
+        self.0.holds(coord)
+    }
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -79,6 +83,10 @@ impl ImageryProvider for Held<dyn ImageryProvider> {
 
     fn generation(&self) -> u64 {
         self.0.generation()
+    }
+
+    fn holds(&self, coord: tuile_core::raster::ImageryCoord) -> bool {
+        self.0.holds(coord)
     }
 
     async fn fetch_tile_bytes(

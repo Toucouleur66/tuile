@@ -261,6 +261,13 @@ impl ContentStore for FoyerStore {
         self.cache
             .insert(key.to_owned(), Stamped::join(deadline, &value));
     }
+
+    /// The memory tier and the disk tier's index, without a read: an entry
+    /// expired but not yet dropped, or a hash collision on the disk, answers
+    /// yes — a hint, as the contract allows, and a `get` then misses.
+    fn holds(&self, key: &str) -> bool {
+        self.cache.contains(key)
+    }
 }
 
 /// A [`FoyerStore`] that can be closed and opened again behind one handle.
@@ -341,6 +348,10 @@ impl ContentStore for SuspendableStore {
         if let Some(store) = self.current() {
             store.put(key, value, ttl).await;
         }
+    }
+
+    fn holds(&self, key: &str) -> bool {
+        self.current().is_some_and(|store| store.holds(key))
     }
 }
 

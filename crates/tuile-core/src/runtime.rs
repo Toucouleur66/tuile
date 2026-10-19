@@ -2110,6 +2110,7 @@ mod tests {
                 )],
                 floor_tiles: 0,
                 identity: u64::from(level),
+                withheld: false,
             })
         }
         fn epoch(&self) -> u64 {

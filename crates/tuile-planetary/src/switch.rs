@@ -18,13 +18,12 @@
 //!   ([`ImageryLayer::source`](tuile_core::raster::ImageryLayer::source)), so
 //!   a consumer never mistakes the new picture of a tile for the old one;
 //! - the loader reports the generation as its
-//!   [`epoch`](tuile_core::source::TileLoader::epoch), and the geometry server
-//!   refreshes every resident tile from an earlier one — **coarse first, and
-//!   keeping the old content until the new has arrived**.
+//!   [`epoch`](tuile_core::source::TileLoader::epoch), and the geometry
+//!   server's budget refreshes every drape of an earlier one — **new before
+//!   old: the old drape stays worn until the new one is drawable**. Meshes are
+//!   untouched: a drape is a resource of its own.
 //!
-//! So a switch is one call here and no black anywhere: the old imagery stays
-//! on every tile until that tile's new drape is resident, and is replaced in
-//! place.
+//! So a switch is one call here and no black anywhere.
 //!
 //! The two imagery sets need not share a grid. The tiling scheme is the held
 //! provider's, asked for again on every use, and a drape that straddles a
@@ -85,5 +84,9 @@ impl ImageryProvider for SwitchableImagery {
 
     fn generation(&self) -> u64 {
         self.now().0
+    }
+
+    fn holds(&self, coord: ImageryCoord) -> bool {
+        self.now().1.holds(coord)
     }
 }
