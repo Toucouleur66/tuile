@@ -7,6 +7,11 @@ Phase 1a of the budget plan: a decision gate. The spec
 (`graphics-budget-to-be-and-spec.md`) is amended only once the owner has decided
 on this document.
 
+**Status: decided on 2026-10-19** (§6). Every recommendation was taken but
+one: D-A5 reverses it. The budget lives with `GeometryServer` on the client,
+whenever the client runs the core, and the WebSocket binding of `tuile-server`
+serves resources statelessly (§4.3, docs/12).
+
 Three questions:
 
 1. **Streams.** Is imagery a stream of its own beside the terrain geometry
@@ -333,27 +338,68 @@ the codec `crates/tuile-web/src/wire.rs`).
 - Upload pacing must be on the page: a decision arrives a message late, so
   only the page knows its frame budget.
 
-### 4.3 The WebSocket binding (`tuile-server`, docs/12)
+### 4.3 The WebSocket binding (`tuile-server`, docs/12): the budget on the client (D-A5)
 
-Not built yet. Docs/12 runs one core `GeometryServer` per WebSocket session
-on the server, with "client-side residency tracked via `Ack`/`Evict`".
+Not built yet. Docs/12 ran one core `GeometryServer` per WebSocket session on
+the server, with "client-side residency tracked via `Ack`/`Evict`". This
+document first recommended keeping that shape, with the budget in the
+server's session. **Decided otherwise on 2026-10-19:** the budget lives with
+`GeometryServer`, and `GeometryServer` runs on the client whenever the client
+runs the core — native wgpu on a desktop, an iPhone or an Android phone, a
+headset, the wasm worker, Hydra through the C ABI. The WebSocket binding
+carries the resources that the client's core asks for; the server resolves
+them and serves the bytes (glb for a mesh, a texture for a drape), with no
+session of its own.
 
-- Read that way, the budget lives in the server's session, exactly as in the
-  worker: the call sequence is §4.2's over a socket, and what crosses is the
-  same messages, serialised (glb for meshes; a compressed texture for drapes).
-  Acks with bytes are what lets a remote budget know the client's GPU.
-- The plan's wording ("budget on the client, server stateless") is a
-  different mode, and one that exists already: the **static HTTP mode**,
-  where `GeometryServer` runs in-process on the client over an HTTP fetcher
-  (protocol.rs, module doc). There the budget is client-side and the server
-  is a byte store. No API is needed for it beyond §4.1.
-- A stateful WebSocket session cannot see the client's local tiers (an HTTP
-  cache or a store on the device): I14 then needs the client to say what it
-  holds (`ClientMessage::Held { resources }` at connection, D-A5).
-- Pressure, thermal and retarget reach a remote budget as messages, one RTT
-  late; the hard limit (`hard_limit`, the jetsam guard) must therefore be
-  enforced by the client's executor as well (refuse an upload beyond it, ack
-  `Discarded`), never by the remote budget alone.
+```rust
+// Client: §4.1 or §4.2 unchanged. The socket sits under the loaders, beside
+// the HTTP fetcher; it is never between the budget and the renderer.
+let need = traverse(tree, &budget.residency(), &views, cfg, frame);
+let d = budget.decide(FrameInput::new(frame, now, &need).with_presence(&store_index));
+for s in &d.start {
+    match s.source {
+        Source::Local => store.read(s.resource, s.gen),          // local tier, own quota (I15)
+        Source::Network => socket.request(s.resource, s.gen),    // or an HTTP GET for the same key
+    }
+}
+for (r, g) in &d.cancel { socket.cancel(*r, *g) }   // a courtesy: the budget has dropped it already
+// replies: budget.on_loaded / on_failed, exactly as from an HTTP fetcher
+
+// Server: per request, a function of the key alone; nothing kept between requests.
+fn resolve(key: &ResourceKey) -> Result<Payload, ResolveError>;   // a mesh's glb, a drape's texture
+```
+
+- **Why on the client.**
+  - The budget's inputs live there: the GPU's memory and the hard limit that
+    guards against a jetsam or out-of-memory kill (`os_proc_available_memory`,
+    `VK_EXT_memory_budget`, `onTrimMemory`), memory pressure and the thermal
+    state, the synchronous presence oracle on the local store (§4b of the
+    spec, I14 and I15), and the display rate the per-frame deadline comes from
+    (I18).
+  - A remote budget decides one round trip late. The hard limit would then
+    need a second enforcer on the client (refusing uploads, acking
+    `Discarded`), and there would be two places to keep right instead of one.
+  - A headset cannot afford decisions that are a round trip old about what its
+    next frames show.
+  - A stateless server scales out and caches: each response is a function of
+    its key, so a CDN or a Cloudflare Worker serves it as it serves the static
+    mode.
+  - Every consumer that exists already runs the core: the native viewers, the
+    web worker, Hydra and the film and bake sessions.
+- **Consequences.**
+  - No `ClientMessage::Held`: the budget asks the client's own tiers directly.
+    No server session mode to maintain, no `GeometryServer` per connection.
+  - The socket carries requests keyed by resource (the key a static `GET`
+    would use for the same bytes), their replies and cancels. Per connection,
+    the server keeps only the ids of requests in flight.
+  - The static HTTP mode and the WebSocket binding become two transports
+    under the same loaders. The protocol of §5 (`ClientMessage`,
+    `ServerMessage`) runs between the client's `GeometryServer` and its
+    renderer, in-process or across a worker's `postMessage`, and never crosses
+    a network.
+  - A client that does not run the core (a third-party 3D Tiles viewer) uses
+    the static mode, as it did.
+  - docs/12 is amended in the same branch.
 
 ### 4.4 Hydra / USD (docs/14, docs/15)
 
@@ -414,8 +460,8 @@ one union (`traverse` 544, `ClientMessage::ViewerState { views }`).
 
 ```rust
 stream.send(ClientMessage::ViewerState { views: vec![left, right], generation })?;
-// server: one traverse over both views → one NeedSet (union, max need per tile)
-//         one decide → one DrawSet; each resource charged once (I16)
+// GeometryServer (on the headset): one traverse over both views → one NeedSet
+//         (union, max need per tile); one decide → one DrawSet; each resource charged once (I16)
 // client: both eyes draw the same DrawSet (I17), each culls by its own frustum
 for ack in pump.upload_within(FrameDeadline::from_refresh(90.0, share)) { stream.send(ack)? }
 ```
@@ -512,7 +558,7 @@ impl Budget {
 }
 ```
 
-- D-A1 (bare ground at start-up), if accepted: a mesh whose need has
+- D-A1 (bare ground at start-up), accepted: a mesh whose need has
   imagery is drawable only with a drape to wear, its own or an ancestor's;
   the floor's mesh and drape form one swap group; I1 becomes "every drawn
   item wears a drape for each layer it needs". A test first: bare = 0 in
@@ -529,7 +575,6 @@ pub enum ClientMessage {
     Thermal(Thermal),
     Retarget { total_bytes: u64 },
     ReleaseBeyond { bytes: u64 },                 // Batch, between frames (replaces Trim)
-    Held { resources: Vec<ResourceId> },          // a remote budget learns the client's tiers (D-A5)
 }
 pub enum ServerMessage {
     Select { draw: DrawSet, ancestry: Vec<(TileId, Ancestry)>, stats: TraversalStats, generation: u64 },
@@ -559,24 +604,28 @@ in the plan's priority order, drained per render frame within
 `FrameDeadline { bytes }` derived from the display rate, never beyond the
 class hard limits; deviations reported, never fed back into decisions.
 
-**Where the budget lives**: in the `GeometryServer` session, whatever side of
-the transport it runs on. Its inputs are messages only, so it runs the same
-in-process, in a worker and in a WebSocket session; the static HTTP mode puts
-it on the client.
+**Where the budget lives** (D-A5, decided against this document's first
+recommendation): with `GeometryServer`, on the client, whatever the host —
+in-process, in a worker, behind the C ABI. Its inputs are messages only, so
+it runs the same in each. The server, static HTTP or WebSocket, resolves and
+serves resources statelessly (§4.3).
 
-## 6. Decisions for Laurent
+## 6. Decisions
 
-| | Question | Recommended |
-|---|---|---|
-| **D-A0** | One arbiter (A) or two budgets (B)? | **A**, on §3 |
-| **D-A1** | Bare floor meshes at start-up (4–8 tile-steps in every scenario, every architecture): make "every drawn item wears a drape" part of I1, the floor mesh and drape one swap group? | Yes, test first |
-| **D-A2** | Imagery as its own `Content` in the same session (A), not a payload (C), not a second stream with its own budget (B′)? | Yes |
-| **D-A3** | Keep fixed per-class targets, or pool the ledger with per-class floors and ceilings so the split follows the view? The ratio moves the low-clamp convergence 2.0–3.3 s and the blur under a warning 19–49 %. | Open: simulate a pooled ledger in Phase 3 before deciding; until then, 40/60 for the default split looks better than 44/56 under pressure |
-| **D-A4** | Several layers: per-layer drapes (`Drape { tile, layer, level }`, composed by the executor; USD composes once all are drawable), or one composed drape per tile keyed by the layer set? | Per layer |
-| **D-A5** | The WebSocket binding: budget in the server session (docs/12) with `Ack { bytes }` and `Held`, and "budget client-side, server stateless" understood as the static HTTP mode? | Yes; correct the plan's wording |
-| **D-A6** | Host side channels: `ToWorker::Detail` and `Budget` fold into the stream (`ViewerState`, `Retarget`); `Pause` and the layer switch stay host messages for now? | Yes |
-| **D-A7** | Headset eyes: `ViewState::from_fov` with an asymmetric frustum, and the incremental need (I6) promoted from follow-up to P6 requirement? | Yes |
-| **D-A8** | Per-frame deadline: the executor's `FrameDeadline` from the display rate, with `upload_bytes_per_frame` kept as the plan's per-step cap? | Yes |
+Laurent decided on 2026-10-19. The spec is amended accordingly (its §1, §10
+and §12–§15).
+
+| | Question | Recommended | Decided, 2026-10-19 | Why |
+|---|---|---|---|---|
+| **D-A0** | One arbiter (A) or two budgets (B)? | **A**, on §3 | **Yes**: one arbiter over one GPU pool | Two ledgers evict worn drapes, overshoot the pool and miss convergence at the low clamp, at any split (§3.3) |
+| **D-A1** | Bare floor meshes at start-up (4–8 tile-steps in every scenario, every architecture): make "every drawn item wears a drape" part of I1, the floor mesh and drape one swap group? | Yes, test first | **Yes**: I1 extended, every drawn item wears a drape; the floor mesh and its drape are one swap group; the test is written first, in Phase 3 | Bare ground is black ground, and the per-step check could not see it because I1 counted meshes only |
+| **D-A2** | Imagery as its own `Content` in the same session (A), not a payload (C), not a second stream with its own budget (B′)? | Yes | **Yes**: imagery is its own `Content` in the same session, not a payload of the terrain tile | A payload cannot meet I10 and turns every redrape into a mesh swap; a stream keyed on what terrain drew leaves ground bare (§3.3) |
+| **D-A3** | Keep fixed per-class targets, or pool the ledger with per-class floors and ceilings so the split follows the view? The ratio moves the low-clamp convergence 2.0–3.3 s and the blur under a warning 19–49 %. | Open: simulate a pooled ledger in Phase 3 before deciding; until then, 40/60 for the default split looks better than 44/56 under pressure | **As proposed**: open; a pooled ledger with per-class floors and ceilings is simulated in Phase 3; the interim default split is 40/60 terrain/imagery | The ratio matters in both shapes, and 40/60 was the best of the three splits measured, under pressure and at the low clamp |
+| **D-A4** | Several layers: per-layer drapes (`Drape { tile, layer, level }`, composed by the executor; USD composes once all are drawable), or one composed drape per tile keyed by the layer set? | Per layer | **Yes**: per-layer drapes `Drape { tile, layer, level }`, composed by the executor | Each layer picks its level, falls back and refreshes on its own; one ledger keeps N layers from needing N splits |
+| **D-A5** | The WebSocket binding: budget in the server session (docs/12) with `Ack { bytes }` and `Held`, and "budget client-side, server stateless" understood as the static HTTP mode? | Yes; correct the plan's wording | **No — client-side** (reverses the recommendation): the budget lives with `GeometryServer`, which runs on the client whenever the client runs the core; the WebSocket binding serves stateless, cacheable resources; no `Held`, no server session (§4.3, docs/12) | The budget's inputs (GPU memory, pressure and thermal, the local presence oracle, the display rate) are on the client; a remote budget is a round trip late and needs a second enforcer of the hard limit; a stateless server scales and caches |
+| **D-A6** | Host side channels: `ToWorker::Detail` and `Budget` fold into the stream (`ViewerState`, `Retarget`); `Pause` and the layer switch stay host messages for now? | Yes | **Yes**: `ToWorker::Detail` disappears (the imagery need comes per tile from the views, I10); `ToWorker::Budget { reported }` becomes `ClientMessage::Retarget`; `Pause` and the layer switch stay host messages for now (the layer switch may fold in with several layers) | One path, native and web; no second source of truth for the imagery level; ordered with the acks, so a session replays |
+| **D-A7** | Headset eyes: `ViewState::from_fov` with an asymmetric frustum, and the incremental need (I6) promoted from follow-up to P6 requirement? | Yes | **Yes**: `ViewState::from_fov` with an asymmetric frustum (OpenXR's four angles); the incremental need and decide of I6 (O(changes · log N)) become a requirement of P6 | A headset eye's frustum is asymmetric; at 90 Hz the cost of `decide` bounds how fresh a decision is |
+| **D-A8** | Per-frame deadline: the executor's `FrameDeadline` from the display rate, with `upload_bytes_per_frame` kept as the plan's per-step cap? | Yes | **Yes**: the executor's `FrameDeadline`, from the display rate, caps uploads per frame; `upload_bytes_per_frame` stays the plan's deterministic per-step cap; what is deferred is reported as a deviation and never feeds `decide` | Only the render side knows its frame; decisions stay a function of their inputs (I12) |
 
 ## Appendix: the full table
 
