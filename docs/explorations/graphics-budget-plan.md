@@ -32,7 +32,7 @@ imagery chosen independently of terrain, proven by simulation before it touches 
 2. **Observer first:**
    - `BudgetObserver` (watch-only, the pattern of `tuile-film-native/src/observe.rs:146`),
      called once per frame by the pump;
-   - JSONL sink (`TUILE_BUDGET_LOG`) and `/metrics`;
+   - its sinks: `/metrics` and the budget's channels on the MCAP session tape (spec §16.5);
    - the fields of AS-IS §4.1, plus `underdraped` and the imagery-over-terrain histogram.
 3. **Symptom tests on today's code, written against the headless control API (Step 0b), committed red** (documented as expected failures, so CI
    stays green: `#[ignore = "red until budget-core"]`), each seen failing:
@@ -45,7 +45,8 @@ imagery chosen independently of terrain, proven by simulation before it touches 
    - render the reference films on the farm (one-off job), open them, and record their
      parameters in `videos/README.md`.
 5. **Device baseline:** the Mac replay and the iPhone touch script from AS-IS §4.2, run for
-   30 min with the JSONL log. Save the logs. They are the "before" curves.
+   30 min with the budget's channels on the session tape. Save the tapes. They are the
+   "before" curves.
 
 ### Step 0b — The headless viewer and its control API (M)
 Built first, on today's code, because every later test and reproduction drives the viewer
@@ -204,7 +205,8 @@ crate that claims wasm); all tests green; the iOS sim and device targets build.
 - Each value is justified by a simulation curve and written next to the constant.
 
 ### Step 7 — Device sessions (S)
-- **Mac:** the Step 0 replays with the JSONL log, compared with the "before" curves.
+- **Mac:** the Step 0 replays with the session tape's budget channels, compared with the
+  "before" curves.
   Convergence time after rotation and zoom-out, latency slope over 30 min, underdraped = 0
   at rest.
 - **iPhone:** the touch-script tour for 30 min, plus a memory warning from Xcode, plus

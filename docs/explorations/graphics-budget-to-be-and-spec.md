@@ -27,7 +27,10 @@ Amended on 2026-10-19 (Phase 1), after the architecture decisions
 - the lens — viewport, field of view, scale, per eye — replaces the fixed focal length (§13);
 - the platforms and their profiles (§14);
 - the API decided, as target signatures (§15). §3 and §5 stay as the sketch of 2026-10-17;
-  where they differ from §15, §15 wins.
+  where they differ from §15, §15 wins;
+- the observability contract: every invariant and obligation has a named signal that tests
+  and production read the same way, one observer in the core, its sinks, the dashboard,
+  the alerts and the field telemetry (§16).
 
 The test plan is `graphics-budget-test-plan.md`.
 
@@ -293,7 +296,7 @@ renderer.
 | **Move** | `set_view(camera)`, `fly_to(target, duration)`, `orbit(angle, duration)`, `zoom(factor, duration)`, `look(heading, pitch)`; touch-equivalent gestures for the handheld profile |
 | **Series** | `run(script)`: a list of timed commands, or a `tuile-tape` file. `step(frames)` and `advance(seconds)` move the stepped clock. `wait_until(condition, timeout)`, with conditions `converged`, `idle`, `no_holes` and `bytes_below(class, n)` |
 | **Inject** | `pressure(level)`, `thermal(state)`, `background()` / `foreground()`, `network(profile)` to change the latency, failure rate or stall of a simulated network, `kill_and_relaunch()` to test persistence |
-| **Record** | `observe(path)`: start the JSONL `BudgetObserver` log; `snapshot(path)`: frame plus budget plus GPU state in one bundle, for a failing test's artefacts |
+| **Record** | `observe(path)`: open the MCAP session tape with the budget's channels beside the camera and the frames (§16.5); `snapshot(path)`: frame plus budget plus GPU state in one bundle, for a failing test's artefacts |
 
 **Uses**
 - The headless real-GPU tests of §8 are written against this API.
@@ -538,7 +541,8 @@ with the invariant or obligation it proves — is `graphics-budget-test-plan.md`
 - every existing test kept.
 
 **Devices**
-- The Mac replays and the iPhone touch scripts from AS-IS §4.2, with the JSONL observer.
+- The Mac replays and the iPhone touch scripts from AS-IS §4.2, with the budget's channels
+  on the session tape (§16.5).
 - A memory warning from Xcode, and thermal "Serious".
 
 **Film**
@@ -554,9 +558,10 @@ with the invariant or obligation it proves — is `graphics-budget-test-plan.md`
   - time since the camera stopped, and convergence;
   - underdraped tiles;
   - the imagery-over-terrain histogram.
-- `BudgetObserver` in tuile-wgpu, watch-only (the pattern of
-  `tuile-film-native/src/observe.rs`), with sinks to JSONL (`TUILE_BUDGET_LOG`) and
-  `/metrics`.
+- `BudgetObserver` in the core, watch-only (the pattern of
+  `tuile-film-native/src/observe.rs`), with its sinks: `/metrics`, the MCAP session tape,
+  tracing, the control API, the overlay and the web worker's channel. §16 is the contract;
+  it supersedes this section where they differ.
 - A viewer debug overlay: bars per class against target and overflow; pending, in-flight
   and credit; counts of drawn exact, fallback and stand-in; the imagery level per tile as a
   colour.
@@ -998,3 +1003,332 @@ quaternion into it.
   the cut.
 - **One cut-over PR, no bridge.** The new path replaces the old one in one PR, reviewed in
   pieces: no flag, no shadow, no adapter between the old protocol and the new.
+
+## 16. Observability contract (Phase 1, 2026-10-19)
+
+The budget is tested and watched through the same signals, so that it can change one piece
+at a time: a change shows in production the way it showed in the test that proved it.
+
+### 16.1 Principles
+
+- **One vocabulary.** Every invariant and every obligation maps to at least one named signal
+  (§16.3, §16.4). Tests assert through those signals wherever they can; dashboards and
+  alerts read the same names. A test that needs a measure the signals lack adds a signal,
+  not a private counter.
+- **One observer, many sinks.** The budget computes nothing for a sink. A `BudgetObserver`
+  in the core receives each step's record; the sinks — Prometheus, the MCAP session tape,
+  tracing, the control API, the overlay, the web worker's channel — read what it
+  accumulated. There is no sink-specific logic in the budget or in the observer.
+- **Deterministic first.** Counts and digests come from the decisions and are the same on
+  every platform. Wall-clock measures (`decide` seconds, upload seconds) are named as such and
+  never feed a decision.
+- **Bounded cardinality.** Labels take their values from closed sets (§16.5); no tile,
+  resource or session id is ever a label. Per-tile detail goes to the MCAP tape.
+- **No coordinates in the field.** As `journal.rs` already holds, field telemetry records the
+  budget's signals, never a position or a credential (§16.9).
+
+### 16.2 The observer (core: no I/O, no allocation per step beyond bounded maps, wasm32)
+
+```rust
+/// Watch-only, called by the host; takes nothing back (the pattern of tuile-film-native's `Observer`).
+pub trait BudgetObserver {
+    /// After each `decide`: from `GeometryServer`, the simulation, a Batch session.
+    fn step(&mut self, _s: &StepRecord<'_>) {}
+    /// After each render frame: from the executor (the pump, the page, the USD scene index).
+    fn frame(&mut self, _f: &FrameRecord<'_>) {}
+}
+impl BudgetObserver for () {}
+impl BudgetObserver for Vec<Box<dyn BudgetObserver + Send>> { /* each in turn */ }
+
+pub struct StepRecord<'a> {
+    pub step: u64,
+    pub frame: u64,
+    pub now: Micros,
+    pub views_changed: bool,           // the host's: some eye's pose or lens moved since the last step
+    pub eyes: u8,
+    pub need: &'a NeedSet,
+    pub events: &'a [BudgetEvent],     // what the host handed the budget since the last step, any order
+    pub presence: &'a [(ResourceId, Presence)],  // the answers this step's oracle gave
+    pub decisions: &'a Decisions,      // stats included
+    pub ledger: Ledger,
+    pub pressure: Pressure,
+    pub thermal: Thermal,
+    pub decide_wall: Option<Micros>,   // measured by the host around `decide`
+}
+pub struct FrameRecord<'a> {
+    pub frame: u64,
+    pub generation: u64,               // of the DrawSet drawn
+    pub deadline: FrameDeadline,
+    pub uploaded: &'a [(ResourceId, Bytes)],
+    pub deferred: u32,
+    pub upload_wall: Micros,
+    pub eyes: &'a [EyeCoverage],       // per eye: wanted tiles in its frustum with no cover, bare items
+}
+
+/// The signals, accumulated: atomics in `tuile_core::metrics`, as the engine's other numbers.
+pub struct BudgetMeter { /* bounded per-tile maps for flaps and convergence */ }
+impl BudgetObserver for BudgetMeter {}
+impl BudgetMeter { pub fn signals(&self) -> BudgetSignals; }
+/// A snapshot of every signal of §16.3, by the same names: what tests assert on.
+pub struct BudgetSignals { /* … */ }
+
+/// The checks one record allows, moved from the simulation's `Sim::check` into the core, so a
+/// device counts the violations a test asserts on.
+pub fn check(s: &StepRecord<'_>, cfg: &BudgetConfig, out: &mut Violations);
+```
+
+- `BudgetEvent` is what the host passes to `on_loaded`, `on_failed`, `on_store_miss`,
+  `on_drawable`, `on_discarded`, `set_pressure`, `set_thermal`, `retarget`, `new_epoch` and
+  `release_beyond`, recorded by the host as it calls them. Their order does not matter: the
+  budget applies them canonically (`arrivals_apply_in_a_canonical_order`).
+- The presence answers come from a recording wrapper around the `PresenceOracle`.
+- `check` covers what one record and the configuration allow: I1 (lost and bare once the
+  floor is in), I2 (unprotected bytes over the target, a class over its hard limit), I7 (heap
+  over its cap, duplicates in flight), I11 (an evicted resource that the draw set draws or
+  wears, or a floor resource), I13 (an eviction or an inexact item in a ready Batch frame).
+  What needs the world — coverage of the ground against each eye's frustum, the network's
+  truth for I5 and I14 — stays in the simulation and the headless harness.
+- `BudgetStats` gains what the signals need: `bare`, `floor_in`, the per-class split of
+  drawable and in-transit bytes, evictions and cancels by reason, `wasted_starts`,
+  `local_waits`, the work counter `work` (resources visited by the step).
+
+### 16.3 Signals
+
+Prefix `tuile_budget_`. Bytes in bytes, durations in seconds, ratios unitless.
+
+| Signal | Type | Labels | From |
+|---|---|---|---|
+| `bytes` | gauge | class, state | ledger: drawable and in transit, per class |
+| `decoded_bytes` | gauge | — | ledger |
+| `protected_bytes` | gauge | class | stats |
+| `target_bytes`, `overflow_bytes`, `hard_limit_bytes` | gauge | class | effective, after pressure and `retarget` |
+| `over_target_seconds_total` | counter | class | time with bytes over the target (overflow in use) |
+| `lost_tiles`; `lost_tile_steps_total` | gauge; counter | — | stats, once the floor is in |
+| `bare_items`; `bare_item_steps_total` | gauge; counter | — | stats (D-A1) |
+| `drawn_tiles` | gauge | role | stats: exact, held, fallback |
+| `eye_lost_tiles`, `eye_bare_items` | gauge | eye | `FrameRecord` |
+| `floor_in`; `floor_seconds` | gauge | — | whether the floor is in; from session start to the floor in |
+| `fallback_depth_max` | gauge | — | deepest climb from a wanted tile to its cover since the last publish |
+| `underdraped_tiles` | gauge | — | stats |
+| `imagery_over_terrain` | gauge | gap | stats histogram |
+| `converged` | gauge | — | stats |
+| `converged_seconds` | histogram | — | from the views going still to convergence |
+| `unconverged_seconds` | gauge | — | still and not converged, for how long |
+| `converge_bound_seconds` | gauge | — | T_conv of the profile |
+| `flaps_total` | counter | kind | a tile's second level change within 10 s while still (I4) |
+| `sse_scale` | gauge | — | relaxation |
+| `pressure_level`, `thermal_level` | gauge | — | 0–3 |
+| `starts_total` | counter | class, source | starts |
+| `wasted_starts_total` | counter | class | started, then out of the need before delivered |
+| `local_waits_total` | counter | — | a stored resource left waiting while a network job of a lower key started (I15) |
+| `cancels_total` | counter | reason | cancels |
+| `completions_total`; `failures_total`; `stale_results_total` | counter | class; class, kind; — | arrivals |
+| `load_seconds` | histogram | class | load latency, from `Micros` |
+| `in_flight` | gauge | class, source | stats |
+| `request_heap_entries`, `tracked_resources`, `duplicates_in_flight` | gauge | — | stats |
+| `decide_seconds`; `decide_peak_seconds` | histogram; gauge | — | wall clock around `decide`; the worst since the last publish |
+| `decide_share_seconds` | gauge | — | the profile's share of a frame for `decide` |
+| `decide_work`; `decide_work_total` | gauge; counter | — | resources visited, deterministic |
+| `evictions_total`; `releases_total` | counter | class, reason; class | GPU evictions; decoded copies released |
+| `thrash_total`, `rereads_total` | counter | class | network refetches, and local re-reads, within 10 s of an eviction |
+| `network_bytes_avoided_total`, `store_misses_total` | counter | — | tiers |
+| `upload_plan_bytes` | gauge | — | the step's plan |
+| `uploads_total`; `upload_bytes_total` | counter | class | executor |
+| `frame_upload_bytes`; `frame_deadline_bytes` | histogram; gauge | — | executor, per render frame |
+| `deadline_deferrals_total` | counter | — | executor (I18) |
+| `frame_upload_seconds` | histogram | — | executor, wall clock |
+| `estimate_drift_exceeded_total` | counter | class | an ack more than 5 % off its estimate |
+| `swaps_total`; `swap_gaps_total` | counter | kind; — | swaps completed; an old half gone before its new half was drawn (must stay 0) |
+| `batch_steps_per_frame`; `batch_fatal_total` | histogram; counter | — | Batch |
+| `invariant_violations_total` | counter | invariant | `check` |
+| `rejected_inputs_total` | counter | — | non-finite need entries |
+
+The decision digest and the stats digest are not metrics: they are the MCAP tape's and the
+`det!` trace's (§16.6).
+
+### 16.4 Every invariant and obligation has a signal
+
+| | Signals |
+|---|---|
+| I1 | `lost_tile_steps_total`, `bare_item_steps_total`, `invariant_violations_total{invariant="I1"}` |
+| I2 | `bytes`, `protected_bytes`, `target_bytes`, `overflow_bytes`, `hard_limit_bytes`, `over_target_seconds_total`, violations I2 |
+| I3 | `converged`, `converged_seconds`, `unconverged_seconds` |
+| I4 | `flaps_total` |
+| I5 | `cancels_total{reason}`, `stale_results_total`, `wasted_starts_total` |
+| I6 | `load_seconds`, `decide_seconds`, `decide_work`, `tracked_resources` (slopes) |
+| I7 | `request_heap_entries`, `tracked_resources`, `duplicates_in_flight`, violations I7 |
+| I8 | `pressure_level`, `thermal_level`, `target_bytes`, `sse_scale`, `lost_tile_steps_total` |
+| I9 | `swaps_total{kind}`, `swap_gaps_total`, `drawn_tiles{role="held"}` |
+| I10 | `underdraped_tiles`, `imagery_over_terrain{gap}` |
+| I11 | violations I11, `evictions_total{reason}` |
+| I12 | the per-step decision digest (`/budget/step`), replayed from `/budget/events` |
+| I13 | `batch_steps_per_frame`, `batch_fatal_total`, violations I13 |
+| I14 | `thrash_total`, `rereads_total`, `starts_total{source}`, `network_bytes_avoided_total` |
+| I15 | `starts_total{source="local"}`, `in_flight{source="local"}`, `local_waits_total`, `store_misses_total` |
+| I16 | `uploads_total`, `upload_bytes_total`, `bytes` (equal to the union run's), `duplicates_in_flight` |
+| I17 | `eye_lost_tiles{eye}`, `eye_bare_items{eye}` |
+| I18 | `frame_upload_bytes`, `frame_deadline_bytes`, `deadline_deferrals_total`, `frame_upload_seconds` |
+| P1.1 | `floor_in`, `floor_seconds`, `lost_tile_steps_total`, `bare_item_steps_total` |
+| P1.2 | `flaps_total`, `drawn_tiles{role}` over a still interval, the digest |
+| P1.3, P2.4, P3.4, P4.5, P5.6, P6.5 | `converged_seconds`, `unconverged_seconds`, `converge_bound_seconds` |
+| P1.4 | `starts_total{class,source}`, `local_waits_total`, `in_flight` |
+| P2.1 | `swaps_total{kind="refine"}`, `swap_gaps_total` |
+| P2.2, P5.3 | `wasted_starts_total`, `cancels_total{reason="grace"}`, `starts_total` |
+| P2.3 | `underdraped_tiles`, `imagery_over_terrain` |
+| P3.1 | `swaps_total{kind="coarsen"}`, `drawn_tiles{role="held"}`, `swap_gaps_total` |
+| P3.2 | `bytes` against `target_bytes`, `over_target_seconds_total` |
+| P3.3 | `bytes` against `hard_limit_bytes`, `sse_scale`, the step's idleness on the tape |
+| P4.1 | `fallback_depth_max`, `lost_tile_steps_total` |
+| P4.2 | violations I11, `evictions_total` |
+| P4.3, P5.4 | `thrash_total`, `rereads_total`, `starts_total{source="network"}`, `flaps_total` |
+| P4.4 | `drawn_tiles{role="exact"}`, `underdraped_tiles` |
+| P5.1 | `lost_tile_steps_total` across the change, `evictions_total` at it |
+| P5.2, P5.5 | `/views` on the tape: the lens of each step, and the need's digest |
+| P6.1 | `uploads_total`, `bytes`, `duplicates_in_flight` |
+| P6.2 | `eye_lost_tiles`, `eye_bare_items` |
+| P6.3 | `frame_upload_bytes`, `deadline_deferrals_total` |
+| P6.4 | `decide_work`, `decide_seconds`, `decide_peak_seconds` against `decide_share_seconds` |
+
+### 16.5 Labels: closed sets
+
+| Label | Values |
+|---|---|
+| class | `terrain_mesh`, `tiles3d_mesh`, `drape`, `overlay` |
+| state | `drawable`, `in_transit` |
+| source | `local`, `network` |
+| role | `exact`, `held`, `fallback` |
+| reason (cancels) | `grace`, `timeout` |
+| reason (evictions) | `sweep`, `pressure`, `admission`, `release_beyond` |
+| kind (failures; flaps; swaps) | `transient`, `permanent`; `terrain`, `imagery`; `refine`, `coarsen`, `mesh_drape`, `layer` |
+| gap | `-8` to `8` |
+| eye | `0` to `3` |
+| invariant | `I1` to `I18` |
+
+The host adds `profile` (desktop, handheld, handheld_low, browser, headset, batch) and
+`platform` (macos, linux, ios, android, web) once, as process labels; the budget never does.
+
+### 16.6 Sinks
+
+1. **Prometheus, through tuile-metrics.** The meter's numbers are atomics in
+   `tuile_core::metrics`, published by `publish_every` (every 500 ms; loopback port 9464
+   unless `TUILE_METRICS_ADDR` says otherwise) like the engine's other numbers. A gauge
+   sampled every 500 ms misses a one-step event, so every one-step quantity has a counter twin
+   (`lost_tile_steps_total`, `bare_item_steps_total`) or a peak reset at each publish
+   (`decide_peak_seconds`, `fallback_depth_max`).
+2. **The MCAP session tape** (it replaces the JSONL log the earlier sections named).
+   tuile-tape writes the budget's channels into the same file as `/camera`, `/clock` and
+   `/frame`, on the same timeline, so one session file holds the camera, the pictures and the
+   decisions, and replays and diffs as one.
+   - **Encoding**, as tuile-tape's channels: message encoding `json`, schema encoding
+     `jsonschema`, schema names `tuile.*`. Floats in Rust's shortest round-trip form (exact,
+     as `/camera`); 64-bit digests as 16-digit hex strings (a JSON number loses them past
+     2^53, as `goldens.txt` writes them); byte counts as integers. Every message carries
+     `version`, `step`, `frame` and `now_us`.
+   - **Log time**: tuile-tape's frame stamp, so a step sits beside the camera and the picture
+     of the frame that drew it.
+   - **Topics**:
+
+     | Topic | Schema | Written | Holds |
+     |---|---|---|---|
+     | `/budget/step` | `tuile.BudgetStep` | every step | the decision digest and the stats digest; counts of starts, cancels, deliveries, evictions, releases and uploads by class; `sse_scale_milli`, `frame_ready`, `converged`; the ledger by class and state; the stats |
+     | `/budget/events` | `tuile.BudgetEvents` | every step | the events the host handed the budget since the last step, and the presence answers the step used: what `decide` read |
+     | `/budget/frame` | `tuile.BudgetFrame` | every render frame | the executor's `FrameRecord` |
+     | `/views` | `tuile.Views` | every step | every eye's pose and lens (viewport, scale, four angles) and the `ViewerState` generation; `/camera` stays the mono path a replay flies |
+     | `/budget/decisions` | `tuile.BudgetDecisions` | every step, traces only | the full `Decisions`: starts, cancels, deliveries, evictions, the upload plan, the draw set |
+     | `/budget/second` | `tuile.BudgetSecond` | every second | the `BudgetSignals` snapshot: the field log (§16.9) |
+
+   - **Replay**: `/views`, `/budget/events` and the session's sources (named in the tape's
+     metadata) are what `decide` read, so a device session's decisions replay offline, bit
+     for bit, and their digests compare step by step with the tape's: I12 in the field.
+     `tuile-trace-dump` prints the budget's channels; `tuile-scan-black` reads `/views` to
+     scan each eye.
+   - The file's own bytes are not yet deterministic (tuile-tape's note on `mcap`'s summary
+     order); tapes are compared by their decoded messages.
+3. **Tracing**, in the `det!` style: one `budget.decide` span per step (`step`, `frame`);
+   `det!("budget.step", step, digest, starts, cancels, evictions, lost, bare)` on the
+   `tuile_det` target, off unless asked, as the selection traces are; `warn` events only for
+   what a person must see — ground lost or bare once the floor is in, a class within 10 % of
+   its hard limit, an invariant violation — and never a line per tile.
+4. **The control API** (§4c): `budget()` returns `BudgetSignals`, by the same names without
+   the prefix, and the last step's summary; `observe(path)` opens the session tape;
+   `wait_until` conditions are signals (`converged`, `lost_tiles == 0`,
+   `bytes_below(class, n)`).
+5. **The overlay** (the viewer's diagnostic views): bars per class against target, overflow
+   and hard limit; lost, bare, held and fallback counts; `sse_scale`; deferrals; `decide`'s
+   p99 against its share. It reads `BudgetSignals` and nothing else.
+6. **The web worker's channel.** The worker owns the meter and posts
+   `ToPage::Signals(BudgetSignals)` every 500 ms (a new host message); the page adds its
+   executor's `FrameRecord`s under the same names and feeds its overlay. No listener runs in
+   a browser: a test reads the page's signals through the page.
+
+### 16.7 The dashboard
+
+One dashboard, "Tuile — graphics budget", over any process that publishes tuile-metrics
+(the desktop viewer, the headless viewer in a test run, the bake and film sessions on the
+farm). Variables: `instance`, `profile`, `platform`.
+
+| Row | Panels | Proves |
+|---|---|---|
+| Coverage | `lost_tiles` and `bare_items` (flat at zero); `drawn_tiles` by role, stacked; `eye_lost_tiles` by eye; `floor_seconds` | I1, I17, P1.1 |
+| Memory | `bytes` by class and state, with `target_bytes`, `overflow_bytes` and `hard_limit_bytes` as lines; `protected_bytes`; the rate of `over_target_seconds_total`; `pressure_level` and `thermal_level` as annotations; `sse_scale` | I2, I8, P3.2, P3.3 |
+| Convergence | `converged` as a state timeline; `converged_seconds` p50 and p95 against `converge_bound_seconds`; `unconverged_seconds`; `underdraped_tiles`; `imagery_over_terrain` as a heatmap; the rate of `flaps_total` | I3, I4, I10 |
+| Work | starts by class and source; wasted starts; cancels by reason; failures; `load_seconds` p95 by class; `in_flight` against the quotas; heap, tracked, duplicates | I5–I7, I15, P1.4, P2.2 |
+| Reuse | thrash, rereads, network bytes avoided, store misses | I14, P4.3, P5.4 |
+| Uploads | `frame_upload_bytes` against `frame_deadline_bytes`; the rate of deferrals; `frame_upload_seconds` p99; `upload_plan_bytes`; estimate drift | I18, P6.3 |
+| Decide | `decide_seconds` p50 and p99 and `decide_peak_seconds` against `decide_share_seconds`; `decide_work` | I6, P6.4 |
+| Integrity | `invariant_violations_total` by invariant (flat at zero); rejected inputs; `swap_gaps_total` | all |
+| Batch | `batch_steps_per_frame`; `batch_fatal_total` | I13 |
+
+Alert rules worth having:
+
+| Alert | Expression | Severity |
+|---|---|---|
+| Ground lost | `increase(tuile_budget_lost_tile_steps_total[1m]) > 0` | critical: black ground |
+| Ground bare | `increase(tuile_budget_bare_item_steps_total[1m]) > 0` | critical |
+| Invariant violated | `increase(tuile_budget_invariant_violations_total[5m]) > 0`, by `invariant` | critical |
+| Duplicates in flight | `tuile_budget_duplicates_in_flight > 0` | critical (I7) |
+| Approaching the hard limit | `sum by (instance, class) (tuile_budget_bytes) / on (instance, class) tuile_budget_hard_limit_bytes > 0.9` for 30 s | warning: the jetsam guard |
+| `decide` over its share | `histogram_quantile(0.99, sum by (instance, le) (rate(tuile_budget_decide_seconds_bucket[5m]))) > on (instance) tuile_budget_decide_share_seconds` for 5 min | warning |
+| Not converging | `tuile_budget_unconverged_seconds > 3 * tuile_budget_converge_bound_seconds` for 1 min | warning |
+| Thrashing | `rate(tuile_budget_thrash_total[5m]) > 1` | warning |
+| Deadline sustained | `rate(tuile_budget_deadline_deferrals_total[1m]) > 10` for 2 min | info |
+
+The dashboard's JSON and the rule file are written from this section at the cut-over, where
+the farm's dashboards live.
+
+### 16.8 Tests read the signals
+
+- The simulation's per-step check becomes the core's `check` plus what needs the world; a
+  scenario asserts `BudgetSignals` (`lost_tile_steps_total == 0`, `converged_seconds ≤
+  T_conv`) rather than private fields where a signal exists.
+- The headless tests and the device runs read the same `BudgetSignals`: live through the
+  control API, afterwards from the tape's `/budget/second` and `/budget/step`.
+- Every signal has a test that it moves when its behaviour happens and stays still when it
+  does not (the test plan's observability level).
+
+### 16.9 Field telemetry (iOS, Android, headset)
+
+Per session, on the device, bounded, with no coordinates and no credential:
+- **The journal** (`journal.rs`, its start and end lines): the end line gains a budget
+  summary — the peak bytes per class against the hard limit, lost and bare steps, invariant
+  violations, `converged_seconds` p50 and p95, the worst `decide`, deferrals, the pressure and
+  thermal events. One line, always written.
+- **The field log**: an MCAP file with `/budget/second` and, from `/budget/events`, the
+  platform's events only (pressure, thermal, retarget, background). No `/camera`, no `/views`,
+  no frames. About a kilobyte a second; capped at 32 MiB, the oldest session dropped first;
+  in the app's own container (`Library/Logs/Tuile/` on iOS, the app's files directory on
+  Android and on the headset).
+- **A trace**, when a person or a test asks for one (`TUILE_TRACE`, as today): the full
+  session tape of §16.6, camera and frames included.
+
+Pulled in tests:
+- iOS simulator: the container from `xcrun simctl get_app_container booted <bundle> data`;
+- iPhone: `xcrun devicectl device copy from --device <id> --domain-type appDataContainer
+  --domain-identifier <bundle> --source Library/Logs/Tuile --destination <dir>`;
+- Android emulator, phone, headset: `adb exec-out run-as <package> tar c files/tuile-logs`
+  (a debuggable build);
+- live, during a run: the control socket's `budget()`, through `adb forward` or the
+  simulator's loopback.
+
+The harness reads the pulled files with the reader the headless tests use, so a device run
+is judged by the same assertions.
