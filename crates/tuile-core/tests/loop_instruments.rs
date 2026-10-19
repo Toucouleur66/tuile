@@ -8,10 +8,12 @@
 //! to them while this one is counting. Here nothing else runs, so the counts
 //! can be compared for equality rather than bounded.
 //!
-//! What it pins down is the loop **as it is**: every arrival is handled on its
-//! own and buys its own pass. A loop that coalesced arrivals would make
-//! `arrivals_per_pass` exceed one and `traversals` fall below the arrivals —
-//! and this test is where that change has to announce itself.
+//! What it pins down is the loop **as it is**: every arrival is waited on
+//! once, and arrivals that are ready together share one pass — a tile and its
+//! siblings answered from disk land on the same turn, so `arrivals_per_pass`
+//! exceeds one and `traversals` falls below the arrivals. Before arrivals were
+//! coalesced each one bought its own pass (1/1, and traversals = arrivals + 1);
+//! this test is where that change announced itself.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -124,7 +126,7 @@ fn near_view() -> ViewState {
 }
 
 #[test]
-fn every_arrival_is_waited_on_once_and_buys_its_own_pass() {
+fn every_arrival_is_waited_on_once_and_siblings_share_a_pass() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = Config {
         pinned_level: None,
@@ -172,22 +174,21 @@ fn every_arrival_is_waited_on_once_and_buys_its_own_pass() {
         arrived,
         "arrival_wait must count each handled completion once"
     );
-    // ... and bought a pass of its own: one arrival per pass, never more.
+    // ... and counted in exactly one pass, which siblings ready together share.
     let per_pass = &m.arrivals_per_pass;
-    assert_eq!(
-        per_pass.count(),
-        arrived,
-        "one arrival-provoked pass per arrival"
+    assert_eq!(per_pass.sum(), arrived, "every arrival is in one pass");
+    assert!(
+        per_pass.count() < arrived,
+        "{} passes for {arrived} arrivals: siblings were not coalesced",
+        per_pass.count()
     );
-    assert_eq!(per_pass.sum(), arrived);
-    assert_eq!(
-        per_pass.peak(),
-        1,
-        "no pass answers more than one arrival today"
+    assert!(
+        per_pass.peak() > 1,
+        "no pass answered more than one arrival"
     );
 
     // The passes are those, plus the one the camera asked for.
-    assert_eq!(m.traversals.get(), arrived + 1);
+    assert_eq!(m.traversals.get(), per_pass.count() + 1);
     assert_eq!(m.traversal_seconds.count(), m.traversals.get());
     // Every pass ends with a Select, and each is timed.
     assert_eq!(m.select_seconds.count(), m.traversals.get());
