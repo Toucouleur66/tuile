@@ -26,10 +26,8 @@
 //! - [`drive`] — render-agnostic consumer driving (progressive + bulk)
 //! - [`fetch`] — abstract byte source ([`fetch::FsFetcher`], `HttpFetcher`)
 //! - [`budget`] — the graphics budget: pure, deterministic GPU residency decisions
-//! - [`cache`] — resident-content LRU under a byte budget
 
 pub mod budget;
-pub mod cache;
 pub mod content;
 pub mod determinism;
 pub mod drive;
@@ -52,14 +50,16 @@ pub mod tiles3d;
 pub mod tileset;
 pub mod traversal;
 
-pub use content::{ContentFormat, DecodedTileContent, TileContent};
+pub use content::{ContentFormat, DecodedTileContent, DrapeContent, TileContent};
 pub use drive::{drive_until_complete, BulkFrame, SceneState};
-pub use protocol::{ClientMessage, GeometryStream, InProcessStream, ServerMessage};
+pub use protocol::{
+    ClientMessage, GeometryStream, InProcessStream, ResourceContent, ServerMessage,
+};
 pub use report::GeometryReport;
-pub use runtime::{in_process, in_process_with, GeometryServer};
+pub use runtime::{in_process, in_process_with, Clock, GeometryServer, SharedMeter};
 pub use source::{
-    CompositeLoader, CompositeTileTree, LoadError, Loaded, TileId, TileLoader, TileProperties,
-    TileTree,
+    CompositeLoader, CompositeTileTree, DrapeReach, LoadError, Loaded, TileId, TileLoader,
+    TileProperties, TileTree,
 };
 pub use tiles3d::{SharedTileset, TilesetLoader, TilesetTree};
 pub use tileset::Tileset;

@@ -24,7 +24,7 @@ use std::collections::HashSet;
 
 use glam::{dvec2, dvec3};
 use tuile_core::tileset::Tileset;
-use tuile_core::traversal::{traverse, Config, ResidencyView, TraversalOutput, ViewState};
+use tuile_core::traversal::{traverse, Config, ResidentSet, TraversalOutput, ViewState};
 use url::Url;
 
 /// Deux branches que la caméra frôle, et une tour qu'elle regarde.
@@ -106,7 +106,7 @@ fn pass(ts: &Tileset, x: f64) -> TraversalOutput {
     let mut out = TraversalOutput::default();
     traverse(
         ts,
-        &ResidencyView::default(),
+        &ResidentSet::default(),
         &[looking_down_from(x)],
         &config,
         0,

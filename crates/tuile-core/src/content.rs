@@ -148,6 +148,74 @@ impl DecodedTileContent {
     }
 }
 
+/// The vertex a consumer uploads per position: position, normal and uv, as
+/// f32 — what the cost estimator charges per vertex.
+pub const VERTEX_STRIDE: u64 = 32;
+
+impl DecodedTileContent {
+    /// What this content costs a consumer that uploads it, by the budget's
+    /// shared estimator: its meshes interleaved (with the CPU copy a consumer
+    /// keeps for stitching), its per-tile uniform, and the textures it owns
+    /// with their mip chains. Draped imagery is a resource of its own
+    /// ([`DrapeContent`]) and is not counted here.
+    pub fn cost(&self) -> crate::budget::cost::Cost {
+        use crate::budget::cost::{drape_cost, mesh_cost, TextureFormat};
+        let vertices: u64 = self.meshes.iter().map(|m| m.positions.len() as u64).sum();
+        let indices: u64 = self.meshes.iter().map(|m| m.indices.len() as u64).sum();
+        let mut cost = mesh_cost(vertices, VERTEX_STRIDE, indices, true);
+        for t in &self.textures {
+            let c = drape_cost(t.width, t.height, TextureFormat::Rgba8);
+            cost.gpu = cost.gpu.plus(c.gpu);
+            cost.staging = cost.staging.plus(c.staging);
+        }
+        cost
+    }
+}
+
+/// One tile's imagery of one layer at one level: a drape, a resource of its
+/// own beside the tile's mesh (D-A2), so imagery sharpens and coarsens
+/// without the mesh being sent again (I10).
+///
+/// The imagery tiles it is made of are placed in the tile's own uv square,
+/// in stacking order: a coarse floor that covers the whole tile first, then
+/// the mosaic of the level asked for, each masked to its own coverage. A
+/// consumer drapes them over the tile's mesh, or over a descendant's through
+/// a [`UvTransform`](crate::budget::UvTransform) when the descendant's own
+/// drape is not drawable yet.
+#[derive(Debug, Clone)]
+pub struct DrapeContent {
+    /// The layer it is of.
+    pub layer: crate::budget::LayerId,
+    /// The budget's imagery level it was composed at.
+    pub level: u32,
+    /// The imagery tiles, placed in the tile's uv square, in stacking order.
+    pub tiles: Vec<crate::raster::ImageryLayer>,
+    /// How many of [`Self::tiles`], from the first, are the coarse floor
+    /// under the mosaic: shared by every drape over a region, and not
+    /// charged to this one.
+    pub floor_tiles: usize,
+    /// What makes it different from another: see
+    /// [`crate::raster::drape_identity`].
+    pub identity: u64,
+}
+
+impl DrapeContent {
+    /// What it costs a consumer: each imagery tile of the mosaic with its
+    /// mip chain, the shared floor excepted. An imagery tile two drapes share
+    /// is charged to both — an over-estimate, never an under-estimate.
+    pub fn cost(&self) -> crate::budget::cost::Cost {
+        use crate::budget::cost::{drape_cost, Cost, TextureFormat};
+        self.tiles
+            .iter()
+            .skip(self.floor_tiles)
+            .map(|t| drape_cost(t.texture.width, t.texture.height, TextureFormat::Rgba8))
+            .fold(Cost::default(), |a, c| Cost {
+                gpu: a.gpu.plus(c.gpu),
+                staging: a.staging.plus(c.staging),
+            })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DecodedMesh {
     pub positions: Vec<[f32; 3]>,

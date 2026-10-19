@@ -300,7 +300,7 @@ impl Budget {
     }
 
     // 1. Arrivals.
-    fn apply_events(&mut self, now: Micros, st: &mut BudgetStats) {
+    pub(super) fn apply_events(&mut self, now: Micros, st: &mut BudgetStats) {
         let mut events = std::mem::take(&mut self.events);
         events.sort();
         for ev in events {
@@ -989,7 +989,7 @@ impl Budget {
     /// The step.
     pub(super) fn step(&mut self, input: FrameInput<'_>) -> Decisions {
         let now = input.now;
-        let mut st = BudgetStats::default();
+        let mut st = std::mem::take(&mut self.pending);
         let mut d = Decisions::default();
         let eff = self.eff();
         for r in std::mem::take(&mut self.ranked_last) {

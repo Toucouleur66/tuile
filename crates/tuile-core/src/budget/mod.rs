@@ -165,6 +165,9 @@ pub struct Budget {
     in_flight: PerClass<u32>,
     local_reads: u32,
     fatal: Option<SessionError>,
+    /// The statistics of arrivals applied ahead of their step
+    /// ([`Budget::apply_arrivals`]), reported by it.
+    pending: BudgetStats,
 }
 
 impl Budget {
@@ -201,6 +204,7 @@ impl Budget {
             in_flight: PerClass::splat(0),
             local_reads: 0,
             fatal: None,
+            pending: BudgetStats::default(),
         })
     }
 
@@ -212,6 +216,18 @@ impl Budget {
     /// One decision step: applies the recorded arrivals, then decides.
     pub fn decide(&mut self, input: FrameInput<'_>) -> Decisions {
         self.step(input)
+    }
+
+    /// Applies the arrivals recorded since the last step now, at `now`, so
+    /// that [`Budget::residency`] answers with them: the step's traversal
+    /// then walks what this step's acknowledgements made drawable, rather
+    /// than what the last step saw. The next [`Budget::decide`] — at the
+    /// same `now` — decides exactly as if it had applied them itself, and
+    /// reports them in its statistics.
+    pub fn apply_arrivals(&mut self, now: Micros) {
+        let mut st = std::mem::take(&mut self.pending);
+        self.apply_events(now, &mut st);
+        self.pending = st;
     }
 
     /// A load finished decoding; `cost` is the estimator's
