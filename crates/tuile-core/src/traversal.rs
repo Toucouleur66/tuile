@@ -23,8 +23,10 @@ pub type FrameNumber = u64;
 /// stereo, multi-viewport): selection is the union over views, priority
 /// takes the best view per tile.
 ///
-/// Symmetric perspective only in v1; orthographic and general projections
-/// are post-v1 constructors.
+/// A symmetric perspective ([`ViewState::perspective`]) or a lens of four
+/// angles ([`ViewState::from_fov`], a headset's asymmetric eye), with a
+/// scale factor ([`ViewState::with_scale`]); orthographic projections are
+/// post-v1 constructors.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(from = "ViewStateParams", into = "ViewStateParams")]
 pub struct ViewState {
@@ -33,12 +35,54 @@ pub struct ViewState {
     up: DVec3,
     viewport_px: DVec2,
     fovy_rad: f64,
+    /// The four angles of a lens built by [`ViewState::from_fov`]; `None`
+    /// for a symmetric perspective.
+    fov: Option<Fov>,
+    /// Physical pixels per logical point.
+    scale: f64,
     // Derived at construction (like the reference implementations).
     frustum: Frustum,
+    /// The focal's numerator in physical pixels: the viewport's height for a
+    /// symmetric perspective, the sharper axis's pixels per tangent for a
+    /// lens of four angles (whose denominator is then 1).
+    sse_numerator_px: f64,
     sse_denominator: f64,
 }
 
+/// A lens's field of view as four angles, radians, OpenXR's convention:
+/// `left` and `down` negative, `right` and `up` positive (spec §13.1).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Fov {
+    /// The left edge, negative.
+    pub left: f64,
+    /// The right edge, positive.
+    pub right: f64,
+    /// The top edge, positive.
+    pub up: f64,
+    /// The bottom edge, negative.
+    pub down: f64,
+}
+
+impl Fov {
+    /// The symmetric lens of a vertical field of view and an aspect
+    /// (width over height).
+    pub fn symmetric(fovy_rad: f64, aspect: f64) -> Fov {
+        let half = fovy_rad / 2.0;
+        let side = (aspect * half.tan()).atan();
+        Fov {
+            left: -side,
+            right: side,
+            up: half,
+            down: -half,
+        }
+    }
+}
+
 /// The serializable construction parameters of a [`ViewState`].
+///
+/// A symmetric perspective at scale 1 only, today: a lens of four angles
+/// travels as its vertical extent, and its scale is not carried. The wire
+/// form of an asymmetric eye comes with the protocol of spec §15.2.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ViewStateParams {
     pub position: DVec3,
@@ -130,9 +174,73 @@ impl ViewState {
             up,
             viewport_px,
             fovy_rad,
+            fov: None,
+            scale: 1.0,
             frustum: Frustum::from_view_proj(&(proj * view)),
+            sse_numerator_px: viewport_px.y,
             sse_denominator: 2.0 * (fovy_rad / 2.0).tan(),
         }
+    }
+
+    /// A view through a lens of four angles (D-A7): a headset's eye, whose
+    /// frustum is not symmetric. Stub: the vertical extent only.
+    pub fn from_fov(
+        position: DVec3,
+        direction: DVec3,
+        up: DVec3,
+        viewport_px: DVec2,
+        fov: Fov,
+    ) -> Self {
+        let direction = direction.normalize();
+        let up = up.normalize();
+        let view = DMat4::look_to_rh(position, direction, up);
+        // Each angle is widened by the culling margin, as `perspective`
+        // widens its field of view; the focal below is not.
+        let limit = std::f64::consts::FRAC_PI_2 * 0.98;
+        let widened = |a: f64| (a * (1.0 + CULL_MARGIN)).clamp(-limit, limit).tan();
+        let proj = off_center_rh(
+            widened(fov.left),
+            widened(fov.right),
+            widened(fov.down),
+            widened(fov.up),
+            0.05,
+            1.0e10,
+        );
+        // The focal of the sharper axis, so that neither is under-refined.
+        let across = viewport_px.x / (fov.right.tan() - fov.left.tan());
+        let high = viewport_px.y / (fov.up.tan() - fov.down.tan());
+        Self {
+            position,
+            direction,
+            up,
+            viewport_px,
+            fovy_rad: fov.up - fov.down,
+            fov: Some(fov),
+            scale: 1.0,
+            frustum: Frustum::from_view_proj(&(proj * view)),
+            sse_numerator_px: across.max(high),
+            sse_denominator: 1.0,
+        }
+    }
+
+    /// The same view on a display of `scale` physical pixels per logical
+    /// point (a browser's `devicePixelRatio`, a phone's 3): the focal, and
+    /// so the screen-space error, is counted in logical pixels (D-L1), so a
+    /// scale change at constant logical size changes no need. 1 by default.
+    pub fn with_scale(mut self, scale: f64) -> Self {
+        self.scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
+        self
+    }
+
+    /// The focal length in logical pixels per unit of tangent (spec §13.2):
+    /// `max(w / (tan r − tan l), h / (tan u − tan d)) / scale`; for a
+    /// symmetric perspective, `h / (2 tan(fovy / 2)) / scale`.
+    pub fn focal_px(&self) -> f64 {
+        self.sse_numerator_px / self.scale / self.sse_denominator
     }
 
     pub fn position(&self) -> DVec3 {
@@ -155,8 +263,29 @@ impl ViewState {
     /// camera inside the bounding volume sees a huge-but-finite error and
     /// always refines.
     pub fn screen_space_error(&self, geometric_error: f64, distance: f64) -> f64 {
-        (geometric_error * self.viewport_px.y) / (distance.max(1e-7) * self.sse_denominator)
+        // At scale 1 the division is exact: a symmetric view's error is the
+        // same, bit for bit, as before lenses had a scale.
+        (geometric_error * (self.sse_numerator_px / self.scale))
+            / (distance.max(1e-7) * self.sse_denominator)
     }
+}
+
+/// A right-handed off-centre perspective projection, depth 0..1, from the
+/// tangents of its four edges (`left` and `bottom` negative): the
+/// asymmetric generalisation of `DMat4::perspective_rh`.
+fn off_center_rh(left: f64, right: f64, bottom: f64, top: f64, near: f64, far: f64) -> DMat4 {
+    let r = far / (near - far);
+    DMat4::from_cols(
+        glam::DVec4::new(2.0 / (right - left), 0.0, 0.0, 0.0),
+        glam::DVec4::new(0.0, 2.0 / (top - bottom), 0.0, 0.0),
+        glam::DVec4::new(
+            (right + left) / (right - left),
+            (top + bottom) / (top - bottom),
+            r,
+            -1.0,
+        ),
+        glam::DVec4::new(0.0, 0.0, r * near, 0.0),
+    )
 }
 
 /// Selection configuration. Names and defaults follow the reference
@@ -771,7 +900,7 @@ pub struct NearestContent {
 
 #[derive(Debug, PartialEq)]
 struct NearestContentKey {
-    views: Vec<[u64; 12]>,
+    views: Vec<[u64; 17]>,
     roots: Vec<TileId>,
     revision: u64,
 }
@@ -802,7 +931,15 @@ impl NearestContent {
 
 /// A view's construction parameters, bit for bit. Everything else in a
 /// [`ViewState`] is derived from them.
-fn view_bits(v: &ViewState) -> [u64; 12] {
+fn view_bits(v: &ViewState) -> [u64; 17] {
+    let fov = v.fov.map_or([0; 4], |f| {
+        [
+            f.left.to_bits(),
+            f.right.to_bits(),
+            f.up.to_bits(),
+            f.down.to_bits(),
+        ]
+    });
     [
         v.position.x.to_bits(),
         v.position.y.to_bits(),
@@ -816,6 +953,11 @@ fn view_bits(v: &ViewState) -> [u64; 12] {
         v.viewport_px.x.to_bits(),
         v.viewport_px.y.to_bits(),
         v.fovy_rad.to_bits(),
+        v.scale.to_bits(),
+        fov[0],
+        fov[1],
+        fov[2],
+        fov[3],
     ]
 }
 
@@ -2906,6 +3048,133 @@ mod tests {
         assert!(inside.is_finite() && inside > 1e9);
         // ge = 0 → sse = 0 at any distance.
         assert_eq!(v.screen_space_error(0.0, 0.0), 0.0);
+    }
+
+    /// The left eye of the simulation's headset (spec §13.1): representative
+    /// angles, not a device's.
+    fn headset_left() -> Fov {
+        Fov {
+            left: (-52f64).to_radians(),
+            right: 44f64.to_radians(),
+            up: 47f64.to_radians(),
+            down: (-53f64).to_radians(),
+        }
+    }
+
+    fn eye(position: DVec3, viewport: DVec2, fov: Fov) -> ViewState {
+        ViewState::from_fov(
+            position,
+            dvec3(0.0, 0.0, -1.0),
+            dvec3(0.0, 1.0, 0.0),
+            viewport,
+            fov,
+        )
+    }
+
+    /// Spec §13.2, D-A7: a lens of four angles culls by those four angles,
+    /// each widened by the culling margin, not by a symmetric cone: a
+    /// headset's left eye sees further left than right, and further down
+    /// than up.
+    #[test]
+    fn an_asymmetric_view_culls_by_its_four_angles() {
+        let v = eye(DVec3::ZERO, dvec2(2000.0, 2000.0), headset_left());
+        // Right is +x, up is +y, forward is −z.
+        let sees = |yaw_deg: f64, pitch_deg: f64| {
+            let (y, p) = (yaw_deg.to_radians(), pitch_deg.to_radians());
+            let dir = dvec3(y.sin() * p.cos(), p.sin(), -y.cos() * p.cos());
+            v.frustum().intersects_sphere(&crate::math::Sphere {
+                center: dir * 100.0,
+                radius: 0.01,
+            })
+        };
+        // Widened by a quarter: left 65°, right 55°, up 58.75°, down 66.25°.
+        assert!(sees(-60.0, 0.0), "60° left is inside the left edge");
+        assert!(!sees(60.0, 0.0), "60° right is outside the right edge");
+        assert!(sees(0.0, -62.0), "62° down is inside the bottom edge");
+        assert!(!sees(0.0, 62.0), "62° up is outside the top edge");
+        assert!(sees(0.0, 0.0) && !sees(180.0, 0.0), "ahead in, behind out");
+    }
+
+    /// Spec §13.2: the focal is the sharper axis's, in logical pixels,
+    /// `max(w / (tan r − tan l), h / (tan u − tan d)) / scale`; for a
+    /// symmetric lens at scale 1 it is today's `h / (2 tan(fovy / 2))`,
+    /// and the screen-space error follows it.
+    #[test]
+    fn the_focal_is_the_sharper_axis_in_logical_pixels() {
+        let fovy = std::f64::consts::FRAC_PI_3;
+        let sym = ViewState::perspective(
+            DVec3::ZERO,
+            dvec3(0.0, 0.0, -1.0),
+            dvec3(0.0, 1.0, 0.0),
+            dvec2(1920.0, 1080.0),
+            fovy,
+        );
+        assert_eq!(sym.focal_px(), 1080.0 / (2.0 * (fovy / 2.0).tan()));
+        let fov = headset_left();
+        let across = |w: f64| w / (fov.right.tan() - fov.left.tan());
+        let high = |h: f64| h / (fov.up.tan() - fov.down.tan());
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9 * b.abs().max(1.0);
+        // Square pixels, a lens wider than tall: the horizontal axis.
+        let v = eye(DVec3::ZERO, dvec2(2000.0, 2000.0), fov);
+        assert!(close(v.focal_px(), across(2000.0)), "{}", v.focal_px());
+        assert!(across(2000.0) > high(2000.0));
+        // Fewer pixels across: the vertical axis is the sharper one.
+        let v = eye(DVec3::ZERO, dvec2(1000.0, 2000.0), fov);
+        assert!(close(v.focal_px(), high(2000.0)), "{}", v.focal_px());
+        // Logical pixels: twice the density, the same focal.
+        let dense = eye(DVec3::ZERO, dvec2(4000.0, 4000.0), fov).with_scale(2.0);
+        assert!(close(dense.focal_px(), across(2000.0)));
+        // The screen-space error follows the focal.
+        assert!(close(
+            dense.screen_space_error(10.0, 100.0),
+            10.0 * dense.focal_px() / 100.0
+        ));
+    }
+
+    /// I16, spec §13.3: two eyes give one selection. A tile both see is
+    /// selected once, with the larger of the two eyes' errors, and requested
+    /// once.
+    #[test]
+    fn two_eyes_list_a_shared_tile_once_with_its_largest_need() {
+        let ts = mini_tileset();
+        let root = ts.root();
+        let mut residency = ResidencyView::default();
+        residency.insert(root);
+        let left = eye(
+            dvec3(-3.0, 0.0, 150.0),
+            dvec2(2000.0, 2000.0),
+            headset_left(),
+        );
+        let mirrored = Fov {
+            left: -headset_left().right,
+            right: -headset_left().left,
+            ..headset_left()
+        };
+        let right = eye(dvec3(3.0, 0.0, 90.0), dvec2(2000.0, 2000.0), mirrored);
+        let sse = |o: &TraversalOutput| -> Vec<f64> {
+            o.selected
+                .iter()
+                .filter(|(t, _)| *t == root)
+                .map(|(_, s)| *s)
+                .collect()
+        };
+        let (l, r) = (
+            run(&ts, &residency, &[left]),
+            run(&ts, &residency, &[right]),
+        );
+        let both = run(&ts, &residency, &[left, right]);
+        assert_eq!(sse(&both).len(), 1, "the shared tile is listed once");
+        assert!(
+            sse(&l)[0] != sse(&r)[0],
+            "the eyes disagree, or this proves nothing"
+        );
+        assert_eq!(sse(&both)[0], sse(&l)[0].max(sse(&r)[0]));
+        let mut asked: Vec<TileId> = both.requests.iter().map(|q| q.tile).collect();
+        let n = asked.len();
+        asked.sort();
+        asked.dedup();
+        assert_eq!(asked.len(), n, "each tile requested once");
+        assert!(n > 0, "the shared tile's children are wanted");
     }
 
     #[test]
