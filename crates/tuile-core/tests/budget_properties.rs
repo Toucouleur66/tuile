@@ -132,7 +132,8 @@ struct Record {
     network_after: BTreeMap<Class, usize>,
     /// The (resource, generation) results the harness reported fresh.
     fresh: BTreeSet<(ResourceId, Generation)>,
-    /// Whether the floor (the root) was drawable before the step.
+    /// Whether the floor (the root's mesh and drape) was drawable before
+    /// the step.
     floor_in: bool,
     /// Stored resources at the step.
     stored: BTreeSet<ResourceId>,
@@ -192,7 +193,9 @@ impl Harness {
                     let need = view(seed, permute);
                     let gpu_before = self.gpu.clone();
                     let transit_before: BTreeSet<_> = self.delivered.keys().copied().collect();
-                    let floor_in = self.gpu.contains(&ResourceId::Mesh(t(0, 0, 0)));
+                    // The floor (D-A1): the root's mesh and its drape.
+                    let floor_in = self.gpu.contains(&ResourceId::Mesh(t(0, 0, 0)))
+                        && self.gpu.contains(&dr(t(0, 0, 0), 0));
                     let input =
                         FrameInput::new(self.frame, self.now, &need).with_presence(&self.store);
                     let d = self.b.decide(input);

@@ -1421,7 +1421,6 @@ mod upload {
     /// mesh, loaded first, waits for its drape, and both are delivered and
     /// uploaded together.
     #[test]
-    #[ignore = "red until every drawn item wears its drapes (D-A1)"]
     fn a_floor_mesh_and_its_drape_upload_as_one_group() {
         let mut c = Rig::interactive_config();
         c.pinned_level = Some(0);
@@ -1682,7 +1681,6 @@ mod draw {
     /// a floor mesh whose drape is not drawable is not drawn bare, and the
     /// floor is in only once both are.
     #[test]
-    #[ignore = "red until every drawn item wears its drapes (D-A1)"]
     fn the_floor_is_drawn_only_with_its_drape() {
         let mut c = Rig::interactive_config();
         c.pinned_level = Some(0);
@@ -1711,7 +1709,6 @@ mod draw {
     /// bare: a deep tile whose mesh and drape arrived first is not drawn
     /// while the floor elsewhere is still missing.
     #[test]
-    #[ignore = "red until every drawn item wears its drapes (D-A1)"]
     fn nothing_refines_while_wanted_ground_is_lost_or_bare() {
         let mut c = Rig::interactive_config();
         c.pinned_level = Some(1);
@@ -1781,7 +1778,6 @@ mod draw {
     /// the parent is drawable and dressed: a parent whose mesh arrived
     /// before any drape it could wear does not replace them.
     #[test]
-    #[ignore = "red until every drawn item wears its drapes (D-A1)"]
     fn held_children_go_only_once_the_parent_is_drawable_and_dressed() {
         let mut r = Rig::interactive();
         let p = t(2, 1, 1);

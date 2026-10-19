@@ -355,7 +355,6 @@ fn cold_start_bare(profile: Profile, seed: u64) -> u32 {
     debug_assertions,
     ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
 )]
-#[ignore = "red until every drawn item wears its drapes (D-A1)"]
 fn a_cold_start_draws_no_bare_ground() {
     for (profile, seed) in [
         (Profile::desktop(), 41),

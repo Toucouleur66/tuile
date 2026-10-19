@@ -8,8 +8,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use tuile_core::budget::{
-    Budget, BudgetConfig, BudgetStats, Bytes, Class, Decisions, FrameInput, Generation, Micros,
-    NeedSet, Policy, Pressure, ResourceId, Role, Source, Thermal, TileId,
+    Budget, BudgetConfig, BudgetStats, Bytes, Class, Decisions, FrameInput, Generation, LayerId,
+    Micros, NeedSet, Policy, Pressure, ResourceId, Role, Source, Thermal, TileId,
 };
 
 use super::gpu::SimGpu;
@@ -379,16 +379,34 @@ impl Sim {
         });
         self.last_cam = Some(cam);
         self.last_views = views;
-        self.floor_in = self
-            .gpu
-            .drawable
-            .contains_key(&ResourceId::Mesh(super::world::tile(0, 0, 0)));
+        self.floor_in = self.floor_drawable();
         if self.floor_in && self.floor_at.is_none() {
             self.floor_at = Some(self.now);
         }
         self.now = self.now.plus(self.profile.dt);
         self.frame += 1;
         (need, d)
+    }
+
+    /// The floor is in (P1.1, D-A1): every tile at a level up to the
+    /// pinned one has its mesh and its drape on the GPU.
+    fn floor_drawable(&self) -> bool {
+        let Some(pinned) = self.profile.budget.pinned_level else {
+            return false;
+        };
+        (0..=pinned).all(|l| {
+            let n = 1u64 << l;
+            (0..n).all(|x| {
+                (0..n).all(|y| {
+                    let t = super::world::tile(l, x, y);
+                    self.gpu.drawable.contains_key(&ResourceId::Mesh(t))
+                        && self
+                            .gpu
+                            .drawable
+                            .contains_key(&ResourceId::drape(t, LayerId(0), l))
+                })
+            })
+        })
     }
 
     fn fail(&self, what: &str) -> ! {
@@ -402,6 +420,33 @@ impl Sim {
     fn check(&self, need: &NeedSet, d: &Decisions) {
         let s = &d.stats;
         let cfg = &self.profile.budget;
+        // I1 (D-A1): every drawn item wears its drapes, from the first step.
+        if s.bare != 0 {
+            self.fail(&format!("I1: {} items drawn bare", s.bare));
+        }
+        let draped: BTreeSet<TileId> = need
+            .drawn
+            .iter()
+            .filter(|(_, n)| n.imagery.is_some())
+            .map(|(t, _)| *t)
+            .collect();
+        for i in &d.draw.items {
+            if i.drapes.is_empty() && i.serves.iter().any(|t| draped.contains(t)) {
+                self.fail(&format!("I1: {:?} drawn bare", i.mesh));
+            }
+        }
+        // P4.2: nothing still wanted on screen, or waited on, is evicted.
+        let on_screen: BTreeSet<TileId> = need
+            .drawn
+            .iter()
+            .chain(&need.blockers)
+            .map(|(t, _)| *t)
+            .collect();
+        for e in &d.evict {
+            if matches!(e, ResourceId::Mesh(t) if on_screen.contains(t)) {
+                self.fail(&format!("P4.2: {e:?}, wanted on screen, evicted"));
+            }
+        }
         // I1: once the floor is in, nothing is lost and the ground is covered.
         if self.floor_in {
             if s.lost != 0 {

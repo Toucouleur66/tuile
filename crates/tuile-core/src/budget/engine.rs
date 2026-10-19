@@ -74,6 +74,16 @@ struct TileNeed {
     q: Quantised,
 }
 
+/// The meshes standing for the wanted tiles, before their drapes.
+#[derive(Default)]
+struct Selection {
+    items: BTreeMap<ResourceId, (Role, BTreeSet<TileId>)>,
+    coarsening: BTreeSet<TileId>,
+    exact: u32,
+    fallback: u32,
+    lost: u32,
+}
+
 /// Work on a wanted resource.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Job {
@@ -570,15 +580,46 @@ impl Budget {
             })
     }
 
-    // 3. The draw set.
-    fn build_draw(
+    /// The layers a wanted tile's drape need asks for.
+    fn layers_of(drapes: &BTreeMap<(TileId, LayerId), u32>, t: TileId) -> BTreeSet<LayerId> {
+        drapes.range(tile_layers(t)).map(|((_, l), _)| *l).collect()
+    }
+
+    /// Whether `tile`'s mesh can be drawn dressed for `layers`: each layer
+    /// has a drawable drape on the tile or one of its ancestors, or — a
+    /// layer switch in progress — the mesh still wears a layer it no longer
+    /// needs. A mesh that cannot is not drawn: bare ground is black ground
+    /// (I1, D-A1).
+    fn dressable(&self, tile: TileId, layers: &BTreeSet<LayerId>) -> bool {
+        let missing = layers
+            .iter()
+            .any(|l| self.best_drape_for(tile, *l, 0).is_none());
+        !missing
+            || self
+                .worn_last
+                .get(&ResourceId::Mesh(tile))
+                .into_iter()
+                .flatten()
+                .any(|d| !layers.contains(&d.layer) && self.drawable(d.resource))
+    }
+
+    /// The meshes that stand for the wanted tiles, at levels up to `cap`:
+    /// each tile itself when drawable and dressed; else the finer tiles it
+    /// held last step (zoom-out); else its nearest drawable, dressed
+    /// ancestor.
+    fn select(
         &self,
         tiles: &BTreeMap<TileId, TileNeed>,
         drapes: &BTreeMap<(TileId, LayerId), u32>,
-        st: &mut BudgetStats,
-    ) -> (DrawSet, BTreeSet<TileId>) {
-        let mut items: BTreeMap<ResourceId, (Role, BTreeSet<TileId>)> = BTreeMap::new();
-        let mut coarsening = BTreeSet::new();
+        cap: Option<u32>,
+    ) -> Selection {
+        let mut sel = Selection::default();
+        let shown = |t: TileId, layers: &BTreeSet<LayerId>| {
+            let level = self.tiles.get(&t).map_or(0, |i| i.level);
+            cap.is_none_or(|c| level <= c)
+                && self.drawable(ResourceId::Mesh(t))
+                && self.dressable(t, layers)
+        };
         let add = |items: &mut BTreeMap<ResourceId, (Role, BTreeSet<TileId>)>,
                    t: TileId,
                    role: Role,
@@ -589,41 +630,64 @@ impl Budget {
             e.0 = e.0.min(role);
             e.1.insert(serves);
         };
-        for (t, tn) in tiles
+        for (t, _) in tiles
             .iter()
             .filter(|(_, n)| n.membership == Membership::Drawn)
         {
-            if self.drawable(ResourceId::Mesh(*t)) {
-                add(&mut items, *t, Role::Exact, *t);
-                st.exact += 1;
+            let layers = Self::layers_of(drapes, *t);
+            if shown(*t, &layers) {
+                add(&mut sel.items, *t, Role::Exact, *t);
+                sel.exact += 1;
                 continue;
             }
-            let _ = tn;
             let held: Vec<TileId> = self
                 .held_last
                 .iter()
                 .copied()
-                .filter(|h| self.drawable(ResourceId::Mesh(*h)) && self.is_descendant(*h, *t))
+                .filter(|h| self.is_descendant(*h, *t) && shown(*h, &layers))
                 .collect();
             for h in &held {
-                add(&mut items, *h, Role::Held, *t);
+                add(&mut sel.items, *h, Role::Held, *t);
             }
             if !held.is_empty() {
-                coarsening.insert(*t);
+                sel.coarsening.insert(*t);
             }
-            let anc = self
-                .ancestors(*t)
-                .into_iter()
-                .find(|a| self.drawable(ResourceId::Mesh(*a)));
+            let anc = self.ancestors(*t).into_iter().find(|a| shown(*a, &layers));
             if let Some(a) = anc {
-                add(&mut items, a, Role::Fallback, *t);
+                add(&mut sel.items, a, Role::Fallback, *t);
                 if held.is_empty() {
-                    st.fallback += 1;
+                    sel.fallback += 1;
                 }
             } else if held.is_empty() {
-                st.lost += 1;
+                sel.lost += 1;
             }
         }
+        sel
+    }
+
+    // 3. The draw set.
+    fn build_draw(
+        &self,
+        tiles: &BTreeMap<TileId, TileNeed>,
+        drapes: &BTreeMap<(TileId, LayerId), u32>,
+        floor_in: bool,
+        st: &mut BudgetStats,
+    ) -> (DrawSet, BTreeSet<TileId>) {
+        let mut sel = self.select(tiles, drapes, None);
+        if sel.lost > 0 && !floor_in {
+            // P1.1 (b): coarse ground before any refinement. While wanted
+            // ground is lost and the floor not in, nothing finer than the
+            // floor is drawn.
+            if let Some(p) = self.cfg.pinned_level {
+                sel = self.select(tiles, drapes, Some(p));
+            }
+        }
+        st.exact += sel.exact;
+        st.fallback += sel.fallback;
+        st.lost += sel.lost;
+        let Selection {
+            items, coarsening, ..
+        } = sel;
         let mut out = Vec::new();
         for (mesh, (role, serves)) in items {
             let tile = mesh.tile();
@@ -846,8 +910,8 @@ impl Budget {
         self.apply_events(now, &mut st);
         let tiles = self.read_need(&input, &mut st);
         let drapes = self.drape_needs(&tiles, input.presence);
-        let (draw, coarsening) = self.build_draw(&tiles, &drapes, &mut st);
         st.floor_in = self.floor_in(&tiles);
+        let (draw, coarsening) = self.build_draw(&tiles, &drapes, st.floor_in, &mut st);
         let mut wants = self.wants(&tiles, &drapes, &draw);
         // Drawn content of an older epoch is refreshed, new before old.
         for i in &draw.items {
@@ -1012,10 +1076,29 @@ impl Budget {
             .filter(|j| j.2 == Job::Deliver)
             .copied()
             .collect();
+        let mut floor_groups: BTreeMap<ResourceId, Vec<ResourceId>> = BTreeMap::new();
+        for (t, tn) in &tiles {
+            let Some(img) = tn.need.imagery.as_ref() else {
+                continue;
+            };
+            if !self.is_floor(tn.need.level) {
+                continue;
+            }
+            let mut group = vec![ResourceId::Mesh(*t)];
+            group.extend(
+                layers(img)
+                    .iter()
+                    .map(|r| ResourceId::drape(*t, r.layer, tn.need.level)),
+            );
+            for m in &group {
+                floor_groups.insert(*m, group.clone());
+            }
+        }
         let (blocked, strained) = self.deliver(
             now,
             &eff,
             &delivers,
+            &floor_groups,
             &coarsening,
             &keep,
             &wants,
@@ -1391,88 +1474,135 @@ impl Budget {
         now: Micros,
         eff: &Eff,
         jobs: &[(PriorityKey, ResourceId, Job, Want)],
+        floor_groups: &BTreeMap<ResourceId, Vec<ResourceId>>,
         coarsening: &BTreeSet<TileId>,
         keep: &BTreeSet<ResourceId>,
         wants: &BTreeMap<ResourceId, Want>,
         d: &mut Decisions,
         st: &mut BudgetStats,
     ) -> (bool, bool) {
-        let mut blocked = false;
-        let mut strained = false;
+        let mut flags = (false, false);
         for (_, r, _, w) in jobs {
-            let Some(e) = self.entries.get(r) else {
+            let Some(group) = floor_groups.get(r) else {
+                self.deliver_one(now, eff, *r, w, coarsening, keep, wants, d, st, &mut flags);
                 continue;
             };
-            let class = e.class;
-            let Some(c) = e.fresh_cpu(self.epoch(*r, class)) else {
-                continue;
-            };
-            let credit_ok = self.ledger.in_transit == Bytes::ZERO
-                || self.ledger.in_transit.plus(c.cost.staging) <= self.cfg.delivery_credit;
-            if !credit_ok {
+            // A floor mesh and its drapes are one swap group (D-A1): none
+            // goes until every one is loaded, then they go together.
+            let ready = group.iter().all(|m| {
+                self.entries.get(m).is_some_and(|e| {
+                    e.gpu.is_some()
+                        || e.transit.is_some()
+                        || e.fresh_cpu(self.epoch(*m, e.class)).is_some()
+                })
+            });
+            if !ready {
                 continue;
             }
-            if !eff.batch {
-                let shrinking = matches!(r, ResourceId::Mesh(t) if coarsening.contains(t));
-                let urgent = matches!(w.urgency, Urgency::Floor | Urgency::Hole | Urgency::Drape);
-                let preload = w.urgency >= Urgency::Ring;
-                let limit = if shrinking {
-                    eff.hard[class]
-                } else if urgent {
-                    eff.hard[class].minus(eff.reserve[class])
-                } else if preload {
-                    // Preload only into room the view does not use, and it
-                    // never displaces anything wanted.
-                    eff.target[class].scaled(u64::from(self.cfg.watermarks.low_percent), 100)
-                } else {
-                    eff.target[class].min(eff.hard[class].minus(eff.reserve[class]))
-                };
-                if preload && (strained || blocked) {
-                    continue;
-                }
-                let mut strain = false;
-                let ok = self.make_room(
-                    now,
-                    class,
-                    c.cost.gpu,
-                    limit,
-                    w.urgency,
-                    keep,
-                    wants,
-                    d,
-                    st,
-                    &mut strain,
+            for m in group {
+                let mw = wants.get(m).copied().unwrap_or(*w);
+                self.deliver_one(
+                    now, eff, *m, &mw, coarsening, keep, wants, d, st, &mut flags,
                 );
-                if strain && w.urgency <= Urgency::Blocker {
-                    strained = true;
-                }
-                if !ok {
-                    if urgent || shrinking {
-                        blocked = true;
-                    }
-                    continue;
-                }
             }
-            let reused = c.delivered_before;
-            let Some(e) = self.entries.get_mut(r) else {
-                continue;
-            };
-            self.active.insert(*r);
-            e.put_transit(
-                &mut self.ledger,
-                Transit {
-                    gen: c.gen,
-                    cost: c.cost,
-                    epoch: c.epoch,
-                },
-            );
-            if reused {
-                st.network_bytes_avoided = st.network_bytes_avoided.plus(c.cost.gpu);
-            }
-            st.delivered += 1;
-            d.deliver.push((*r, c.gen));
         }
-        (blocked, strained)
+        flags
+    }
+
+    /// Delivers `r` if it is decoded, not yet on its way, and fits the
+    /// credit and its class's limit. `flags`: (blocked, strained).
+    #[allow(clippy::too_many_arguments)]
+    fn deliver_one(
+        &mut self,
+        now: Micros,
+        eff: &Eff,
+        r: ResourceId,
+        w: &Want,
+        coarsening: &BTreeSet<TileId>,
+        keep: &BTreeSet<ResourceId>,
+        wants: &BTreeMap<ResourceId, Want>,
+        d: &mut Decisions,
+        st: &mut BudgetStats,
+        flags: &mut (bool, bool),
+    ) {
+        let (blocked, strained) = (&mut flags.0, &mut flags.1);
+        let Some(e) = self.entries.get(&r) else {
+            return;
+        };
+        let class = e.class;
+        let epoch = self.epoch(r, class);
+        // Already on its way, or on the GPU at the current epoch (a stale
+        // GPU copy is redelivered: new before old).
+        if e.transit.is_some() || e.gpu.is_some_and(|g| g.epoch == epoch) {
+            return;
+        }
+        let Some(c) = e.fresh_cpu(epoch) else {
+            return;
+        };
+        let credit_ok = self.ledger.in_transit == Bytes::ZERO
+            || self.ledger.in_transit.plus(c.cost.staging) <= self.cfg.delivery_credit;
+        if !credit_ok {
+            return;
+        }
+        if !eff.batch {
+            let shrinking = matches!(r, ResourceId::Mesh(t) if coarsening.contains(&t));
+            let urgent = matches!(w.urgency, Urgency::Floor | Urgency::Hole | Urgency::Drape);
+            let preload = w.urgency >= Urgency::Ring;
+            let limit = if shrinking {
+                eff.hard[class]
+            } else if urgent {
+                eff.hard[class].minus(eff.reserve[class])
+            } else if preload {
+                // Preload only into room the view does not use, and it
+                // never displaces anything wanted.
+                eff.target[class].scaled(u64::from(self.cfg.watermarks.low_percent), 100)
+            } else {
+                eff.target[class].min(eff.hard[class].minus(eff.reserve[class]))
+            };
+            if preload && (*strained || *blocked) {
+                return;
+            }
+            let mut strain = false;
+            let ok = self.make_room(
+                now,
+                class,
+                c.cost.gpu,
+                limit,
+                w.urgency,
+                keep,
+                wants,
+                d,
+                st,
+                &mut strain,
+            );
+            if strain && w.urgency <= Urgency::Blocker {
+                *strained = true;
+            }
+            if !ok {
+                if urgent || shrinking {
+                    *blocked = true;
+                }
+                return;
+            }
+        }
+        let reused = c.delivered_before;
+        let Some(e) = self.entries.get_mut(&r) else {
+            return;
+        };
+        self.active.insert(r);
+        e.put_transit(
+            &mut self.ledger,
+            Transit {
+                gen: c.gen,
+                cost: c.cost,
+                epoch: c.epoch,
+            },
+        );
+        if reused {
+            st.network_bytes_avoided = st.network_bytes_avoided.plus(c.cost.gpu);
+        }
+        st.delivered += 1;
+        d.deliver.push((r, c.gen));
     }
 
     fn plan(
