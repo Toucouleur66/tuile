@@ -174,6 +174,8 @@ pub struct Tileset {
     deferred: bool,
     /// The external tilesets fetched but not yet grafted.
     held: Vec<HeldGraft>,
+    /// How many grafts have changed this arena: its [`TileTree::revision`].
+    grafts: u64,
 }
 
 /// An external tileset waiting for the gap between two passes.
@@ -216,6 +218,7 @@ impl Tileset {
             geometric_error: json.geometric_error,
             deferred: false,
             held: Vec::new(),
+            grafts: 0,
         })
     }
 
@@ -291,6 +294,13 @@ impl TileTree for Tileset {
     /// correct and would climb the whole chain for a number already in hand.
     fn level(&self, id: TileId) -> u32 {
         self.tile(id).depth
+    }
+
+    /// A graft is the only edit an arena ever takes — it adds the external
+    /// root under its host and takes the host's content — so counting them is
+    /// the revision.
+    fn revision(&self) -> Option<u64> {
+        Some(self.grafts)
     }
 }
 
@@ -372,6 +382,7 @@ impl Tileset {
         let h = &mut self.tiles[host.0 as usize];
         h.content = None;
         h.children.push(new_root);
+        self.grafts += 1;
         Ok(new_root)
     }
 }

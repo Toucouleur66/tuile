@@ -175,6 +175,25 @@ pub trait TileTree: Send + Sync {
         Vec::new()
     }
 
+    /// A number that changes whenever any answer of
+    /// [`children`](TileTree::children) or [`properties`](TileTree::properties)
+    /// could, or `None` when the tree cannot say.
+    ///
+    /// The contract is one way: two calls that return the same `Some` value
+    /// promise that every `children` and `properties` answer in between was
+    /// the same. It does not cover [`roots`](TileTree::roots), which callers
+    /// compare themselves. It never goes down, which is what lets a
+    /// composite add its sources' up. A tree that only grows may count its
+    /// edits; a tree whose shape never changes may answer a constant.
+    ///
+    /// What it buys: work that depends on the tree's shape alone can be kept
+    /// from one pass to the next — see [`crate::traversal::NearestContent`].
+    /// Default `None`, which makes that work run again on every pass: always
+    /// right, only slower. Answer `Some` only when it is true.
+    fn revision(&self) -> Option<u64> {
+        None
+    }
+
     /// How deep this tile sits, roots at 0.
     ///
     /// **Only the tree can answer this, and that is the whole point.** A
@@ -331,6 +350,16 @@ impl TileTree for CompositeTileTree {
         for source in &self.sources {
             source.defer_edits();
         }
+    }
+
+    /// The sum of the sources' revisions, when every source has one.
+    ///
+    /// A sum, because revisions only move forward: any source's moving moves
+    /// it. One source that cannot say makes the whole composite unable to.
+    fn revision(&self) -> Option<u64> {
+        self.sources
+            .iter()
+            .try_fold(0u64, |sum, s| Some(sum.wrapping_add(s.revision()?)))
     }
 
     fn apply_deferred_edits(&self) -> Vec<(TileId, String)> {

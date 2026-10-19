@@ -159,6 +159,16 @@ impl TileTree for TerrainTree {
         Vec::new()
     }
 
+    /// The quadtree's shape never changes: `children` is all four down to
+    /// `max_level`, and `properties` is the tile's rectangle over a fixed
+    /// height range. Neither reads the availability, which only decides
+    /// whether a tile has data of its own or is built from its ancestor's —
+    /// so the reveals that grow it as tiles land leave this constant. The
+    /// roots do read it, and the contract leaves those to the caller.
+    fn revision(&self) -> Option<u64> {
+        Some(0)
+    }
+
     /// The planet, as the largest sphere that fits inside it.
     ///
     /// A quadtree over the whole ellipsoid is the one dataset where most of
@@ -315,6 +325,60 @@ mod tests {
         // And the trait object forwards to the same.
         boxed.defer_edits();
         assert!(boxed.apply_deferred_edits().is_empty());
+    }
+
+    /// The revision is a promise that `children` and `properties` have not
+    /// moved, and a reveal is the one thing that happens to this tree while a
+    /// session runs. So: reveal a whole level's worth of descendants, and
+    /// every answer below the roots must be what it was — down to the bits of
+    /// the bounding volume.
+    #[test]
+    fn a_reveal_leaves_the_shape_the_revision_vouches_for() {
+        let layer = LayerJson::from_slice(
+            br#"{ "format": "quantized-mesh-1.0", "tiles": ["{z}/{x}/{y}.terrain"],
+                  "maxzoom": 10, "metadataAvailability": 10,
+                  "available": [[{"startX":0,"startY":0,"endX":1,"endY":0}]] }"#,
+        )
+        .expect("layer");
+        let tree = TerrainTree::new(layer);
+        let tiles = [
+            TileId::from_terrain(0, 0, 0),
+            TileId::from_terrain(1, 3, 1),
+            TileId::from_terrain(2, 5, 2),
+            TileId::from_terrain(6, 40, 20),
+        ];
+        let shape = |tree: &TerrainTree| {
+            tiles
+                .iter()
+                .map(|&t| format!("{:?} {:?}", tree.children(t), tree.properties(t)))
+                .collect::<Vec<_>>()
+        };
+        let before = (tree.revision(), shape(&tree));
+        let revealed = TileCoord::new(2, 5, 2);
+        assert!(!tree.availability().is_available(revealed));
+        tree.availability().add_descendant_ranges(
+            0,
+            &[
+                vec![crate::layer::AvailabilityRange {
+                    start_x: 0,
+                    start_y: 0,
+                    end_x: 3,
+                    end_y: 1,
+                }],
+                vec![crate::layer::AvailabilityRange {
+                    start_x: 0,
+                    start_y: 0,
+                    end_x: 7,
+                    end_y: 3,
+                }],
+            ],
+        );
+        assert!(
+            tree.availability().is_available(revealed),
+            "the reveal did nothing, so this test proves nothing"
+        );
+        assert_eq!((tree.revision(), shape(&tree)), before);
+        assert!(before.0.is_some(), "a terrain tree vouches for its shape");
     }
 
     #[test]

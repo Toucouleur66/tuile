@@ -526,13 +526,43 @@ pub struct TraversalOutput {
 ///
 /// `_frame` is reserved for history-dependent refinements (LOD fades);
 /// injecting it keeps tests deterministic (no clocks in the core).
+///
+/// The reference pass: every scene-wide number is worked out from scratch.
+/// A session that traverses again and again keeps a [`NearestContent`] and
+/// calls [`traverse_with`] instead, which selects exactly the same tiles.
 pub fn traverse(
+    tree: &dyn TileTree,
+    residency: &ResidencyView,
+    views: &[ViewState],
+    config: &Config,
+    frame: FrameNumber,
+    rendered_last: &HashSet<TileId>,
+    out: &mut TraversalOutput,
+) {
+    traverse_with(
+        tree,
+        residency,
+        views,
+        config,
+        frame,
+        rendered_last,
+        &mut NearestContent::default(),
+        out,
+    );
+}
+
+/// [`traverse`], with the nearest-content distance carried over from the
+/// previous pass when nothing it depends on has changed. See
+/// [`NearestContent`].
+#[allow(clippy::too_many_arguments)]
+pub fn traverse_with(
     tree: &dyn TileTree,
     residency: &ResidencyView,
     views: &[ViewState],
     config: &Config,
     _frame: FrameNumber,
     rendered_last: &HashSet<TileId>,
+    near: &mut NearestContent,
     out: &mut TraversalOutput,
 ) {
     out.selected.clear();
@@ -546,7 +576,7 @@ pub fn traverse(
 
     let uniform_distance = config
         .uniform_detail
-        .then(|| nearest_content_distance(tree, views));
+        .then(|| near.distance(tree, views, &roots));
     let occluder = config.horizon_culling.then(|| tree.occluder()).flatten();
     // The two scene-wide numbers every per-tile decision below is measured
     // against. `d_near` walks the tree to find the deepest content on the
@@ -685,6 +715,92 @@ fn nearest_content_distance(tree: &dyn TileTree, views: &[ViewState]) -> f64 {
         }
     }
     best.max(1.0)
+}
+
+/// The nearest-content distance of an earlier pass, kept while every input
+/// to it is unchanged.
+///
+/// # Why
+///
+/// [`Config::uniform_detail`] prices the whole pass at one distance, found by
+/// a descent along the line of sight that follows every branch the ray enters
+/// (`deepest_content_along`). On a terrain globe that descent goes down to
+/// the deepest level the tree allows, and it is most of what a pass costs:
+/// measured on a local bake (`docs/explorations/incremental-traversal.md`),
+/// 1.6 ms of a 1.8 ms traversal, against 0.2 ms for the walk that actually
+/// selects. A bake answers about fourteen arrivals per frame with the camera
+/// standing still, and every one of those passes repeated the same descent
+/// and found the same number.
+///
+/// # Why the answer is the same
+///
+/// The descent reads the views' positions and directions, the tree's roots,
+/// and `children` and `properties` along the way. Nothing else: not the
+/// residency, not the previous selection, not the clock. So it is a function
+/// of `(views, roots, the tree's shape)`, and the same inputs give the same
+/// bits. The views are compared bit for bit, the roots as a list, and the
+/// tree's shape through [`TileTree::revision`]. A tree that cannot vouch for
+/// its shape answers `None` there, and pays for the descent on every pass, as
+/// every tree did before.
+#[derive(Debug, Default)]
+pub struct NearestContent {
+    /// What the kept distance was computed from; `None` until the first
+    /// descent, and after a pass whose tree gave no revision.
+    key: Option<NearestContentKey>,
+    distance: f64,
+    /// How many descents were actually run, for the tests that check the
+    /// memo is used at all.
+    descents: u64,
+}
+
+#[derive(Debug, PartialEq)]
+struct NearestContentKey {
+    views: Vec<[u64; 12]>,
+    roots: Vec<TileId>,
+    revision: u64,
+}
+
+impl NearestContent {
+    /// The distance [`nearest_content_distance`] would give for these views
+    /// over this tree, worked out again only when an input has changed.
+    fn distance(&mut self, tree: &dyn TileTree, views: &[ViewState], roots: &[TileId]) -> f64 {
+        let key = tree.revision().map(|revision| NearestContentKey {
+            views: views.iter().map(view_bits).collect(),
+            roots: roots.to_vec(),
+            revision,
+        });
+        if key.is_some() && key == self.key {
+            return self.distance;
+        }
+        self.distance = nearest_content_distance(tree, views);
+        self.descents += 1;
+        self.key = key;
+        self.distance
+    }
+
+    /// How many descents this memo has run.
+    pub fn descents(&self) -> u64 {
+        self.descents
+    }
+}
+
+/// A view's construction parameters, bit for bit. Everything else in a
+/// [`ViewState`] is derived from them.
+fn view_bits(v: &ViewState) -> [u64; 12] {
+    [
+        v.position.x.to_bits(),
+        v.position.y.to_bits(),
+        v.position.z.to_bits(),
+        v.direction.x.to_bits(),
+        v.direction.y.to_bits(),
+        v.direction.z.to_bits(),
+        v.up.x.to_bits(),
+        v.up.y.to_bits(),
+        v.up.z.to_bits(),
+        v.viewport_px.x.to_bits(),
+        v.viewport_px.y.to_bits(),
+        v.fovy_rad.to_bits(),
+    ]
 }
 
 /// How far the descent will follow a ray before giving up. Deeper than any
@@ -1720,6 +1836,216 @@ mod tests {
             "the interactive limit no longer makes arrival rate matter — this \
              test can no longer tell whether the render's setting does anything"
         );
+    }
+
+    /// Two passes are the same pass: same tiles drawn in the same order with
+    /// the same errors, same requests in the same order, same holds, same
+    /// counts.
+    fn assert_same_pass(kept: &TraversalOutput, fresh: &TraversalOutput, at: &str) {
+        assert_eq!(kept.selected, fresh.selected, "{at}: selection");
+        assert_eq!(kept.requests, fresh.requests, "{at}: requests");
+        assert_eq!(kept.awaiting, fresh.awaiting, "{at}: awaiting");
+        assert_eq!(kept.stats, fresh.stats, "{at}: stats");
+    }
+
+    /// **A distance kept from the last pass selects exactly what a fresh
+    /// descent selects.**
+    ///
+    /// The session's loop, both ways at once: a camera that stands still for
+    /// a dozen arrivals, then moves, five times over. Every pass is run twice
+    /// — once from scratch ([`traverse`], the reference) and once with the
+    /// session's [`NearestContent`] — and the two must agree to the bit, from
+    /// the first pass to convergence. Tiles land four at a time, so the
+    /// residency and the previous selection both change under a still camera,
+    /// which is what the memo must not be fooled by.
+    ///
+    /// And the memo must actually be used: one descent per camera, not one
+    /// per pass. The cameras are far enough apart that their distances
+    /// differ, so a memo that ignored the camera would hand the wrong one to
+    /// the next pass and the comparison would catch it.
+    #[test]
+    fn a_kept_distance_selects_what_a_fresh_descent_selects() {
+        let ts = deep_tileset(5);
+        let config = Config {
+            uniform_detail: true,
+            ..Config::default()
+        };
+        let tilted = ViewState::perspective(
+            dvec3(40.0, -30.0, 90.0),
+            dvec3(-0.3, 0.2, -1.0),
+            dvec3(0.0, 1.0, 0.0),
+            dvec2(1024.0, 768.0),
+            std::f64::consts::FRAC_PI_3,
+        );
+        let cameras = [
+            camera_at(120.0),
+            camera_at(300.0),
+            tilted,
+            camera_at(60.0),
+            camera_at(120.0),
+        ];
+        let distances: Vec<u64> = cameras
+            .iter()
+            .map(|v| nearest_content_distance(&ts, std::slice::from_ref(v)).to_bits())
+            .collect();
+        assert!(
+            distances.windows(2).all(|w| w[0] != w[1]),
+            "two cameras in a row share a distance, so a memo blind to the \
+             camera would pass this test"
+        );
+
+        let mut near = NearestContent::default();
+        let mut residency = ResidencyView::default();
+        let mut rendered_last: HashSet<TileId> = HashSet::new();
+        let mut passes = 0;
+        for (c, view) in cameras.iter().enumerate() {
+            let views = std::slice::from_ref(view);
+            for round in 0..12 {
+                let mut fresh = TraversalOutput::default();
+                traverse(
+                    &ts,
+                    &residency,
+                    views,
+                    &config,
+                    0,
+                    &rendered_last,
+                    &mut fresh,
+                );
+                let mut kept = TraversalOutput::default();
+                traverse_with(
+                    &ts,
+                    &residency,
+                    views,
+                    &config,
+                    0,
+                    &rendered_last,
+                    &mut near,
+                    &mut kept,
+                );
+                assert_same_pass(&kept, &fresh, &format!("camera {c}, pass {round}"));
+                passes += 1;
+                rendered_last = fresh.selected.iter().map(|(t, _)| *t).collect();
+                for req in fresh.requests.iter().take(4) {
+                    residency.insert(req.tile);
+                }
+            }
+        }
+        assert_eq!(
+            near.descents(),
+            cameras.len() as u64,
+            "{passes} passes: the memo should descend once per camera"
+        );
+    }
+
+    /// **A graft under a still camera is a new tree, and is priced afresh.**
+    ///
+    /// The one edit a 3D Tiles arena takes. Here it lands right under the
+    /// line of sight and carries content deeper than anything before it, so
+    /// the nearest-content distance moves from 70 to 115 — and with it the
+    /// decision on the grafted root, whose error sits between the two
+    /// prices. The camera has not moved; only [`TileTree::revision`] says the
+    /// kept distance is stale.
+    #[test]
+    fn a_graft_under_a_still_camera_is_priced_afresh() {
+        let json = r#"{ "asset": { "version": "1.1" }, "geometricError": 400,
+            "root": { "boundingVolume": { "sphere": [0, 0, 0, 100] },
+                      "geometricError": 100, "refine": "REPLACE",
+                      "content": { "uri": "root.glb" },
+                      "children": [{
+                        "boundingVolume": { "sphere": [0, 0, 0, 50] },
+                        "geometricError": 20, "refine": "REPLACE",
+                        "content": { "uri": "host.json" } }] } }"#;
+        let external = r#"{ "asset": { "version": "1.1" }, "geometricError": 20,
+            "root": { "boundingVolume": { "sphere": [0, 0, 0, 10] },
+                      "geometricError": 2, "refine": "REPLACE",
+                      "content": { "uri": "inner.glb" },
+                      "children": [{
+                        "boundingVolume": { "sphere": [0, 0, 0, 5] },
+                        "geometricError": 0,
+                        "content": { "uri": "leaf.glb" } }] } }"#;
+        let base = Url::parse("file:///t/tileset.json").expect("url");
+        let mut ts = Tileset::from_json_bytes(json.as_bytes(), &base).expect("tileset");
+        let host = ts.tile(ts.root()).children[0];
+        let views = [camera_at(120.0)];
+        let config = Config {
+            uniform_detail: true,
+            ..Config::default()
+        };
+        let residency = ResidencyView::default();
+        let nothing = HashSet::new();
+        let mut near = NearestContent::default();
+
+        let mut before = TraversalOutput::default();
+        traverse_with(
+            &ts,
+            &residency,
+            &views,
+            &config,
+            0,
+            &nothing,
+            &mut near,
+            &mut before,
+        );
+        let priced_before = nearest_content_distance(&ts, &views);
+
+        let ext_url = Url::parse("file:///t/host.json").expect("url");
+        let ext: crate::tileset::TilesetJson =
+            serde_json::from_str(external).expect("external tileset");
+        ts.graft(host, ext, &ext_url).expect("graft");
+        assert_ne!(
+            nearest_content_distance(&ts, &views).to_bits(),
+            priced_before.to_bits(),
+            "the graft did not move the distance, so this test proves nothing"
+        );
+
+        let mut fresh = TraversalOutput::default();
+        traverse(&ts, &residency, &views, &config, 0, &nothing, &mut fresh);
+        let mut kept = TraversalOutput::default();
+        traverse_with(
+            &ts, &residency, &views, &config, 0, &nothing, &mut near, &mut kept,
+        );
+        assert_same_pass(&kept, &fresh, "after the graft");
+        assert_eq!(near.descents(), 2, "the graft must cost a descent");
+    }
+
+    /// A tree that cannot vouch for its shape pays for the descent on every
+    /// pass, as every tree did before the memo.
+    #[test]
+    fn a_tree_without_a_revision_descends_every_pass() {
+        struct Unsure(Tileset);
+        impl crate::source::TileTree for Unsure {
+            fn roots(&self) -> Vec<TileId> {
+                self.0.roots()
+            }
+            fn children(&self, id: TileId) -> Vec<TileId> {
+                self.0.children(id)
+            }
+            fn properties(&self, id: TileId) -> crate::source::TileProperties {
+                self.0.properties(id)
+            }
+        }
+        let tree = Unsure(deep_tileset(3));
+        assert_eq!(tree.revision(), None);
+        let views = [camera_at(120.0)];
+        let config = Config {
+            uniform_detail: true,
+            ..Config::default()
+        };
+        let mut near = NearestContent::default();
+        for _ in 0..3 {
+            let mut out = TraversalOutput::default();
+            traverse_with(
+                &tree,
+                &ResidencyView::default(),
+                &views,
+                &config,
+                0,
+                &HashSet::new(),
+                &mut near,
+                &mut out,
+            );
+        }
+        assert_eq!(near.descents(), 3);
     }
 
     /// A held REPLACE with nothing of its own on screen must stop asking for its
