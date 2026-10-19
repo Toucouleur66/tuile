@@ -173,6 +173,7 @@ fn every_visible_ground_point_is_selected() {
     };
 
     let mut rendered_last: HashSet<TileId> = HashSet::new();
+    let mut chosen_before: HashSet<TileId> = HashSet::new();
     let mut out = TraversalOutput::default();
     let mut misses: Vec<(f64, f64, f64)> = Vec::new();
 
@@ -189,9 +190,11 @@ fn every_visible_ground_point_is_selected() {
             &config,
             0,
             &rendered_last,
+            &chosen_before,
             &mut out,
         );
         rendered_last = out.selected.iter().map(|(t, _)| *t).collect();
+        chosen_before = out.chosen.iter().copied().collect();
         let selected: HashSet<(u32, u64, u64)> = out
             .selected
             .iter()

@@ -190,12 +190,23 @@ fn every_sample_of_visible_ground_is_covered_by_something_selected() {
 
     let mut out = TraversalOutput::default();
     let mut rendered: HashSet<TileId> = HashSet::new();
+    // One camera: every round refines against the same (empty) memory.
+    let chosen_before: HashSet<TileId> = HashSet::new();
     // What the farm allows in flight. Bounded rounds, because a convergence
     // that needs unbounded rounds is a hang, and this test would rather fail.
     const IN_FLIGHT: usize = 256;
     let mut rounds = 0;
     for _ in 0..60 {
-        traverse(&tree, &residency, &views, &config, 0, &rendered, &mut out);
+        traverse(
+            &tree,
+            &residency,
+            &views,
+            &config,
+            0,
+            &rendered,
+            &chosen_before,
+            &mut out,
+        );
         rendered = out.selected.iter().map(|(t, _)| *t).collect();
         // A held tile's descendants are wanted, resident and drawn by nothing;
         // the server marks them rendered at exactly this point, and a model

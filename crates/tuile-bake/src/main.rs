@@ -528,10 +528,14 @@ fn parse_args() -> Result<Job, String> {
 }
 
 fn main() -> std::process::ExitCode {
+    // The determinism trace (`tuile_det`) is off unless asked for, with
+    // `TUILE_LOG=tuile_det=info` (a farm job's `--trace`). It writes a line per visited tile per
+    // pass: on by default it was 136 MB for 96 frames, and it cost a pass
+    // more than the traversal did (3.5 ms against 1.3).
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("TUILE_LOG")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,tuile_det=off")),
         )
         .init();
 

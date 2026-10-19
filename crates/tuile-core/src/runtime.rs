@@ -366,6 +366,7 @@ pub fn in_process_with(
             out: TraversalOutput::default(),
             selected: HashSet::new(),
             rendered_last: HashSet::new(),
+            chosen_before: HashSet::new(),
             near: NearestContent::default(),
             view_moved: false,
             frame: 0,
@@ -420,6 +421,7 @@ pub struct GeometryServer {
     out: TraversalOutput,
     selected: HashSet<TileId>,
     rendered_last: HashSet<TileId>,
+    chosen_before: HashSet<TileId>,
     /// The scene-wide distance a uniform-detail pass is priced at, kept from
     /// one pass to the next while the camera and the tree's shape hold still.
     near: NearestContent,
@@ -491,6 +493,7 @@ impl GeometryServer {
             out: &mut self.out,
             selected: &mut self.selected,
             rendered_last: &mut self.rendered_last,
+            chosen_before: &mut self.chosen_before,
             near: &mut self.near,
             acked: &mut self.acked,
             filled: &mut self.filled,
@@ -710,6 +713,12 @@ struct Session<'a> {
     /// What the previous pass drew. Consulted by the descendant limit — see
     /// [`crate::traversal::Config::loading_descendant_limit`].
     rendered_last: &'a mut HashSet<TileId>,
+    /// What the last pass under the previous views chose at its own level:
+    /// the refine hysteresis's memory (`Config::refine_hysteresis`). Moved on
+    /// only when the camera moves, so every pass of one frame refines against
+    /// the same memory and the frame it settles on does not depend on how
+    /// its tiles arrived.
+    chosen_before: &'a mut HashSet<TileId>,
     near: &'a mut NearestContent,
     acked: &'a mut HashSet<TileId>,
     filled: &'a mut HashSet<TileId>,
@@ -924,6 +933,11 @@ impl Session<'_> {
         // Open a new pass before anything is touched: from here on, every tile
         // this traversal reaches is off limits to the sweep at the end of it.
         self.cache.start_pass();
+        if camera_moved {
+            // `out` still holds the last pass under the views just left.
+            self.chosen_before.clear();
+            self.chosen_before.extend(self.out.chosen.iter().copied());
+        }
         let started = crate::metrics::stamp();
         traverse_with(
             self.tree,
@@ -932,6 +946,7 @@ impl Session<'_> {
             self.config,
             *self.frame,
             self.rendered_last,
+            self.chosen_before,
             self.near,
             self.out,
         );
@@ -1552,12 +1567,14 @@ mod tests {
             s.config,
             *s.frame,
             s.rendered_last,
+            s.chosen_before,
             &mut fresh,
         );
         let at = format!("pass {}", *s.frame);
         assert_eq!(s.out.selected, fresh.selected, "{at}: selection");
         assert_eq!(s.out.requests, fresh.requests, "{at}: requests");
         assert_eq!(s.out.awaiting, fresh.awaiting, "{at}: awaiting");
+        assert_eq!(s.out.chosen, fresh.chosen, "{at}: chosen");
         assert_eq!(s.out.stats, fresh.stats, "{at}: stats");
         if s.config.uniform_detail {
             CHECKED.with(|c| c.set((c.get().0 + 1, s.near.descents())));
