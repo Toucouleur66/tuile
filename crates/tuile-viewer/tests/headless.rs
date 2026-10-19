@@ -63,9 +63,11 @@ fn a_headless_frame_is_drawn_read_back_and_scanned() {
     assert!(state.metrics.frame_exact > 0 && state.metrics.uploads > 0);
 }
 
-/// A script that moves the eye, eases it with the wheel and resizes the
-/// frame, run twice: the same states, frame for frame, and the same session
-/// log, message for message.
+/// A script that moves the eye, eases it with the wheel, glides it and
+/// resizes the frame, run twice: the same states, frame for frame, and the
+/// same session log, message for message. The glide is what a wall clock
+/// would give away: where the eye is on each frame of it is the clock's to
+/// say.
 #[test]
 fn the_stepped_clock_makes_two_runs_of_one_script_the_same() {
     let dir = tempfile::tempdir().expect("a directory");
@@ -80,6 +82,8 @@ fn the_stepped_clock_makes_two_runs_of_one_script_the_same() {
         .then(Series::still(40))
         .then(Series::new().at(0, Action::Go(over_paris(5.0e4))))
         .then(Series::still(20))
+        .then(Series::new().at(0, Action::Glide(over_paris(2.0e5), 1.0)))
+        .then(Series::still(70))
         .then(Series::new().at(
             0,
             Action::Resize {
