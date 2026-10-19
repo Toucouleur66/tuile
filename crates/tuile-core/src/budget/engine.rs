@@ -457,6 +457,27 @@ impl Budget {
         out
     }
 
+    /// Every floor tile the need lists is drawable with its floor drape
+    /// of every layer it wears (P1.1), and the need lists one at least.
+    fn floor_in(&self, tiles: &BTreeMap<TileId, TileNeed>) -> bool {
+        let mut any = false;
+        let all = tiles
+            .iter()
+            .filter(|(_, n)| self.is_floor(n.need.level))
+            .all(|(t, n)| {
+                any = true;
+                self.drawable(ResourceId::Mesh(*t))
+                    && n.need
+                        .imagery
+                        .as_ref()
+                        .map(layers)
+                        .unwrap_or(&[])
+                        .iter()
+                        .all(|r| self.drawable(ResourceId::drape(*t, r.layer, n.need.level)))
+            });
+        any && all
+    }
+
     fn drawable(&self, r: ResourceId) -> bool {
         self.entries.get(&r).is_some_and(|e| e.gpu.is_some())
     }
@@ -637,6 +658,13 @@ impl Budget {
                     }
                 }
                 chosen.sort_by_key(|d| d.layer);
+            }
+            // Bare: a layer the tiles need is worn by no drape, and no old
+            // layer stands in for it during a switch.
+            let missing = needs.keys().any(|l| !chosen.iter().any(|d| d.layer == *l));
+            let switching = chosen.iter().any(|d| !needs.contains_key(&d.layer));
+            if missing && !switching {
+                st.bare += 1;
             }
             if role == Role::Exact {
                 let off = needs.iter().any(|(layer, n)| {
@@ -819,6 +847,7 @@ impl Budget {
         let tiles = self.read_need(&input, &mut st);
         let drapes = self.drape_needs(&tiles, input.presence);
         let (draw, coarsening) = self.build_draw(&tiles, &drapes, &mut st);
+        st.floor_in = self.floor_in(&tiles);
         let mut wants = self.wants(&tiles, &drapes, &draw);
         // Drawn content of an older epoch is refreshed, new before old.
         for i in &draw.items {

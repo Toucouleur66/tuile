@@ -243,6 +243,21 @@ impl Rig {
         }
     }
 
+    /// The loads still pending whose resource passes `keep` complete, at
+    /// their estimates; the others stay in flight.
+    pub fn load_where(&mut self, keep: impl Fn(ResourceId) -> bool) {
+        let done: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|(r, _)| keep(**r))
+            .map(|(r, g)| (*r, *g))
+            .collect();
+        for (r, g) in done {
+            self.pending.remove(&r);
+            self.b.on_loaded(r, g, est(r));
+        }
+    }
+
     /// The consumer uploads `d`'s plan, at the estimates.
     pub fn upload(&mut self, d: &Decisions) {
         for r in &d.upload_plan.items {

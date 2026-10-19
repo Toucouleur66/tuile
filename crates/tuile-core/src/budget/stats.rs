@@ -79,6 +79,13 @@ pub struct BudgetStats {
     pub fallback: u32,
     /// Wanted tiles with nothing to draw (must be 0 once the floor is in).
     pub lost: u32,
+    /// Drawn items whose tiles ask for imagery and that do not wear a
+    /// drawable drape for every layer they need, own or ancestor's (must be
+    /// 0: bare ground is black ground, I1 as extended by D-A1).
+    pub bare: u32,
+    /// The floor is in: every floor tile the need lists has its mesh and,
+    /// for every layer it wears, its floor drape drawable (P1.1).
+    pub floor_in: bool,
     /// Drawn tiles whose drape is more than one level from their need.
     pub underdraped: u32,
     /// Drawn tiles per imagery-minus-terrain level gap (`gap + 8`).
@@ -133,6 +140,8 @@ impl BudgetStats {
             u64::from(self.held),
             u64::from(self.fallback),
             u64::from(self.lost),
+            u64::from(self.bare),
+            u64::from(self.floor_in),
             u64::from(self.underdraped),
             u64::from(self.rejected_inputs),
             u64::from(self.converged),

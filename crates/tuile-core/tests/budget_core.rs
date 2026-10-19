@@ -1417,6 +1417,35 @@ mod upload {
         assert_eq!(d.deliver.len(), 3, "{RED}");
         assert!(r.b.ledger().in_transit <= Bytes(MESH.0 * 3));
     }
+    /// I1 (D-A1): the floor's mesh and its drape form one swap group: the
+    /// mesh, loaded first, waits for its drape, and both are delivered and
+    /// uploaded together.
+    #[test]
+    #[ignore = "red until every drawn item wears its drapes (D-A1)"]
+    fn a_floor_mesh_and_its_drape_upload_as_one_group() {
+        let mut c = Rig::interactive_config();
+        c.pinned_level = Some(0);
+        let mut r = Rig::new(c);
+        let root = t(0, 0, 0);
+        let need = drawn_draped(&[root], 0);
+        r.step(&need);
+        r.load_where(|x| x == mesh(root));
+        let d = r.step(&need);
+        assert!(
+            d.deliver.is_empty(),
+            "{RED}: the floor mesh delivered without its drape"
+        );
+        r.load_where(|x| x == dr(root, 0));
+        let d = r.step(&need);
+        let mut both: Vec<_> = d.deliver.iter().map(|x| x.0).collect();
+        both.sort();
+        assert_eq!(both, vec![mesh(root), dr(root, 0)]);
+        assert!(d
+            .upload_plan
+            .groups
+            .iter()
+            .any(|g| g.members == vec![mesh(root), dr(root, 0)]));
+    }
 }
 
 mod draw {
@@ -1648,6 +1677,141 @@ mod draw {
             vec![dl(a, 1, 3)],
             "the new layer replaced it"
         );
+    }
+    /// I1 (D-A1), P1.1, M25: the floor's mesh is drawn only with its drape:
+    /// a floor mesh whose drape is not drawable is not drawn bare, and the
+    /// floor is in only once both are.
+    #[test]
+    #[ignore = "red until every drawn item wears its drapes (D-A1)"]
+    fn the_floor_is_drawn_only_with_its_drape() {
+        let mut c = Rig::interactive_config();
+        c.pinned_level = Some(0);
+        let mut r = Rig::new(c);
+        let root = t(0, 0, 0);
+        let need = drawn_draped(&[root], 0);
+        r.step(&need);
+        r.load_where(|x| x == mesh(root));
+        for _ in 0..4 {
+            let d = r.step(&need);
+            r.upload(&d);
+        }
+        let d = r.step(&need);
+        assert!(!d.draw.draws(root), "{RED}: the floor mesh drawn bare");
+        assert_eq!(d.stats.bare, 0);
+        assert!(!d.stats.floor_in);
+        r.load_where(|x| x == dr(root, 0));
+        let d = r.settle(&need, 10);
+        let item = d.draw.get(mesh(root)).expect("drawn once dressed");
+        assert_eq!(base_drape(item).map(|x| x.resource), Some(dr(root, 0)));
+        assert!(d.stats.floor_in);
+        assert_eq!(d.stats.bare, 0);
+    }
+
+    /// P1.1 (b): no area refines while wanted ground anywhere is lost or
+    /// bare: a deep tile whose mesh and drape arrived first is not drawn
+    /// while the floor elsewhere is still missing.
+    #[test]
+    #[ignore = "red until every drawn item wears its drapes (D-A1)"]
+    fn nothing_refines_while_wanted_ground_is_lost_or_bare() {
+        let mut c = Rig::interactive_config();
+        c.pinned_level = Some(1);
+        let mut r = Rig::new(c);
+        let root = t(0, 0, 0);
+        let kids = children(root);
+        let mid = children(kids[0])[0];
+        let deep = children(mid)[0];
+        let need = NeedSet {
+            drawn: std::iter::once((deep, draped(deep, 3)))
+                .chain(kids[1..].iter().map(|&k| (k, draped(k, 1))))
+                .collect(),
+            ancestors: vec![
+                (root, draped(root, 0)),
+                (kids[0], draped(kids[0], 1)),
+                (mid, draped(mid, 2)),
+            ],
+            ..NeedSet::new()
+        };
+        r.step(&need);
+        r.load_where(|x| x.tile() == deep);
+        for _ in 0..4 {
+            let d = r.step(&need);
+            r.upload(&d);
+        }
+        let d = r.step(&need);
+        assert!(d.stats.lost > 0, "{RED}: the floor came in by itself");
+        assert!(
+            !d.draw.draws(deep),
+            "a level-3 tile drawn while {} wanted tiles are lost",
+            d.stats.lost
+        );
+        assert_eq!(d.stats.bare, 0);
+    }
+
+    /// P2.1, I1 (D-A1): a refining parent's children appear together, in
+    /// one step, each dressed (here in the parent's drape, theirs not yet
+    /// loaded), and the parent goes in that step.
+    #[test]
+    fn refining_children_appear_together_each_with_its_drapes() {
+        let mut r = Rig::interactive();
+        let p = t(2, 1, 1);
+        let kids = children(p);
+        r.settle(&drawn_draped(&[p], 2), 20);
+        let mut hold = drawn_draped(&[p], 2);
+        hold.blockers = kids.iter().map(|&k| (k, draped(k, 3))).collect();
+        r.step(&hold);
+        r.load_where(|x| matches!(x, ResourceId::Mesh(_)));
+        for _ in 0..4 {
+            let d = r.step(&hold);
+            r.upload(&d);
+        }
+        let mut refined = drawn_draped(&kids, 3);
+        refined.ancestors.push((p, draped(p, 2)));
+        let d = r.step(&refined);
+        for k in kids {
+            let item = d.draw.get(mesh(k)).expect(RED);
+            assert_eq!(item.role, Role::Exact);
+            let worn = base_drape(item).expect("dressed");
+            assert_eq!(worn.resource, dr(p, 2), "in the parent's drape");
+        }
+        assert!(!d.draw.draws(p), "the parent goes in the same step");
+        assert_eq!(d.stats.bare, 0);
+    }
+
+    /// P3.1, I1 (D-A1), M35: on a zoom-out the held children go only once
+    /// the parent is drawable and dressed: a parent whose mesh arrived
+    /// before any drape it could wear does not replace them.
+    #[test]
+    #[ignore = "red until every drawn item wears its drapes (D-A1)"]
+    fn held_children_go_only_once_the_parent_is_drawable_and_dressed() {
+        let mut r = Rig::interactive();
+        let p = t(2, 1, 1);
+        let kids = children(p);
+        r.settle(&drawn_draped(&kids, 3), 20);
+        let need = drawn_draped(&[p], 2);
+        r.step(&need);
+        r.load_where(|x| x == mesh(p));
+        for _ in 0..4 {
+            let d = r.step(&need);
+            r.upload(&d);
+        }
+        let d = r.step(&need);
+        assert!(
+            r.b.residency().drawable(p),
+            "{RED}: the parent's mesh is drawable"
+        );
+        for k in kids {
+            assert_eq!(
+                d.draw.get(mesh(k)).map(|i| i.role),
+                Some(Role::Held),
+                "a held child went before its parent was dressed"
+            );
+        }
+        assert!(!d.draw.draws(p), "the parent drawn bare");
+        assert_eq!(d.stats.bare, 0);
+        r.load_where(|x| x == dr(p, 2));
+        let d = r.settle(&need, 10);
+        assert_eq!(d.draw.get(mesh(p)).map(|i| i.role), Some(Role::Exact));
+        assert!(kids.iter().all(|&k| !d.draw.draws(k)));
     }
 }
 

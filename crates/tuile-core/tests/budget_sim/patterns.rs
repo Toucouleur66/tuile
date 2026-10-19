@@ -340,3 +340,31 @@ fn a_scale_change_alone_decides_nothing_new() {
     assert_eq!(first, None, "P5.5: the decisions moved at step {first:?}");
     assert!(Lens::desktop().at_scale(2.0) != Lens::desktop(), "{RED}");
 }
+
+fn cold_start_bare(profile: Profile, seed: u64) -> u32 {
+    let mut sim = Sim::new(quiet(profile), seed);
+    sim.run(6.0, &|_| home());
+    sim.log.iter().map(|l| l.stats.bare).sum()
+}
+
+/// I1 (D-A1), P1.1: a cold start never draws a mesh without the drapes it
+/// needs — not one item, not one step, from the first (the architecture
+/// experiment counted 4 to 8 bare tile-steps at start-up, every variant).
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+)]
+#[ignore = "red until every drawn item wears its drapes (D-A1)"]
+fn a_cold_start_draws_no_bare_ground() {
+    for (profile, seed) in [
+        (Profile::desktop(), 41),
+        (Profile::handheld(), 42),
+        (Profile::handheld_low(), 43),
+        (Profile::headset(90), 44),
+    ] {
+        let name = profile.name;
+        let bare = cold_start_bare(profile, seed);
+        assert_eq!(bare, 0, "{name}: {bare} bare item-steps at start-up");
+    }
+}
