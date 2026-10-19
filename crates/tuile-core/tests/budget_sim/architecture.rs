@@ -46,7 +46,7 @@ use super::gpu::SimGpu;
 use super::net::{wire_bytes, Arrival, SimNet, SimStore};
 use super::scenarios::{approach, back_and_forth, home, turn, zoom};
 use super::server::Profile;
-use super::world::{cost, parent, tile, traverse, Camera, Residency};
+use super::world::{cost, parent, tile, traverse, Camera, Residency, View};
 
 /// One drawn item of the frame: mesh, role, the tiles it serves, the drape
 /// it wears (resource, level).
@@ -327,8 +327,12 @@ impl Run {
                 img.on_loaded(r, g, Cost::flat(Bytes(1)));
             }
         }
+        let views = [View {
+            cam,
+            lens: self.profile.eyes[0].lens,
+        }];
         let need = traverse(
-            &cam,
+            &views,
             &TerrainView(&self.terrain),
             self.sse_scale,
             &self.drawn_last,

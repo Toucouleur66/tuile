@@ -32,7 +32,7 @@ pub fn approach(t: f64) -> Camera {
     }
 }
 
-fn settle(sim: &mut Sim, secs: f64) -> Micros {
+pub fn settle(sim: &mut Sim, secs: f64) -> Micros {
     sim.run(5.0, &approach);
     let stop = sim.now;
     sim.run(secs, &|_| home());

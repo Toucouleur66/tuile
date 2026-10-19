@@ -156,6 +156,9 @@ pub struct SimNet {
     pub network_starts: u64,
     /// Network bytes transferred, total.
     pub network_bytes: u64,
+    /// Whether what arrives fills the local store (a disk cache); off for
+    /// a device that keeps nothing between evictions.
+    pub store_fills: bool,
 }
 
 impl SimNet {
@@ -169,6 +172,7 @@ impl SimNet {
             latencies: Vec::new(),
             network_starts: 0,
             network_bytes: 0,
+            store_fills: true,
         }
     }
 
@@ -255,7 +259,9 @@ impl SimNet {
                         self.latencies
                             .push((at, at.since(f.started).0 as f64 / 1_000.0));
                     }
-                    self.store.held.insert(r);
+                    if self.store_fills {
+                        self.store.held.insert(r);
+                    }
                     out.push(Arrival::Loaded(r, f.gen, cost(r)));
                 }
                 Outcome::Fail => out.push(Arrival::Failed(r, f.gen)),

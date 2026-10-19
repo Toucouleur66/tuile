@@ -1556,6 +1556,29 @@ mod draw {
             assert_eq!(d.stats.underdraped, 0);
         }
     }
+
+    /// P5.1: a need widened by a resize or a rotation covers its new tiles
+    /// in the step it widens, by a fallback on the nearest drawable
+    /// ancestor, while what was drawn stays drawn.
+    #[test]
+    fn a_widened_need_covers_its_new_tiles_by_fallback_in_the_same_step() {
+        let mut r = Rig::interactive();
+        let root = t(0, 0, 0);
+        let kids = children(root);
+        let mut narrow = drawn(&[kids[0]]);
+        narrow.ancestors.push((root, need_of_tile(root)));
+        r.settle(&narrow, 20);
+        let mut wide = drawn(&kids);
+        wide.ancestors.push((root, need_of_tile(root)));
+        let d = r.step(&wide);
+        assert_eq!(d.draw.get(mesh(kids[0])).map(|i| i.role), Some(Role::Exact));
+        let cover = d.draw.get(mesh(root)).expect(RED);
+        assert_eq!(cover.role, Role::Fallback);
+        let mut new_tiles = kids[1..].to_vec();
+        new_tiles.sort();
+        assert_eq!(cover.serves, new_tiles);
+        assert_eq!((d.stats.lost, d.stats.fallback), (0, 3));
+    }
 }
 
 mod batch {

@@ -16,6 +16,7 @@ mod architecture;
 mod detmath;
 mod gpu;
 mod net;
+mod patterns;
 mod rng;
 mod scenarios;
 mod server;

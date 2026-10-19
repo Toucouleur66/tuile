@@ -14,9 +14,43 @@ use tuile_core::budget::{
 
 use super::gpu::SimGpu;
 use super::net::{Arrival, NetProfile, SimNet};
-use super::world::{children, parent, traverse, Camera, Residency};
+use super::world::{children, parent, sight, traverse, Camera, Lens, Residency, View};
 
-/// A device profile: the budget, the network, the frame rate.
+/// One eye of a profile's rig: where it sits along the camera's right
+/// vector, metres, and its lens.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Eye {
+    /// Offset along the camera's right vector, metres (half the IPD).
+    pub offset_m: f64,
+    /// Its lens.
+    pub lens: Lens,
+}
+
+impl Eye {
+    /// A single eye on the camera.
+    pub fn mono(lens: Lens) -> Vec<Eye> {
+        vec![Eye {
+            offset_m: 0.0,
+            lens,
+        }]
+    }
+
+    /// Two eyes `ipd_m` apart, the right one's lens the left one's mirror.
+    pub fn pair(ipd_m: f64, left: Lens) -> Vec<Eye> {
+        vec![
+            Eye {
+                offset_m: -ipd_m / 2.0,
+                lens: left,
+            },
+            Eye {
+                offset_m: ipd_m / 2.0,
+                lens: left.mirrored(),
+            },
+        ]
+    }
+}
+
+/// A device profile: the budget, the network, the frame rate, the eyes.
 #[derive(Clone, Debug)]
 pub struct Profile {
     /// Its name, for messages.
@@ -29,6 +63,8 @@ pub struct Profile {
     pub dt: Micros,
     /// The convergence bound of I3 after the camera stops.
     pub converge_within: Micros,
+    /// The eyes: one, or a stereo rig.
+    pub eyes: Vec<Eye>,
 }
 
 impl Profile {
@@ -45,6 +81,7 @@ impl Profile {
             net: NetProfile::desktop(),
             dt: Micros(16_667),
             converge_within: Micros::from_secs(2),
+            eyes: Eye::mono(Lens::desktop()),
         }
     }
 
@@ -62,6 +99,7 @@ impl Profile {
             net: NetProfile::handheld(),
             dt: Micros(16_667),
             converge_within: Micros::from_secs(4),
+            eyes: Eye::mono(Lens::portrait()),
         }
     }
 
@@ -89,7 +127,26 @@ impl Profile {
             net: NetProfile::desktop().clean(),
             dt: Micros(16_667),
             converge_within: Micros::NEVER,
+            eyes: Eye::mono(Lens::desktop()),
         }
+    }
+
+    /// A stereo headset at `hz`: a phone's memory and a desktop's network
+    /// (Wi-Fi), two eyes 63 mm apart with asymmetric lenses, a step per
+    /// display period, 2 s to converge (spec §14, proposed).
+    pub fn headset(hz: u32) -> Self {
+        let mut p = Profile::handheld();
+        p.name = match hz {
+            72 => "headset-72",
+            90 => "headset-90",
+            120 => "headset-120",
+            _ => "headset",
+        };
+        p.net = NetProfile::desktop();
+        p.dt = Micros(1_000_000 / u64::from(hz));
+        p.converge_within = Micros::from_secs(2);
+        p.eyes = Eye::pair(0.063, Lens::headset_left());
+        p
     }
 }
 
@@ -110,8 +167,8 @@ pub struct StepLog {
     pub idle: bool,
 }
 
-struct View<'a>(&'a Budget);
-impl Residency for View<'_> {
+struct BudgetResidency<'a>(&'a Budget);
+impl Residency for BudgetResidency<'_> {
     fn resident(&self, t: TileId) -> bool {
         self.0.residency().resident(t)
     }
@@ -133,6 +190,11 @@ pub struct Sim {
     pub frame: u64,
     /// Every step's log.
     pub log: Vec<StepLog>,
+    /// The eyes now: the profile's, until a resize or a rotation changes
+    /// their lenses.
+    pub eyes: Vec<Eye>,
+    /// The views of the last step.
+    pub last_views: Vec<View>,
     /// Decoded resources the server holds.
     decoded: BTreeSet<ResourceId>,
     /// The latest fresh generation loaded for each resource.
@@ -165,6 +227,8 @@ impl Sim {
             now: Micros::ZERO,
             frame: 0,
             log: Vec::new(),
+            eyes: profile.eyes.clone(),
+            last_views: Vec::new(),
             decoded: BTreeSet::new(),
             fresh: BTreeMap::new(),
             drawn_last: BTreeSet::new(),
@@ -182,6 +246,31 @@ impl Sim {
 
     fn pinned(&self) -> u32 {
         self.profile.budget.pinned_level.unwrap_or(0)
+    }
+
+    /// Every eye's view of `cam`: each eye shifted along the camera's right
+    /// vector, through its own lens.
+    pub fn views(&self, cam: Camera) -> Vec<View> {
+        let (hs, hc) = super::detmath::sin_cos(cam.heading);
+        self.eyes
+            .iter()
+            .map(|e| View {
+                cam: Camera {
+                    x: cam.x + e.offset_m * hs,
+                    y: cam.y - e.offset_m * hc,
+                    ..cam
+                },
+                lens: e.lens,
+            })
+            .collect()
+    }
+
+    /// Every eye now looks through `lens` (a resize, a rotation, a scale
+    /// change), from the next step on.
+    pub fn set_lens(&mut self, lens: Lens) {
+        for e in &mut self.eyes {
+            e.lens = lens;
+        }
     }
 
     /// One step with the camera at `cam`. Panics, with the scenario context,
@@ -208,9 +297,10 @@ impl Sim {
             Policy::Batch => &none,
             Policy::Interactive => &self.drawn_last,
         };
+        let views = self.views(cam);
         let need = traverse(
-            &cam,
-            &View(&self.budget),
+            &views,
+            &BudgetResidency(&self.budget),
             self.sse_scale,
             drawn_last,
             self.pinned(),
@@ -258,7 +348,7 @@ impl Sim {
             .filter(|i| i.role != Role::Fallback)
             .map(|i| i.mesh.tile())
             .collect();
-        let still = self.last_cam == Some(cam);
+        let still = self.last_cam == Some(cam) && self.last_views == views;
         self.track_levels(still, &d);
         let converged = d.stats.converged
             && need.blockers.is_empty()
@@ -288,6 +378,7 @@ impl Sim {
                 .len() as u32,
         });
         self.last_cam = Some(cam);
+        self.last_views = views;
         self.floor_in = self
             .gpu
             .drawable
