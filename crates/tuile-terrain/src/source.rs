@@ -28,6 +28,14 @@ pub trait TerrainSource: Send + Sync {
     /// The tile's bytes, with the lifetime its origin stated — a decoded mesh
     /// is worth storing, and only the origin knows for how long.
     async fn fetch_tile(&self, coord: TileCoord) -> Result<Fetched<Vec<u8>>, TerrainSourceError>;
+
+    /// Whether a local store holds the tile, asked of its index without
+    /// reading it, synchronously: the graphics budget's presence oracle
+    /// (see [`ContentStore::holds`]). The default knows of no store.
+    fn holds(&self, coord: TileCoord) -> bool {
+        let _ = coord;
+        false
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -105,6 +113,10 @@ impl<T: TerrainSource> CachedTerrain<T> {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl<T: TerrainSource> TerrainSource for CachedTerrain<T> {
+    fn holds(&self, coord: TileCoord) -> bool {
+        self.store.holds(&self.key(coord))
+    }
+
     async fn fetch_tile(&self, coord: TileCoord) -> Result<Fetched<Vec<u8>>, TerrainSourceError> {
         let key = self.key(coord);
         let m = tuile_core::metrics::metrics();

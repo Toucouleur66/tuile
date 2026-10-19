@@ -197,6 +197,13 @@ pub struct DrapeContent {
     /// What makes it different from another: see
     /// [`crate::raster::drape_identity`].
     pub identity: u64,
+    /// The tiles were deliberately **not** fetched, because the consumer said
+    /// it already holds the composed drape under [`Self::identity`] (a bake
+    /// whose packs hold it). A promise and a demand at once: the pixels exist
+    /// wherever the consumer keeps them, and a consumer that set this must
+    /// resolve them — an empty drape read as "no imagery" would be bare
+    /// ground nobody is told about. Never set for a consumer that did not ask.
+    pub withheld: bool,
 }
 
 impl DrapeContent {
