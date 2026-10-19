@@ -17,7 +17,7 @@ pub(crate) mod store;
 
 use std::sync::Arc;
 
-pub(crate) use launch::{Budget, Detail, Gate, Started};
+pub(crate) use launch::{Budget, Gate, Started};
 
 use crate::app::{App, ViewerConfig};
 use crate::embed::{self, ViewerHost};
@@ -176,8 +176,8 @@ fn session(embedder: Arc<dyn ViewerHost>) -> anyhow::Result<()> {
     // phone's, sized from its memory. See `profile`.
     let profile = profile::Profile::current();
     tracing::info!(
-        resident_mib = profile.resident_budget_bytes >> 20,
-        fetches = profile.simultaneous_fetches,
+        gpu_mib = profile.gpu_bytes >> 20,
+        local_reads = profile.max_local_reads,
         decode_threads = profile.decode_threads,
         runtime_threads = profile.runtime_workers,
         "profile"
@@ -197,24 +197,12 @@ fn session(embedder: Arc<dyn ViewerHost>) -> anyhow::Result<()> {
         .enable_all()
         .build()?;
     let handle = rt.handle().clone();
-    // The budget counts decoded CPU bytes; the GPU copy costs about 1.35× that
-    // (mip chains, interleaved vertices), measured — so the desktop's 4 GiB is
-    // ~5 GiB of GPU, which unified memory carries comfortably now that a
-    // drape is a quarter of what it was. A phone's is sized from what the
-    // system leaves the process: see `profile::Profile::handheld`.
-    //
-    // Sized above the working set on purpose. `forbid_holes` loads a whole
-    // subtree before selecting any of it, and a tile loaded but not yet
-    // selected is protected by nothing: squeeze the budget below what a view
-    // needs and those tiles are evicted and re-requested forever. At 768 MiB a
-    // desktop's motionless camera still churned twenty tiles a second — the
-    // session never settles, and it reads as the app hanging.
-    //
-    // The reference session, shared with the headless tests rather than written
-    // out here. When these numbers lived only in this file, every test invented
-    // its own and a harness that never evicted passed while the globe went
-    // black — see `Config::interactive_globe`.
-    let pinned = settings::pinned_level(profile.pinned_level);
+    // What the session may hold, load and upload: the graphics budget, sized
+    // from the device by the profile — a desktop's quarter of the machine, a
+    // phone's share of what the system leaves the process. The floor it pins
+    // (`TUILE_PIN_LEVEL` tunes it) is loaded first and never evicted.
+    let mut budget = profile.budget();
+    budget.pinned_level = settings::pinned_level(profile.pinned_level);
     let config = Config {
         // TUILE_NO_CULL=1 keeps every tile the traversal reaches, however far
         // off screen. Expensive and not a mode anyone should run in — it exists
@@ -226,7 +214,7 @@ fn session(embedder: Arc<dyn ViewerHost>) -> anyhow::Result<()> {
         // ground is missing, each of the two things that can remove it has to
         // be switchable off on its own.
         horizon_culling: std::env::var("TUILE_NO_HORIZON_CULL").is_err(),
-        ..profile.traversal(pinned)
+        ..Config::interactive_globe()
     };
     // Everything between here and a running server is network, and runs on
     // the runtime: see `launch`. The host's credentials and sources, the
@@ -238,6 +226,7 @@ fn session(embedder: Arc<dyn ViewerHost>) -> anyhow::Result<()> {
         opening,
         store: tuile_storage_foyer::default_cache_dir().join(&embed::identity().store),
         config,
+        budget: budget.clone(),
         profile: profile.clone(),
         timeout: crate::launch::START_TIMEOUT,
     };
@@ -304,7 +293,7 @@ fn session(embedder: Arc<dyn ViewerHost>) -> anyhow::Result<()> {
             pitch: view.pitch,
         }),
         lit_at_unix_seconds: settings::lit_at()?,
-        pinned_level: pinned,
+        pinned_level: budget.pinned_level,
         profile: profile.clone(),
         retries,
         window: winit::window::Window::default_attributes(),

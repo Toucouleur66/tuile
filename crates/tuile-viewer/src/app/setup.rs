@@ -363,7 +363,27 @@ impl App {
         // The viewer's pass carries depth, so the overlay must declare it too.
         let overlay = OverlayRenderer::new(&gpu, surface_format, Some(DEPTH_FORMAT));
         // The render origin tracks the eye (set each frame); start there.
-        let pump = ContentPump::new(self.controller.camera.position);
+        // The display's refresh, which each frame's upload deadline is made
+        // of; sixty when the window cannot say.
+        #[cfg_attr(not(feature = "control"), allow(irrefutable_let_patterns))]
+        if let super::screen::Screen::Window(windowed) = &screen {
+            if let Some(hz) = windowed
+                .window
+                .current_monitor()
+                .and_then(|m| m.refresh_rate_millihertz())
+            {
+                self.refresh_hz = (hz / 1000).clamp(24, 240);
+            }
+        }
+        let mut pump = ContentPump::new(self.controller.camera.position);
+        // The floor drawn behind everything, each tile in its own drape.
+        if crate::backdrop::shell_enabled() {
+            pump.set_backdrop_level(Some(crate::backdrop::BASE_LEVEL));
+        }
+        // Every frame recorded with the session's budget, once there is one.
+        if let Some(meter) = self.session.as_ref().and_then(|s| s.meter()) {
+            pump.observe(meter);
+        }
         let targets = tuile_wgpu::FrameTargets::for_surface(&gpu, format, size);
         // Built and uploaded once for the whole session.
         let shell = tuile_wgpu::prepare(&gpu, &crate::backdrop::shell_content(), DVec3::ZERO);

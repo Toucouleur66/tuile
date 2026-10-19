@@ -4,18 +4,19 @@
 //! How hard a session may push the machine it runs on.
 //!
 //! The viewer is one program on a desktop and on a phone, and nearly every
-//! difference between the two is a number: how much decoded ground stays
-//! resident, how many fetches are in flight, how many threads decode, how big
+//! difference between the two is a number: how much ground the GPU holds,
+//! how many reads the store serves at once, how many threads decode, how big
 //! the tile store is, how many frames a second are worth drawing when nothing
 //! moves. Those numbers live here, side by side, so the two machines are
 //! compared in one place instead of in `cfg` blocks scattered through the
 //! session.
 //!
-//! [`Profile::desktop`] is exactly what the desktop application has always
-//! run with. [`Profile::handheld`] is sized from the device: a phone shares
-//! one pool of memory between the CPU and the GPU, and the system ends an
-//! application that takes too much of it without asking — so the budgets
-//! are a share of what the process may still take, not a constant.
+//! What a session may hold, load and upload is the graphics budget's
+//! ([`Profile::budget`]): its numbers are sized here from the device.
+//! [`Profile::handheld`] is sized from the phone: it shares one pool of
+//! memory between the CPU and the GPU, and the system ends an application
+//! that takes too much of it without asking — so the budget is a share of
+//! what the process may still take, not a constant.
 //!
 //! [`Profile::browser`] is a page: the desktop's numbers or the phone's, cut
 //! to what a tab may hold — the worker that keeps the residency is a wasm32
@@ -24,7 +25,14 @@
 
 use std::time::Duration;
 
-const MIB: usize = 1024 * 1024;
+use tuile_core::budget::{BudgetConfig, Bytes};
+
+/// The platform's signals, in the budget's vocabulary: what a memory warning,
+/// an Android trim level, the background and the device's temperature are
+/// handed to the budget as (`set_pressure`, `set_thermal`).
+pub(crate) use tuile_core::budget::{Pressure, Thermal};
+
+const MIB: u64 = 1024 * 1024;
 
 /// What the system says about the memory this process may use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,86 +54,36 @@ impl DeviceMemory {
     }
 }
 
-/// How hot the device is running, as the system grades it.
-// Only a phone's system reports anything but nominal.
-#[cfg_attr(
-    not(any(all(target_os = "ios", feature = "application"), target_os = "android")),
-    allow(dead_code)
-)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
-pub(crate) enum Thermal {
-    #[default]
-    Nominal,
-    Fair,
-    /// The system is throttling: do less, visibly.
-    Serious,
-    /// Close to being shut down: as little as the picture allows.
-    Critical,
-}
-
-/// How short of memory the system says it is — the third thing a handset
-/// reports, beside its memory and its temperature. A desktop and a phone that
-/// tells the application through a warning event instead never say anything
-/// but nominal here.
-// Only Android reports anything but nominal.
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
-pub(crate) enum Pressure {
-    #[default]
-    Nominal,
-    /// Running low: let go of what the view does not need.
-    Warning,
-    /// The system is about to end applications: as little as the picture
-    /// allows.
-    Critical,
-}
-
-/// Per-frame limits on moving decoded tiles to the GPU.
-///
-/// Uploading is done on the frame's own thread, so every upload is time the
-/// frame does not have. A count alone is not a budget — one tile is a few
-/// kilobytes of mesh, another megabytes of imagery — so a phone also stops
-/// when the frame's share of time is spent. One upload always goes through,
-/// or a slow device would never make progress at all.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct UploadBudget {
-    pub tiles: usize,
-    pub time: Option<Duration>,
-}
-
-impl UploadBudget {
-    /// Whether another upload fits, after `done` uploads that took `spent`.
-    pub(crate) fn allows(&self, done: usize, spent: Duration) -> bool {
-        if done == 0 {
-            return true;
-        }
-        done < self.tiles && self.time.is_none_or(|limit| spent < limit)
-    }
-}
-
 /// The numbers a session runs with. See the module.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Profile {
-    /// Decoded content the geometry server keeps resident, bytes.
-    pub resident_budget_bytes: usize,
-    pub resident_tile_limit: usize,
-    /// Tile loads in flight at once — one HTTP/2 stream each.
-    pub simultaneous_fetches: usize,
-    /// The level held for the whole session when `TUILE_PIN_LEVEL` says
-    /// nothing. Never below [`crate::backdrop::BASE_LEVEL`], which draws it.
+    /// The GPU memory the graphics budget is sized from, bytes: every
+    /// class's target, overflow and hard limit are shares of it
+    /// ([`BudgetConfig::interactive`]). A phone's follows what the system
+    /// leaves the process (`retarget`).
+    pub gpu_bytes: u64,
+    /// The budget's floor: levels `0..=pinned_level`, mesh and drape, loaded
+    /// first and never evicted — what every fallback lands on, and what the
+    /// backdrop draws.
     pub pinned_level: u32,
+    /// Reads of the local tile store in flight at once, a quota of their own
+    /// beside the network's (I15): a desktop's store answers 32 at a time —
+    /// at 8 a warm start converged later than a cold one (D5, 2026-10-20).
+    pub max_local_reads: u32,
+    /// The most imagery levels a drape may sit above its tile's terrain
+    /// level: what one draw's slots hold (a 5 × 5 mosaic is two levels).
+    pub imagery_over_terrain_cap: u32,
     /// Threads of the async runtime: network, store, the server.
     pub runtime_workers: usize,
     /// Its blocking pool: the store's file I/O.
     pub blocking_threads: usize,
     /// Threads decoding and resampling tiles.
     pub decode_threads: usize,
-    pub uploads: UploadBudget,
     /// The tile store's memory and disk tiers, bytes.
     pub store_memory_bytes: usize,
     pub store_disk_bytes: usize,
-    /// Whether the window stays hidden until the coarse pyramid is on the GPU
-    /// (a desktop), or opens at once with a loading indicator over the globe
+    /// Whether the window stays hidden until the floor is on the GPU (a
+    /// desktop), or opens at once with a loading indicator over the globe
     /// (a phone, where the system ends an application that shows nothing).
     pub hold_window_until_warm: bool,
     /// Whether frames are drawn only while something changes on screen.
@@ -133,8 +91,8 @@ pub(crate) struct Profile {
     /// Whether the surface and its render targets are let go of while the
     /// application is in the background.
     pub release_surface_in_background: bool,
-    /// Whether loads are held, and residency trimmed, while the view is not
-    /// on screen: a phone in the background, a hidden browser tab.
+    /// Whether loads are held while the view is not on screen: a phone in
+    /// the background, a hidden browser tab.
     pub pause_loads_when_hidden: bool,
     /// Whether the window is the application's own, which Escape closes and
     /// a missing GPU ends — never a page's canvas, which belongs to the page.
@@ -153,28 +111,32 @@ pub(crate) struct Profile {
 }
 
 impl Profile {
-    /// The desktop application, as it has always run.
+    /// The desktop application: a quarter of the machine's memory for the
+    /// GPU's ground, between 1 and 4 GiB — what unified memory carries
+    /// beside a compositor and a browser.
     pub(crate) fn desktop() -> Self {
-        let interactive = tuile_core::traversal::Config::interactive_globe(None);
+        #[cfg(not(target_arch = "wasm32"))]
+        let physical = crate::device::memory().physical;
+        #[cfg(target_arch = "wasm32")]
+        let physical = 16 * 1024 * MIB;
+        Self::desktop_with(physical)
+    }
+
+    /// [`Self::desktop`] on a machine of `physical` bytes.
+    pub(crate) fn desktop_with(physical: u64) -> Self {
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
         Self {
-            resident_budget_bytes: interactive.resident_budget_bytes,
-            resident_tile_limit: interactive.resident_tile_limit,
-            simultaneous_fetches: interactive.maximum_simultaneous_fetches,
-            pinned_level: 4,
-            runtime_workers: std::thread::available_parallelism().map_or(4, |n| n.get()),
+            gpu_bytes: (physical / 4).clamp(1024 * MIB, 4096 * MIB),
+            pinned_level: crate::backdrop::BASE_LEVEL,
+            max_local_reads: 32,
+            imagery_over_terrain_cap: 2,
+            runtime_workers: cores,
             blocking_threads: 512,
-            decode_threads: std::thread::available_parallelism()
-                .map_or(4, |n| n.get())
-                .saturating_sub(1)
-                .max(1),
-            uploads: UploadBudget {
-                tiles: tuile_wgpu::UPLOADS_PER_FRAME,
-                time: None,
-            },
-            store_memory_bytes: 256 * MIB,
-            // Saturating, as the core's own four gibibytes are: on a 32-bit target
-            // (a page's wasm) the number does not fit, and is never used there.
-            store_disk_bytes: 4096usize.saturating_mul(MIB),
+            decode_threads: cores.saturating_sub(1).max(1),
+            store_memory_bytes: 256 * MIB as usize,
+            // Saturating: on a 32-bit target (a page's wasm) the number does
+            // not fit, and is never used there.
+            store_disk_bytes: 4096usize.saturating_mul(MIB as usize),
             hold_window_until_warm: true,
             render_on_demand: false,
             release_surface_in_background: false,
@@ -188,32 +150,23 @@ impl Profile {
 
     /// A phone or a tablet with `memory`, and `cores` processors.
     pub(crate) fn handheld(memory: DeviceMemory, cores: usize) -> Self {
-        // A fifth of what is left to the process for decoded ground. The GPU
-        // copy costs about 1.35× that again on the same memory, and imagery,
-        // the render targets and the runtime need the rest: well under the
-        // half at which the system starts ending applications.
-        let usable = usize::try_from(memory.usable()).unwrap_or(usize::MAX);
-        let resident = (usable / 5).clamp(160 * MIB, 768 * MIB);
+        // A fifth of what is left to the process for the GPU's ground: the
+        // CPU's decoded copies, the render targets and the runtime need the
+        // rest, well under the half at which the system starts ending
+        // applications.
+        let gpu_bytes = (memory.usable() / 5).clamp(160 * MIB, 768 * MIB);
         Self {
-            resident_budget_bytes: resident,
-            // The desktop's ratio of tiles to bytes: about 256 KiB a tile.
-            resident_tile_limit: (resident / (256 * 1024)).max(1024),
-            // One HTTP/2 connection carries them all; more in flight is a
-            // longer queue inside the client, not more bandwidth.
-            simultaneous_fetches: 16,
-            // Level 3 is 85 tiles through the pyramid, a few megabytes: the
-            // floor every fallback lands on, and what the launch waits for.
+            gpu_bytes,
             pinned_level: crate::backdrop::BASE_LEVEL,
+            max_local_reads: 8,
+            // The low clamp drapes one level over its terrain, the rest two.
+            imagery_over_terrain_cap: if gpu_bytes <= 192 * MIB { 1 } else { 2 },
             runtime_workers: 2,
             blocking_threads: 4,
             // Leave the main thread and the runtime a core each.
             decode_threads: cores.saturating_sub(2).clamp(1, 3),
-            uploads: UploadBudget {
-                tiles: 4,
-                time: Some(Duration::from_millis(6)),
-            },
-            store_memory_bytes: 32 * MIB,
-            store_disk_bytes: 768 * MIB,
+            store_memory_bytes: 32 * MIB as usize,
+            store_disk_bytes: 768 * MIB as usize,
             hold_window_until_warm: false,
             render_on_demand: true,
             release_surface_in_background: true,
@@ -240,13 +193,11 @@ impl Profile {
     /// A page in a browser: a desktop's or a phone's, by `handheld`, with
     /// `memory_gib` the device's memory as the browser reports it.
     ///
-    /// The residency is held by the worker, whose heap is wasm32: four
-    /// gibibytes at the very most and in practice half that before a tab is
-    /// killed, so the desktop's budget does not fit and is cut. There is no
-    /// tile store yet, no runtime of threads, no counters' endpoint; decoding
-    /// runs in the worker, which has one thread. The pinned level is the one
-    /// the backdrop draws — 85 tiles, not the desktop's 682 — because a page
-    /// opens on its indicator at once rather than holding a window shut.
+    /// The worker that keeps the session is a wasm32 heap: four gibibytes at
+    /// the very most and in practice half that before a tab is killed, so
+    /// the desktop's budget does not fit and is cut. There is no tile store
+    /// yet, no runtime of threads, no counters' endpoint; decoding runs in
+    /// the worker, which has one thread.
     #[cfg(any(target_arch = "wasm32", test))]
     pub(crate) fn browser(handheld: bool, memory_gib: Option<f64>) -> Self {
         const GIB: f64 = (1u64 << 30) as f64;
@@ -260,24 +211,15 @@ impl Profile {
                 1,
             )
         } else {
-            Self::desktop()
+            Self::desktop_with((memory_gib.unwrap_or(8.0).max(1.0) * GIB) as u64)
         };
         let ceiling = if handheld { 384 * MIB } else { 768 * MIB };
-        let resident = base.resident_budget_bytes.min(ceiling);
         Self {
-            resident_budget_bytes: resident,
-            resident_tile_limit: (resident / (256 * 1024)).max(1024),
-            simultaneous_fetches: if handheld { 16 } else { 32 },
-            pinned_level: crate::backdrop::BASE_LEVEL,
+            gpu_bytes: base.gpu_bytes.min(ceiling),
+            max_local_reads: 8,
             runtime_workers: 1,
             blocking_threads: 1,
             decode_threads: 1,
-            // Uploads run on the page's one thread, between its frames: a
-            // share of the frame's time on every device, not only a phone.
-            uploads: UploadBudget {
-                tiles: base.uploads.tiles,
-                time: Some(Duration::from_millis(if handheld { 6 } else { 8 })),
-            },
             store_memory_bytes: 0,
             store_disk_bytes: 0,
             hold_window_until_warm: false,
@@ -288,6 +230,7 @@ impl Profile {
             metrics_endpoint: false,
             clear_damaged_store: false,
             suspend_takes_the_surface: false,
+            ..base
         }
     }
 
@@ -308,15 +251,15 @@ impl Profile {
         }
     }
 
-    /// The traversal's configuration for this profile, the rest as the
-    /// reference interactive session has it.
-    pub(crate) fn traversal(&self, pinned_level: Option<u32>) -> tuile_core::traversal::Config {
-        tuile_core::traversal::Config {
-            resident_budget_bytes: self.resident_budget_bytes,
-            resident_tile_limit: self.resident_tile_limit,
-            maximum_simultaneous_fetches: self.simultaneous_fetches,
-            ..tuile_core::traversal::Config::interactive_globe(pinned_level)
-        }
+    /// The graphics budget this profile runs on: the interactive policy over
+    /// [`Self::gpu_bytes`], with the profile's floor, local-read quota and
+    /// imagery cap. Everything a session may hold, load and upload is in it.
+    pub(crate) fn budget(&self) -> BudgetConfig {
+        let mut b = BudgetConfig::interactive(Bytes(self.gpu_bytes));
+        b.pinned_level = Some(self.pinned_level);
+        b.max_local_reads = self.max_local_reads;
+        b.imagery_over_terrain_cap = self.imagery_over_terrain_cap;
+        b
     }
 
     /// The shortest interval between two frames, for how hot the device runs
@@ -333,26 +276,6 @@ impl Profile {
         };
         Duration::from_secs(1) / fps
     }
-
-    /// What a memory warning asks the server to let go of: everything beyond
-    /// half the budget, except what the view draws and its ancestors — the
-    /// server never releases those, so the ground stays covered.
-    pub(crate) fn trim_on_warning(&self) -> usize {
-        self.resident_budget_bytes / 2
-    }
-
-    /// The same, on the way into the background, where the system ends the
-    /// largest applications first.
-    pub(crate) fn trim_in_background(&self) -> usize {
-        self.resident_budget_bytes / 4
-    }
-
-    /// What the system's saying it is critically short asks for: as much as
-    /// the background — the view's tiles and their ancestors are kept all the
-    /// same, so the ground stays covered.
-    pub(crate) fn trim_on_critical_pressure(&self) -> usize {
-        self.trim_in_background()
-    }
 }
 
 #[cfg(test)]
@@ -361,25 +284,20 @@ mod tests {
 
     const GIB: u64 = 1024 * 1024 * 1024;
 
-    /// The desktop profile is the reference interactive session, number for
-    /// number: making the phone fit must not move the desktop.
+    /// The desktop's budget is a quarter of the machine, between 1 and
+    /// 4 GiB, reads its store 32 at a time, and is never held back.
     #[test]
-    fn the_desktop_runs_as_it_always_has() {
-        let p = Profile::desktop();
-        let reference = tuile_core::traversal::Config::interactive_globe(Some(4));
-        let config = p.traversal(Some(4));
-        assert_eq!(
-            config.resident_budget_bytes,
-            reference.resident_budget_bytes
-        );
-        assert_eq!(config.resident_tile_limit, reference.resident_tile_limit);
-        assert_eq!(
-            config.maximum_simultaneous_fetches,
-            reference.maximum_simultaneous_fetches
-        );
+    fn the_desktop_sizes_its_budget_from_the_machine() {
+        assert_eq!(Profile::desktop_with(16 * GIB).gpu_bytes, 4 * GIB);
+        assert_eq!(Profile::desktop_with(64 * GIB).gpu_bytes, 4 * GIB);
+        assert_eq!(Profile::desktop_with(2 * GIB).gpu_bytes, GIB);
+        let p = Profile::desktop_with(16 * GIB);
+        let b = p.budget();
+        assert_eq!(b.max_local_reads, 32);
+        assert_eq!(b.pinned_level, Some(crate::backdrop::BASE_LEVEL));
+        assert!(b.validate().is_ok());
         assert!(p.hold_window_until_warm && !p.render_on_demand);
         assert!(p.owns_its_window && !p.pause_loads_when_hidden);
-        assert_eq!(p.uploads.tiles, tuile_wgpu::UPLOADS_PER_FRAME);
         assert_eq!(p.frame_interval(Thermal::Critical, true), Duration::ZERO);
     }
 
@@ -398,20 +316,18 @@ mod tests {
             )
         };
         let roomy = phone(Some(3 * GIB));
-        assert_eq!(roomy.resident_budget_bytes, 3 * 1024 * MIB / 5);
-        assert!(roomy.resident_budget_bytes < 3 * 1024 * MIB / 2);
+        assert_eq!(roomy.gpu_bytes, 3 * GIB / 5);
         // Less left, less held — down to the floor and no further.
         let tight = phone(Some(GIB / 2));
-        assert_eq!(tight.resident_budget_bytes, 160 * MIB);
+        assert_eq!(tight.gpu_bytes, 160 * MIB);
+        assert_eq!(tight.imagery_over_terrain_cap, 1);
         // Lots left still caps out.
-        assert_eq!(phone(Some(16 * GIB)).resident_budget_bytes, 768 * MIB);
+        assert_eq!(phone(Some(16 * GIB)).gpu_bytes, 768 * MIB);
         // A simulator says nothing about what is left: a quarter of the
         // machine stands in for it.
-        let unknown = phone(None);
-        assert_eq!(unknown.resident_budget_bytes, 6 * 1024 * MIB / 4 / 5);
-        for p in [roomy, tight, unknown] {
-            assert!(p.resident_tile_limit >= 1024);
-            assert!(p.simultaneous_fetches < Profile::desktop().simultaneous_fetches);
+        assert_eq!(phone(None).gpu_bytes, 6 * GIB / 4 / 5);
+        for p in [roomy, tight] {
+            assert!(p.budget().validate().is_ok());
             assert!(p.runtime_workers <= 2 && p.decode_threads <= 3);
             assert!(p.decode_threads >= 1);
             assert!(!p.hold_window_until_warm && p.render_on_demand);
@@ -432,7 +348,7 @@ mod tests {
         let phone = Profile::handheld(memory, 8);
         assert!(android.suspend_takes_the_surface);
         assert!(!phone.suspend_takes_the_surface);
-        assert!(!Profile::desktop().suspend_takes_the_surface);
+        assert!(!Profile::desktop_with(16 * GIB).suspend_takes_the_surface);
         assert!(!Profile::browser(true, None).suspend_takes_the_surface);
         assert_eq!(
             Profile {
@@ -441,24 +357,7 @@ mod tests {
             },
             phone
         );
-        // A low-end handset: 3 GiB, 1 GiB available → a fifth, above the floor.
-        assert_eq!(android.resident_budget_bytes, 1024 * MIB / 5);
-        assert!(android.trim_on_critical_pressure() < android.trim_on_warning());
-    }
-
-    /// The pinned level is the one the backdrop draws, or the backdrop could
-    /// be evicted from under the globe.
-    #[test]
-    fn a_phone_pins_the_level_its_backdrop_draws() {
-        let p = Profile::handheld(
-            DeviceMemory {
-                physical: 4 * GIB,
-                available: None,
-            },
-            2,
-        );
-        assert_eq!(p.pinned_level, crate::backdrop::BASE_LEVEL);
-        assert_eq!(p.decode_threads, 1);
+        assert_eq!(android.gpu_bytes, GIB / 5);
     }
 
     /// A page fits a wasm32 heap, opens at once on its indicator, draws on
@@ -468,42 +367,23 @@ mod tests {
         let desktop = Profile::browser(false, Some(16.0));
         let phone = Profile::browser(true, Some(4.0));
         for p in [&desktop, &phone] {
-            assert!(p.resident_budget_bytes <= 768 * MIB);
-            assert!(p.resident_tile_limit >= 1024);
+            assert!(p.gpu_bytes <= 768 * MIB);
             assert_eq!(p.pinned_level, crate::backdrop::BASE_LEVEL);
             assert!(!p.hold_window_until_warm && p.render_on_demand);
             assert!(p.pause_loads_when_hidden && !p.release_surface_in_background);
             assert!(!p.owns_its_window && !p.metrics_endpoint);
             assert_eq!((p.store_memory_bytes, p.store_disk_bytes), (0, 0));
-            assert!(p.uploads.time.is_some());
         }
-        assert!(phone.resident_budget_bytes < desktop.resident_budget_bytes);
-        assert!(phone.resident_budget_bytes <= 384 * MIB);
-        assert!(phone.simultaneous_fetches < desktop.simultaneous_fetches);
+        assert!(phone.gpu_bytes < desktop.gpu_bytes);
+        assert!(phone.gpu_bytes <= 384 * MIB);
         // A browser that does not say how much memory there is gets a phone
         // of four gibibytes, not nothing.
-        assert!(Profile::browser(true, None).resident_budget_bytes >= 160 * MIB);
+        assert!(Profile::browser(true, None).gpu_bytes >= 160 * MIB);
     }
 
-    /// A trim never asks for more than the budget, and the background asks
-    /// for more to go than a warning does.
+    /// Hotter runs slower; saving power runs slower.
     #[test]
-    fn trims_shrink_toward_what_the_view_draws() {
-        let p = Profile::handheld(
-            DeviceMemory {
-                physical: 8 * GIB,
-                available: Some(4 * GIB),
-            },
-            6,
-        );
-        assert!(p.trim_on_warning() < p.resident_budget_bytes);
-        assert!(p.trim_in_background() < p.trim_on_warning());
-    }
-
-    /// Hotter runs slower; saving power runs slower; one upload always goes
-    /// through, the rest stop at the count or the time, whichever comes first.
-    #[test]
-    fn the_phone_slows_down_when_it_is_hot_and_uploads_within_its_frame() {
+    fn the_phone_slows_down_when_it_is_hot() {
         let p = Profile::handheld(
             DeviceMemory {
                 physical: 8 * GIB,
@@ -516,11 +396,5 @@ mod tests {
         assert_eq!(at(Thermal::Fair, true), Duration::from_secs(1) / 30);
         assert_eq!(at(Thermal::Serious, false), Duration::from_secs(1) / 30);
         assert_eq!(at(Thermal::Critical, false), Duration::from_secs(1) / 20);
-
-        let b = p.uploads;
-        assert!(b.allows(0, Duration::from_secs(1)), "the first always goes");
-        assert!(b.allows(1, Duration::from_millis(1)));
-        assert!(!b.allows(1, Duration::from_millis(7)), "out of time");
-        assert!(!b.allows(4, Duration::ZERO), "out of tiles");
     }
 }

@@ -26,14 +26,11 @@ const BARE_GROUND: [f32; 4] = [0.09, 0.15, 0.24, 1.0];
 /// The level drawn behind everything, complete, every frame.
 ///
 /// One level covers the globe on its own — there is no need for the pyramid —
-/// and the count is `2·4^level`, so this is the whole trade: level 3 is 128
-/// draw calls and about 1.2 km per texel of imagery; level 4 is 512 and half
-/// that. Three is enough to make a hole blurry rather than bare, which is all a
-/// backstop owes.
-///
-/// It must not exceed the pinned floor, or the layer it draws is one eviction
-/// can take away.
-pub(crate) const BASE_LEVEL: u32 = 3;
+/// and the count is `2·4^level`: level 2 is 32 draw calls. It is the budget's
+/// floor (every profile pins it), loaded first, mesh and drape, and never
+/// evicted — so the layer it draws is one no eviction can take away. Enough to
+/// make a hole blurry rather than bare, which is all a backstop owes.
+pub(crate) const BASE_LEVEL: u32 = 2;
 
 /// The diagnostic colour, from `TUILE_SHELL=green`.
 const MARKER_GROUND: [f32; 4] = [0.35, 0.72, 0.32, 1.0];

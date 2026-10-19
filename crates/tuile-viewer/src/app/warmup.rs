@@ -8,6 +8,7 @@
 //! someone forms a first impression.
 
 use super::App;
+use tuile_core::budget::Bytes;
 
 /// The state of the wait for a floor under the globe.
 pub(super) struct Warmup {
@@ -32,13 +33,19 @@ impl App {
     /// larger than a rendered frame's for the same reason: nothing is competing
     /// for the GPU, and the sooner this finishes the sooner the window appears.
     pub(super) fn pump_while_hidden(&mut self) {
-        const WHILE_NOBODY_IS_WATCHING: usize = 64;
+        let views = self.eye_views();
+        let origin = self.controller.camera.position;
         let (Some(active), Some(session)) = (self.active.as_mut(), self.session.as_mut()) else {
             return;
         };
+        // The camera too: the view the window will open on loads behind the
+        // floor while nothing is shown. A frame's deadline, four times over —
+        // nothing competes for the GPU while the window is hidden.
+        let mut deadline = active.pump.deadline(60);
+        deadline.bytes = Bytes(deadline.bytes.0.saturating_mul(4));
         active
             .pump
-            .pump(&mut session.stream, &active.gpu, WHILE_NOBODY_IS_WATCHING);
+            .advance(&mut session.stream, &active.gpu, &views, origin, deadline);
         if self.still_warming() {
             return;
         }
@@ -118,17 +125,16 @@ impl App {
             tracing::warn!("server: {err}");
         }
 
-        // Settled and complete: everything the source was ever going to give is
-        // on the GPU.
+        // Settled: every floor mesh and drape the budget lists is on the GPU.
         if let Some(p) = priming {
-            if p.settled() && held >= p.expected() {
+            if p.settled() && p.total > 0 {
                 if p.unavailable > 0 {
                     tracing::warn!(
                         tiles = held,
                         primed = p.total,
                         unavailable = p.unavailable,
                         seconds = self.warmup.since.elapsed().as_secs_f32(),
-                        "coarse pyramid is on the GPU, less the tiles the source does \
+                        "the floor is on the GPU, less the tiles the source does \
                          not serve; the ground under those falls back to a coarser \
                          ancestor"
                     );
@@ -136,7 +142,7 @@ impl App {
                     tracing::info!(
                         tiles = held,
                         seconds = self.warmup.since.elapsed().as_secs_f32(),
-                        "coarse pyramid is on the GPU"
+                        "the floor is on the GPU, mesh and drape"
                     );
                 }
                 return false;

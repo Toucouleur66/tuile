@@ -554,6 +554,15 @@ impl GeometryServer {
         // answers them all (`drain_ready`).
         let mut client_first = true;
 
+        // The floor first, before any view: a step at once, with nothing to
+        // see yet, lists the pinned levels and starts their loads — so the
+        // ground every fallback lands on is on its way before the first
+        // camera arrives.
+        if let Err(stop) = state.step(&host, &tx, &mut loads) {
+            tracing::error!(reason = stop.why("starting"), "geometry server stopping");
+            return;
+        }
+
         loop {
             // Whether this turn had to wait: a turn that waited has given the
             // host its turn already.
