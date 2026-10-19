@@ -522,7 +522,6 @@ mod requests {
     /// D-A4, I16 by layer: two layers of one tile are two requests, one
     /// per layer, and one draw item wearing both.
     #[test]
-    #[ignore = "red until the budget drapes every layer (D-A4)"]
     fn two_layers_of_one_tile_are_two_requests_and_one_draw_item() {
         let mut r = Rig::interactive();
         let a = t(3, 2, 2);
@@ -1597,7 +1596,6 @@ mod draw {
     /// drape is drawable wears it, and wears its overlay through the
     /// nearest ancestor that has the overlay — never another layer's drape.
     #[test]
-    #[ignore = "red until the budget drapes every layer (D-A4)"]
     fn each_layer_falls_back_on_its_own() {
         let mut r = Rig::interactive();
         let root = t(0, 0, 0);
@@ -1630,7 +1628,6 @@ mod draw {
     /// I1 (D-A1), D-A4: on a layer switch the old layer stays worn until
     /// the new one is drawable, then the new one replaces it in one step.
     #[test]
-    #[ignore = "red until the budget drapes every layer (D-A4)"]
     fn a_layer_switch_keeps_the_old_layer_worn_until_the_new_one_is_drawable() {
         let mut r = Rig::interactive();
         let a = t(3, 2, 2);
@@ -2171,7 +2168,6 @@ mod refresh {
     }
     /// D-A4: a layer's epoch refreshes that layer's drapes only.
     #[test]
-    #[ignore = "red until the budget drapes every layer (D-A4)"]
     fn an_epoch_refreshes_only_its_layer() {
         let mut r = Rig::interactive();
         let a = t(3, 2, 2);

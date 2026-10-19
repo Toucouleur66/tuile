@@ -97,9 +97,9 @@ fn sort_key(n: &TileNeed) -> impl Ord + '_ {
     )
 }
 
-/// The layers a need asks for. Stub: the first only.
+/// The layers a need asks for, in stacking order.
 fn layers(img: &ImageryNeed) -> &[LayerReach] {
-    &img.layers[..img.layers.len().min(1)]
+    &img.layers
 }
 
 /// Every layer of `tile`, as a range of a map keyed by `(tile, layer)`.
@@ -623,10 +623,21 @@ impl Budget {
                     }
                 }
             }
-            let chosen: Vec<DrapeChoice> = needs
+            let mut chosen: Vec<DrapeChoice> = needs
                 .iter()
                 .filter_map(|(layer, n)| self.best_drape_for(tile, *layer, *n))
                 .collect();
+            if chosen.len() < needs.len() {
+                // A layer switch in progress: a layer the tiles now ask for
+                // is drawable nowhere yet, so the layers this mesh wore last
+                // step and no longer needs stay worn until it is.
+                for old in self.worn_last.get(&mesh).into_iter().flatten() {
+                    if !needs.contains_key(&old.layer) && self.drawable(old.resource) {
+                        chosen.push(*old);
+                    }
+                }
+                chosen.sort_by_key(|d| d.layer);
+            }
             if role == Role::Exact {
                 let off = needs.iter().any(|(layer, n)| {
                     !chosen
@@ -835,6 +846,12 @@ impl Budget {
             drawn_res.extend(i.drapes.iter().map(|x| x.resource));
         }
         self.drawn_last = drawn_res.clone();
+        self.worn_last = draw
+            .items
+            .iter()
+            .filter(|i| !i.drapes.is_empty())
+            .map(|i| (i.mesh, i.drapes.clone()))
+            .collect();
         self.chain_last = wants
             .iter()
             .filter(|(r, w)| w.urgency == Urgency::Ancestor && self.drawable(**r))
