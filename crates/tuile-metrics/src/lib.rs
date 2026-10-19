@@ -72,11 +72,25 @@ pub fn serve(handle: &tokio::runtime::Handle) {
         tracing::warn!("no metrics endpoint on {addr}: {e}");
         return;
     }
-    describe();
     tracing::info!("metrics on http://{addr}/metrics");
+    publish_every(handle, PUBLISH_EVERY);
+}
 
+/// Publishes the engine's numbers into whatever recorder the process already
+/// has, every `period`, on `handle`.
+///
+/// For a host that owns its own endpoint. A process may install one global
+/// recorder, so [`serve`] — which installs one — fails in a host that already
+/// exports metrics of its own; this only describes the series and starts the
+/// copy, and the numbers come out wherever the host's recorder sends them.
+///
+/// Call it after the recorder is installed: a series described or written
+/// before there is one goes nowhere. Called twice it starts two loops, which
+/// write the same values and cost a second copy, nothing more.
+pub fn publish_every(handle: &tokio::runtime::Handle, period: Duration) {
+    describe();
     handle.spawn(async move {
-        let mut tick = tokio::time::interval(PUBLISH_EVERY);
+        let mut tick = tokio::time::interval(period);
         loop {
             tick.tick().await;
             publish(tuile_core::metrics::metrics());
@@ -132,8 +146,22 @@ fn describe() {
         "tuile_store_bytes_fetched",
         "Bytes fetched from the origin."
     );
+    describe_counter!(
+        "tuile_drapes_withheld",
+        "Drapes the consumer already held, so their layers were never requested."
+    );
     describe_counter!("tuile_frames", "Frames presented.");
     describe_counter!("tuile_uploads", "Tiles uploaded to the GPU.");
+    describe_counter!("tuile_stitch_plans", "Stitching plans worked out.");
+    describe_counter!("tuile_restitched", "Tiles given new stitching strips.");
+    describe_counter!(
+        "tuile_stitch_overflows",
+        "Tiles left unstitched: their plan had more knots than the consumer holds."
+    );
+    describe_counter!(
+        "tuile_height_queries",
+        "Height queries against a frame's ground."
+    );
 
     describe_gauge!("tuile_tiles_visited", "Nodes the last pass walked.");
     describe_gauge!("tuile_tiles_culled", "Nodes no view could see.");
@@ -156,6 +184,22 @@ fn describe() {
     describe_gauge!(
         "tuile_tiles_filled",
         "Selected tiles drawn by a stand-in surface rather than their own geometry."
+    );
+    describe_gauge!(
+        "tuile_priming_total",
+        "Coarse tiles the session primes before drawing."
+    );
+    describe_gauge!(
+        "tuile_priming_pending",
+        "Coarse tiles not answered yet, queued or in flight."
+    );
+    describe_gauge!(
+        "tuile_priming_unavailable",
+        "Coarse tiles given up on: none at the source, failed, or not geometry."
+    );
+    describe_gauge!(
+        "tuile_priming_done",
+        "One once the coarse pyramid has been asked for in full."
     );
     let m = tuile_core::metrics::metrics();
     for (name, help, _) in timers(m) {
@@ -198,7 +242,7 @@ fn describe() {
 /// `_seconds_peak` (gauges). The sum is a gauge only because the recorder's
 /// counters are integers; it never goes down, and `rate(sum) / rate(count)` is
 /// the mean over any window.
-fn timers(m: &Metrics) -> [(&'static str, &'static str, &Timer); 12] {
+fn timers(m: &Metrics) -> [(&'static str, &'static str, &Timer); 17] {
     [
         ("traversal", "The traversal walk.", &m.traversal_seconds),
         (
@@ -236,6 +280,23 @@ fn timers(m: &Metrics) -> [(&'static str, &'static str, &Timer); 12] {
         ("present", "Waiting for a drawable.", &m.present_seconds),
         ("upload", "A tile upload to the GPU.", &m.upload_seconds),
         ("stitch", "Working out a stitching plan.", &m.stitch_seconds),
+        (
+            "bake_frame",
+            "A bake frame resolved and written, its pose excluded.",
+            &m.bake_frame_seconds,
+        ),
+        ("pose", "Deciding a bake frame's pose.", &m.pose_seconds),
+        ("finish", "Finishing one tile, any mode.", &m.finish_seconds),
+        (
+            "ground",
+            "Building the ground a frame's selection draws.",
+            &m.ground_seconds,
+        ),
+        (
+            "height_query",
+            "A height query against a frame's ground.",
+            &m.height_query_seconds,
+        ),
     ]
 }
 
@@ -280,6 +341,8 @@ fn publish(m: &Metrics) {
     counter!("tuile_stitch_plans").absolute(m.stitch_plans.get());
     counter!("tuile_restitched").absolute(m.restitched.get());
     counter!("tuile_stitch_overflows").absolute(m.stitch_overflows.get());
+    counter!("tuile_drapes_withheld").absolute(m.drapes_withheld.get());
+    counter!("tuile_height_queries").absolute(m.height_queries.get());
 
     gauge!("tuile_tiles_visited").set(m.tiles_visited.get() as f64);
     gauge!("tuile_tiles_culled").set(m.tiles_culled.get() as f64);
@@ -294,6 +357,10 @@ fn publish(m: &Metrics) {
     gauge!("tuile_pending_uploads").set(m.pending_uploads.get() as f64);
     gauge!("tuile_prepared_tiles").set(m.prepared_tiles.get() as f64);
     gauge!("tuile_tiles_filled").set(m.tiles_filled.get() as f64);
+    gauge!("tuile_priming_total").set(m.priming_total.get() as f64);
+    gauge!("tuile_priming_pending").set(m.priming_pending.get() as f64);
+    gauge!("tuile_priming_unavailable").set(m.priming_unavailable.get() as f64);
+    gauge!("tuile_priming_done").set(m.priming_done.get() as f64);
 
     // The peak is read in place, not taken: a scrape must not reset what a
     // status line in the same process reads as "the worst this window".
@@ -362,5 +429,52 @@ mod tests {
             text.contains("tuile_arrival_wait_seconds_peak 1.5"),
             "peak not in seconds:\n{text}"
         );
+    }
+
+    /// A host's recorder — installed by the host, not by [`serve`] — gets the
+    /// bake's timers and the series that were recorded but never published,
+    /// from [`publish_every`]'s own loop.
+    ///
+    /// The runtime is current-thread so the loop runs on this thread, where
+    /// the local recorder is the one its writes reach.
+    #[test]
+    fn publish_every_publishes_into_the_host_s_recorder() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let m = tuile_core::metrics::metrics();
+        m.bake_frame_seconds.record(Duration::from_millis(2));
+        m.pose_seconds.record(Duration::from_millis(30));
+        m.height_queries.inc();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("a runtime");
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                publish_every(&tokio::runtime::Handle::current(), Duration::from_millis(5));
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            });
+        });
+        let text = handle.render();
+        for series in [
+            "tuile_bake_frame_seconds_count",
+            "tuile_bake_frame_seconds_sum",
+            "tuile_bake_frame_seconds_peak",
+            "tuile_pose_seconds_count",
+            "tuile_finish_seconds_count",
+            "tuile_ground_seconds_count",
+            "tuile_height_query_seconds_count",
+            "tuile_height_queries",
+            "tuile_drapes_withheld",
+            "tuile_priming_total",
+            "tuile_priming_pending",
+            "tuile_priming_unavailable",
+            "tuile_priming_done",
+            "tuile_stitch_plans",
+            "# HELP tuile_stitch_overflows",
+            "# HELP tuile_pose_seconds_sum",
+        ] {
+            assert!(text.contains(series), "{series} missing from:\n{text}");
+        }
     }
 }
