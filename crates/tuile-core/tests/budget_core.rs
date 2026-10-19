@@ -2485,7 +2485,6 @@ mod deadline {
     /// the executor's throughput: a quarter of 13.9, 11.1 and 8.3 ms at 72,
     /// 90 and 120 Hz.
     #[test]
-    #[ignore = "red until FrameDeadline derives from the display (I18)"]
     fn a_frame_deadline_is_its_share_of_the_display_period() {
         for (hz, period_us) in [(72u32, 13_888u64), (90, 11_111), (120, 8_333)] {
             let d = FrameDeadline::from_refresh(hz, 250, 1_000_000);
@@ -2505,7 +2504,6 @@ mod deadline {
     /// I18, I9: the first item of a frame always goes, a swap group goes
     /// whole when it fits and waits whole when it does not.
     #[test]
-    #[ignore = "red until FrameDeadline::take caps a frame's uploads (I18)"]
     fn the_first_item_always_goes_and_a_swap_group_goes_whole() {
         let cap = |b| FrameDeadline {
             bytes: Bytes(b),

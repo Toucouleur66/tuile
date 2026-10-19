@@ -38,8 +38,13 @@ impl FrameDeadline {
     /// throughput is the executor's own and may vary; it never enters
     /// `decide`.
     pub fn from_refresh(hz: u32, upload_share_permille: u16, bytes_per_ms: u64) -> Self {
-        let _ = (hz, upload_share_permille, bytes_per_ms);
-        FrameDeadline::UNBOUNDED
+        let period_us = 1_000_000 / u64::from(hz.max(1));
+        let time_us = period_us * u64::from(upload_share_permille.min(1_000)) / 1_000;
+        let bytes = u128::from(time_us) * u128::from(bytes_per_ms) / 1_000;
+        FrameDeadline {
+            bytes: Bytes(u64::try_from(bytes).unwrap_or(u64::MAX)),
+            time: Micros(time_us),
+        }
     }
 
     /// The prefix of `queue` (the executor's uploads, in the plan's order)
@@ -54,7 +59,37 @@ impl FrameDeadline {
         done: Bytes,
         cost: impl Fn(ResourceId) -> Bytes,
     ) -> &'p [ResourceId] {
-        let _ = (groups, done, cost);
-        queue
+        let mut used = done;
+        let mut n = 0;
+        while n < queue.len() {
+            // The unit at `n`: a whole swap group when the queue holds its
+            // members from here on, contiguously, as the plan lays them out;
+            // else the item alone.
+            let unit = groups
+                .iter()
+                .find(|g| {
+                    g.members.len() > 1
+                        && g.members.contains(&queue[n])
+                        && queue
+                            .get(n..n + g.members.len())
+                            .is_some_and(|run| run.iter().all(|r| g.members.contains(r)))
+                })
+                .map_or(1, |g| g.members.len());
+            let bytes = queue[n..n + unit]
+                .iter()
+                .fold(Bytes::ZERO, |a, r| a.plus(cost(*r)));
+            if used.plus(bytes) <= self.bytes {
+                used = used.plus(bytes);
+                n += unit;
+                continue;
+            }
+            if n == 0 && done == Bytes::ZERO {
+                // The first item of a frame always goes, alone if its group
+                // is too big.
+                n = 1;
+            }
+            break;
+        }
+        &queue[..n]
     }
 }
