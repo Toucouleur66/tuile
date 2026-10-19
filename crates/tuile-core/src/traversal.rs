@@ -245,10 +245,16 @@ pub struct Config {
     /// thresholds nothing moves, which is the whole point — the band has to be
     /// wider than the frame-to-frame jitter of the error, and 15 % is.
     ///
-    /// The previous frame is read from `rendered_last`. On the first frame that
-    /// set is empty and there is nothing to be sticky about, so the bare
-    /// comparison is used — otherwise every first frame would select one level
-    /// finer than every subsequent one.
+    /// The previous frame is read from `chosen_before`: the tiles the traversal
+    /// *chose* at their own level under the previous views, not the tiles it
+    /// drew. A tile drawn only as a stand-in — a REPLACE held while its
+    /// children load — was not chosen, and must not turn sticky: it would stop
+    /// refining for good once its children arrived, and whether it ever stood
+    /// in depends on the order tiles arrive in, which made a frame a function
+    /// of the network (a parent at level 17 against its four children at 18,
+    /// run to run). On the first frame that set is empty and there is nothing
+    /// to be sticky about, so the bare comparison is used — otherwise every
+    /// first frame would select one level finer than every subsequent one.
     pub refine_hysteresis: f64,
     /// Whether to drop tiles no view can see. Off is a diagnostic, not a mode.
     ///
@@ -519,6 +525,10 @@ pub struct TraversalOutput {
     /// marks these children rendered at exactly this point, for exactly this
     /// reason.
     pub awaiting: Vec<TileId>,
+    /// Tiles this pass chose at their own level: fine enough, with content —
+    /// drawn if resident, wanted if not. Never a stand-in held for its
+    /// children. Fed back as the next views' `chosen_before`.
+    pub chosen: Vec<TileId>,
     pub stats: TraversalStats,
 }
 
@@ -530,6 +540,7 @@ pub struct TraversalOutput {
 /// The reference pass: every scene-wide number is worked out from scratch.
 /// A session that traverses again and again keeps a [`NearestContent`] and
 /// calls [`traverse_with`] instead, which selects exactly the same tiles.
+#[allow(clippy::too_many_arguments)]
 pub fn traverse(
     tree: &dyn TileTree,
     residency: &ResidencyView,
@@ -537,6 +548,7 @@ pub fn traverse(
     config: &Config,
     frame: FrameNumber,
     rendered_last: &HashSet<TileId>,
+    chosen_before: &HashSet<TileId>,
     out: &mut TraversalOutput,
 ) {
     traverse_with(
@@ -546,6 +558,7 @@ pub fn traverse(
         config,
         frame,
         rendered_last,
+        chosen_before,
         &mut NearestContent::default(),
         out,
     );
@@ -562,12 +575,14 @@ pub fn traverse_with(
     config: &Config,
     _frame: FrameNumber,
     rendered_last: &HashSet<TileId>,
+    chosen_before: &HashSet<TileId>,
     near: &mut NearestContent,
     out: &mut TraversalOutput,
 ) {
     out.selected.clear();
     out.requests.clear();
     out.awaiting.clear();
+    out.chosen.clear();
     out.stats = TraversalStats::default();
     let roots = tree.roots();
     if views.is_empty() || roots.is_empty() {
@@ -598,6 +613,7 @@ pub fn traverse_with(
             views,
             config,
             rendered_last,
+            chosen_before,
             uniform_distance,
             occluder.as_ref(),
             root,
@@ -894,6 +910,7 @@ fn visit(
     views: &[ViewState],
     config: &Config,
     rendered_last: &HashSet<TileId>,
+    chosen_before: &HashSet<TileId>,
     uniform_distance: Option<f64>,
     occluder: Option<&Occluder>,
     id: TileId,
@@ -1019,10 +1036,10 @@ fn visit(
     // (structural empty tiles always descend).
     // La bande morte : voir `Config::refine_hysteresis`. Sans mémoire de la
     // frame précédente il n'y a rien à stabiliser, et le seuil nu s'applique.
-    let threshold = if config.refine_hysteresis <= 0.0 || rendered_last.is_empty() {
+    let threshold = if config.refine_hysteresis <= 0.0 || chosen_before.is_empty() {
         config.maximum_screen_space_error
-    } else if rendered_last.contains(&id) {
-        // Dessinée ici la dernière fois : il faut nettement pire pour la couper.
+    } else if chosen_before.contains(&id) {
+        // Choisie ici la dernière fois : il faut nettement pire pour la couper.
         config.maximum_screen_space_error * (1.0 + config.refine_hysteresis)
     } else {
         // Déjà coupée : il faut nettement mieux pour la recoller.
@@ -1074,6 +1091,7 @@ fn visit(
             );
             return Visit::READY_BUT_BARE;
         }
+        out.chosen.push(id);
         if residency.is_resident(id) {
             crate::det!("tile", id = id.0, depth = depth, act = "select", sse = sse);
             out.selected.push((id, sse));
@@ -1112,6 +1130,7 @@ fn visit(
                     views,
                     config,
                     rendered_last,
+                    chosen_before,
                     uniform_distance,
                     occluder,
                     child,
@@ -1148,6 +1167,7 @@ fn visit(
                     views,
                     config,
                     rendered_last,
+                    chosen_before,
                     uniform_distance,
                     occluder,
                     child,
@@ -1415,6 +1435,7 @@ mod tests {
             &Config::default(),
             0,
             &rendered_last,
+            &rendered_last,
             &mut out,
         );
         let selected: HashSet<TileId> = out.selected.iter().map(|(t, _)| *t).collect();
@@ -1439,6 +1460,7 @@ mod tests {
                 ..Config::default()
             },
             0,
+            &rendered_last,
             &rendered_last,
             &mut out,
         );
@@ -1759,10 +1781,35 @@ mod tests {
         config: &Config,
         per_round: usize,
     ) -> Vec<TileId> {
+        converge_after(ts, views, config, per_round, &HashSet::new())
+    }
+
+    /// [`converge_like_the_server`], for a frame that follows one which
+    /// settled on `before`, chosen and drawn, and whose tiles were all let
+    /// go since. As the server does, every pass of the frame refines against
+    /// that one memory; only what is drawn moves from pass to pass.
+    #[allow(clippy::panic, reason = "a fixture that never settles is a bug")]
+    fn converge_after(
+        ts: &Tileset,
+        views: &[ViewState],
+        config: &Config,
+        per_round: usize,
+        before: &HashSet<TileId>,
+    ) -> Vec<TileId> {
         let mut residency = ResidencyView::default();
-        let mut rendered_last: HashSet<TileId> = HashSet::new();
+        let mut rendered_last = before.clone();
         for _ in 0..2000 {
-            let out = run_with(ts, &residency, views, config, &rendered_last);
+            let mut out = TraversalOutput::default();
+            traverse(
+                ts,
+                &residency,
+                views,
+                config,
+                0,
+                &rendered_last,
+                before,
+                &mut out,
+            );
             if out.requests.is_empty() {
                 return ids(&out.selected);
             }
@@ -1772,6 +1819,56 @@ mod tests {
             }
         }
         panic!("the session never reached a fixed point");
+    }
+
+    /// **A tile standing in for its children does not turn sticky.**
+    ///
+    /// A REPLACE whose children are still loading is drawn in their place, so
+    /// that the ground is never bare. Its error here sits inside the refine
+    /// deadband — above τ, under τ·(1 + h). When the deadband remembered what
+    /// was *drawn*, a pass that ran while the children were on their way drew
+    /// the parent, the next pass found it "drawn here last time", raised its
+    /// threshold, and the frame settled on the parent; a link that delivered
+    /// all five tiles at once never drew it, and the frame settled on the
+    /// children. Two frames from one camera, decided by the network: a parent
+    /// at level 17 against its four children at 18, in real bakes, run to
+    /// run. The deadband remembers what the previous frame *chose*.
+    #[test]
+    fn a_frame_settles_alike_whether_a_parent_stood_in_or_not() {
+        let ts = mini_tileset();
+        let root = ts.root();
+        let mut children = ts.tile(root).children.clone();
+        children.sort_unstable();
+        let config = Config::default();
+        let tau = config.maximum_screen_space_error;
+        let inside = tau * (1.0 + config.refine_hysteresis / 2.0);
+        let sse_at = |d: f64| camera_at(d).screen_space_error(ts.tile(root).geometric_error, d);
+        let (mut lo, mut hi) = (1.0_f64, 100_000.0_f64);
+        for _ in 0..200 {
+            let mid = 0.5 * (lo + hi);
+            if sse_at(mid) > inside {
+                lo = mid
+            } else {
+                hi = mid
+            }
+        }
+        let views = [camera_at(0.5 * (lo + hi))];
+        // The frame before chose the children, drew them, and let them go.
+        let before: HashSet<TileId> = children.iter().copied().collect();
+
+        let one_at_a_time = converge_after(&ts, &views, &config, 1, &before);
+        let all_at_once = converge_after(&ts, &views, &config, usize::MAX, &before);
+        assert_eq!(
+            one_at_a_time, all_at_once,
+            "the frame depends on how fast its tiles arrived"
+        );
+        let mut settled = all_at_once;
+        settled.sort_unstable();
+        assert_eq!(
+            settled, children,
+            "the children were chosen the frame before: within the deadband \
+             they stay chosen"
+        );
     }
 
     /// **The same frame must select the same ground however fast the tiles
@@ -1909,6 +2006,7 @@ mod tests {
                     &config,
                     0,
                     &rendered_last,
+                    &rendered_last,
                     &mut fresh,
                 );
                 let mut kept = TraversalOutput::default();
@@ -1918,6 +2016,7 @@ mod tests {
                     views,
                     &config,
                     0,
+                    &rendered_last,
                     &rendered_last,
                     &mut near,
                     &mut kept,
@@ -1983,6 +2082,7 @@ mod tests {
             &config,
             0,
             &nothing,
+            &nothing,
             &mut near,
             &mut before,
         );
@@ -1999,10 +2099,12 @@ mod tests {
         );
 
         let mut fresh = TraversalOutput::default();
-        traverse(&ts, &residency, &views, &config, 0, &nothing, &mut fresh);
+        traverse(
+            &ts, &residency, &views, &config, 0, &nothing, &nothing, &mut fresh,
+        );
         let mut kept = TraversalOutput::default();
         traverse_with(
-            &ts, &residency, &views, &config, 0, &nothing, &mut near, &mut kept,
+            &ts, &residency, &views, &config, 0, &nothing, &nothing, &mut near, &mut kept,
         );
         assert_same_pass(&kept, &fresh, "after the graft");
         assert_eq!(near.descents(), 2, "the graft must cost a descent");
@@ -2040,6 +2142,7 @@ mod tests {
                 &views,
                 &config,
                 0,
+                &HashSet::new(),
                 &HashSet::new(),
                 &mut near,
                 &mut out,
@@ -2273,7 +2376,9 @@ mod tests {
     }
 
     /// A pass with an explicit config and an explicit "what was drawn last
-    /// time" — the two inputs the descendant limit reads.
+    /// time" — the two inputs the descendant limit reads. What was drawn is
+    /// taken for what was chosen too, as it is in a previous frame that had
+    /// settled.
     fn run_with(
         ts: &Tileset,
         residency: &ResidencyView,
@@ -2282,7 +2387,16 @@ mod tests {
         rendered_last: &HashSet<TileId>,
     ) -> TraversalOutput {
         let mut out = TraversalOutput::default();
-        traverse(ts, residency, views, config, 0, rendered_last, &mut out);
+        traverse(
+            ts,
+            residency,
+            views,
+            config,
+            0,
+            rendered_last,
+            rendered_last,
+            &mut out,
+        );
         out
     }
 

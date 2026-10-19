@@ -1054,9 +1054,9 @@ impl Live {
         );
         // Loads run as tasks on the session's runtime: they advance while the
         // server traverses, and arrivals ready together are answered by one
-        // pass. What a frame selects already depended on the order tiles
-        // arrive in through the traversal's refine hysteresis (a pass keeps
-        // what the previous one drew), inline or not.
+        // pass. What a frame settles on does not depend on the order they land
+        // in: the refine hysteresis remembers what the previous frame chose,
+        // not what a pass drew while tiles were on their way.
         let spawn = tuile_core::runtime::Spawn::Tokio(runtime.handle().clone());
         tracing::info!(loads = ?spawn, "where the session's loads run");
         let (stream, server) = in_process_with(tree, loader, traversal);
@@ -3040,11 +3040,6 @@ pub(crate) mod tests {
     /// converges over passes, refinement has a dead band against the pass
     /// before (`Config::refine_hysteresis`), and a zoom-out that has to
     /// fetch its coarse ground again settles on the other side of it.
-    ///
-    /// Without that dead band: with it, which passes ran on the way to a
-    /// frame decides the frame, and loads run as tasks land in whatever
-    /// order the runtime's workers finish them — the same flight let go
-    /// twice then settles otherwise now and then (2 runs in 30 on an M2).
     #[test]
     fn letting_go_between_frames_bounds_what_is_held_and_is_the_same_twice() {
         for finish in [Finish::Pictures, Finish::Identity] {
@@ -3053,7 +3048,6 @@ pub(crate) mod tests {
             let config = |trim| SessionConfig {
                 traversal: Config {
                     pinned_level: None,
-                    refine_hysteresis: 0.0,
                     ..Config::default()
                 },
                 finish,

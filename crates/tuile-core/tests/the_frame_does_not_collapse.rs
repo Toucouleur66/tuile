@@ -111,6 +111,7 @@ fn pass(ts: &Tileset, x: f64) -> TraversalOutput {
         &config,
         0,
         &HashSet::new(),
+        &HashSet::new(),
         &mut out,
     );
     out
