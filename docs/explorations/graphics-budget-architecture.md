@@ -346,10 +346,11 @@ document first recommended keeping that shape, with the budget in the
 server's session. **Decided otherwise on 2026-10-19:** the budget lives with
 `GeometryServer`, and `GeometryServer` runs on the client whenever the client
 runs the core — native wgpu on a desktop, an iPhone or an Android phone, a
-headset, the wasm worker, Hydra through the C ABI. The WebSocket binding
-carries the resources that the client's core asks for; the server resolves
-them and serves the bytes (glb for a mesh, a texture for a drape), with no
-session of its own.
+headset, the wasm worker, Hydra through the C ABI, or a local process beside
+a renderer that cannot link Rust. The WebSocket binding carries the resources
+that the client's core asks for; the server resolves them and serves the
+bytes (a tileset's glb, a terrain or imagery tile as its source delivered it;
+the client composes the drapes), with no session of its own.
 
 ```rust
 // Client: §4.1 or §4.2 unchanged. The socket sits under the loaders, beside
@@ -366,7 +367,7 @@ for (r, g) in &d.cancel { socket.cancel(*r, *g) }   // a courtesy: the budget ha
 // replies: budget.on_loaded / on_failed, exactly as from an HTTP fetcher
 
 // Server: per request, a function of the key alone; nothing kept between requests.
-fn resolve(key: &ResourceKey) -> Result<Payload, ResolveError>;   // a mesh's glb, a drape's texture
+fn resolve(key: &ResourceKey) -> Result<Payload, ResolveError>;   // a tileset's glb, a source tile as stored
 ```
 
 - **Why on the client.**
@@ -395,8 +396,9 @@ fn resolve(key: &ResourceKey) -> Result<Payload, ResolveError>;   // a mesh's gl
   - The static HTTP mode and the WebSocket binding become two transports
     under the same loaders. The protocol of §5 (`ClientMessage`,
     `ServerMessage`) runs between the client's `GeometryServer` and its
-    renderer, in-process or across a worker's `postMessage`, and never crosses
-    a network.
+    renderer — in-process, across a worker's `postMessage`, or over a local
+    socket to a renderer that cannot link Rust — and never leaves the
+    consumer's machine.
   - A client that does not run the core (a third-party 3D Tiles viewer) uses
     the static mode, as it did.
   - docs/12 is amended in the same branch.

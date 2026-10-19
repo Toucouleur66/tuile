@@ -313,7 +313,8 @@ renderer.
 ## 5. Interfaces with GeometryStream and ContentPump
 
 The sketch of 2026-10-17; §15.2 and §15.4 are the decided protocol and executor. In
-particular `Credit` is not added, and the protocol never crosses a network (D-A5).
+particular `Credit` is not added, and the protocol never leaves the consumer's machine
+(D-A5).
 
 **Protocol (protocol.rs)**
 - `Ack { resource, gen, bytes }`.
@@ -954,12 +955,14 @@ pub enum ResourceContent {
   `ServerMessage::Fill` and `Retire` (D3).
 - **Never added:** `ClientMessage::Held` (D-A5: the budget asks the client's own tiers), and
   §5's `Credit { bytes }` (the budget counts in-transit bytes itself until `Ack` or
-  `Discarded`; in-process or across a worker, no transport grants credit).
+  `Discarded`; in-process, across a worker or over a local socket, no transport grants
+  credit).
 - **Host messages (D-A6):** `ToWorker::Detail` is deleted; `ToWorker::Budget { reported }`
   becomes `ClientMessage::Retarget`; `ToWorker::Pause` and the layer switch,
   `ToWorker::Imagery`, stay host messages for now.
-- The protocol never crosses a network (D-A5): the WebSocket binding is a transport of the
-  loaders (docs/12).
+- The protocol never leaves the consumer's machine (D-A5): in-process, across a worker, or
+  over a local socket to a renderer that cannot link Rust. The WebSocket of `tuile-server` is
+  a transport of the loaders (docs/12).
 
 ### 15.3 Views (`tuile_core::traversal`)
 

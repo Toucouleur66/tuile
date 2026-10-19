@@ -44,23 +44,26 @@ Acceptance criteria:
 - [ ] No frame > 33 ms attributable to decode (decode off the render thread).
 - [ ] Zero `unwrap()`/`panic!` in the core's production paths.
 
-## M2 — Network middleware: WebSocket streaming + static mode + pluggable cache
+## M2 — Network middleware: stateless resolver (HTTP + WebSocket fetch) + static mode + pluggable cache
 
-Scope: `tuile-server`, client `WsStream` binding, `tuile-wgpu-viewer --remote`.
+Scope: `tuile-server` (the HTTP and WebSocket front over `tuile-tile-server`'s store), the client's WebSocket `TileFetcher`, `tuile-wgpu-viewer --remote`.
+
+The geometry server, and the graphics budget it owns, stay on the consumer's side; the server resolves what they fetch and keeps no session (`docs/explorations/graphics-budget-architecture.md`, D-A5, 2026-10-19; `docs/12-crate-server.md`).
 
 Deliverables:
-1. **Network binding of streaming mode**: WebSocket endpoint (one session = one core `GeometryServer`), envelope serialization (versioned from the first byte), geometry as glb on the wire. Client `WsStream` binding (decodes on the client side) + `tuile-wgpu-viewer --remote ws://…`.
-2. `tuile` native binary (axum): `tuile serve <dir|s3://|gs://>` via `object_store`. Routes: WS streaming, tileset.json, contents, health, basic metrics.
+1. **The stateless resolver and its WebSocket transport**: a WebSocket endpoint carrying requests by key, their replies and cancels — no session, no `GeometryServer` on the server — envelope serialization (versioned from the first byte), geometry as glb on the wire. The client's WebSocket `TileFetcher` (decoding on the client side) + `tuile-wgpu-viewer --remote ws://…`.
+2. `tuile` native binary (axum): `tuile serve <dir|s3://|gs://>` via `object_store`. Routes: WS fetch, tileset.json, contents, health, basic metrics.
 3. `TileCache` trait + impls: `NoopCache`, `MemoryLruCache` (byte budget), `DiskCache`. Selection by config/CLI — the cache is removable depending on the environment.
 4. Correct HTTP headers (static mode): ETag, immutable Cache-Control on contents, configurable CORS, Range requests on glb.
-5. Cloudflare Workers target (`cloudflare` feature, `worker` crate): static mode (same routes, R2 storage, cache = Cache API or Noop — the CDN does the work). Streaming on Workers = Durable Objects track, non-blocking. A `wrangler.toml` example in `examples/`.
+5. Cloudflare Workers target (`cloudflare` feature, `worker` crate): static mode (same routes, R2 storage, cache = Cache API or Noop — the CDN does the work). No session state, so no Durable Object: a Worker answers the same keys; whether it also terminates the WebSocket is a deployment choice. A `wrangler.toml` example in `examples/`.
 6. Implicit tiling subtree decoding (deferred from M1 if applicable): the server can return a clean 404 on an unavailable tile.
 
 Acceptance criteria:
-- [ ] `tuile-wgpu-viewer --remote` displays the fixtures with visual AND selection parity vs local mode (same `Select` sequence for a replayed camera trajectory — programmatic test, not just visual).
+- [ ] `tuile-wgpu-viewer --remote` displays the fixtures with visual AND selection parity vs local mode (same `Select` sequence for a replayed camera trajectory — programmatic test, not just visual): the same core and budget, fetching over the WebSocket.
+- [ ] Every WS reply equals the static `GET` of its key, byte for byte, and depends on its key alone (two connections, any order, the same bytes): no state on the server beyond the ids in flight on a connection.
 - [ ] The main open source 3D Tiles web viewers (including three.js 3DTilesRenderer) consume a tileset served by `tuile serve` without error (manual test documented in `docs/`, test HTML pages committed).
 - [ ] The M1 wgpu viewer works against the server in static mode (`HttpPullStream` — full homemade loop).
-- [ ] Integration tests: end-to-end WS session (+ cancellation, timeout, malformed messages → Error), ETag/304, immutability, LRU respects the budget, NoopCache = passthrough.
+- [ ] Integration tests: end-to-end over a WS connection (+ cancellation, timeout, malformed messages → Error), ETag/304, immutability, LRU respects the budget, NoopCache = passthrough.
 - [ ] Workers build OK (`worker-build`), deployment documented step by step.
 
 ## M2.5 — Raster imagery (`core::raster` module)
@@ -89,7 +92,7 @@ Acceptance criteria:
 
 In priority order:
 
-1. **`tuile-hydra`**: specialized OpenUSD facade — Hydra scene index plugin, **designated second consumer of streaming mode** (`WsStream` client, with the core's decoding embedded in the facade). This is the target that justifies the cleanliness of the `GeometryStream` trait.
+1. **`tuile-hydra`**: specialized OpenUSD facade — Hydra scene index plugin, **designated second consumer of streaming mode** (the geometry server linked in its process through a C ABI, as `docs/14-crate-hydra.md` builds it; a `WsStream` client over a local socket, glb on the wire, wherever the core cannot be linked). This is the target that justifies the cleanliness of the `GeometryStream` trait.
 2. **`tuile-swift`**: specialized Apple facade — RealityKit via LowLevelMesh, iOS/iPadOS/visionOS AND native macOS targets (stereo rendering on visionOS: this is what requires multi-view traversal). Priority raised: it's the project's third renderer, just behind wgpu and OpenUSD/Hydra.
 3. `tuile-wasm`: JS bindings of the core for three.js.
 4. `tuile-cesium-ion`: Cesium ion source connector — endpoint resolution (`/v1/assets/{id}/endpoint`), Authorization bearer, token refresh on 401, credits/attribution. A `TileFetcher` impl on top of the HTTP fetcher: zero changes in the core (this is the seam purity test). Take inspiration from the behavior of the reference clients (`references/`). Never a token in the repo; imagery tiles (raster overlay) are a separate feature, post-connector.
