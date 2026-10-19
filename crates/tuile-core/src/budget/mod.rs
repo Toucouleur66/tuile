@@ -36,9 +36,7 @@ pub mod tier;
 pub mod types;
 pub mod view;
 
-#[cfg(feature = "budget-experiments")]
-pub use config::Pool;
-pub use config::{BudgetConfig, FailurePolicy, PressureFractions, Relaxation, Watermarks};
+pub use config::{BudgetConfig, FailurePolicy, Pool, PressureFractions, Relaxation, Watermarks};
 pub use deadline::FrameDeadline;
 pub use decisions::{
     Decisions, DrapeChoice, DrawItem, DrawSet, Role, Start, SwapGroup, UploadPlan,
@@ -268,13 +266,23 @@ impl Budget {
     /// device-memory hint). The budget itself knows no platform. Takes effect
     /// at the next step.
     pub fn retarget(&mut self, total: Bytes) {
-        let den = self
+        // The device's whole: the pool's hard limit once, and the hard
+        // limits of the classes outside it.
+        let pool = self.cfg.pool;
+        let outside = self
             .cfg
             .hard_limit
             .iter()
-            .fold(Bytes::ZERO, |a, (_, b)| a.plus(b))
-            .0
-            .max(1);
+            .filter(|(c, _)| !pool.holds(*c))
+            .fold(Bytes::ZERO, |a, (_, b)| a.plus(b));
+        let pooled = Class::ALL.iter().any(|c| pool.holds(*c));
+        let den = if pooled {
+            outside.plus(pool.hard_limit)
+        } else {
+            outside
+        }
+        .0
+        .max(1);
         self.factor = (total.0, den);
     }
 

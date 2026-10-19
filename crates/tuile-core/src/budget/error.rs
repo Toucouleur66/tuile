@@ -41,6 +41,10 @@ pub enum ConfigError {
     /// Batch never retries: a film never ships a hole.
     #[error("a batch budget must end the session on failure")]
     BatchMustEndOnFailure,
+    /// A pool whose hard limit is below its target, or whose members'
+    /// floors add up to more than the whole.
+    #[error("the pool's hard limit is below its target, or its floors exceed 100 %")]
+    Pool,
 }
 
 /// A condition that ends a session (Batch only).

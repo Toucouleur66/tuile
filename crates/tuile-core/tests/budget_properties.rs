@@ -521,6 +521,12 @@ proptest! {
             for class in Class::ALL {
                 prop_assert!(rec.d.stats.gpu[class] <= cfg.hard_limit[class]);
             }
+            // The pool's members together (D-A3) never cross the pool's.
+            let pooled = Class::ALL
+                .iter()
+                .filter(|c| cfg.pool.holds(**c))
+                .fold(Bytes::ZERO, |a, c| a.plus(rec.d.stats.gpu[*c]));
+            prop_assert!(pooled <= cfg.pool.hard_limit);
         }
         prop_assume!(decided_something(&tr));
     }

@@ -92,25 +92,122 @@ mod config {
         assert!(c.target.iter().all(|(_, b)| b > Bytes::ZERO));
     }
 
-    /// D-A3 (interim) and D3, spec §15.1: the ground's pool is 82 % of the
-    /// device, split 40/60 between terrain (33 %) and imagery (49 %); the
-    /// stand-ins' class is gone, its 2 % folded into the pool.
+    /// D-A3 (decided 2026-10-20) and D3, spec §15.1: the ground is one pool
+    /// of 82 % of the device — terrain between 25 % and 60 % of it, imagery
+    /// between 40 % and 75 % —, the stand-ins' class gone, its 2 % in the
+    /// pool.
     #[test]
-    fn the_interactive_split_gives_imagery_sixty_percent_of_the_ground_pool() {
+    fn the_ground_is_one_pool_with_floors_and_ceilings() {
         let total = Bytes::gib(1);
         let c = BudgetConfig::interactive(total);
-        assert_eq!(
-            c.hard_limit[Class::TerrainMesh],
-            total.scaled(33, 100),
+        let ground = total.scaled(82, 100);
+        let p = c.pool;
+        assert!(
+            p.holds(Class::TerrainMesh) && p.holds(Class::Drape),
             "{RED}"
         );
-        assert_eq!(c.hard_limit[Class::Drape], total.scaled(49, 100));
-        let all = c.hard_limit.iter().fold(Bytes::ZERO, |a, (_, b)| a.plus(b));
+        assert!(!p.holds(Class::Tiles3dMesh) && !p.holds(Class::Overlay));
+        assert_eq!(p.hard_limit, ground);
+        assert_eq!(c.hard_limit[Class::TerrainMesh], ground.scaled(60, 100));
+        assert_eq!(c.hard_limit[Class::Drape], ground.scaled(75, 100));
+        assert_eq!(
+            (
+                p.floor_percent[Class::TerrainMesh],
+                p.floor_percent[Class::Drape]
+            ),
+            (25, 40)
+        );
+        let outside = c.hard_limit[Class::Tiles3dMesh].plus(c.hard_limit[Class::Overlay]);
+        let all = outside.plus(p.hard_limit);
         assert!(
             all <= total && total.minus(all) < Bytes(4),
-            "the four classes share the whole device, to the byte's rounding"
+            "the pool and the other classes share the whole device"
         );
         assert_eq!(Class::ALL.len(), 4, "no class for stand-ins");
+    }
+
+    /// Engineering bar: a pool whose floors exceed the whole is refused.
+    #[test]
+    fn a_pool_whose_floors_exceed_the_whole_is_refused() {
+        let mut c = BudgetConfig::interactive(Bytes::mib(256));
+        c.pool.floor_percent[Class::Drape] = 90;
+        assert_eq!(Budget::new(c).err(), Some(ConfigError::Pool));
+    }
+}
+
+mod pool {
+    use super::*;
+
+    /// A ground of `pool` meshes' worth, terrain and imagery pooled, the
+    /// classes' ceilings at the pool's, floors at 25 % and 40 %.
+    fn pooled(pool: u64) -> BudgetConfig {
+        let mut c = Rig::interactive_config();
+        let whole = Bytes(MESH.0 * pool);
+        c.pool.target = whole;
+        c.pool.overflow = Bytes::ZERO;
+        c.pool.hard_limit = Bytes::mib(512);
+        for k in [Class::TerrainMesh, Class::Drape] {
+            c.target[k] = whole;
+            c.overflow[k] = Bytes::ZERO;
+            c.hard_limit[k] = Bytes::mib(512);
+        }
+        c.decoded_target = Bytes::ZERO;
+        c
+    }
+
+    /// D-A3: a member grows into what the other leaves — terrain alone may
+    /// take the whole pool, up to its ceiling, with no drape to share it.
+    #[test]
+    fn a_member_grows_into_what_the_other_leaves() {
+        let mut r = Rig::new(pooled(8));
+        let tiles: Vec<_> = (0..8).map(|x| t(4, x, 0)).collect();
+        let d = r.settle(&drawn(&tiles), 30);
+        assert_eq!(
+            d.stats.target[Class::TerrainMesh],
+            Bytes(MESH.0 * 8),
+            "{RED}"
+        );
+        assert!(d.evict.is_empty());
+        assert_eq!(d.stats.exact, 8);
+    }
+
+    /// D-A3: one sweep over the pool, in the one eviction order: what is
+    /// least needed goes, whatever its class, down to the pool's low
+    /// watermark — and a member is not swept below its floor.
+    #[test]
+    fn one_sweep_trims_the_pool_and_spares_a_member_at_its_floor() {
+        let mut c = pooled(8);
+        c.pool.floor_percent[Class::Drape] = 40;
+        let mut r = Rig::new(c);
+        let draped: Vec<_> = (0..3).map(|x| t(3, x, 0)).collect();
+        r.settle(&drawn_draped(&draped, 3), 30);
+        let old: Vec<_> = (0..4).map(|x| t(4, x, 9)).collect();
+        r.settle(&drawn(&old), 30);
+        let new: Vec<_> = (0..4).map(|x| t(4, x, 12)).collect();
+        let d = r.settle(&drawn(&new), 40);
+        let used = d.stats.gpu[Class::TerrainMesh].plus(d.stats.gpu[Class::Drape]);
+        assert!(used <= Bytes(MESH.0 * 8), "{RED}: the pool over its target");
+        assert!(
+            d.stats.gpu[Class::Drape] > Bytes::ZERO,
+            "the drapes, at their floor, are spared"
+        );
+    }
+
+    /// D-A3: the members together never cross the pool's hard limit, even
+    /// when each alone is under its own.
+    #[test]
+    fn the_members_together_never_cross_the_pools_hard_limit() {
+        let mut c = pooled(64);
+        c.pool.hard_limit = Bytes(MESH.0 * 6 + drape().0 * 2);
+        c.pool.target = c.pool.hard_limit;
+        let mut r = Rig::new(c.clone());
+        let tiles: Vec<_> = (0..8).map(|x| t(4, x, 0)).collect();
+        for _ in 0..40 {
+            let d = r.step(&drawn_draped(&tiles, 4));
+            let used = d.stats.gpu[Class::TerrainMesh].plus(d.stats.gpu[Class::Drape]);
+            assert!(used <= c.pool.hard_limit, "{RED}: {used:?}");
+            r.complete(&d);
+        }
     }
 }
 

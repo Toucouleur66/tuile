@@ -56,35 +56,66 @@ struct Eff {
     local: u32,
     upload: Bytes,
     batch: bool,
-    /// D-A3's pooled ledger, under study.
-    #[cfg(feature = "budget-experiments")]
+    /// The pooled ledger's numbers (D-A3); `None` with no member, and
+    /// under Batch.
     pool: Option<PoolEff>,
 }
 
-/// The pool's numbers for a step (D-A3, under study).
-#[cfg(feature = "budget-experiments")]
+/// The pool's numbers for a step (D-A3): its totals after pressure and
+/// `retarget`, each member's floor and its ceilings.
 #[derive(Clone, Copy)]
 struct PoolEff {
     members: PerClass<bool>,
     target: Bytes,
     overflow: Bytes,
     hard: Bytes,
-    floor: PerClass<u8>,
-    ceiling: PerClass<u8>,
+    floor_percent: PerClass<u8>,
+    /// Each member's own target and hard limit: its ceilings.
+    ceil_target: PerClass<Bytes>,
+    ceil_overflow: PerClass<Bytes>,
+    ceil_hard: PerClass<Bytes>,
 }
 
-#[cfg(feature = "budget-experiments")]
 impl PoolEff {
-    /// A member's target given what the other members use: what the pool
-    /// leaves, between its floor and its ceiling.
-    fn share(&self, c: Class, of: Bytes, used: &PerClass<Bytes>) -> Bytes {
-        let others = Class::ALL
+    /// What the other members use.
+    fn others(&self, c: Class, used: &PerClass<Bytes>) -> Bytes {
+        Class::ALL
             .iter()
             .filter(|o| **o != c && self.members[**o])
-            .fold(Bytes::ZERO, |a, o| a.plus(used[*o]));
-        let lo = of.scaled(u64::from(self.floor[c]), 100);
-        let hi = of.scaled(u64::from(self.ceiling[c]), 100);
-        of.minus(others).max(lo).min(hi)
+            .fold(Bytes::ZERO, |a, o| a.plus(used[*o]))
+    }
+
+    /// A member's floor, of the pool's `total`.
+    fn floor(&self, c: Class, total: Bytes) -> Bytes {
+        total.scaled(u64::from(self.floor_percent[c]), 100)
+    }
+
+    /// A member's target, given what every member uses: what the pool
+    /// leaves once the others are counted, between its floor and its
+    /// ceiling.
+    fn target(&self, c: Class, used: &PerClass<Bytes>) -> Bytes {
+        self.target
+            .minus(self.others(c, used))
+            .max(self.floor(c, self.target))
+            .min(self.ceil_target[c])
+    }
+
+    /// Its overflow, in proportion to its target.
+    fn overflow(&self, c: Class, target: Bytes) -> Bytes {
+        self.overflow
+            .scaled(target.0, self.target.0.max(1))
+            .min(self.ceil_overflow[c])
+    }
+
+    /// Its hard limit: what the pool's hard limit leaves once the others
+    /// are counted, between its floor and its ceiling, never under its
+    /// target.
+    fn hard(&self, c: Class, used: &PerClass<Bytes>, target: Bytes) -> Bytes {
+        self.hard
+            .minus(self.others(c, used))
+            .max(self.floor(c, self.hard))
+            .min(self.ceil_hard[c])
+            .max(target)
     }
 }
 
@@ -217,19 +248,30 @@ impl Budget {
                 Thermal::Critical => 4,
             }
         };
-        #[allow(unused_mut)]
         let mut hard = PerClass::from_fn(|c| scale(self.cfg.hard_limit[c], 100));
-        #[allow(unused_mut)]
         let mut target = PerClass::from_fn(|c| scale(self.cfg.target[c], pct));
-        #[allow(unused_mut)]
         let mut overflow = PerClass::from_fn(|c| scale(self.cfg.overflow[c], pct));
-        #[cfg(feature = "budget-experiments")]
-        let pool = match (self.cfg.pool, batch) {
-            (Some(pool), false) => Some(self.pool(pool, &mut target, &mut overflow, &mut hard)),
-            _ => None,
-        };
+        let cp = self.cfg.pool;
+        let pool = (!batch && Class::ALL.iter().any(|c| cp.members[*c])).then(|| {
+            let p = PoolEff {
+                members: cp.members,
+                target: scale(cp.target, pct),
+                overflow: scale(cp.overflow, pct),
+                hard: scale(cp.hard_limit, 100),
+                floor_percent: cp.floor_percent,
+                ceil_target: target,
+                ceil_overflow: overflow,
+                ceil_hard: hard,
+            };
+            for c in Class::ALL.into_iter().filter(|c| p.members[*c]) {
+                let t = p.target(c, &self.ledger.gpu);
+                target[c] = t;
+                overflow[c] = p.overflow(c, t);
+                hard[c] = p.hard(c, &self.ledger.gpu, t);
+            }
+            p
+        });
         Eff {
-            #[cfg(feature = "budget-experiments")]
             pool,
             target,
             overflow,
@@ -255,40 +297,6 @@ impl Budget {
             },
             batch,
         }
-    }
-
-    /// D-A3's pooled ledger, under study: each member's target, overflow
-    /// and hard limit from what the pool leaves once the others are counted.
-    #[cfg(feature = "budget-experiments")]
-    fn pool(
-        &self,
-        pool: super::config::Pool,
-        target: &mut PerClass<Bytes>,
-        overflow: &mut PerClass<Bytes>,
-        hard: &mut PerClass<Bytes>,
-    ) -> PoolEff {
-        let members = PerClass::from_fn(|c| pool.ceiling_percent[c] > 0);
-        let sum = |p: &PerClass<Bytes>| {
-            Class::ALL
-                .iter()
-                .filter(|c| members[**c])
-                .fold(Bytes::ZERO, |a, c| a.plus(p[*c]))
-        };
-        let p = PoolEff {
-            members,
-            target: sum(target),
-            overflow: sum(overflow),
-            hard: sum(hard),
-            floor: pool.floor_percent,
-            ceiling: pool.ceiling_percent,
-        };
-        for c in Class::ALL.into_iter().filter(|c| members[*c]) {
-            let t = p.share(c, p.target, &self.ledger.gpu);
-            overflow[c] = p.overflow.scaled(t.0, p.target.0.max(1));
-            target[c] = t;
-            hard[c] = p.share(c, p.hard, &self.ledger.gpu).max(t);
-        }
-        p
     }
 
     // 1. Arrivals.
@@ -1269,13 +1277,12 @@ impl Budget {
         st.target = eff.target;
         st.overflow = eff.overflow;
         st.hard_limit = eff.hard;
-        #[cfg(feature = "budget-experiments")]
         if let Some(p) = eff.pool {
             // The pool's shares as the step leaves them.
             for c in Class::ALL.into_iter().filter(|c| p.members[*c]) {
-                let t = p.share(c, p.target, &self.ledger.gpu);
+                let t = p.target(c, &self.ledger.gpu);
                 st.target[c] = t;
-                st.overflow[c] = p.overflow.scaled(t.0, p.target.0.max(1));
+                st.overflow[c] = p.overflow(c, t);
             }
         }
         st.decoded = self.ledger.decoded;
@@ -1684,7 +1691,7 @@ impl Budget {
             let shrinking = matches!(r, ResourceId::Mesh(t) if coarsening.contains(&t));
             let urgent = matches!(w.urgency, Urgency::Floor | Urgency::Hole | Urgency::Drape);
             let preload = w.urgency >= Urgency::Ring;
-            let limit = if shrinking {
+            let mut limit = if shrinking {
                 eff.hard[class]
             } else if urgent {
                 eff.hard[class].minus(eff.reserve[class])
@@ -1695,6 +1702,22 @@ impl Budget {
             } else {
                 eff.target[class].min(eff.hard[class].minus(eff.reserve[class]))
             };
+            if let Some(p) = eff.pool.filter(|p| p.members[class]) {
+                // A member also stays within what the pool leaves it now,
+                // the other members' deliveries of this step counted.
+                let reserve = p.hard.scaled(u64::from(self.cfg.hard_reserve_percent), 100);
+                let whole = if shrinking {
+                    p.hard
+                } else if urgent {
+                    p.hard.minus(reserve)
+                } else if preload {
+                    p.target
+                        .scaled(u64::from(self.cfg.watermarks.low_percent), 100)
+                } else {
+                    p.target.min(p.hard.minus(reserve))
+                };
+                limit = limit.min(whole.minus(p.others(class, &self.ledger.gpu)));
+            }
             if preload && (*strained || *blocked) {
                 return;
             }
@@ -1834,12 +1857,10 @@ impl Budget {
         st: &mut BudgetStats,
     ) {
         let w = self.cfg.watermarks;
-        #[cfg(feature = "budget-experiments")]
         if let Some(p) = eff.pool {
             self.evict_pooled(now, p, drawn, d, st);
         }
         for class in Class::ALL {
-            #[cfg(feature = "budget-experiments")]
             if eff.pool.is_some_and(|p| p.members[class]) {
                 continue;
             }
@@ -1930,10 +1951,9 @@ impl Budget {
         }
     }
 
-    /// D-A3, under study: one sweep over the pool's members, in the one
-    /// eviction order, down to the low watermark of the pool's target, no
-    /// member below its floor, none left above its ceiling.
-    #[cfg(feature = "budget-experiments")]
+    /// D-A3: one sweep over the pool's members, in the one eviction order,
+    /// down to the low watermark of the pool's target, no member below its
+    /// floor, none left above its ceiling.
     fn evict_pooled(
         &mut self,
         now: Micros,
@@ -1949,18 +1969,20 @@ impl Budget {
                 .filter(|c| p.members[**c])
                 .fold(Bytes::ZERO, |a, c| a.plus(l.gpu[*c]))
         };
-        let ceil = |c: Class| p.target.scaled(u64::from(p.ceiling[c]), 100);
-        let floor = |c: Class| p.target.scaled(u64::from(p.floor[c]), 100);
-        let over_ceiling = |l: &Ledger| {
-            Class::ALL
-                .iter()
-                .any(|c| p.members[*c] && l.gpu[*c] > ceil(*c))
-        };
-        let high = p.target.scaled(u64::from(w.high_percent), 100);
-        if used(&self.ledger) <= high && !over_ceiling(&self.ledger) {
+        let pct = |b: Bytes, percent: u8| b.scaled(u64::from(percent), 100);
+        let floor = |c: Class| p.floor(c, p.target);
+        // A member over its own ceiling (its own high watermark) is trimmed
+        // to its own low one, as a class outside the pool is.
+        let ceiling_high = |c: Class| pct(p.ceil_target[c], w.high_percent);
+        let ceiling_low = |c: Class| pct(p.ceil_target[c], w.low_percent);
+        let mut over: PerClass<bool> =
+            PerClass::from_fn(|c| p.members[c] && self.ledger.gpu[c] > ceiling_high(c));
+        let high = pct(p.target, w.high_percent);
+        let pool_over = used(&self.ledger) > high;
+        if !pool_over && Class::ALL.iter().all(|c| !over[*c]) {
             return;
         }
-        let low = p.target.scaled(u64::from(w.low_percent), 100);
+        let low = pct(p.target, w.low_percent);
         st.work = st.work.saturating_add(self.entries.len() as u32);
         let mut cands: Vec<_> = self
             .entries
@@ -1977,17 +1999,24 @@ impl Budget {
                     (e.last_needed, Reverse(e.level), Reverse(e.distance), *r),
                     *r,
                     e.class,
+                    e.gpu.map_or(Bytes::ZERO, |g| g.bytes),
                 )
             })
             .collect();
         cands.sort();
-        for (_, r, class) in cands {
-            let pool_low = used(&self.ledger) <= low;
-            let class_over = self.ledger.gpu[class] > ceil(class);
-            if pool_low && !over_ceiling(&self.ledger) {
+        for (_, r, class, bytes) in cands {
+            for c in Class::ALL {
+                over[c] &= self.ledger.gpu[c] > ceiling_low(c);
+            }
+            let pool_trim = pool_over && used(&self.ledger) > low;
+            if !pool_trim && Class::ALL.iter().all(|c| !over[*c]) {
                 break;
             }
-            if !class_over && (pool_low || self.ledger.gpu[class] <= floor(class)) {
+            // Over its ceiling it goes; for the pool's sake, only down to
+            // its floor.
+            let goes =
+                over[class] || (pool_trim && self.ledger.gpu[class].minus(bytes) >= floor(class));
+            if !goes {
                 continue;
             }
             if let Some(e) = self.entries.get_mut(&r) {
@@ -2022,23 +2051,18 @@ impl Budget {
             .map(|l| now.since(l))
             .unwrap_or(Micros::ZERO)
             .0;
-        #[allow(unused_mut)]
         let mut over = strained
             || Class::ALL
                 .iter()
                 .any(|&c| protected[c] > eff.target[c].plus(eff.overflow[c]));
-        #[cfg(feature = "budget-experiments")]
         if let Some(p) = eff.pool {
-            // The pool's members relax on the pool's protected bytes.
+            // The pool's members relax on the pool's protected bytes too.
             let pooled = Class::ALL
                 .iter()
                 .filter(|c| p.members[**c])
                 .fold(Bytes::ZERO, |a, c| a.plus(protected[*c]));
-            over = strained
-                || pooled > p.target.plus(p.overflow)
-                || Class::ALL
-                    .iter()
-                    .any(|&c| !p.members[c] && protected[c] > eff.target[c].plus(eff.overflow[c]));
+            // And each member on its own share, as before.
+            over |= pooled > p.target.plus(p.overflow);
         }
         let at_hard = blocked
             || Class::ALL.iter().any(|&c| {

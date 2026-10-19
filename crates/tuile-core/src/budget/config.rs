@@ -57,20 +57,44 @@ pub struct PressureFractions {
     pub background_percent: u8,
 }
 
-/// D-A3, under study: the terrain and imagery classes share one pool, each
-/// between a floor and a ceiling of it, so that the split follows the view
-/// instead of a fixed ratio. A class's effective target is what the pool
-/// leaves once the other members' protected bytes are counted, clamped to
-/// its floor and ceiling; its overflow follows in proportion, and its hard
-/// limit is what the pool's hard limit leaves once the other members' bytes
-/// are counted, clamped the same way. Compiled only for the experiments.
-#[cfg(feature = "budget-experiments")]
+/// The pooled ledger (D-A3, decided 2026-10-20): classes that share one pool
+/// of bytes, so that the split between them follows the view instead of a
+/// fixed ratio. The members' bytes together are held to the pool's target,
+/// overflow and hard limit; each member between a floor (a percent of the
+/// pool) and a ceiling (its own `target`, `overflow` and `hard_limit`). A
+/// member's effective target is what the pool leaves once the other
+/// members' bytes are counted, clamped to its floor and its ceiling; one
+/// eviction sweep runs over the members in the one eviction order; the
+/// relaxation reads the pool's protected bytes. Classes outside the pool
+/// keep their own targets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Pool {
-    /// Each member's floor, percent of the pool; 0 for a class outside it.
+    /// The classes that share the pool.
+    pub members: PerClass<bool>,
+    /// The members' bytes together are trimmed to this.
+    pub target: Bytes,
+    /// Visible-only headroom above the pool's target.
+    pub overflow: Bytes,
+    /// The members' bytes together never cross this.
+    pub hard_limit: Bytes,
+    /// Each member's floor, percent of the pool's target and hard limit.
     pub floor_percent: PerClass<u8>,
-    /// Each member's ceiling, percent of the pool; 0 for a class outside it.
-    pub ceiling_percent: PerClass<u8>,
+}
+
+impl Pool {
+    /// No pool: every class keeps its own target.
+    pub const NONE: Pool = Pool {
+        members: PerClass([false; 4]),
+        target: Bytes::ZERO,
+        overflow: Bytes::ZERO,
+        hard_limit: Bytes::ZERO,
+        floor_percent: PerClass([0; 4]),
+    };
+
+    /// Whether `c` shares the pool.
+    pub fn holds(&self, c: Class) -> bool {
+        self.members[c]
+    }
 }
 
 /// Every number the budget runs on.
@@ -134,22 +158,42 @@ pub struct BudgetConfig {
     pub failure: FailurePolicy,
     /// A load that has waited this long gets the full age bonus.
     pub age_full: Micros,
-    /// D-A3's pooled ledger, under study.
-    #[cfg(feature = "budget-experiments")]
-    pub pool: Option<Pool>,
+    /// The pooled ledger (D-A3): the ground's terrain and imagery, in a
+    /// viewer.
+    pub pool: Pool,
 }
 
 impl BudgetConfig {
-    /// A viewer's budget for `gpu` bytes in total, split between classes.
+    /// A viewer's budget for `gpu` bytes in total.
     ///
-    /// The ground's pool — terrain and imagery — is 82 % of the device,
-    /// split 40/60: terrain 33 %, imagery 49 % (the interim split of D-A3,
-    /// spec §15.1, until a pooled ledger is decided on evidence). 3D Tiles
-    /// keep 15 % and overlays 3 %. Every other number is a first proposal
-    /// (decision D5), tuned per profile from simulated curves.
+    /// The ground — terrain and imagery — is one pool of 82 % of the device
+    /// (D-A3, decided 2026-10-20): terrain between 25 % and 60 % of it,
+    /// imagery between 40 % and 75 %, the split following the view. 3D Tiles
+    /// keep 15 % and overlays 3 % of their own. Every other number is a
+    /// first proposal (decision D5), tuned per profile from simulated curves.
     pub fn interactive(gpu: Bytes) -> Self {
         let share = |pct: u64| gpu.scaled(pct, 100);
-        let hard_limit = PerClass([share(33), share(15), share(49), share(3)]);
+        let ground = share(82);
+        let mut members = PerClass::splat(false);
+        members[Class::TerrainMesh] = true;
+        members[Class::Drape] = true;
+        let mut floor_percent = PerClass::splat(0u8);
+        floor_percent[Class::TerrainMesh] = 25;
+        floor_percent[Class::Drape] = 40;
+        let pool = Pool {
+            members,
+            target: ground.scaled(70, 100),
+            overflow: ground.scaled(15, 100),
+            hard_limit: ground,
+            floor_percent,
+        };
+        // The members' own limits are their ceilings.
+        let hard_limit = PerClass([
+            ground.scaled(60, 100),
+            share(15),
+            ground.scaled(75, 100),
+            share(3),
+        ]);
         BudgetConfig {
             policy: Policy::Interactive,
             target: PerClass::from_fn(|c| hard_limit[c].scaled(70, 100)),
@@ -187,8 +231,7 @@ impl BudgetConfig {
                 max: Micros::from_secs(30),
             },
             age_full: Micros::from_secs(2),
-            #[cfg(feature = "budget-experiments")]
-            pool: None,
+            pool,
         }
     }
 
@@ -228,8 +271,7 @@ impl BudgetConfig {
             imagery_tile_px: 256,
             failure: FailurePolicy::EndSession,
             age_full: Micros::from_secs(2),
-            #[cfg(feature = "budget-experiments")]
-            pool: None,
+            pool: Pool::NONE,
         }
     }
 
@@ -281,6 +323,17 @@ impl BudgetConfig {
         }
         if self.policy == Policy::Batch && self.failure != FailurePolicy::EndSession {
             return Err(ConfigError::BatchMustEndOnFailure);
+        }
+        let p = &self.pool;
+        if Class::ALL.iter().any(|c| p.members[*c]) {
+            let floors: u32 = Class::ALL
+                .iter()
+                .filter(|c| p.members[**c])
+                .map(|c| u32::from(p.floor_percent[*c]))
+                .sum();
+            if p.hard_limit < p.target || floors > 100 {
+                return Err(ConfigError::Pool);
+            }
         }
         Ok(())
     }

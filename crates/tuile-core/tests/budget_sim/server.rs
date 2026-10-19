@@ -583,11 +583,14 @@ impl Sim {
                 self.fail(&format!("I2: {c:?} over its hard limit"));
             }
         }
-        let total = |p: &tuile_core::budget::PerClass<Bytes>| {
-            Class::ALL.iter().fold(Bytes::ZERO, |a, c| a.plus(p[*c]))
-        };
-        if total(&s.gpu) > total(&cfg.hard_limit) {
-            self.fail("I2: the device's total over the hard limits' sum");
+        // And the pool's members together never cross the pool's.
+        let pool = cfg.pool;
+        let pooled = Class::ALL
+            .iter()
+            .filter(|c| pool.holds(**c))
+            .fold(Bytes::ZERO, |a, c| a.plus(s.gpu[*c]));
+        if pooled > pool.hard_limit && Class::ALL.iter().any(|c| pool.holds(*c)) {
+            self.fail("I2: the pool over its hard limit");
         }
         // I5: only the fresh generation is delivered.
         for (r, g) in &d.deliver {
