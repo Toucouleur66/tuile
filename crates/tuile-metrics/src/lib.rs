@@ -32,7 +32,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
-use tuile_core::metrics::{ByLevel, Metrics, Tally, Timer, LEVELS};
+use tuile_core::metrics::{ByLevel, Metrics, Tally, Timer, EYES, LEVELS};
 
 /// Where the exporter listens unless `TUILE_METRICS_ADDR` says otherwise.
 ///
@@ -193,6 +193,30 @@ fn describe() {
     describe_gauge!(
         "tuile_tiles_filled",
         "Selected tiles drawn by a stand-in surface rather than their own geometry."
+    );
+    describe_gauge!(
+        "tuile_frame_exact",
+        "Selected tiles the last frame drew with their own surface."
+    );
+    describe_gauge!(
+        "tuile_frame_coarser",
+        "Selected tiles the last frame drew with a coarser ancestor standing in."
+    );
+    describe_gauge!(
+        "tuile_frame_lost",
+        "Selected tiles the last frame drew with nothing at all: holes."
+    );
+    describe_gauge!(
+        "tuile_frame_stand_ins",
+        "Selected tiles the last frame drew with a stand-in."
+    );
+    describe_gauge!(
+        "tuile_frame_digest",
+        "A digest of the tiles the last frame drew, its low 48 bits: constant while the picture is."
+    );
+    describe_gauge!(
+        "tuile_eye_pixels",
+        "Per eye of the last frame read back: ground pixels (series=ground), and those left the clear colour (series=black)."
     );
     describe_gauge!(
         "tuile_priming_total",
@@ -367,6 +391,20 @@ fn publish(m: &Metrics) {
     gauge!("tuile_pending_uploads").set(m.pending_uploads.get() as f64);
     gauge!("tuile_prepared_tiles").set(m.prepared_tiles.get() as f64);
     gauge!("tuile_tiles_filled").set(m.tiles_filled.get() as f64);
+    gauge!("tuile_frame_exact").set(m.frame_exact.get() as f64);
+    gauge!("tuile_frame_coarser").set(m.frame_coarser.get() as f64);
+    gauge!("tuile_frame_lost").set(m.frame_lost.get() as f64);
+    gauge!("tuile_frame_stand_ins").set(m.frame_stand_ins.get() as f64);
+    // Forty-eight bits, which a float carries exactly: a fingerprint to see
+    // the picture change by, not a number to do arithmetic on.
+    gauge!("tuile_frame_digest").set((m.frame_digest.get() & ((1 << 48) - 1)) as f64);
+    for eye in 0..EYES {
+        let label = eye.to_string();
+        gauge!("tuile_eye_pixels", "series" => "ground", "eye" => label.clone())
+            .set(m.eye_ground_pixels.get(eye) as f64);
+        gauge!("tuile_eye_pixels", "series" => "black", "eye" => label)
+            .set(m.eye_black_pixels.get(eye) as f64);
+    }
     gauge!("tuile_priming_total").set(m.priming_total.get() as f64);
     gauge!("tuile_priming_pending").set(m.priming_pending.get() as f64);
     gauge!("tuile_priming_unavailable").set(m.priming_unavailable.get() as f64);
@@ -488,5 +526,32 @@ mod tests {
         ] {
             assert!(text.contains(series), "{series} missing from:\n{text}");
         }
+    }
+
+    /// What a frame drew, and what its eyes saw, reach the endpoint — and
+    /// move when the numbers do.
+    #[test]
+    fn the_frame_and_its_eyes_are_published() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let m = tuile_core::metrics::metrics();
+        m.frame_lost.set(7);
+        m.eye_black_pixels.set(1, 42);
+        metrics::with_local_recorder(&recorder, || publish(m));
+        let text = handle.render();
+        for series in [
+            "tuile_frame_lost 7",
+            "tuile_frame_exact",
+            "tuile_frame_coarser",
+            "tuile_frame_stand_ins",
+            "tuile_frame_digest",
+            "tuile_eye_pixels{series=\"black\",eye=\"1\"} 42",
+            "tuile_eye_pixels{series=\"ground\",eye=\"0\"}",
+        ] {
+            assert!(text.contains(series), "{series} missing from:\n{text}");
+        }
+        m.frame_lost.set(0);
+        metrics::with_local_recorder(&recorder, || publish(m));
+        assert!(handle.render().contains("tuile_frame_lost 0"));
     }
 }
