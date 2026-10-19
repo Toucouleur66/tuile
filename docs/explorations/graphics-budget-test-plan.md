@@ -25,9 +25,9 @@ Phase 2 of the budget plan, written on 2026-10-19 against `feat/budget-core` at 
 - **Tests and production share one vocabulary.** A test asserts through the signals of the
   spec's §16 wherever one exists (`lost_tile_steps_total == 0`, `converged_seconds ≤ T_conv`),
   so a regression reads the same on a dashboard as in a red test.
-- **Counts** (§12): 216 cells — 74 existing tests, 141 new, and one later, for a headset
+- **Counts** (§12): 218 cells — 74 existing tests, 143 new, and one later, for a headset
   shell that does not exist yet. By level, existing / new: L1 34 / 20; L2 14 / 16; L3 24 /
-  36; L4 2 / 17; L5 0 / 23, plus the one later; O 0 / 29.
+  38; L4 2 / 17; L5 0 / 23, plus the one later; O 0 / 29.
 
 ## 1. Levels
 
@@ -42,7 +42,9 @@ Phase 2 of the budget plan, written on 2026-10-19 against `feat/budget-core` at 
 
 Profiles (spec §14): **D** desktop, **H** handheld, **Hl** handheld at its low clamp,
 **W** web (the budget a message away from its executor), **X72**, **X90**, **X120** a
-stereo headset at that rate, **D2** a desktop with two eyes (hyperstereo), **B** batch.
+stereo headset at that rate, **D2** a desktop with two eyes (hyperstereo), **B** batch,
+**R** a remote session for a consumer that declares its budget (decisions and acks a round
+trip late on a LAN, the budget on the declared memory; D-A5).
 
 ## 2. The matrix
 
@@ -267,6 +269,8 @@ devices.
 | L3 | `a_film_does_not_depend_on_how_frames_are_split` | I13 | B | exists: sim | — | the digest |
 | L3 | `architecture_shared_arbiter_against_split_budgets` | D-A0's evidence (an experiment, ignored) | D, H, Hl | exists: sim (`architecture.rs`) | — | — |
 | L3 | `architecture_pooled_ledger_against_fixed_split` | D-A3's evidence (an experiment, ignored) | D, H, Hl | new | 3 | — |
+| L3 | `a_remote_session_stays_within_its_declared_memory` | I2 and the ledger from `Ack` bytes, with decisions and acks a round trip late (D-A5) | R | new | 3 | `bytes`, `hard_limit_bytes` |
+| L3 | `a_remote_film_is_exact_with_acks_a_round_trip_late` | I13 under a remote session | R, B | new | 3 | `batch_steps_per_frame` |
 | L4 | `upload_plan_respects_bytes` | I18 with the plan's cap (spec §8) | D, H | new | 4.1, green at 5 | `upload_plan_bytes`, `frame_upload_bytes` |
 | L4 | `headless_memory_warning_mid_zoom_is_never_black` | I8, I1 | H | new | 5 | black scan, `target_bytes` |
 | L4 | `a_fallback_never_paints_over_its_drawn_siblings` | D3: the fallback pass replaces the stand-ins (`stand_ins.rs` rewritten; `no_two_surfaces.rs` kept) | D | new | 4.2 | the black scan, a two-surface scan |
@@ -559,24 +563,28 @@ Read against this plan:
 - **D3's wording** (`Role::Held` against `Role::Fallback`, spec §10): the cells of P1 and P3
   assume both roles stay as `decisions.rs` defines them.
 - **P2's fallback climb** has no bound yet; the first green run proposes one, for review.
+- **`ClientMessage::Held`** (open, D-A5): a remote consumer with local tiers would need a cell
+  of its own (I14 across a session); none is written until it is decided.
+- **D-T1**, the session's transport: the remote-session cells simulate a round trip, not a
+  transport; the transport's own tests come with tuile-server (M2).
 
 ## 12. Counts
 
 Cells are the rows of §2: one test, run under the profiles of its row. A test that proves
 two patterns has a row in each — only `a_zoom_out_to_200_km_and_back_never_shows_a_hole`,
-in P2 and in P3 — so 216 cells are 215 distinct tests. Counted by script from the tables
+in P2 and in P3 — so 218 cells are 217 distinct tests. Counted by script from the tables
 above; the last column counts each row once per profile it runs under.
 
 | Level | Existing | New | Later | Cells | Runs (cells × profiles), existing / new |
 |---|---|---|---|---|---|
 | L1 | 34 | 20 | 0 | 54 | 35 / 25 |
 | L2 | 14 | 16 | 0 | 30 | 16 / 36 |
-| L3 | 24 | 36 | 0 | 60 | 26 / 82 |
+| L3 | 24 | 38 | 0 | 62 | 26 / 85 |
 | L4 | 2 | 17 | 0 | 19 | 2 / 28 |
 | L5 | 0 | 23 | 1 | 24 | 0 / 24 |
 | O | 0 | 29 | 0 | 29 | 0 / 29 |
-| **All** | **74** | **141** | **1** | **216** | **79 / 224** |
+| **All** | **74** | **143** | **1** | **218** | **79 / 227** |
 
 By pattern, existing / new: P1 13 / 20; P2 12 / 14; P3 13 / 11; P4 8 / 14; P5 0 / 19;
-P6 2 / 17 (+1 later); cross-cutting 26 / 17; observability 0 / 29. P5 has no existing test
+P6 2 / 17 (+1 later); cross-cutting 26 / 19; observability 0 / 29. P5 has no existing test
 at all: the budget has never been tested against a change of viewport.

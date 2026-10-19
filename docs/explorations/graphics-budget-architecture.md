@@ -7,10 +7,11 @@ Phase 1a of the budget plan: a decision gate. The spec
 (`graphics-budget-to-be-and-spec.md`) is amended only once the owner has decided
 on this document.
 
-**Status: decided on 2026-10-19** (§6). Every recommendation was taken but
-one: D-A5 reverses it. The budget lives with `GeometryServer` on the client,
-whenever the client runs the core, and the WebSocket binding of `tuile-server`
-serves resources statelessly (§4.3, docs/12).
+**Status: decided on 2026-10-19** (§6). Every recommendation was taken; D-A5
+was reformulated by Laurent: the budget lives with `GeometryServer`, and
+`GeometryServer` runs where its budget's inputs are — locally on interactive
+devices, in a `tuile-server` session for a consumer that declares its budget
+(§4.3, docs/12). The transport is an open decision, D-T1.
 
 Three questions:
 
@@ -338,70 +339,68 @@ the codec `crates/tuile-web/src/wire.rs`).
 - Upload pacing must be on the page: a decision arrives a message late, so
   only the page knows its frame budget.
 
-### 4.3 The WebSocket binding (`tuile-server`, docs/12): the budget on the client (D-A5)
+### 4.3 The WebSocket binding (`tuile-server`, docs/12): the budget where its inputs are (D-A5)
 
-Not built yet. Docs/12 ran one core `GeometryServer` per WebSocket session on
-the server, with "client-side residency tracked via `Ack`/`Evict`". This
-document first recommended keeping that shape, with the budget in the
-server's session. **Decided otherwise on 2026-10-19:** the budget lives with
-`GeometryServer`, and `GeometryServer` runs on the client whenever the client
-runs the core — native wgpu on a desktop, an iPhone or an Android phone, a
-headset, the wasm worker, Hydra through the C ABI, or a local process beside
-a renderer that cannot link Rust. The WebSocket binding carries the resources
-that the client's core asks for; the server resolves them and serves the
-bytes (a tileset's glb, a terrain or imagery tile as its source delivered it;
-the client composes the drapes), with no session of its own.
+Not built yet. Docs/12 runs one core `GeometryServer` per WebSocket session on
+the server, with "client-side residency tracked via `Ack`/`Evict`".
+**Decided on 2026-10-19, as Laurent reformulated it:** the budget lives with
+`GeometryServer`, and `GeometryServer` runs where its budget's inputs are.
+That gives two placements, not one.
+
+**Interactive devices run it locally.** A desktop, a phone, a headset or a
+browser runs `GeometryServer` and its budget in-process or in a worker
+(§4.1, §4.2):
+- memory pressure must act at once: a memory warning or an `onTrimMemory`
+  level a round trip late is a jetsam kill, and the hard limit would need a
+  second enforcer on the device;
+- the presence oracle on the local store is synchronous (§4b of the spec, I14
+  and I15), and a remote budget cannot ask it;
+- a head-rate rotation (300°/s) cannot wait a round trip for the decision about
+  what its next frames show, and the per-frame deadline comes from the
+  device's own display (I18).
+
+**Consumers that declare their budget can run it in a `tuile-server`
+session.** A USD/Cycles render node, a farm, a simulator cluster whose
+image-generator channels declare their memory, a consumer that cannot link
+the core: their memory is a declared number, not a signal that moves under
+them, and their latency — a batch, a LAN — tolerates a round trip. The call
+sequence is §4.2's over a socket:
 
 ```rust
-// Client: §4.1 or §4.2 unchanged. The socket sits under the loaders, beside
-// the HTTP fetcher; it is never between the budget and the renderer.
-let need = traverse(tree, &budget.residency(), &views, cfg, frame);
-let d = budget.decide(FrameInput::new(frame, now, &need).with_presence(&store_index));
-for s in &d.start {
-    match s.source {
-        Source::Local => store.read(s.resource, s.gen),          // local tier, own quota (I15)
-        Source::Network => socket.request(s.resource, s.gen),    // or an HTTP GET for the same key
-    }
+// Consumer: declares its memory, sends its views, executes, acks with bytes.
+socket.send(ClientMessage::Retarget { total_bytes: declared })?;      // at the start, and on change
+socket.send(ClientMessage::ViewerState { views, generation })?;
+for msg in socket.messages() {                                         // Select / Content / Cancel / Evict
+    executor.apply(msg);                                               // glb decoded on the consumer's side
 }
-for (r, g) in &d.cancel { socket.cancel(*r, *g) }   // a courtesy: the budget has dropped it already
-// replies: budget.on_loaded / on_failed, exactly as from an HTTP fetcher
+for (resource, gen, bytes) in executor.uploaded() {
+    socket.send(ClientMessage::Ack { resource, gen, bytes })?;         // the session's ledger is exact
+}
+// past its own hard limit the executor refuses and sends Discarded { resource, gen }
 
-// Server: per request, a function of the key alone; nothing kept between requests.
-fn resolve(key: &ResourceKey) -> Result<Payload, ResolveError>;   // a tileset's glb, a source tile as stored
+// tuile-server, one session per consumer: §4.1's server side, unchanged.
+let need = traverse(tree, &budget.residency(), &views, cfg, frame);
+let d = budget.decide(FrameInput::new(frame, now, &need));             // presence: see Held, below
 ```
 
-- **Why on the client.**
-  - The budget's inputs live there: the GPU's memory and the hard limit that
-    guards against a jetsam or out-of-memory kill (`os_proc_available_memory`,
-    `VK_EXT_memory_budget`, `onTrimMemory`), memory pressure and the thermal
-    state, the synchronous presence oracle on the local store (§4b of the
-    spec, I14 and I15), and the display rate the per-frame deadline comes from
-    (I18).
-  - A remote budget decides one round trip late. The hard limit would then
-    need a second enforcer on the client (refusing uploads, acking
-    `Discarded`), and there would be two places to keep right instead of one.
-  - A headset cannot afford decisions that are a round trip old about what its
-    next frames show.
-  - A stateless server scales out and caches: each response is a function of
-    its key, so a CDN or a Cloudflare Worker serves it as it serves the static
-    mode.
-  - Every consumer that exists already runs the core: the native viewers, the
-    web worker, Hydra and the film and bake sessions.
-- **Consequences.**
-  - No `ClientMessage::Held`: the budget asks the client's own tiers directly.
-    No server session mode to maintain, no `GeometryServer` per connection.
-  - The socket carries requests keyed by resource (the key a static `GET`
-    would use for the same bytes), their replies and cancels. Per connection,
-    the server keeps only the ids of requests in flight.
-  - The static HTTP mode and the WebSocket binding become two transports
-    under the same loaders. The protocol of §5 (`ClientMessage`,
-    `ServerMessage`) runs between the client's `GeometryServer` and its
-    renderer — in-process, across a worker's `postMessage`, or over a local
-    socket to a renderer that cannot link Rust — and never leaves the
-    consumer's machine.
-  - A client that does not run the core (a third-party 3D Tiles viewer) uses
-    the static mode, as it did.
-  - docs/12 is amended in the same branch.
+- The session's budget is fed by the declared memory (`retarget`) and by the
+  `Ack { resource, gen, bytes }` of the consumer: that is why the ack carries
+  bytes and a generation.
+- `ClientMessage::Held { resources }` — what a remote consumer already holds in
+  local tiers — is **open, not decided**: needed only for a remote consumer
+  that has local tiers (I14 then needs the session to know them); optional for
+  a declared-budget consumer, which usually has none.
+- The transport is an open decision too, **D-T1** (docs/12): WebSocket in v1;
+  under discussion, QUIC (`quinn`) / WebTransport first — multiplexed streams,
+  priorities and a cancel per content, no TCP head-of-line blocking behind a
+  22 MB drape, connection migration between Wi-Fi and cellular — shared-memory
+  IPC on the same machine (zero-copy glb), WebSocket as the fallback. The
+  protocol stays transport-agnostic.
+- The static mode is unchanged: `HttpPullStream`, `GeometryServer` on the
+  client, every reply cacheable by a CDN or a Worker. `tuile-tile-server`, the
+  source-tile store, is the storage and cache side of both modes.
+- This changes no code: neither the session server nor its binding exists yet,
+  and every consumer that exists runs its core locally.
 
 ### 4.4 Hydra / USD (docs/14, docs/15)
 
@@ -577,6 +576,7 @@ pub enum ClientMessage {
     Thermal(Thermal),
     Retarget { total_bytes: u64 },
     ReleaseBeyond { bytes: u64 },                 // Batch, between frames (replaces Trim)
+    // Held { resources: Vec<ResourceId> }        // open (§4.3): a remote session's consumer with local tiers only
 }
 pub enum ServerMessage {
     Select { draw: DrawSet, ancestry: Vec<(TileId, Ancestry)>, stats: TraversalStats, generation: u64 },
@@ -606,11 +606,10 @@ in the plan's priority order, drained per render frame within
 `FrameDeadline { bytes }` derived from the display rate, never beyond the
 class hard limits; deviations reported, never fed back into decisions.
 
-**Where the budget lives** (D-A5, decided against this document's first
-recommendation): with `GeometryServer`, on the client, whatever the host —
-in-process, in a worker, behind the C ABI. Its inputs are messages only, so
-it runs the same in each. The server, static HTTP or WebSocket, resolves and
-serves resources statelessly (§4.3).
+**Where the budget lives** (D-A5): with `GeometryServer`, which runs where
+its budget's inputs are — in-process or in a worker on an interactive device,
+in a `tuile-server` session for a consumer that declares its budget (§4.3).
+Its inputs are messages only, so it runs the same in each.
 
 ## 6. Decisions
 
@@ -624,10 +623,11 @@ and §12–§15).
 | **D-A2** | Imagery as its own `Content` in the same session (A), not a payload (C), not a second stream with its own budget (B′)? | Yes | **Yes**: imagery is its own `Content` in the same session, not a payload of the terrain tile | A payload cannot meet I10 and turns every redrape into a mesh swap; a stream keyed on what terrain drew leaves ground bare (§3.3) |
 | **D-A3** | Keep fixed per-class targets, or pool the ledger with per-class floors and ceilings so the split follows the view? The ratio moves the low-clamp convergence 2.0–3.3 s and the blur under a warning 19–49 %. | Open: simulate a pooled ledger in Phase 3 before deciding; until then, 40/60 for the default split looks better than 44/56 under pressure | **As proposed**: open; a pooled ledger with per-class floors and ceilings is simulated in Phase 3; the interim default split is 40/60 terrain/imagery | The ratio matters in both shapes, and 40/60 was the best of the three splits measured, under pressure and at the low clamp |
 | **D-A4** | Several layers: per-layer drapes (`Drape { tile, layer, level }`, composed by the executor; USD composes once all are drawable), or one composed drape per tile keyed by the layer set? | Per layer | **Yes**: per-layer drapes `Drape { tile, layer, level }`, composed by the executor | Each layer picks its level, falls back and refreshes on its own; one ledger keeps N layers from needing N splits |
-| **D-A5** | The WebSocket binding: budget in the server session (docs/12) with `Ack { bytes }` and `Held`, and "budget client-side, server stateless" understood as the static HTTP mode? | Yes; correct the plan's wording | **No — client-side** (reverses the recommendation): the budget lives with `GeometryServer`, which runs on the client whenever the client runs the core; the WebSocket binding serves stateless, cacheable resources; no `Held`, no server session (§4.3, docs/12) | The budget's inputs (GPU memory, pressure and thermal, the local presence oracle, the display rate) are on the client; a remote budget is a round trip late and needs a second enforcer of the hard limit; a stateless server scales and caches |
+| **D-A5** | The WebSocket binding: budget in the server session (docs/12) with `Ack { bytes }` and `Held`, and "budget client-side, server stateless" understood as the static HTTP mode? | Yes; correct the plan's wording | **Reformulated**: the budget lives with `GeometryServer`, which runs where its budget's inputs are — locally (in-process or in a worker) on interactive devices; in a `tuile-server` session, its budget fed by `Ack { resource, gen, bytes }` and the declared memory, for a consumer that declares its budget (a render node, a farm, a simulator cluster, one that cannot link the core). `Held` is open: only for a remote consumer with local tiers (§4.3, docs/12) | Pressure must act at once, the local store's presence oracle is synchronous and a head-rate rotation cannot wait a round trip; a declared budget and a batch or LAN latency tolerate one |
 | **D-A6** | Host side channels: `ToWorker::Detail` and `Budget` fold into the stream (`ViewerState`, `Retarget`); `Pause` and the layer switch stay host messages for now? | Yes | **Yes**: `ToWorker::Detail` disappears (the imagery need comes per tile from the views, I10); `ToWorker::Budget { reported }` becomes `ClientMessage::Retarget`; `Pause` and the layer switch stay host messages for now (the layer switch may fold in with several layers) | One path, native and web; no second source of truth for the imagery level; ordered with the acks, so a session replays |
 | **D-A7** | Headset eyes: `ViewState::from_fov` with an asymmetric frustum, and the incremental need (I6) promoted from follow-up to P6 requirement? | Yes | **Yes**: `ViewState::from_fov` with an asymmetric frustum (OpenXR's four angles); the incremental need and decide of I6 (O(changes · log N)) become a requirement of P6 | A headset eye's frustum is asymmetric; at 90 Hz the cost of `decide` bounds how fresh a decision is |
 | **D-A8** | Per-frame deadline: the executor's `FrameDeadline` from the display rate, with `upload_bytes_per_frame` kept as the plan's per-step cap? | Yes | **Yes**: the executor's `FrameDeadline`, from the display rate, caps uploads per frame; `upload_bytes_per_frame` stays the plan's deterministic per-step cap; what is deferred is reported as a deviation and never feeds `decide` | Only the render side knows its frame; decisions stay a function of their inputs (I12) |
+| **D-T1** | The transport of the session binding | — | **Open.** docs/12 says WebSocket in v1, WebTransport later. Under discussion: QUIC (`quinn`) / WebTransport first, shared-memory IPC on the same machine (zero-copy glb), WebSocket as the fallback; Workers keep the static mode (WebTransport on Workers to verify). The protocol stays transport-agnostic | Multiplexed streams give priorities and a cancel per content, no TCP head-of-line blocking behind a 22 MB drape, and connection migration between Wi-Fi and cellular |
 
 ## Appendix: the full table
 

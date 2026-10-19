@@ -313,8 +313,9 @@ renderer.
 ## 5. Interfaces with GeometryStream and ContentPump
 
 The sketch of 2026-10-17; §15.2 and §15.4 are the decided protocol and executor. In
-particular `Credit` is not added, and the protocol never leaves the consumer's machine
-(D-A5).
+particular `Credit` is not added, and the geometry server runs where its budget's inputs
+are (D-A5): locally on interactive devices, in a `tuile-server` session for a consumer
+that declares its budget.
 
 **Protocol (protocol.rs)**
 - `Ack { resource, gen, bytes }`.
@@ -577,9 +578,10 @@ with the invariant or obligation it proves — is `graphics-budget-test-plan.md`
 | **D4** | Later | Imagery texture arrays or atlases (phase 2) |
 | **D5** | Open | iOS budget fractions, credit size, imagery-over-terrain cap (3 proposed). Interim default split of the terrain and imagery pool: 40/60 (D-A3) |
 | **Skirts** | Deferred | Skirts are deferred (see the header) |
-| **D-A0…D-A8** | Decided 2026-10-19 | `graphics-budget-architecture.md` §6: one arbiter; I1 extended; imagery its own content; a pooled ledger simulated in Phase 3; per-layer drapes; the budget on the client and a stateless server; side channels folded into the stream; `ViewState::from_fov` and the incremental decide for P6; the executor's `FrameDeadline` |
+| **D-A0…D-A8** | Decided 2026-10-19 | `graphics-budget-architecture.md` §6: one arbiter; I1 extended; imagery its own content; a pooled ledger simulated in Phase 3; per-layer drapes; the budget with `GeometryServer`, which runs where its budget's inputs are (locally on interactive devices, in a `tuile-server` session for a declared budget); side channels folded into the stream; `ViewState::from_fov` and the incremental decide for P6; the executor's `FrameDeadline` |
 | **Cut-over** | Decided 2026-10-19 | One PR, reviewed in pieces, with no bridge: no flag, no shadow, no adapter between the old protocol and the new |
 | **Deadband** | Decided 2026-10-19 | The refine deadband of #86 (`1ba0d77`, what the last pass *chose*) stays in the traversal; the budget does not re-decide the cut |
+| **D-T1** | Open | The transport of a `tuile-server` session: WebSocket in v1 (docs/12); under discussion, QUIC (`quinn`) / WebTransport first (multiplexed streams: priorities and a cancel per content, no TCP head-of-line blocking behind a 22 MB drape, connection migration between Wi-Fi and cellular), shared-memory IPC on the same machine (zero-copy glb), WebSocket as the fallback; Workers keep the static mode (WebTransport on Workers to verify). The protocol stays transport-agnostic |
 | **D-L1** | Proposed | Screen-space thresholds in logical pixels, so a scale change alone changes no need (§13.2, P5.5) |
 | **D-P1** | Decided 2026-10-19, on evidence | The handheld convergence bound is set from device measurements: the L5 iPhone sessions, recorded in MCAP (the session tape, §16.6), which also calibrate the simulation's network model. Until then the 4 s test stays red and ignored (§11.7 measured 6.4 s against the model's floor of 6.3 s) |
 
@@ -863,6 +865,7 @@ eye. The executor draws the one `DrawSet` once per eye, culled by that eye's fru
 | **Web** (WebGPU, WebGL2) | `Profile::browser`, Interactive, within the worker's wasm32 heap | `navigator.deviceMemory` → `Retarget` (D-A6); no pressure signal: a hidden tab is the host's `Pause`; no thermal | `requestAnimationFrame` at the display rate; the deadline is the page's; a decision arrives one message late | one eye; the canvas; `devicePixelRatio` | the worker (`tuile-viewer/src/web/worker.rs`); the page executes | an in-memory index of the browser's store (an IndexedDB read is asynchronous, not a presence query) |
 | **Headset** (Android-based, stereo) | `Profile::headset` (new): a handheld's memory, a desktop's network (Wi-Fi), Interactive | as Android | 72, 90, 120 Hz; one `FrameDeadline` per eye pair; `decide`'s p99 within a quarter of the frame (proposed) | two eyes, four asymmetric angles from the runtime | in-process | foyer index |
 | **Batch** (films, bakes, Hydra) | `BudgetConfig::batch()` | none; `release_beyond` between frames | none: a frame is drawn at `frame_ready` | the film's cameras; `Stereo::eyes` for a stereo film | in-process in `tuile_bake::Session`; Hydra through the C ABI | the bake's store |
+| **Declared budget, remote** (a USD/Cycles render node, a farm, a simulator cluster's image generators, a consumer that cannot link the core) | Batch or Interactive, from what the consumer declares | the declared memory (`Retarget`), the consumer's `Ack` bytes; no pressure signal | the consumer's; a batch or a LAN tolerates the round trip | the consumer's views | a `tuile-server` session (D-A5; transport D-T1) | none, or `Held` (open) |
 
 T_conv(π), I3's bound per profile: desktop 2 s; handheld 4 s, red today (6.4 s measured
 against a network floor of 6.3 s, §11.7), its bound to be set from the iPhone sessions
@@ -954,16 +957,19 @@ pub enum ResourceContent {
 - **Removed:** `ClientMessage::Ack { tile }`; `ClientMessage::Cancel { tile }` (cancellation is
   the budget's, from the need); `ClientMessage::Trim` (`ReleaseBeyond`);
   `ServerMessage::Fill` and `Retire` (D3).
-- **Never added:** `ClientMessage::Held` (D-A5: the budget asks the client's own tiers), and
-  §5's `Credit { bytes }` (the budget counts in-transit bytes itself until `Ack` or
-  `Discarded`; in-process, across a worker or over a local socket, no transport grants
-  credit).
+- **Open, not decided:** `ClientMessage::Held { resources }`, what a remote consumer already
+  holds in local tiers. Needed only for a remote session whose consumer has local tiers (I14
+  then needs the session to know them); optional for a declared-budget consumer (D-A5).
+- **Never added:** §5's `Credit { bytes }`: the budget counts in-transit bytes itself until
+  `Ack` or `Discarded`, whatever the transport.
 - **Host messages (D-A6):** `ToWorker::Detail` is deleted; `ToWorker::Budget { reported }`
   becomes `ClientMessage::Retarget`; `ToWorker::Pause` and the layer switch,
   `ToWorker::Imagery`, stay host messages for now.
-- The protocol never leaves the consumer's machine (D-A5): in-process, across a worker, or
-  over a local socket to a renderer that cannot link Rust. The WebSocket of `tuile-server` is
-  a transport of the loaders (docs/12).
+- **Where it runs (D-A5).** In-process or across a worker on an interactive device; across
+  the network to a consumer that declares its budget, whose `GeometryServer` runs in a
+  `tuile-server` session — its budget fed by the declared memory (`Retarget`) and by `Ack {
+  resource, gen, bytes }`. glb on that wire, as docs/12 says.
+- **The transport is open (D-T1, §10).** The protocol stays transport-agnostic.
 
 ### 15.3 Views (`tuile_core::traversal`)
 
@@ -1210,6 +1216,8 @@ The decision digest and the stats digest are not metrics: they are the MCAP tape
 
 The host adds `profile` (desktop, handheld, handheld_low, browser, headset, batch) and
 `platform` (macos, linux, ios, android, web) once, as process labels; the budget never does.
+A `tuile-server` process aggregates its sessions' meters under its own labels: a session id
+is never a label, and a session's detail goes to its tape.
 
 ### 16.6 Sinks
 
