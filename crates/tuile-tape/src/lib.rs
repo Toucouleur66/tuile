@@ -70,6 +70,7 @@ pub enum TapeError {
     NotAPath(String),
 }
 pub mod path;
+pub mod scan;
 pub mod timelapse;
 
 /// The topic a tape states its frames' instants on: one message, a
@@ -280,14 +281,15 @@ enum Inner {
         destination: std::path::PathBuf,
         writer: mcap::Writer<BufWriter<File>>,
         camera_channel: u16,
-        /// Déclaré à la première image écrite, et pas avant.
+        /// Les canaux autres que celui de la caméra, par sujet, chacun
+        /// déclaré au premier message écrit, et pas avant.
         ///
         /// Une tape de trajectoire n'écrit que des poses. Annoncer un canal
         /// d'images qu'elle n'utilisera jamais coûtait un second schéma dans
         /// le résumé, et donc un ordre d'itération à deux éléments — que
         /// `mcap` tire d'un `HashMap`. Avec un seul canal, l'ordre est celui
         /// qu'il y a, et le fichier est le même à chaque génération.
-        image_channel: Option<u16>,
+        channels: std::collections::BTreeMap<String, u16>,
         /// The crash journal: raw, append-only, readable at any byte offset.
         /// Camera only — it is what a replay needs, and it is the part that has
         /// to survive a kill.
@@ -376,8 +378,8 @@ impl Tape {
             destination,
             writer,
             camera_channel,
-            // Déclaré au premier usage, pas d'avance : voir `push_image`.
-            image_channel: None,
+            // Déclarés au premier usage, pas d'avance : voir `push_image`.
+            channels: std::collections::BTreeMap::new(),
             pending: Vec::with_capacity(BATCH),
             open: None,
             written: 0,
@@ -534,50 +536,101 @@ impl Tape {
     /// Silent on failure, by design: a trace that killed the session it was
     /// observing would be worse than no trace. Failures are logged.
     pub fn push_image(&mut self, rgba: &[u8], width: u32, height: u32) {
+        self.push_image_on(IMAGE_TOPIC, rgba, width, height);
+    }
+
+    /// [`Tape::push_image`], on a topic of the caller's: one per eye of a
+    /// stereo pair, say, each beside the others on the same timeline.
+    pub fn push_image_on(&mut self, topic: &str, rgba: &[u8], width: u32, height: u32) {
+        let Some((writer, channel, frame_index)) =
+            self.channel_for(topic, IMAGE_SCHEMA, IMAGE_JSON_SCHEMA)
+        else {
+            return;
+        };
+        if let Err(e) = write_image(writer, channel, rgba, width, height, frame_index) {
+            tracing::error!("cannot write a trace frame: {e}");
+        }
+    }
+
+    /// Appends a JSON document of the caller's to `topic`, on the frame whose
+    /// camera was pushed last — what a session observed of that frame, say,
+    /// beside the camera and the picture. `schema` names the document's
+    /// shape and `json_schema` states it, once, when the channel is declared.
+    ///
+    /// Silent on failure like [`Tape::push_image`]: failures are logged.
+    pub fn push_json(&mut self, topic: &str, schema: &str, json_schema: &str, json: &str) {
+        let Some((writer, channel, frame_index)) = self.channel_for(topic, schema, json_schema)
+        else {
+            return;
+        };
+        let stamp = frame_index * NANOS_PER_FRAME;
+        let written = writer.write_to_known_channel(
+            &mcap::records::MessageHeader {
+                channel_id: channel,
+                sequence: frame_index as u32,
+                log_time: stamp,
+                publish_time: stamp,
+            },
+            json.as_bytes(),
+        );
+        if let Err(e) = written {
+            tracing::error!("cannot write to {topic}: {e}");
+        }
+    }
+
+    /// The writer, the channel of `topic` — declared now if this is its
+    /// first message — and the frame a message written now belongs to.
+    /// `None` on a replay, or when the channel cannot be declared.
+    fn channel_for(
+        &mut self,
+        topic: &str,
+        schema: &str,
+        json_schema: &str,
+    ) -> Option<(&mut mcap::Writer<BufWriter<File>>, u16, u64)> {
         let Inner::Recording {
             writer,
-            image_channel,
+            channels,
             written,
             ..
         } = &mut self.0
         else {
-            return;
+            return None;
         };
         // `written` counts frames *pushed*, and a host pushes the camera before
-        // the picture it took under it — so the picture belongs to the frame
-        // just closed, not the one about to open. Stamping with `written` put
-        // every image one frame late: invisible standing still, and exactly
-        // wrong in the fast movement a trace is opened to explain. A test holds
-        // this.
+        // what it observed under it — so the message belongs to the frame just
+        // closed, not the one about to open. Stamping with `written` put every
+        // image one frame late: invisible standing still, and exactly wrong in
+        // the fast movement a trace is opened to explain. A test holds this.
         let frame_index = written.saturating_sub(1);
-        // Le canal naît ici, à la première image. MCAP autorise un schéma et
+        // Le canal naît ici, au premier message. MCAP autorise un schéma et
         // un canal à apparaître n'importe où dans la section de données, tant
         // que c'est avant le premier message qui s'y réfère.
-        let channel = match image_channel {
+        let channel = match channels.get(topic) {
             Some(id) => *id,
             None => {
                 let declared = writer
-                    .add_schema(IMAGE_SCHEMA, "jsonschema", IMAGE_JSON_SCHEMA.as_bytes())
+                    .add_schema(schema, "jsonschema", json_schema.as_bytes())
                     .and_then(|schema| {
                         writer.add_channel(
                             schema,
-                            IMAGE_TOPIC,
+                            topic,
                             "json",
                             &std::collections::BTreeMap::new(),
                         )
                     });
                 match declared {
-                    Ok(id) => *image_channel.insert(id),
+                    Ok(id) => {
+                        channels.insert(topic.to_owned(), id);
+                        id
+                    }
                     Err(e) => {
-                        tracing::error!("cannot declare the trace channel: {e}");
-                        return;
+                        tracing::error!("cannot declare the channel {topic}: {e}");
+                        return None;
                     }
                 }
             }
         };
-        if let Err(e) = write_image(writer, channel, rgba, width, height, frame_index) {
-            tracing::error!("cannot write a trace frame: {e}");
-        }
+        Some((writer, channel, frame_index))
     }
 
     /// The next recorded frame, or `None` at the end of the path.
@@ -770,6 +823,38 @@ fn write_camera<W: std::io::Write + std::io::Seek>(
         json.as_bytes(),
     )?;
     Ok(())
+}
+
+/// One message of a tape, as it was written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Message {
+    pub topic: String,
+    /// The frame's instant on the tape's timeline, nanoseconds.
+    pub log_time: u64,
+    pub data: Vec<u8>,
+}
+
+/// Every message of the tape at `path`, by instant and, within one instant,
+/// by topic — each channel's own in the order it was written.
+///
+/// What two tapes are compared by. The container is not: `mcap` writes its
+/// summary records in a hash map's order, so two files carrying the same
+/// messages on several channels differ in their last bytes. Their messages
+/// do not.
+pub fn messages(path: impl AsRef<Path>) -> Result<Vec<Message>, TapeError> {
+    let bytes = std::fs::read(path.as_ref())?;
+    let mut out = Vec::new();
+    for message in mcap::MessageStream::new(&bytes)? {
+        let message = message?;
+        out.push(Message {
+            topic: message.channel.topic.clone(),
+            log_time: message.log_time,
+            data: message.data.to_vec(),
+        });
+    }
+    // Stable: a topic's messages of one instant keep their order.
+    out.sort_by(|a, b| (a.log_time, &a.topic).cmp(&(b.log_time, &b.topic)));
+    Ok(out)
 }
 
 /// Brings the channels of several files together in one.
@@ -1504,5 +1589,40 @@ mod tests {
         let path = dir.path().join("nonsense.mcap");
         std::fs::write(&path, b"this is not mcap").expect("write");
         assert!(Tape::replaying(&path).is_err());
+    }
+
+    /// What a session observed of a frame sits on that frame's instant,
+    /// beside its camera and its pictures, on as many topics as it has —
+    /// and the tape still replays as the camera path it is.
+    #[test]
+    fn observations_and_pictures_land_on_the_frame_they_describe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("session.mcap");
+        let mut tape = Tape::recording(&path).expect("open");
+        for n in 0..3 {
+            tape.push(frame(f64::from(n)));
+            tape.push_json("/state", "test.State", "{}", &format!("{{\"frame\":{n}}}"));
+            tape.push_image_on("/eye/1/frame", &[0, 0, 0, 255], 1, 1);
+        }
+        tape.finish().expect("close");
+
+        let read = messages(&path).expect("messages");
+        let on = |topic: &str| -> Vec<u64> {
+            read.iter()
+                .filter(|m| m.topic == topic)
+                .map(|m| m.log_time / NANOS_PER_FRAME)
+                .collect()
+        };
+        assert_eq!(on("/state"), [0, 1, 2]);
+        assert_eq!(on("/eye/1/frame"), [0, 1, 2]);
+        assert_eq!(on(CAMERA_TOPIC), [0, 1, 2]);
+        let second = read
+            .iter()
+            .find(|m| m.topic == "/state" && m.log_time == NANOS_PER_FRAME)
+            .expect("the second frame's state");
+        assert_eq!(second.data, b"{\"frame\":1}");
+
+        let mut replay = Tape::replaying(&path).expect("replay");
+        assert_eq!(replay.next_frame(), Some(frame(0.0)));
     }
 }
