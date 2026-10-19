@@ -592,7 +592,7 @@ pub enum ResourceContent {
 
 - `ClientMessage::Cancel { tile }` and `Trim` go: cancellation is the
   budget's, from the need; a release between frames is `ReleaseBeyond`.
-- `Fill`/`Retire` (stand-ins) stay as they are until decision D3 of the spec.
+- `Fill`/`Retire` (stand-ins) go: decision D3 of the spec, taken on 2026-10-19 (spec §10).
 - `DecodedTileContent::imagery` and `withheld_drape` leave the mesh content;
   the drape identity of `raster::drape_identity` keys `DrapeContent`.
 
