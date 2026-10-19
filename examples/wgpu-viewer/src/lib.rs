@@ -126,9 +126,7 @@ impl ViewerHost for Public {
         {
             let catalog = catalog_url()?;
             tracing::info!(%catalog, "catalog proxy");
-            Ok(Arc::new(
-                IonSources::new(Arc::clone(&http), http, "").with_api_base(catalog),
-            ))
+            Ok(through_catalog(http, catalog))
         }
         #[cfg(not(target_os = "android"))]
         {
@@ -136,6 +134,13 @@ impl ViewerHost for Public {
             Ok(Arc::new(IonSources::new(Arc::clone(&http), http, token)))
         }
     }
+}
+
+/// The sources through a catalog proxy that holds the token, at `catalog`
+/// (ending in `/`): what a device that holds no token asks — Android, and a
+/// headless run of this application, which serves the proxy beside it.
+pub fn through_catalog(http: Arc<NativeHttp>, catalog: url::Url) -> Arc<dyn Sources> {
+    Arc::new(IonSources::new(Arc::clone(&http), http, "").with_api_base(catalog))
 }
 
 /// The catalog proxy's address, ending in `/` so the catalog's paths are

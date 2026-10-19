@@ -22,7 +22,21 @@ tuile-bing = { version = "0.8.5", path = "../../crates/tuile-bing" }
 tuile-cesium-ion = { version = "0.8.5", path = "../../crates/tuile-cesium-ion" }
 tuile-native-fetchers = { version = "0.8.5", path = "../../crates/tuile-native-fetchers" }
 tuile-viewer = { version = "0.8.5", path = "../../crates/tuile-viewer" }
-
-# Android: the catalog proxy's address, read and checked as a URL.
-[target.'cfg(target_os = "android")'.dependencies]
+# The catalog proxy's address, read and checked as a URL: Android's, and a
+# headless run's.
 url = { workspace = true }
+
+# The headless runs (`tests/headless.rs`): this host's application, driven
+# through its control API over the real catalog — through a catalog proxy
+# served in the test process, which alone holds the token.
+[dev-dependencies]
+axum = "0.8"
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
+tracing-subscriber = { workspace = true }
+tuile-camera = { version = "0.8.4", path = "../../crates/tuile-camera" }
+tuile-cesium-ion = { version = "0.8.4", path = "../../crates/tuile-cesium-ion", features = ["proxy"] }
+tuile-core = { version = "0.8.4", path = "../../crates/tuile-core" }
+tuile-tape = { version = "0.8.4", path = "../../crates/tuile-tape" }
+tuile-viewer = { version = "0.8.4", path = "../../crates/tuile-viewer", features = ["control"] }
