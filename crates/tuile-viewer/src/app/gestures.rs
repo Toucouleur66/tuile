@@ -51,7 +51,7 @@ impl App {
     /// One finger event, in device pixels: through the recognizer, then
     /// carried out.
     pub(crate) fn finger(&mut self, id: u64, phase: Phase, at: (f64, f64)) {
-        for gesture in self.touches.on(self.clock.now(), id, phase, at) {
+        for gesture in self.touches.on(Instant::now(), id, phase, at) {
             self.gesture(gesture);
         }
         self.demand.poke();
@@ -118,7 +118,7 @@ impl App {
         if self.profile.hold_window_until_warm {
             return None;
         }
-        let now = self.clock.now();
+        let now = Instant::now();
         let ready = self.session.is_some();
         // Asked only until the launch is over: it drains the server's errors
         // and reports, which the status line does after that.
@@ -159,9 +159,10 @@ impl App {
             return None;
         }
         let ui = self.ui_frame();
-        let turn = self.stats.started.map_or(0.0, |t| {
-            now.saturating_duration_since(t).as_secs_f64() / TURN_SECONDS
-        });
+        let turn = self
+            .stats
+            .started
+            .map_or(0.0, |t| t.elapsed().as_secs_f64() / TURN_SECONDS);
         Some(match indicator.style {
             Style::Launch => tuile_ui::Spinner {
                 centre: ui.centre(),
@@ -200,13 +201,13 @@ impl App {
             pending_uploads: self.active.as_ref().map_or(0, |a| a.pump.pending_uploads()),
             sliding: self.active.as_ref().map_or(0, |a| a.pump.sliding()),
         };
-        self.demand.saw(self.clock.now(), busy);
+        self.demand.saw(Instant::now(), busy);
     }
 
     /// A phone's turn of the loop: a frame when one is due, and otherwise a
     /// sleep until it is — never a spin.
     pub(super) fn pace_the_frames(&mut self) -> ControlFlow {
-        let now = self.clock.now();
+        let now = Instant::now();
         self.read_the_pressure(now);
         // In front with no surface: the one made on the way back failed. Made
         // again on every turn until it exists — a screen that stays empty is

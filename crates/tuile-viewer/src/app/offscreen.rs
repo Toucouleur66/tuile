@@ -17,6 +17,9 @@ use tuile_camera::GlobeCamera;
 use tuile_tape::scan::Bare;
 use tuile_wgpu::{GpuContext, Readback};
 
+/// How many pixels of an eye are scanned, about: see [`Offscreen::read`].
+const SAMPLES: f64 = 262_144.0;
+
 /// The format an eye is drawn in: the renderer's own sRGB target.
 pub(crate) const FORMAT: wgpu::TextureFormat = tuile_wgpu::TEXTURE_FORMAT;
 
@@ -123,10 +126,17 @@ impl Offscreen {
     pub(crate) fn read(&mut self, gpu: &GpuContext, cameras: &[GlobeCamera]) {
         let m = tuile_core::metrics::metrics();
         let size = self.size;
+        // About a quarter of a million rays an eye, whatever the frame: every
+        // pixel of a small one, every fourth of a phone's — a hole is
+        // thousands of pixels, and the scan runs on the frame's own thread.
+        let step = ((f64::from(size.0) * f64::from(size.1) / SAMPLES)
+            .sqrt()
+            .ceil() as usize)
+            .max(1);
         for (index, (eye, camera)) in self.eyes.iter_mut().zip(cameras).enumerate() {
             eye.pixels = eye.readback.take(gpu, size);
             eye.bare = eye.pixels.as_ref().map_or(Bare::default(), |pixels| {
-                tuile_tape::scan::bare_ground(pixels, size.0, size.1, &frame_of(camera), 1)
+                tuile_tape::scan::bare_ground(pixels, size.0, size.1, &frame_of(camera), step)
             });
             m.eye_ground_pixels.set(index, eye.bare.ground);
             m.eye_black_pixels.set(index, eye.bare.black);

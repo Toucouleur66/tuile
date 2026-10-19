@@ -236,7 +236,7 @@ fn session(embedder: Arc<dyn ViewerHost>) -> anyhow::Result<()> {
         terrain: embedder.terrain(),
         layers,
         opening,
-        store: embed::identity().store.clone(),
+        store: tuile_storage_foyer::default_cache_dir().join(&embed::identity().store),
         config,
         profile: profile.clone(),
         timeout: crate::launch::START_TIMEOUT,
@@ -312,7 +312,6 @@ fn session(embedder: Arc<dyn ViewerHost>) -> anyhow::Result<()> {
         // `TUILE_BACKEND=gl` forces one — a launch setting on Android.
         backends: crate::app::backend_named(std::env::var("TUILE_BACKEND").ok().as_deref())
             .map_err(anyhow::Error::msg)?,
-        clock: crate::app::Clock::default(),
     };
 
     // Everything the engine counts, scrapeable, so the log can stop being a

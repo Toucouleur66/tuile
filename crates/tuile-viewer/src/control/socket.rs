@@ -24,8 +24,8 @@
 //! | `state` | | the last step's state (see [`super::State`]) |
 //! | `metrics` | | the engine's numbers now, absolute: `tuile_core::metrics::Snapshot` |
 //! | `limits` | | the profile's limits |
-//! | `step` | `frames` (1) | the state after them |
-//! | `settle` | `bound` | `{"frames":n,"settled":bool}` |
+//! | `step` | `frames` (1): refreshes of the run's display | the state after them |
+//! | `settle` | `seconds` (10): the bound | `{"frames":n,"seconds":s,"settled":bool}` |
 //! | `go` | `lon` `lat` `altitude` `heading` `pitch`, `seconds` to glide | `null` |
 //! | `url` | `url`: a steering URL | `null` |
 //! | `touch` | `id`, `finger` (`down` `moved` `up` `cancelled`), `x` `y` as fractions | `null` |
@@ -39,7 +39,8 @@
 //! | `close` | | `null`, and [`super::Headless::serve`] returns |
 //!
 //! Moves and inputs take effect on the next step, as they would in a window
-//! on the next frame.
+//! on the next frame. A run is in real time: between two requests it waits,
+//! as a window does between two frames nobody asked for.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -234,8 +235,16 @@ fn carry(run: &mut Headless, request: &Value) -> Result<Value, String> {
             Ok(run.steps(frames).to_json())
         }
         "settle" => {
-            let settled = run.settle(count(request, "bound", 600)?);
-            Ok(json!({"frames": settled.frames, "settled": settled.settled}))
+            let bound = match request.get("seconds") {
+                None => 10.0,
+                Some(v) => v.as_f64().ok_or("seconds is a number")?,
+            };
+            let settled = run.settle(bound);
+            Ok(json!({
+                "frames": settled.frames,
+                "seconds": settled.seconds,
+                "settled": settled.settled,
+            }))
         }
         "go" => {
             let view = View {

@@ -4,81 +4,83 @@
 //! The viewer headless, and the API that drives it — for tests, and for
 //! debug builds a device is driven through.
 //!
-//! # The same viewer
+//! # The same viewer, the same world
 //!
-//! [`Headless`] is the application every window runs: the same frame (eased,
-//! streamed, resolved, painted), the same pump and upload budget, the same
-//! profile, lifecycle and steering. Only the ends differ:
+//! [`Headless`] is the application every window runs, on the session every
+//! window runs:
 //!
-//! - **the screen** is a texture per eye, read back after every frame and
-//!   scanned for ground left the clear colour — one eye for a window, two
-//!   for a headset's rig ([`Eyes`]);
-//! - **the clock** is stepped: a frame is one [`Headless::step`], and the
-//!   interval the camera eases by is the run's refresh, exactly;
-//! - **the network** is a [`Fixture`] globe, and the geometry server is
-//!   polled between two frames until it has nothing left to do, every load
-//!   inline — so what reaches a frame is a function of the frames before it,
-//!   and two runs of one script draw the same frames;
+//! - **the sources** are the host's ([`Start::host`]): the real terrain and
+//!   imagery, asked over the network the way the application asks them;
+//! - **the store** is the tile store on disk, in the directory a run names
+//!   ([`Start::store`]): a fresh one is a cold start, one an earlier run left
+//!   is a warm one;
+//! - **the session** is brought up as the application brings it up: the
+//!   runtime and its threads, the geometry server on a thread of its own, the
+//!   loads as tasks;
+//! - **time** is the wall's: a step is one refresh of the display the run
+//!   says it has ([`Start::refresh_hz`]), and a step that runs long misses
+//!   refreshes as a frame on a screen does;
 //! - **the device** is said, not asked: a desktop's numbers or a phone's,
 //!   from a memory a test states ([`Device`]).
+//!
+//! Only the ends differ from a window: the frame is drawn into a texture per
+//! eye ([`Eyes`]) and read back after every frame, and every eye is scanned
+//! for ground left the clear colour.
 //!
 //! # Reading it
 //!
 //! Through the numbers the engine publishes — `tuile_core::metrics`, the
 //! series `tuile-metrics` exports — never through accessors of its own. A
-//! [`State`] is one step's: the view a script reads (the scripting snapshot),
-//! the metrics as a [`Snapshot`] since the run began, what each eye's scan
-//! found, what the network was asked, and what every [`Observer`] added.
+//! [`State`] is one step's: the view a script reads (the scripting
+//! snapshot), the metrics as a [`Snapshot`] since the run began, what each
+//! eye's scan found, and what every [`Observer`] added.
 //!
 //! # The session log
 //!
 //! A run may write itself down as one MCAP file ([`Start::log`]), on the
-//! timeline a tape keeps: the camera on `/camera` (a tape, which
-//! `TUILE_REPLAY` flies again), each step's [`State`] on `/state`, each
-//! observer on its own topic, and — when asked — every eye's picture on
-//! `/frame` (one eye; `tuile-scan-black` reads it) or `/eye/<n>/frame`. Two
-//! runs of one script write the same messages ([`tuile_tape::messages`]).
+//! timeline a tape keeps: the camera on `/camera` — a tape, which
+//! `TUILE_REPLAY` and [`Headless::fly`] fly again — each step's [`State`] on
+//! `/state`, each observer on its own topic and, as [`Start::pictures`]
+//! says, the eyes' pictures: on `/frame` for one eye, which
+//! `tuile-scan-black` reads, or `/eye/<n>/frame`.
 //!
 //! # Driving it
 //!
-//! [`Action`]s — a jump or a glide of the eye (a steering command, the queue
-//! a URL arrives on), a finger, the wheel, a resize, the density, memory
-//! pressure, the background — one at a time with [`Headless::act`], or as a
-//! [`Series`] timed in frames ([`Headless::play`]); a tape with
+//! [`Action`]s — a jump or a glide of the eye (a steering command, on the
+//! queue a URL arrives on), a finger, the wheel, a resize, the density,
+//! memory pressure, the background — one at a time with [`Headless::act`],
+//! or as a [`Series`] timed in seconds ([`Headless::play`]); a tape with
 //! [`Headless::fly`]. [`patterns`] holds the motion patterns of the budget's
-//! specification as series.
+//! specification.
 //!
 //! # The socket
 //!
 //! [`Headless::listen`] serves the same commands to other programs: JSON, one
-//! request a line, on a loopback address only — see [`socket`] for the
-//! vocabulary, version 1.
+//! request a line, on a loopback address only — see [`socket`].
 //!
 //! One headless viewer per process at a time: the numbers it reads are the
 //! process's.
 
-pub mod fixture;
 mod log;
 pub mod patterns;
 mod series;
 pub mod socket;
 
 use std::collections::BTreeMap;
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
-use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
-pub use fixture::{Fixture, Store};
-pub use log::Observer;
+use web_time::Instant;
+
+pub use log::{Observer, Pictures};
 pub use series::{Action, Finger, Pressure, Series};
 pub use tuile_core::metrics::Snapshot;
 
-use crate::app::{App, Clock, Rig, Stepper, Turn, ViewerConfig};
+use crate::app::{App, Rig, Turn, ViewerConfig};
+use crate::embed::ViewerHost;
 use crate::steer::{Command, Goto, Request};
 
 /// Where the eye is and how it looks, as the command line and a steering URL
@@ -252,8 +254,14 @@ pub struct Limits {
 }
 
 /// What a run starts from.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Start {
+    /// Who the application is and where its ground comes from: the
+    /// embedding host's three answers, as a window's session has them.
+    pub host: Arc<dyn ViewerHost>,
+    /// The tile store's directory on disk. A fresh directory is a cold
+    /// start; one an earlier run left is a warm one.
+    pub store: PathBuf,
     pub view: View,
     /// One eye's frame, in device pixels.
     pub size: (u32, u32),
@@ -261,40 +269,50 @@ pub struct Start {
     pub scale: f64,
     pub eyes: Eyes,
     pub device: Device,
-    /// Frames a second: the stepped clock moves a frame's worth each step.
+    /// The display's refresh, frames a second: a step is one refresh.
     pub refresh_hz: f64,
-    /// The ground.
-    pub fixture: Fixture,
-    /// The tile store: a fresh one is a cold start, one a previous run filled
-    /// is a warm one.
-    pub store: Store,
     /// The instant the scene is lit for, UTC seconds.
     pub lit_at: f64,
     /// Where the session log is written, if anywhere: see the module.
     pub log: Option<PathBuf>,
-    /// Whether every eye's picture goes into the log too.
-    pub log_pictures: bool,
+    /// Which pictures go into the log.
+    pub pictures: Pictures,
 }
 
-/// Midsummer noon over Greenwich, 2026: the sun high over the default view,
-/// the same instant every run.
+/// Midsummer noon over Greenwich, 2026: the sun high over Europe.
 pub const MIDSUMMER_NOON: f64 = 1_782_043_200.0;
 
-impl Default for Start {
-    fn default() -> Self {
+impl Start {
+    /// A desktop's window over France, from `host`, its store in `store`.
+    pub fn new(host: Arc<dyn ViewerHost>, store: impl Into<PathBuf>) -> Self {
         Self {
+            host,
+            store: store.into(),
             view: View::default(),
-            size: (256, 256),
-            scale: 1.0,
+            size: (1280, 800),
+            scale: 2.0,
             eyes: Eyes::Mono,
             device: Device::Desktop,
             refresh_hz: 60.0,
-            fixture: Fixture::default(),
-            store: Store::default(),
             lit_at: MIDSUMMER_NOON,
             log: None,
-            log_pictures: false,
+            pictures: Pictures::WhenWrong,
         }
+    }
+}
+
+impl std::fmt::Debug for Start {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Start")
+            .field("store", &self.store)
+            .field("view", &self.view)
+            .field("size", &self.size)
+            .field("scale", &self.scale)
+            .field("eyes", &self.eyes)
+            .field("device", &self.device)
+            .field("refresh_hz", &self.refresh_hz)
+            .field("log", &self.log)
+            .finish_non_exhaustive()
     }
 }
 
@@ -305,7 +323,7 @@ pub enum Refused {
     NoGpu(String),
     /// Another headless viewer is running in this process.
     Busy,
-    /// The session could not be brought up.
+    /// The session could not be brought up: the host's own words.
     Session(String),
 }
 
@@ -333,7 +351,11 @@ pub struct EyeReading {
 pub struct State {
     /// Steps since the run began, this one counted.
     pub frame: u64,
-    /// Whether this step drew a frame.
+    /// Seconds since the run began, at the end of this step.
+    pub seconds: f64,
+    /// How long this step's frame took, seconds: turn, draw and read-back.
+    pub took: f64,
+    /// Whether this step drew a frame anybody could see.
     pub drew: bool,
     /// The view, as a script reads it.
     pub view: View,
@@ -344,9 +366,6 @@ pub struct State {
     pub eyes: Vec<EyeReading>,
     /// The engine's numbers since the run began.
     pub metrics: Snapshot,
-    /// What the network was asked since the run began: terrain tiles and
-    /// imagery tiles.
-    pub network: (u64, u64),
     /// What each observer read, by topic.
     pub observed: BTreeMap<String, serde_json::Value>,
 }
@@ -356,6 +375,8 @@ impl State {
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "frame": self.frame,
+            "seconds": self.seconds,
+            "took": self.took,
             "drew": self.drew,
             "view": self.view.to_json(),
             "size": [self.size.0, self.size.1],
@@ -365,14 +386,19 @@ impl State {
                 "black": e.black,
             })).collect::<Vec<_>>(),
             "metrics": serde_json::to_value(self.metrics).unwrap_or_default(),
-            "network": {"terrain": self.network.0, "imagery": self.network.1},
             "observed": self.observed,
         })
     }
 
-    /// Whether any eye saw ground left the clear colour.
+    /// The most pixels of ground any eye saw left the clear colour.
     pub fn black(&self) -> u64 {
         self.eyes.iter().map(|e| e.black).max().unwrap_or(0)
+    }
+
+    /// Whether this frame broke what every frame is held to: ground left
+    /// black in an eye, or selected ground drawn by nothing.
+    pub fn wrong(&self) -> bool {
+        self.drew && (self.black() > 0 || self.metrics.frame_lost > 0)
     }
 
     /// Whether the picture is what the selection asked for: every selected
@@ -394,22 +420,18 @@ impl State {
     }
 }
 
-/// What a series of steps came to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a wait came to.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Settled {
-    /// Steps taken.
+    /// Steps taken, and the seconds they took.
     pub frames: u64,
-    /// Whether the picture settled within them.
+    pub seconds: f64,
+    /// Whether the picture settled within the bound.
     pub settled: bool,
 }
 
-/// Steps the picture must hold still, complete, to count as settled.
+/// Frames drawn the picture must hold still, complete, to count as settled.
 const STILL_FOR: usize = 3;
-
-/// Polls of the geometry server one step allows. Far above anything a step
-/// needs; a server that is still busy after them is churning, and the step
-/// goes on without it rather than spinning for ever.
-const SERVER_POLLS: u64 = 1_000_000;
 
 /// Whether a headless viewer is running in this process.
 static RUNNING: AtomicBool = AtomicBool::new(false);
@@ -430,52 +452,36 @@ impl Drop for Claim {
     }
 }
 
-/// Notes that the server woke itself.
-#[derive(Debug, Default)]
-struct Woken(AtomicBool);
-
-impl Wake for Woken {
-    fn wake(self: Arc<Self>) {
-        self.0.store(true, Ordering::SeqCst);
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.0.store(true, Ordering::SeqCst);
-    }
-}
-
-type ServerFuture = Pin<Box<dyn Future<Output = ()>>>;
-
 /// The viewer, headless: see the module.
 pub struct Headless {
     app: App,
-    hand: Stepper,
-    server: Option<ServerFuture>,
-    woken: Arc<Woken>,
     requests: Sender<Request>,
-    /// The switcher's: a change of imagery resolves on it.
+    /// The session's: its loads, its store, its server's thread.
     runtime: Option<tokio::runtime::Runtime>,
-    dt: Duration,
-    /// The run's time, as its clock has it.
-    elapsed: Duration,
+    /// One refresh of the display.
+    interval: Duration,
+    began: Instant,
+    /// When the next refresh is due.
+    due: Instant,
     frame: u64,
     baseline: Snapshot,
-    network: (u64, u64),
     start: Start,
     limits: Limits,
     history: Vec<State>,
     observers: Vec<Box<dyn Observer>>,
     log: Option<log::SessionLog>,
     socket: Option<socket::Listener>,
-    /// The server's polls the last step took.
-    polls: u64,
     /// Last, so it is let go of once everything else has gone.
     _claim: Claim,
 }
 
 impl Headless {
-    /// Brings a run up: the GPU, the fixture globe, the session in lockstep,
-    /// and the application on its offscreen eyes.
+    /// Brings a run up as the application brings itself up: the GPU, the
+    /// host's sources, the tile store, the session on its runtime — and the
+    /// application on its offscreen eyes.
+    ///
+    /// A desktop waits for its session before its first frame, as its window
+    /// does; a phone collects it from its loop, drawing meanwhile.
     pub fn start(start: Start) -> Result<Self, Refused> {
         let claim = Claim::take().ok_or(Refused::Busy)?;
         Self::bring_up(start, claim)
@@ -484,6 +490,10 @@ impl Headless {
     fn bring_up(start: Start, claim: Claim) -> Result<Self, Refused> {
         let gpu = pollster::block_on(tuile_wgpu::GpuContext::headless())
             .map_err(|e| Refused::NoGpu(e.to_string()))?;
+        // The process's identity and layers, as `main` adopts the host's: the
+        // first host wins, and a test process has one.
+        crate::embed::adopt(start.host.identity(), start.host.imagery());
+        let layers = crate::embed::layers();
         let profile = start.device.profile();
         let limits = Limits {
             resident_bytes: profile.resident_budget_bytes as u64,
@@ -491,37 +501,42 @@ impl Headless {
             uploads_per_frame: profile.uploads.tiles as u64,
         };
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_name("tuile-headless")
+            .worker_threads(profile.runtime_workers)
+            .max_blocking_threads(profile.blocking_threads)
+            .thread_name("tuile-runtime")
             .enable_all()
             .build()
             .map_err(|e| Refused::Session(e.to_string()))?;
-        // The network's time starts again with the run's.
-        start.fixture.advance_to(Duration::ZERO);
-        let globe = pollster::block_on(crate::globe::assemble(
-            Arc::new(start.fixture.clone()),
-            Some(Arc::new(start.store.clone())),
-            &fixture::terrain(),
-            fixture::layers(),
-            0,
-            Arc::new(tuile_core::offload::Inline),
-        ))
-        .map_err(|e| Refused::Session(format!("{e:#}")))?;
+        let handle = runtime.handle().clone();
         let pinned = Some(profile.pinned_level);
-        let (started, server) = crate::native::launch::in_lockstep(
-            globe,
-            profile.traversal(pinned),
-            runtime.handle().clone(),
-        );
-        let (clock, hand) = Clock::stepped(web_time::Instant::now());
+        let plan = crate::native::launch::Plan {
+            host: Arc::clone(&start.host),
+            terrain: start.host.terrain(),
+            layers,
+            opening: 0,
+            store: start.store.clone(),
+            config: profile.traversal(pinned),
+            profile: profile.clone(),
+            timeout: crate::launch::START_TIMEOUT,
+        };
+        let launch = crate::native::launch::start(&handle, plan.clone());
+        let launch = if profile.hold_window_until_warm {
+            crate::launch::Launch::finished(Ok(launch.wait().map_err(Refused::Session)?))
+        } else {
+            launch
+        };
+        let retries = (!profile.hold_window_until_warm).then(|| {
+            let handle = handle.clone();
+            crate::launch::Retries::new(move || crate::native::launch::start(&handle, plan.clone()))
+        });
         let (requests, queue) = std::sync::mpsc::channel();
         let config = ViewerConfig {
             controller: tuile_camera::CameraController::new(
                 crate::start::StartView::from(start.view).camera(),
             )
             .with_min_altitude(1.0),
-            title: "Tuile (headless)".into(),
-            layers: fixture::layers(),
+            title: crate::embed::identity().name.clone(),
+            layers,
             layer: 0,
             here: None,
             requests: queue,
@@ -529,19 +544,18 @@ impl Headless {
             lit_at_unix_seconds: start.lit_at,
             pinned_level: pinned,
             profile,
-            retries: None,
+            retries,
             window: winit::window::Window::default_attributes(),
             controls: true,
             backends: None,
-            clock,
         };
-        let mut app = App::new(config, crate::launch::Launch::finished(Ok(started)));
+        let mut app = App::new(config, launch);
         app.speak_through(said);
         app.start_offscreen(gpu, start.size, start.scale, start.eyes.rig());
         let log = match &start.log {
             Some(path) => Some(
-                log::SessionLog::open(path, start.log_pictures, start.eyes.count())
-                    .map_err(|e| Refused::Session(e.to_string()))?,
+                log::SessionLog::open(path, start.pictures, start.eyes.count())
+                    .map_err(Refused::Session)?,
             ),
             None => None,
         };
@@ -550,35 +564,32 @@ impl Headless {
         // run's.
         m.eye_ground_pixels.clear();
         m.eye_black_pixels.clear();
-        let server: ServerFuture = Box::pin(server.run());
+        let began = Instant::now();
         Ok(Self {
             app,
-            hand,
-            server: Some(server),
-            woken: Arc::new(Woken::default()),
             requests,
             runtime: Some(runtime),
-            dt: Duration::from_secs_f64(1.0 / start.refresh_hz.max(1.0)),
-            elapsed: Duration::ZERO,
+            interval: Duration::from_secs_f64(1.0 / start.refresh_hz.max(1.0)),
+            began,
+            due: began,
             frame: 0,
             baseline: m.snapshot(),
-            network: start.fixture.asked(),
             limits,
             start,
             history: Vec::new(),
             observers: Vec::new(),
             log,
             socket: None,
-            polls: 0,
             _claim: claim,
         })
     }
 
-    /// Ends this run and starts another over the same store and the same
-    /// fixture: the application killed and opened again, warm.
-    pub fn relaunch(self) -> Result<Self, Refused> {
+    /// Ends this run — the session closed, its store written down — and
+    /// starts another over the same store: the application killed and
+    /// opened again, warm. The new run writes `log`, if anywhere.
+    pub fn relaunch(self, log: Option<PathBuf>) -> Result<Self, Refused> {
         let start = Start {
-            log: None,
+            log,
             ..self.start.clone()
         };
         drop(self);
@@ -595,22 +606,34 @@ impl Headless {
         &self.start
     }
 
-    /// One frame: the clock moves a frame on, the geometry server answers
-    /// what the last frame asked, the loop turns, and the frame it asks for
-    /// is drawn, read back and observed.
+    /// Seconds since the run began.
+    pub fn seconds(&self) -> f64 {
+        self.began.elapsed().as_secs_f64()
+    }
+
+    /// One refresh: waits for it, turns the loop, draws the frame the turn
+    /// asks for, reads it back and observes it.
+    ///
+    /// A frame that takes longer than a refresh misses the next ones, as on
+    /// a screen: the step after it waits for the refresh after it ends.
     pub fn step(&mut self) -> &State {
-        self.app.land();
-        self.hand.advance(self.dt);
-        self.elapsed += self.dt;
-        // What the network owes by now lands before the server is polled.
-        self.start.fixture.advance_to(self.elapsed);
-        self.polls = self.run_the_server();
+        let now = Instant::now();
+        if self.due > now {
+            std::thread::sleep(self.due - now);
+        }
+        let began = Instant::now();
         let drew = match self.app.turn() {
             Turn::End => false,
             Turn::Flow(_) => self.app.render_if_asked(),
         };
+        self.app.land();
+        let ended = Instant::now();
+        // The next refresh after this one ended.
+        let interval = self.interval.as_secs_f64();
+        let refreshes = (ended.duration_since(self.began).as_secs_f64() / interval).floor() + 1.0;
+        self.due = self.began + Duration::from_secs_f64(refreshes * interval);
         self.frame += 1;
-        let mut state = self.read(drew);
+        let mut state = self.read(drew, ended.duration_since(began).as_secs_f64());
         for observer in &mut self.observers {
             let reading = observer.observe(&state);
             state.observed.insert(observer.topic().to_owned(), reading);
@@ -625,7 +648,7 @@ impl Headless {
             .unwrap_or_else(|| unreachable!("a step was just recorded"))
     }
 
-    /// `n` frames.
+    /// `n` refreshes.
     pub fn steps(&mut self, n: u64) -> &State {
         for _ in 1..n {
             self.step();
@@ -633,33 +656,52 @@ impl Headless {
         self.step()
     }
 
-    /// Steps until the picture is complete and has held still for a few
-    /// frames, or `bound` frames have passed.
-    pub fn settle(&mut self, bound: u64) -> Settled {
-        for frames in 1..=bound {
+    /// Steps for `seconds` of the run's time.
+    pub fn run_for(&mut self, seconds: f64) -> &State {
+        let until = self.seconds() + seconds;
+        loop {
             self.step();
-            if self.still() {
+            if self.seconds() >= until {
+                break;
+            }
+        }
+        self.history
+            .last()
+            .unwrap_or_else(|| unreachable!("a step was just recorded"))
+    }
+
+    /// Steps until the picture is complete and has held still for a few
+    /// frames, or `bound` seconds have passed.
+    pub fn settle(&mut self, bound: f64) -> Settled {
+        let (from, frames) = (self.seconds(), self.frame);
+        loop {
+            self.step();
+            let seconds = self.seconds() - from;
+            let settled = self.still();
+            if settled || seconds >= bound {
                 return Settled {
-                    frames,
-                    settled: true,
+                    frames: self.frame - frames,
+                    seconds,
+                    settled,
                 };
             }
         }
-        Settled {
-            frames: bound,
-            settled: false,
-        }
     }
 
-    /// Steps until `holds` of the state, or `bound` frames have passed;
-    /// returns how many it took, or the bound.
-    pub fn wait_until(&mut self, bound: u64, holds: impl Fn(&State) -> bool) -> Result<u64, u64> {
-        for frames in 1..=bound {
-            if holds(self.step()) {
-                return Ok(frames);
+    /// Steps until `holds` of the state, or `bound` seconds have passed;
+    /// says how long it took, or that it did not.
+    pub fn wait_until(&mut self, bound: f64, holds: impl Fn(&State) -> bool) -> Result<f64, f64> {
+        let from = self.seconds();
+        loop {
+            let held = holds(self.step());
+            let seconds = self.seconds() - from;
+            if held {
+                return Ok(seconds);
+            }
+            if seconds >= bound {
+                return Err(seconds);
             }
         }
-        Err(bound)
     }
 
     /// Whether the last few frames drawn were complete and drew the same
@@ -688,15 +730,31 @@ impl Headless {
         series::carry_out(self, action);
     }
 
-    /// Plays `series`: each step's actions, then the step. Returns the states
-    /// it produced.
+    /// Plays `series` in the run's time: before each step, every action due
+    /// by the refresh it waits for; then the step. Returns the states it
+    /// produced.
     pub fn play(&mut self, series: &Series) -> &[State] {
         let first = self.history.len();
-        for actions in series.frames() {
-            for action in actions {
+        let from = self.due.max(Instant::now());
+        let mut next = 0;
+        let actions = series.actions();
+        loop {
+            let at = self
+                .due
+                .max(Instant::now())
+                .duration_since(from)
+                .as_secs_f64();
+            while let Some((when, action)) = actions.get(next) {
+                if *when > at {
+                    break;
+                }
                 self.act(action);
+                next += 1;
             }
             self.step();
+            if next == actions.len() && at >= series.seconds() {
+                break;
+            }
         }
         &self.history[first..]
     }
@@ -707,12 +765,17 @@ impl Headless {
         self.app.fly(tape);
     }
 
+    /// Whether a tape given to [`Headless::fly`] still has cameras to fly.
+    pub fn flying(&self) -> bool {
+        self.app.flying()
+    }
+
     /// The last step's state, or the state before the first.
     pub fn state(&self) -> State {
         self.history
             .last()
             .cloned()
-            .unwrap_or_else(|| self.read(false))
+            .unwrap_or_else(|| self.read(false, 0.0))
     }
 
     /// Every step's state, in order.
@@ -741,29 +804,13 @@ impl Headless {
         self.app.frames_presented()
     }
 
-    /// Whether a tape given to [`Headless::fly`] still has cameras to fly.
-    pub fn flying(&self) -> bool {
-        self.app.flying()
-    }
-
     /// Adds a source of readings: a topic in the session log, a key in every
     /// [`State::observed`] from the next step on.
     pub fn observe_with(&mut self, observer: Box<dyn Observer>) {
         self.observers.push(observer);
     }
 
-    /// The run's store, to start another from.
-    pub fn store(&self) -> &Store {
-        &self.start.store
-    }
-
-    /// The server's polls the last step took.
-    pub fn server_polls(&self) -> u64 {
-        self.polls
-    }
-
-    /// Why the session ended, if it has: a replay that reached its end with
-    /// nobody landing it, say.
+    /// Why the session ended, if it has.
     pub fn ended(&self) -> Option<&'static str> {
         self.app.ending()
     }
@@ -787,37 +834,7 @@ impl Headless {
         &mut self.app
     }
 
-    /// Polls the geometry server until it has nothing left to do: every
-    /// message the last frame sent taken, every load it could finish
-    /// finished — all inline, on this thread, in an order that is the same
-    /// every run.
-    fn run_the_server(&mut self) -> u64 {
-        let Some(server) = self.server.as_mut() else {
-            return 0;
-        };
-        let waker = Waker::from(Arc::clone(&self.woken));
-        let mut cx = Context::from_waker(&waker);
-        let mut polls = 0;
-        loop {
-            self.woken.0.store(false, Ordering::SeqCst);
-            polls += 1;
-            if let Poll::Ready(()) = server.as_mut().poll(&mut cx) {
-                tracing::info!("the geometry server ended");
-                self.server = None;
-                break;
-            }
-            if !self.woken.0.load(Ordering::SeqCst) {
-                break;
-            }
-            if polls >= SERVER_POLLS {
-                tracing::warn!(polls, "the geometry server is still busy; stepping on");
-                break;
-            }
-        }
-        polls
-    }
-
-    fn read(&self, drew: bool) -> State {
+    fn read(&self, drew: bool, took: f64) -> State {
         let metrics = tuile_core::metrics::metrics()
             .snapshot()
             .since(&self.baseline);
@@ -826,21 +843,24 @@ impl Headless {
             .into();
         let (size, scale) = self.app.screen_size().unwrap_or((self.start.size, 1.0));
         let eyes = (0..self.start.eyes.count())
-            .map(|eye| EyeReading {
-                ground: metrics.eye_ground_pixels[eye.min(tuile_core::metrics::EYES - 1)],
-                black: metrics.eye_black_pixels[eye.min(tuile_core::metrics::EYES - 1)],
+            .map(|eye| {
+                let slot = eye.min(tuile_core::metrics::EYES - 1);
+                EyeReading {
+                    ground: metrics.eye_ground_pixels[slot],
+                    black: metrics.eye_black_pixels[slot],
+                }
             })
             .collect();
-        let asked = self.start.fixture.asked();
         State {
             frame: self.frame,
+            seconds: self.seconds(),
+            took,
             drew,
             view,
             size,
             scale,
             eyes,
             metrics,
-            network: (asked.0 - self.network.0, asked.1 - self.network.1),
             observed: BTreeMap::new(),
         }
     }
@@ -866,11 +886,11 @@ impl Drop for Headless {
             }
         }
         self.socket = None;
+        // As a desktop's session ends: the stream, the store written down,
+        // the server joined.
         self.app.shut_down();
-        // The server goes before the runtime its switcher spawns on.
-        self.server = None;
         if let Some(runtime) = self.runtime.take() {
-            runtime.shutdown_background();
+            runtime.shutdown_timeout(Duration::from_secs(10));
         }
     }
 }

@@ -47,7 +47,7 @@ impl App {
                         self.flight = Some(super::flight::Flight::new(
                             from,
                             to,
-                            self.clock.now(),
+                            web_time::Instant::now(),
                             seconds,
                         ));
                     }
@@ -63,9 +63,10 @@ impl App {
                 let viewport = self.viewport();
                 steer::north_up(&mut self.controller, viewport);
             }
-            Command::Here => self
-                .locator
-                .request(self.clock.now(), crate::location::Placement::OVERHEAD),
+            Command::Here => self.locator.request(
+                web_time::Instant::now(),
+                crate::location::Placement::OVERHEAD,
+            ),
             Command::Freeze(on) => {
                 self.views.freeze = on;
                 tracing::info!("traversal freeze: {on}");
@@ -195,15 +196,15 @@ impl App {
         /// How long a message stays beside the position.
         const NOTICE: std::time::Duration = std::time::Duration::from_secs(8);
 
-        let now = self.clock.now();
-        if now.saturating_duration_since(self.title_at) < EVERY {
+        let now = web_time::Instant::now();
+        if now.duration_since(self.title_at) < EVERY {
             return;
         }
         self.title_at = now;
         if self
             .notice
             .as_ref()
-            .is_some_and(|(_, since)| now.saturating_duration_since(*since) > NOTICE)
+            .is_some_and(|(_, since)| now.duration_since(*since) > NOTICE)
         {
             self.notice = None;
         }

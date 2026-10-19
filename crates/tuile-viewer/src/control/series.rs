@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! What a run can be told to do, one frame at a time.
+//! What a run can be told to do, and when, in seconds of its own time.
 //!
 //! Every action enters where the same thing enters a window: a move of the
 //! eye is a steering command on the queue a URL arrives on, a finger goes
@@ -73,54 +73,67 @@ pub enum Pressure {
     Critical,
 }
 
-/// Actions timed in frames: frame `n`'s actions are done before the `n`-th
-/// step of the series. A frame with none is a step with nothing done.
+/// Actions timed in seconds from the start of the series, and how long it
+/// lasts.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct Series(Vec<Vec<Action>>);
+pub struct Series {
+    actions: Vec<(f64, Action)>,
+    seconds: f64,
+}
 
 impl Series {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// `frames` steps with nothing done: the time a still camera is given.
-    pub fn still(frames: usize) -> Self {
-        Self(vec![Vec::new(); frames])
-    }
-
-    /// One action a frame, in order.
-    pub fn of(actions: impl IntoIterator<Item = Action>) -> Self {
-        Self(actions.into_iter().map(|a| vec![a]).collect())
-    }
-
-    /// Adds `action` to frame `frame`, the series growing to reach it.
-    #[must_use]
-    pub fn at(mut self, frame: usize, action: Action) -> Self {
-        if self.0.len() <= frame {
-            self.0.resize(frame + 1, Vec::new());
+    /// Nothing done for `seconds`: the time a still camera is given.
+    pub fn still(seconds: f64) -> Self {
+        Self {
+            actions: Vec::new(),
+            seconds,
         }
-        self.0[frame].push(action);
+    }
+
+    /// `action` at `seconds`, the series lasting at least until then.
+    #[must_use]
+    pub fn at(mut self, seconds: f64, action: Action) -> Self {
+        let i = self.actions.partition_point(|(t, _)| *t <= seconds);
+        self.actions.insert(i, (seconds, action));
+        self.seconds = self.seconds.max(seconds);
         self
+    }
+
+    /// The eye along a path over `seconds`: `at(t)` for `t` from 0 to 1,
+    /// sampled `per_second` times a second. A frame does what is due by the
+    /// refresh it waits for, so a run whose frames are slower than the
+    /// samples moves the eye as far, in fewer and longer steps.
+    pub fn path(seconds: f64, per_second: f64, at: impl Fn(f64) -> View) -> Self {
+        let n = (seconds * per_second).ceil().max(1.0) as usize;
+        let mut series = Self::still(seconds);
+        for i in 1..=n {
+            let t = i as f64 / n as f64;
+            series = series.at(t * seconds, Action::Go(at(t)));
+        }
+        series
     }
 
     /// This series, then `next`.
     #[must_use]
     pub fn then(mut self, next: Series) -> Self {
-        self.0.extend(next.0);
+        let offset = self.seconds;
+        self.actions
+            .extend(next.actions.into_iter().map(|(t, a)| (t + offset, a)));
+        self.seconds += next.seconds;
         self
     }
 
-    /// Steps it takes.
-    pub fn len(&self) -> usize {
-        self.0.len()
+    /// How long it lasts.
+    pub fn seconds(&self) -> f64 {
+        self.seconds
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    pub(super) fn frames(&self) -> impl Iterator<Item = &Vec<Action>> {
-        self.0.iter()
+    pub(super) fn actions(&self) -> &[(f64, Action)] {
+        &self.actions
     }
 }
 
@@ -161,5 +174,38 @@ pub(super) fn carry_out(run: &mut Headless, action: &Action) {
             app.hidden(false);
             app.come_back();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Actions keep their order in time, a series that follows another starts
+    /// where it ended, and a path ends where it says.
+    #[test]
+    fn a_series_is_timed_in_seconds_and_follows_on() {
+        let view = |altitude| View {
+            altitude,
+            ..View::default()
+        };
+        let s = Series::new()
+            .at(0.5, Action::Rescale(2.0))
+            .at(0.1, Action::Rescale(1.0))
+            .then(Series::still(1.0))
+            .then(Series::path(2.0, 10.0, |t| view(1000.0 * (1.0 + t))));
+        assert!((s.seconds() - 3.5).abs() < 1e-9);
+        let times: Vec<f64> = s.actions().iter().map(|(t, _)| *t).collect();
+        assert!(times.windows(2).all(|w| w[0] <= w[1]), "{times:?}");
+        assert_eq!(s.actions()[0].1, Action::Rescale(1.0));
+        assert_eq!(s.actions().len(), 2 + 20);
+        assert!(
+            (times[2] - 1.6).abs() < 1e-9,
+            "the path starts after the still"
+        );
+        assert_eq!(
+            s.actions().last().map(|(_, a)| a),
+            Some(&Action::Go(view(2000.0)))
+        );
     }
 }

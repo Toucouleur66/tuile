@@ -5,7 +5,6 @@
 //! pixel gestures to the render-agnostic [`tuile_camera::CameraController`] and
 //! drives the geometry stream through the [`ContentPump`].
 
-mod clock;
 mod command;
 mod demand;
 #[cfg(feature = "control")]
@@ -33,9 +32,6 @@ mod tape;
 mod touch;
 mod warmup;
 
-pub(crate) use clock::Clock;
-#[cfg(feature = "control")]
-pub(crate) use clock::Stepper;
 pub(crate) use eyes::Rig;
 #[cfg(feature = "control")]
 pub(crate) use touch::Phase as Finger;
@@ -103,9 +99,6 @@ pub struct ViewerConfig {
     /// The graphics backends to choose from; `None` is the platform's own
     /// choice. A page may force WebGL2, say, to test it.
     pub(crate) backends: Option<wgpu::Backends>,
-    /// Where the application reads the time: the wall's, unless a headless
-    /// run steps it.
-    pub(crate) clock: Clock,
 }
 
 /// Where the on-screen controls live: the part of the frame not under a
@@ -324,8 +317,6 @@ pub struct App {
     menu: Option<crate::menu::Installed>,
     /// Running totals, reported once per second and again on the way out.
     stats: crate::session::Stats,
-    /// Where the time comes from: see [`clock`].
-    clock: Clock,
     /// The eyes a frame is drawn for: one, unless a headless run asks for a
     /// headset's pair. See [`eyes`].
     rig: Rig,
@@ -356,9 +347,9 @@ impl App {
         // system's question — if it has one — is up while the globe warms.
         let mut locator = crate::location::Locator::platform();
         if let Some(placement) = config.here {
-            locator.request(config.clock.now(), placement);
+            locator.request(web_time::Instant::now(), placement);
         }
-        let now = config.clock.now();
+        let now = web_time::Instant::now();
         let mut app = Self {
             imagery: imagery::Imagery::new(config.layers, config.layer),
             locator,
@@ -439,7 +430,6 @@ impl App {
             window_attributes: config.window,
             gpu_on_its_way: None,
             backends: config.backends,
-            clock: config.clock,
             rig: Rig::MONO,
             speaker: crate::desktop::try_alert,
             #[cfg(feature = "control")]
@@ -455,7 +445,7 @@ impl App {
     /// Takes the session if it has arrived since the last turn of the loop,
     /// or the reason it never will. Never waits.
     fn take_the_session(&mut self) {
-        let now = self.clock.now();
+        let now = web_time::Instant::now();
         // A start-up that failed, due again: on a phone, and only in front.
         if self.launch.is_none()
             && self.session.is_none()
@@ -575,7 +565,7 @@ impl App {
     /// Moves the view if the location that was asked for has arrived, and
     /// says how the request ended either way.
     fn take_the_location(&mut self) {
-        let now = self.clock.now();
+        let now = web_time::Instant::now();
         if let Some(outcome) = self.locator.tick(now, &mut self.controller) {
             self.located |= matches!(outcome, crate::location::Outcome::Centred { .. });
             self.say(&outcome.to_string());
@@ -607,7 +597,7 @@ impl App {
     /// stays a few seconds, or until the next one replaces it.
     fn say(&mut self, message: &str) {
         tracing::info!("{message}");
-        let now = self.clock.now();
+        let now = web_time::Instant::now();
         self.notice = Some((message.to_owned(), now));
         // Shown on the next turn of the loop, not a quarter of a second on.
         self.title_at = now - std::time::Duration::from_secs(1);
@@ -692,7 +682,7 @@ impl App {
         // Back in front: a start-up that failed is tried at once — the
         // person may have just typed a token in the system's settings.
         if let Some(retries) = self.retries.as_mut() {
-            retries.foreground(self.clock.now());
+            retries.foreground(web_time::Instant::now());
         }
     }
 

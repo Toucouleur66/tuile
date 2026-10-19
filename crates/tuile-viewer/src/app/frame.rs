@@ -73,9 +73,8 @@ impl App {
     /// Returns the interval, which is the only number the easing is allowed to
     /// depend on.
     fn start_the_frame(&mut self) -> std::time::Duration {
-        let now = self.clock.now();
-        let dt = now.saturating_duration_since(self.pacing.last_frame);
-        self.pacing.last_frame = now;
+        let dt = self.pacing.last_frame.elapsed();
+        self.pacing.last_frame = web_time::Instant::now();
         let m = tuile_core::metrics::metrics();
         m.frames.inc();
         m.frame_seconds.record(dt);
@@ -90,7 +89,7 @@ impl App {
         self.controller.advance(dt.as_secs_f64());
         // A glide puts the eye where it is due, frame by frame.
         if let Some(flight) = self.flight {
-            let (view, over) = flight.at(self.clock.now());
+            let (view, over) = flight.at(web_time::Instant::now());
             crate::steer::jump(&mut self.controller, view.camera());
             if over {
                 self.flight = None;
