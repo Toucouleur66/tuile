@@ -371,7 +371,7 @@ proptest! {
         let tr = trace(interactive(), &ops);
         for rec in &tr {
             for e in &rec.d.evict {
-                prop_assert!(!rec.d.draw.items.iter().any(|i| i.mesh == *e || i.drape.map(|x| x.resource) == Some(*e)));
+                prop_assert!(!rec.d.draw.items.iter().any(|i| i.mesh == *e || i.drapes.iter().any(|x| x.resource == *e)));
                 prop_assert!(rec.gpu_before.contains(e), "{:?} evicted but not on the GPU", e);
                 prop_assert!(!rec.transit_before.contains(e), "{:?} evicted in transit", e);
                 prop_assert_ne!(e.tile(), t(0, 0, 0));

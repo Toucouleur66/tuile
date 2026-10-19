@@ -15,9 +15,9 @@ mod budget_common;
 use budget_common::*;
 use tuile_core::budget::cost::Cost;
 use tuile_core::budget::{
-    Budget, BudgetConfig, Bytes, Class, ConfigError, Failure, FailurePolicy, Micros, NeedSet,
-    PerClass, Pressure, Protection, ResourceId, ResourceState, Role, SessionError, Source, Thermal,
-    Tier, Urgency,
+    Budget, BudgetConfig, Bytes, Class, ConfigError, Failure, FailurePolicy, LayerId, Micros,
+    NeedSet, PerClass, Pressure, Protection, ResourceId, ResourceState, Role, SessionError, Source,
+    Thermal, Tier, Urgency,
 };
 
 const RED: &str = "the budget core regressed";
@@ -480,15 +480,12 @@ mod requests {
         let a = t(2, 1, 1);
         let d = r.step(&drawn_draped(&[a], 5));
         assert!(
-            d.start
-                .iter()
-                .any(|s| s.resource == ResourceId::Drape(a, 5)),
+            d.start.iter().any(|s| s.resource == dr(a, 5)),
             "{RED}: {:?}",
             d.start
         );
         assert_eq!(
-            r.b.resource(ResourceId::Drape(a, 5))
-                .and_then(|v| v.urgency),
+            r.b.resource(dr(a, 5)).and_then(|v| v.urgency),
             Some(Urgency::Hole),
             "a missing tile's drape is as urgent as its mesh"
         );
@@ -501,16 +498,11 @@ mod requests {
         let mut r = Rig::interactive();
         let a = t(2, 1, 1);
         let d = r.step(&drawn_draped(&[a], 9));
-        assert!(
-            d.start
-                .iter()
-                .any(|s| s.resource == ResourceId::Drape(a, 5)),
-            "{RED}"
-        );
+        assert!(d.start.iter().any(|s| s.resource == dr(a, 5)), "{RED}");
         assert!(!d
             .start
             .iter()
-            .any(|s| matches!(s.resource, ResourceId::Drape(_, l) if l > 5)));
+            .any(|s| matches!(s.resource, ResourceId::Drape { level, .. } if level > 5)));
     }
 
     /// C11, §4: a drawn, drawable tile wearing a coarser drape asks for its
@@ -522,11 +514,33 @@ mod requests {
         r.settle(&drawn_draped(&[a], 3), 20);
         r.step(&drawn_draped(&[a], 5));
         assert_eq!(
-            r.b.resource(ResourceId::Drape(a, 5))
-                .and_then(|v| v.urgency),
+            r.b.resource(dr(a, 5)).and_then(|v| v.urgency),
             Some(Urgency::Drape),
             "{RED}"
         );
+    }
+    /// D-A4, I16 by layer: two layers of one tile are two requests, one
+    /// per layer, and one draw item wearing both.
+    #[test]
+    #[ignore = "red until the budget drapes every layer (D-A4)"]
+    fn two_layers_of_one_tile_are_two_requests_and_one_draw_item() {
+        let mut r = Rig::interactive();
+        let a = t(3, 2, 2);
+        let need = drawn_layered(&[a], 4, &[0, 1]);
+        let d = r.step(&need);
+        let mut drapes: Vec<_> = d
+            .start
+            .iter()
+            .filter(|s| s.class == Class::Drape)
+            .map(|s| s.resource)
+            .collect();
+        drapes.sort();
+        assert_eq!(drapes, vec![dl(a, 0, 4), dl(a, 1, 4)], "{RED}");
+        r.complete(&d);
+        let d = r.settle(&need, 20);
+        assert_eq!(d.draw.items.len(), 1);
+        let worn: Vec<_> = d.draw.items[0].drapes.iter().map(|x| x.resource).collect();
+        assert_eq!(worn, vec![dl(a, 0, 4), dl(a, 1, 4)], "in stacking order");
     }
 }
 
@@ -969,11 +983,9 @@ mod protection {
             ds.push(d);
         }
         let last = ds.last().expect("steps");
-        let worn = last.draw.get(mesh(kid)).and_then(|i| i.drape).expect(RED);
-        assert_eq!(worn.resource, ResourceId::Drape(root, 2));
-        assert!(ds
-            .iter()
-            .all(|d| !d.evict.contains(&ResourceId::Drape(root, 2))));
+        let worn = last.draw.get(mesh(kid)).and_then(base_drape).expect(RED);
+        assert_eq!(worn.resource, dr(root, 2));
+        assert!(ds.iter().all(|d| !d.evict.contains(&dr(root, 2))));
     }
 
     /// I11, C7: the pinned floor is never evicted, needed or not.
@@ -1384,7 +1396,7 @@ mod upload {
     fn a_mesh_and_its_drape_form_one_swap_group() {
         let a = t(3, 2, 2);
         let (_, d) = loaded(Rig::interactive_config(), &drawn_draped(&[a], 4));
-        let want = vec![mesh(a), ResourceId::Drape(a, 4)];
+        let want = vec![mesh(a), dr(a, 4)];
         assert!(
             d.upload_plan.groups.iter().any(|g| g.members == want),
             "{RED}"
@@ -1492,11 +1504,11 @@ mod draw {
         let a = t(3, 2, 2);
         r.settle(&drawn_draped(&[a], 3), 10);
         let d = r.step(&drawn_draped(&[a], 5));
-        let worn = d.draw.get(mesh(a)).and_then(|i| i.drape).expect(RED);
-        assert_eq!(worn.resource, ResourceId::Drape(a, 3));
+        let worn = d.draw.get(mesh(a)).and_then(base_drape).expect(RED);
+        assert_eq!(worn.resource, dr(a, 3));
         let d = r.settle(&drawn_draped(&[a], 5), 10);
-        let worn = d.draw.get(mesh(a)).and_then(|i| i.drape).expect("worn");
-        assert_eq!(worn.resource, ResourceId::Drape(a, 5));
+        let worn = d.draw.get(mesh(a)).and_then(base_drape).expect("worn");
+        assert_eq!(worn.resource, dr(a, 5));
     }
 
     /// I9, C20: on a zoom-out a finer drape already worn is kept until the
@@ -1509,8 +1521,8 @@ mod draw {
         r.settle(&drawn_draped(&[root], 1), 10);
         r.settle(&drawn_draped(&[a], 4), 10);
         let d = r.step(&drawn_draped(&[a], 2));
-        let worn = d.draw.get(mesh(a)).and_then(|i| i.drape).expect(RED);
-        assert_eq!(worn.resource, ResourceId::Drape(a, 4));
+        let worn = d.draw.get(mesh(a)).and_then(base_drape).expect(RED);
+        assert_eq!(worn.resource, dr(a, 4));
     }
 
     /// I1: a wanted tile with nothing to draw is counted lost.
@@ -1549,7 +1561,7 @@ mod draw {
         let a = t(3, 2, 2);
         for level in [3, 6, 2, 5] {
             let d = r.settle(&drawn_draped(&[a], level), 20);
-            let worn = d.draw.get(mesh(a)).and_then(|i| i.drape).expect(RED);
+            let worn = d.draw.get(mesh(a)).and_then(base_drape).expect(RED);
             assert!(
                 worn.level.abs_diff(level) <= 1,
                 "need {level}, worn {}",
@@ -1581,6 +1593,65 @@ mod draw {
         assert_eq!(cover.serves, new_tiles);
         assert_eq!((d.stats.lost, d.stats.fallback), (0, 3));
     }
+    /// D-A4, M36: each layer falls back on its own: a tile whose base
+    /// drape is drawable wears it, and wears its overlay through the
+    /// nearest ancestor that has the overlay — never another layer's drape.
+    #[test]
+    #[ignore = "red until the budget drapes every layer (D-A4)"]
+    fn each_layer_falls_back_on_its_own() {
+        let mut r = Rig::interactive();
+        let root = t(0, 0, 0);
+        let a = children(root)[3];
+        // The root wears both layers; `a` then gets its base drape only.
+        let mut both = drawn_layered(&[root], 0, &[0, 1]);
+        r.settle(&both, 20);
+        both = drawn_layered(&[a], 1, &[0]);
+        both.ancestors.push((root, layered(root, 0, &[0, 1])));
+        r.settle(&both, 20);
+        // Now `a` wants both layers at level 1: the overlay's own is not
+        // loaded yet.
+        let mut need = drawn_layered(&[a], 1, &[0, 1]);
+        need.ancestors.push((root, layered(root, 0, &[0, 1])));
+        let d = r.step(&need);
+        let item = d.draw.get(mesh(a)).expect(RED);
+        assert_eq!(item.role, Role::Exact);
+        let base = item.drape(LayerId(0)).expect("the base layer worn");
+        assert_eq!(base.resource, dl(a, 0, 1));
+        let overlay = item.drape(LayerId(1)).expect("the overlay worn");
+        assert_eq!(
+            overlay.resource,
+            dl(root, 1, 0),
+            "the overlay's own ancestor"
+        );
+        assert_ne!(overlay.uv, tuile_core::budget::UvTransform::IDENTITY);
+        assert_eq!(item.drapes.len(), 2, "one drape per layer");
+    }
+
+    /// I1 (D-A1), D-A4: on a layer switch the old layer stays worn until
+    /// the new one is drawable, then the new one replaces it in one step.
+    #[test]
+    #[ignore = "red until the budget drapes every layer (D-A4)"]
+    fn a_layer_switch_keeps_the_old_layer_worn_until_the_new_one_is_drawable() {
+        let mut r = Rig::interactive();
+        let a = t(3, 2, 2);
+        r.settle(&drawn_layered(&[a], 3, &[0]), 20);
+        let switched = drawn_layered(&[a], 3, &[1]);
+        let d = r.step(&switched);
+        let item = d.draw.get(mesh(a)).expect(RED);
+        assert_eq!(
+            item.drapes.iter().map(|x| x.resource).collect::<Vec<_>>(),
+            vec![dl(a, 0, 3)],
+            "the old layer stays worn"
+        );
+        assert!(d.start.iter().any(|s| s.resource == dl(a, 1, 3)));
+        let d = r.settle(&switched, 20);
+        let item = d.draw.get(mesh(a)).expect("drawn");
+        assert_eq!(
+            item.drapes.iter().map(|x| x.resource).collect::<Vec<_>>(),
+            vec![dl(a, 1, 3)],
+            "the new layer replaced it"
+        );
+    }
 }
 
 mod batch {
@@ -1607,8 +1678,8 @@ mod batch {
         for i in &d.draw.items {
             assert_eq!(i.role, Role::Exact);
             assert_eq!(
-                i.drape.map(|x| x.resource),
-                Some(ResourceId::Drape(i.mesh.tile(), 5))
+                base_drape(i).map(|x| x.resource),
+                Some(dr(i.mesh.tile(), 5))
             );
         }
     }
@@ -2035,37 +2106,24 @@ mod refresh {
         let a = t(3, 2, 2);
         let need = drawn_draped(&[a], 4);
         r.settle(&need, 10);
-        let old = r.b.resource(ResourceId::Drape(a, 4)).and_then(|v| v.gen);
-        r.b.new_epoch(Class::Drape);
+        let old = r.b.resource(dr(a, 4)).and_then(|v| v.gen);
+        r.b.new_epoch(Class::Drape, None);
         let d = r.step(&need);
-        assert!(
-            d.start
-                .iter()
-                .any(|s| s.resource == ResourceId::Drape(a, 4)),
-            "{RED}"
-        );
+        assert!(d.start.iter().any(|s| s.resource == dr(a, 4)), "{RED}");
         assert_eq!(
-            r.b.resource(ResourceId::Drape(a, 4))
-                .and_then(|v| v.urgency),
+            r.b.resource(dr(a, 4)).and_then(|v| v.urgency),
             Some(Urgency::Refresh)
         );
         r.complete(&d);
         for _ in 0..10 {
             let d = r.step(&need);
-            let worn = d
-                .draw
-                .get(mesh(a))
-                .and_then(|i| i.drape)
-                .map(|x| x.resource);
-            assert_eq!(worn, Some(ResourceId::Drape(a, 4)), "never a hole");
+            let worn = d.draw.get(mesh(a)).and_then(base_drape).map(|x| x.resource);
+            assert_eq!(worn, Some(dr(a, 4)), "never a hole");
             r.complete(&d);
         }
-        let new = r.b.resource(ResourceId::Drape(a, 4)).and_then(|v| v.gen);
+        let new = r.b.resource(dr(a, 4)).and_then(|v| v.gen);
         assert_ne!(new, old, "the new content replaced the old");
-        assert_eq!(
-            r.b.resource(ResourceId::Drape(a, 4)).map(|v| v.urgency),
-            Some(None)
-        );
+        assert_eq!(r.b.resource(dr(a, 4)).map(|v| v.urgency), Some(None));
     }
 
     /// Review of point 7: a refresh uses only free slots: floor, holes and
@@ -2077,7 +2135,7 @@ mod refresh {
         let mut r = Rig::new(c);
         let a = t(3, 2, 2);
         r.settle(&drawn_draped(&[a], 4), 10);
-        r.b.new_epoch(Class::Drape);
+        r.b.new_epoch(Class::Drape, None);
         let h = t(3, 6, 6);
         let d = r.step(&drawn_draped(&[a, h], 4));
         let drapes: Vec<_> = d
@@ -2086,7 +2144,7 @@ mod refresh {
             .filter(|s| s.class == Class::Drape)
             .map(|s| s.resource)
             .collect();
-        assert_eq!(drapes, vec![ResourceId::Drape(h, 4)], "{RED}");
+        assert_eq!(drapes, vec![dr(h, 4)], "{RED}");
     }
 
     /// Review of point 7: a refresh never preempts anything.
@@ -2102,7 +2160,7 @@ mod refresh {
         need.ring.push((g, need_ring(g)));
         let d = r.step(&need);
         assert!(d.start.iter().any(|s| s.resource == mesh(g)), "{RED}");
-        r.b.new_epoch(Class::TerrainMesh);
+        r.b.new_epoch(Class::TerrainMesh, None);
         let ds = r.idle_for(&need, Micros::from_secs(1));
         assert!(ds.iter().all(|d| d.cancel.is_empty()));
         assert!(!started(&ds, mesh(a)), "the ring holds the only slot");
@@ -2110,6 +2168,28 @@ mod refresh {
 
     fn need_ring(id: tuile_core::budget::TileId) -> tuile_core::budget::Need {
         need(id)
+    }
+    /// D-A4: a layer's epoch refreshes that layer's drapes only.
+    #[test]
+    #[ignore = "red until the budget drapes every layer (D-A4)"]
+    fn an_epoch_refreshes_only_its_layer() {
+        let mut r = Rig::interactive();
+        let a = t(3, 2, 2);
+        let need = drawn_layered(&[a], 4, &[0, 1]);
+        r.settle(&need, 20);
+        r.b.new_epoch(Class::Drape, Some(LayerId(1)));
+        let d = r.step(&need);
+        let drapes: Vec<_> = d
+            .start
+            .iter()
+            .filter(|s| s.class == Class::Drape)
+            .map(|s| s.resource)
+            .collect();
+        assert_eq!(drapes, vec![dl(a, 1, 4)], "{RED}");
+        assert_eq!(
+            r.b.resource(dl(a, 1, 4)).and_then(|v| v.urgency),
+            Some(Urgency::Refresh)
+        );
     }
 }
 
@@ -2125,12 +2205,7 @@ mod drape_caps {
         let mut r = Rig::new(c);
         let a = t(2, 1, 1);
         let d = r.step(&drawn_draped(&[a], 9));
-        assert!(
-            d.start
-                .iter()
-                .any(|s| s.resource == ResourceId::Drape(a, 4)),
-            "{RED}"
-        );
+        assert!(d.start.iter().any(|s| s.resource == dr(a, 4)), "{RED}");
     }
 
     /// D5: the cap over terrain is a profile parameter.
@@ -2141,12 +2216,7 @@ mod drape_caps {
         let mut r = Rig::new(c);
         let a = t(2, 1, 1);
         let d = r.step(&drawn_draped(&[a], 9));
-        assert!(
-            d.start
-                .iter()
-                .any(|s| s.resource == ResourceId::Drape(a, 3)),
-            "{RED}"
-        );
+        assert!(d.start.iter().any(|s| s.resource == dr(a, 3)), "{RED}");
     }
 
     /// The configuration reports the effective cap.

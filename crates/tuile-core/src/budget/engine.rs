@@ -32,14 +32,14 @@ use super::decisions::{
 };
 use super::error::{AuditError, SessionError};
 use super::imagery::{best_drape, needed_level, DrapeCandidate, LevelClamp, UvTransform};
-use super::need::{Membership, Need};
+use super::need::{ImageryNeed, LayerReach, Membership, Need};
 use super::priority::{score, PriorityKey, Quantised, Urgency};
 use super::state::{CpuCopy, Entry, Gpu, Load, Transit};
 use super::stats::{BudgetStats, GAP_BUCKETS, LATENCY_BUCKETS};
 use super::tier::{Presence, PresenceOracle, Source, Tier};
 use super::types::{
-    Bytes, Class, Failure, Generation, Micros, PerClass, Policy, Pressure, ResourceId, Thermal,
-    TileId,
+    Bytes, Class, Failure, Generation, LayerId, Micros, PerClass, Policy, Pressure, ResourceId,
+    Thermal, TileId,
 };
 use super::view::{Protection, ResourceState, ResourceView};
 use super::{Budget, Event, FrameInput, Ledger, TileInfo, RECENT_CAP, THRASH_WINDOW};
@@ -81,11 +81,12 @@ enum Job {
     Deliver,
 }
 
-fn sort_key(n: &TileNeed) -> impl Ord {
+fn sort_key(n: &TileNeed) -> impl Ord + '_ {
     let img = n
         .need
         .imagery
-        .map(|i| (i.footprint.ratio().to_bits(), i.max_level));
+        .as_ref()
+        .map(|i| (i.footprint.ratio().to_bits(), &i.layers));
     (
         Reverse(n.membership),
         n.q,
@@ -94,6 +95,16 @@ fn sort_key(n: &TileNeed) -> impl Ord {
         n.need.parent,
         n.need.class,
     )
+}
+
+/// The layers a need asks for. Stub: the first only.
+fn layers(img: &ImageryNeed) -> &[LayerReach] {
+    &img.layers[..img.layers.len().min(1)]
+}
+
+/// Every layer of `tile`, as a range of a map keyed by `(tile, layer)`.
+fn tile_layers(tile: TileId) -> std::ops::RangeInclusive<(TileId, LayerId)> {
+    (tile, LayerId(0))..=(tile, LayerId(u16::MAX))
 }
 
 fn backoff(policy: FailurePolicy, failures: u32, why: Failure) -> Micros {
@@ -119,8 +130,16 @@ impl Budget {
     fn class_of(&self, r: ResourceId, mesh_class: Class) -> Class {
         match r {
             ResourceId::Mesh(_) => mesh_class,
-            ResourceId::Drape(..) => Class::Drape,
+            ResourceId::Drape { .. } => Class::Drape,
         }
+    }
+
+    /// The content epoch `r` must be of: its class's, plus its layer's for
+    /// a drape (D-A4: a layer refreshes on its own).
+    fn epoch(&self, r: ResourceId, class: Class) -> u64 {
+        self.epochs[class]
+            + r.layer()
+                .map_or(0, |l| self.layer_epochs.get(&l).copied().unwrap_or(0))
     }
 
     fn is_floor(&self, level: u32) -> bool {
@@ -362,7 +381,7 @@ impl Budget {
     /// store, or only remotely.
     fn drape_tier(&self, r: ResourceId, presence: &dyn PresenceOracle) -> Tier {
         let e = self.entries.get(&r);
-        let epoch = self.epochs[Class::Drape];
+        let epoch = self.epoch(r, Class::Drape);
         match e {
             Some(e) if e.gpu.is_some_and(|g| g.epoch == epoch) => Tier::Gpu,
             Some(e) if e.fresh_cpu(epoch).is_some() => Tier::Decoded,
@@ -386,50 +405,54 @@ impl Budget {
         &mut self,
         tiles: &BTreeMap<TileId, TileNeed>,
         presence: &dyn PresenceOracle,
-    ) -> BTreeMap<TileId, u32> {
+    ) -> BTreeMap<(TileId, LayerId), u32> {
         let mut out = BTreeMap::new();
         let floor = self.cfg.pinned_level.unwrap_or(0);
         let batch = self.cfg.policy == Policy::Batch;
         let cap = self.cfg.imagery_cap();
         for (t, tn) in tiles {
             let draped = matches!(tn.membership, Membership::Drawn | Membership::Blocker);
-            let Some(img) = tn.need.imagery.filter(|_| draped) else {
+            let Some(img) = tn.need.imagery.as_ref().filter(|_| draped) else {
                 continue;
             };
-            let clamp = LevelClamp {
-                floor,
-                terrain_level: tn.need.level,
-                over_terrain_cap: cap,
-                source_max: img.max_level,
-            };
-            if batch {
-                out.insert(*t, needed_level(None, img.footprint, clamp));
-                continue;
-            }
-            let prev = self.imagery_prev.get(t).copied();
-            let relaxed = needed_level(prev, img.footprint.relaxed(self.scale), clamp);
-            let mut level = relaxed;
-            if self.drape_tier(ResourceId::Drape(*t, relaxed), presence) == Tier::Remote {
-                let full = needed_level(prev, img.footprint, clamp);
-                let ceiling = tn.need.level.saturating_add(cap).min(img.max_level);
-                let lo = relaxed.min(full).saturating_sub(1).max(floor);
-                let hi = relaxed.max(full).saturating_add(1).min(ceiling);
-                let best = (lo..=hi)
-                    .map(|l| {
-                        let tier = self.drape_tier(ResourceId::Drape(*t, l), presence);
-                        ((tier, l.abs_diff(relaxed), Reverse(l)), l)
-                    })
-                    .min();
-                if let Some(((tier, ..), l)) = best {
-                    if tier != Tier::Remote {
-                        level = l;
+            for reach in layers(img) {
+                let key = (*t, reach.layer);
+                let drape = |l| ResourceId::drape(*t, reach.layer, l);
+                let clamp = LevelClamp {
+                    floor,
+                    terrain_level: tn.need.level,
+                    over_terrain_cap: cap,
+                    source_max: reach.max_level,
+                };
+                if batch {
+                    out.insert(key, needed_level(None, img.footprint, clamp));
+                    continue;
+                }
+                let prev = self.imagery_prev.get(&key).copied();
+                let relaxed = needed_level(prev, img.footprint.relaxed(self.scale), clamp);
+                let mut level = relaxed;
+                if self.drape_tier(drape(relaxed), presence) == Tier::Remote {
+                    let full = needed_level(prev, img.footprint, clamp);
+                    let ceiling = tn.need.level.saturating_add(cap).min(reach.max_level);
+                    let lo = relaxed.min(full).saturating_sub(1).max(floor);
+                    let hi = relaxed.max(full).saturating_add(1).min(ceiling);
+                    let best = (lo..=hi)
+                        .map(|l| {
+                            let tier = self.drape_tier(drape(l), presence);
+                            ((tier, l.abs_diff(relaxed), Reverse(l)), l)
+                        })
+                        .min();
+                    if let Some(((tier, ..), l)) = best {
+                        if tier != Tier::Remote {
+                            level = l;
+                        }
                     }
                 }
+                out.insert(key, level);
             }
-            out.insert(*t, level);
         }
-        for (t, l) in &out {
-            self.imagery_prev.insert(*t, *l);
+        for (k, l) in &out {
+            self.imagery_prev.insert(*k, *l);
         }
         out
     }
@@ -472,13 +495,14 @@ impl Budget {
         out
     }
 
-    fn best_drape_for(&self, tile: TileId, need: u32) -> Option<DrapeChoice> {
+    fn best_drape_for(&self, tile: TileId, layer: LayerId, need: u32) -> Option<DrapeChoice> {
         // The tile's own drape at exactly its need is the best there is:
         // the coarsest at or above the need, and the closest owner.
-        let own = ResourceId::Drape(tile, need);
+        let own = ResourceId::drape(tile, layer, need);
         if self.drawable(own) {
             return Some(DrapeChoice {
                 resource: own,
+                layer,
                 level: need,
                 uv: UvTransform::IDENTITY,
             });
@@ -497,10 +521,11 @@ impl Budget {
                 }
             };
             let Some(uv) = uv else { continue };
-            let lo = ResourceId::Drape(*x, 0);
-            let hi = ResourceId::Drape(*x, u32::MAX);
+            // Only this layer's drapes: a layer never falls back on another's.
+            let lo = ResourceId::drape(*x, layer, 0);
+            let hi = ResourceId::drape(*x, layer, u32::MAX);
             for (r, e) in self.entries.range(lo..=hi) {
-                if let (ResourceId::Drape(_, level), Some(_)) = (r, e.gpu) {
+                if let (ResourceId::Drape { level, .. }, Some(_)) = (r, e.gpu) {
                     cands.push((
                         DrapeCandidate {
                             level: *level,
@@ -518,6 +543,7 @@ impl Budget {
             .find(|c| c.0 == best)
             .map(|(c, resource, uv)| DrapeChoice {
                 resource,
+                layer,
                 level: c.level,
                 uv,
             })
@@ -527,7 +553,7 @@ impl Budget {
     fn build_draw(
         &self,
         tiles: &BTreeMap<TileId, TileNeed>,
-        drapes: &BTreeMap<TileId, u32>,
+        drapes: &BTreeMap<(TileId, LayerId), u32>,
         st: &mut BudgetStats,
     ) -> (DrawSet, BTreeSet<TileId>) {
         let mut items: BTreeMap<ResourceId, (Role, BTreeSet<TileId>)> = BTreeMap::new();
@@ -580,24 +606,37 @@ impl Budget {
         let mut out = Vec::new();
         for (mesh, (role, serves)) in items {
             let tile = mesh.tile();
-            let need = match role {
-                Role::Exact => drapes.get(&tile).copied(),
-                Role::Held => self
-                    .imagery_prev
-                    .get(&tile)
-                    .copied()
-                    .or_else(|| serves.iter().filter_map(|s| drapes.get(s)).max().copied()),
-                Role::Fallback => serves.iter().filter_map(|s| drapes.get(s)).max().copied(),
-            };
-            let drape = need.and_then(|n| self.best_drape_for(tile, n));
-            if role == Role::Exact {
-                if let Some(n) = need {
-                    match drape {
-                        Some(d) if d.level.abs_diff(n) <= 1 => {}
-                        _ => st.underdraped += 1,
+            // The level each layer is needed at: the tile's own need when
+            // exact; a held tile keeps its own last level; a fallback
+            // dresses for the finest of the tiles it serves.
+            let mut needs: BTreeMap<LayerId, u32> = BTreeMap::new();
+            for s in &serves {
+                for ((_, layer), n) in drapes.range(tile_layers(*s)) {
+                    let e = needs.entry(*layer).or_insert(*n);
+                    *e = (*e).max(*n);
+                }
+            }
+            if role == Role::Held {
+                for (layer, n) in needs.iter_mut() {
+                    if let Some(p) = self.imagery_prev.get(&(tile, *layer)) {
+                        *n = *p;
                     }
                 }
-                if let Some(d) = drape {
+            }
+            let chosen: Vec<DrapeChoice> = needs
+                .iter()
+                .filter_map(|(layer, n)| self.best_drape_for(tile, *layer, *n))
+                .collect();
+            if role == Role::Exact {
+                let off = needs.iter().any(|(layer, n)| {
+                    !chosen
+                        .iter()
+                        .any(|d| d.layer == *layer && d.level.abs_diff(*n) <= 1)
+                });
+                if off {
+                    st.underdraped += 1;
+                }
+                for d in &chosen {
                     let gap = i64::from(d.level)
                         - i64::from(self.tiles.get(&tile).map(|i| i.level).unwrap_or(0));
                     let i = (gap + 8).clamp(0, GAP_BUCKETS as i64 - 1) as usize;
@@ -610,7 +649,7 @@ impl Budget {
             out.push(DrawItem {
                 mesh,
                 role,
-                drape,
+                drapes: chosen,
                 serves: serves.into_iter().collect(),
             });
         }
@@ -621,7 +660,7 @@ impl Budget {
     fn wants(
         &self,
         tiles: &BTreeMap<TileId, TileNeed>,
-        drapes: &BTreeMap<TileId, u32>,
+        drapes: &BTreeMap<(TileId, LayerId), u32>,
         draw: &DrawSet,
     ) -> BTreeMap<ResourceId, Want> {
         let mut out: BTreeMap<ResourceId, Want> = BTreeMap::new();
@@ -655,51 +694,56 @@ impl Budget {
                     level: tn.need.level,
                 },
             );
-            if floor && tn.need.imagery.is_some() {
-                put(
-                    &mut out,
-                    ResourceId::Drape(*t, tn.need.level),
-                    Want {
-                        urgency: Urgency::Floor,
-                        q: tn.q,
-                        class: Class::Drape,
-                        level: tn.need.level,
-                    },
-                );
-            }
-            let Some(&n) = drapes.get(t) else { continue };
-            let drape = ResourceId::Drape(*t, n);
-            let du = match tn.membership {
-                Membership::Blocker => Some(Urgency::Blocker),
-                _ if !mesh_drawable => Some(urgency),
-                _ => {
-                    let worn = draw.get(ResourceId::Mesh(*t)).and_then(|i| i.drape);
-                    let off = match worn {
-                        None => true,
-                        Some(w) if batch => w.resource != drape,
-                        Some(w) => {
-                            w.level.abs_diff(n) > 1
-                                || (self.pressure != Pressure::Normal && w.level > n)
-                        }
-                    };
-                    off.then_some(if floor {
-                        Urgency::Floor
-                    } else {
-                        Urgency::Drape
-                    })
+            if floor {
+                for reach in tn.need.imagery.as_ref().map(layers).unwrap_or(&[]) {
+                    put(
+                        &mut out,
+                        ResourceId::drape(*t, reach.layer, tn.need.level),
+                        Want {
+                            urgency: Urgency::Floor,
+                            q: tn.q,
+                            class: Class::Drape,
+                            level: tn.need.level,
+                        },
+                    );
                 }
-            };
-            if let Some(du) = du {
-                put(
-                    &mut out,
-                    drape,
-                    Want {
-                        urgency: du,
-                        q: tn.q,
-                        class: Class::Drape,
-                        level: tn.need.level,
-                    },
-                );
+            }
+            for ((_, layer), &n) in drapes.range(tile_layers(*t)) {
+                let drape = ResourceId::drape(*t, *layer, n);
+                let du = match tn.membership {
+                    Membership::Blocker => Some(Urgency::Blocker),
+                    _ if !mesh_drawable => Some(urgency),
+                    _ => {
+                        let worn = draw
+                            .get(ResourceId::Mesh(*t))
+                            .and_then(|i| i.drape(*layer).copied());
+                        let off = match worn {
+                            None => true,
+                            Some(w) if batch => w.resource != drape,
+                            Some(w) => {
+                                w.level.abs_diff(n) > 1
+                                    || (self.pressure != Pressure::Normal && w.level > n)
+                            }
+                        };
+                        off.then_some(if floor {
+                            Urgency::Floor
+                        } else {
+                            Urgency::Drape
+                        })
+                    }
+                };
+                if let Some(du) = du {
+                    put(
+                        &mut out,
+                        drape,
+                        Want {
+                            urgency: du,
+                            q: tn.q,
+                            class: Class::Drape,
+                            level: tn.need.level,
+                        },
+                    );
+                }
             }
         }
         out
@@ -732,7 +776,7 @@ impl Budget {
         class: Class,
         presence: &dyn PresenceOracle,
     ) -> Tier {
-        let epoch = self.epochs[class];
+        let epoch = self.epoch(r, class);
         match e {
             Some(e) if e.gpu.is_some_and(|g| g.epoch == epoch) => Tier::Gpu,
             Some(e) if e.fresh_cpu(epoch).is_some() => Tier::Decoded,
@@ -767,9 +811,9 @@ impl Budget {
         let mut wants = self.wants(&tiles, &drapes, &draw);
         // Drawn content of an older epoch is refreshed, new before old.
         for i in &draw.items {
-            for r in std::iter::once(i.mesh).chain(i.drape.map(|x| x.resource)) {
+            for r in std::iter::once(i.mesh).chain(i.drapes.iter().map(|x| x.resource)) {
                 if let Some(e) = self.entries.get(&r) {
-                    if e.stale_gpu(self.epochs[e.class]) && !wants.contains_key(&r) {
+                    if e.stale_gpu(self.epoch(r, e.class)) && !wants.contains_key(&r) {
                         wants.insert(
                             r,
                             Want {
@@ -788,9 +832,7 @@ impl Budget {
         let mut drawn_res: BTreeSet<ResourceId> = BTreeSet::new();
         for i in &draw.items {
             drawn_res.insert(i.mesh);
-            if let Some(dr) = i.drape {
-                drawn_res.insert(dr.resource);
-            }
+            drawn_res.extend(i.drapes.iter().map(|x| x.resource));
         }
         self.drawn_last = drawn_res.clone();
         self.chain_last = wants
@@ -854,7 +896,7 @@ impl Budget {
         let mut jobs: Vec<(PriorityKey, ResourceId, Job, Want)> = Vec::new();
         for (r, w) in &wants {
             let class = self.class_of(*r, w.class);
-            let epoch = self.epochs[class];
+            let epoch = self.epoch(*r, class);
             let e = self.entries.get(r);
             let mut urgency = w.urgency;
             let job = match e {
@@ -971,12 +1013,10 @@ impl Budget {
                     .all(|(t, _)| {
                         let item = draw.get(ResourceId::Mesh(*t));
                         let exact = item.is_some_and(|i| i.role == Role::Exact);
-                        let drape_ok = match drapes.get(t) {
-                            None => true,
-                            Some(&n) => item
-                                .and_then(|i| i.drape)
-                                .is_some_and(|x| x.resource == ResourceId::Drape(*t, n)),
-                        };
+                        let drape_ok = drapes.range(tile_layers(*t)).all(|((_, l), &n)| {
+                            item.and_then(|i| i.drape(*l))
+                                .is_some_and(|x| x.resource == ResourceId::drape(*t, *l, n))
+                        });
                         exact && drape_ok
                     });
             d.frame_ready = complete && self.fatal.is_none();
@@ -1176,7 +1216,7 @@ impl Budget {
             }
             let gen = Generation(self.next_gen);
             self.next_gen += 1;
-            let epoch = self.epochs[class];
+            let epoch = self.epoch(*r, class);
             let e = self
                 .entries
                 .entry(*r)
@@ -1318,7 +1358,7 @@ impl Budget {
                 continue;
             };
             let class = e.class;
-            let Some(c) = e.fresh_cpu(self.epochs[class]) else {
+            let Some(c) = e.fresh_cpu(self.epoch(*r, class)) else {
                 continue;
             };
             let credit_ok = self.ledger.in_transit == Bytes::ZERO
@@ -1394,7 +1434,7 @@ impl Budget {
         eff: &Eff,
         keys: &BTreeMap<ResourceId, PriorityKey>,
         tiles: &BTreeMap<TileId, TileNeed>,
-        drapes: &BTreeMap<TileId, u32>,
+        drapes: &BTreeMap<(TileId, LayerId), u32>,
     ) -> UploadPlan {
         // Group: the blockers of one parent (meshes and drapes), else a
         // tile's mesh and its drape.
@@ -1615,14 +1655,14 @@ impl Budget {
         now: Micros,
         tiles: &BTreeMap<TileId, TileNeed>,
         wants: &BTreeMap<ResourceId, Want>,
-        drapes: &BTreeMap<TileId, u32>,
+        drapes: &BTreeMap<(TileId, LayerId), u32>,
     ) {
         // Amortised: emptied entries and unreferenced tiles go every eighth
         // step, so a step does not scan all it tracks.
         if !self.steps.is_multiple_of(8) {
             let held = &self.held_last;
             self.imagery_prev
-                .retain(|t, _| drapes.contains_key(t) || held.contains(t));
+                .retain(|k, _| drapes.contains_key(k) || held.contains(&k.0));
             return;
         }
         let entries = &self.entries;
@@ -1673,7 +1713,7 @@ impl Budget {
         self.tiles.retain(|t, _| keep.contains(t));
         let held = &self.held_last;
         self.imagery_prev
-            .retain(|t, _| drapes.contains_key(t) || held.contains(t));
+            .retain(|k, _| drapes.contains_key(k) || held.contains(&k.0));
     }
 
     pub(super) fn release_beyond_impl(&mut self, target: Bytes) -> Vec<ResourceId> {
@@ -1734,7 +1774,7 @@ impl Budget {
                 .or(e.gpu.map(|g| g.gen))
                 .or(e.cpu.map(|c| c.gen)),
         };
-        let epoch = self.epochs[e.class];
+        let epoch = self.epoch(r, e.class);
         let tier = if e.gpu.is_some() {
             Tier::Gpu
         } else if e.fresh_cpu(epoch).is_some() {

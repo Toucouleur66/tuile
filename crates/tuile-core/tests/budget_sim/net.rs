@@ -93,7 +93,7 @@ impl NetProfile {
 pub fn wire_bytes(r: ResourceId, gpu: u64) -> u64 {
     match r {
         ResourceId::Mesh(_) => gpu / 4,
-        ResourceId::Drape(..) => gpu / 16,
+        ResourceId::Drape { .. } => gpu / 16,
     }
 }
 
@@ -203,7 +203,7 @@ impl SimNet {
                 self.network_starts += 1;
                 let server = match s.resource {
                     ResourceId::Mesh(_) => self.profile.meshes,
-                    ResourceId::Drape(..) => self.profile.imagery,
+                    ResourceId::Drape { .. } => self.profile.imagery,
                 };
                 if self.rng.permille(server.stall_permille) {
                     (None, Outcome::Ok)

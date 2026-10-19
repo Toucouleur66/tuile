@@ -7,7 +7,7 @@ use super::error::SessionError;
 use super::imagery::UvTransform;
 use super::stats::BudgetStats;
 use super::tier::Source;
-use super::types::{Bytes, Class, Generation, ResourceId, TileId};
+use super::types::{Bytes, Class, Generation, LayerId, ResourceId, TileId};
 
 /// A load to start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -36,11 +36,14 @@ pub enum Role {
     Fallback,
 }
 
-/// The drape a drawn mesh wears.
+/// A drape a drawn mesh wears, for one layer.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DrapeChoice {
-    /// The drape: the tile's own at some level, or an ancestor's.
+    /// The drape: the tile's own at some level, or an ancestor's, of
+    /// `layer`.
     pub resource: ResourceId,
+    /// Its layer.
+    pub layer: LayerId,
     /// Its imagery level.
     pub level: u32,
     /// The mapping of the mesh's UV square into it.
@@ -54,10 +57,19 @@ pub struct DrawItem {
     pub mesh: ResourceId,
     /// How.
     pub role: Role,
-    /// Its drape, if it wears one.
-    pub drape: Option<DrapeChoice>,
+    /// The drapes it wears: one per layer the tiles it serves ask for, in
+    /// stacking order (D-A4). A mesh whose need asks for imagery is drawn
+    /// only dressed, every layer it needs worn (I1, D-A1).
+    pub drapes: Vec<DrapeChoice>,
     /// The wanted tiles it stands for (itself when `Exact`), sorted.
     pub serves: Vec<TileId>,
+}
+
+impl DrawItem {
+    /// The drape it wears for `layer`, if any.
+    pub fn drape(&self, layer: LayerId) -> Option<&DrapeChoice> {
+        self.drapes.iter().find(|d| d.layer == layer)
+    }
 }
 
 /// Everything drawn this step, sorted by mesh. The consumer applies it
@@ -174,15 +186,12 @@ impl Decisions {
         for i in &self.draw.items {
             h.resource(i.mesh);
             h.u64(i.role as u64);
-            match i.drape {
-                None => h.u64(0),
-                Some(d) => {
-                    h.u64(1);
-                    h.resource(d.resource);
-                    h.u64(u64::from(d.level));
-                    for f in d.uv.scale.iter().chain(&d.uv.offset) {
-                        h.u64(f.to_bits());
-                    }
+            h.u64(i.drapes.len() as u64);
+            for d in &i.drapes {
+                h.resource(d.resource);
+                h.u64(u64::from(d.level));
+                for f in d.uv.scale.iter().chain(&d.uv.offset) {
+                    h.u64(f.to_bits());
                 }
             }
             h.u64(i.serves.len() as u64);
@@ -216,10 +225,11 @@ impl Fnv {
                 self.u64(0);
                 self.u64(t.0);
             }
-            ResourceId::Drape(t, l) => {
+            ResourceId::Drape { tile, layer, level } => {
                 self.u64(1);
-                self.u64(t.0);
-                self.u64(u64::from(l));
+                self.u64(tile.0);
+                self.u64(u64::from(layer.0));
+                self.u64(u64::from(level));
             }
         }
     }

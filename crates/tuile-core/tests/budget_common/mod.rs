@@ -11,8 +11,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use tuile_core::budget::cost::{drape_cost, Cost, TextureFormat};
 use tuile_core::budget::{
-    Budget, BudgetConfig, Bytes, Class, Decisions, FrameInput, GeoRect, ImageryNeed, Micros, Need,
-    NeedSet, Presence, PresenceOracle, ResourceId, TexelFootprint, TileId,
+    Budget, BudgetConfig, Bytes, Class, Decisions, FrameInput, GeoRect, ImageryNeed, LayerId,
+    LayerReach, Micros, Need, NeedSet, Presence, PresenceOracle, ResourceId, TexelFootprint,
+    TileId,
 };
 
 /// The estimated bytes of every test mesh.
@@ -27,7 +28,7 @@ pub fn drape() -> Bytes {
 pub fn est(r: ResourceId) -> Cost {
     match r {
         ResourceId::Mesh(_) => Cost::flat(MESH),
-        ResourceId::Drape(..) => drape_cost(256, 256, TextureFormat::Rgba8),
+        ResourceId::Drape { .. } => drape_cost(256, 256, TextureFormat::Rgba8),
     }
 }
 
@@ -87,10 +88,48 @@ pub fn need(id: TileId) -> Need {
 
 /// The same need, wanting imagery at `level` (source maximum 22).
 pub fn draped(id: TileId, level: u32) -> Need {
+    need(id).with_imagery(ImageryNeed::base(footprint(level), 22))
+}
+
+/// The base imagery layer's drape of `id` at `level`.
+pub fn dr(id: TileId, level: u32) -> ResourceId {
+    ResourceId::drape(id, LayerId(0), level)
+}
+
+/// The drape a draw item wears for the base layer, if any.
+pub fn base_drape(item: &tuile_core::budget::DrawItem) -> Option<tuile_core::budget::DrapeChoice> {
+    item.drape(LayerId(0)).copied()
+}
+
+/// The drape of `id` for `layer` at `level`.
+pub fn dl(id: TileId, layer: u16, level: u32) -> ResourceId {
+    ResourceId::drape(id, LayerId(layer), level)
+}
+
+/// A need for `id` wearing `layers` (each reaching level 22), all at the
+/// imagery `level`.
+pub fn layered(id: TileId, level: u32, layers: &[u16]) -> Need {
     need(id).with_imagery(ImageryNeed {
         footprint: footprint(level),
-        max_level: 22,
+        layers: layers
+            .iter()
+            .map(|&l| LayerReach {
+                layer: LayerId(l),
+                max_level: 22,
+            })
+            .collect(),
     })
+}
+
+/// A need with `tiles` drawn, each wearing `layers` at imagery `level`.
+pub fn drawn_layered(tiles: &[TileId], level: u32, layers: &[u16]) -> NeedSet {
+    NeedSet {
+        drawn: tiles
+            .iter()
+            .map(|&id| (id, layered(id, level, layers)))
+            .collect(),
+        ..NeedSet::default()
+    }
 }
 
 /// A need with `tiles` drawn, no imagery.

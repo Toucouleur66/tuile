@@ -14,7 +14,7 @@ use tuile_core::budget::{
 
 use super::gpu::SimGpu;
 use super::net::{Arrival, NetProfile, SimNet};
-use super::world::{children, parent, sight, traverse, Camera, Lens, Residency, View};
+use super::world::{children, parent, traverse, Camera, Lens, Residency, View};
 
 /// One eye of a profile's rig: where it sits along the camera's right
 /// vector, metres, and its lens.
@@ -458,7 +458,7 @@ impl Sim {
                 .draw
                 .items
                 .iter()
-                .any(|i| i.mesh == *e || i.drape.map(|x| x.resource) == Some(*e));
+                .any(|i| i.mesh == *e || i.drapes.iter().any(|x| x.resource == *e));
             if drawn
                 || self.gpu.pending.contains_key(e)
                 || e.tile().terrain_coord().0 <= self.pinned() && cfg.pinned_level.is_some()
@@ -507,7 +507,7 @@ impl Sim {
         }
         for i in &d.draw.items {
             let mesh = i.mesh.tile().terrain_coord().0;
-            let drape = i.drape.map(|x| x.level).unwrap_or(0);
+            let drape = i.drapes.first().map(|x| x.level).unwrap_or(0);
             for t in &i.serves {
                 let e = self.levels.entry(*t).or_insert((mesh, drape, Vec::new()));
                 if (e.0, e.1) != (mesh, drape) {
@@ -615,14 +615,14 @@ impl Sim {
                     .draw
                     .items
                     .iter()
-                    .map(|i| (i.mesh, i.drape.map(|x| x.resource)))
+                    .map(|i| (i.mesh, i.drapes.first().map(|x| x.resource)))
                     .collect();
                 let release = self.budget.release_beyond(Bytes::mib(256));
                 for r in &release {
                     if let Some(b) = self.gpu.drawable.remove(r) {
                         let c = match r {
                             ResourceId::Mesh(_) => Class::TerrainMesh,
-                            ResourceId::Drape(..) => Class::Drape,
+                            ResourceId::Drape { .. } => Class::Drape,
                         };
                         self.gpu.bytes[c] = self.gpu.bytes[c].minus(b);
                     }

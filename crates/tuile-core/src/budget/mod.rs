@@ -40,13 +40,13 @@ pub use decisions::{
 };
 pub use error::{AuditError, ConfigError, SessionError};
 pub use imagery::{DrapeCandidate, GeoRect, LevelClamp, TexelFootprint, UvTransform};
-pub use need::{ImageryNeed, Membership, Need, NeedSet};
+pub use need::{ImageryNeed, LayerReach, Membership, Need, NeedSet};
 pub use priority::{PriorityKey, Quantised, Urgency};
 pub use stats::BudgetStats;
 pub use tier::{NoStore, Presence, PresenceOracle, Source, Tier};
 pub use types::{
-    Bytes, Class, Failure, Generation, Micros, PerClass, Policy, Pressure, ResourceId, Thermal,
-    TileId,
+    Bytes, Class, Failure, Generation, LayerId, Micros, PerClass, Policy, Pressure, ResourceId,
+    Thermal, TileId,
 };
 pub use view::{Protection, ResourceState, ResourceView};
 
@@ -129,7 +129,7 @@ pub struct Budget {
     events: Vec<Event>,
     entries: std::collections::BTreeMap<ResourceId, state::Entry>,
     tiles: std::collections::BTreeMap<TileId, TileInfo>,
-    imagery_prev: std::collections::BTreeMap<TileId, u32>,
+    imagery_prev: std::collections::BTreeMap<(TileId, LayerId), u32>,
     held_last: std::collections::BTreeSet<TileId>,
     drawn_last: std::collections::BTreeSet<ResourceId>,
     swap_last: std::collections::BTreeSet<ResourceId>,
@@ -145,6 +145,8 @@ pub struct Budget {
     wanted_last: std::collections::BTreeSet<ResourceId>,
     recent: std::collections::BTreeMap<ResourceId, Micros>,
     epochs: PerClass<u64>,
+    /// Per imagery layer, added to the drape class's epoch.
+    layer_epochs: std::collections::BTreeMap<LayerId, u64>,
     next_gen: u64,
     last_now: Option<Micros>,
     scale: u32,
@@ -179,6 +181,7 @@ impl Budget {
             wanted_last: Default::default(),
             recent: Default::default(),
             epochs: PerClass::splat(0),
+            layer_epochs: Default::default(),
             next_gen: 1,
             last_now: None,
             scale: 1_000,
@@ -230,10 +233,14 @@ impl Budget {
     }
 
     /// The content of `class` changed upstream (imagery epoch, radiometric
-    /// or source update): every resident resource of the class is refreshed
-    /// at the lowest urgency, new before old, without a hole.
-    pub fn new_epoch(&mut self, class: Class) {
-        self.epochs[class] += 1;
+    /// or source update): every resident resource of the class — of
+    /// `layer` only, for a drape layer's update (D-A4) — is refreshed at the
+    /// lowest urgency, new before old, without a hole.
+    pub fn new_epoch(&mut self, class: Class, layer: Option<LayerId>) {
+        match (class, layer) {
+            (Class::Drape, Some(l)) => *self.layer_epochs.entry(l).or_insert(0) += 1,
+            _ => self.epochs[class] += 1,
+        }
     }
 
     /// The platform's memory signal; takes effect at the next step.

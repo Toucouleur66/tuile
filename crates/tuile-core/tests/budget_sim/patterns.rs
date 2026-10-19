@@ -54,7 +54,7 @@ fn keeps_what_is_still_seen(sim: &Sim, before: &Decisions, at: &Decisions) {
         .draw
         .items
         .iter()
-        .flat_map(|i| std::iter::once(i.mesh).chain(i.drape.map(|x| x.resource)))
+        .flat_map(|i| std::iter::once(i.mesh).chain(i.drapes.iter().map(|x| x.resource)))
         .collect();
     for e in &at.evict {
         assert!(
@@ -207,7 +207,7 @@ fn a_resize_decides_on_the_new_viewport_the_same_step() {
     let sharpest = |n: &NeedSet| {
         n.drawn
             .iter()
-            .filter_map(|(_, x)| x.imagery.map(|i| i.footprint.ratio()))
+            .filter_map(|(_, x)| x.imagery.as_ref().map(|i| i.footprint.ratio()))
             .fold(0.0, f64::max)
     };
     assert!(

@@ -324,7 +324,7 @@ pub fn has_children(id: TileId) -> bool {
 pub fn cost(r: ResourceId) -> Cost {
     match r {
         ResourceId::Mesh(t) => Cost::flat(region(t).mesh_bytes()),
-        ResourceId::Drape(t, level) => {
+        ResourceId::Drape { tile: t, level, .. } => {
             let up = level.saturating_sub(t.terrain_coord().0).min(4);
             let side = 256u32 << up;
             drape_cost(side, side, TextureFormat::Rgba8)
@@ -518,10 +518,7 @@ fn need_of(views: &[View], id: TileId, tau: f64) -> Need {
         n = n.with_parent(p);
     }
     if let Some(fp) = footprint {
-        n = n.with_imagery(ImageryNeed {
-            footprint: fp,
-            max_level: region(id).imagery_max(),
-        });
+        n = n.with_imagery(ImageryNeed::base(fp, region(id).imagery_max()));
     }
     n
 }

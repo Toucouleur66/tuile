@@ -38,8 +38,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use tuile_core::budget::cost::Cost;
 use tuile_core::budget::imagery::{needed_level, LevelClamp};
 use tuile_core::budget::{
-    Budget, BudgetConfig, Bytes, Class, Decisions, FrameInput, Generation, Micros, NeedSet,
-    Presence, PresenceOracle, Pressure, ResourceId, Role, TileId,
+    Budget, BudgetConfig, Bytes, Class, Decisions, FrameInput, Generation, LayerId, Micros,
+    NeedSet, Presence, PresenceOracle, Pressure, ResourceId, Role, TileId,
 };
 
 use super::gpu::SimGpu;
@@ -163,7 +163,7 @@ impl PresenceOracle for MeshesOnly<'_> {
     fn holds(&self, r: ResourceId) -> Presence {
         match r {
             ResourceId::Mesh(_) => self.0.holds(r),
-            ResourceId::Drape(..) => Presence::Absent,
+            ResourceId::Drape { .. } => Presence::Absent,
         }
     }
 }
@@ -175,7 +175,7 @@ impl PresenceOracle for DrapesOnly<'_> {
     fn holds(&self, r: ResourceId) -> Presence {
         match r {
             ResourceId::Mesh(_) => Presence::Absent,
-            ResourceId::Drape(..) => self.0.holds(r),
+            ResourceId::Drape { .. } => self.0.holds(r),
         }
     }
 }
@@ -299,7 +299,7 @@ impl Run {
         for a in self.net.poll(self.now) {
             let to_imagery = match a {
                 Arrival::Loaded(r, ..) | Arrival::Failed(r, _) | Arrival::StoreMiss(r, _) => {
-                    split && matches!(r, ResourceId::Drape(..))
+                    split && matches!(r, ResourceId::Drape { .. })
                 }
             };
             let b = if to_imagery {
@@ -394,7 +394,7 @@ impl Run {
                             self.mirror_pending.remove(r);
                         }
                     }
-                    ResourceId::Drape(..) => self.net.cancel(*r, *g),
+                    ResourceId::Drape { .. } => self.net.cancel(*r, *g),
                 }
             }
             for s in &di.start {
@@ -402,7 +402,7 @@ impl Run {
                     ResourceId::Mesh(_) => {
                         self.mirror_pending.insert(s.resource, s.gen);
                     }
-                    ResourceId::Drape(..) => self.net.start(s, self.now),
+                    ResourceId::Drape { .. } => self.net.start(s, self.now),
                 }
             }
         }
@@ -412,8 +412,8 @@ impl Run {
         let mut from_search = 0u64;
         for i in &dt.draw.items {
             let drape = match &di {
-                None => i.drape.map(|d| (d.resource, d.level)),
-                Some(di) => match di.draw.get(i.mesh).and_then(|x| x.drape) {
+                None => i.drapes.first().map(|d| (d.resource, d.level)),
+                Some(di) => match di.draw.get(i.mesh).and_then(|x| x.drapes.first().copied()) {
                     Some(d) if self.dgpu.drawable.contains_key(&d.resource) => {
                         Some((d.resource, d.level))
                     }
@@ -454,7 +454,7 @@ impl Run {
             if *role != Role::Exact {
                 continue;
             }
-            let Some(img) = wants.get(&mesh.tile()).and_then(|n| n.imagery) else {
+            let Some(img) = wants.get(&mesh.tile()).and_then(|n| n.imagery.as_ref()) else {
                 continue;
             };
             self.m.exact += 1;
@@ -462,7 +462,7 @@ impl Run {
                 floor,
                 terrain_level: mesh.tile().terrain_coord().0,
                 over_terrain_cap: cap,
-                source_max: img.max_level,
+                source_max: img.layers.first().map_or(0, |l| l.max_level),
             };
             let n = needed_level(None, img.footprint, clamp);
             if drape.is_none_or(|d| d.1 + 1 < n) {
@@ -496,13 +496,13 @@ impl Run {
                     ResourceId::Mesh(_) => {
                         self.mirror_delivered.insert(*r, *g);
                     }
-                    ResourceId::Drape(..) => {
+                    ResourceId::Drape { .. } => {
                         self.dgpu.pending.insert(*r, *g);
                     }
                 }
             }
             for r in &di.evict {
-                if let ResourceId::Drape(..) = r {
+                if let ResourceId::Drape { .. } = r {
                     if worn.contains(r) {
                         self.m.worn_evicted += 1;
                     }
@@ -518,7 +518,7 @@ impl Run {
                             img.on_drawable(*r, g, Bytes(1));
                         }
                     }
-                    ResourceId::Drape(..) => {
+                    ResourceId::Drape { .. } => {
                         let Some(g) = self.dgpu.pending.remove(r) else {
                             continue;
                         };
@@ -617,10 +617,10 @@ impl Run {
     fn search_drape(&self, t: TileId) -> Option<(ResourceId, u32)> {
         let mut cur = Some(t);
         while let Some(x) = cur {
-            let lo = ResourceId::Drape(x, 0);
-            let hi = ResourceId::Drape(x, u32::MAX);
+            let lo = ResourceId::drape(x, LayerId(0), 0);
+            let hi = ResourceId::drape(x, LayerId(0), u32::MAX);
             if let Some((r, _)) = self.dgpu.drawable.range(lo..=hi).next_back() {
-                if let ResourceId::Drape(_, l) = r {
+                if let ResourceId::Drape { level: l, .. } = r {
                     return Some((*r, *l));
                 }
             }

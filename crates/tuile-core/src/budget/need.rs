@@ -5,7 +5,7 @@
 //! about the view.
 
 use super::imagery::{GeoRect, TexelFootprint};
-use super::types::{Class, TileId};
+use super::types::{Class, LayerId, TileId};
 
 /// What the traversal wants, built afresh each decision step.
 ///
@@ -133,13 +133,37 @@ impl Need {
     }
 }
 
-/// The imagery a tile wants: a texel footprint on screen, and the deepest
-/// level the imagery source has there.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// How deep one imagery layer reaches over a tile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LayerReach {
+    /// The layer.
+    pub layer: LayerId,
+    /// Its source's deepest level over this tile.
+    pub max_level: u32,
+}
+
+/// The imagery a tile wants (D-A4): one texel footprint on screen,
+/// geometric and common to every layer, and how deep each layer it wears
+/// reaches. Each layer picks its level, falls back and refreshes on its
+/// own.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ImageryNeed {
     /// How large one level-0 texel looks on screen, at the tile's closest
     /// visible point.
     pub footprint: TexelFootprint,
-    /// The imagery source's deepest level over this tile.
-    pub max_level: u32,
+    /// The layers the tile wears, in stacking order.
+    pub layers: Vec<LayerReach>,
+}
+
+impl ImageryNeed {
+    /// One layer, the base imagery (`LayerId(0)`), reaching `max_level`.
+    pub fn base(footprint: TexelFootprint, max_level: u32) -> Self {
+        ImageryNeed {
+            footprint,
+            layers: vec![LayerReach {
+                layer: LayerId(0),
+                max_level,
+            }],
+        }
+    }
 }

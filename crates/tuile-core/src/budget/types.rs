@@ -170,22 +170,48 @@ impl Micros {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Generation(pub u64);
 
-/// What the budget manages: a tile's mesh, or a tile's drape at one imagery
-/// level. Requests, the ledger and evictions are all keyed by it; the derived
-/// order is the final tie-break of every decision.
+/// An imagery layer: one source draped over the ground. Layers stack in
+/// their order, 0 at the bottom (the base imagery), overlays above.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LayerId(pub u16);
+
+/// What the budget manages: a tile's mesh, or a tile's drape — its imagery
+/// of one layer at one level (D-A4). Requests, the ledger and evictions are
+/// all keyed by it; the derived order is the final tie-break of every
+/// decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ResourceId {
     /// The tile's geometry.
     Mesh(TileId),
-    /// The tile's imagery mosaic at an imagery level.
-    Drape(TileId, u32),
+    /// The tile's imagery mosaic of one layer at one imagery level.
+    Drape {
+        /// The tile it drapes.
+        tile: TileId,
+        /// Its layer.
+        layer: LayerId,
+        /// Its imagery level.
+        level: u32,
+    },
 }
 
 impl ResourceId {
+    /// A tile's drape of `layer` at `level`.
+    pub const fn drape(tile: TileId, layer: LayerId, level: u32) -> Self {
+        ResourceId::Drape { tile, layer, level }
+    }
+
     /// The tile this resource belongs to.
     pub const fn tile(self) -> TileId {
         match self {
-            ResourceId::Mesh(t) | ResourceId::Drape(t, _) => t,
+            ResourceId::Mesh(t) | ResourceId::Drape { tile: t, .. } => t,
+        }
+    }
+
+    /// A drape's layer; `None` for a mesh.
+    pub const fn layer(self) -> Option<LayerId> {
+        match self {
+            ResourceId::Mesh(_) => None,
+            ResourceId::Drape { layer, .. } => Some(layer),
         }
     }
 }

@@ -28,7 +28,7 @@ pub struct SimGpu {
 fn class(r: ResourceId) -> Class {
     match r {
         ResourceId::Mesh(_) => Class::TerrainMesh,
-        ResourceId::Drape(..) => Class::Drape,
+        ResourceId::Drape { .. } => Class::Drape,
     }
 }
 
@@ -51,7 +51,7 @@ impl SimGpu {
             if !self.drawable.contains_key(&i.mesh) {
                 return Err(format!("{:?} drawn but not uploaded: black ground", i.mesh));
             }
-            if let Some(dr) = i.drape {
+            for dr in &i.drapes {
                 if !self.drawable.contains_key(&dr.resource) {
                     return Err(format!("{:?} worn but not uploaded", dr.resource));
                 }
