@@ -18,10 +18,10 @@ workspace = true
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
-tuile-bing = { version = "0.8.2", path = "../../crates/tuile-bing" }
-tuile-cesium-ion = { version = "0.8.2", path = "../../crates/tuile-cesium-ion" }
-tuile-native-fetchers = { version = "0.8.2", path = "../../crates/tuile-native-fetchers" }
-tuile-viewer = { version = "0.8.2", path = "../../crates/tuile-viewer" }
+tuile-bing = { version = "0.8.3", path = "../../crates/tuile-bing" }
+tuile-cesium-ion = { version = "0.8.3", path = "../../crates/tuile-cesium-ion" }
+tuile-native-fetchers = { version = "0.8.3", path = "../../crates/tuile-native-fetchers" }
+tuile-viewer = { version = "0.8.3", path = "../../crates/tuile-viewer" }
 
 # Android: the catalog proxy's address, read and checked as a URL.
 [target.'cfg(target_os = "android")'.dependencies]
