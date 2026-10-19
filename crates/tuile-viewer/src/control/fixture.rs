@@ -15,12 +15,21 @@
 //! the store's own count of what it served instead
 //! (`tuile_core::metrics::Metrics::store_hits`).
 //!
+//! **Latency**, when a run asks for it ([`Fixture::with_latency`]), is in the
+//! run's own time: an answer lands once the run's stepped clock has moved
+//! that far past the question, never by the wall clock — so a slow network is
+//! as repeatable as an instant one.
+//!
 //! [`Store`] is the tile store between runs: memory shared by a run and the
 //! one relaunched after it, which is what a warm start reads.
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 use bytes::Bytes;
 use image::ImageEncoder as _;
@@ -81,7 +90,49 @@ pub struct Asked {
 pub struct Fixture {
     /// The deepest imagery level served.
     pub imagery_levels: u32,
+    /// How long, in the run's time, every answer takes.
+    pub latency: Duration,
     asked: Arc<Asked>,
+    wire: Arc<Wire>,
+}
+
+/// The fixture's network: the run's time, and the answers waiting for it.
+#[derive(Debug, Default)]
+struct Wire {
+    /// Nanoseconds since the run began.
+    now: AtomicU64,
+    waiting: Mutex<Vec<(u64, Waker)>>,
+}
+
+impl Wire {
+    /// An answer, `latency` after now.
+    fn answer(self: &Arc<Self>, latency: Duration) -> Answer {
+        let due = self.now.load(Ordering::SeqCst) + latency.as_nanos() as u64;
+        Answer {
+            wire: Arc::clone(self),
+            due,
+        }
+    }
+}
+
+/// An answer on its way: ready once the run's time reaches `due`.
+struct Answer {
+    wire: Arc<Wire>,
+    due: u64,
+}
+
+impl Future for Answer {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.wire.now.load(Ordering::SeqCst) >= self.due {
+            return Poll::Ready(());
+        }
+        if let Ok(mut waiting) = self.wire.waiting.lock() {
+            waiting.push((self.due, cx.waker().clone()));
+        }
+        Poll::Pending
+    }
 }
 
 impl Default for Fixture {
@@ -95,7 +146,36 @@ impl Fixture {
     pub fn new(imagery_levels: u32) -> Self {
         Self {
             imagery_levels,
+            latency: Duration::ZERO,
             asked: Arc::new(Asked::default()),
+            wire: Arc::new(Wire::default()),
+        }
+    }
+
+    /// The same globe behind a network that takes `latency` to answer, in
+    /// the run's time.
+    #[must_use]
+    pub fn with_latency(mut self, latency: Duration) -> Self {
+        self.latency = latency;
+        self
+    }
+
+    /// The run's clock has reached `since_start`: every answer due by then
+    /// lands. A new run starts its time again from zero.
+    pub(crate) fn advance_to(&self, since_start: Duration) {
+        let now = since_start.as_nanos() as u64;
+        self.wire.now.store(now, Ordering::SeqCst);
+        let due: Vec<Waker> = match self.wire.waiting.lock() {
+            Ok(mut waiting) => {
+                let (due, later): (Vec<_>, Vec<_>) =
+                    waiting.drain(..).partition(|(at, _)| *at <= now);
+                *waiting = later;
+                due.into_iter().map(|(_, waker)| waker).collect()
+            }
+            Err(_) => Vec::new(),
+        };
+        for waker in due {
+            waker.wake();
         }
     }
 
@@ -116,7 +196,11 @@ impl Sources for Fixture {
         }
         Ok((
             ellipsoid_layer(),
-            Arc::new(Ellipsoid(Arc::clone(&self.asked))),
+            Arc::new(Ellipsoid {
+                asked: Arc::clone(&self.asked),
+                wire: Arc::clone(&self.wire),
+                latency: self.latency,
+            }),
         ))
     }
 
@@ -127,6 +211,8 @@ impl Sources for Fixture {
         Ok(Arc::new(Colours {
             deepest: self.imagery_levels,
             asked: Arc::clone(&self.asked),
+            wire: Arc::clone(&self.wire),
+            latency: self.latency,
             pictures: Mutex::new(BTreeMap::new()),
         }))
     }
@@ -161,12 +247,19 @@ fn ellipsoid_layer() -> LayerJson {
 }
 
 /// The ellipsoid as terrain: a grid at height 0 on every tile.
-struct Ellipsoid(Arc<Asked>);
+struct Ellipsoid {
+    asked: Arc<Asked>,
+    wire: Arc<Wire>,
+    latency: Duration,
+}
 
 #[async_trait::async_trait]
 impl TerrainSource for Ellipsoid {
     async fn fetch_tile(&self, coord: TileCoord) -> Result<Fetched<Vec<u8>>, TerrainSourceError> {
-        self.0.terrain.fetch_add(1, Ordering::Relaxed);
+        self.asked.terrain.fetch_add(1, Ordering::Relaxed);
+        if !self.latency.is_zero() {
+            self.wire.answer(self.latency).await;
+        }
         Ok(Fetched::undated(grid(coord)))
     }
 }
@@ -254,6 +347,8 @@ fn grid(coord: TileCoord) -> Vec<u8> {
 struct Colours {
     deepest: u32,
     asked: Arc<Asked>,
+    wire: Arc<Wire>,
+    latency: Duration,
     /// Each picture encoded once: `(level, shade)`.
     pictures: Mutex<BTreeMap<(u32, bool), Bytes>>,
 }
@@ -272,6 +367,9 @@ impl ImageryProvider for Colours {
 
     async fn fetch_tile_bytes(&self, coord: ImageryCoord) -> Result<Fetched<Bytes>, RasterError> {
         self.asked.imagery.fetch_add(1, Ordering::Relaxed);
+        if !self.latency.is_zero() {
+            self.wire.answer(self.latency).await;
+        }
         let key = (coord.level, (coord.x + coord.y) % 2 == 1);
         let mut pictures = self
             .pictures
@@ -373,6 +471,26 @@ mod tests {
             }
             assert_ne!(colour(level, false), colour(level + 1, false));
         }
+    }
+
+    /// Over a slow network an answer lands when the run's time reaches it,
+    /// and not a moment before — however long the wall clock waits.
+    #[test]
+    fn a_slow_answer_lands_when_the_runs_time_reaches_it() {
+        let fixture = Fixture::default().with_latency(Duration::from_millis(100));
+        fixture.advance_to(Duration::ZERO);
+        let (_, terrain) =
+            futures_executor::block_on(Sources::terrain(&fixture, TERRAIN_ASSET)).expect("terrain");
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut answer = terrain.fetch_tile(TileCoord::new(0, 0, 0));
+        assert!(answer.as_mut().poll(&mut cx).is_pending());
+        std::thread::sleep(Duration::from_millis(120));
+        fixture.advance_to(Duration::from_millis(99));
+        assert!(answer.as_mut().poll(&mut cx).is_pending(), "early");
+        fixture.advance_to(Duration::from_millis(100));
+        assert!(answer.as_mut().poll(&mut cx).is_ready());
+        assert_eq!(fixture.asked(), (1, 0));
     }
 
     /// The fixture's terrain decodes as a tile of the grid it was asked for.

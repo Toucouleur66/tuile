@@ -12,13 +12,18 @@
 //! | P5 | orientation | portrait and landscape, a resize, a change of density |
 //! | P6 | stereo | two eyes 63 mm apart, a head moving at 90 Hz |
 //!
+//! The fixture answers at once unless a run says otherwise; the runs over
+//! [`SLOW_NETWORK`] take a phone's latency on every tile, in the run's time.
+//!
 //! Each is a [`Pattern`]: where the run starts, how long it is given to come
 //! up, the motion as a [`Series`], and how long the picture then has to
 //! settle — the specification's convergence bound, two seconds on a desktop
 //! and four on a phone, at the run's refresh. The eye is moved by steering
 //! commands, one a frame, exactly as fast as the pattern says.
 
-use super::{Action, Device, Eyes, Series, Start, View};
+use std::time::Duration;
+
+use super::{Action, Device, Eyes, Fixture, Series, Start, View};
 
 /// Where the patterns look: Paris.
 pub const PARIS: (f64, f64) = (2.35, 48.85);
@@ -26,6 +31,10 @@ pub const PARIS: (f64, f64) = (2.35, 48.85);
 /// The specification's convergence bound, seconds: a desktop's, a phone's.
 pub const DESKTOP_SECONDS: f64 = 2.0;
 pub const PHONE_SECONDS: f64 = 4.0;
+
+/// A phone's network on a bad day: every tile answered this long after it
+/// was asked, in the run's time.
+pub const SLOW_NETWORK: Duration = Duration::from_millis(150);
 
 /// A headset: Android, and roomier than a phone.
 pub const HEADSET: Device = Device::Android {
@@ -313,4 +322,39 @@ pub fn stereo_head_motion() -> Pattern {
         over(lon, lat, 2.0e3, heading, 30.0 + 10.0 * (7.0 * s).sin())
     });
     pattern("P6 stereo, head motion at 90 Hz", start, motion)
+}
+
+/// The same pattern, over [`SLOW_NETWORK`].
+fn slow(mut pattern: Pattern, name: &'static str) -> Pattern {
+    pattern.name = name;
+    pattern.start.fixture = Fixture::default().with_latency(SLOW_NETWORK);
+    pattern
+}
+
+/// P1: a phone's cold start over a slow network.
+pub fn cold_start_over_a_slow_network() -> Pattern {
+    let start = Start {
+        device: Device::PHONE,
+        size: (144, 312),
+        scale: 3.0,
+        fixture: Fixture::default().with_latency(SLOW_NETWORK),
+        ..Start::default()
+    };
+    Pattern {
+        name: "P1 cold start, phone, slow network",
+        warm: 0,
+        motion: Series::new(),
+        settle: bound(&start),
+        start,
+    }
+}
+
+/// P2: the fast zoom over a slow network.
+pub fn zoom_in_fast_over_a_slow_network() -> Pattern {
+    slow(zoom_in_fast(), "P2 zoom in, fast, slow network")
+}
+
+/// P4: the head-rate yaw over a slow network.
+pub fn yaw_at_head_rate_over_a_slow_network() -> Pattern {
+    slow(yaw_at_head_rate(), "P4 yaw at head rate, slow network")
 }

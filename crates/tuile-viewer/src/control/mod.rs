@@ -376,8 +376,9 @@ impl State {
     }
 
     /// Whether the picture is what the selection asked for: every selected
-    /// tile drawn by itself, nothing standing in, nothing waiting to upload
-    /// and nothing loading.
+    /// tile drawn by itself, and nothing standing in — the specification's
+    /// convergence (I3), short of the digest holding still, which
+    /// [`Headless::settle`] watches over frames.
     pub fn complete(&self) -> bool {
         let m = &self.metrics;
         self.drew
@@ -385,8 +386,11 @@ impl State {
             && m.frame_lost == 0
             && m.frame_coarser == 0
             && m.frame_stand_ins == 0
-            && m.pending_uploads == 0
-            && m.loads_in_flight == 0
+    }
+
+    /// Whether nothing is loading and nothing waits to be uploaded.
+    pub fn idle(&self) -> bool {
+        self.metrics.loads_in_flight == 0 && self.metrics.pending_uploads == 0
     }
 }
 
@@ -452,6 +456,8 @@ pub struct Headless {
     /// The switcher's: a change of imagery resolves on it.
     runtime: Option<tokio::runtime::Runtime>,
     dt: Duration,
+    /// The run's time, as its clock has it.
+    elapsed: Duration,
     frame: u64,
     baseline: Snapshot,
     network: (u64, u64),
@@ -490,6 +496,8 @@ impl Headless {
             .enable_all()
             .build()
             .map_err(|e| Refused::Session(e.to_string()))?;
+        // The network's time starts again with the run's.
+        start.fixture.advance_to(Duration::ZERO);
         let globe = pollster::block_on(crate::globe::assemble(
             Arc::new(start.fixture.clone()),
             Some(Arc::new(start.store.clone())),
@@ -551,6 +559,7 @@ impl Headless {
             requests,
             runtime: Some(runtime),
             dt: Duration::from_secs_f64(1.0 / start.refresh_hz.max(1.0)),
+            elapsed: Duration::ZERO,
             frame: 0,
             baseline: m.snapshot(),
             network: start.fixture.asked(),
@@ -592,6 +601,9 @@ impl Headless {
     pub fn step(&mut self) -> &State {
         self.app.land();
         self.hand.advance(self.dt);
+        self.elapsed += self.dt;
+        // What the network owes by now lands before the server is polled.
+        self.start.fixture.advance_to(self.elapsed);
         self.polls = self.run_the_server();
         let drew = match self.app.turn() {
             Turn::End => false,
@@ -651,14 +663,12 @@ impl Headless {
     }
 
     /// Whether the last few frames drawn were complete and drew the same
-    /// tiles, with nothing left to load or upload since. Frames, not steps: a
-    /// phone at rest draws four times a second, and the steps between draw
-    /// nothing.
+    /// tiles: converged, as the specification has it (I3). Frames, not
+    /// steps: a phone at rest draws four times a second, and the steps
+    /// between draw nothing. Loads may still be in flight — what is
+    /// prefetched beside the view is not the picture; [`State::idle`] says
+    /// whether they are.
     fn still(&self) -> bool {
-        let quiet = self
-            .history
-            .last()
-            .is_some_and(|s| s.metrics.loads_in_flight == 0 && s.metrics.pending_uploads == 0);
         let tail: Vec<&State> = self
             .history
             .iter()
@@ -666,8 +676,7 @@ impl Headless {
             .filter(|s| s.drew)
             .take(STILL_FOR)
             .collect();
-        quiet
-            && tail.len() == STILL_FOR
+        tail.len() == STILL_FOR
             && tail.iter().all(|s| s.complete())
             && tail
                 .windows(2)
