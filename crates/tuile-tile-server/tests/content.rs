@@ -165,3 +165,103 @@ async fn a_read_only_cache_reads_the_store_and_declines_what_it_is_offered() {
         "and nothing to publish"
     );
 }
+
+/// An absence store that counts what it is asked.
+#[derive(Default)]
+struct Counted {
+    inner: tuile_tile_server::MemoryRegister,
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+impl Counted {
+    fn asked(&self) -> usize {
+        self.asked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl tuile_tile_server::Absences for Counted {
+    async fn record(
+        &self,
+        layer: &str,
+        absences: &[tuile_tile_server::Absence],
+    ) -> Result<(), String> {
+        self.inner.record(layer, absences).await
+    }
+    async fn absent(
+        &self,
+        layer: &str,
+        id: u64,
+        now: std::time::SystemTime,
+    ) -> Result<bool, String> {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.absent(layer, id, now).await
+    }
+}
+
+/// A tile the process holds — buffered, or in a projection — is read
+/// without asking the absence store; one it does not hold asks it, before
+/// the archives, as before.
+#[tokio::test]
+async fn a_tile_held_is_read_without_asking_the_absence_store() {
+    let clock = TestClock::new();
+    let objects = memory();
+    // The layers and their absence siblings, as a catalog makes them.
+    let on = |objects: &Arc<dyn object_store::ObjectStore>| {
+        let layers = catalog::layers(&common::catalog()).expect("layers");
+        TileStore::with_clock(objects.clone(), layers, eager(), clock.clock())
+    };
+    let writer = on(&objects);
+    writer
+        .put(IMAGERY, LEVEL, X0, Y0, body(LEVEL, X0, Y0, 1))
+        .await
+        .expect("put");
+    writer.flush_all().await.expect("flush");
+
+    let absences = Arc::new(Counted::default());
+    let store = Arc::new(on(&objects).with_absences(absences.clone()));
+    let cache = StoreContent::new(store.clone());
+    let key = |x: u32| format!("img/{IMAGERY}/{LEVEL}/{x}/{Y0}");
+
+    // Not held: the absence store first, then the bucket.
+    assert_eq!(cache.get(&key(X0)).await, Some(body(LEVEL, X0, Y0, 1)));
+    assert_eq!(absences.asked(), 1, "a tile not held asks");
+
+    // Projected: held, read locally, nobody asked.
+    let [w, s, e, n] =
+        tuile_tile_server::projection::bounds(tuile_tile_server::Grid::WebMercator, LEVEL, X0, Y0);
+    let eye = tuile_tile_server::Eye {
+        lon: (w + e) / 2.0,
+        lat: (s + n) / 2.0,
+        height: 5_800.0,
+    };
+    let fp = tuile_tile_server::Footprint::from_eyes(
+        [eye],
+        tuile_tile_server::projection::DEFAULT_TILE_FACTOR,
+    );
+    let dir = tempfile::tempdir().expect("dir");
+    store.project(&fp, dir.path()).await.expect("project");
+    let before = store.stats();
+    assert_eq!(cache.get(&key(X0)).await, Some(body(LEVEL, X0, Y0, 1)));
+    assert_eq!(
+        store.stats().projection,
+        before.projection + 1,
+        "read from the projection"
+    );
+    assert_eq!(absences.asked(), 1, "a projected tile asks nothing");
+
+    // Buffered: held, nobody asked.
+    cache
+        .put(&key(X0 + 1), body(LEVEL, X0 + 1, Y0, 1), None)
+        .await;
+    assert_eq!(
+        cache.get(&key(X0 + 1)).await,
+        Some(body(LEVEL, X0 + 1, Y0, 1))
+    );
+    assert_eq!(absences.asked(), 1, "a buffered tile asks nothing");
+
+    // An absence of a tile not held is still answered by the store.
+    cache.put(&key(X0 + 2), ABSENT, None).await;
+    assert_eq!(cache.get(&key(X0 + 2)).await, Some(ABSENT));
+    assert_eq!(absences.asked(), 2);
+}
