@@ -581,7 +581,7 @@ with the invariant or obligation it proves — is `graphics-budget-test-plan.md`
 | **Cut-over** | Decided 2026-10-19 | One PR, reviewed in pieces, with no bridge: no flag, no shadow, no adapter between the old protocol and the new |
 | **Deadband** | Decided 2026-10-19 | The refine deadband of #86 (`1ba0d77`, what the last pass *chose*) stays in the traversal; the budget does not re-decide the cut |
 | **D-L1** | Proposed | Screen-space thresholds in logical pixels, so a scale change alone changes no need (§13.2, P5.5) |
-| **D-P1** | Open | The handheld convergence bound: keep 4 s and change the quotas or the network model, or bound it by the throughput floor (1.1 × what the network model allows); §11.7 measured 6.4 s against a floor of 6.3 s |
+| **D-P1** | Decided 2026-10-19, on evidence | The handheld convergence bound is set from device measurements: the L5 iPhone sessions, recorded in MCAP (the session tape, §16.6), which also calibrate the simulation's network model. Until then the 4 s test stays red and ignored (§11.7 measured 6.4 s against the model's floor of 6.3 s) |
 
 ## 11. Amendments from the implementation (Steps 1–3)
 
@@ -865,7 +865,8 @@ eye. The executor draws the one `DrawSet` once per eye, culled by that eye's fru
 | **Batch** (films, bakes, Hydra) | `BudgetConfig::batch()` | none; `release_beyond` between frames | none: a frame is drawn at `frame_ready` | the film's cameras; `Stereo::eyes` for a stereo film | in-process in `tuile_bake::Session`; Hydra through the C ABI | the bake's store |
 
 T_conv(π), I3's bound per profile: desktop 2 s; handheld 4 s, red today (6.4 s measured
-against a network floor of 6.3 s, §11.7; decision D-P1); handheld-low 4 s (3.3 s measured,
+against a network floor of 6.3 s, §11.7), its bound to be set from the iPhone sessions
+(D-P1); handheld-low 4 s (3.3 s measured,
 architecture document §3.2); web, its device's bound plus one step; headset 2 s on the
 desktop network model (proposed); batch, not timed: a frame waits for `frame_ready`.
 

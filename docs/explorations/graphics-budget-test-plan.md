@@ -73,7 +73,7 @@ devices.
 | L2 | `a_still_camera_only_ever_refines` | P1.2, over generated paths that end still (§3) | D, H | new | 3 | `drawn_tiles` |
 | L2 | `starts_follow_the_priority_order_within_each_quota` | P1.4 | D, H | new | 3 | `starts_total`, `in_flight` |
 | L3 | `a_still_camera_converges_within_two_seconds_on_desktop` | P1.3 | D | exists: sim | — | `converged_seconds` |
-| L3 | `a_still_camera_converges_within_four_seconds_on_a_phone` | P1.3; red and ignored until D-P1 | H | exists: sim | 3 (D-P1) | `converged_seconds` |
+| L3 | `a_still_camera_converges_within_four_seconds_on_a_phone` | P1.3; red and ignored until its bound is set from the L5 iPhone sessions (D-P1) | H | exists: sim | 6 (D-P1) | `converged_seconds` |
 | L3 | `a_still_camera_converges_at_the_handheld_low_clamp` | P1.3, P1-low | Hl | exists: sim | — | `converged_seconds` |
 | L3 | `a_relaunch_fills_the_view_from_the_store_without_network` | P1-warm, I14, I15 | H | exists: sim | — | `starts_total{source}` |
 | L3 | `ten_still_minutes_cancel_nothing_flap_nothing_and_hold_the_digest` | P1.2 (I4), I5, I3 | D | exists: sim | — | `flaps_total`, `cancels_total` |
@@ -550,8 +550,9 @@ Read against this plan:
 
 ## 11. Open points this plan depends on
 
-- **D-P1**, the handheld convergence bound: `a_still_camera_converges_within_four_seconds_on_a_phone`
-  stays red until it is decided.
+- **D-P1**, decided on evidence: the handheld bound is set from the L5 iPhone sessions recorded
+  in MCAP, which also calibrate the simulation's network model;
+  `a_still_camera_converges_within_four_seconds_on_a_phone` stays red and ignored until then.
 - **D-L1**, logical pixels: P5.5's cells assume it.
 - **D-A3**, the pooled ledger: `architecture_pooled_ledger_against_fixed_split` gives the
   evidence; the goldens are re-recorded once if the split changes.
