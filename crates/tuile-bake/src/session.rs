@@ -784,6 +784,7 @@ impl Session {
             return None;
         };
         let grounds = live.grounds.as_ref()?;
+        let started = tuile_core::metrics::stamp();
         let selected: Vec<TileId> = live
             .scene
             .selected()
@@ -849,6 +850,9 @@ impl Session {
             tuile_film::ground::Ground::unstitched(&drawn.stitching, &keys)
         };
         live.ground_built = ground.heap_bytes();
+        tuile_core::metrics::metrics()
+            .ground_seconds
+            .record(started.elapsed());
         tracing::debug!(memory = ?self.ground_memory(), "ground");
         Some(ground)
     }
@@ -1744,7 +1748,34 @@ fn finish_tile_from(
 }
 
 /// A tile as the session keeps it, finished as `finish` says.
+///
+/// Timed whatever the mode, into `finish_seconds`: an identity finish is the
+/// cheap end of the same series, and a pack by reference reading near zero
+/// there is the measurement, not a gap in it.
 pub(crate) fn finish_tile_as(
+    memo: &TextureMemo,
+    dataset: &str,
+    tile: TileId,
+    decoded: DecodedTileContent,
+    bake_max_size: u32,
+    provenance: Option<&tuile_planetary::Provenance>,
+    finish: Finish,
+) -> TileGeometry {
+    tuile_core::metrics::metrics().finish_seconds.time(|| {
+        finished_as(
+            memo,
+            dataset,
+            tile,
+            decoded,
+            bake_max_size,
+            provenance,
+            finish,
+        )
+    })
+}
+
+/// [`finish_tile_as`], untimed.
+fn finished_as(
     memo: &TextureMemo,
     dataset: &str,
     tile: TileId,
@@ -3174,6 +3205,125 @@ pub(crate) mod tests {
                 .iter()
                 .all(|t| t.memoized.is_some() && !t.content.meshes.is_empty()));
         }
+    }
+
+    /// A bake over the quad moves its timers: one frame and one pose per
+    /// frame baked, and a finish for every tile the pack holds at least.
+    ///
+    /// The metrics are the process's, and other tests bake, finish and pose
+    /// alongside this one: the counts are compared as deltas, and as at least
+    /// what this bake did. What this does not cover: that a sample's duration
+    /// is right — only that each one is taken.
+    #[test]
+    fn a_bake_times_its_frames_poses_and_finishes() {
+        let loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut session = Session::new(
+            Box::new(Quad),
+            Arc::new(QuadLoader(loads)),
+            SessionConfig::default(),
+        )
+        .expect("session");
+        let poses: Vec<tuile_tape::Frame> = [
+            (800.0, 800.0, 6000.0),
+            (800.0, 800.0, 1500.0),
+            (500.0, 700.0, 600.0),
+            (1100.0, 300.0, 250.0),
+        ]
+        .into_iter()
+        .map(|(x, y, height)| tuile_tape::Frame {
+            position: [x, y, height],
+            direction: [0.0, 0.0, -1.0],
+            up: [0.0, 1.0, 0.0],
+            fovy: 45f64.to_radians(),
+        })
+        .collect();
+        let m = tuile_core::metrics::metrics();
+        let counts = || {
+            (
+                m.bake_frame_seconds.count(),
+                m.pose_seconds.count(),
+                m.finish_seconds.count(),
+            )
+        };
+        let before = counts();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("quad.tuilepack");
+        crate::bake::bake_frames(
+            &mut session,
+            &crate::bake::BakeFrames {
+                first: 1,
+                last: poses.len() as u32,
+                viewport: (960.0, 720.0),
+                out: &out,
+                scene: crate::bake::SceneName::Given("quad".into()),
+                culling: "full",
+                content: &crate::bake::PackContent::embedded(),
+                packed: &crate::bake::PackedMirror::new(),
+            },
+            &mut crate::bake::Poses(&poses),
+        )
+        .expect("a bake");
+        let after = counts();
+        let bytes = std::fs::read(&out).expect("the pack");
+        let tiles = tuile_pack::Pack::open(&bytes).expect("open").tile_count() as u64;
+        let frames = poses.len() as u64;
+        assert!(tiles > 0, "the bake packed tiles");
+        assert!(
+            after.0 - before.0 >= frames,
+            "bake frames: {before:?} -> {after:?}"
+        );
+        assert!(
+            after.1 - before.1 >= frames,
+            "poses: {before:?} -> {after:?}"
+        );
+        assert!(
+            after.2 - before.2 >= tiles,
+            "finishes for {tiles} tiles: {before:?} -> {after:?}"
+        );
+    }
+
+    /// Building a ground and reading heights off it are timed and counted:
+    /// one sample per ground built, one count and one sample per query.
+    #[test]
+    fn a_ground_and_its_heights_are_timed_and_counted() {
+        let mut session = Session::new(
+            Box::new(GeoQuad),
+            Arc::new(GeoLoader),
+            SessionConfig {
+                finish: Finish::Identity,
+                ..SessionConfig::default()
+            },
+        )
+        .expect("session");
+        session.keep_ground();
+        session
+            .frame(vec![geo_view(0.3, 0.3, 300.0)])
+            .expect("frame");
+        let (l, x, y) = GEO_ROOT;
+        let g = tuile_core::geo::ecef_to_geodetic(geo_at(l, x, y, 0.3, 0.3, 0.0));
+        let m = tuile_core::metrics::metrics();
+        let counts = || {
+            (
+                m.ground_seconds.count(),
+                m.height_queries.get(),
+                m.height_query_seconds.count(),
+            )
+        };
+        let before = counts();
+        let how = tuile_film::ground::Prepare::default();
+        for stitch in [true, false] {
+            let ground = session.ground(how, stitch).expect("kept");
+            for _ in 0..3 {
+                assert!(ground.height_at(g.lon, g.lat).is_some());
+            }
+        }
+        let after = counts();
+        assert!(after.0 - before.0 >= 2, "grounds: {before:?} -> {after:?}");
+        assert!(after.1 - before.1 >= 6, "queries: {before:?} -> {after:?}");
+        assert!(
+            after.2 - before.2 >= 6,
+            "query samples: {before:?} -> {after:?}"
+        );
     }
 
     /// What a tile refers to in the tile store — its terrain tile, its imagery

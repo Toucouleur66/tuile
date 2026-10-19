@@ -162,10 +162,13 @@ pub fn bake_frames(
     let mut writer: Option<PackWriter> = None;
     let mut poses = Vec::with_capacity((job.last - job.first + 1) as usize);
 
+    let metrics = tuile_core::metrics::metrics();
     for number in job.first..=job.last {
-        let pose = source
-            .pose(number, session)
-            .map_err(|e| format!("frame {number}: {e}"))?;
+        let posing = Instant::now();
+        let pose = source.pose(number, session);
+        let pose_seconds = posing.elapsed();
+        metrics.pose_seconds.record(pose_seconds);
+        let pose = pose.map_err(|e| format!("frame {number}: {e}"))?;
         let at = Instant::now();
         let frame = session
             .frame_for_pose(&pose, job.viewport)
@@ -227,11 +230,14 @@ pub fn bake_frames(
         }
         open.end();
         poses.push(pose);
+        let seconds = at.elapsed();
+        metrics.bake_frame_seconds.record(seconds);
         tracing::info!(
             frame = number,
             selected,
             reused,
-            seconds = at.elapsed().as_secs_f64(),
+            seconds = seconds.as_secs_f64(),
+            pose_seconds = pose_seconds.as_secs_f64(),
             "BAKE-FRAME"
         );
     }

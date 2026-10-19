@@ -514,6 +514,32 @@ pub struct Metrics {
     /// notice.
     pub tiles_filled: Gauge,
 
+    // --- Bake ---
+    //
+    // A bake is a loop over frames on one thread: ask for a pose, resolve the
+    // frame, write it. The log line it prints per frame timed only the middle
+    // and the end, and read a millisecond beside frames thirty apart — the rest
+    // was nowhere. These are the whole loop, piece by piece, so the missing
+    // time has a name.
+    /// One frame resolved and written to the pack, from its pose being known
+    /// to its last tile being pushed. The pose is not in it: that is
+    /// [`Metrics::pose_seconds`].
+    pub bake_frame_seconds: Timer,
+    /// Deciding one frame's pose. For a tape it is a lookup; for a source that
+    /// places the camera against the ground, it is convergences of its own,
+    /// the ground built and queried — on the bake's thread, before the frame.
+    pub pose_seconds: Timer,
+    /// Finishing one tile as it arrives — composed and encoded, or only named
+    /// for a pack by reference — on the finish pool.
+    pub finish_seconds: Timer,
+    /// Building the ground a frame's selection draws, as heights a camera is
+    /// kept over.
+    pub ground_seconds: Timer,
+    /// Height queries against a frame's ground: every one counted.
+    pub height_queries: Counter,
+    /// What a height query costs.
+    pub height_query_seconds: Timer,
+
     // --- Per level ---
     //
     // Where the totals above are actually going. A session that slows down as
