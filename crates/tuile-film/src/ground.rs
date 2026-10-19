@@ -18,8 +18,9 @@
 //!   triangles. Nothing is interpolated between samples; the height is the
 //!   surface's, where the line crosses it.
 
+use std::sync::Arc;
+
 use glam::DVec3;
-use tuile_core::content::DecodedMesh;
 use tuile_core::geo::{geodetic_to_ecef, Geodetic};
 use tuile_core::source::TileId;
 use tuile_core::stitch;
@@ -62,68 +63,188 @@ pub fn prepared(mesh: Mesh, how: Prepare) -> (Mesh, Smoothed) {
 /// Where the line down a place starts: above any ground there is.
 const ABOVE_M: f64 = 12_000.0;
 
-/// A tile as drawn, kept for its heights alone: where its vertices are and
-/// how they make triangles.
-struct Drawn {
+/// A tile as drawn, kept for its heights alone: where its vertices are, how
+/// they make triangles, and which triangles lie over which part of it.
+pub(crate) struct Drawn {
     rect: GeoRect,
     origin: DVec3,
     positions: Vec<[f32; 3]>,
     indices: Vec<u32>,
+    cells: Cells,
+    /// The triangles no cell can vouch for ([`span`]): read wherever the
+    /// tile is.
+    everywhere: Vec<u32>,
+}
+
+/// A tile's triangles by cell ([`span`]), numbered as narrowly as they can
+/// be.
+enum Cells {
+    Narrow(Grid<u16>),
+    Wide(Grid<u32>),
 }
 
 impl Drawn {
-    fn of(key: &TileKey, origin: DVec3, mesh: DecodedMesh) -> Self {
+    /// Tile `key`, its vertices `positions` about `origin` making the
+    /// triangles `indices`.
+    pub(crate) fn of(
+        key: &TileKey,
+        origin: DVec3,
+        positions: Vec<[f32; 3]>,
+        indices: Vec<u32>,
+    ) -> Self {
         let (level, x, y) = TileId(key.id).terrain_coord();
+        let rect = GeographicTilingScheme::default().tile_rect(TileCoord::new(level, x, y));
+        let triangles = indices.as_chunks::<3>().0;
+        let middle = (rect.west + rect.east) / 2.0;
+        let places: Vec<Geodetic> = positions
+            .iter()
+            .map(|p| {
+                let mut g = geodetic(origin + DVec3::from(p.map(f64::from)));
+                // Longitudes on the tile's side of the antimeridian.
+                let off = g.lon - middle;
+                g.lon =
+                    middle + (off - std::f64::consts::TAU * (off / std::f64::consts::TAU).round());
+                g
+            })
+            .collect();
+        let boxes: Vec<Option<[f64; 4]>> = triangles
+            .iter()
+            .map(|t| span(&positions, &places, t))
+            .collect();
+        let everywhere = (0..triangles.len() as u32)
+            .filter(|t| boxes[*t as usize].is_none())
+            .collect();
+        let side = ((triangles.len() as f64 / TRIANGLES_A_CELL).sqrt().round() as usize)
+            .clamp(1, MOST_A_SIDE);
+        let cells = if triangles.len() <= usize::from(u16::MAX) + 1 {
+            Cells::Narrow(Grid::of(rect, side, &boxes))
+        } else {
+            Cells::Wide(Grid::of(rect, side, &boxes))
+        };
         Self {
-            rect: GeographicTilingScheme::default().tile_rect(TileCoord::new(level, x, y)),
+            rect,
             origin,
-            positions: mesh.positions,
-            indices: mesh.indices,
+            positions,
+            indices,
+            cells,
+            everywhere,
         }
+    }
+
+    /// The bytes its vertices, triangles and cells take.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        use std::mem::size_of_val;
+        size_of_val(self.positions.as_slice())
+            + size_of_val(self.indices.as_slice())
+            + size_of_val(self.everywhere.as_slice())
+            + match &self.cells {
+                Cells::Narrow(grid) => grid.heap_bytes(),
+                Cells::Wide(grid) => grid.heap_bytes(),
+            }
+    }
+
+    /// How far along `dir` from `from`, in the tile's frame, the line down
+    /// `lon`, `lat` first meets one of its triangles (either side): those
+    /// listed over the place, and those read everywhere, are all it can
+    /// meet.
+    fn first_hit(&self, lon: f64, lat: f64, from: DVec3, dir: DVec3) -> Option<f64> {
+        let triangles = self.indices.as_chunks::<3>().0;
+        let along = |t: u32| hit(&self.positions, &triangles[t as usize], from, dir);
+        let listed = match &self.cells {
+            Cells::Narrow(grid) => grid
+                .at(lon, lat)
+                .iter()
+                .filter_map(|&t| along(u32::from(t)))
+                .reduce(f64::min),
+            Cells::Wide(grid) => grid
+                .at(lon, lat)
+                .iter()
+                .filter_map(|&t| along(t))
+                .reduce(f64::min),
+        };
+        self.everywhere
+            .iter()
+            .filter_map(|&t| along(t))
+            .chain(listed)
+            .reduce(f64::min)
     }
 }
 
+/// About how many triangles a cell lists: fewer cells a tile is less to
+/// keep, and more triangles read a height. On 64 × 64 tiles drawn as the
+/// render service draws them (`what_a_height_costs`), 2, 4, 8 and 16 read a
+/// height in the same time within the noise, and 8 keeps a fifth less than
+/// 2: a tile's cells come to a quarter of its mesh.
+const TRIANGLES_A_CELL: f64 = 8.0;
+
+/// The most cells a side of a tile.
+const MOST_A_SIDE: usize = 128;
+
 /// The ground of one frame: the meshes of the tiles it draws, as drawn.
+///
+/// A view: each tile is built once by the [`Stitching`] that holds it and
+/// shared from there, so a ground costs a pointer a tile.
 #[derive(Default)]
 pub struct Ground {
-    tiles: Vec<Drawn>,
+    tiles: Vec<Arc<Drawn>>,
+    /// Which tiles' rectangles, widened by [`ON`], lie over which part of
+    /// the ground: `None` for a ground of no tile.
+    by_place: Option<Grid<u32>>,
 }
 
 impl Ground {
     /// The ground `stitching` draws for `selection`, as last planned
     /// ([`Stitching::frame`]). Tiles it does not hold are not ground.
     pub fn of(stitching: &Stitching, selection: &[TileKey]) -> Self {
-        let tiles = selection
-            .iter()
-            .filter_map(|key| {
-                let (origin, mesh) = stitching.drawn(key)?;
-                Some(Drawn::of(key, origin, mesh))
-            })
-            .collect();
-        Self { tiles }
+        Self::made_of(
+            selection
+                .iter()
+                .filter_map(|key| stitching.ground(key, true))
+                .collect(),
+        )
     }
 
     /// The ground `stitching` holds for `selection`, unstitched: each tile
     /// as it entered, whatever was last planned.
     pub fn unstitched(stitching: &Stitching, selection: &[TileKey]) -> Self {
-        let tiles = selection
+        Self::made_of(
+            selection
+                .iter()
+                .filter_map(|key| stitching.ground(key, false))
+                .collect(),
+        )
+    }
+
+    fn made_of(tiles: Vec<Arc<Drawn>>) -> Self {
+        let boxes: Vec<Option<[f64; 4]>> = tiles
             .iter()
-            .filter_map(|key| {
-                let (origin, mesh) = stitching.held(key)?;
-                Some(Drawn::of(
-                    key,
-                    origin,
-                    DecodedMesh {
-                        positions: mesh.positions.clone(),
-                        normals: None,
-                        uvs: None,
-                        indices: mesh.indices.clone(),
-                        material: Default::default(),
-                    },
-                ))
+            .map(|t| {
+                let r = t.rect;
+                Some([r.west - ON, r.east + ON, r.south - ON, r.north + ON])
             })
             .collect();
-        Self { tiles }
+        let by_place = boxes.iter().flatten().copied().reduce(|a, b| {
+            [
+                a[0].min(b[0]),
+                a[1].max(b[1]),
+                a[2].min(b[2]),
+                a[3].max(b[3]),
+            ]
+        });
+        let by_place = by_place.map(|[west, east, south, north]| {
+            let side = ((tiles.len() as f64).sqrt() * 2.0).round() as usize;
+            Grid::of(
+                GeoRect {
+                    west,
+                    south,
+                    east,
+                    north,
+                },
+                side.clamp(1, MOST_A_SIDE),
+                &boxes,
+            )
+        });
+        Self { tiles, by_place }
     }
 
     /// The tiles this ground is made of.
@@ -135,15 +256,10 @@ impl Ground {
         self.tiles.is_empty()
     }
 
-    /// The bytes the meshes it is made of take.
+    /// The bytes the tiles it is made of take: their meshes and cells —
+    /// kept by the stitching that built them, and shared.
     pub fn heap_bytes(&self) -> usize {
-        self.tiles
-            .iter()
-            .map(|t| {
-                std::mem::size_of_val(t.positions.as_slice())
-                    + std::mem::size_of_val(t.indices.as_slice())
-            })
-            .sum()
+        self.tiles.iter().map(|t| t.heap_bytes()).sum()
     }
 
     /// The height of the drawn ground at `lon`, `lat` (radians): where a
@@ -151,29 +267,62 @@ impl Ground {
     /// drawn tile is there.
     ///
     /// Counted in `height_queries` and timed in `height_query_seconds`
-    /// ([`tuile_core::metrics`]), every call. Timing all of them rather than
-    /// one in N is measured, not assumed: a stamp pair and its record cost
-    /// about 40 ns, a query on one 64×64 tile about 43 µs — a tenth of a
-    /// percent. A query off every tile costs 13 ns and pays the same 40, which
-    /// is still nothing beside the queries that find ground.
+    /// ([`tuile_core::metrics`]) one call in [`SAMPLED`], standing for all
+    /// of them: see there.
     pub fn height_at(&self, lon: f64, lat: f64) -> Option<f64> {
+        let asked = ASKED.with(|asked| {
+            let n = asked.get() + 1;
+            asked.set(n % SAMPLED);
+            n
+        });
+        if asked < SAMPLED {
+            return self.height_under(lon, lat);
+        }
         let metrics = tuile_core::metrics::metrics();
-        metrics.height_queries.inc();
+        metrics.height_queries.add(SAMPLED);
+        let started = tuile_core::metrics::stamp();
+        let height = self.height_under(lon, lat);
         metrics
             .height_query_seconds
-            .time(|| self.height_under(lon, lat))
+            .record_sample(started.elapsed(), SAMPLED);
+        height
     }
 
     /// [`Self::height_at`], uncounted.
     fn height_under(&self, lon: f64, lat: f64) -> Option<f64> {
+        let by_place = self.by_place.as_ref()?;
         let (top, down) = line_down(lon, lat);
-        self.tiles
+        by_place
+            .at(lon, lat)
             .iter()
+            .map(|&k| &self.tiles[k as usize])
             .filter(|t| t.holds(lon, lat))
-            .filter_map(|t| first_hit(&t.positions, &t.indices, top - t.origin, down))
+            .filter_map(|t| t.first_hit(lon, lat, top - t.origin, down))
             .map(|along| ABOVE_M - along)
             .reduce(f64::max)
     }
+}
+
+/// One height query in this many is counted and timed, and stands for the
+/// others: a query reads a few dozen triangles, a few hundred nanoseconds,
+/// and two clock reads and four atomic additions on counters every thread
+/// of every bake shares are a measurable part of it — a tenth, on one
+/// thread with no other (`what_a_height_costs`), and more where threads
+/// contend for the counters — and of the profile that is meant to show
+/// where the time goes. A thread counts its
+/// own queries, unshared, and every [`SAMPLED`]th one adds that many to
+/// `height_queries` and its own duration, that many times over, to
+/// `height_query_seconds`, whose peak is the slowest query sampled.
+///
+/// The count is exact but for the fewer than [`SAMPLED`] each thread has
+/// asked since its last sample; the total is an estimate whose error falls
+/// as the square root of the samples. Prime, so that it does not beat with
+/// the regular patterns a caller asks in.
+pub const SAMPLED: u64 = 61;
+
+thread_local! {
+    /// The height queries this thread has asked since its last sample.
+    static ASKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// How far outside its rectangle a place still reads a tile, in radians: a
@@ -190,6 +339,208 @@ impl Drawn {
     }
 }
 
+/// A rectangle of longitude and latitude cut in `side` × `side` cells, and
+/// numbers listed by cell: each in every cell its box falls in — a tile's
+/// triangles, a ground's tiles.
+///
+/// A place falls in the cell its coordinates fall in, clamped to the grid,
+/// and a box's sides are cut alike: by one function, monotonic, so that a
+/// place inside a box always falls in a cell that lists it.
+struct Grid<T> {
+    west: f64,
+    south: f64,
+    /// A cell's width and height, in radians.
+    step: (f64, f64),
+    side: usize,
+    /// Where each cell's list begins in `listed`, and where the last ends.
+    starts: Vec<u32>,
+    /// The cells' lists, one after the other.
+    listed: Vec<T>,
+}
+
+impl<T: Copy + Default + TryFrom<usize>> Grid<T> {
+    /// `rect` cut in `side` × `side`, number `n` listed in the cells
+    /// `boxes[n]` — west, east, south, north — falls in; a `None` nowhere.
+    /// Every number has to fit a `T`.
+    fn of(rect: GeoRect, side: usize, boxes: &[Option<[f64; 4]>]) -> Self {
+        let step = (rect.width() / side as f64, rect.height() / side as f64);
+        let spans: Vec<Option<[usize; 4]>> = boxes
+            .iter()
+            .map(|b| {
+                let [west, east, south, north] = (*b)?;
+                Some([
+                    cell(west, rect.west, step.0, side),
+                    cell(east, rect.west, step.0, side),
+                    cell(south, rect.south, step.1, side),
+                    cell(north, rect.south, step.1, side),
+                ])
+            })
+            .collect();
+        let mut starts = vec![0u32; side * side + 1];
+        for [i0, i1, j0, j1] in spans.iter().flatten() {
+            for j in *j0..=*j1 {
+                for i in *i0..=*i1 {
+                    starts[j * side + i + 1] += 1;
+                }
+            }
+        }
+        for k in 1..starts.len() {
+            starts[k] += starts[k - 1];
+        }
+        let mut next = starts.clone();
+        let mut listed = vec![T::default(); starts[side * side] as usize];
+        for (n, span) in spans.iter().enumerate() {
+            let (Some([i0, i1, j0, j1]), Ok(n)) = (*span, T::try_from(n)) else {
+                continue;
+            };
+            for j in j0..=j1 {
+                for i in i0..=i1 {
+                    let k = j * side + i;
+                    listed[next[k] as usize] = n;
+                    next[k] += 1;
+                }
+            }
+        }
+        Self {
+            west: rect.west,
+            south: rect.south,
+            step,
+            side,
+            starts,
+            listed,
+        }
+    }
+
+    /// The numbers listed over `lon`, `lat`.
+    fn at(&self, lon: f64, lat: f64) -> &[T] {
+        let i = cell(lon, self.west, self.step.0, self.side);
+        let j = cell(lat, self.south, self.step.1, self.side);
+        let k = j * self.side + i;
+        &self.listed[self.starts[k] as usize..self.starts[k + 1] as usize]
+    }
+
+    fn heap_bytes(&self) -> usize {
+        use std::mem::size_of_val;
+        size_of_val(self.starts.as_slice()) + size_of_val(self.listed.as_slice())
+    }
+}
+
+/// The cell of `side` steps of `step` from `from` that `x` falls in,
+/// clamped to them: monotonic in `x`.
+fn cell(x: f64, from: f64, step: f64, side: usize) -> usize {
+    // NaN casts to 0; no place that reads a tile is NaN.
+    ((x - from) / step).floor().clamp(0.0, (side - 1) as f64) as usize
+}
+
+/// The longitude, latitude and height of `p`, earth-centred, by Bowring's
+/// formula alone: within nanoradians of
+/// [`tuile_core::geo::ecef_to_geodetic`], which
+/// iterates it four times more, for any point within tens of kilometres of
+/// the ellipsoid — far inside [`SLACK_M`] — at a fraction of the cost: a
+/// tile's every vertex is converted when its cells are built.
+fn geodetic(p: DVec3) -> Geodetic {
+    use tuile_core::geo::{WGS84_A as A, WGS84_B as B};
+    let e2 = 1.0 - (B * B) / (A * A);
+    let ep2 = (A * A - B * B) / (B * B);
+    let rho = p.x.hypot(p.y);
+    let beta = (p.z * A).atan2(rho * B);
+    let (sin_b, cos_b) = beta.sin_cos();
+    let lat = (p.z + ep2 * B * sin_b * sin_b * sin_b).atan2(rho - e2 * A * cos_b * cos_b * cos_b);
+    let (sin_lat, cos_lat) = lat.sin_cos();
+    let n = A / (1.0 - e2 * sin_lat * sin_lat).sqrt();
+    Geodetic {
+        lon: p.y.atan2(p.x),
+        lat,
+        // Only ever compared with `LOWEST_M`: kilometres from any doubt.
+        height: rho * cos_lat + p.z * sin_lat - A * A / n,
+    }
+}
+
+/// Below every radius of curvature of the ellipsoid, less [`LOWEST_M`]:
+/// metres a radian, at least, along a meridian or a parallel's great
+/// circle.
+const RADIUS_M: f64 = 6.3e6;
+/// The deepest a vertex goes and is listed: a skirt hangs 6 km at most.
+const LOWEST_M: f64 = -30_000.0;
+/// The longest edge listed: the bound on the bulge below is quadratic.
+const LONGEST_M: f64 = 50_000.0;
+/// The furthest from the equator a triangle is listed, in radians (89°).
+const POLEWARD: f64 = 1.553_343_034_274_953_2;
+/// The least angle at a triangle's first vertex, as a sine, for its hit
+/// test's rounding to stay below [`SLACK_M`].
+const SLIVER: f64 = 1.0e-2;
+/// Metres of margin round every box, for the rounding of the hit test and
+/// of the vertices' coordinates.
+const SLACK_M: f64 = 0.25;
+
+/// The box, west, east, south and north (radians), that holds every place
+/// whose line down meets triangle `t` — `None` for a triangle no box can be
+/// vouched for, to be read wherever its tile is. `places` are the
+/// vertices' coordinates.
+///
+/// The line down a place is the ellipsoid's normal there, and every point
+/// on it — down to the axis, thousands of kilometres under any vertex —
+/// has the place's longitude and latitude. A line meets a triangle at one
+/// of the triangle's points, widened by [`EDGE`]: the box has to hold
+/// those points' coordinates. It is the vertices' box, widened by:
+///
+/// - nothing for the longitude itself: a meridian bounds a half-space, two
+///   less than π apart a convex wedge, and a triangle whose vertices are
+///   in the wedge is in it;
+/// - a bulge in latitude: the points of one latitude make a cone round the
+///   axis, convex on the equator's side and curving poleward along the
+///   parallel by `tan φ / (N + h)`; a flat triangle whose vertices are on
+///   the equator's side of it crosses it by at most `tan φ ℓ² / 8 R` for a
+///   reach `ℓ` along the parallel — taken twice over, `ℓ` its longest edge;
+/// - [`EDGE`]: the widened triangle reaches `3 · 1e-6` of its longest edge
+///   past the triangle;
+/// - [`SLACK_M`], for the rounding: the hit test's barycentric coordinates
+///   are off by about `ε |s| / (sin α cos θ)` metres — `ε` the f64
+///   epsilon, `|s|` the tens of kilometres from the line's start to the
+///   vertex, `α` the triangle's angle at its first vertex, `θ` the angle
+///   between the line and the triangle's normal — a micrometre for any
+///   triangle the line does not graze; and where it grazes one, the plane
+///   is crossed as far away as the error is large, both as `1 / cos θ`. The
+///   vertices' coordinates are those of the very `f32` vertices the test
+///   reads, to the nanoradians of [`geodetic`].
+///
+/// Not vouched for: a sliver, whose rounding grows as `1 / sin α`; an edge
+/// longer than [`LONGEST_M`] or a vertex deeper than [`LOWEST_M`], where the
+/// bulge's bound stops holding; a vertex past [`POLEWARD`], where a
+/// longitude's metres run out.
+fn span(positions: &[[f32; 3]], places: &[Geodetic], t: &[u32; 3]) -> Option<[f64; 4]> {
+    let vertex = |i: u32| Some(DVec3::from(positions.get(i as usize)?.map(f64::from)));
+    let (a, b, c) = (vertex(t[0])?, vertex(t[1])?, vertex(t[2])?);
+    let (e1, e2) = (b - a, c - a);
+    let longest = e1.length().max(e2.length()).max((c - b).length());
+    let sine = e1.cross(e2).length() / (e1.length() * e2.length());
+    // Written so that a NaN — a triangle with an edge of no length — is not
+    // vouched for either.
+    let shapely = sine >= SLIVER && longest <= LONGEST_M;
+    if !shapely {
+        return None;
+    }
+    let [p, q, r] = t.map(|i| places[i as usize]);
+    if p.height.min(q.height).min(r.height) < LOWEST_M {
+        return None;
+    }
+    let poleward = p.lat.abs().max(q.lat.abs()).max(r.lat.abs());
+    let placed = poleward <= POLEWARD;
+    if !placed {
+        return None;
+    }
+    let margin =
+        2.0 * poleward.tan() * longest * longest / (8.0 * RADIUS_M) + 3.0e-6 * longest + SLACK_M;
+    let lat = margin / RADIUS_M;
+    let lon = margin / (RADIUS_M * (poleward + lat).cos());
+    Some([
+        p.lon.min(q.lon).min(r.lon) - lon,
+        p.lon.max(q.lon).max(r.lon) + lon,
+        p.lat.min(q.lat).min(r.lat) - lat,
+        p.lat.max(q.lat).max(r.lat) + lat,
+    ])
+}
+
 /// The vertical line down the place `lon`, `lat`: where it starts, above
 /// any ground, and which way is down — earth-centred.
 fn line_down(lon: f64, lat: f64) -> (DVec3, DVec3) {
@@ -200,17 +551,6 @@ fn line_down(lon: f64, lat: f64) -> (DVec3, DVec3) {
     });
     let down = -DVec3::new(lat.cos() * lon.cos(), lat.cos() * lon.sin(), lat.sin());
     (top, down)
-}
-
-/// How far along `dir` from `from` the ray first meets one of the
-/// triangles `indices` makes of `positions` (both sides), in their frame.
-fn first_hit(positions: &[[f32; 3]], indices: &[u32], from: DVec3, dir: DVec3) -> Option<f64> {
-    indices
-        .as_chunks::<3>()
-        .0
-        .iter()
-        .filter_map(|t| hit(positions, t, from, dir))
-        .reduce(f64::min)
 }
 
 /// How far along `dir` from `from` the ray meets the triangle `t` makes of
@@ -244,7 +584,7 @@ const EDGE: f64 = -1.0e-6;
 mod tests {
     use super::*;
     use std::f64::consts::PI;
-    use tuile_core::content::MaterialDesc;
+    use tuile_core::content::{DecodedMesh, MaterialDesc};
 
     /// Tile `level/x/y` as a grid of `n` spacings a side, `height(u, north)`
     /// metres over the ellipsoid at each vertex.
@@ -335,6 +675,17 @@ mod tests {
         fn pick<T: Copy>(&mut self, of: &[T]) -> T {
             of[((self.next() * of.len() as f64) as usize).min(of.len() - 1)]
         }
+    }
+
+    /// How far along `dir` from `from` the ray first meets one of the
+    /// triangles `indices` makes of `positions` (both sides), in their frame.
+    fn first_hit(positions: &[[f32; 3]], indices: &[u32], from: DVec3, dir: DVec3) -> Option<f64> {
+        indices
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .filter_map(|t| hit(positions, t, from, dir))
+            .reduce(f64::min)
     }
 
     /// The height under a place read by brute force: every tile whose
@@ -570,6 +921,15 @@ mod tests {
     fn the_height_is_every_triangle_s_answer_bit_for_bit() {
         let mut dice = Dice(0x5EED_6E0D);
         let tiles = landscape(&mut dice);
+        // And the four fine tiles alone: a ground whose tiles' sides fall
+        // on the lines that cut it in cells.
+        let block = tiles[1..5].to_vec();
+        for tiles in [tiles, block] {
+            every_triangle_s_answer(&tiles, &mut dice);
+        }
+    }
+
+    fn every_triangle_s_answer(tiles: &[(TileKey, Mesh)], dice: &mut Dice) {
         let selection: Vec<TileKey> = tiles.iter().map(|(k, _)| *k).collect();
         let grounds = [
             (
@@ -594,7 +954,7 @@ mod tests {
         ];
         for (name, how, stitch) in grounds {
             let mut stitching = Stitching::default();
-            for (key, mesh) in &tiles {
+            for (key, mesh) in tiles {
                 stitching.enter(*key, None, &prepared(mesh.clone(), how).0);
             }
             let ground = if stitch {
@@ -605,7 +965,7 @@ mod tests {
             };
             assert_eq!(ground.len(), tiles.len());
             let (mut asked, mut found, mut differ) = (0usize, 0usize, Vec::new());
-            for (lon, lat) in places(&ground, &mut dice) {
+            for (lon, lat) in places(&ground, dice) {
                 let (indexed, brute) = (ground.height_at(lon, lat), brute_force(&ground, lon, lat));
                 asked += 1;
                 found += usize::from(brute.is_some());
@@ -621,6 +981,179 @@ mod tests {
                 &differ[..differ.len().min(5)]
             );
         }
+    }
+
+    /// What a height costs, and a ground: `cargo test --release -p
+    /// tuile-film --lib what_a_height_costs -- --ignored --nocapture`.
+    ///
+    /// A block of `SIDE` × `SIDE` irregular 64 × 64 tiles drawn as the
+    /// render service draws them, asked at places all over it: heights a
+    /// second read by brute force and through the cells, with and without
+    /// their metering, and what building the ground costs the first time
+    /// and the next.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn what_a_height_costs() {
+        use std::time::Instant;
+        const SIDE: u64 = 8;
+        let mut dice = Dice(7);
+        let tiles: Vec<(TileKey, Mesh)> = (0..SIDE * SIDE)
+            .map(|k| tin(14, 9000 + k % SIDE, 6200 + k / SIDE, 64, &mut dice))
+            .collect();
+        let selection: Vec<TileKey> = tiles.iter().map(|(k, _)| *k).collect();
+        let how = Prepare {
+            skirts: true,
+            smooth: Smooth::Geometry {
+                bound: smoothing::DEFAULT_BOUND_M,
+            },
+        };
+        let mut stitching = Stitching::default();
+        for (key, mesh) in &tiles {
+            stitching.enter(*key, None, &prepared(mesh.clone(), how).0);
+        }
+        stitching.frame(&selection);
+
+        let clock = Instant::now();
+        let ground = Ground::of(&stitching, &selection);
+        let first = clock.elapsed();
+        let clock = Instant::now();
+        let again = Ground::of(&stitching, &selection);
+        let next = clock.elapsed();
+        let clock = Instant::now();
+        let cloned: usize = selection
+            .iter()
+            .filter_map(|key| stitching.drawn(key))
+            .map(|(_, mesh)| mesh.indices.len())
+            .sum();
+        let as_before = clock.elapsed();
+        assert_eq!(again.len(), ground.len());
+        let triangles: usize = ground.tiles.iter().map(|t| t.indices.len() / 3).sum();
+        let listed: usize = ground
+            .tiles
+            .iter()
+            .map(|t| match &t.cells {
+                Cells::Narrow(grid) => grid.listed.len(),
+                Cells::Wide(grid) => grid.listed.len(),
+            })
+            .sum();
+        let everywhere: usize = ground.tiles.iter().map(|t| t.everywhere.len()).sum();
+        eprintln!(
+            "{} tiles, {triangles} triangles ({cloned} indices), {:.1} MiB with their cells; \
+             {listed} listings, {everywhere} read everywhere",
+            ground.len(),
+            ground.heap_bytes() as f64 / f64::from(1u32 << 20),
+        );
+        eprintln!(
+            "Ground::of: {first:?} building the cells, {next:?} once built; \
+             the meshes drawn again as before: {as_before:?}"
+        );
+
+        let r = GeographicTilingScheme::default().tile_rect(TileCoord::new(14, 9000, 6200));
+        let (w, h) = (r.width() * SIDE as f64, r.height() * SIDE as f64);
+        let places: Vec<(f64, f64)> = (0..50_000)
+            .map(|_| {
+                (
+                    dice.between(r.west, r.west + w),
+                    dice.between(r.south, r.south + h),
+                )
+            })
+            .collect();
+        // And as a ray is marched: places a few tens of metres apart, one
+        // after the other, a few hundred along each of many lines.
+        let step = r.width() / 64.0;
+        let mut marched = Vec::new();
+        while marched.len() < places.len() {
+            let (mut lon, mut lat) = (
+                dice.between(r.west, r.west + w),
+                dice.between(r.south, r.south + h),
+            );
+            let heading = dice.between(0.0, std::f64::consts::TAU);
+            for _ in 0..300 {
+                lon = (lon + step * heading.cos()).clamp(r.west, r.west + w);
+                lat = (lat + step * heading.sin()).clamp(r.south, r.south + h);
+                marched.push((lon, lat));
+            }
+        }
+        // The best of a few rounds: a laptop's other work only ever slows
+        // one down.
+        let per_second = |name: &str, n: usize, read: &dyn Fn(f64, f64) -> Option<f64>| {
+            for (how, places) in [("anywhere", &places), ("marched", &marched)] {
+                let mut best = f64::INFINITY;
+                let mut found = 0;
+                for _ in 0..5 {
+                    let clock = Instant::now();
+                    found = places[..n]
+                        .iter()
+                        .filter(|(lon, lat)| read(*lon, *lat).is_some())
+                        .count();
+                    best = best.min(clock.elapsed().as_secs_f64());
+                }
+                eprintln!(
+                    "{name}, {how}: {:.0} heights a second, {:.3} µs each ({found} of {n} found)",
+                    n as f64 / best,
+                    best * 1.0e6 / n as f64,
+                );
+            }
+        };
+        per_second("brute force", 400, &|lon, lat| {
+            brute_force(&ground, lon, lat)
+        });
+        let timer = tuile_core::metrics::Timer::default();
+        let counter = tuile_core::metrics::Counter::default();
+        per_second("cells, unmetered", places.len(), &|lon, lat| {
+            ground.height_under(lon, lat)
+        });
+        per_second(
+            "cells, one in SAMPLED metered",
+            places.len(),
+            &|lon, lat| ground.height_at(lon, lat),
+        );
+        per_second("cells, every one metered", places.len(), &|lon, lat| {
+            counter.inc();
+            timer.time(|| ground.height_under(lon, lat))
+        });
+        per_second("every tile's rectangle", places.len(), &|lon, lat| {
+            let holding = ground.tiles.iter().filter(|t| t.holds(lon, lat)).count();
+            (holding > 0).then_some(0.0)
+        });
+        per_second(
+            "the rectangles listed over the place",
+            places.len(),
+            &|lon, lat| {
+                let by_place = ground.by_place.as_ref()?;
+                let holding = by_place
+                    .at(lon, lat)
+                    .iter()
+                    .filter(|&&k| ground.tiles[k as usize].holds(lon, lat))
+                    .count();
+                (holding > 0).then_some(0.0)
+            },
+        );
+    }
+
+    /// The cells' coordinates are the engine's to well within the margin
+    /// they are widened by, from the deepest skirt to above any summit,
+    /// pole to pole short of the last degree.
+    #[test]
+    fn the_cells_coordinates_are_the_engine_s() {
+        let mut dice = Dice(11);
+        let mut worst = (0.0f64, 0.0f64);
+        for _ in 0..100_000 {
+            let place = Geodetic {
+                lon: dice.between(-PI, PI),
+                lat: dice.between(-POLEWARD, POLEWARD),
+                height: dice.between(LOWEST_M, 12_000.0),
+            };
+            let p = geodetic_to_ecef(place);
+            let (ours, theirs) = (geodetic(p), tuile_core::geo::ecef_to_geodetic(p));
+            assert_eq!(ours.lon, theirs.lon);
+            worst.0 = worst.0.max((ours.lat - theirs.lat).abs());
+            worst.1 = worst.1.max((ours.height - theirs.height).abs());
+        }
+        assert!(
+            worst.0 * RADIUS_M < SLACK_M / 1000.0 && worst.1 < 1.0,
+            "{worst:?}"
+        );
     }
 
     #[test]

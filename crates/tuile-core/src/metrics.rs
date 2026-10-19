@@ -88,9 +88,16 @@ pub struct Timer {
 
 impl Timer {
     pub fn record(&self, elapsed: std::time::Duration) {
+        self.record_sample(elapsed, 1);
+    }
+
+    /// Records one duration standing for `weight` of them, as a caller that
+    /// times one call in `weight` does: the total grows by `weight` times
+    /// it, the count by `weight`, and the peak is the slowest sampled.
+    pub fn record_sample(&self, elapsed: std::time::Duration, weight: u64) {
         let nanos = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
-        self.nanos.fetch_add(nanos, ORDER);
-        self.count.fetch_add(1, ORDER);
+        self.nanos.fetch_add(nanos.saturating_mul(weight), ORDER);
+        self.count.fetch_add(weight, ORDER);
         self.peak_nanos.fetch_max(nanos, ORDER);
     }
 
@@ -535,9 +542,14 @@ pub struct Metrics {
     /// Building the ground a frame's selection draws, as heights a camera is
     /// kept over.
     pub ground_seconds: Timer,
-    /// Height queries against a frame's ground: every one counted.
+    /// Tiles cut into cells for a ground to read heights off: once a tile,
+    /// and again each time its stitching moves its vertices. What building a
+    /// ground costs beyond a pointer a tile.
+    pub ground_tiles: Counter,
+    /// Height queries against a frame's ground, counted by samples standing
+    /// for many (`tuile_film::ground::SAMPLED`).
     pub height_queries: Counter,
-    /// What a height query costs.
+    /// What a height query costs, timed by the same samples.
     pub height_query_seconds: Timer,
 
     // --- Per level ---
@@ -696,6 +708,19 @@ mod tests {
         // happened once still has to be visible a minute later.
         t.record(std::time::Duration::from_millis(1));
         assert!((t.peak_millis() - 30.0).abs() < 0.001);
+    }
+
+    /// A sample standing for many weighs as many in the total and the
+    /// count — the mean is the samples' — and as one in the peak.
+    #[test]
+    fn a_sample_stands_for_its_weight() {
+        let t = Timer::default();
+        t.record_sample(std::time::Duration::from_micros(2), 61);
+        t.record_sample(std::time::Duration::from_micros(4), 61);
+        assert_eq!(t.count(), 122);
+        assert!((t.total_seconds() - 366.0e-6).abs() < 1.0e-12);
+        assert!((t.mean_millis() - 0.003).abs() < 1.0e-9);
+        assert!((t.peak_millis() - 0.004).abs() < 1.0e-9);
     }
 
     #[test]

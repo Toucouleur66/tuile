@@ -13,12 +13,14 @@
 //! Free of any GPU, so a browser worker and a headless binary stitch alike.
 
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 use glam::DVec3;
 use tuile_core::content::{DecodedMesh, MaterialDesc};
 use tuile_core::source::TileId;
 use tuile_core::stitch::{self, Edges, Stitch};
 
+use crate::ground::Drawn;
 use crate::{Mesh, TileKey};
 
 struct Held {
@@ -29,7 +31,15 @@ struct Held {
     edges: Edges,
     /// What the renderer was last told.
     told: Stitch,
+    /// The tile as a ground reads it ([`crate::ground::Ground`]): as it
+    /// entered, and as drawn by `told`. Each is built the first time it is
+    /// asked for and kept while what it is built from stays: the second
+    /// is let go when `told` changes, both when the tile enters again.
+    ground: [OnceLock<Arc<Drawn>>; 2],
 }
+
+/// Which of [`Held::ground`] is the tile drawn by `told`.
+const STITCHED: usize = 1;
 
 /// What a renderer does for one tile before it draws the frame.
 #[derive(Debug, Clone, PartialEq)]
@@ -120,7 +130,8 @@ pub fn heap_bytes(mesh: &DecodedMesh) -> usize {
 }
 
 impl Stitching {
-    /// The bytes the meshes and edges it holds take.
+    /// The bytes the meshes and edges it holds take, and the tiles it keeps
+    /// for the grounds read off it.
     pub fn heap_bytes(&self) -> usize {
         self.held
             .values()
@@ -131,6 +142,12 @@ impl Stitching {
                         .sides
                         .iter()
                         .map(|side| std::mem::size_of_val(side.as_slice()))
+                        .sum::<usize>()
+                    + held
+                        .ground
+                        .iter()
+                        .filter_map(OnceLock::get)
+                        .map(|drawn| drawn.heap_bytes())
                         .sum::<usize>()
             })
             .sum()
@@ -169,6 +186,7 @@ impl Stitching {
                 factor: mesh.base_color_factor,
                 edges,
                 told: Stitch::default(),
+                ground: Default::default(),
             },
         );
         // A tile that enters is one the last plan did not know.
@@ -181,20 +199,53 @@ impl Stitching {
     /// the CPU. `None` for a tile not held.
     pub fn drawn(&self, key: &TileKey) -> Option<(DVec3, DecodedMesh)> {
         let held = self.held.get(key)?;
-        let origin = held.edges.origin;
+        Some((held.edges.origin, self.drawn_mesh(held)))
+    }
+
+    fn drawn_mesh(&self, held: &Held) -> DecodedMesh {
         let mut mesh = if held.told.inserts.iter().all(Vec::is_empty) {
             held.mesh.clone()
         } else {
-            stitch::split(&held.mesh, origin, &held.told.inserts)
+            stitch::split(&held.mesh, held.edges.origin, &held.told.inserts)
         };
-        if !held.told.is_nothing() {
-            if let Some(uvs) = mesh.uvs.clone() {
-                for (p, uv) in mesh.positions.iter_mut().zip(&uvs) {
-                    *p = (glam::Vec3::from(*p) + held.told.offset(*uv, self.band)).to_array();
-                }
+        self.offset(held, &mut mesh.positions, mesh.uvs.as_deref());
+        mesh
+    }
+
+    /// `positions` moved as `held.told` moves them, by the vertices' `uvs`.
+    fn offset(&self, held: &Held, positions: &mut [[f32; 3]], uvs: Option<&[[f32; 2]]>) {
+        if held.told.is_nothing() {
+            return;
+        }
+        if let Some(uvs) = uvs {
+            for (p, uv) in positions.iter_mut().zip(uvs) {
+                *p = (glam::Vec3::from(*p) + held.told.offset(*uv, self.band)).to_array();
             }
         }
-        Some((origin, mesh))
+    }
+
+    /// Tile `key` as a ground reads it: drawn as last planned when
+    /// `stitched` ([`Self::drawn`]), as it entered otherwise. Built once and
+    /// shared until the tile's mesh changes. `None` for a tile not held.
+    pub(crate) fn ground(&self, key: &TileKey, stitched: bool) -> Option<Arc<Drawn>> {
+        let held = self.held.get(key)?;
+        let kept = &held.ground[usize::from(stitched)];
+        Some(Arc::clone(kept.get_or_init(|| {
+            tuile_core::metrics::metrics().ground_tiles.inc();
+            let mesh = &held.mesh;
+            let (positions, indices) = if !stitched {
+                (mesh.positions.clone(), mesh.indices.clone())
+            } else if held.told.inserts.iter().all(Vec::is_empty) {
+                // As `drawn_mesh`, without copying what heights do not read.
+                let mut positions = mesh.positions.clone();
+                self.offset(held, &mut positions, mesh.uvs.as_deref());
+                (positions, mesh.indices.clone())
+            } else {
+                let drawn = self.drawn_mesh(held);
+                (drawn.positions, drawn.indices)
+            };
+            Arc::new(Drawn::of(key, held.edges.origin, positions, indices))
+        })))
     }
 
     /// The mesh of `key` as it entered, about its origin: as drawn when
@@ -266,6 +317,7 @@ impl Stitching {
                     .fold(0.0, f32::max);
                 let strips = plan.packed();
                 held.told = plan;
+                held.ground[STITCHED].take();
                 Some(Restitch {
                     key,
                     mesh,

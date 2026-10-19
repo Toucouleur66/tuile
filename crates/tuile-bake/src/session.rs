@@ -936,10 +936,13 @@ pub struct GroundMemory {
     pub kept_tiles: usize,
     pub kept_bytes: usize,
     /// The tiles last drawn, as prepared (skirts, smoothing) and held for
-    /// stitching — kept from one ground to the next.
+    /// stitching, with each tile as grounds read it, cut into cells — kept
+    /// from one ground to the next.
     pub prepared_tiles: usize,
     pub prepared_bytes: usize,
-    /// The ground it returned, which its caller holds.
+    /// The ground it returned: its tiles as heights are read off them, with
+    /// their cells. The stitching keeps them and the ground shares them, so
+    /// they are in `prepared_bytes` too.
     pub drawn_bytes: usize,
 }
 
@@ -3283,7 +3286,8 @@ pub(crate) mod tests {
     }
 
     /// Building a ground and reading heights off it are timed and counted:
-    /// one sample per ground built, one count and one sample per query.
+    /// one sample per ground built; the queries by samples, each standing
+    /// for `SAMPLED` of them.
     #[test]
     fn a_ground_and_its_heights_are_timed_and_counted() {
         let mut session = Session::new(
@@ -3311,17 +3315,23 @@ pub(crate) mod tests {
         };
         let before = counts();
         let how = tuile_film::ground::Prepare::default();
+        let sampled = tuile_film::ground::SAMPLED;
         for stitch in [true, false] {
             let ground = session.ground(how, stitch).expect("kept");
-            for _ in 0..3 {
+            for _ in 0..2 * sampled {
                 assert!(ground.height_at(g.lon, g.lat).is_some());
             }
         }
+        // Four times `SAMPLED` queries on this thread: four samples at
+        // least, whatever it had asked before.
         let after = counts();
         assert!(after.0 - before.0 >= 2, "grounds: {before:?} -> {after:?}");
-        assert!(after.1 - before.1 >= 6, "queries: {before:?} -> {after:?}");
         assert!(
-            after.2 - before.2 >= 6,
+            after.1 - before.1 >= 4 * sampled,
+            "queries: {before:?} -> {after:?}"
+        );
+        assert!(
+            after.2 - before.2 >= 4 * sampled,
             "query samples: {before:?} -> {after:?}"
         );
     }
