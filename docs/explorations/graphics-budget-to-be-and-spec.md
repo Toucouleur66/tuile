@@ -348,70 +348,112 @@ What must stay identical, and is tested:
 
 ## 7. What is deleted at merge (one branch, no flag, no shadow)
 
+Line numbers are those of `main` at 65b04cb (v0.8.3 plus #83–#87); the cut-over
+PR re-reads them, since `main` keeps moving.
+
 **tuile-core**
 - `src/cache.rs` entirely:
-  - `ResidentCache`;
+  - `ResidentCache` 76;
   - `HIGH_WATER` 31, `LOW_WATER` 38;
-  - `release_beyond` 300, `release_all_but` 316, `trim_except` 375.
+  - `trim` 282, `release_beyond` 300 (`release_all_but` and `trim_except`
+    are already gone from `main`).
 - `src/traversal.rs`:
-  - the `Config` fields `resident_budget_bytes` 291, `maximum_simultaneous_fetches` 293,
-    `pinned_level` 318, `resident_tile_limit` 347 (moved to `BudgetConfig`);
-  - the budget numbers in `interactive_globe` 388-399;
-  - `ResidencyView` 428-454 becomes a view exported by `Budget`.
+  - the `Config` fields `resident_budget_bytes` 297,
+    `maximum_simultaneous_fetches` 299, `pinned_level` 324,
+    `resident_tile_limit` 353 (moved to `BudgetConfig`);
+  - the budget numbers in `interactive_globe` 394-404 and in the handheld
+    preset 420-425;
+  - `ResidencyView` 435 becomes a view exported by `Budget`.
+  - `traverse`/`traverse_with` (544/571) keep taking `&[ViewState]`: the
+    stereo union stays in the traversal (P6).
 - `src/runtime.rs`:
-  - fields `cache` 118, `in_flight` 120, `started` 124, `acked` 142, `filled` 145,
-    `view_moved` 155;
-  - the `Cancel`/`Trim` handling 386-411;
-  - protection and trim 592-667;
-  - cancellation 701-745; spawn loops 752-785;
-  - the scheduling half of `refresh` 848-876;
-  - insert/evict in `on_load_done` 1023-1063;
-  - the per-arrival `retraverse` 270-276.
+  - fields `cache` 387, `in_flight` 389, `started` 393, `acked` 411,
+    `filled` 414, `view_moved` 428;
+  - the `Cancel`/`Trim` handling of `on_client` 781-811;
+  - protection and trim in `retraverse` 1011-1070 (the `selected` protected
+    set, the pinned chain, `cache.trim`);
+  - the `camera_moved` cancellation 1144-1167;
+  - the priming and spawn loops 1174-1206;
+  - the scheduling half of `refresh` 1270-1300;
+  - insert/evict in `on_load_done` 1457-1484;
+  - the per-arrival `retraverse` after `drain_ready` (606; `drain_ready` 645): arrivals
+    are applied at the next `decide`.
 - `src/protocol.rs`:
   - `ClientMessage::Trim` 52;
-  - the bare `Ack` 43;
-  - the unbounded pair 272-307.
-- `src/offload.rs`: the cancel-blind `run` 193-206.
+  - the bare `Ack { tile }` 43;
+  - the unbounded pair `in_process_pair` 294-307 (`InProcessStream` keeps
+    the channels, bounded by the delivery credit).
+- `src/offload.rs`: `run` 287-301 still runs a cancelled job to the end and
+  drops its answer; jobs gain the cancel token and generation (§5).
 
 **tuile-wgpu**
 - `src/pump.rs`:
   - FIFO `pending` 28;
   - `UPLOADS_PER_FRAME` 89;
-  - `pump`, `pump_while`, `advance`, `advance_with`, `advance_while` 227-397;
+  - `pump`, `drain`, `pump_while`, `advance`, `advance_with`,
+    `advance_while` 227-437;
   - the unpruned `ancestry` 56;
-  - the per-upload `live_by_level` 287-297;
-  - `push_front` fills 480;
-  - the `retain/contains` Evict 530.
+  - the per-upload `live_by_level` call 324;
+  - the `push_front` refill 505;
+  - the `retain/contains` of `Evict` 537-556.
 - (Renderer skirt and stencil changes are **not** part of this branch.)
 
 **tuile-planetary**
-- `ImageryDetail` 290-312 and its use at 1043-1060 (the load-time level choice), replaced by
-  the drape resource at the level the budget asks.
+- `ImageryDetail` 298-318 and its use in the drape level choice 1170-1186
+  (`level_for_texel_spacing` from the terrain error, raised by the global
+  altitude target), replaced by the drape resource at the level the budget
+  asks.
 
 **tuile-viewer**
 - `src/profile.rs`:
-  - `UploadBudget` 58-79;
-  - the `Profile` budget fields 84-98;
-  - `traversal()` 190-197;
-  - `trim_on_warning` and `trim_in_background` 217-225.
+  - `UploadBudget` 91-104;
+  - the `Profile` budget fields `resident_budget_bytes`,
+    `resident_tile_limit`, `simultaneous_fetches` 109-113 and `uploads` 123;
+  - `traversal()` 313-320;
+  - `trim_on_warning` 340, `trim_in_background` 346,
+    `trim_on_critical_pressure` 353.
 
-  These are replaced by `Profile::budget() -> BudgetConfig`.
-- `src/app/lifecycle.rs`: `Step::Trim` 49, 114, 154-155 → `Step::Pressure`.
-- `src/app/gestures.rs` 111-114.
+  These are replaced by `Profile::budget() -> BudgetConfig`. The viewer's
+  own `Pressure`, `Thermal` and `DeviceMemory` (profile.rs) stay: they are
+  the platform side and feed `set_pressure`, `set_thermal` and `retarget`.
+- `src/app/lifecycle.rs`: `Step::Trim` 55 and its producers (156, 207, 227,
+  and the tests from 268) → `Step::Pressure`.
+- `src/app/gestures.rs`: `Step::Trim` → `ClientMessage::Trim` 353-358 (and
+  its test label 439, 475-482).
 - `src/app/frame.rs`:
-  - 113-115 (global texel target);
-  - 142-164 (budget closure).
+  - 111-123 (global texel target, `ImageryDetail::set_target_texel_spacing`);
+  - 128-171 (the upload budget closure, `UploadBudget::allows`).
+- `src/native/android_signals.rs` (new since the spec was written):
+  `pressure_of_trim` 46 maps `onTrimMemory` levels to the viewer's
+  `Pressure`; it stays and feeds `Budget::set_pressure`/`retarget`.
+- `src/web/worker.rs` (the web worker moved here from `tuile-web`):
+  `ToWorker::Detail { metres }` (control.rs 35, handled at worker.rs 148)
+  goes with `ImageryDetail`; `ToWorker::Budget { reported }` (149) becomes
+  `retarget`.
 
 **Downstream changes in the same commit**
-- `tuile-bake/src/session.rs`: 1051, 1254-1262, 1529-1533, on `BudgetConfig::batch()`.
-- `tuile-web/src/worker.rs` 129, which is already broken per PR #60.
-- `examples/orbit-probe`, `examples/globe-bulk`, `tuile-wgpu/examples/snapshot.rs`.
+- `tuile-bake/src/session.rs`: the `ImageryDetail` field 569 and
+  `set_imagery_detail` 671/1098-1117, `ClientMessage::Trim` between frames
+  1272-1280, the `budget` read at 1041, `exact_traversal` 1570-1573; all on
+  `BudgetConfig::batch()` (`frame_ready`, `release_beyond`).
+- `examples/wasm-globe` no longer exists (removed on `main`); the web
+  viewer is `crates/tuile-viewer` (`src/web`), with `examples/web-viewer`
+  and `examples/web-viewer-vite` as its pages.
+- `examples/orbit-probe`, `examples/globe-bulk`,
+  `crates/tuile-wgpu/examples/snapshot.rs`.
 - Tests:
-  - `tuile-wgpu/tests/{eager_batches,fast_zoom_never_empties,no_black_ground,no_seams,no_two_surfaces,stand_ins}.rs`;
-  - `tuile-planetary/tests/selection_covers_the_ground.rs`;
+  - `tuile-wgpu/tests/{eager_batches,fast_zoom_never_empties,headless,imagery_passes,no_black_ground,no_seams,no_two_surfaces,overlay,stand_ins}.rs`;
+  - `tuile-planetary/tests/{selection_covers_the_ground,seams_are_closed}.rs`;
   - `tuile-viewer/src/app/stall.rs`.
 - The downstream host (films): no API change beyond the re-recorded goldens. Its own film
   goldens move with ours.
+
+**Not a seam of the budget**
+- `TileStore::held` and `TileStore::get_unheld` in
+  `tuile-tile-server/src/store.rs` (792, 806) are the tile *server's* store:
+  async, and they return the payload. They are not a presence oracle. The
+  client-side oracle (§4b) answers synchronously from an index (the foyer
+  store's, the HTTP disk cache's) and never reads a payload.
 
 ## 8. Test strategy
 
