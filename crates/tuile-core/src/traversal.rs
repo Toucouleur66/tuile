@@ -724,7 +724,7 @@ fn nearest_content_distance(tree: &dyn TileTree, views: &[ViewState]) -> f64 {
 ///
 /// [`Config::uniform_detail`] prices the whole pass at one distance, found by
 /// a descent along the line of sight that follows every branch the ray enters
-/// ([`deepest_content_along`]). On a terrain globe that descent goes down to
+/// (`deepest_content_along`). On a terrain globe that descent goes down to
 /// the deepest level the tree allows, and it is most of what a pass costs:
 /// measured on a local bake (`docs/explorations/incremental-traversal.md`),
 /// 1.6 ms of a 1.8 ms traversal, against 0.2 ms for the walk that actually
