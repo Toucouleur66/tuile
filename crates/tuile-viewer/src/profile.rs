@@ -73,6 +73,11 @@ pub(crate) struct Profile {
     /// The most imagery levels a drape may sit above its tile's terrain
     /// level: what one draw's slots hold (a 5 × 5 mosaic is two levels).
     pub imagery_over_terrain_cap: u32,
+    /// The traversal's screen-space error threshold, logical pixels (D-L1):
+    /// a desktop's 1, the 2 device pixels it always drew at on a display of
+    /// density 2; a phone's ⅔, the same 2 at its density 3. A window moved
+    /// between displays then asks for nothing new.
+    pub sse_threshold: f64,
     /// Threads of the async runtime: network, store, the server.
     pub runtime_workers: usize,
     /// Its blocking pool: the store's file I/O.
@@ -130,6 +135,7 @@ impl Profile {
             pinned_level: crate::backdrop::BASE_LEVEL,
             max_local_reads: 32,
             imagery_over_terrain_cap: 2,
+            sse_threshold: 1.0,
             runtime_workers: cores,
             blocking_threads: 512,
             decode_threads: cores.saturating_sub(1).max(1),
@@ -161,6 +167,7 @@ impl Profile {
             max_local_reads: 8,
             // The low clamp drapes one level over its terrain, the rest two.
             imagery_over_terrain_cap: if gpu_bytes <= 192 * MIB { 1 } else { 2 },
+            sse_threshold: 2.0 / 3.0,
             runtime_workers: 2,
             blocking_threads: 4,
             // Leave the main thread and the runtime a core each.
@@ -260,6 +267,15 @@ impl Profile {
         b.max_local_reads = self.max_local_reads;
         b.imagery_over_terrain_cap = self.imagery_over_terrain_cap;
         b
+    }
+
+    /// The traversal's configuration for this profile: the reference
+    /// interactive session at the profile's threshold.
+    pub(crate) fn traversal(&self) -> tuile_core::traversal::Config {
+        tuile_core::traversal::Config {
+            maximum_screen_space_error: self.sse_threshold,
+            ..tuile_core::traversal::Config::interactive_globe()
+        }
     }
 
     /// The shortest interval between two frames, for how hot the device runs
