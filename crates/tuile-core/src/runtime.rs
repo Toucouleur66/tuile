@@ -2087,6 +2087,97 @@ mod tests {
         assert!(matches!(stream.poll_message(&mut cx), Poll::Ready(None)));
     }
 
+    /// **A cancelled load is aborted for real, and a resource is never
+    /// loaded twice at once.** A loader whose loads never answer records
+    /// each load's start and the drop of its future — which is what aborts
+    /// the request under it (a browser's `AbortController`, a native
+    /// client's connection). The camera leaves the ground those loads were
+    /// for; once their grace has passed, every one of them is dropped within
+    /// the step that cancels it, and at no moment are two loads of one tile
+    /// alive together.
+    #[test]
+    fn a_cancelled_load_is_aborted_and_never_overlaps_its_restart() {
+        use std::sync::atomic::AtomicU64;
+        #[derive(Default)]
+        struct Live {
+            alive: std::collections::HashMap<TileId, u32>,
+            overlap: u32,
+            started: u32,
+            dropped: u32,
+        }
+        struct Guard(Arc<std::sync::Mutex<Live>>, TileId);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let mut l = self.0.lock().expect("live");
+                l.dropped += 1;
+                if let Some(n) = l.alive.get_mut(&self.1) {
+                    *n -= 1;
+                }
+            }
+        }
+        struct Hanging(Arc<std::sync::Mutex<Live>>);
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        impl TileLoader for Hanging {
+            async fn load(&self, id: TileId) -> Result<Loaded, LoadError> {
+                {
+                    let mut l = self.0.lock().expect("live");
+                    l.started += 1;
+                    let n = l.alive.entry(id).or_default();
+                    *n += 1;
+                    if *n > 1 {
+                        l.overlap += 1;
+                    }
+                }
+                let _guard = Guard(Arc::clone(&self.0), id);
+                futures_util::future::pending().await
+            }
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tileset = deep_tileset(dir.path());
+        let live = Arc::new(std::sync::Mutex::new(Live::default()));
+        let tree: Box<dyn TileTree> = Box::new(TilesetTree::new(Arc::new(RwLock::new(tileset))));
+        let now = Arc::new(AtomicU64::new(0));
+        let clock = Arc::clone(&now);
+        let (mut stream, server) = in_process_with(
+            tree,
+            Arc::new(Hanging(Arc::clone(&live))),
+            Config::default(),
+            roomy(),
+        )
+        .expect("budget");
+        let server = server.with_clock(Arc::new(move || Micros(clock.load(Ordering::SeqCst))));
+        let mut server = Box::pin(server.run());
+        let mut consumer = Consumer::default();
+        look(&stream, near_view(), 1);
+        settle(&mut server, &mut stream, &mut consumer);
+        let started = live.lock().expect("live").started;
+        assert!(started > 0, "nothing started");
+        // Away, long enough for the grace to pass; the steps that follow
+        // cancel what the near view wanted.
+        for (k, view) in [far_view(), near_view(), far_view()]
+            .into_iter()
+            .enumerate()
+        {
+            now.fetch_add(2_000_000, Ordering::SeqCst);
+            look(&stream, view, 2 + k as u64);
+            settle(&mut server, &mut stream, &mut consumer);
+        }
+        let l = live.lock().expect("live");
+        assert!(l.dropped > 0, "no cancelled load was dropped");
+        assert_eq!(
+            l.overlap, 0,
+            "{} loads overlapped a live one of their tile",
+            l.overlap
+        );
+        let alive: u32 = l.alive.values().sum();
+        assert_eq!(
+            alive + l.dropped,
+            l.started,
+            "a load neither alive nor dropped"
+        );
+    }
+
     /// **The loader is asked about a resource's presence once a second at
     /// most**, however many steps weigh it: answering a drape costs the
     /// loader its imagery mosaic, and asking it at every step of a settling
