@@ -904,7 +904,7 @@ mod tests {
         .expect("order");
         assert_eq!(order.segments, Store::Mezzanine);
         let done = service.compress(&order).await.expect("compressed");
-        assert_eq!(done.key, "1557732/20261020T1000Z-ab12/films/copy@1.mp4");
+        assert_eq!(done.key, "1557732/20261020T1000Z-ab12/films/copy-v1.mp4");
         assert_eq!(done.frames, 5);
         assert!(runs.exists(&done.key).await.expect("exists"));
         let refused = service

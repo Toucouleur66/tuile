@@ -5,7 +5,7 @@
 //! into the file a viewer gets, by a **delivery profile**.
 //!
 //! ```text
-//! render segments (mezzanine) ─► join ─► compress <profile> ─► <run>/films/<profile>@<v>.mp4
+//! render segments (mezzanine) ─► join ─► compress <profile> ─► <run>/films/<profile>-v<n>.mp4
 //! ```
 //!
 //! The render nodes write a near-transparent HEVC Main10 *mezzanine*
@@ -18,7 +18,7 @@
 //!
 //! The profiles here are generic, typed encoder specs; a product names its
 //! own choices after them. A profile's [`version`](Profile::version) moves
-//! whenever its settings do, and is part of its file's key: a retuned
+//! whenever its settings do, and is part of its file's key (`<name>-v<version>`): a retuned
 //! profile makes new files and never overwrites a delivered one.
 //!
 //! This module is the contract (the profiles, the order, the answer); the
@@ -53,7 +53,7 @@ pub struct Profile {
     /// Its name among [`Profile::preset`]'s.
     pub name: String,
     /// Raised whenever a setting below changes: the key of every file made
-    /// with it (`<name>@<version>`).
+    /// with it (`<name>-v<version>`).
     pub version: u32,
     pub codec: VideoCodec,
     /// Bits per sample of the encoded stream: 8 or 10.
@@ -205,9 +205,10 @@ impl Profile {
         }
     }
 
-    /// The key of the files it makes: `<name>@<version>`.
+    /// The key of the files it makes: `<name>-v<version>` — letters,
+    /// digits and dashes, what any store key and any URL take as they are.
     pub fn key(&self) -> String {
-        format!("{}@{}", self.name, self.version)
+        format!("{}-v{}", self.name, self.version)
     }
 
     /// The (mean, ceiling) bitrates of a `width`×`height` film at `fps`, in
@@ -276,11 +277,11 @@ impl Delivery {
         Some(Delivery::Encode { profile })
     }
 
-    /// Its files' key: the profile's, or `copy@1`.
+    /// Its files' key: the profile's, or `copy-v1`.
     pub fn key(&self) -> String {
         match self {
             Delivery::Encode { profile } => profile.key(),
-            Delivery::Copy => "copy@1".into(),
+            Delivery::Copy => "copy-v1".into(),
         }
     }
 }
@@ -385,8 +386,8 @@ mod tests {
     #[test]
     fn a_delivery_is_named_and_keyed_by_its_version() {
         let web = Delivery::named("h264", Some(100_000_000)).expect("h264");
-        assert_eq!(web.key(), "h264@1");
-        assert_eq!(film_key("1557732/20261020T1012Z-ab12/", &web), "1557732/20261020T1012Z-ab12/films/h264@1.mp4");
+        assert_eq!(web.key(), "h264-v1");
+        assert_eq!(film_key("1557732/20261020T1012Z-ab12/", &web), "1557732/20261020T1012Z-ab12/films/h264-v1.mp4");
         assert_eq!(Delivery::named("copy", None), Some(Delivery::Copy));
         assert_eq!(Delivery::named("av1", None), None);
         let order: CompressOrder = serde_json::from_value(serde_json::json!({
