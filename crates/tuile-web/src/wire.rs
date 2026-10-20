@@ -55,26 +55,7 @@ pub fn encode_client(message: &ClientMessage) -> Vec<u8> {
     match message {
         ClientMessage::ViewerState { views, generation } => {
             w.u8(0);
-            w.len(views.len());
-            for view in views {
-                let p = ViewStateParams::from(*view);
-                w.dvec3(p.position);
-                w.dvec3(p.direction);
-                w.dvec3(p.up);
-                w.f64(p.viewport_px.x);
-                w.f64(p.viewport_px.y);
-                w.f64(p.fovy_rad);
-                match p.fov {
-                    Some(fov) => {
-                        w.u8(1);
-                        for v in [fov.left, fov.right, fov.up, fov.down] {
-                            w.f64(v);
-                        }
-                    }
-                    None => w.u8(0),
-                }
-                w.f64(p.scale);
-            }
+            write_views(&mut w, views);
             w.u64(*generation);
         }
         ClientMessage::Ack {
@@ -118,49 +99,80 @@ pub fn encode_client(message: &ClientMessage) -> Vec<u8> {
             w.u8(6);
             w.u64(*bytes);
         }
+        ClientMessage::Ahead { views } => {
+            w.u8(7);
+            write_views(&mut w, views);
+        }
     }
     w.0
+}
+
+/// The views of a message, each with its lens and scale.
+fn write_views(w: &mut Writer, views: &[ViewState]) {
+    w.len(views.len());
+    for view in views {
+        let p = ViewStateParams::from(*view);
+        w.dvec3(p.position);
+        w.dvec3(p.direction);
+        w.dvec3(p.up);
+        w.f64(p.viewport_px.x);
+        w.f64(p.viewport_px.y);
+        w.f64(p.fovy_rad);
+        match p.fov {
+            Some(fov) => {
+                w.u8(1);
+                for v in [fov.left, fov.right, fov.up, fov.down] {
+                    w.f64(v);
+                }
+            }
+            None => w.u8(0),
+        }
+        w.f64(p.scale);
+    }
+}
+
+/// The views [`write_views`] wrote.
+fn read_views(r: &mut Reader<'_>) -> Result<Vec<ViewState>, WireError> {
+    let n = r.len()?;
+    let mut views = Vec::with_capacity(n.min(16));
+    for _ in 0..n {
+        let position = r.dvec3()?;
+        let direction = r.dvec3()?;
+        let up = r.dvec3()?;
+        let viewport_px = DVec2::new(r.f64()?, r.f64()?);
+        let fovy_rad = r.f64()?;
+        let fov = match r.u8()? {
+            0 => None,
+            1 => Some(Fov {
+                left: r.f64()?,
+                right: r.f64()?,
+                up: r.f64()?,
+                down: r.f64()?,
+            }),
+            tag => {
+                return Err(WireError::Tag {
+                    what: "a lens",
+                    tag,
+                })
+            }
+        };
+        let mut params =
+            ViewStateParams::perspective(position, direction, up, viewport_px, fovy_rad);
+        params.fov = fov;
+        params.scale = r.f64()?;
+        views.push(ViewState::from(params));
+    }
+    Ok(views)
 }
 
 /// Reads a message the page wrote.
 pub fn decode_client(bytes: &[u8]) -> Result<ClientMessage, WireError> {
     let mut r = Reader::new(bytes);
     let message = match r.u8()? {
-        0 => {
-            let n = r.len()?;
-            let mut views = Vec::with_capacity(n.min(16));
-            for _ in 0..n {
-                let position = r.dvec3()?;
-                let direction = r.dvec3()?;
-                let up = r.dvec3()?;
-                let viewport_px = DVec2::new(r.f64()?, r.f64()?);
-                let fovy_rad = r.f64()?;
-                let fov = match r.u8()? {
-                    0 => None,
-                    1 => Some(Fov {
-                        left: r.f64()?,
-                        right: r.f64()?,
-                        up: r.f64()?,
-                        down: r.f64()?,
-                    }),
-                    tag => {
-                        return Err(WireError::Tag {
-                            what: "a lens",
-                            tag,
-                        })
-                    }
-                };
-                let mut params =
-                    ViewStateParams::perspective(position, direction, up, viewport_px, fovy_rad);
-                params.fov = fov;
-                params.scale = r.f64()?;
-                views.push(ViewState::from(params));
-            }
-            ClientMessage::ViewerState {
-                views,
-                generation: r.u64()?,
-            }
-        }
+        0 => ClientMessage::ViewerState {
+            views: read_views(&mut r)?,
+            generation: r.u64()?,
+        },
         1 => ClientMessage::Ack {
             resource: r.resource()?,
             gen: Generation(r.u64()?),
@@ -198,6 +210,9 @@ pub fn decode_client(bytes: &[u8]) -> Result<ClientMessage, WireError> {
             total_bytes: r.u64()?,
         },
         6 => ClientMessage::ReleaseBeyond { bytes: r.u64()? },
+        7 => ClientMessage::Ahead {
+            views: read_views(&mut r)?,
+        },
         tag => {
             return Err(WireError::Tag {
                 what: "a client message",
@@ -1328,16 +1343,27 @@ mod tests {
             panic!("not a viewer state");
         };
         assert_eq!(generation, 12);
-        assert_eq!(views.len(), 2);
-        for (sent, got) in [view, eye].iter().zip(&views) {
-            let (a, b) = (ViewStateParams::from(*sent), ViewStateParams::from(*got));
-            assert_eq!(
-                (a.position, a.direction, a.up),
-                (b.position, b.direction, b.up)
-            );
-            assert_eq!((a.viewport_px, a.fovy_rad), (b.viewport_px, b.fovy_rad));
-            assert_eq!((a.fov, a.scale), (b.fov, b.scale));
-        }
+        let same = |views: &[ViewState]| {
+            assert_eq!(views.len(), 2);
+            for (sent, got) in [view, eye].iter().zip(views) {
+                let (a, b) = (ViewStateParams::from(*sent), ViewStateParams::from(*got));
+                assert_eq!(
+                    (a.position, a.direction, a.up),
+                    (b.position, b.direction, b.up)
+                );
+                assert_eq!((a.viewport_px, a.fovy_rad), (b.viewport_px, b.fovy_rad));
+                assert_eq!((a.fov, a.scale), (b.fov, b.scale));
+            }
+        };
+        same(&views);
+        // The frames ahead cross the same way.
+        let ClientMessage::Ahead { views } = decode_client(&encode_client(&ClientMessage::Ahead {
+            views: vec![view, eye],
+        }))
+        .expect("reads back") else {
+            panic!("not the views ahead");
+        };
+        same(&views);
         let drape = ResourceId::drape(TileId(4), LayerId(3), 12);
         let mut messages = vec![
             ClientMessage::Ack {
