@@ -85,6 +85,35 @@ pub fn start_viewer(
     make_worker: js_sys::Function,
     events: js_sys::Function,
 ) -> Result<WebViewer, JsError> {
+    start_viewer_with(canvas, options, make_worker, events, None)
+}
+
+/// Creates a viewer on `canvas`, with a Rust application owning each frame.
+///
+/// Everything [`start_viewer`] does, and `host` is asked for the camera before
+/// each frame and sees canvas events before the viewer's own controls — see
+/// [`crate::frame_host`]. This is the door a simulator or a replay comes in
+/// by; the package's JS API is unchanged and does not use it.
+///
+/// The host is **not** required to be `Send` or `Sync`: a page's host holds UI
+/// signals that are neither, and the loop here is single-threaded anyway.
+pub fn start_with_host(
+    canvas: web_sys::HtmlCanvasElement,
+    options: JsValue,
+    make_worker: js_sys::Function,
+    events: js_sys::Function,
+    host: Box<dyn crate::frame_host::FrameHost>,
+) -> Result<WebViewer, JsError> {
+    start_viewer_with(canvas, options, make_worker, events, Some(host))
+}
+
+fn start_viewer_with(
+    canvas: web_sys::HtmlCanvasElement,
+    options: JsValue,
+    make_worker: js_sys::Function,
+    events: js_sys::Function,
+    frame_host: Option<Box<dyn crate::frame_host::FrameHost>>,
+) -> Result<WebViewer, JsError> {
     super::log::install();
     let options: Options = serde_wasm_bindgen::from_value(options)
         .map_err(|e| JsError::new(&format!("options: {e}")))?;
@@ -133,6 +162,7 @@ pub fn start_viewer(
     let retries = Retries::new(move || session::start(&plan));
     let config = ViewerConfig {
         controller: CameraController::new(view.camera()).with_min_altitude(1.0),
+        frame_host,
         title: options.name,
         layers,
         layer: 0,

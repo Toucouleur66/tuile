@@ -279,6 +279,9 @@ fn session(embedder: Arc<dyn ViewerHost>) -> anyhow::Result<()> {
     );
     let app_config = ViewerConfig {
         controller,
+        // The viewer's own binary is nobody's host: the person at the keyboard
+        // owns this camera.
+        frame_host: None,
         title: host::app_name().into(),
         layers,
         layer: opening,

@@ -71,6 +71,7 @@ mod backdrop;
 mod desktop;
 mod device;
 pub mod embed;
+pub mod frame_host;
 mod gate;
 mod globe;
 mod host;
@@ -125,6 +126,27 @@ pub mod android {
 mod web;
 #[cfg(target_arch = "wasm32")]
 use web as shell;
+
+/// The door a Rust host comes in by on the web: the viewer on a canvas, with
+/// an application owning each frame ([`frame_host`]).
+///
+/// The function rather than the module: what a host is promised is this call,
+/// and the shell around it is the viewer's own business.
+#[cfg(target_arch = "wasm32")]
+pub use web::page::start_with_host;
+
+/// The worker entries a host's own module must re-export.
+///
+/// A host that starts the viewer with [`start_with_host`] *is* the wasm
+/// module the page loads, so the package's `worker.js` and
+/// `decode-worker.js` import **its** name, not the viewer's — and they call
+/// these. Re-exporting them is how a host's module carries them; they are
+/// `#[wasm_bindgen]` already, so naming them here is enough for the bindings
+/// to appear in the host's own JS.
+#[cfg(target_arch = "wasm32")]
+pub use web::decode::run_decode_worker;
+#[cfg(target_arch = "wasm32")]
+pub use web::worker::run_worker;
 
 pub use embed::{
     credential, renamed_by_environment, Identity, ImageryChoice, MissingCredential, Sources,

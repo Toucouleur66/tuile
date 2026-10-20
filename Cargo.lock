@@ -6546,6 +6546,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tuile-atmosphere",
  "tuile-core",
+ "tuile-overlay",
  "tuile-pack",
  "tuile-terrain",
 ]
@@ -6712,6 +6713,13 @@ dependencies = [
  "tuile-terrain",
  "tuile-wgpu",
  "wgpu",
+]
+
+[[package]]
+name = "tuile-overlay"
+version = "0.11.0"
+dependencies = [
+ "glam 0.33.1",
 ]
 
 [[package]]

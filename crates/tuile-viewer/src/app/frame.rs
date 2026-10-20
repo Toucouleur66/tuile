@@ -83,10 +83,53 @@ impl App {
         dt
     }
 
+    /// Gives an embedding application the frame before it is prepared, and
+    /// carries out what it asked for.
+    ///
+    /// The host is taken out of `self` for the call and put back after: it is
+    /// handed the camera and the preload list, which live in `self` too, and
+    /// one of them has to let go. Taking the host is the cheap end — a box
+    /// moved twice — and it also means a host that panics does not leave a
+    /// half-borrowed application behind.
+    fn ask_the_host(&mut self, dt: std::time::Duration) {
+        let Some(mut host) = self.frame_host.take() else {
+            return;
+        };
+        let (w, h) = self.viewport();
+        let mut camera = crate::frame_host::HostCamera::new(self.controller.camera);
+        let mut preload = std::mem::take(&mut self.preload);
+        preload.clear();
+        {
+            let mut frame = crate::frame_host::HostFrame {
+                camera: &mut camera,
+                preload: &mut preload,
+                viewport: (w as u32, h as u32),
+            };
+            host.before_frame(dt.as_secs_f64(), &mut frame);
+        }
+        match camera.taken() {
+            Some(crate::frame_host::Asked::Drive(pose)) => self.controller.drive(pose),
+            // Placing is a jump with the floor kept, and it ends any glide:
+            // two things moving the same eye is the one state nobody can
+            // reason about.
+            Some(crate::frame_host::Asked::Place(pose)) => {
+                self.flight = None;
+                self.controller.jump_to(pose);
+            }
+            Some(crate::frame_host::Asked::Release) => self.controller.release(),
+            None => {}
+        }
+        self.preload = preload;
+        self.frame_host = Some(host);
+    }
+
     /// Moves the eye toward where the gestures have put it, and watches how it
     /// went.
     fn ease_the_camera(&mut self, dt: std::time::Duration) {
         let before = self.controller.camera.position;
+        // Before the ease: a host that drives sets the pose this frame is
+        // drawn and traversed from, and the ease then finds nothing to do.
+        self.ask_the_host(dt);
         self.controller.advance(dt.as_secs_f64());
         // A glide puts the eye where it is due, frame by frame.
         if let Some(flight) = self.flight {

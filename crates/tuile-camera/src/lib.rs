@@ -384,6 +384,15 @@ pub struct CameraController {
     target: GlobeCamera,
     /// The surface to stay above. `None` clamps against the ellipsoid alone.
     ground: Option<Arc<dyn GroundHeight>>,
+    /// A host is driving the camera, so [`Self::update`] neither eases nor
+    /// clamps.
+    ///
+    /// Remembered rather than applied once, because the clamp is not applied
+    /// where the camera is set — it is applied in `update`, every frame, to
+    /// the *target*. A `drive` that only assigned both would be lifted off
+    /// its pose by the very next frame, which is a bug a caller cannot see
+    /// and cannot work around.
+    driven: bool,
 }
 
 /// The terrain where it has an opinion, sea level where it does not.
@@ -426,6 +435,7 @@ impl CameraController {
             min_altitude: 1.0,
             target: camera,
             ground: None,
+            driven: false,
         }
     }
 
@@ -689,6 +699,67 @@ impl CameraController {
         &self.target
     }
 
+    /// Puts the eye exactly at `camera`, leaving nothing behind that would
+    /// move it again: no easing, and **no altitude floor**.
+    ///
+    /// For a host that owns the camera — a replay, a simulator, a scripted
+    /// flight — where the pose was decided against the host's own ground, and
+    /// the controller's two services both become ways of being wrong:
+    ///
+    /// * easing draws a pose somewhere behind the asked-for one, by an amount
+    ///   that depends on how long the last frame took;
+    /// * [`Self::min_altitude`] raises a pose that was deliberate. A film's
+    ///   eye goes where the film says, including low over a ridge whose
+    ///   sampled height disagrees.
+    ///
+    /// The target is set to the same pose, so the next [`Self::update`] has
+    /// nothing to pull toward: a camera driven this frame and released the
+    /// next carries on from where it was driven rather than snapping back to
+    /// a stale gesture.
+    ///
+    /// This is the only way into the controller that skips the floor. Every
+    /// gesture still goes through [`Self::update`], which still clamps; a host
+    /// that wants the floor should use [`crate::CameraController::jump_to`]
+    /// and let the controller take over.
+    pub fn drive(&mut self, camera: GlobeCamera) {
+        self.camera = camera;
+        self.target = camera;
+        self.driven = true;
+    }
+
+    /// Stops driving: the controller eases and clamps again, from wherever
+    /// the camera was last driven to.
+    pub fn release(&mut self) {
+        self.driven = false;
+        // The gesture target becomes the driven pose, so there is nothing
+        // stale to be pulled back toward. The floor applies from the next
+        // update, as it does for a gesture.
+        self.target = self.camera;
+    }
+
+    /// Whether a host is driving the camera.
+    pub fn is_driven(&self) -> bool {
+        self.driven
+    }
+
+    /// Puts the eye at `camera` with the floor applied, and the controller
+    /// carrying on normally from there — what a host means by *place*.
+    ///
+    /// Unlike [`Self::drive`], the altitude floor and the relief it is
+    /// measured against still hold, so a pose inside a hillside is lifted out
+    /// of it as a gesture would be.
+    pub fn jump_to(&mut self, camera: GlobeCamera) {
+        self.camera = camera;
+        self.target = camera;
+        // Placing is handing the camera back: a host that places is no longer
+        // driving, or the floor it just asked for would not apply.
+        self.driven = false;
+        // The same clamp a gesture gets, applied once here so `place` and a
+        // drag agree about where the floor is.
+        self.camera.position = self.lifted(self.camera.position);
+        self.target.position = self.camera.position;
+    }
+
     /// Eases the live camera toward the gesture target by a **duration**, not by
     /// a fixed fraction — call once a frame with the time since the last one.
     ///
@@ -721,6 +792,14 @@ impl CameraController {
     }
 
     pub fn update(&mut self, k: f64) {
+        // A driven camera is already where it was asked to be, and neither
+        // the ease nor the floor below applies to it. Returning here rather
+        // than guarding each of them is the point: the clamp is on the
+        // *target*, every frame, so a `drive` that merely assigned would be
+        // lifted off its pose on the very next turn of the loop.
+        if self.driven {
+            return;
+        }
         let k = k.clamp(0.0, 1.0);
         // One clamp for every gesture. Tilting and dragging move the eye
         // laterally, so a camera legally placed a moment ago can end up inside
@@ -778,6 +857,124 @@ mod tests {
     fn nadir_over(lat: f64, lon: f64, alt: f64) -> CameraController {
         let cam = GlobeCamera::from_geodetic(lat, lon, alt, 0.0, FRAC_PI_2, 60f64.to_radians());
         CameraController::new(cam).with_min_altitude(100.0)
+    }
+
+    /// The contract a host is given: what it drives is what is drawn.
+    ///
+    /// Bit for bit, not "close enough". A simulator comparing its own camera
+    /// path against a film's is comparing poses, and a floor or an ease that
+    /// moved the eye by a metre makes every such comparison a lie.
+    #[test]
+    fn a_driven_pose_is_drawn_exactly_even_under_the_floor() {
+        // A hundred metres of floor, and a pose deliberately below it.
+        let mut ctrl = nadir_over(42.7_f64.to_radians(), 2.9_f64.to_radians(), 100_000.0);
+        assert_eq!(ctrl.min_altitude, 100.0);
+        let under = GlobeCamera::from_geodetic(
+            42.7_f64.to_radians(),
+            2.9_f64.to_radians(),
+            // Ten metres up: a tenth of the floor.
+            10.0,
+            0.0,
+            FRAC_PI_2,
+            60f64.to_radians(),
+        );
+
+        ctrl.drive(under);
+
+        assert_eq!(
+            ctrl.camera.position, under.position,
+            "the floor moved a driven eye"
+        );
+        assert_eq!(ctrl.camera.direction, under.direction);
+        assert_eq!(ctrl.camera.up, under.up);
+        assert_eq!(ctrl.camera.fovy, under.fovy);
+
+        // And it stays there: a frame's ease must not pull it anywhere,
+        // because the target was driven too.
+        ctrl.advance(1.0 / 60.0);
+        assert_eq!(
+            ctrl.camera.position, under.position,
+            "the ease moved a driven eye"
+        );
+    }
+
+    /// `place` is the other door, and it must keep the floor — otherwise a
+    /// host has no way to ask for "put it here and behave normally".
+    #[test]
+    fn a_placed_pose_is_lifted_to_the_floor() {
+        let mut ctrl = nadir_over(42.7_f64.to_radians(), 2.9_f64.to_radians(), 100_000.0);
+        let under = GlobeCamera::from_geodetic(
+            42.7_f64.to_radians(),
+            2.9_f64.to_radians(),
+            10.0,
+            0.0,
+            FRAC_PI_2,
+            60f64.to_radians(),
+        );
+
+        ctrl.jump_to(under);
+
+        let height = ecef_to_geodetic(ctrl.camera.position).height;
+        assert!(
+            height >= ctrl.min_altitude - 1e-6,
+            "placed at {height} m, under the {} m floor",
+            ctrl.min_altitude
+        );
+    }
+
+    /// Driving and then releasing continues from the driven pose. Without
+    /// this the eye snaps back to whatever gesture the controller was last
+    /// left holding, which on screen is a jump out of nowhere.
+    #[test]
+    fn releasing_a_driven_camera_carries_on_from_where_it_was_driven() {
+        let mut ctrl = nadir_over(42.7_f64.to_radians(), 2.9_f64.to_radians(), 100_000.0);
+        let far = GlobeCamera::from_geodetic(
+            43.5_f64.to_radians(),
+            3.8_f64.to_radians(),
+            4_000.0,
+            0.0,
+            FRAC_PI_2,
+            60f64.to_radians(),
+        );
+        ctrl.drive(far);
+        ctrl.release();
+        assert!(!ctrl.is_driven());
+        // Release is "stop driving": the controller eases again, and with its
+        // target set to where the camera was driven there is nothing to ease
+        // toward. A release that left a stale target would snap the eye back
+        // to the last gesture, which on screen is a jump out of nowhere.
+        for _ in 0..10 {
+            ctrl.advance(1.0 / 60.0);
+        }
+        let drift = (ctrl.camera.position - far.position).length();
+        // 4 km up, well clear of the floor, so nothing but a stale target
+        // could move it.
+        assert!(drift < 1e-6, "released camera drifted {drift} m");
+    }
+
+    /// A gesture after a release behaves exactly as a gesture always has —
+    /// floor included. Driving must not leave the controller permanently
+    /// unclamped.
+    #[test]
+    fn the_floor_is_back_once_the_host_lets_go() {
+        let mut ctrl = nadir_over(42.7_f64.to_radians(), 2.9_f64.to_radians(), 100_000.0);
+        let under = GlobeCamera::from_geodetic(
+            42.7_f64.to_radians(),
+            2.9_f64.to_radians(),
+            10.0,
+            0.0,
+            FRAC_PI_2,
+            60f64.to_radians(),
+        );
+        ctrl.drive(under);
+        ctrl.release();
+        ctrl.update(1.0);
+        let height = ecef_to_geodetic(ctrl.camera.position).height;
+        assert!(
+            height >= ctrl.min_altitude - 1e-6,
+            "after release the eye sits at {height} m, under the {} m floor",
+            ctrl.min_altitude
+        );
     }
 
     #[test]
