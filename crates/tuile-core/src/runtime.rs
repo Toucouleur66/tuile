@@ -499,6 +499,14 @@ impl GeometryServer {
         Arc::clone(&self.state.meter)
     }
 
+    /// Where each load in flight stands in the budget's priority order, as
+    /// of its latest step — for a host's pool that orders the work those
+    /// loads wait on (a browser's decode workers), reading
+    /// [`crate::offload::loading`] when a job is submitted.
+    pub fn load_ranks(&self) -> crate::offload::LoadRanks {
+        self.state.ranks.clone()
+    }
+
     /// The budget this session runs on.
     pub fn budget_config(&self) -> &BudgetConfig {
         self.state.budget.config()
@@ -762,6 +770,9 @@ struct State {
     meter: SharedMeter,
     /// Loads in flight, by resource.
     in_flight: BTreeMap<ResourceId, Flight>,
+    /// Where each of them stands in the budget's order, as of the last step:
+    /// for a pool that orders the work they wait on.
+    ranks: crate::offload::LoadRanks,
     /// The decoded copies the budget counts (its decoded tier): delivered
     /// from here, again after an eviction, until the budget releases them.
     decoded: BTreeMap<ResourceId, (Generation, ResourceContent)>,
@@ -806,6 +817,7 @@ impl State {
             budget,
             meter,
             in_flight: BTreeMap::new(),
+            ranks: crate::offload::LoadRanks::default(),
             decoded: BTreeMap::new(),
             events: Vec::new(),
             epoch: 0,
@@ -1125,8 +1137,10 @@ impl State {
     fn start(&mut self, host: &Host<'_>, r: ResourceId, gen: Generation, loads: &mut Loads) {
         let loader = Arc::clone(host.loader);
         let (handle, registration) = AbortHandle::new_pair();
+        // Named while it is polled: the work it hands a pool says which load
+        // it is for, and the pool orders it by that load's rank.
         let fut: BoxLoadFut = Box::pin(Woken::new(
-            async move {
+            crate::offload::ForLoad::new(r, async move {
                 let result = match r {
                     ResourceId::Mesh(t) => loader.load(t).await.map(Fetched::Mesh),
                     ResourceId::Drape { tile, layer, level } => loader
@@ -1135,7 +1149,7 @@ impl State {
                         .map(Fetched::Drape),
                 };
                 (r, gen, result)
-            },
+            }),
             &crate::metrics::metrics().load_wake_wait_seconds,
         ));
         loads.push(Abortable::new(fut, registration), &handle);
@@ -1347,6 +1361,20 @@ impl State {
                 crate::metrics::publish_budget(meter.publish());
             }
         }
+        // The loads in flight, in the budget's order of this step; those it
+        // no longer ranks (not wanted, waiting out their grace) after them.
+        let mut ranked: Vec<(Option<crate::budget::PriorityKey>, ResourceId)> = self
+            .in_flight
+            .keys()
+            .map(|r| (self.budget.resource(*r).and_then(|v| v.priority), *r))
+            .collect();
+        ranked.sort_by(|a, b| match (&a.0, &b.0) {
+            (Some(x), Some(y)) => x.cmp(y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.1.cmp(&b.1),
+        });
+        self.ranks.publish(ranked.into_iter().map(|(_, r)| r));
         let priming = self.priming(&need);
         let mm = crate::metrics::metrics();
         mm.priming_total.set(u64::from(priming.total));
@@ -2023,6 +2051,50 @@ mod tests {
             consumer.errors
         );
         assert!(matches!(stream.poll_message(&mut cx), Poll::Ready(None)));
+    }
+
+    /// **The loads in flight are ranked in the budget's order, and each
+    /// names itself to the work it hands a pool**: what a decode pool orders
+    /// its queue by. A loader that never answers keeps every load in flight;
+    /// each one notes the resource [`crate::offload::loading`] names while
+    /// it is polled, and every one of those is ranked, the ranks a
+    /// permutation of the loads.
+    #[test]
+    fn loads_in_flight_are_ranked_and_name_themselves() {
+        struct Noting(Arc<std::sync::Mutex<Vec<ResourceId>>>);
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        impl TileLoader for Noting {
+            async fn load(&self, _id: TileId) -> Result<Loaded, LoadError> {
+                if let Some(r) = crate::offload::loading() {
+                    self.0.lock().expect("noted").push(r);
+                }
+                futures_util::future::pending().await
+            }
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tileset = deep_tileset(dir.path());
+        let noted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut stream, server) = in_process_with(
+            Box::new(tileset),
+            Arc::new(Noting(Arc::clone(&noted))),
+            Config::default(),
+            roomy(),
+        )
+        .expect("budget");
+        let ranks = server.load_ranks();
+        let mut server = Box::pin(server.run());
+        let mut consumer = Consumer::default();
+        look(&stream, near_view(), 1);
+        settle(&mut server, &mut stream, &mut consumer);
+        let noted = noted.lock().expect("noted").clone();
+        assert!(!noted.is_empty(), "no load named itself");
+        let mut seen: Vec<u32> = noted
+            .iter()
+            .map(|r| ranks.rank(*r).expect("a load in flight is ranked"))
+            .collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..noted.len() as u32).collect::<Vec<_>>());
     }
 
     /// **A release between frames is announced** as any eviction, and takes
