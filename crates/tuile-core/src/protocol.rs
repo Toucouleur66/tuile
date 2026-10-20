@@ -9,8 +9,9 @@
 //!   in poll form; consumers `.await` messages.
 //! - **Sending is synchronous and non-blocking** — `send` is called from
 //!   render loops (a `ViewerState` per frame) which must never await.
-//! - Consumer-side `Content` is always [`TileContent::Decoded`]; raw glb is
-//!   what network bindings put on the wire (M2).
+//! - Consumer-side `Content` is decoded ([`ResourceContent`]): a mesh or a
+//!   drape, each a resource of its own; raw glb is what network bindings put
+//!   on the wire (M2).
 //!
 //! Bindings: [`InProcessStream`] here (channels, zero serialization); the
 //! WebSocket binding lives in `tuile-server`/clients (M2). The static HTTP

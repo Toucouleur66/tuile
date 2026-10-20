@@ -45,9 +45,15 @@ use std::task::{Context, Poll};
 
 use crate::budget::ResourceId;
 
-thread_local! {
-    static LOADING: Cell<Option<ResourceId>> = const { Cell::new(None) };
+// Const already; clippy on Android's target reads the expansion otherwise.
+#[allow(clippy::missing_const_for_thread_local)]
+mod loading_slot {
+    use super::*;
+    thread_local! {
+        pub(super) static LOADING: Cell<Option<ResourceId>> = const { Cell::new(None) };
+    }
 }
+use loading_slot::LOADING;
 
 /// The resource whose load is being polled on this thread, if any: what a
 /// job submitted from inside a load is for. A pool that orders its queue

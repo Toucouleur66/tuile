@@ -3,7 +3,7 @@
 
 //! The geometry server: traversal, the graphics budget, fetch and decode,
 //! orchestrated around the pure [`traverse`](crate::traversal::traverse)
-//! function and the pure [`Budget`](crate::budget::Budget).
+//! function and the pure [`crate::budget::Budget`].
 //!
 //! This is a LOGICAL server, not a network server: [`in_process`] binds it
 //! to a consumer over channels (the fully decoded liaison). Network
