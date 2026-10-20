@@ -24,8 +24,8 @@ use glam::DVec3;
 use std::collections::{BTreeMap, HashMap};
 use std::task::{Context, Poll};
 use tuile_core::budget::{
-    Bytes, Class, DrawSet, EyeCoverage, FrameDeadline, FrameRecord, Generation, LayerId,
-    PerClass, ResourceId, Role, UploadPlan,
+    Bytes, Class, DrawSet, EyeCoverage, FrameDeadline, FrameRecord, Generation, LayerId, PerClass,
+    ResourceId, Role, UploadPlan,
 };
 use tuile_core::protocol::{
     Ancestry, ClientMessage, GeometryStream, Priming, ResourceContent, ServerMessage,
@@ -434,9 +434,11 @@ impl ContentPump {
         deadline: FrameDeadline,
     ) -> usize {
         let order = self.upload_order();
+        // What an upload moves, not what it is charged: a drape is charged
+        // its share of the imagery it names, and uploads every tile of it.
         let estimate = |r: ResourceId| match self.queue.get(&r).map(|q| &q.content) {
-            Some(ResourceContent::Mesh(m)) => m.cost().gpu,
-            Some(ResourceContent::Drape(d)) => d.cost().gpu,
+            Some(ResourceContent::Mesh(m)) => m.cost().staging,
+            Some(ResourceContent::Drape(d)) => d.cost().staging,
             None => Bytes::ZERO,
         };
         let taken: Vec<ResourceId> = deadline
@@ -445,16 +447,25 @@ impl ContentPump {
         let deferred = (order.len() - taken.len()) as u32;
         let began = web_time::Instant::now();
         let mut uploaded: Vec<(ResourceId, Bytes)> = Vec::with_capacity(taken.len());
+        let mut moved = 0u64;
         for r in taken {
             let Some(q) = self.queue.remove(&r) else {
                 continue;
             };
-            if let Some(bytes) = self.upload_one(stream, gpu, r, q) {
-                uploaded.push((r, Bytes(bytes)));
+            let staging = match &q.content {
+                ResourceContent::Mesh(m) => m.cost().staging.0,
+                ResourceContent::Drape(d) => d.cost().staging.0,
+            };
+            // Recorded as what the upload moved: the frame's deadline is in
+            // those bytes (I18).
+            if self.upload_one(stream, gpu, r, q).is_some() {
+                uploaded.push((r, Bytes(staging)));
+                moved += staging;
             }
         }
         let wall = began.elapsed();
-        let bytes: u64 = uploaded.iter().map(|(_, b)| b.0).sum();
+        // The throughput is of what the uploads moved.
+        let bytes = moved;
         // The throughput a frame's deadline is made of, measured: a moving
         // average, so one slow upload does not halve the next frame's share.
         let ms = wall.as_secs_f64() * 1000.0;
@@ -954,7 +965,8 @@ fn mesh_bytes(prepared: &PreparedTile, content: &tuile_core::DecodedTileContent)
         .meshes
         .iter()
         .map(|m| {
-            m.positions.len() as u64 * tuile_core::content::VERTEX_STRIDE + m.indices.len() as u64 * 4
+            m.positions.len() as u64 * tuile_core::content::VERTEX_STRIDE
+                + m.indices.len() as u64 * 4
         })
         .sum();
     // The tile's uniform, at the alignment a uniform offset needs.
@@ -1199,7 +1211,11 @@ mod tests {
         });
         let mut pump = ContentPump::new(DVec3::ZERO);
         pump.drain(&mut stream);
-        assert_eq!(pump.pending_uploads(), 2, "another generation's cancel took it");
+        assert_eq!(
+            pump.pending_uploads(),
+            2,
+            "another generation's cancel took it"
+        );
         stream.inbox.push_back(ServerMessage::Cancel {
             resources: vec![(ResourceId::Mesh(TileId(1)), Generation(1))],
         });
@@ -1239,16 +1255,19 @@ mod tests {
                 .is_none_or(|p| p.coverage[2] <= 0.0 || p.coverage[3] <= 0.0),
             "a layer over another quarter reaches the child"
         );
-        let _ = (DrapeChoice {
-            resource: ResourceId::drape(TileId(1), LayerId(0), 3),
-            layer: LayerId(0),
-            level: 3,
-            uv: quarter,
-        }, DrawItem {
-            mesh: ResourceId::Mesh(TileId(2)),
-            role: Role::Exact,
-            drapes: Vec::new(),
-            serves: vec![TileId(2)],
-        });
+        let _ = (
+            DrapeChoice {
+                resource: ResourceId::drape(TileId(1), LayerId(0), 3),
+                layer: LayerId(0),
+                level: 3,
+                uv: quarter,
+            },
+            DrawItem {
+                mesh: ResourceId::Mesh(TileId(2)),
+                role: Role::Exact,
+                drapes: Vec::new(),
+                serves: vec![TileId(2)],
+            },
+        );
     }
 }

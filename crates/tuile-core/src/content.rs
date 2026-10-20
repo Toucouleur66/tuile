@@ -208,14 +208,43 @@ pub struct DrapeContent {
 
 impl DrapeContent {
     /// What it costs a consumer: each imagery tile of the mosaic with its
-    /// mip chain, the shared floor excepted. An imagery tile two drapes share
-    /// is charged to both — an over-estimate, never an under-estimate.
+    /// mip chain, in the share of it the drape covers — the shared floor
+    /// excepted.
+    ///
+    /// An imagery tile is uploaded once however many drapes name it, and the
+    /// drapes over neighbouring ground at one level name the same tiles where
+    /// they meet: charging each drape the whole of every tile it touches
+    /// counted a tile straddling an edge twice and a coarse one over a corner
+    /// four times. Charged by covered area, drapes over a partition of the
+    /// ground at one level charge each tile once between them. Two drapes
+    /// over the same ground at the same level (a parent's and its child's)
+    /// still charge the overlap twice: an over-estimate, never an under-one.
+    /// Its staging bytes — what an upload moves — are every tile's whole.
     pub fn cost(&self) -> crate::budget::cost::Cost {
         use crate::budget::cost::{drape_cost, Cost, TextureFormat};
+        use crate::budget::Bytes;
         self.tiles
             .iter()
             .skip(self.floor_tiles)
-            .map(|t| drape_cost(t.texture.width, t.texture.height, TextureFormat::Rgba8))
+            .map(|t| {
+                let whole = drape_cost(t.texture.width, t.texture.height, TextureFormat::Rgba8);
+                // The tile spans 1 / scale of the drape's uv square on each
+                // axis; the part of it inside the square is its coverage.
+                let c = t.coverage;
+                let covered = (c[2].min(1.0) - c[0].max(0.0)).max(0.0) as f64
+                    * (c[3].min(1.0) - c[1].max(0.0)).max(0.0) as f64;
+                let share =
+                    (covered * f64::from(t.scale[0]) * f64::from(t.scale[1])).clamp(0.0, 1.0);
+                // In parts per million: the same integers on every platform.
+                let ppm = (share * 1_000_000.0).round() as u64;
+                // Held: the share. Moved: the whole tile, for an upload is a
+                // texture's, whoever else names it — what an executor's
+                // frame deadline and the delivery credit measure.
+                Cost {
+                    gpu: Bytes(whole.gpu.0).scaled(ppm, 1_000_000),
+                    staging: whole.staging,
+                }
+            })
             .fold(Cost::default(), |a, c| Cost {
                 gpu: a.gpu.plus(c.gpu),
                 staging: a.staging.plus(c.staging),
@@ -459,6 +488,81 @@ fn to_rgba8(img: &gltf::image::Data) -> Result<DecodedTexture, ContentError> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use crate::budget::cost::{drape_cost, TextureFormat};
+    use crate::raster::{GeoRect, ImageryCoord, ImageryLayer};
+
+    /// An imagery tile of 256² placed over a terrain tile, its own rectangle
+    /// `imagery` and the terrain tile's `tile`.
+    fn placed(tile: &GeoRect, imagery: &GeoRect, x: u64) -> ImageryLayer {
+        ImageryLayer::placed(
+            ImageryCoord { level: 9, x, y: 0 },
+            std::sync::Arc::new(DecodedTexture {
+                width: 256,
+                height: 256,
+                rgba8: Vec::new(),
+            }),
+            tile,
+            imagery,
+        )
+    }
+
+    fn drape(tiles: Vec<ImageryLayer>) -> DrapeContent {
+        DrapeContent {
+            layer: crate::budget::LayerId(0),
+            level: 9,
+            tiles,
+            floor_tiles: 0,
+            identity: 0,
+            withheld: false,
+        }
+    }
+
+    /// **A drape is charged the share of each imagery tile it covers, so two
+    /// neighbours sharing a tile charge it once between them.** The imagery
+    /// tiles a drape names are shared with every drape over the same ground
+    /// at the same level; charging each drape the whole of every tile it
+    /// touches counted a tile straddling an edge twice, and a coarse drape
+    /// over a corner four times — a ledger two to four times what the GPU
+    /// held, and a budget that evicted at a third of its room.
+    #[test]
+    fn neighbouring_drapes_charge_a_shared_imagery_tile_once() {
+        let whole = drape_cost(256, 256, TextureFormat::Rgba8).gpu.0;
+        // One imagery tile [0, 2] × [0, 1], straddling two terrain tiles
+        // [0, 1] and [1, 2].
+        let imagery = GeoRect {
+            west: 0.0,
+            south: 0.0,
+            east: 2.0,
+            north: 1.0,
+        };
+        let west = GeoRect {
+            west: 0.0,
+            south: 0.0,
+            east: 1.0,
+            north: 1.0,
+        };
+        let east = GeoRect {
+            west: 1.0,
+            south: 0.0,
+            east: 2.0,
+            north: 1.0,
+        };
+        let a = drape(vec![placed(&west, &imagery, 0)]).cost().gpu.0;
+        let b = drape(vec![placed(&east, &imagery, 0)]).cost().gpu.0;
+        assert!(
+            a.abs_diff(whole / 2) <= whole / 100,
+            "{a} for half of {whole}"
+        );
+        assert!(
+            (a + b).abs_diff(whole) <= whole / 100,
+            "{} for one tile of {whole}",
+            a + b
+        );
+        // A tile wholly inside is charged whole.
+        let inside = drape(vec![placed(&imagery, &imagery, 0)]).cost().gpu.0;
+        assert!(inside.abs_diff(whole) <= whole / 100);
+    }
+
     use super::*;
     use glam::dvec3;
 
