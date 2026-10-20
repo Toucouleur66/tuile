@@ -2073,6 +2073,131 @@ mod batch {
         }
     }
 
+    /// I13: what a batch frame reads does not depend on the order its loads
+    /// come back in. A stand-in for the traversal refines a tile once its
+    /// mesh is in — holding it, its four children waited on, until they all
+    /// are — as terrain is revealed pass by pass. Loads come back one at a
+    /// time (a bake at one fetch in flight), in six orders. Every order reads
+    /// the same drapes, and those are exactly the drapes the frame wears:
+    /// batch never cancels a load it started, so a drape started for a pass
+    /// the selection settles past is read anyway, and whether one is would
+    /// depend on the order the meshes land in.
+    #[test]
+    fn a_batch_frame_reads_the_same_drapes_whatever_order_its_loads_land_in() {
+        use std::cmp::Reverse;
+        use std::collections::{BTreeMap, BTreeSet};
+        use tuile_core::budget::{Generation, TileId};
+
+        type Pick = fn(&BTreeMap<ResourceId, Generation>) -> ResourceId;
+        let first: Pick = |p| *p.keys().next().expect("pending");
+        let last: Pick = |p| *p.keys().next_back().expect("pending");
+        let meshes_first: Pick = |p| {
+            *p.keys()
+                .find(|r| matches!(r, ResourceId::Mesh(_)))
+                .or_else(|| p.keys().next())
+                .expect("pending")
+        };
+        let drapes_first: Pick = |p| {
+            *p.keys()
+                .find(|r| matches!(r, ResourceId::Drape { .. }))
+                .or_else(|| p.keys().next())
+                .expect("pending")
+        };
+        let finest_first: Pick = |p| {
+            *p.keys()
+                .max_by_key(|r| (r.tile().terrain_coord().0, Reverse(**r)))
+                .expect("pending")
+        };
+        let coarsest_first: Pick = |p| {
+            *p.keys()
+                .min_by_key(|r| (r.tile().terrain_coord().0, **r))
+                .expect("pending")
+        };
+        let roots = [t(3, 2, 2), t(3, 4, 4)];
+        let level = |tile: TileId| tile.terrain_coord().0 + 3;
+        // The pass: a root whose mesh is not in is drawn; one whose mesh is
+        // in is held, its children waited on, until every child's is in;
+        // then the children are drawn.
+        let pass = |loaded: &BTreeSet<ResourceId>| {
+            let mut need = NeedSet::new();
+            for root in roots {
+                let kids = children(root);
+                let wear = |k: &TileId| (*k, draped(*k, level(*k)));
+                if !loaded.contains(&mesh(root)) {
+                    need.drawn.push(wear(&root));
+                } else if kids.iter().all(|k| loaded.contains(&mesh(*k))) {
+                    need.drawn.extend(kids.iter().map(wear));
+                } else {
+                    need.drawn.push(wear(&root));
+                    need.blockers.extend(kids.iter().map(wear));
+                }
+            }
+            need
+        };
+        let mut read: Vec<(&str, BTreeSet<ResourceId>)> = Vec::new();
+        for (name, pick) in [
+            ("in order", first),
+            ("in reverse", last),
+            ("meshes first", meshes_first),
+            ("drapes first", drapes_first),
+            ("finest first", finest_first),
+            ("coarsest first", coarsest_first),
+        ] {
+            // One load of each class in flight: which drapes find a slot
+            // while a pass still draws a tile then turns on the order.
+            let mut c = BudgetConfig::batch();
+            c.pinned_level = None;
+            c.max_in_flight[Class::TerrainMesh] = 1;
+            c.max_in_flight[Class::Drape] = 1;
+            let mut r = Rig::new(c);
+            let mut loaded = BTreeSet::new();
+            let mut started = BTreeSet::new();
+            let mut worn = None;
+            for _ in 0..200 {
+                let d = r.step(&pass(&loaded));
+                started.extend(
+                    d.start
+                        .iter()
+                        .map(|s| s.resource)
+                        .filter(|r| matches!(r, ResourceId::Drape { .. })),
+                );
+                if d.frame_ready {
+                    worn = Some(
+                        d.draw
+                            .items
+                            .iter()
+                            .flat_map(|i| i.drapes.iter().map(|x| x.resource))
+                            .collect::<BTreeSet<_>>(),
+                    );
+                    break;
+                }
+                r.upload(&d);
+                // One load comes back.
+                if !r.pending.is_empty() {
+                    let done = pick(&r.pending);
+                    let gen = r.pending.remove(&done).expect("pending");
+                    r.b.on_loaded(done, gen, est(done));
+                    loaded.insert(done);
+                }
+            }
+            let worn = worn.unwrap_or_else(|| panic!("{name}: the frame was never made"));
+            let kids: BTreeSet<ResourceId> = roots
+                .iter()
+                .flat_map(|root| children(*root))
+                .map(|k| dr(k, level(k)))
+                .collect();
+            assert_eq!(worn, kids, "{name}: the frame wears its children's drapes");
+            assert_eq!(
+                started, worn,
+                "{name}: a drape was read that the frame does not wear"
+            );
+            read.push((name, started));
+        }
+        for (name, drapes) in &read[1..] {
+            assert_eq!(drapes, &read[0].1, "{name} read other drapes than in order");
+        }
+    }
+
     /// I13: under Batch, the traversal sees loaded content as resident, so
     /// terrain selection does not wait on uploads.
     #[test]
