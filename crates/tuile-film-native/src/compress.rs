@@ -157,6 +157,50 @@ impl Stream {
     }
 }
 
+/// `profile` with the encoder settings `var` names changed — tuning, for
+/// calibration runs, never a switch between paths: `TUILE_COMPRESS_QUALITY`,
+/// `_PRESET`, `_B_FRAMES`, `_LOOKAHEAD`, `_SPATIAL_AQ`, `_TEMPORAL_AQ`,
+/// `_MULTIPASS` (0 or 1). A setting changed is said on stderr, and the
+/// file's key does not change with it: a tuned run is a trial.
+pub fn tuned(
+    mut profile: tuile_farm::compress::Profile,
+    var: impl Fn(&str) -> Option<String>,
+) -> Result<tuile_farm::compress::Profile, crate::Error> {
+    let key = profile.key();
+    let number = |name: &str| -> Result<Option<u8>, crate::Error> {
+        match var(name) {
+            Some(v) if !v.trim().is_empty() => {
+                let n = v.trim().parse().map_err(|e| format!("{name}={v}: {e}"))?;
+                eprintln!("compress {key}: {name}={n}");
+                Ok(Some(n))
+            }
+            _ => Ok(None),
+        }
+    };
+    if let Some(n) = number("TUILE_COMPRESS_QUALITY")? {
+        profile.quality = n;
+    }
+    if let Some(n) = number("TUILE_COMPRESS_PRESET")? {
+        profile.preset = n;
+    }
+    if let Some(n) = number("TUILE_COMPRESS_B_FRAMES")? {
+        profile.b_frames = n;
+    }
+    if let Some(n) = number("TUILE_COMPRESS_LOOKAHEAD")? {
+        profile.lookahead = n;
+    }
+    if let Some(n) = number("TUILE_COMPRESS_SPATIAL_AQ")? {
+        profile.spatial_aq = n > 0;
+    }
+    if let Some(n) = number("TUILE_COMPRESS_TEMPORAL_AQ")? {
+        profile.temporal_aq = n > 0;
+    }
+    if let Some(n) = number("TUILE_COMPRESS_MULTIPASS")? {
+        profile.multipass = n > 0;
+    }
+    Ok(profile)
+}
+
 /// What a compression made.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Compressed {
@@ -190,9 +234,10 @@ pub fn compress(
             })
         }
         tuile_farm::compress::Delivery::Encode { profile } => {
+            let profile = tuned(profile.clone(), |name| std::env::var(name).ok())?;
             #[cfg(all(target_os = "linux", feature = "nvenc"))]
             {
-                gpu::encode_profile(joined, out, profile, fps, device, began)
+                gpu::encode_profile(joined, out, &profile, fps, device, began)
             }
             #[cfg(not(all(target_os = "linux", feature = "nvenc")))]
             {
@@ -323,8 +368,10 @@ mod gpu {
             });
             let encoded = encode(device, spec, pictures, |e| package.take(e));
             let decoded = decoding.join().map_err(|_| "the decoder panicked")?;
-            decoded?;
+            // The encoder's failure first: a decoder told the encoder
+            // stopped says nothing of why.
             encoded?;
+            decoded?;
             Ok(package.finish()?)
         })
     }
@@ -403,6 +450,23 @@ mod tests {
             .concat()
         );
         assert_eq!(stream.access_unit(&mut file, 1).expect("second"), [0, 0, 0, 1, 0x41, 2]);
+    }
+
+    /// A tuning variable changes its one setting and nothing else; a value
+    /// that is not a number is refused.
+    #[test]
+    fn a_profile_is_tuned_by_the_variables_that_name_its_settings() {
+        let base = tuile_farm::compress::Profile::h264();
+        let tuned = tuned(base.clone(), |name| match name {
+            "TUILE_COMPRESS_B_FRAMES" => Some("0".into()),
+            "TUILE_COMPRESS_MULTIPASS" => Some("0".into()),
+            _ => None,
+        })
+        .expect("tuned");
+        assert_eq!((tuned.b_frames, tuned.multipass), (0, false));
+        assert_eq!(tuned.quality, base.quality);
+        assert_eq!(tuned.key(), base.key());
+        assert!(super::tuned(base, |_| Some("many".into())).is_err());
     }
 
     /// A copy is the joined film as it is: every frame, laid out for a
