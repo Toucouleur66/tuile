@@ -390,8 +390,18 @@ pub fn encode(
     frames: impl IntoIterator<Item = Result<Frame, String>>,
     mut take: impl FnMut(Encoded) -> Result<(), String>,
 ) -> Result<f64, String> {
+    // Each step said on stderr with TUILE_NVENC_TRACE set: the driver may
+    // end the process without a word.
+    let trace = std::env::var_os("TUILE_NVENC_TRACE").is_some();
+    let step = |what: &str| {
+        if trace {
+            eprintln!("nvenc: {what}");
+        }
+    };
+    step(&format!("{spec:?}"));
     let cuda = CudaContext::new(device).map_err(|e| format!("CUDA device {device}: {e:?}"))?;
     let encoder = Encoder::initialize_with_cuda(cuda).map_err(told)?;
+    step("encoder open");
     let guid = spec.guid();
     if !encoder.get_encode_guids().map_err(told)?.contains(&guid) {
         return Err(format!("NVENC: this card does not encode {:?}", spec.out));
@@ -414,6 +424,7 @@ pub fn encode(
         .map_err(told)?
         .presetCfg;
     configure(&mut config, spec)?;
+    step("configured");
     let (width, height) = spec.size;
     let mut init = EncoderInitParams::new(guid, width as u32, height as u32);
     init.preset_guid(preset)
@@ -424,6 +435,7 @@ pub fn encode(
     let session = encoder
         .start_session(spec.input.format(), init)
         .map_err(told)?;
+    step("session started");
     let pool = spec.buffers();
     let mut inputs = Vec::with_capacity(pool);
     let mut outputs = Vec::with_capacity(pool);
@@ -438,6 +450,7 @@ pub fn encode(
         0 => width * if spec.input == Input::P010 { 2 } else { 1 },
         pitch => pitch,
     };
+    step(&format!("{pool} buffers, pitch {pitch}"));
     let bytes = spec.input.bytes(spec.size);
     let mut free: VecDeque<usize> = (0..pool).collect();
     let mut pending: VecDeque<usize> = VecDeque::new();
@@ -469,7 +482,11 @@ pub fn encode(
                 input_timestamp: frame.shown,
                 ..Default::default()
             };
-            match session.encode_picture(&mut inputs[slot], &mut outputs[slot], params) {
+            let result = session.encode_picture(&mut inputs[slot], &mut outputs[slot], params);
+            if frame.shown < 3 {
+                step(&format!("picture {}: {:?}", frame.shown, result.as_ref().err().map(|e| e.kind())));
+            }
+            match result {
                 Ok(()) => {
                     pending.push_back(slot);
                     busy += began.elapsed().as_secs_f64();

@@ -3,7 +3,8 @@
 
 # Final-stage compression for rendered films
 
-Status: research and design, 20 Oct. 2026. Nothing here is built or deployed.
+Status: research and design, 20 Oct. 2026; decided the same day and built
+on branch `feat/film-compression` (§8, §9). Nothing is deployed.
 Scope: the last stage of a film's pipeline, which turns rendered pictures into
 the file a viewer gets. It is offered to the user as a choice of **compression
 profile**. The GPU paths covered are NVIDIA (NVENC on L4 / RTX PRO 6000) and
@@ -623,18 +624,67 @@ All *(to confirm against the current GCP price sheet and the measured fps)*.
 
 ---
 
-## 8. Decisions for Laurent
+## 8. Decided (Laurent, 20 Oct. 2026)
 
-1. **Mezzanine store:** GCS in the same region with a TTL (recommended; no
-   egress) or R2 `stl-renders` (simpler; ≈ 0.1–0.4 $ of egress per film).
-   And its retention: 30 days, 90 days, or kept for life, for reuse.
-2. **Default sharing codec:** H.264 (recommended: plays everywhere) or HEVC
-   (lighter, Apple and recent Chrome only).
-3. **Sharing cap:** none, or a size cap such as ≤ 100 MB / ≤ 16 MB per
-   minute, with a second pass when it is exceeded.
-4. **Credits** for a compression of an existing render: 0 or 1.
-5. **Offering `master`** to the public, or keeping it internal.
-6. **ProRes:** Mac only and internal, or a licence question put to Apple
-   before any product.
-7. **Order:** step 0 (quick wins) first, as an independent PR, before the
-   final stage. Recommended.
+1. **Where the stage sits:** between the join of the film and its
+   publication — render segments → join → **compress** (one final encode
+   per chosen profile) → publish.
+2. **Credits:** untouched. No price for a compression, no billing change.
+3. **Profiles kept:** sharing (H.264, `web`), high quality (HEVC Main10,
+   `high`), and spatial (MV-HEVC, as today). **The AV1 sharing profile is
+   dropped**; `master` is not offered for now.
+4. **Defaults by format:** the vertical (phone) format shares by default
+   (`web`); HD and 4K default to `high`, which they must offer; spatial is
+   MV-HEVC.
+5. **The choice is the user's**, in the render options panel; spatial has
+   only MV-HEVC.
+
+Taken from this study's recommendations where nothing was said:
+
+- **Mezzanine store: GCS, same region as the L4 service, deleted after 30
+  days** (option A of §2.4).
+- **Sharing cap: 100 MB**, with a second encode at the mean rate that fits
+  when the first passes it.
+- **No ProRes, no `master` in the product.**
+
+## 9. What is built (branch `feat/film-compression`)
+
+- **`tuile_mp4::film`**: one video track of H.264, HEVC (one layer or two)
+  or AV1, read and written with `mp4-atom`. Every film it writes — the
+  muxers' (`Muxer::finish`), the spatial muxer's, the join's — is
+  **faststart** (`ftyp, moov, mdat`) with **`colr nclx` 1/1/1 limited** and
+  `pasp` 1:1. B-frames: composition offsets kept non-negative behind an edit
+  list. `tuile_farm::concat` is `film::join` for every codec (the spatial
+  join folded into it); a join may let each segment go once copied, so a
+  film and its segments are never held whole twice where the disk is
+  memory.
+- **`tuile_farm::compress`**: the generic profiles (`h264`, `hevc-main10`,
+  `mezzanine`) with their version in their files' key
+  (`<run>/films/<name>-v<n>.mp4`), the **rate tables by pixel rate** of
+  §3.2 in place of 12 Mb/s for every size, the size cap; the order and the
+  answer of `POST /compress`; the mezzanine store (`TUILE_MEZZANINE_STORE`,
+  `gs://<bucket>` by the machine's own identity); `assemble::gather`.
+- **The render node** (`nvenc.rs`): one NVENC loop for every single-view
+  film, with a pool of buffers so that **B-frames and lookahead** hold
+  pictures; outputs read back in decoding order with the frame each is
+  shown as; **BT.709 in the VUI** (H.264, HEVC) and in AV1's colour config.
+  The `mezzanine` codec is HEVC Main10 by NVENC's own 8 → 10-bit conversion
+  of today's 8-bit I420 (the float → P010 dithering shader of §3.4 (1) is
+  still to do, with the atmosphere work). H.264 and AV1 written by a render
+  node take the H.264 profile's rate by the picture's size unless one is
+  asked for.
+- **The final stage** (`compress.rs`): the joined film decoded by **NVDEC**
+  (a safe decoder added to lapoule-dev's `nvidia-video-codec-sdk` fork,
+  branch `feat/decoder`), **10 → 8 bits dithered** for H.264 (a fixed
+  interleaved-gradient pattern: the mean of a smooth gradient kept, no
+  temporal noise), one NVENC session for the whole film, a second pass at
+  the capped rate when the cap is passed. `tuile-film-serve` gains
+  **`POST /compress`** (receipts from the run store, segments from the
+  mezzanine store, joined, delivered, checked frame for frame and for
+  cadence) and the image gains **`tuile-film-compress`** (the same by hand,
+  and `--probe`: what a player finds in a film).
+- **Spatial** is unchanged: MV-HEVC segments, joined (now faststart and
+  colour-tagged by the join), delivered as they are (`copy`).
+
+Measured on a Cloud Run L4: see §9.1.
+
