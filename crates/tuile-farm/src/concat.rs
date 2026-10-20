@@ -110,6 +110,12 @@ pub fn check_cadence(probe: Probe, fps: f64) -> Result<(), String> {
 /// ([`tuile_mp4::film::join`]: faststart, its colour said). H.264, HEVC —
 /// a spatial film's two layers included — or AV1. Returns the frame count.
 pub fn concat(segments: &[PathBuf], out: &Path) -> Result<u64, ConcatError> {
+    concat_into(segments, out, false)
+}
+
+/// [`concat`], each segment's file removed once it is copied when `consume`
+/// is set ([`tuile_mp4::film::join_into`]).
+pub fn concat_into(segments: &[PathBuf], out: &Path, consume: bool) -> Result<u64, ConcatError> {
     if segments.is_empty() {
         return Err(ConcatError::Empty);
     }
@@ -117,7 +123,7 @@ pub fn concat(segments: &[PathBuf], out: &Path) -> Result<u64, ConcatError> {
     for path in segments {
         track(path)?;
     }
-    tuile_mp4::film::join(segments, out).map_err(|e| match e {
+    tuile_mp4::film::join_into(segments, out, consume).map_err(|e| match e {
         tuile_mp4::Mp4Error::Mismatch(what) => ConcatError::Mismatch {
             path: out.to_path_buf(),
             what,

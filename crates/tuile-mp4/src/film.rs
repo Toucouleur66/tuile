@@ -438,6 +438,13 @@ fn same_stream(a: &Codec, b: &Codec) -> bool {
 /// — and the same timescale, or the join is refused. Returns the frames
 /// written.
 pub fn join(segments: &[PathBuf], out: &Path) -> Result<u64, Mp4Error> {
+    join_into(segments, out, false)
+}
+
+/// [`join`], each segment's file removed once its samples are copied when
+/// `consume` is set: where the disk is memory, the film and its segments
+/// are then never held whole twice.
+pub fn join_into(segments: &[PathBuf], out: &Path, consume: bool) -> Result<u64, Mp4Error> {
     let mut tracks = Vec::with_capacity(segments.len());
     for path in segments {
         let mut file = File::open(path).map_err(io)?;
@@ -487,12 +494,17 @@ pub fn join(segments: &[PathBuf], out: &Path) -> Result<u64, Mp4Error> {
     let mut writer = BufWriter::new(File::create(out).map_err(io)?);
     writer.write_all(&table.head(bytes)?).map_err(io)?;
     let mut buffer = Vec::new();
-    for (file, track) in &mut tracks {
+    for ((file, track), path) in tracks.into_iter().zip(segments) {
+        let mut file = file;
         for s in &track.samples {
             buffer.resize(s.size as usize, 0);
             file.seek(SeekFrom::Start(s.offset)).map_err(io)?;
             file.read_exact(&mut buffer).map_err(io)?;
             writer.write_all(&buffer).map_err(io)?;
+        }
+        drop(file);
+        if consume {
+            std::fs::remove_file(path).map_err(io)?;
         }
     }
     writer.flush().map_err(io)?;
