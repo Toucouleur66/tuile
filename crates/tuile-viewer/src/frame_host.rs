@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
-
 //! What an application embedding the viewer may do with each frame before it
 //! is traversed and drawn.
 //!

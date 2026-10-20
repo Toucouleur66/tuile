@@ -71,9 +71,6 @@ mod backdrop;
 mod desktop;
 mod device;
 pub mod embed;
-/// What an embedding application may do with each frame before it is drawn:
-/// the camera it is drawn from, and the views streamed for it. `host` below
-/// is the machine the viewer runs on, which is a different thing entirely.
 pub mod frame_host;
 mod gate;
 mod globe;

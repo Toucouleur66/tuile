@@ -90,7 +90,7 @@ impl OverlayEyes {
 }
 
 /// What a mesh has to do with the sun's shadows, when the film's look has
-/// any ([`crate::Look::shadow`]); nothing otherwise.
+/// any (`tuile_film::Look::shadow`); nothing otherwise.
 ///
 /// A mesh that **casts** is drawn into the same map of the sun as the
 /// ground, once a frame and for both eyes: the ground under it, and any
@@ -100,7 +100,7 @@ impl OverlayEyes {
 /// the dome alone gives.
 ///
 /// A caster is seen by the sun on a grid of texels
-/// ([`OverlayCamera::shadow_texel`] wide, in metres): a shape narrower than
+/// (`tuile_film::OverlayCamera::shadow_texel` wide, in metres): a shape narrower than
 /// [`MIN_SHADOW_TEXELS`] of them, as the sun sees it, casts an outline a
 /// texel wide at most — its edges are drawn into the map as well, so that
 /// it never vanishes — and only one that wide or wider casts its whole
