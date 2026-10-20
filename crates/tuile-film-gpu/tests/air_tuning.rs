@@ -72,8 +72,7 @@ fn uniforms(air: &AirTuning) -> (AtmosphereUniform, FrameUniform, Look) {
     let frame = FrameUniform::new(&FrameCamera::of(&view, 64.0 / 48.0), &look, [64, 48, 1, 0]);
     // The light's own camera, as the look reads it.
     assert_eq!(
-        sky.illumination.adaptation,
-        look.camera.white_adaptation,
+        sky.illumination.adaptation, look.camera.white_adaptation,
         "the white balance's adaptation"
     );
     (atmosphere, frame, look)

@@ -502,6 +502,111 @@ ne vise pas le pixel : on vise la tendance avec la distance et l'heure.
   PBR Neutral (Khronos) est à vérifier avant d'écrire le jumeau WGSL ; la
   formule publiée seule suffit.
 
+## 8. Tuning values (environment)
+
+Every setting of the air is a tuning value: a number read once from the
+environment by a native host (`tuile-film-render`, `tuile-film-produce` and
+the farm through `RenderSpec`, the desktop viewer), validated in one place —
+`tuile_atmosphere::tuning::AirTuning::from_env` — and handed to the shaders
+through their uniforms. Unset, each is today's constant: with no variable
+set, the film's name and its pictures are those of before, to the byte
+(`tests/atmosphere.rs`, `an_atmosphere_films_pictures_are_the_same_to_the_byte`
+and `a_default_films_pictures_are_the_same_to_the_byte`, on the Apple GPU they
+were frozen on). None is a switch: drawing the physical atmosphere at all is
+still `--atmosphere` / `--turbidity`. A value that is not a finite number in
+its range is refused, naming the variable, its value and the range. The
+look's flags (`--exposure`, `--turbidity`, …) are applied after the
+environment and win. Every value that changes the picture is in the look,
+and so in the film's name (`engine::film_prefix`): a film rendered under
+other settings is another film, never a cached one.
+
+| Variable | Default | Range | What it does |
+|---|---|---|---|
+| `TUILE_AIR_TURBIDITY` | 2.0 | 1 – 10 | the air's optical depth in the green over its molecules' alone |
+| `TUILE_AIR_AOD_550` | 0.1085 (= turbidity 2) | 0 – 3 | the aerosols' optical depth from sea level at 550 nm (AERONET); not with the turbidity |
+| `TUILE_AIR_MIE_SCALE_HEIGHT` | 1200 m | 100 – 8000, under the molecules' | thickness of the aerosol layer |
+| `TUILE_AIR_MIE_ALBEDO` | 0.9 (3.996/4.440) | 0.5 – 1 | single-scattering albedo: scattered (brightens) vs absorbed (darkens) |
+| `TUILE_AIR_MIE_G` | 0.8 | 0 – 0.95 | Cornette-Shanks anisotropy |
+| `TUILE_AIR_RAYLEIGH_SCATTERING` | 5.802e-6,13.558e-6,33.1e-6 | 1e-7 – 1e-4 each | molecules' scattering RGB, per metre (film and viewer) |
+| `TUILE_AIR_RAYLEIGH_SCALE_HEIGHT` | 8000 m | 5000 – 12000 | molecules' scale height (film and viewer) |
+| `TUILE_AIR_OZONE_ABSORPTION` | 0.650e-6,1.881e-6,0.085e-6 | 0 – 1e-5 each | ozone at its densest, RGB |
+| `TUILE_AIR_GROUND_ALBEDO` | 0.3 | 0 – 1 | the ground's albedo in the model: light sent back up into the air |
+| `TUILE_AIR_EXPOSURE_FOLLOWS` | 0.75 | 0 – 0.95 | share of a bright light's difference the auto-exposure makes up |
+| `TUILE_AIR_NIGHT_DEPTH_EV` | 3.0 | 0.5 – 8 | how much darker a dim light is shown |
+| `TUILE_AIR_WHITE_ADAPTATION` | 0.35 | 0 – 1 | how far the white balance goes to the light's white |
+| `TUILE_AIR_METER_REFLECTANCE` | 0.18 | 0.05 – 0.5 | the reflectance the meter takes the scene for |
+| `TUILE_AIR_VEIL_BOUND` | 6.0 | 1 – 100 | soft cap of the veil, in ground-of-0.1 lights |
+| `TUILE_AIR_MARCH_STEPS` | 12 | 4 – 64, whole | steps of the eye-to-ground march under 10 km |
+| `TUILE_AIR_MARCH_STEPS_HIGH` | 24 | 4 – 128, whole | the same from over 10 km |
+| `TUILE_AIR_REFLECTANCE` | 6.5 (0.7 stored imagery) | 0.1 – 50 | real reflectance an imagery value of one stands for |
+| `TUILE_AIR_VIEWER_MIE_SCATTERING` | 21e-6 | 0 – 1e-3 | the viewer's aerosol scattering at sea level |
+| `TUILE_AIR_VIEWER_MIE_G` | 0.76 | 0 – 0.95 | the viewer's anisotropy |
+| `TUILE_AIR_VIEWER_STRENGTH` | 1.0 | 0 – 4 | the viewer's optical depth scale |
+| `TUILE_LOOK_EXPOSURE_EV` | 1.0 (0.8 stored) | -10 – 10 | the film's exposure before the auto-exposure |
+| `TUILE_LOOK_CONTRAST` | 1.0 | 0.25 – 4 | power on luminance about middle grey |
+| `TUILE_LOOK_SATURATION` | 1.0 | 0 – 4 | saturation, last |
+| `TUILE_LOOK_SUN_LIGHT` | 2.5,2.45,2.3 | 0 – 100 each | the calibration sun (linear RGB) |
+| `TUILE_LOOK_SKY_LIGHT` | 0.72,0.76,0.8 | 0 – 100 each | the calibration dome |
+| `TUILE_LOOK_HIGHLIGHT_KNEE` | 0.5 | 0.05 – 0.95 | where highlights start to roll off |
+
+Not tuning values, on purpose: `DAYLIGHT_EV100` (a label: it cancels out of
+every exposure), the metering grid (24×14 rays: sampling), the tables' sizes
+and their multiple-scattering steps (fixed texture sizes and accuracy, not
+look), the night floors, and the calibration *reference* atmosphere — a clear
+day's at today's constants, which defines the renderer's units and so does
+not move with the tuning.
+
+The viewer and the film agree when the viewer's aerosols are set to the
+film's: `TUILE_AIR_VIEWER_MIE_SCATTERING` = the film's `β_M · ϖ` (8.14e-5 at
+turbidity 2, `AOD/H_M · ϖ` in general) and `TUILE_AIR_VIEWER_MIE_G` =
+`TUILE_AIR_MIE_G`; the molecules and the scale height are shared already. The
+viewer's closed form has no multiple scattering and no absorption: agreeing
+inputs are not identical pictures.
+
+### 8.1 Aerosol units: AOD ↔ turbidity ↔ extinction
+
+`τ_R = β_R(550 nm) · H_R = 13.558e-6 × 8000 = 0.1085` (Bruneton 2017's
+wavelengths are 680, 550 and 440 nm, so the green channel is 550 nm).
+
+- `T = 1 + AOD₅₅₀ / τ_R`, `AOD₅₅₀ = (T − 1) · τ_R`
+- `β_M(sea level) = AOD₅₅₀ / H_M` per metre; scattering `ϖ · β_M`,
+  absorption `(1 − ϖ) · β_M`.
+
+Today: T 2 = AOD 0.1085 = 9.04e-5 /m. A measured AOD (AERONET level 2,
+interpolated to 550 nm by its Ångström exponent) feeds `TUILE_AIR_AOD_550`
+directly. Two caveats: the model's aerosols are grey (Ångström exponent 0),
+and a station's AOD is the column *above it* — a high station's
+(Pic du Midi, 2 877 m) is not to be scaled down to sea level with the
+model's 1.2 km; it bounds the column over the summit only.
+
+### 8.2 The low-altitude veil: what each setting does
+
+`examples/veil_table.rs` measures it without a render: the eye 15° down,
+across the sun's azimuth (sun 40° up), over level ground of reflectance
+0.08 (what decoded imagery stands for at `reflectance` 6.5). `T` is the
+ground's light kept, `V` the veil's share of what reaches the eye
+(exposure scales both alike). Plain (ground 150 m) / mountain (ground
+1 500 m):
+
+| Setting | 500 m: V | 2 km: V | 5 km: V | 10 km: V | 15 km: V |
+|---|---|---|---|---|---|
+| today (AOD 0.108, H 1.2 km, ground albedo 0.3) | 0.34 / 0.20 | 0.63 / 0.44 | 0.74 / 0.60 | 0.80 / 0.68 | 0.81 / 0.71 |
+| A. AOD 0.05 | 0.24 / 0.15 | 0.50 / 0.38 | 0.66 / 0.55 | 0.73 / 0.65 | 0.76 / 0.68 |
+| AOD 0.03 (Toulouse, mid-October) | 0.20 / 0.14 | 0.45 / 0.36 | 0.62 / 0.53 | 0.71 / 0.64 | 0.74 / 0.68 |
+| B. AOD 0.05, H 2 km | 0.21 / 0.15 | 0.48 / 0.40 | 0.65 / 0.57 | 0.74 / 0.67 | 0.76 / 0.70 |
+| H 2 km, today's AOD | 0.29 / 0.20 | 0.59 / 0.47 | 0.74 / 0.64 | 0.80 / 0.72 | 0.82 / 0.74 |
+| C. ground albedo 0.12 | 0.28 / 0.16 | 0.56 / 0.40 | 0.70 / 0.56 | 0.77 / 0.65 | 0.78 / 0.68 |
+| g 0.75 / ϖ 0.95 | ±0.01 | ±0.01 | ±0.01 | ±0.00 | ±0.00 |
+| H 0.8 km, today's AOD | 0.38 / 0.17 | 0.63 / 0.40 | 0.74 / 0.56 | 0.79 / 0.65 | 0.80 / 0.69 |
+| A+B+C combined | 0.16 / 0.13 | 0.42 / 0.35 | 0.61 / 0.53 | 0.70 / 0.63 | 0.73 / 0.67 |
+| no aerosol at all (floor) | 0.13 / 0.11 | 0.36 / 0.32 | 0.55 / 0.51 | 0.66 / 0.62 | 0.70 / 0.66 |
+
+What it says, plainly: the aerosols are the lever **under about 3 km**; above
+5 km the veil is mostly the molecules' (with no aerosol at all it is still
+0.55 – 0.70), which is the physical sky, not a setting. Lowering it there is
+a matter of what the ground is taken to be (`TUILE_AIR_REFLECTANCE`), of the
+view (a steeper look crosses less air) and of the grade, not of the air.
+
 ## Sources
 
 - Hillaire, *A Scalable and Production Ready Sky and Atmosphere Rendering Technique*, EGSR 2020 — https://onlinelibrary.wiley.com/doi/abs/10.1111/cgf.14050
@@ -513,3 +618,5 @@ ne vise pas le pixel : on vise la tendance avec la distance et l'heure.
 - Reda & Andreas, *Solar Position Algorithm* (NREL TP-560-34302, ±0,0003°) — https://docs.nlr.gov/docs/fy08osti/34302.pdf ; NOAA — https://gml.noaa.gov/grad/solcalc/calcdetails.html
 - Nishita et al. 1993 ; Preetham et al. 1999 ; Hosek & Wilkie 2012 ; Cornette & Shanks 1992 ; Lagarde & de Rousiers, *Moving Frostbite to PBR* (2014) : références classiques, citées pour les modèles et l'EV100.
 - Références locales (inspiration seulement) : `references/cesium/packages/engine/Source/Shaders/Builtin/Functions/computeScattering.glsl` (16×4 pas, `atmosphereInnerRadius`), `Scene/Tonemapper.js`.
+- AERONET (NASA), aerosol optical depth, version 3 level 2 — https://aeronet.gsfc.nasa.gov/ ; Dubovik et al., *Variability of absorption and optical properties of key aerosol types observed in worldwide locations*, J. Atmos. Sci. 59 (2002) — single-scattering albedo 0.88 – 0.98 and asymmetry 0.6 – 0.75 at 550 nm by aerosol type.
+- U.S. Standard Atmosphere 1976 (NOAA/NASA/USAF) — the molecules' scale height, ~8 km near the ground.

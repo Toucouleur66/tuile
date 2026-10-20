@@ -748,9 +748,8 @@ impl LutAtmosphere {
                                 added[c] += m.inscattered[c] * strength;
                             }
                         }
-                        [0, 1, 2].map(|c| {
-                            l[c] * agree(c) * through[c] + added[c] * scale[c] / meter
-                        })
+                        [0, 1, 2]
+                            .map(|c| l[c] * agree(c) * through[c] + added[c] * scale[c] / meter)
                     }
                     Metered::Sky { eye, direction } => {
                         let g = tuile_core::geo::ecef_to_geodetic(eye);
