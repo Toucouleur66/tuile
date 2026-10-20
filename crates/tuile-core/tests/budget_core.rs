@@ -2028,6 +2028,51 @@ mod batch {
         }
     }
 
+    /// I13: a batch frame's drapes are those of what it draws. A tile the
+    /// need names while the selection is still settling — its mesh not yet
+    /// in, the tile replaced by its children before it is — never has a
+    /// drape loaded: batch never cancels a load it started, so a drape
+    /// started for it would be read whatever the frame draws, and what a
+    /// bake reads would depend on the order its meshes came in.
+    #[test]
+    fn a_batch_drape_waits_for_the_meshes_the_frame_draws() {
+        let mut r = Rig::batch();
+        let parent = t(3, 2, 2);
+        let first = r.step(&drawn_draped(&[parent], 6));
+        assert!(
+            first
+                .start
+                .iter()
+                .all(|s| matches!(s.resource, ResourceId::Mesh(_))),
+            "a drape started before the frame's meshes were in: {:?}",
+            first.start
+        );
+        // The parent's mesh is not in yet: the need moves to its children.
+        let kids = children(parent);
+        let need = drawn_draped(&kids, 7);
+        let mut started: Vec<ResourceId> = first.start.iter().map(|s| s.resource).collect();
+        let mut ready = false;
+        for _ in 0..30 {
+            let d = r.step(&need);
+            started.extend(d.start.iter().map(|s| s.resource));
+            if d.frame_ready {
+                ready = true;
+                break;
+            }
+            r.complete(&d);
+        }
+        assert!(ready, "the frame was made");
+        assert!(
+            !started
+                .iter()
+                .any(|s| matches!(s, ResourceId::Drape { tile, .. } if *tile == parent)),
+            "a drape was loaded for a tile the frame never draws: {started:?}"
+        );
+        for k in kids {
+            assert!(started.contains(&dr(k, 7)), "{k:?} wears its drape");
+        }
+    }
+
     /// I13: under Batch, the traversal sees loaded content as resident, so
     /// terrain selection does not wait on uploads.
     #[test]
