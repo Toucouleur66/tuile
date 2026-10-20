@@ -139,7 +139,9 @@ struct TileNeed {
 /// The meshes standing for the wanted tiles, before their drapes.
 #[derive(Default)]
 struct Selection {
-    items: BTreeMap<ResourceId, (Role, BTreeSet<TileId>)>,
+    /// (mesh, a tile it serves, the role it serves it in), unsorted: a mesh
+    /// is drawn in the least of its roles, for every tile it serves.
+    items: Vec<(ResourceId, TileId, Role)>,
     coarsening: BTreeSet<TileId>,
     exact: u32,
     fallback: u32,
@@ -720,17 +722,12 @@ impl Budget {
             })
     }
 
-    /// The layers a wanted tile's drape need asks for.
-    fn layers_of(drapes: &BTreeMap<(TileId, LayerId), u32>, t: TileId) -> BTreeSet<LayerId> {
-        drapes.range(tile_layers(t)).map(|((_, l), _)| *l).collect()
-    }
-
     /// Whether `tile`'s mesh can be drawn dressed for `layers`: each layer
     /// has a drawable drape on the tile or one of its ancestors, or — a
     /// layer switch in progress — the mesh still wears a layer it no longer
     /// needs. A mesh that cannot is not drawn: bare ground is black ground
     /// (I1, D-A1).
-    fn dressable(&self, tile: TileId, layers: &BTreeSet<LayerId>) -> bool {
+    fn dressable(&self, tile: TileId, layers: &[LayerId]) -> bool {
         let missing = layers.iter().any(|l| !self.has_drape(tile, *l));
         !missing
             || self
@@ -753,51 +750,44 @@ impl Budget {
         cap: Option<u32>,
     ) -> Selection {
         let mut sel = Selection::default();
-        let shown = |t: TileId, layers: &BTreeSet<LayerId>| {
+        // The layers each wanted tile's drape need asks for, in layer order.
+        let mut layers: Vec<LayerId> = Vec::new();
+        let shown = |t: TileId, layers: &[LayerId]| {
             let level = self.tiles.get(&t).map_or(0, |i| i.level);
             cap.is_none_or(|c| level <= c)
                 && self.drawable(ResourceId::Mesh(t))
                 && self.dressable(t, layers)
         };
-        let add = |items: &mut BTreeMap<ResourceId, (Role, BTreeSet<TileId>)>,
-                   t: TileId,
-                   role: Role,
-                   serves: TileId| {
-            let e = items
-                .entry(ResourceId::Mesh(t))
-                .or_insert((role, BTreeSet::new()));
-            e.0 = e.0.min(role);
-            e.1.insert(serves);
-        };
         for (t, _) in tiles
             .iter()
             .filter(|(_, n)| n.membership == Membership::Drawn)
         {
-            let layers = Self::layers_of(drapes, *t);
+            layers.clear();
+            layers.extend(drapes.range(tile_layers(*t)).map(|((_, l), _)| *l));
             if shown(*t, &layers) {
-                add(&mut sel.items, *t, Role::Exact, *t);
+                sel.items.push((ResourceId::Mesh(*t), *t, Role::Exact));
                 sel.exact += 1;
                 continue;
             }
-            let held: Vec<TileId> = self
-                .held_below(ancestry, *t)
-                .filter(|h| shown(*h, &layers))
-                .collect();
-            for h in &held {
-                add(&mut sel.items, *h, Role::Held, *t);
+            let mut held = false;
+            for h in self.held_below(ancestry, *t) {
+                if shown(h, &layers) {
+                    sel.items.push((ResourceId::Mesh(h), *t, Role::Held));
+                    held = true;
+                }
             }
-            if !held.is_empty() {
+            if held {
                 sel.coarsening.insert(*t);
             }
             let anc = self.ancestors(*t).find(|a| shown(*a, &layers));
             if let Some(a) = anc {
-                add(&mut sel.items, a, Role::Fallback, *t);
+                sel.items.push((ResourceId::Mesh(a), *t, Role::Fallback));
                 let level = |x: TileId| self.tiles.get(&x).map_or(0, |i| i.level);
                 sel.depth = sel.depth.max(level(*t).saturating_sub(level(a)));
-                if held.is_empty() {
+                if !held {
                     sel.fallback += 1;
                 }
-            } else if held.is_empty() {
+            } else if !held {
                 sel.lost += 1;
             }
         }
@@ -828,19 +818,33 @@ impl Budget {
         st.lost += sel.lost;
         st.fallback_depth_max = st.fallback_depth_max.max(sel.depth);
         let Selection {
-            items, coarsening, ..
+            mut items,
+            coarsening,
+            ..
         } = sel;
-        let mut out = Vec::new();
-        for (mesh, (role, serves)) in items {
+        // By mesh, then by tile served: each mesh's run is one draw item.
+        items.sort_unstable();
+        let meshes = items.chunk_by(|a, b| a.0 == b.0).count();
+        let mut out = Vec::with_capacity(meshes);
+        // The level each layer is needed at, by layer.
+        let mut needs: Vec<(LayerId, u32)> = Vec::new();
+        for run in items.chunk_by(|a, b| a.0 == b.0) {
+            let mesh = run[0].0;
+            let role = run.iter().map(|x| x.2).min().unwrap_or(Role::Exact);
+            let mut serves: Vec<TileId> = Vec::with_capacity(run.len());
+            serves.extend(run.iter().map(|x| x.1));
+            serves.dedup();
             let tile = mesh.tile();
             // The level each layer is needed at: the tile's own need when
             // exact; a held tile keeps its own last level; a fallback
             // dresses for the finest of the tiles it serves.
-            let mut needs: BTreeMap<LayerId, u32> = BTreeMap::new();
+            needs.clear();
             for s in &serves {
                 for ((_, layer), n) in drapes.range(tile_layers(*s)) {
-                    let e = needs.entry(*layer).or_insert(*n);
-                    *e = (*e).max(*n);
+                    match needs.binary_search_by_key(layer, |x| x.0) {
+                        Ok(i) => needs[i].1 = needs[i].1.max(*n),
+                        Err(i) => needs.insert(i, (*layer, *n)),
+                    }
                 }
             }
             if role == Role::Held {
@@ -850,16 +854,19 @@ impl Budget {
                     }
                 }
             }
-            let mut chosen: Vec<DrapeChoice> = needs
-                .iter()
-                .filter_map(|(layer, n)| self.best_drape_for(tile, *layer, *n))
-                .collect();
+            let needed = |l: LayerId| needs.iter().any(|x| x.0 == l);
+            let mut chosen: Vec<DrapeChoice> = Vec::with_capacity(needs.len());
+            chosen.extend(
+                needs
+                    .iter()
+                    .filter_map(|(layer, n)| self.best_drape_for(tile, *layer, *n)),
+            );
             if chosen.len() < needs.len() {
                 // A layer switch in progress: a layer the tiles now ask for
                 // is drawable nowhere yet, so the layers this mesh wore last
                 // step and no longer needs stay worn until it is.
                 for old in self.worn_last.get(&mesh).into_iter().flatten() {
-                    if !needs.contains_key(&old.layer) && self.drawable(old.resource) {
+                    if !needed(old.layer) && self.drawable(old.resource) {
                         chosen.push(*old);
                     }
                 }
@@ -867,8 +874,10 @@ impl Budget {
             }
             // Bare: a layer the tiles need is worn by no drape, and no old
             // layer stands in for it during a switch.
-            let missing = needs.keys().any(|l| !chosen.iter().any(|d| d.layer == *l));
-            let switching = chosen.iter().any(|d| !needs.contains_key(&d.layer));
+            let missing = needs
+                .iter()
+                .any(|(l, _)| !chosen.iter().any(|d| d.layer == *l));
+            let switching = chosen.iter().any(|d| !needed(d.layer));
             if missing && !switching {
                 st.bare += 1;
             }
@@ -895,7 +904,7 @@ impl Budget {
                 mesh,
                 role,
                 drapes: chosen,
-                serves: serves.into_iter().collect(),
+                serves,
             });
         }
         (DrawSet { items: out }, coarsening)
