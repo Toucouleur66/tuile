@@ -41,16 +41,19 @@ use glam::{DVec3, Mat4, Vec3};
 use crate::FrameCamera;
 
 /// One of the two eyes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Eye {
-    Left,
-    Right,
+///
+/// `tuile-overlay`'s, re-exported: an overlay says which eye it is drawn into
+/// ([`tuile_overlay::OverlayEyes`]), and two enums that look alike would be
+/// two things to convert between for no reason.
+pub use tuile_overlay::Eye;
+
+/// What a film does with an eye, which an overlay has no opinion about.
+pub(crate) trait EyeSide {
+    /// −1 for the left eye, +1 for the right: which way it is moved.
+    fn side(self) -> f64;
 }
 
-impl Eye {
-    pub const BOTH: [Eye; 2] = [Eye::Left, Eye::Right];
-
-    /// −1 for the left eye, +1 for the right: which way it is moved.
+impl EyeSide for Eye {
     fn side(self) -> f64 {
         match self {
             Eye::Left => -1.0,

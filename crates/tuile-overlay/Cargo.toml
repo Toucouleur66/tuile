@@ -1,0 +1,18 @@
+[package]
+name = "tuile-overlay"
+description = "Geometry an application hands a renderer to draw in the world: triangles, their colours, and how they meet the ground"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Data and arithmetic. No GPU, no I/O, and deliberately not `tuile-film`:
+# these types say what to draw, and a host that is not making a film — a
+# viewer, a simulator — needs them without the film's camera, its pack or its
+# look.
+[dependencies]
+glam = { workspace = true }
+
+[lints]
+workspace = true
