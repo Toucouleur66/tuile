@@ -41,7 +41,8 @@ use nvidia_video_codec_sdk::sys::nvEncodeAPI::{
     NV_ENC_VUI_MATRIX_COEFFS, NV_ENC_VUI_TRANSFER_CHARACTERISTIC, NV_ENC_VUI_VIDEO_FORMAT,
 };
 use nvidia_video_codec_sdk::{
-    CodecPictureParams, EncodeError, EncodePictureParams, Encoder, EncoderInitParams, ErrorKind,
+    CodecPictureParams, EncodeError, EncodePictureParams, Encoder, EncoderInitParams, EncoderInput,
+    ErrorKind,
 };
 use tuile_farm::compress::{Profile, VideoCodec};
 use tuile_mp4::film::{FilmWriter, Written};
