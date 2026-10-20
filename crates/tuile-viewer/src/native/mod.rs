@@ -304,6 +304,7 @@ fn session(embedder: Arc<dyn ViewerHost>) -> anyhow::Result<()> {
             pitch: view.pitch,
         }),
         lit_at_unix_seconds: settings::lit_at()?,
+        air: tuile_atmosphere::AirTuning::from_env()?.viewer,
         pinned_level: pinned,
         profile: profile.clone(),
         retries,

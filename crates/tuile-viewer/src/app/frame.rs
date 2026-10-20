@@ -225,10 +225,11 @@ impl App {
                 // Strength 0 is what turns it off, so the checkbox needs no
                 // second path through the renderer — the shader already
                 // short-circuits on it.
-                atmosphere: tuile_atmosphere::AerialPerspective::new(
+                atmosphere: tuile_atmosphere::AerialPerspective::of_air(
                     eye.position,
                     origin,
                     &self.sun,
+                    &self.air,
                     strength,
                 ),
             })

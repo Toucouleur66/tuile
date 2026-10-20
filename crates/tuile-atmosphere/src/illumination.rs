@@ -66,14 +66,58 @@ pub const NIGHT_DEPTH_EV: f32 = 3.0;
 /// |ev|/b)`, `D` [`NIGHT_DEPTH_EV`], `b` chosen so that the two meet with
 /// the same slope. Smooth and increasing: a sunset (−8) is shown 1.7 stops
 /// under noon, the end of civil twilight (−15) 2.7, a full Moon (−19) 3.1,
-/// a moonless night (−26) 4.
+/// a moonless night (−26) 4. [`CameraResponse::shown_ev`] of the default
+/// camera.
 pub fn shown_ev(ev: f32) -> f32 {
-    let kept = 1.0 - EXPOSURE_FOLLOWS;
-    if ev >= 0.0 {
-        return kept * ev;
+    CameraResponse::default().shown_ev(ev)
+}
+
+/// How a camera meets the light: how much of a light's difference from
+/// daylight its exposure makes up, how dark it lets the night be, how far
+/// it balances towards the light's white, and what it takes the scene it
+/// meters for. Tuning values (`crate::tuning`), today's constants by
+/// default.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CameraResponse {
+    /// [`EXPOSURE_FOLLOWS`]: of a light brighter than daylight, the share
+    /// of its difference, in stops, the exposure makes up. Below 1.
+    pub follows: f32,
+    /// [`NIGHT_DEPTH_EV`]: the scale, in stops, of how dark a dim light is
+    /// shown.
+    pub night_depth_ev: f32,
+    /// [`ReferenceIllumination::WHITE_ADAPTATION`].
+    pub white_adaptation: f32,
+    /// [`crate::hillaire::METER_REFLECTANCE`]: the reflectance the meter
+    /// takes the scene for. The air's own light — the sky, what it adds
+    /// between eye and ground — is metered as the light that would make
+    /// ground of it as bright.
+    pub meter_reflectance: f64,
+}
+
+impl Default for CameraResponse {
+    fn default() -> Self {
+        Self::TODAY
     }
-    let b = NIGHT_DEPTH_EV / (kept * std::f32::consts::LN_2);
-    -NIGHT_DEPTH_EV * (1.0 - ev / b).log2()
+}
+
+impl CameraResponse {
+    /// Today's constants, as a `const`.
+    pub const TODAY: Self = Self {
+        follows: EXPOSURE_FOLLOWS,
+        night_depth_ev: NIGHT_DEPTH_EV,
+        white_adaptation: ReferenceIllumination::WHITE_ADAPTATION,
+        meter_reflectance: crate::hillaire::METER_REFLECTANCE,
+    };
+
+    /// [`shown_ev`] under this camera's `follows` and `night_depth_ev`.
+    pub fn shown_ev(&self, ev: f32) -> f32 {
+        let kept = 1.0 - self.follows;
+        if ev >= 0.0 {
+            return kept * ev;
+        }
+        let b = self.night_depth_ev / (kept * std::f32::consts::LN_2);
+        -self.night_depth_ev * (1.0 - ev / b).log2()
+    }
 }
 
 /// What a moment's sun and sky give a scene, and how the camera meets it.
@@ -224,8 +268,14 @@ impl ReferenceIllumination {
     /// what brings the light from its own brightness to the one
     /// [`shown_ev`] shows it at.
     pub fn exposure_offset_ev(&self) -> f32 {
+        self.exposure_offset_ev_under(&CameraResponse::default())
+    }
+
+    /// [`Self::exposure_offset_ev`] for a camera that meets the light as
+    /// `camera` says.
+    pub fn exposure_offset_ev_under(&self, camera: &CameraResponse) -> f32 {
         let metered = self.ev100 - DAYLIGHT_EV100;
-        self.compensation_ev + shown_ev(metered) - metered
+        self.compensation_ev + camera.shown_ev(metered) - metered
     }
 
     /// The camera's white balance, as gains on the picture's light: none
@@ -294,6 +344,28 @@ mod tests {
         assert!((-4.3..=-3.6).contains(&shown(&light)), "{}", shown(&light));
         light.ev100 = DAYLIGHT_EV100 - 8.0;
         assert!((-2.0..=-1.3).contains(&shown(&light)), "{}", shown(&light));
+    }
+
+    #[test]
+    fn a_camera_that_follows_less_shows_a_bright_light_brighter() {
+        let mut light = ReferenceIllumination::provisional(DVec3::Z, [1.0; 3], [1.0; 3]);
+        light.ev100 = DAYLIGHT_EV100 + 2.0;
+        let camera = CameraResponse {
+            follows: 0.5,
+            ..CameraResponse::default()
+        };
+        assert!((light.exposure_offset_ev_under(&camera) + 1.0).abs() < 1e-6);
+        assert_eq!(
+            light.exposure_offset_ev_under(&CameraResponse::default()),
+            light.exposure_offset_ev()
+        );
+        // A deeper night: a dim light shown darker.
+        light.ev100 = DAYLIGHT_EV100 - 20.0;
+        let deep = CameraResponse {
+            night_depth_ev: 5.0,
+            ..CameraResponse::default()
+        };
+        assert!(light.exposure_offset_ev_under(&deep) < light.exposure_offset_ev());
     }
 
     #[test]

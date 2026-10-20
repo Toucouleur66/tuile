@@ -125,8 +125,8 @@ fn glare(d: vec3f) -> vec3f {
     return light * atmosphere.illuminance.xyz;
 }
 
-// Where the roll-off of highlights begins, in linear luminance.
-const KNEE: f32 = 0.5;
+// Where the roll-off of highlights begins, in linear luminance: the
+// frame's `white_balance.w` (0.5 by default, `Look::highlight_knee`).
 
 @compute @workgroup_size(8, 8)
 fn present(@builtin(global_invocation_id) id: vec3u) {
@@ -200,11 +200,12 @@ fn present(@builtin(global_invocation_id) id: vec3u) {
     // ratios. A picture pushed bright keeps what its bright ground showed,
     // where a straight clip turned towns and beaches to flat white.
     let lit = dot(linear, luma);
-    if (lit > KNEE) {
+    let knee = frame.white_balance.w;
+    if (lit > knee) {
         // tanh of a large number is 1, but written as a ratio of two
         // exponentials some drivers make it ∞/∞: a sun's disc, thousands of
         // times white, came out black. Past 10 it is 1 to the last bit.
-        let bent = KNEE + (1.0 - KNEE) * tanh(min((lit - KNEE) / (1.0 - KNEE), 10.0));
+        let bent = knee + (1.0 - knee) * tanh(min((lit - knee) / (1.0 - knee), 10.0));
         linear *= bent / lit;
     }
     if (overlaid) {

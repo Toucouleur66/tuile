@@ -528,6 +528,11 @@ async fn main() -> Result<(), Error> {
         Some("decoded") | None => {}
         Some(other) => return Err(format!("imagery is read stored or decoded, not {other}").into()),
     }
+    // The air's settings as the environment states them (`TUILE_AIR_*`,
+    // `TUILE_LOOK_*`), today's where it does not: what the look starts
+    // from, the flags below over them.
+    let air = tuile_atmosphere::AirTuning::from_env()?;
+    order.look = order.look.tuned(&air);
     if let Some(stops) = value("--exposure") {
         order.look.exposure_ev = stops.parse()?;
     }
@@ -541,7 +546,7 @@ async fn main() -> Result<(), Error> {
         order.look.shadow = strength.parse()?;
     }
     if flag("--atmosphere") || value("--turbidity").is_some() {
-        order.look.atmosphere = Some(tuile_film::AtmosphereParams::default());
+        order.look.atmosphere = Some(air.params);
     }
     if let Some(turbidity) = value("--turbidity") {
         order.look.turbidity = Some(turbidity.parse()?);

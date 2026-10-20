@@ -44,7 +44,9 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::window::WindowId;
 
-/// How much air to put between the eye and the ground.
+/// How much air to put between the eye and the ground, with the checkbox on:
+/// all of [`ViewerConfig::air`]'s, whose own strength
+/// (`TUILE_AIR_VIEWER_STRENGTH`, 1 by default) scales it.
 ///
 /// 1.0 is the physical atmosphere, and the physical atmosphere is the right
 /// answer: Earth's own haze is already the cue people read, and anything above
@@ -84,6 +86,10 @@ pub struct ViewerConfig {
     /// The instant the scene is lit for, UTC seconds since the Unix epoch —
     /// which sets where the sun is, and so where the terminator falls.
     pub lit_at_unix_seconds: f64,
+    /// The air between the eye and the ground: its molecules, its aerosols
+    /// and its strength, today's by default — on a desktop, as the
+    /// `TUILE_AIR_*` tuning values say ([`tuile_atmosphere::tuning`]).
+    pub air: tuile_atmosphere::AerialAir,
     /// The level held in memory for the session, if any.
     pub pinned_level: Option<u32>,
     /// How hard the session may push the machine.
@@ -226,6 +232,8 @@ pub struct App {
     /// hour is fixed for a session, so recomputing the ephemeris every frame
     /// would answer the same question sixty times a second.
     sun: tuile_atmosphere::Sun,
+    /// The air between the eye and the ground ([`ViewerConfig::air`]).
+    air: tuile_atmosphere::AerialAir,
     /// Everything that only exists once there is a window. `None` until
     /// `resumed`, and that is the only reason this is an `Option`.
     active: Option<Active>,
@@ -367,6 +375,7 @@ impl App {
             layer_budget: Default::default(),
             title: config.title.clone(),
             sun: tuile_atmosphere::Sun::at_unix_seconds(config.lit_at_unix_seconds),
+            air: config.air,
             active: None,
             session: None,
             launch: Some(launch),

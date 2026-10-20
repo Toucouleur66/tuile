@@ -142,6 +142,8 @@ pub fn start_viewer(
         lit_at_unix_seconds: web_time::SystemTime::now()
             .duration_since(web_time::UNIX_EPOCH)
             .map_or(0.0, |d| d.as_secs_f64()),
+        // A page has no environment: today's air.
+        air: tuile_atmosphere::AerialAir::default(),
         pinned_level: Some(profile.pinned_level),
         profile,
         retries: Some(retries),

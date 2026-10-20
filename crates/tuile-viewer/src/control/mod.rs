@@ -551,6 +551,7 @@ impl Headless {
             requests: queue,
             remembers: false,
             lit_at_unix_seconds: start.lit_at,
+        air: tuile_atmosphere::AerialAir::default(),
             pinned_level: pinned,
             profile,
             retries,

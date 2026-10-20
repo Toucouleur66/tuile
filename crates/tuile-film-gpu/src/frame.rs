@@ -30,7 +30,8 @@ pub struct FrameUniform {
     pub local_up: [f32; 4],
     pub horizon: [f32; 4],
     pub zenith: [f32; 4],
-    /// xyz: the white balance ([`Look::white_balance`]).
+    /// xyz: the white balance ([`Look::white_balance`]); w: where the
+    /// roll-off of highlights begins ([`Look::highlight_knee`]).
     pub white_balance: [f32; 4],
 }
 
@@ -160,7 +161,7 @@ impl FrameUniform {
             local_up: air.map_or([0.0; 4], |(_, at)| at.up.extend(0.0).to_array()),
             horizon: air.map_or([0.0; 4], |(haze, _)| haze.horizon.extend(0.0).to_array()),
             zenith: air.map_or([0.0; 4], |(haze, _)| haze.zenith.extend(0.0).to_array()),
-            white_balance: look.white_balance.extend(1.0).to_array(),
+            white_balance: look.white_balance.extend(look.highlight_knee).to_array(),
         }
     }
 

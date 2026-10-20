@@ -70,8 +70,7 @@ fn lerp3(b: vec2f, x: vec2f, y: vec2f, z: vec2f) -> vec2f {
 }
 
 // How many times the light of the ground under it the air's veil may
-// reach: see `resolve`.
-const VEIL_BOUND: f32 = 6.0;
+// reach — `atmosphere.tuning.x`, 6 by default: see `resolve`.
 
 // The ground the triangle means where the pixel meets it, for the air: `p`,
 // moved along the vertical by how far the flat triangle lies under the
@@ -262,7 +261,7 @@ fn resolve(@builtin(global_invocation_id) id: vec3u) {
                 let r = length(x);
                 let lit = ground_light(r - atmosphere.centre.w, x / r, x / r, ambient, 1.0);
                 let texel = 0.1 * atmosphere.illuminance.y / (ATMOSPHERE_PI * max(atmosphere.ground.y, 1e-30));
-                let cap = VEIL_BOUND * texel * dot(lit, luma);
+                let cap = atmosphere.tuning.x * texel * dot(lit, luma);
                 let v = dot(veil, luma);
                 veil /= sqrt(1.0 + (v / max(cap, 1e-30)) * (v / max(cap, 1e-30)));
             }
