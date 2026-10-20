@@ -66,7 +66,7 @@
 //!   --scale <s>           picture size against the bake's (default 1)
 //!   --supersample <n>     default 2
 //!   --fps <n>             default 30
-//!   --mbps <n>            default 12
+//!   --mbps <n>            default: the encoder's own by the picture's size
 //!   --no-tone             no grade: imagery as stored, the look as it is
 //!   --tone-table <file>   this grade, not the film's own: a film's grade
 //!                         as --calibrate writes it
@@ -576,7 +576,7 @@ async fn main() -> Result<(), Error> {
     if flag("--no-tone") || calibrating.is_some() {
         order.tone = Tone::Off;
     }
-    let mbps: f64 = value("--mbps").map_or(Ok(12.0), |m| m.parse())?;
+    let mbps: f64 = value("--mbps").map_or(Ok(0.0), |m| m.parse())?;
     let anchor: u8 = value("--anchor").map_or(Ok(10), |a| a.parse())?;
     let cache = value("--cache")
         .or_else(|| std::env::var("TUILE_CACHE_DIR").ok())

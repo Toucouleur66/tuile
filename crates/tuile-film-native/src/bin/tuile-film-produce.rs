@@ -109,11 +109,13 @@ struct Args {
     /// `mv-hevc` (spatial video: AVFoundation on a Mac, NVENC on a card
     /// that encodes it). A film is joined from its parts, and the join
     /// reads H.264 and spatial films.
-    #[arg(long, default_value = "h264", value_parser = ["h264", "nvenc-h264", "mv-hevc", "nvenc-mv-hevc"])]
+    /// `mezzanine` is the HEVC Main10 a render node writes for the final
+    /// stage, on an NVIDIA card.
+    #[arg(long, default_value = "h264", value_parser = ["h264", "nvenc-h264", "mezzanine", "mv-hevc", "nvenc-mv-hevc"])]
     codec: String,
-    /// Megabits a second.
-    #[arg(long, default_value_t = 12.0)]
-    mbps: f64,
+    /// Megabits a second. Absent: the encoder's own by the picture's size.
+    #[arg(long)]
+    mbps: Option<f64>,
     /// The sun, `<azimuth>,<elevation>` in degrees, where the film begins.
     #[arg(long, value_parser = pair, allow_hyphen_values = true)]
     sun: Option<(f64, f64)>,
@@ -570,7 +572,7 @@ mod tests {
         // gives it, whichever the machine has.
         assert_eq!(args.codec, "h264");
         let rendering = rendering(&args, None).expect("rendering");
-        assert_eq!(rendering.bitrate, 12_000_000);
+        assert_eq!(rendering.bitrate, 0, "the encoder's own, by the picture's size");
         assert!(rendering.order.look.haze.is_none());
     }
 

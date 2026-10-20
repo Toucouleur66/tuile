@@ -50,8 +50,13 @@ pub struct SegmentOrder<O = NoOrder> {
     pub pack: String,
     /// First and last frame.
     pub frames: (u32, u32),
-    /// The segment's key in the run store; its receipt beside it, `.json`.
+    /// The segment's key in the store `store` names; its receipt beside it,
+    /// `.json`.
     pub out: String,
+    /// Where the segment goes: the run store, or the mezzanine store — a
+    /// segment only the final stage reads ([`Service::compress`]).
+    #[serde(default)]
+    pub store: tuile_farm::compress::Store,
     #[serde(default)]
     pub rendering: RenderSpec,
     /// The film's store tiles for these frames, prepared by the tile
@@ -200,6 +205,9 @@ fn phases(t: &Timings) -> String {
 /// makes the host's overlays.
 pub struct Service<F: OverlayFactory = NoOverlays> {
     pub runs: Arc<ObjectRunStore>,
+    /// Where a render's mezzanine is kept (`TUILE_MEZZANINE_STORE`); the run
+    /// store when there is none.
+    pub mezzanine: Option<Arc<ObjectRunStore>>,
     /// The tile store's server, when it is one: zones are fetched from it
     /// as extracts before a render.
     pub remote: Option<Arc<dyn tuile_repository::Get>>,
@@ -296,6 +304,7 @@ impl<F: OverlayFactory> Service<F> {
     ) -> Self {
         Self {
             runs,
+            mezzanine: None,
             remote: None,
             tiles,
             cache,
@@ -503,7 +512,8 @@ impl<F: OverlayFactory> Service<F> {
         );
         let frames = done.frames;
 
-        let bytes = self.runs.put(&local, &order.out).await?;
+        let store = self.store(order.store);
+        let bytes = store.put(&local, &order.out).await?;
         let receipt = SegmentDone {
             out: order.out.clone(),
             frames: u64::from(frames),
@@ -515,13 +525,110 @@ impl<F: OverlayFactory> Service<F> {
         };
         let receipt_path = scratch.path().join("segment.json");
         std::fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt)?)?;
-        self.runs
+        store
             .put(
                 &receipt_path,
                 &format!("{}.json", order.out.trim_end_matches(".mp4")),
             )
             .await?;
         Ok(receipt)
+    }
+}
+
+impl<F: OverlayFactory> Service<F> {
+    /// The store `store` names.
+    fn store(&self, store: tuile_farm::compress::Store) -> &ObjectRunStore {
+        match (store, &self.mezzanine) {
+            (tuile_farm::compress::Store::Mezzanine, Some(mezzanine)) => mezzanine,
+            _ => &self.runs,
+        }
+    }
+
+    /// The final stage of a film: every segment its receipts vouch for,
+    /// fetched from where they are kept and joined here, then delivered as
+    /// the order says ([`crate::compress`]) into the run store. The film
+    /// that comes out is checked as the join was: every frame, at its
+    /// cadence. The encode waits its turn for the card with the renders.
+    pub async fn compress(
+        &self,
+        order: &tuile_farm::compress::CompressOrder,
+    ) -> Result<tuile_farm::compress::CompressDone, Error> {
+        use tuile_farm::assemble::{gather, Gathered, RunKeys};
+        std::fs::create_dir_all(&self.cache)?;
+        let scratch = tempfile::tempdir_in(&self.cache)?;
+        let run = RunKeys::new(&order.run, &order.render_id);
+        let gathered = gather(
+            self.runs.as_ref(),
+            self.store(order.segments),
+            &run,
+            order.chunks,
+            &scratch.path().join("join"),
+            Some(order.fps),
+        )
+        .await?;
+        let Gathered::Joined {
+            path: joined,
+            frames,
+            bytes: joined_bytes,
+            fetch_seconds,
+            join_seconds,
+        } = gathered
+        else {
+            return Err(format!(
+                "{}: the receipts of render {} are not all in",
+                order.run, order.render_id
+            )
+            .into());
+        };
+        let card = self.renders.acquire().await.map_err(|e| e.to_string())?;
+        let delivered = scratch.path().join("film.mp4");
+        let (to, delivery) = (delivered.clone(), order.delivery.clone());
+        let fps = order.fps.round().max(1.0) as u32;
+        let device = std::env::var("TUILE_CUDA_DEVICE")
+            .ok()
+            .and_then(|d| d.parse().ok())
+            .unwrap_or(0);
+        let compressed = tokio::task::spawn_blocking(move || {
+            crate::compress::compress(&joined, &to, &delivery, fps, device)
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        drop(card);
+        let probe = tuile_farm::concat::probe(&delivered)?;
+        if probe.frames != frames {
+            return Err(format!(
+                "the delivered film carries {} frames, the joined one {frames}",
+                probe.frames
+            )
+            .into());
+        }
+        tuile_farm::concat::check_cadence(probe, order.fps)?;
+        let key = order
+            .out
+            .clone()
+            .unwrap_or_else(|| tuile_farm::compress::film_key(&order.run, &order.delivery));
+        let bytes = self.runs.put(&delivered, &key).await?;
+        let bitrate = (bytes as f64 * 8.0 / probe.seconds.max(1e-3)).round() as u64;
+        eprintln!(
+            "compress {key}: {frames} frames, {:.1} MB from {:.1} MB joined ({:.1} Mb/s), \
+             {} pass(es) in {:.1} s",
+            bytes as f64 / 1e6,
+            joined_bytes as f64 / 1e6,
+            bitrate as f64 / 1e6,
+            compressed.passes,
+            compressed.seconds
+        );
+        Ok(tuile_farm::compress::CompressDone {
+            key,
+            frames,
+            bytes,
+            joined_bytes,
+            passes: compressed.passes,
+            bitrate,
+            fetch_seconds,
+            join_seconds,
+            encode_seconds: compressed.seconds,
+        })
     }
 }
 
@@ -589,15 +696,18 @@ pub async fn service_from_env_with<F: OverlayFactory>(overlays: F) -> Result<Ser
     let tiles = crate::setup::tile_store(&cache).await?;
     let mut service =
         Service::with_overlays(runs, tiles.objects, cache, limits_from_env()?, overlays);
+    service.mezzanine = ObjectRunStore::mezzanine_from_env()?.map(Arc::new);
     // The tile store's server, when the store is one: extracts come from it.
     service.remote = tuile_repository::HttpGet::from_env()?
         .map(|get| Arc::new(get) as Arc<dyn tuile_repository::Get>);
     Ok(service)
 }
 
-/// The service's routes: `GET /`, and `POST /segments` — answered once the
+/// The service's routes: `GET /`, `POST /segments` — answered once the
 /// segment is in the store, or at once (202) when there is a `notify` to
-/// tell how it ends.
+/// tell how it ends — and `POST /compress`, a film's final stage
+/// ([`Service::compress`]), answered once the delivered film is in the run
+/// store.
 pub fn router<F: OverlayFactory>(
     service: Arc<Service<F>>,
     notify: Option<Arc<dyn Notify<F::Order>>>,
@@ -643,9 +753,28 @@ pub fn router<F: OverlayFactory>(
             },
         }
     }
+    async fn compress<F: OverlayFactory>(
+        State((service, _)): State<Held<F>>,
+        Json(order): Json<tuile_farm::compress::CompressOrder>,
+    ) -> axum::response::Response {
+        eprintln!(
+            "compress {} ← render {} as {}",
+            order.run,
+            order.render_id,
+            order.delivery.key()
+        );
+        match service.compress(&order).await {
+            Ok(done) => Json(done).into_response(),
+            Err(e) => {
+                eprintln!("compress {} failed: {e}", order.run);
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            }
+        }
+    }
     axum::Router::new()
         .route("/", axum::routing::get(|| async { "tuile-film-serve" }))
         .route("/segments", axum::routing::post(segment::<F>))
+        .route("/compress", axum::routing::post(compress::<F>))
         .with_state((service, notify))
 }
 
@@ -721,6 +850,7 @@ mod tests {
             pack: "packs/never.tuilepack".into(),
             frames: (1, 2),
             out: "out.mp4".into(),
+            store: Default::default(),
             rendering: RenderSpec::default(),
             extracts: Vec::new(),
             context: serde_json::Value::Null,
@@ -730,6 +860,58 @@ mod tests {
         };
         let refused = service.segment(&order).await.expect_err("no pack");
         assert!(refused.to_string().contains("did not come"), "{refused}");
+    }
+
+    /// A film's final stage on the service: its receipts read from the run
+    /// store, its segments from the mezzanine store, joined, delivered under
+    /// the run as the order says — every frame there — and a render whose
+    /// receipts are not all in refused.
+    #[tokio::test]
+    async fn a_film_is_compressed_from_its_mezzanine_into_the_run_store() {
+        use tuile_farm::assemble::{Receipt, RunKeys};
+        use tuile_farm::compress::{CompressOrder, Delivery, Store};
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(dir.path().join("catalog.json"), br#"{"layers": []}"#).expect("catalog");
+        let tuning = tuile_farm::Tuning::default;
+        let runs = Arc::new(ObjectRunStore::local(&dir.path().join("runs"), tuning()).expect("store"));
+        let mezzanine =
+            Arc::new(ObjectRunStore::local(&dir.path().join("mezz"), tuning()).expect("store"));
+        let tiles: Arc<dyn tuile_repository::Objects> =
+            Arc::new(ObjectRunStore::local(dir.path(), tuning()).expect("store"));
+        let mut service = Service::new(runs.clone(), tiles, dir.path().join("cache"), Limits::default());
+        service.mezzanine = Some(mezzanine.clone());
+        let keys = RunKeys::new("1557732/20261020T1000Z-ab12", "video-9-run");
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(&scratch).expect("scratch");
+        for (task, first, last) in [(0u32, 1u64, 3u64), (1, 4, 5)] {
+            let segment = scratch.join(format!("{task}.mp4"));
+            let entry = tuile_mp4::film::avc1(64, 48, &[0x67, 0x64, 0, 0x28], &[0x68]).expect("entry");
+            let mut w = tuile_mp4::film::FilmWriter::create(&segment, entry, 30).expect("writer");
+            for i in 0..(last + 1 - first) {
+                w.push(&[0, 0, 0, 2, 0x65, i as u8], i == 0, i).expect("push");
+            }
+            w.finish().expect("finish");
+            mezzanine.put(&segment, &keys.segment(u64::from(task))).await.expect("segment");
+            let receipt = scratch.join(format!("{task}.json"));
+            let r = Receipt { task, first, last, segments: vec![u64::from(task)] };
+            std::fs::write(&receipt, serde_json::to_vec(&r).expect("json")).expect("receipt");
+            runs.put(&receipt, &keys.receipt(task)).await.expect("receipt");
+        }
+        let order: CompressOrder = serde_json::from_value(serde_json::json!({
+            "run": "1557732/20261020T1000Z-ab12", "render_id": "video-9-run", "chunks": 2,
+            "fps": 30.0, "segments": "mezzanine", "delivery": {"kind": "copy"},
+        }))
+        .expect("order");
+        assert_eq!(order.segments, Store::Mezzanine);
+        let done = service.compress(&order).await.expect("compressed");
+        assert_eq!(done.key, "1557732/20261020T1000Z-ab12/films/copy@1.mp4");
+        assert_eq!(done.frames, 5);
+        assert!(runs.exists(&done.key).await.expect("exists"));
+        let refused = service
+            .compress(&CompressOrder { chunks: 3, delivery: Delivery::Copy, ..order })
+            .await
+            .expect_err("a chunk missing");
+        assert!(refused.to_string().contains("not all in"), "{refused}");
     }
 
     #[tokio::test]
