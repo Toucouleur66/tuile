@@ -393,7 +393,7 @@ VMAF is not very sensitive to banding (§6).
 The `targetQuality` values are guesses to be calibrated (§6). Lookahead and
 B-frames break the "one picture in, one out" loop in `nvenc.rs`. The final
 encoder has to keep its input buffers until they are released (the
-NVENC_ERR_NEED_MORE_INPUT pattern) and must write `ctts`.
+NV_ENC_ERR_NEED_MORE_INPUT pattern) and must write `ctts`.
 
 ### 4.4 Where it runs
 
