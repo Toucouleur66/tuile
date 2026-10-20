@@ -2055,9 +2055,39 @@ mod batch {
         };
         let (a, two) = run();
         let (b, _) = run();
-        assert_eq!(a, vec![mesh(t(3, 0, 0)), mesh(t(3, 1, 0))], "{RED}");
+        assert_eq!(a.gpu, vec![mesh(t(3, 0, 0)), mesh(t(3, 1, 0))], "{RED}");
         assert_eq!(a, b);
-        assert!(two.iter().all(|t| !a.contains(&mesh(*t))));
+        assert!(two.iter().all(|t| !a.gpu.contains(&mesh(*t))));
+    }
+
+    /// I13: what a release between frames lets go of, it lets go of whole —
+    /// the decoded copy with the GPU's. A batch's decoded target is
+    /// unbounded, so a copy left in the decoded tier would never go, and an
+    /// in-process consumer's copy is the very allocation the decoded copy
+    /// shares: releasing one and keeping the other bounds nothing.
+    #[test]
+    fn release_beyond_lets_go_of_the_decoded_copy_too() {
+        let mut r = Rig::batch();
+        let one: Vec<_> = (0..4).map(|x| t(3, x, 0)).collect();
+        let two: Vec<_> = (2..6).map(|x| t(3, x, 0)).collect();
+        r.settle(&drawn(&one), 20);
+        r.settle(&drawn(&two), 20);
+        let before = r.b.ledger().decoded;
+        let released = r.b.release_beyond(Bytes::ZERO);
+        assert!(!released.gpu.is_empty(), "{RED}");
+        assert_eq!(released.decoded, released.gpu, "{RED}");
+        for gone in &released.gpu {
+            let held = r.b.resource(*gone).map_or(Bytes::ZERO, |v| v.decoded);
+            assert_eq!(held, Bytes::ZERO, "{gone:?} kept its decoded copy");
+        }
+        assert!(r.b.ledger().decoded < before, "{RED}");
+        // What the last frame needed keeps both.
+        for kept in &two {
+            assert!(r
+                .b
+                .resource(mesh(*kept))
+                .is_some_and(|v| v.decoded > Bytes::ZERO));
+        }
     }
 
     /// I13, D1: a Batch failure ends the session.
