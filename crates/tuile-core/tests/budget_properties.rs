@@ -7,7 +7,7 @@
 //!
 //! The runner only records; each property asserts one thing over the trace,
 //! so a failure names the property it breaks. Cases: `PROPTEST_CASES`
-//! (256 locally, 10 000 in CI, 1 000 000 nightly).
+//! (256 locally, 10 000 in CI's release job; no nightly job exists yet).
 
 #![allow(clippy::unwrap_used, clippy::panic)]
 
