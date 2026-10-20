@@ -23,9 +23,8 @@ use tuile_core::drive::drive_until_complete;
 use tuile_core::geo::{ecef_to_geodetic, enu_frame, geodetic_to_ecef, Geodetic, WGS84_A};
 use tuile_core::report::GeometryReport;
 use tuile_core::runtime::in_process_with;
-use tuile_core::source::{TileId, TileLoader, TileTree};
+use tuile_core::source::{TileLoader, TileTree};
 use tuile_core::traversal::{Config, ViewState};
-use tuile_core::TileContent;
 use tuile_native_fetchers::NativeHttp;
 use tuile_planetary::{globe_on, GlobeOptions};
 use tuile_wgpu::{prepare, GpuContext, PreparedTile, TileRenderer, ViewUniform};
@@ -189,7 +188,7 @@ async fn ion_globe(
 
     // No cache wrappers: a bulk run visits each tile once, so a store would
     // only pay the cost of writing entries nothing comes back for.
-    let (tree, loader, _detail, _heights) = globe_on(
+    let (tree, loader, _heights) = globe_on(
         terrain,
         bing,
         layer,
@@ -258,13 +257,16 @@ async fn main() -> Result<()> {
     // --- Tree + loader → generic geometry server, driven in bulk ---
     let config = Config {
         maximum_screen_space_error: preset.max_sse,
-        // Fat pipe: many terrain tiles loading at once, each fanning out its
-        // imagery mosaic fetches concurrently on top.
-        maximum_simultaneous_fetches: 64,
-        resident_budget_bytes: 2 << 30,
         ..Config::default()
     };
-    let (mut stream, server) = in_process_with(tree, loader, config);
+    // A bulk frame: the batch budget, ready only when every mesh and drape
+    // it draws is held.
+    let (mut stream, server) = in_process_with(
+        tree,
+        loader,
+        config,
+        tuile_core::budget::BudgetConfig::batch(),
+    )?;
     tokio::spawn(server.run());
 
     tracing::info!("bulk-loading selection for {name}…");
@@ -272,24 +274,25 @@ async fn main() -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     tracing::info!(
-        "selection stable: {} tiles, {} decoded, {} errors (visited {}, culled {})",
-        frame.selected.len(),
-        frame.contents.len(),
+        "frame ready: {} drawn, {} meshes and {} drapes decoded, {} errors (visited {}, culled {})",
+        frame.draw.items.len(),
+        frame.meshes.len(),
+        frame.drapes.len(),
         frame.errors.len(),
         frame.stats.visited,
         frame.stats.culled,
     );
-    for (tile, msg) in &frame.errors {
-        tracing::warn!("tile {tile:?}: {msg}");
+    for (resource, msg) in &frame.errors {
+        tracing::warn!("{resource:?}: {msg}");
     }
+    // Each drawn mesh with the drapes it wears, in draw order.
+    let dressed = frame.dressed();
 
     // JSON view of the generated geometry, next to the PNG. Render-agnostic
     // and built the same way a streaming consumer would (fold each tile in).
     let mut report = GeometryReport::new();
-    for (tile, content) in &frame.contents {
-        if let TileContent::Decoded(d) = content {
-            report.add(*tile, d);
-        }
+    for (tile, content) in &dressed {
+        report.add(*tile, content);
     }
     let json_path = std::path::Path::new(&out).with_extension("json");
     std::fs::write(&json_path, report.to_json_pretty()).context("write report json")?;
@@ -309,19 +312,12 @@ async fn main() -> Result<()> {
     let renderer = TileRenderer::new(&gpu, TEXTURE_FORMAT);
     renderer.set_view(&gpu.queue, &preset.uniform());
 
-    // Render ONLY the selected frontier — not every resident tile. Coarse
-    // ancestors stay resident as REPLACE stand-ins during convergence; drawing
-    // them too would overlap the fine tiles (z-fighting / ghosting).
-    let selected: std::collections::HashSet<TileId> =
-        frame.selected.iter().map(|(t, _)| *t).collect();
-    let prepared: Vec<PreparedTile> = frame
-        .contents
+    // Render ONLY what the frame draws — not every resident tile. Coarse
+    // ancestors stay resident while the frame loads; drawing them too would
+    // overlap the fine tiles (z-fighting / ghosting).
+    let prepared: Vec<PreparedTile> = dressed
         .iter()
-        .filter(|(t, _)| selected.contains(t))
-        .filter_map(|(_, c)| match c {
-            TileContent::Decoded(d) => Some(prepare(&gpu, d, preset.render_origin)),
-            _ => None,
-        })
+        .map(|(_, content)| prepare(&gpu, content, preset.render_origin))
         .collect();
     tracing::info!("rendering {} tiles at {size}×{size}…", prepared.len());
 
