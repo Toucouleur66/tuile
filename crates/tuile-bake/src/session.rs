@@ -890,6 +890,45 @@ impl Session {
     ) -> Result<Frame, FrameError> {
         self.frame(vec![pose_view(pose, viewport)])
     }
+
+    /// The views of the frames that come next, in their order: their tiles
+    /// are loaded while this session converges and places the ones before
+    /// — with the load slots the current frame leaves, never in its place —
+    /// and kept between frames ([`SessionConfig::release_beyond`]) until
+    /// they are drawn. Replaces the views given before. What any frame
+    /// selects is the same with or without them: only when its tiles
+    /// arrive changes (`ClientMessage::Ahead`). Nothing for a packed
+    /// session, which loads nothing.
+    pub fn ahead(&mut self, views: Vec<ViewStateParams>) -> Result<(), FrameError> {
+        let Source::Live(live) = &mut self.0 else {
+            return Ok(());
+        };
+        let views: Vec<ViewState> = views.into_iter().map(Into::into).collect();
+        live.stream
+            .send(ClientMessage::Ahead { views })
+            .map_err(|_| FrameError::ServerGone)
+    }
+}
+
+/// How many frames ahead of the one it converges a bake announces
+/// ([`Session::ahead`]), unless `TUILE_BAKE_AHEAD` says: a tuning of how
+/// far the loads may run before the frames that need them.
+pub(crate) fn frames_ahead() -> usize {
+    count_knob("TUILE_BAKE_AHEAD").unwrap_or(FRAMES_AHEAD)
+}
+
+/// [`frames_ahead`]'s default.
+const FRAMES_AHEAD: usize = 8;
+
+/// The frames a bake announces at the frame `index` of its sequence
+/// ([`Session::ahead`]): every second one of the next [`frames_ahead`] —
+/// a frame's tiles are its neighbours', and the session's pass over the
+/// views ahead costs as many views as it is given — renewed each half of
+/// that, so that the pass runs again only when the frames ahead moved on.
+/// `None` where the frames announced last still hold.
+pub(crate) fn announced(index: usize, len: usize) -> Option<std::ops::Range<usize>> {
+    let ahead = frames_ahead();
+    (index % (ahead / 2).max(1) == 0).then(|| (index + 1).min(len)..(index + 1 + ahead).min(len))
 }
 
 /// The bytes the ground a camera is kept over takes
