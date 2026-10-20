@@ -1386,6 +1386,8 @@ fn dump_frame(path: &std::path::Path, number: u32) -> Result<(), String> {
             up: glam::DVec3::from_array(view.up),
             viewport_px: glam::dvec2(view.viewport_px[0], view.viewport_px[1]),
             fovy_rad: view.fovy_rad,
+            fov: None,
+            scale: 1.0,
         }])
         .map_err(|e| format!("frame {number}: {e}"))?;
 
@@ -1671,6 +1673,8 @@ fn verify(
             up: glam::DVec3::from_array(view.up),
             viewport_px: glam::dvec2(view.viewport_px[0], view.viewport_px[1]),
             fovy_rad: view.fovy_rad,
+            fov: None,
+            scale: 1.0,
         }];
         let from_pack = packed
             .frame(views.clone())
