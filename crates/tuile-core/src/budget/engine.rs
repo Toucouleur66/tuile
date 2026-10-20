@@ -32,7 +32,7 @@ use super::decisions::{
     Decisions, DrapeChoice, DrawItem, DrawSet, Role, Start, SwapGroup, UploadPlan,
 };
 use super::error::{AuditError, SessionError};
-use super::imagery::{best_drape, needed_level, DrapeCandidate, LevelClamp, UvTransform};
+use super::imagery::{drape_rank, needed_level, DrapeCandidate, GeoRect, LevelClamp, UvTransform};
 use super::need::{ImageryNeed, LayerReach, Membership, Need};
 use super::priority::{score, PriorityKey, Quantised, Urgency};
 use super::state::{CpuCopy, Entry, Gpu, Load, Transit};
@@ -582,38 +582,88 @@ impl Budget {
         self.entries.get(&r).is_some_and(|e| e.gpu.is_some())
     }
 
-    fn is_descendant(&self, mut t: TileId, of: TileId) -> bool {
-        let target = self.tiles.get(&of).map(|i| i.level);
-        for _ in 0..64 {
-            let Some(info) = self.tiles.get(&t) else {
-                return false;
-            };
-            let Some(p) = info.parent else {
-                return false;
-            };
-            if p == of {
-                return true;
+    /// Every (ancestor, held tile) pair of last step's held tiles, sorted,
+    /// with the lowest level the walk from the held tile passed before
+    /// reaching that ancestor: `held` is a descendant of `of` exactly when
+    /// that level is above `of`'s own (or `of`'s is unknown). One walk per
+    /// held tile, once per step, instead of one per held tile and missing
+    /// tile.
+    fn held_ancestry(&self, out: &mut Vec<(TileId, TileId, u32)>) {
+        out.clear();
+        for &h in &self.held_last {
+            let mut t = h;
+            let mut passed = u32::MAX;
+            for _ in 0..64 {
+                let Some(info) = self.tiles.get(&t) else {
+                    break;
+                };
+                let Some(p) = info.parent else {
+                    break;
+                };
+                out.push((p, h, passed));
+                passed = passed.min(info.level);
+                t = p;
             }
-            if target.is_some_and(|l| info.level <= l) {
-                return false;
-            }
-            t = p;
         }
-        false
+        // A cycle visits an ancestor twice: its first visit, the highest
+        // level passed, is the one that counts.
+        out.sort_unstable_by_key(|a| (a.0, a.1, Reverse(a.2)));
+        out.dedup_by(|b, a| (a.0, a.1) == (b.0, b.1));
     }
 
-    /// The tile's ancestors, nearest first, as far as the budget knows them.
-    fn ancestors(&self, t: TileId) -> Vec<TileId> {
-        let mut out = Vec::new();
-        let mut cur = t;
-        while let Some(p) = self.tiles.get(&cur).and_then(|i| i.parent) {
-            if out.len() >= 64 {
-                break;
-            }
-            out.push(p);
-            cur = p;
+    /// The held tiles below `of`, in tile order.
+    fn held_below<'h>(
+        &self,
+        ancestry: &'h [(TileId, TileId, u32)],
+        of: TileId,
+    ) -> impl Iterator<Item = TileId> + 'h {
+        let target = self.tiles.get(&of).map(|i| i.level);
+        let from = ancestry.partition_point(|a| a.0 < of);
+        ancestry[from..]
+            .iter()
+            .take_while(move |a| a.0 == of)
+            .filter(move |a| target.is_none_or(|l| a.2 > l))
+            .map(|a| a.1)
+    }
+
+    /// The tile's ancestors, nearest first, as far as the budget knows them:
+    /// at most 64, lazily, so a caller that stops at the first hit walks no
+    /// further.
+    fn ancestors(&self, t: TileId) -> impl Iterator<Item = TileId> + '_ {
+        std::iter::successors(self.tiles.get(&t).and_then(|i| i.parent), move |p| {
+            self.tiles.get(p).and_then(|i| i.parent)
+        })
+        .take(64)
+    }
+
+    /// The UV mapping of `tile`'s mesh into the drapes of `x`, the tile
+    /// itself (`up == 0`) or one of its ancestors: `None` when either
+    /// footprint is unknown.
+    fn uv_into(&self, rect: Option<GeoRect>, up: usize, x: TileId) -> Option<UvTransform> {
+        if up == 0 {
+            return Some(UvTransform::IDENTITY);
         }
-        out
+        match (rect, self.tiles.get(&x).and_then(|i| i.rect)) {
+            (Some(a), Some(b)) => UvTransform::between(a, b),
+            _ => None,
+        }
+    }
+
+    /// The drawable drapes of `layer` on `x`, with their levels.
+    fn drawable_drapes(
+        &self,
+        x: TileId,
+        layer: LayerId,
+    ) -> impl Iterator<Item = (ResourceId, u32)> + '_ {
+        // Only this layer's drapes: a layer never falls back on another's.
+        let lo = ResourceId::drape(x, layer, 0);
+        let hi = ResourceId::drape(x, layer, u32::MAX);
+        self.entries
+            .range(lo..=hi)
+            .filter_map(|(r, e)| match (r, e.gpu) {
+                (ResourceId::Drape { level, .. }, Some(_)) => Some((*r, *level)),
+                _ => None,
+            })
     }
 
     fn best_drape_for(&self, tile: TileId, layer: LayerId, need: u32) -> Option<DrapeChoice> {
@@ -629,44 +679,44 @@ impl Budget {
             });
         }
         let rect = self.tiles.get(&tile).and_then(|i| i.rect);
-        let mut chain = vec![tile];
-        chain.extend(self.ancestors(tile));
-        let mut cands: Vec<(DrapeCandidate, ResourceId, UvTransform)> = Vec::new();
-        for (up, x) in chain.iter().enumerate() {
-            let uv = if up == 0 {
-                Some(UvTransform::IDENTITY)
-            } else {
-                match (rect, self.tiles.get(x).and_then(|i| i.rect)) {
-                    (Some(a), Some(b)) => UvTransform::between(a, b),
-                    _ => None,
-                }
+        // `best_drape`'s fold, walked lazily: the first of equal ranks wins.
+        let mut best: Option<(DrapeCandidate, ResourceId, UvTransform)> = None;
+        for (up, x) in std::iter::once(tile)
+            .chain(self.ancestors(tile))
+            .enumerate()
+        {
+            let Some(uv) = self.uv_into(rect, up, x) else {
+                continue;
             };
-            let Some(uv) = uv else { continue };
-            // Only this layer's drapes: a layer never falls back on another's.
-            let lo = ResourceId::drape(*x, layer, 0);
-            let hi = ResourceId::drape(*x, layer, u32::MAX);
-            for (r, e) in self.entries.range(lo..=hi) {
-                if let (ResourceId::Drape { level, .. }, Some(_)) = (r, e.gpu) {
-                    cands.push((
-                        DrapeCandidate {
-                            level: *level,
-                            up: up as u32,
-                        },
-                        *r,
-                        uv,
-                    ));
+            for (r, level) in self.drawable_drapes(x, layer) {
+                let c = DrapeCandidate {
+                    level,
+                    up: up as u32,
+                };
+                if best.is_none_or(|(b, ..)| drape_rank(need, c) < drape_rank(need, b)) {
+                    best = Some((c, r, uv));
                 }
             }
         }
-        let best = best_drape(need, cands.iter().map(|c| c.0))?;
-        cands
-            .into_iter()
-            .find(|c| c.0 == best)
-            .map(|(c, resource, uv)| DrapeChoice {
-                resource,
-                layer,
-                level: c.level,
-                uv,
+        best.map(|(c, resource, uv)| DrapeChoice {
+            resource,
+            layer,
+            level: c.level,
+            uv,
+        })
+    }
+
+    /// Whether `tile` has any drawable drape of `layer`, on itself or an
+    /// ancestor it maps into: `best_drape_for(tile, layer, _).is_some()`,
+    /// stopping at the first found.
+    fn has_drape(&self, tile: TileId, layer: LayerId) -> bool {
+        let rect = self.tiles.get(&tile).and_then(|i| i.rect);
+        std::iter::once(tile)
+            .chain(self.ancestors(tile))
+            .enumerate()
+            .any(|(up, x)| {
+                self.drawable_drapes(x, layer).next().is_some()
+                    && self.uv_into(rect, up, x).is_some()
             })
     }
 
@@ -681,9 +731,7 @@ impl Budget {
     /// needs. A mesh that cannot is not drawn: bare ground is black ground
     /// (I1, D-A1).
     fn dressable(&self, tile: TileId, layers: &BTreeSet<LayerId>) -> bool {
-        let missing = layers
-            .iter()
-            .any(|l| self.best_drape_for(tile, *l, 0).is_none());
+        let missing = layers.iter().any(|l| !self.has_drape(tile, *l));
         !missing
             || self
                 .worn_last
@@ -701,6 +749,7 @@ impl Budget {
         &self,
         tiles: &BTreeMap<TileId, TileNeed>,
         drapes: &BTreeMap<(TileId, LayerId), u32>,
+        ancestry: &[(TileId, TileId, u32)],
         cap: Option<u32>,
     ) -> Selection {
         let mut sel = Selection::default();
@@ -731,10 +780,8 @@ impl Budget {
                 continue;
             }
             let held: Vec<TileId> = self
-                .held_last
-                .iter()
-                .copied()
-                .filter(|h| self.is_descendant(*h, *t) && shown(*h, &layers))
+                .held_below(ancestry, *t)
+                .filter(|h| shown(*h, &layers))
                 .collect();
             for h in &held {
                 add(&mut sel.items, *h, Role::Held, *t);
@@ -742,7 +789,7 @@ impl Budget {
             if !held.is_empty() {
                 sel.coarsening.insert(*t);
             }
-            let anc = self.ancestors(*t).into_iter().find(|a| shown(*a, &layers));
+            let anc = self.ancestors(*t).find(|a| shown(*a, &layers));
             if let Some(a) = anc {
                 add(&mut sel.items, a, Role::Fallback, *t);
                 let level = |x: TileId| self.tiles.get(&x).map_or(0, |i| i.level);
@@ -765,13 +812,15 @@ impl Budget {
         floor_in: bool,
         st: &mut BudgetStats,
     ) -> (DrawSet, BTreeSet<TileId>) {
-        let mut sel = self.select(tiles, drapes, None);
+        let mut ancestry = Vec::new();
+        self.held_ancestry(&mut ancestry);
+        let mut sel = self.select(tiles, drapes, &ancestry, None);
         if sel.lost > 0 && !floor_in {
             // P1.1 (b): coarse ground before any refinement. While wanted
             // ground is lost and the floor not in, nothing finer than the
             // floor is drawn.
             if let Some(p) = self.cfg.pinned_level {
-                sel = self.select(tiles, drapes, Some(p));
+                sel = self.select(tiles, drapes, &ancestry, Some(p));
             }
         }
         st.exact += sel.exact;
