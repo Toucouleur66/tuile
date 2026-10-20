@@ -11,9 +11,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use glam::DVec3;
-use tuile_core::content::{DecodedMesh, DecodedTileContent, TileContent};
+use tuile_core::budget::{BudgetConfig, DrawItem, Generation, ResourceId, Role};
+use tuile_core::content::{DecodedMesh, DecodedTileContent, DrapeContent};
 use tuile_core::drive::SceneState;
-use tuile_core::protocol::{ClientMessage, GeometryStream, ServerMessage, StreamError};
+use tuile_core::protocol::{
+    ClientMessage, GeometryStream, ResourceContent, ServerMessage, StreamError,
+};
 use tuile_core::runtime::in_process_with;
 use tuile_core::source::{TileId, TileLoader, TileTree};
 use tuile_core::traversal::{Config, ViewState, ViewStateParams};
@@ -22,14 +25,21 @@ use tuile_core::traversal::{Config, ViewState, ViewStateParams};
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
     pub traversal: Config,
-    /// Longest a single frame may take to converge.
+    /// The budget the session's geometry server runs on:
+    /// [`BudgetConfig::batch`] — unbounded, exact, never cancelling what a
+    /// frame needs. A frame is answered when the server says every mesh and
+    /// drape it needs is held (`frame_ready`, I13); a load that takes longer
+    /// than its `load_timeout` (120 s) or fails ends the session with the
+    /// reason (`FailurePolicy::EndSession`): a bake never ships a hole.
+    /// [`exact_budget`] applies the environment's knobs to it.
+    pub budget: BudgetConfig,
+    /// Longest a single frame may take to become ready.
     ///
-    /// A bulk frame blocks until every selected tile is resident, and there are
-    /// two ways that never happens: a fetch that hangs without failing, and a
-    /// resident budget too small for the frame's working set, where eviction
-    /// during convergence keeps the request count above zero. Neither is
-    /// hypothetical, and on a farm both look identical — a node that stopped.
-    /// This turns them into a reported failure.
+    /// The outer bound, over the budget's per-load `load_timeout`: a frame
+    /// of thousands of loads that each arrive in time can still take a
+    /// long while, and a node that stopped must be told from one that is
+    /// working. This turns a frame that never becomes ready into a
+    /// reported failure.
     pub frame_timeout: Duration,
     /// Whether a frame that converged but lost tiles along the way is an error.
     ///
@@ -57,14 +67,16 @@ pub struct SessionConfig {
     pub bake_max_size: u32,
     /// What each tile is finished into. See [`Finish`].
     pub finish: Finish,
-    /// What the geometry server may keep, in bytes, of what frames leave
-    /// behind: once a frame has converged, everything beyond it that the
-    /// frame neither draws nor stands on is let go (`ClientMessage::Trim`).
-    /// A frame still converges with no budget at all — nothing it waits on
-    /// is ever taken — so this bounds a long flight's memory, never a
-    /// frame's. `None` keeps everything, as a session always did.
+    /// What the session keeps, in bytes, of what frames leave behind: once
+    /// a frame is ready, everything the frame did not need is let go — both
+    /// copies, the session's and the server's — down to this
+    /// (`ClientMessage::ReleaseBeyond`, deterministic: the same flight lets
+    /// go of the same resources). A frame never waits on less for it —
+    /// nothing a frame needs is ever let go — so this bounds a long
+    /// flight's memory, never a frame's; what was let go is loaded again
+    /// when a later frame needs it. `None` keeps everything.
     /// `TUILE_BAKE_KEEP_GIB` when the environment says.
-    pub trim_between_frames: Option<usize>,
+    pub release_beyond: Option<u64>,
 }
 
 /// What a session makes of a tile once its content has arrived.
@@ -95,31 +107,19 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             traversal: Config::default(),
-            // The only bound there is, now that the patience has none.
-            //
-            // `RetryConfig::patient()` never gives up on a tile: a bake is
-            // all-or-nothing and nobody is watching, so there is no number of
-            // attempts after which renouncing is better than waiting. That
-            // moves the whole decision here — this is what separates "the
-            // origin had a bad ten minutes" from "the shot is lost", and
-            // nothing else will end the wait.
-            //
-            // Fifteen minutes, and each half of that is deliberate. Long
-            // enough that the unlimited patience can actually be spent — at a
-            // thirty-second ceiling it buys about thirty attempts, so a real
-            // outage is survived rather than converted into a thrown-away
-            // bake, which was the entire point. Short enough to stay a bound:
-            // the job itself is capped at 7200 s for 2880 frames, so one stuck
-            // frame costs an eighth of the run and then *reports*, instead of
+            // Each load is bounded by the budget's `load_timeout` (120 s in
+            // `BudgetConfig::batch`): a load that has not answered by then
+            // ends the session, with the resource it was waiting on named
+            // (`FailurePolicy::EndSession`). The store's patient retries
+            // (`RetryConfig::patient`) run inside that bound.
+            budget: BudgetConfig::batch(),
+            // And the frame as a whole by this: thousands of loads that each
+            // answer in time can still take a while, and a node that stopped
+            // must be told from one that is working. Fifteen minutes: the
+            // job is capped at 7200 s for 2880 frames, so one stuck frame
+            // costs an eighth of the run and then *reports*, instead of
             // sitting in `wait` until the platform kills it with no reason
             // attached.
-            //
-            // It used to be 120 s flat beside a retry profile that budgeted
-            // 182 s, so the chain could never finish inside a frame at all.
-            // Measured 19 September 2026: `in_flight=1` for ninety seconds,
-            // `selected` frozen at 230, then `frame did not converge within
-            // 120s` — and not one line saying a retry was underway, because
-            // they logged at `debug`.
             frame_timeout: Duration::from_secs(900),
             fail_on_tile_errors: true,
             // Deliberately not "" — an empty dataset would collapse the URI to
@@ -129,10 +129,10 @@ impl Default for SessionConfig {
             // shots raise it where the RAM is real, a laptop lowers it.
             bake_max_size: env_knob("TUILE_BAKE_MAX", 2048_u32).clamp(64, 8192),
             finish: Finish::Pictures,
-            trim_between_frames: std::env::var("TUILE_BAKE_KEEP_GIB")
+            release_beyond: std::env::var("TUILE_BAKE_KEEP_GIB")
                 .ok()
                 .and_then(|gib| gib.parse::<f64>().ok())
-                .map(|gib| (gib * f64::from(1u32 << 30)) as usize),
+                .map(|gib| (gib * f64::from(1u32 << 30)) as u64),
         }
     }
 }
@@ -559,14 +559,6 @@ pub(crate) struct Live {
     stream: tuile_core::protocol::InProcessStream,
     runtime: tokio::runtime::Runtime,
     config: SessionConfig,
-    /// The imagery-resolution handle, when the source exposes one.
-    ///
-    /// Imagery detail is driven by the **camera's altitude**, decoupled from
-    /// the terrain LOD. Left unset, draped imagery follows the terrain's
-    /// geometric error — and since adjacent terrain levels carry imagery from
-    /// different capture batches, every LOD boundary becomes an exposure seam
-    /// across the ground (measured on the first SSE-1 gate render).
-    imagery_detail: Option<tuile_planetary::ImageryDetail>,
     /// The ground's heights as the resident terrain gives them, when the
     /// source keeps them (a globe does). See [`Session::heights`].
     heights: Option<Arc<tuile_terrain::TerrainHeights>>,
@@ -574,15 +566,18 @@ pub(crate) struct Live {
     provenance: Option<Arc<tuile_planetary::Provenance>>,
     /// Baked, encoded textures kept across frames. See [`TextureMemo`].
     textures: Arc<TextureMemo>,
-    /// What the consumer holds, tile by tile.
+    /// What the consumer holds of the stream: each mesh and drape as the
+    /// server delivered it.
     ///
-    /// The server sends a tile's `Content` **once per residency** and never
-    /// again — the invariant the whole streaming protocol is built on. A
-    /// consumer that threw its tiles away after each frame (as this one used
-    /// to, by rebuilding the session) simply never saw them a second time. So
-    /// residency is kept here, exactly as the interactive viewer keeps it:
-    /// filled by `Content`, emptied by `Evict`, everything else survives.
-    resident: HashMap<TileId, Arc<TileGeometry>>,
+    /// The server sends a resource's `Content` **once per residency** and
+    /// never again — the invariant the whole streaming protocol is built on.
+    /// So what came is kept here, exactly as the interactive viewer keeps
+    /// it: filled by `Content`, emptied by `Evict`, everything else survives.
+    held: Held,
+    /// Each drawn tile, finished from the mesh and the drapes it wears, with
+    /// that dressing: a tile drawn again in the same dressing is not
+    /// finished again.
+    resident: HashMap<TileId, Finished>,
     /// The consumer's view of the selection, rebuilt from the server's
     /// messages and **kept across frames**.
     scene: SceneState,
@@ -668,12 +663,6 @@ impl Session {
         )?))))
     }
 
-    pub(crate) fn set_imagery_detail(&mut self, detail: tuile_planetary::ImageryDetail) {
-        if let Source::Live(live) = &mut self.0 {
-            live.set_imagery_detail(detail);
-        }
-    }
-
     pub(crate) fn set_heights(&mut self, heights: Arc<tuile_terrain::TerrainHeights>) {
         if let Source::Live(live) = &mut self.0 {
             live.heights = Some(heights);
@@ -742,7 +731,7 @@ impl Session {
         let meshes = grounds.as_it_came.as_ref()?;
         let mut stitching = tuile_film::stitching::Stitching::default();
         let mut keys = Vec::new();
-        for (tile, _) in live.scene.selected() {
+        for tile in &drawn_tiles(&live.scene) {
             let (Some((origin, mesh)), true) = (meshes.get(tile), grounds.kept.contains_key(tile))
             else {
                 continue;
@@ -756,7 +745,7 @@ impl Session {
             let source = live
                 .resident
                 .get(tile)
-                .and_then(|g| g.refs.as_ref())
+                .and_then(|f| f.geometry.refs.as_ref())
                 .map(|refs| u32::from(refs.terrain.level));
             stitching.enter(key, source, &mesh);
             keys.push(key);
@@ -785,11 +774,8 @@ impl Session {
         };
         let grounds = live.grounds.as_ref()?;
         let started = tuile_core::metrics::stamp();
-        let selected: Vec<TileId> = live
-            .scene
-            .selected()
-            .iter()
-            .map(|(tile, _)| *tile)
+        let selected: Vec<TileId> = drawn_tiles(&live.scene)
+            .into_iter()
             .filter(|tile| grounds.kept.contains_key(tile))
             .collect();
         let key = |tile: TileId| tuile_film::TileKey {
@@ -836,7 +822,7 @@ impl Session {
                 let source = live
                     .resident
                     .get(&tile)
-                    .and_then(|g| g.refs.as_ref())
+                    .and_then(|f| f.geometry.refs.as_ref())
                     .map(|refs| u32::from(refs.terrain.level));
                 drawn.stitching.enter(key(tile), source, &mesh);
                 drawn.entered.insert(tile, *arrival);
@@ -949,11 +935,9 @@ pub struct GroundMemory {
 /// What is kept of the resident tiles' terrain ([`Session::keep_ground`]).
 #[derive(Default)]
 struct Grounds {
-    /// Each tile's, with the arrival it came by.
+    /// Each tile's, with the arrival of the mesh it was kept from: a tile
+    /// that came again is told from the one before it.
     kept: HashMap<TileId, (u64, crate::ground::Kept)>,
-    /// Counts the tiles that came, so that one that came again is told from
-    /// the one before it.
-    arrivals: u64,
     /// Each tile's mesh as it came, when asked
     /// ([`Session::keep_ground_and_meshes`]).
     as_it_came: Option<HashMap<TileId, (DVec3, DecodedMesh)>>,
@@ -963,6 +947,97 @@ struct Grounds {
 struct KeptTile {
     kept: crate::ground::Kept,
     as_it_came: Option<DecodedMesh>,
+}
+
+/// What the session holds of the stream, kept across frames: each mesh and
+/// drape with the arrival it came by and the generation it was delivered
+/// at, until the server evicts it.
+#[derive(Default)]
+struct Held {
+    meshes: HashMap<TileId, (u64, Arc<DecodedTileContent>)>,
+    drapes: HashMap<ResourceId, (u64, Arc<DrapeContent>)>,
+    /// The generation each held resource came with: what a `Cancel` names.
+    gens: HashMap<ResourceId, Generation>,
+    /// Counts the deliveries, so that a resource that came again is told
+    /// from the one before it.
+    arrivals: u64,
+}
+
+impl Held {
+    /// Takes in one delivery; returns the bytes it is acknowledged with.
+    fn deliver(&mut self, resource: ResourceId, gen: Generation, content: ResourceContent) -> u64 {
+        self.arrivals += 1;
+        self.gens.insert(resource, gen);
+        match content {
+            ResourceContent::Mesh(mesh) => {
+                let bytes = mesh.cost().gpu.0;
+                self.meshes.insert(resource.tile(), (self.arrivals, mesh));
+                bytes
+            }
+            ResourceContent::Drape(drape) => {
+                let bytes = drape.cost().gpu.0;
+                self.drapes.insert(resource, (self.arrivals, drape));
+                bytes
+            }
+        }
+    }
+
+    /// Lets one resource go.
+    fn forget(&mut self, resource: ResourceId) {
+        self.gens.remove(&resource);
+        match resource {
+            ResourceId::Mesh(tile) => {
+                self.meshes.remove(&tile);
+            }
+            ResourceId::Drape { .. } => {
+                self.drapes.remove(&resource);
+            }
+        }
+    }
+
+    /// What a draw item is made of, as held: its mesh's arrival and each
+    /// worn drape's. `None` while one of them is not held.
+    fn dressing(&self, item: &DrawItem) -> Option<Dressing> {
+        let (mesh, _) = self.meshes.get(&item.mesh.tile())?;
+        let drapes = item
+            .drapes
+            .iter()
+            .map(|c| self.drapes.get(&c.resource).map(|(a, _)| (c.resource, *a)))
+            .collect::<Option<Vec<_>>>()?;
+        Some(Dressing {
+            mesh: *mesh,
+            drapes,
+        })
+    }
+}
+
+/// What a finished tile was finished from: the arrival of its mesh and of
+/// each drape it wears. Two equal dressings make the same tile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Dressing {
+    mesh: u64,
+    drapes: Vec<(ResourceId, u64)>,
+}
+
+/// A drawn tile, finished, with the dressing it was finished from.
+struct Finished {
+    dressing: Dressing,
+    geometry: Arc<TileGeometry>,
+}
+
+/// The tiles a frame draws: every drawn mesh but a fallback (a coarser
+/// ancestor standing in for ground that is not its own), in the draw set's
+/// order — by tile.
+fn drawn_tiles(scene: &SceneState) -> Vec<TileId> {
+    drawn_items(scene).map(|item| item.mesh.tile()).collect()
+}
+
+fn drawn_items(scene: &SceneState) -> impl Iterator<Item = &DrawItem> {
+    scene
+        .draw()
+        .items
+        .iter()
+        .filter(|item| item.role != Role::Fallback)
 }
 
 /// The ground last drawn ([`Session::ground`]): each tile prepared as
@@ -981,13 +1056,13 @@ struct Drawn {
 /// transcribe them wrongly — the failure being a pack that answers no camera,
 /// which costs a whole execution to discover.
 pub fn pose_view(pose: &tuile_tape::Frame, viewport: (f64, f64)) -> ViewStateParams {
-    ViewStateParams {
-        position: glam::DVec3::from_array(pose.position),
-        direction: glam::DVec3::from_array(pose.direction),
-        up: glam::DVec3::from_array(pose.up),
-        viewport_px: glam::dvec2(viewport.0, viewport.1),
-        fovy_rad: pose.fovy,
-    }
+    ViewStateParams::perspective(
+        glam::DVec3::from_array(pose.position),
+        glam::DVec3::from_array(pose.direction),
+        glam::DVec3::from_array(pose.up),
+        glam::dvec2(viewport.0, viewport.1),
+        pose.fovy,
+    )
 }
 
 impl Live {
@@ -1027,6 +1102,7 @@ impl Live {
         config: SessionConfig,
     ) -> std::io::Result<Self> {
         let traversal = exact_traversal(config.traversal.clone());
+        let budget = exact_budget(config.budget.clone());
         // Every knob that can move a selection, once, at the top of the
         // stream. A run that differs because it was configured differently is
         // not the bug worth chasing, and this is what tells the two apart
@@ -1039,12 +1115,12 @@ impl Live {
             uniform = traversal.uniform_detail,
             uniform_radius = traversal.uniform_detail_radius,
             forbid_holes = traversal.forbid_holes,
-            stand_ins = traversal.stand_ins,
-            pinned_level = traversal.pinned_level,
-            budget = traversal.resident_budget_bytes,
-            fetches = traversal.maximum_simultaneous_fetches,
-            descendant_limit = traversal.loading_descendant_limit,
-            preload_siblings = traversal.preload_siblings,
+            policy = tuile_core::determinism::dbg(budget.policy),
+            pinned_level = tuile_core::determinism::dbg(budget.pinned_level),
+            imagery_cap = budget.imagery_cap(),
+            max_drape_side = budget.max_drape_side,
+            in_flight = tuile_core::determinism::dbg(budget.max_in_flight),
+            local_reads = budget.max_local_reads,
             occluder = tree.occluder().map(|o| o.radius),
             bake_max = config.bake_max_size,
         );
@@ -1066,7 +1142,8 @@ impl Live {
         // not what a pass drew while tiles were on their way.
         let spawn = tuile_core::runtime::Spawn::Tokio(runtime.handle().clone());
         tracing::info!(loads = ?spawn, "where the session's loads run");
-        let (stream, server) = in_process_with(tree, loader, traversal);
+        let (stream, server) = in_process_with(tree, loader, traversal, budget)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
         let server = server.with_spawn(spawn);
 
         // The server runs on its own runtime handle so a frame call can block
@@ -1083,10 +1160,10 @@ impl Live {
             stream,
             runtime,
             config,
-            imagery_detail: None,
             heights: None,
             provenance: None,
             textures: Arc::new(TextureMemo::default()),
+            held: Held::default(),
             resident: HashMap::new(),
             scene: SceneState::default(),
             generation: 0,
@@ -1097,29 +1174,11 @@ impl Live {
         })
     }
 
-    /// Hands the session the imagery-resolution handle its source exposes.
-    pub(crate) fn set_imagery_detail(&mut self, detail: tuile_planetary::ImageryDetail) {
-        self.imagery_detail = Some(detail);
-    }
-
     /// Resolves one frame for the given views, blocking until it converges.
     ///
     /// Multiple views are a union, not a choice: stereo pairs must share one
     /// selection or the eyes drift apart at LOD boundaries.
     pub fn frame(&mut self, views: Vec<ViewStateParams>) -> Result<Frame, FrameError> {
-        if let Some(detail) = &self.imagery_detail {
-            // TUILE_TEXEL_SPACING (metres/texel) pins the imagery level by
-            // hand — the diagnosis knob for "which level is this seam from",
-            // and the farm's override when a shot wants one level throughout.
-            let forced = std::env::var("TUILE_TEXEL_SPACING")
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .filter(|v| v.is_finite() && *v > 0.0);
-            if let Some(spacing) = forced.or_else(|| target_texel_spacing(&views)) {
-                tracing::info!(spacing, forced = forced.is_some(), "imagery texel target");
-                detail.set_target_texel_spacing(spacing);
-            }
-        }
         // The view this frame is a function of, printed before anything reads
         // it and in a form that round-trips. When two runs disagree about an
         // image, the first thing to rule out is that they were handed
@@ -1163,18 +1222,19 @@ impl Live {
         }
 
         let timeout = self.config.frame_timeout;
-        let bake_max_size = self.config.bake_max_size;
-        let finish = self.config.finish;
-        let provenance = self.provenance.clone();
-        // Copied out before the destructure below, which leaves `config`
-        // behind its `..`.
-        let dataset = self.config.dataset.clone();
+        let finisher = Finisher {
+            memo: Arc::clone(&self.textures),
+            dataset: self.config.dataset.clone(),
+            bake_max_size: self.config.bake_max_size,
+            finish: self.config.finish,
+            provenance: self.provenance.clone(),
+        };
         // Destructured so the pump can borrow the pieces it needs while the
         // runtime is borrowed too.
         let Self {
             stream,
             runtime,
-            textures,
+            held,
             resident,
             scene,
             grounds,
@@ -1188,13 +1248,10 @@ impl Live {
                 converge(
                     stream,
                     scene,
+                    held,
                     resident,
                     grounds.as_mut(),
-                    Arc::clone(textures),
-                    &dataset,
-                    bake_max_size,
-                    finish,
-                    provenance,
+                    &finisher,
                     generation,
                     &mut errors,
                 ),
@@ -1205,21 +1262,21 @@ impl Live {
             Ok(Ok(())) => {}
             // The stream closing on us is normally "the server went away", and
             // was reported as exactly that — which is useless when the server
-            // has just told us, in the message before it stopped, which tile it
-            // could not load and why. A tile failure now ENDS the session (see
-            // `GeometryServer::fail`), so this is the ordinary path for it, and
-            // the reason has to survive the closure.
+            // has just told us, in the message before it stopped, which
+            // resource it could not load and why. A load failure ENDS a batch
+            // session (`FailurePolicy::EndSession`), so this is the ordinary
+            // path for it, and the reason has to survive the closure.
             Ok(Err(_closed)) if !errors.is_empty() => {}
             Ok(Err(_closed)) => return Err(FrameError::ServerGone),
             Err(_elapsed) => return Err(FrameError::TimedOut(timeout)),
         }
 
+        let drawn = drawn_tiles(&self.scene);
         tuile_core::det!(
             "converged",
             gen = generation,
-            selected = self.scene.selected().len(),
-            sel_digest =
-                tuile_core::determinism::digest(self.scene.selected().iter().map(|(t, _)| t.0)),
+            selected = drawn.len(),
+            sel_digest = tuile_core::determinism::digest(drawn.iter().map(|t| t.0)),
             resident = self.resident.len(),
             errors = errors.len(),
             deferred = self.scene.stats().deferred_subtrees,
@@ -1236,17 +1293,16 @@ impl Live {
             });
         }
 
-        // The selection, resolved against what we hold. A selected tile with
-        // no content is not a tile to skip — it is the eager contract broken,
-        // and the server will never send it again.
+        // The draw set, resolved against what is finished. A drawn tile with
+        // no finished geometry is not a tile to skip — it is the batch
+        // contract broken (I13: a frame is ready only when everything it
+        // draws is held).
         let mut missing: Option<TileId> = None;
         let mut missing_count = 0usize;
-        let tiles: Vec<Arc<TileGeometry>> = self
-            .scene
-            .selected()
+        let tiles: Vec<Arc<TileGeometry>> = drawn
             .iter()
-            .filter_map(|(tile, _sse)| match self.resident.get(tile) {
-                Some(held) => Some(Arc::clone(held)),
+            .filter_map(|tile| match self.resident.get(tile) {
+                Some(finished) => Some(Arc::clone(&finished.geometry)),
                 None => {
                     missing_count += 1;
                     missing.get_or_insert(*tile);
@@ -1269,13 +1325,13 @@ impl Live {
             "frame resolved (reused = drapes already baked by an earlier frame)"
         );
 
-        // The frame is whole: what earlier frames left behind may go now,
-        // swept on the server's next pass, with this frame's views
-        // protected. Its tiles are held by the frame itself meanwhile.
-        if let Some(budget_bytes) = self.config.trim_between_frames {
+        // The frame is whole: what it did not need may go now, down to what
+        // the session keeps — announced back as evictions, taken in at the
+        // next frame. Its tiles are held by the frame itself meanwhile.
+        if let Some(bytes) = self.config.release_beyond {
             if self
                 .stream
-                .send(ClientMessage::Trim { budget_bytes })
+                .send(ClientMessage::ReleaseBeyond { bytes })
                 .is_err()
             {
                 return Err(FrameError::ServerGone);
@@ -1289,65 +1345,85 @@ impl Live {
     }
 }
 
-/// Drives one frame to convergence on a stream that outlives it.
+/// How the session finishes a tile: everything a finish needs that is the
+/// session's rather than the tile's.
+struct Finisher {
+    memo: Arc<TextureMemo>,
+    dataset: String,
+    bake_max_size: u32,
+    finish: Finish,
+    provenance: Option<Arc<tuile_planetary::Provenance>>,
+}
+
+/// A tile finished on the pool: the tile, the dressing it was finished
+/// from, the result, and its ground when one is kept.
+type Finishing = (TileId, Dressing, TileGeometry, Option<KeptTile>);
+
+/// Drives one frame to readiness on a stream that outlives it.
 ///
-/// Two conditions, both necessary: the server reports no outstanding loads,
-/// **and** the selection it reports answers the camera just sent. Waiting only
-/// on the first renders the previous camera's ground whenever a stale `Select`
-/// lands first.
+/// Three conditions, all necessary: the server reports the frame ready
+/// (`frame_ready`: every mesh and drape it draws is held, I13), the draw set
+/// it reports answers the camera just sent — waiting only on the first
+/// renders the previous camera's ground whenever a stale `Select` lands
+/// first — and every drawn tile is finished from the dressing it is drawn
+/// in.
 #[allow(clippy::too_many_arguments)]
 async fn converge(
     stream: &mut tuile_core::protocol::InProcessStream,
     scene: &mut SceneState,
-    resident: &mut HashMap<TileId, Arc<TileGeometry>>,
+    held: &mut Held,
+    resident: &mut HashMap<TileId, Finished>,
     mut grounds: Option<&mut Grounds>,
-    memo: Arc<TextureMemo>,
-    dataset: &str,
-    bake_max_size: u32,
-    finish: Finish,
-    provenance: Option<Arc<tuile_planetary::Provenance>>,
+    finisher: &Finisher,
     generation: u64,
     errors: &mut Vec<(Option<TileId>, String)>,
 ) -> Result<(), StreamError> {
     // Finishing a tile — composing its 2048² mosaic and encoding it — is the
-    // cost of a frame, and it used to run here, inline, one tile after the
-    // next, on the thread that also receives the stream: frame 1 of a bake
-    // spent 106 s composing 273 drapes on one core of eight. It now runs on a
-    // dedicated pool of one thread per core, while the pump keeps receiving.
+    // cost of a frame, and it used to run inline on the thread that also
+    // receives the stream: frame 1 of a bake spent 106 s composing 273
+    // drapes on one core of eight. It runs on a dedicated pool of one thread
+    // per core, while the pump keeps receiving.
     //
-    // Each tile's result is what it was before: the encoding of one tile does
-    // not depend on any other. Only the order tiles become resident changes,
-    // and `resident` is a map. A frame converges once the server says so AND
-    // every tile it sent is finished.
-    let pool = finish_pool();
-    let mut finishing: tokio::task::JoinSet<(TileId, u64, TileGeometry, Option<KeptTile>)> =
-        tokio::task::JoinSet::new();
-    // A tile evicted — or re-sent — while it is being finished must not come
-    // back from a stale task: each arrival gets a number, and only the latest
-    // is taken in.
-    let mut arrivals: HashMap<TileId, u64> = HashMap::new();
-    let mut next_arrival = 0u64;
+    // Each tile's result does not depend on any other's: only the order
+    // tiles are finished in changes, and `resident` is a map.
+    let mut finishing: tokio::task::JoinSet<Finishing> = tokio::task::JoinSet::new();
+    // The dressing each tile's latest finish was started from: a finish that
+    // comes back from an older one is not taken in.
+    let mut started: HashMap<TileId, Dressing> = HashMap::new();
     loop {
-        let server_done = scene.generation() >= generation && scene.is_complete();
-        if server_done && finishing.is_empty() {
-            return Ok(());
+        let ready = scene.generation() >= generation && scene.frame_ready();
+        if ready {
+            // Every drawn tile, from what it is drawn in.
+            for item in drawn_items(scene) {
+                start_finish(
+                    item,
+                    held,
+                    resident,
+                    &mut started,
+                    grounds.as_deref(),
+                    finisher,
+                    &mut finishing,
+                );
+            }
+            if finishing.is_empty() {
+                return Ok(());
+            }
         }
         tokio::select! {
             finished = finishing.join_next(), if !finishing.is_empty() => {
                 match finished {
-                    Some(Ok((tile, arrival, geometry, kept))) => {
-                        if arrivals.get(&tile) == Some(&arrival) {
-                            arrivals.remove(&tile);
-                            resident.insert(tile, Arc::new(geometry));
+                    Some(Ok((tile, dressing, geometry, kept))) => {
+                        if started.get(&tile) == Some(&dressing) {
+                            started.remove(&tile);
                             if let (Some(grounds), Some(kept)) = (grounds.as_deref_mut(), kept) {
                                 if let (Some(meshes), Some(mesh)) =
                                     (grounds.as_it_came.as_mut(), kept.as_it_came)
                                 {
                                     meshes.insert(tile, (kept.kept.origin(), mesh));
                                 }
-                                grounds.arrivals += 1;
-                                grounds.kept.insert(tile, (grounds.arrivals, kept.kept));
+                                grounds.kept.insert(tile, (dressing.mesh, kept.kept));
                             }
+                            resident.insert(tile, Finished { dressing, geometry: Arc::new(geometry) });
                         }
                     }
                     // A panicking finish is a bug, not a missing tile to wait
@@ -1356,99 +1432,158 @@ async fn converge(
                     None => {}
                 }
             }
-            message = stream.next_message(), if !server_done => {
+            message = stream.next_message(), if !ready => {
                 let Some(message) = message else {
                     return Err(StreamError::Closed);
                 };
                 scene.apply(&message);
-                // The pump's own view of convergence, message by message. `complete`
-                // is the condition that ENDS a frame, so a run that saw it one message
-                // earlier than another kept a different selection — and that is
-                // invisible from anywhere else.
+                // The pump's own view of convergence, message by message.
+                // `ready` is the condition that ENDS a frame, so a run that
+                // saw it one message earlier than another kept a different
+                // selection — and that is invisible from anywhere else.
                 tuile_core::det!(
                     "pump",
                     gen_seen = scene.generation(),
                     gen_want = generation,
-                    complete = scene.is_complete(),
-                    selected = scene.selected().len(),
+                    complete = scene.frame_ready(),
+                    selected = scene.draw().items.len(),
                     resident = resident.len(),
                 );
                 match message {
                     // Once per residency, and never again — so this is the only
-                    // moment a tile can be taken in.
-                    ServerMessage::Content {
-                        tile,
-                        content: TileContent::Decoded(decoded),
-                        ..
-                    } => {
-                        let keep_ground = grounds.is_some();
-                        let keep_meshes =
-                            grounds.as_ref().is_some_and(|g| g.as_it_came.is_some());
-                        next_arrival += 1;
-                        arrivals.insert(tile, next_arrival);
-                        let arrival = next_arrival;
-                        let (memo, dataset) = (Arc::clone(&memo), dataset.to_string());
-                        let provenance = provenance.clone();
-                        let (done, result) = tokio::sync::oneshot::channel();
-                        pool.spawn(move || {
-                            // The mesh as it came, before a finish by
-                            // identity lets it go: the ground a camera is
-                            // kept over. Kept on the pool, beside the
-                            // finish, rather than on the thread that
-                            // receives the stream.
-                            let kept = decoded
-                                .meshes
-                                .first()
-                                .filter(|_| keep_ground)
-                                .map(|mesh| KeptTile {
-                                    kept: crate::ground::Kept::of(
-                                        tile,
-                                        decoded.local_origin_ecef,
-                                        mesh,
-                                    ),
-                                    as_it_came: keep_meshes.then(|| DecodedMesh {
-                                        positions: mesh.positions.clone(),
-                                        normals: None,
-                                        uvs: mesh.uvs.clone(),
-                                        indices: mesh.indices.clone(),
-                                        material: Default::default(),
-                                    }),
-                                });
-                            let geometry = finish_tile_as(
-                                &memo,
-                                &dataset,
-                                tile,
-                                decoded,
-                                bake_max_size,
-                                provenance.as_deref(),
-                                finish,
-                            );
-                            let _ = done.send((geometry, kept));
-                        });
-                        finishing.spawn(async move {
-                            let (geometry, kept) =
-                                result.await.expect("a tile finish panicked");
-                            (tile, arrival, geometry, kept)
-                        });
+                    // moment a resource can be taken in. Acknowledged at once
+                    // with what holding it costs: the budget counts it held.
+                    ServerMessage::Content { resource, gen, content, .. } => {
+                        let bytes = held.deliver(resource, gen, content);
+                        stream.send(ClientMessage::Ack { resource, gen, bytes })?;
                     }
-                    ServerMessage::Evict { tiles } => {
-                        for tile in tiles {
-                            arrivals.remove(&tile);
-                            resident.remove(&tile);
-                            if let Some(grounds) = grounds.as_deref_mut() {
-                                grounds.kept.remove(&tile);
-                                if let Some(meshes) = grounds.as_it_came.as_mut() {
-                                    meshes.remove(&tile);
+                    // Delivered, not yet taken in for good: dropped.
+                    ServerMessage::Cancel { resources } => {
+                        for (resource, gen) in resources {
+                            if held.gens.get(&resource) == Some(&gen) {
+                                held.forget(resource);
+                            }
+                        }
+                    }
+                    ServerMessage::Evict { resources } => {
+                        for resource in resources {
+                            held.forget(resource);
+                            if let ResourceId::Mesh(tile) = resource {
+                                resident.remove(&tile);
+                                started.remove(&tile);
+                                if let Some(grounds) = grounds.as_deref_mut() {
+                                    grounds.kept.remove(&tile);
+                                    if let Some(meshes) = grounds.as_it_came.as_mut() {
+                                        meshes.remove(&tile);
+                                    }
                                 }
                             }
                         }
                     }
-                    ServerMessage::Error { tile, message } => errors.push((tile, message)),
+                    ServerMessage::Error { resource, message } => {
+                        errors.push((resource.map(|r| r.tile()), message));
+                    }
+                    // Started early: a tile drawn exactly, in drapes of its
+                    // own, is finished while the rest of the frame loads. A
+                    // dressing that changes before the frame is ready is
+                    // finished again; the texture memo spares a repeat.
+                    ServerMessage::Select { generation: answered, .. } if answered >= generation => {
+                        for item in drawn_items(scene) {
+                            let own = item.role == Role::Exact
+                                && item.drapes.iter().all(|c| {
+                                    c.resource.tile() == item.mesh.tile()
+                                        && c.uv == tuile_core::budget::UvTransform::IDENTITY
+                                });
+                            if own {
+                                start_finish(item, held, resident, &mut started, grounds.as_deref(), finisher, &mut finishing);
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
         }
     }
+}
+
+/// Starts finishing `item` on the pool, unless it is finished, or being
+/// finished, from the dressing it is drawn in.
+fn start_finish(
+    item: &DrawItem,
+    held: &Held,
+    resident: &HashMap<TileId, Finished>,
+    started: &mut HashMap<TileId, Dressing>,
+    grounds: Option<&Grounds>,
+    finisher: &Finisher,
+    finishing: &mut tokio::task::JoinSet<Finishing>,
+) {
+    let tile = item.mesh.tile();
+    let Some(dressing) = held.dressing(item) else {
+        return;
+    };
+    if resident.get(&tile).is_some_and(|f| f.dressing == dressing)
+        || started.get(&tile) == Some(&dressing)
+    {
+        return;
+    }
+    let Some((_, mesh)) = held.meshes.get(&tile) else {
+        return;
+    };
+    let mesh = Arc::clone(mesh);
+    let drapes: HashMap<ResourceId, Arc<DrapeContent>> = item
+        .drapes
+        .iter()
+        .filter_map(|c| {
+            held.drapes
+                .get(&c.resource)
+                .map(|(_, d)| (c.resource, Arc::clone(d)))
+        })
+        .collect();
+    // The ground is kept once per mesh that came, whatever it wears.
+    let keep_ground =
+        grounds.is_some_and(|g| g.kept.get(&tile).map(|(a, _)| *a) != Some(dressing.mesh));
+    let keep_meshes = keep_ground && grounds.is_some_and(|g| g.as_it_came.is_some());
+    started.insert(tile, dressing.clone());
+    let item = item.clone();
+    let memo = Arc::clone(&finisher.memo);
+    let dataset = finisher.dataset.clone();
+    let provenance = finisher.provenance.clone();
+    let (bake_max_size, finish) = (finisher.bake_max_size, finisher.finish);
+    let (done, result) = tokio::sync::oneshot::channel();
+    finish_pool().spawn(move || {
+        // The mesh as it came, before a finish by identity lets it go: the
+        // ground a camera is kept over. Kept on the pool, beside the finish,
+        // rather than on the thread that receives the stream.
+        let kept = mesh
+            .meshes
+            .first()
+            .filter(|_| keep_ground)
+            .map(|first| KeptTile {
+                kept: crate::ground::Kept::of(tile, mesh.local_origin_ecef, first),
+                as_it_came: keep_meshes.then(|| DecodedMesh {
+                    positions: first.positions.clone(),
+                    normals: None,
+                    uvs: first.uvs.clone(),
+                    indices: first.indices.clone(),
+                    material: Default::default(),
+                }),
+            });
+        let dressed = tuile_core::drive::dress(&mesh, &item, &drapes);
+        let geometry = finish_tile_as(
+            &memo,
+            &dataset,
+            tile,
+            dressed,
+            bake_max_size,
+            provenance.as_deref(),
+            finish,
+        );
+        let _ = done.send((geometry, kept));
+    });
+    finishing.spawn(async move {
+        let (geometry, kept) = result.await.expect("a tile finish panicked");
+        (tile, dressing, geometry, kept)
+    });
 }
 
 /// The pool tiles are finished on: one thread per core (unless
@@ -1467,46 +1602,6 @@ fn finish_pool() -> &'static rayon::ThreadPool {
             .build()
             .expect("the tile finishing pool")
     })
-}
-
-/// The ground texel spacing (metres/texel) the given views want, or `None`
-/// when no view says anything usable.
-///
-/// The classic screen-density formula — `2·altitude·tan(fovy/2) /
-/// viewport_height` — over the camera's height above the **ellipsoid**. The
-/// minimum across views, because a union selection must satisfy its most
-/// demanding eye.
-///
-/// The height used to be `|position| − equatorial radius`, with a comment
-/// saying the sphere/ellipsoid difference vanished into the level
-/// quantisation. It does not: at 42.5° N the ellipsoid's radius is 9.7 km
-/// *smaller* than the equatorial one, so that subtraction is 9.7 km short —
-/// and for any camera below that it goes **negative**, where the `.max()` used
-/// to hide it. A camera 5 km up came out at 1 metre, asking for a texel
-/// spacing of 0.86 mm: the finest imagery the source has, everywhere in the
-/// frame, which took a container to its memory ceiling (measured 2026-09-09).
-///
-/// It stayed hidden while the trajectory generator had its own spherical bug
-/// and flew three times too high — two errors of the same family, the second
-/// making the first look plausible.
-fn target_texel_spacing(views: &[ViewStateParams]) -> Option<f64> {
-    views
-        .iter()
-        .filter_map(|v| {
-            let altitude = tuile_core::geo::ecef_to_geodetic(v.position)
-                .height
-                .max(1.0);
-            let height_px = v.viewport_px.y;
-            if height_px <= 0.0
-                || height_px.is_nan()
-                || !v.fovy_rad.is_finite()
-                || v.fovy_rad <= 0.0
-            {
-                return None;
-            }
-            Some(2.0 * altitude * (v.fovy_rad / 2.0).tan() / height_px)
-        })
-        .min_by(f64::total_cmp)
 }
 
 /// A numeric knob from the environment, or its default.
@@ -1547,22 +1642,12 @@ pub(crate) fn count_knob(name: &str) -> Option<usize> {
 
 /// The traversal a bulk frame runs, whatever the caller asked for.
 ///
-/// Stand-ins are an interactive kindness — a plausible surface while the real
-/// tile is in flight. A bulk frame has no "while": it converges or it fails,
-/// and a stand-in that slipped into a kept frame is the invisible defect
-/// docs/15 forbids (two farm nodes disagreeing about which tiles were real).
-/// Holes are forbidden for the same reason, whichever way the caller's config
-/// leans.
-///
-/// A residency budget is an interactive notion: it lets a viewer stay inside
-/// its device by giving up tiles it can ask for again. This path has none.
-/// A batch frame converges when every tile it selects is there, so an
-/// eviction *during* convergence takes away what the frame is waiting on and
-/// keeps the request count above zero for ever — a hang, not a limit
-/// (measured: frame 19 of a 4K bake). What a batch job may hold is bounded
-/// where it is held — by what a session keeps of a tile ([`Finish`]), and by
-/// the machine it is given — not by evicting from under a frame.
-/// `TUILE_RESIDENT_BUDGET_GB` is no longer read.
+/// Holes are forbidden: a bulk frame has no "while", it is ready or it
+/// fails, and what it is ready with must not depend on how fast the tiles
+/// came. The rest of what makes a bulk frame exact — no stand-ins, no
+/// residency limit, no cancelling what a frame waits on, no subtree given up
+/// on — is the batch budget's ([`exact_budget`], `BudgetConfig::batch`), not
+/// the traversal's.
 ///
 /// Public because a **bake** has to be able to name what it baked. A pack is
 /// the bake of the settings it was made with, not of the defaults, so the
@@ -1571,60 +1656,7 @@ pub(crate) fn count_knob(name: &str) -> Option<usize> {
 /// resolution would give two packs made with different maximum screen-space
 /// errors the same name, and they would answer for each other.
 pub fn exact_traversal(mut config: Config) -> Config {
-    config.stand_ins = false;
     config.forbid_holes = true;
-    config.resident_budget_bytes = usize::MAX;
-    config.resident_tile_limit = usize::MAX;
-    // Micro-batches, not one bulk flood: the wave is sized to the connection
-    // pool, because beyond it nothing goes any faster.
-    //
-    // It fired 256 while the client keeps
-    // [`tuile_native_fetchers::CONNECTIONS_PER_HOST`] = 64 keep-alive
-    // connections per host. What the surplus costs depends on the protocol,
-    // and it costs something either way:
-    //
-    // - over HTTP/2 — one connection per host, multiplexed — concurrency is
-    //   bounded by the server's `SETTINGS_MAX_CONCURRENT_STREAMS`, commonly
-    //   100 to 128. Requests past it queue inside the client, holding their
-    //   buffers and burning their share of the request timeout while they wait
-    //   for a stream. That is not bandwidth; it is a queue, and it makes every
-    //   timeout measure the queue rather than the server.
-    // - over HTTP/1.1 the pool figure is an *idle* limit, not a concurrency
-    //   cap: 256 requests open up to 256 connections and only 64 are kept for
-    //   reuse, so the rest is handshake churn against the origin.
-    //
-    // Which of the two applies here has not been measured. 64 is the right
-    // answer under both.
-    //
-    // Over-subscribing also makes the origin answer worse: a bake died at frame
-    // 2807 on an HTTP 500 from ion, which is what a flood gets. The wave now
-    // matches what can actually be in flight, and stays saturated because a
-    // finished request frees its connection immediately.
-    config.maximum_simultaneous_fetches =
-        env_knob("TUILE_FETCHES", tuile_native_fetchers::CONNECTIONS_PER_HOST).max(1);
-    // Never give up on a subtree, however long it takes.
-    //
-    // The last interactive kindness in this list, and the one that cost the
-    // most. A hold waiting on more than `loading_descendant_limit`
-    // not-yet-drawable descendants cancels the whole subtree's requests and
-    // asks for one coarse ancestor instead — the right trade for a viewer,
-    // where a coarse picture now beats a sharp one in seven seconds.
-    //
-    // It is a decision taken on `waiting`, which counts what has not arrived
-    // *yet*: the network chooses. And because cancelling those requests can
-    // take the pass's request count to zero, it does not merely coarsen the
-    // frame — it can END it, on the coarse answer, reporting a clean
-    // convergence with no gaps and no errors. Measured on 2026-09-08: six runs
-    // of one frame on one pod, same binary, same warm cache, five selecting 106
-    // tiles and one selecting 7, indistinguishable from the outside.
-    //
-    // A bulk frame has no "while". It converges or it fails, and what it
-    // converges on must not depend on how fast the tiles came.
-    //
-    // TUILE_DESCENDANT_LIMIT restores a finite threshold for a comparison —
-    // it is the switch that makes the defect above reappear on demand, which
-    // is the only honest way to show a fix is doing something.
-    config.loading_descendant_limit = env_knob("TUILE_DESCENDANT_LIMIT", u32::MAX).max(1);
     // TUILE_CULL=0 keeps every tile the traversal reaches, however far off
     // screen. Expensive and not a mode to render in — it exists to answer one
     // question: whether ground that is missing was culled.
@@ -1636,13 +1668,6 @@ pub fn exact_traversal(mut config: Config) -> Config {
     let sse: f64 = env_knob("TUILE_MAX_SSE", 0.0);
     if sse > 0.0 {
         config.maximum_screen_space_error = sse;
-    }
-    // TUILE_PINNED_LEVEL sizes the coarse pyramid every session primes: it is
-    // the floor under the globe, and 2730 tiles of it is most of a cold
-    // frame's cost.
-    let pinned: i64 = env_knob("TUILE_PINNED_LEVEL", -1);
-    if pinned >= 0 {
-        config.pinned_level = u32::try_from(pinned).ok();
     }
     // The USD decree: the whole frame as fine as its nearest tile, meshes
     // and imagery both — LOD boundaries are walls across a rendered image.
@@ -1660,6 +1685,50 @@ pub fn exact_traversal(mut config: Config) -> Config {
         config.uniform_detail_radius = radius;
     }
     config
+}
+
+/// The budget a bulk frame runs on: `budget` with the environment's knobs.
+///
+/// - `TUILE_PINNED_LEVEL` sizes the coarse pyramid every session primes: the
+///   floor under the globe, never let go, and 2730 tiles of it is most of a
+///   cold frame's cost. `-1` leaves no floor.
+/// - `TUILE_IMAGERY_BOOST` is how many levels a drape may climb above its
+///   terrain tile (`imagery_over_terrain_cap`).
+///
+/// Public for the same reason as [`exact_traversal`]: what decides a
+/// frame's content goes into the name of the scene a pack is the bake of
+/// ([`budget_settings`]).
+pub fn exact_budget(mut budget: BudgetConfig) -> BudgetConfig {
+    if let Ok(raw) = std::env::var("TUILE_PINNED_LEVEL") {
+        match raw.trim().parse::<i64>() {
+            Ok(level) if level >= 0 => budget.pinned_level = u32::try_from(level).ok(),
+            Ok(_) => budget.pinned_level = None,
+            Err(_) => {}
+        }
+    }
+    if let Ok(cap) = std::env::var("TUILE_IMAGERY_BOOST")
+        .unwrap_or_default()
+        .trim()
+        .parse::<u32>()
+    {
+        budget.imagery_over_terrain_cap = cap;
+    }
+    budget
+}
+
+/// What of a budget decides what a frame contains, as one line: the
+/// policy, the floor, how far imagery may climb above its terrain and the
+/// size of a drape. Its throughput settings (loads in flight, local reads,
+/// timeouts) decide how fast, never what, and are left out.
+pub fn budget_settings(budget: &BudgetConfig) -> String {
+    format!(
+        "policy={:?} pinned={:?} imagery_cap={} drape_side={} imagery_px={}",
+        budget.policy,
+        budget.pinned_level,
+        budget.imagery_cap(),
+        budget.max_drape_side,
+        budget.imagery_tile_px,
+    )
 }
 
 /// One decoded tile, made boundary-ready.
@@ -1982,35 +2051,6 @@ pub(crate) mod tests {
         assert_eq!(parse_count(Some(" 12\n")), Some(12));
     }
 
-    /// The imagery level follows the camera's height above the **ellipsoid**.
-    ///
-    /// It followed `|position| − equatorial radius`, which at 42.5° N is 9.7 km
-    /// short — negative for any camera below that, where `.max(1.0)` turned it
-    /// into one metre. A camera 5 km up therefore asked for a texel spacing of
-    /// 0.86 mm: the finest imagery the source has, over every tile in the
-    /// frame. Measured 2026-09-09, it took a container to its 6 GB ceiling.
-    #[test]
-    fn the_texel_target_follows_the_height_above_the_ellipsoid() {
-        let camera = tuile_core::geo::geodetic_to_ecef(tuile_core::geo::Geodetic {
-            lon: 2.17_f64.to_radians(),
-            lat: 42.52_f64.to_radians(),
-            height: 5_000.0,
-        });
-        let view = ViewStateParams {
-            position: camera,
-            direction: -camera.normalize(),
-            up: glam::DVec3::Z,
-            viewport_px: glam::DVec2::new(1280.0, 960.0),
-            fovy_rad: 45f64.to_radians(),
-        };
-        let spacing = target_texel_spacing(&[view]).expect("a view says something");
-        // 2 · 5000 · tan(22.5°) / 960 ≈ 4.31 m per texel.
-        assert!(
-            (spacing - 4.31).abs() < 0.05,
-            "texel target is {spacing} m — a camera five kilometres up wants \
-             metres per texel, not fractions of a millimetre"
-        );
-    }
     use super::*;
     use tuile_core::content::DecodedTexture;
 
@@ -2060,13 +2100,15 @@ pub(crate) mod tests {
     /// queue, and an origin answering 500 to a flood.
     #[test]
     fn the_fetch_wave_fits_the_connection_pool() {
-        let config = exact_traversal(Config::default());
-        assert!(
-            config.maximum_simultaneous_fetches <= tuile_native_fetchers::CONNECTIONS_PER_HOST,
-            "{} requests in flight against {} connections — the surplus only queues",
-            config.maximum_simultaneous_fetches,
-            tuile_native_fetchers::CONNECTIONS_PER_HOST,
-        );
+        let budget = exact_budget(SessionConfig::default().budget);
+        for (class, in_flight) in budget.max_in_flight.iter() {
+            assert!(
+                in_flight as usize <= tuile_native_fetchers::CONNECTIONS_PER_HOST,
+                "{class:?}: {in_flight} requests in flight against {} connections — \
+                 the surplus only queues",
+                tuile_native_fetchers::CONNECTIONS_PER_HOST,
+            );
+        }
     }
 
     /// The same tile re-draped is a different picture, so it must be a
@@ -2203,16 +2245,18 @@ pub(crate) mod tests {
     }
 
     /// Whatever the caller's traversal config says, a bulk frame is exact:
-    /// no stand-in surface may reach a kept frame, and holes stay forbidden.
+    /// holes stay forbidden, and the session runs on the batch budget.
     #[test]
     fn bulk_traversal_is_exact_whatever_the_caller_asked() {
         let exact = exact_traversal(Config {
-            stand_ins: true,
             forbid_holes: false,
             ..Config::default()
         });
-        assert!(!exact.stand_ins);
         assert!(exact.forbid_holes);
+        assert_eq!(
+            SessionConfig::default().budget.policy,
+            tuile_core::budget::Policy::Batch
+        );
     }
 
     /// Une erreur d'écran posée par l'appelant survit à la résolution.
@@ -2221,7 +2265,7 @@ pub(crate) mod tests {
     /// savait nommer `--sse 3` et le bake cuisait à 16, parce que la valeur
     /// n'arrivait jamais jusqu'ici. Elle arrive maintenant par
     /// `config.session.traversal`, et ce test dit que `exact_traversal` —
-    /// qui écrase délibérément `stand_ins` et `forbid_holes` — ne l'écrase
+    /// qui écrase délibérément `forbid_holes` — ne l'écrase
     /// PAS au passage. Il ne couvre pas la plomberie du shell : que
     /// `bake_job.sh` passe bien `--sse` ne se vérifie qu'en lisant la ligne
     /// `BAKE-BEGIN` d'une vraie cuisson.
@@ -2566,6 +2610,8 @@ pub(crate) mod tests {
             up: DVec3::new(0.0, 1.0, 0.0),
             viewport_px: glam::DVec2::new(960.0, 720.0),
             fovy_rad: 45f64.to_radians(),
+            fov: None,
+            scale: 1.0,
         }
     }
 
@@ -2772,6 +2818,8 @@ pub(crate) mod tests {
             up: up.cross(DVec3::Z).cross(up).normalize(),
             viewport_px: glam::DVec2::new(960.0, 720.0),
             fovy_rad: 45f64.to_radians(),
+            fov: None,
+            scale: 1.0,
         }
     }
 
@@ -2934,6 +2982,8 @@ pub(crate) mod tests {
             up: DVec3::new(0.0, 1.0, 0.0),
             viewport_px: glam::DVec2::new(960.0, 720.0),
             fovy_rad: 45f64.to_radians(),
+            fov: None,
+            scale: 1.0,
         }
     }
 
@@ -3055,7 +3105,7 @@ pub(crate) mod tests {
             })
             .collect();
         let held = match &session.0 {
-            Source::Live(live) => live.resident.len(),
+            Source::Live(live) => live.held.meshes.len(),
             Source::Packed(_) => unreachable!("a live session"),
         };
         (
@@ -3079,13 +3129,14 @@ pub(crate) mod tests {
         for finish in [Finish::Pictures, Finish::Identity] {
             // The quad is five levels deep: the default floor of pinned
             // levels would keep all of it.
-            let config = |trim| SessionConfig {
-                traversal: Config {
-                    pinned_level: None,
-                    ..Config::default()
+            let config = |release| SessionConfig {
+                budget: {
+                    let mut budget = BudgetConfig::batch();
+                    budget.pinned_level = None;
+                    budget
                 },
                 finish,
-                trim_between_frames: trim,
+                release_beyond: release,
                 ..SessionConfig::default()
             };
             let (kept, kept_loads, kept_held) = quad_flight_with(config(None));
@@ -3373,19 +3424,22 @@ pub(crate) mod tests {
 
     /// A residency budget is an interactive notion: it keeps a viewer inside
     /// its device by letting go of tiles it can fetch again. A batch frame is
-    /// exact or it is nothing — it converges when every tile it selects is
-    /// there — so evicting on a budget while it converges only takes away
-    /// tiles it is waiting on, and the frame never ends (measured: frame 19
-    /// of a 4K bake spent its fifteen minutes this way). The batch path has
-    /// no budget, whatever the caller or the environment asked.
+    /// exact or it is nothing — it is ready when every tile it draws is
+    /// there — so evicting on a budget while it loads only takes away tiles
+    /// it is waiting on, and the frame never ends (measured: frame 19 of a
+    /// 4K bake spent its fifteen minutes this way). The session's budget is
+    /// the batch one: unbounded, nothing needed ever cancelled.
     #[test]
     fn the_batch_path_has_no_residency_budget() {
-        let exact = exact_traversal(Config {
-            resident_budget_bytes: 1,
-            ..Config::default()
-        });
-        assert_eq!(exact.resident_budget_bytes, usize::MAX);
-        assert_eq!(exact.resident_tile_limit, usize::MAX);
+        use tuile_core::budget::Bytes;
+        let budget = exact_budget(SessionConfig::default().budget);
+        for (class, target) in budget.target.iter() {
+            assert_eq!(target, Bytes::MAX, "{class:?}");
+        }
+        for (class, hard) in budget.hard_limit.iter() {
+            assert_eq!(hard, Bytes::MAX, "{class:?}");
+        }
+        assert_eq!(budget.cancel_grace, tuile_core::budget::Micros::NEVER);
     }
 
     /// What [`quad_flight`] gave before anything was optimised.

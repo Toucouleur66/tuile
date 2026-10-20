@@ -57,14 +57,13 @@ pub mod tape;
 pub mod tiles;
 
 pub use globe::{
-    asset_of_namespace, duration_or, imagery_boost_cap, source_namespace, GlobeConfig, GlobeError,
-    ReferenceFetched, ReferenceImagery, Sources, SourcesHandle, TileCache, BING_AERIAL,
-    CESIUM_WORLD_TERRAIN,
+    asset_of_namespace, duration_or, source_namespace, GlobeConfig, GlobeError, ReferenceFetched,
+    ReferenceImagery, Sources, SourcesHandle, TileCache, BING_AERIAL, CESIUM_WORLD_TERRAIN,
 };
 pub use packed::PackedError;
 pub use session::{
-    exact_traversal, EncodedTexture, Finish, Frame, FrameError, GroundMemory, Session,
-    SessionConfig, TileGeometry,
+    budget_settings, exact_budget, exact_traversal, EncodedTexture, Finish, Frame, FrameError,
+    GroundMemory, Session, SessionConfig, TileGeometry,
 };
 /// What a caller already holds, so a bake never fetches it twice. See
 /// [`GlobeConfig::held_drape`].

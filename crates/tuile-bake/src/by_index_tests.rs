@@ -225,6 +225,29 @@ fn patch() -> Vec<TileId> {
     out
 }
 
+/// `mesh` wearing its own `drape`, as a session dresses a tile drawn exactly.
+fn dressed(
+    mesh: &tuile_core::DecodedTileContent,
+    tile: TileId,
+    drape: tuile_core::content::DrapeContent,
+) -> tuile_core::DecodedTileContent {
+    use tuile_core::budget::{DrapeChoice, DrawItem, ResourceId, Role, UvTransform};
+    let resource = ResourceId::drape(tile, drape.layer, drape.level);
+    let item = DrawItem {
+        mesh: ResourceId::Mesh(tile),
+        role: Role::Exact,
+        drapes: vec![DrapeChoice {
+            resource,
+            layer: drape.layer,
+            level: drape.level,
+            uv: UvTransform::IDENTITY,
+        }],
+        serves: vec![tile],
+    };
+    let drapes = std::collections::HashMap::from([(resource, Arc::new(drape))]);
+    tuile_core::drive::dress(mesh, &item, &drapes)
+}
+
 /// Loads the patch through `imagery`, finishes every tile by identity and
 /// writes the pack of references. Returns its bytes.
 async fn pack_of<I: ImageryProvider + 'static>(imagery: I, by_stamp: bool) -> Vec<u8> {
@@ -232,7 +255,7 @@ async fn pack_of<I: ImageryProvider + 'static>(imagery: I, by_stamp: bool) -> Ve
         br#"{"format":"quantized-mesh-1.0","tiles":["{z}/{x}/{y}.terrain"],"maxzoom":16}"#,
     )
     .expect("layer.json");
-    let (_tree, loader, _detail, _heights, provenance) = globe_with_provenance(
+    let (_tree, loader, _heights, provenance) = globe_with_provenance(
         Flat,
         imagery,
         layer,
@@ -246,9 +269,17 @@ async fn pack_of<I: ImageryProvider + 'static>(imagery: I, by_stamp: bool) -> Ve
     let memo = Arc::new(TextureMemo::default());
     let mut tiles = Vec::new();
     for id in patch() {
-        let Loaded::Content(content) = loader.load(id).await.expect("load") else {
+        let Loaded::Content(mesh) = loader.load(id).await.expect("load") else {
             unreachable!("terrain loads content");
         };
+        // The tile's own drape, at the imagery level of its terrain's: what
+        // the budget asks of a tile seen at its terrain's density.
+        let layer = tuile_core::budget::LayerId(0);
+        let drape = loader
+            .load_drape(id, layer, TERRAIN_LEVEL)
+            .await
+            .expect("drape");
+        let content = dressed(&mesh, id, drape);
         tiles.push(Arc::new(finish_tile_as(
             &memo,
             "t",
