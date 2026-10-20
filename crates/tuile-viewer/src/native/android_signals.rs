@@ -184,12 +184,12 @@ mod tests {
     /// among them.
     #[test]
     fn trim_levels_read_as_pressure() {
-        use Pressure::{Critical, Nominal, Warning};
-        assert_eq!(pressure_of_trim(0), Nominal);
+        use Pressure::{Critical, Normal, Warning};
+        assert_eq!(pressure_of_trim(0), Normal);
         assert_eq!(pressure_of_trim(trim::RUNNING_MODERATE), Warning);
         assert_eq!(pressure_of_trim(trim::RUNNING_LOW), Warning);
         assert_eq!(pressure_of_trim(trim::RUNNING_CRITICAL), Critical);
-        assert_eq!(pressure_of_trim(trim::UI_HIDDEN), Nominal);
+        assert_eq!(pressure_of_trim(trim::UI_HIDDEN), Normal);
         assert_eq!(pressure_of_trim(trim::BACKGROUND), Warning);
         assert_eq!(pressure_of_trim(trim::MODERATE), Critical);
         assert_eq!(pressure_of_trim(trim::COMPLETE), Critical);
@@ -197,7 +197,7 @@ mod tests {
         assert_eq!(pressure_of_trim(12), Warning);
         assert_eq!(pressure_of_trim(30), Warning);
         assert_eq!(pressure_of_trim(100), Critical);
-        assert_eq!(pressure_of_trim(-1), Nominal);
+        assert_eq!(pressure_of_trim(-1), Normal);
     }
 
     #[test]

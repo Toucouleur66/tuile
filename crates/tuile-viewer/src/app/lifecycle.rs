@@ -208,9 +208,11 @@ impl Lifecycle {
         steps
     }
 
-    /// The system is short of memory.
+    /// The system is short of memory: a warning, unless something heavier
+    /// is in force — the background squeezes harder, and a warning received
+    /// there is not news.
     pub(super) fn memory_warning(&mut self) -> Vec<Step> {
-        self.press(Pressure::Warning).into_iter().collect()
+        self.memory_pressure(Pressure::Warning)
     }
 
     /// The memory signal has gone quiet for long enough: the budget's
@@ -469,10 +471,14 @@ mod tests {
         assert!(l
             .background()
             .contains(&Step::Pressure(Pressure::Background)));
+        assert!(l.memory_warning().is_empty(), "a warning is lighter");
+        assert!(l.memory_pressure(Pressure::Critical).is_empty());
+        assert!(l.calm().is_empty(), "calm while away");
+        // In front, a warning is news.
+        let mut l = phone();
         assert!(l
             .memory_warning()
             .contains(&Step::Pressure(Pressure::Warning)));
-        assert!(l.memory_pressure(Pressure::Critical).is_empty());
-        assert!(l.calm().is_empty(), "calm while away");
+        assert!(l.memory_warning().is_empty(), "the same warning again");
     }
 }

@@ -10,8 +10,8 @@
 //! the runtime — and this test holds it to that with the worst network there
 //! is: one that accepts every request and never answers any.
 //!
-//! The frame step is the window's own: [`tuile_wgpu::ContentPump::advance_while`]
-//! with the phone's upload budget, on a real (headless) GPU, against a real
+//! The frame step is the window's own: [`tuile_wgpu::ContentPump::advance`]
+//! within the frame's upload deadline, on a real (headless) GPU, against a real
 //! geometry server whose loader is wrapped in the same gate the window uses.
 //! It is run for [`FRAMES`] frames. A frame that waited on this network would
 //! wait forever, so the promise is checked as "every frame comes back", with a
@@ -117,8 +117,10 @@ fn a_frame_returns_and_the_indicator_turns_while_the_network_stalls() {
     let (mut stream, server) = tuile_core::runtime::in_process_with(
         Box::new(Planet),
         loader,
-        profile.traversal(Some(profile.pinned_level)),
-    );
+        profile.traversal(),
+        profile.budget(),
+    )
+    .expect("the profile's budget is valid");
     let handle = runtime.handle().clone();
     let _server = std::thread::spawn(move || handle.block_on(server.run()));
 
@@ -126,7 +128,6 @@ fn a_frame_returns_and_the_indicator_turns_while_the_network_stalls() {
     let viewport = DVec2::new(1179.0, 2556.0);
     let mut pump = tuile_wgpu::ContentPump::new(camera.position);
     let mut loading = Loading::new(Instant::now());
-    let budget = profile.uploads;
     let finished = Arc::new(AtomicBool::new(false));
     let watched = finished.clone();
     std::thread::spawn(move || {
@@ -139,14 +140,15 @@ fn a_frame_returns_and_the_indicator_turns_while_the_network_stalls() {
     let (mut frames, mut slowest) = (0, Duration::ZERO);
     while frames < FRAMES {
         let t = Instant::now();
-        pump.advance_while(
+        let deadline = pump.deadline(60);
+        pump.advance(
             &mut stream,
             &gpu,
             &[camera.view_state(viewport)],
             camera.position,
-            |done, spent| budget.allows(done, spent),
+            deadline,
         );
-        let (_, resolution) = pump.resolve(&gpu.queue);
+        let (_, resolution) = pump.resolve(&gpu);
         let indicator = loading.step(
             Instant::now(),
             Observed {
@@ -179,12 +181,13 @@ fn a_frame_returns_and_the_indicator_turns_while_the_network_stalls() {
     // The frames are quick; the server's first pass may come after them.
     let asked_by = Instant::now() + Duration::from_secs(5);
     while asked.0.load(Ordering::SeqCst) == 0 && Instant::now() < asked_by {
-        pump.advance_while(
+        let deadline = pump.deadline(60);
+        pump.advance(
             &mut stream,
             &gpu,
             &[camera.view_state(viewport)],
             camera.position,
-            |done, spent| budget.allows(done, spent),
+            deadline,
         );
         std::thread::sleep(Duration::from_millis(10));
     }
