@@ -62,7 +62,10 @@ impl App {
         // pump.
         self.note_what_could_not_be_drawn(resolution);
         self.record_the_traced_frame();
-        self.publish_the_view(Some((rendered, resolution.coarser == 0 && resolution.lost == 0)));
+        self.publish_the_view(Some((
+            rendered,
+            resolution.coarser == 0 && resolution.lost == 0,
+        )));
         self.report_once_a_second(rendered, resolution);
     }
 
@@ -134,9 +137,7 @@ impl App {
         // withholds the camera, which is what makes `F` a test of the renderer
         // against a fixed selection.
         let uploaded = if self.views.freeze {
-            active
-                .pump
-                .pump(&mut session.stream, &active.gpu, deadline)
+            active.pump.pump(&mut session.stream, &active.gpu, deadline)
         } else {
             active
                 .pump
@@ -394,7 +395,10 @@ impl App {
             let s = &active.pump.stats;
             let (_imagery_textures, imagery_bytes) =
                 active.gpu.imagery.lock().expect("imagery textures").live();
-            let budget = BudgetLine::of(tuile_core::metrics::budget().as_ref());
+            let budget = BudgetLine::of(
+                tuile_core::metrics::budget().as_ref(),
+                &self.profile.budget(),
+            );
             // One line, and only what a person watching a globe would ask:
             // where am I, is the picture complete, is it sharp, and is the
             // engine still turning. Everything else — visited, culled, bytes,
@@ -573,14 +577,36 @@ impl App {
 }
 
 /// The budget's signals in one clause of the status line: what the GPU holds
-/// against its target, how many loads are in flight, the relaxation, and
-/// whether the view has converged — the numbers the overlay shows, read from
-/// the same published snapshot as the metrics endpoint.
-struct BudgetLine(Option<tuile_core::budget::BudgetSignals>);
+/// against what the budget trims it to, how many loads are in flight, the
+/// relaxation, and whether the view has converged — the numbers the overlay
+/// shows, read from the same published snapshot as the metrics endpoint.
+///
+/// The target is the configured one: the ground's pool (terrain and imagery
+/// together) and the other classes' own. The pool's members' effective
+/// targets are each what the pool leaves the other — their sum moves with
+/// what is held and says nothing about the room left.
+struct BudgetLine(Option<tuile_core::budget::BudgetSignals>, u64, u64);
 
 impl BudgetLine {
-    fn of(signals: Option<&tuile_core::budget::BudgetSignals>) -> Self {
-        Self(signals.cloned())
+    fn of(
+        signals: Option<&tuile_core::budget::BudgetSignals>,
+        config: &tuile_core::budget::BudgetConfig,
+    ) -> Self {
+        let pool = &config.pool;
+        let others: u64 = config
+            .target
+            .iter()
+            .filter(|(c, _)| !pool.members[*c])
+            .map(|(_, t)| t.0)
+            .sum();
+        let total: u64 = config
+            .hard_limit
+            .iter()
+            .filter(|(c, _)| !pool.members[*c])
+            .map(|(_, h)| h.0)
+            .sum::<u64>()
+            + pool.hard_limit.0;
+        Self(signals.cloned(), pool.target.0 + others, total)
     }
 }
 
@@ -591,15 +617,21 @@ impl fmt::Display for BudgetLine {
         };
         let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
         let held: u64 = s.bytes.iter().map(|(_, [d, t])| d + t).sum();
-        let target: u64 = s.target_bytes.iter().map(|(_, t)| t).sum();
         let flight: u32 = s.in_flight.iter().map(|(_, n)| n).sum();
+        let evicted: u64 = s
+            .evictions_total
+            .iter()
+            .map(|(_, e)| e.iter().sum::<u64>())
+            .sum();
         write!(
             f,
-            "budget {:.0}/{:.0} MiB, {} in flight + {} local, scale {:.2}, {}",
+            "budget {:.0}/{:.0} MiB (hard {:.0}), {} in flight + {} local, {} evicted, scale {:.2}, {}",
             mib(held),
-            mib(target),
+            mib(self.1),
+            mib(self.2),
             flight,
             s.local_reads,
+            evicted,
             f64::from(s.sse_scale_milli) / 1000.0,
             if s.converged { "converged" } else { "settling" }
         )
