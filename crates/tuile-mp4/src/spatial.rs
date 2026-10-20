@@ -14,10 +14,8 @@
 //! then `mdat`, so that a player can start before the end.
 
 use mp4_atom::{
-    Blin, Cams, Cmfy, Co64, Ctts, CttsEntry, Dadj, Decode, Dinf, Dref, Encode, Eyes, FourCC, Ftyp,
-    Hdlr, Hero, Hfov, Hvc1, HvcCArray, Hvcc, Lhvc, Mdat, Mdhd, Mdia, Minf, Moov, Mvhd, Stbl, Stco,
-    Stri, Stsc, StscEntry, Stsd, Stss, Stsz, StszSamples, Stts, SttsEntry, Tkhd, Trak, Url, Vexu,
-    Visual, Vmhd,
+    Blin, Cams, Cmfy, Dadj, Decode, Encode, Eyes, Hero, Hfov, Hvc1, HvcCArray, Hvcc, Lhvc, Stri,
+    Vexu, Visual,
 };
 
 use crate::Mp4Error;
@@ -28,6 +26,18 @@ use crate::Mp4Error;
 /// 3D reference displays SEI if given one; `lhvC` holds the second layer's
 /// SPS and PPS. Returned as the records' bodies.
 pub fn hevc_records(units: &[&[u8]]) -> Result<(Vec<u8>, Vec<u8>), Mp4Error> {
+    let (hvcc, lhvc) = records_of(units, true)?;
+    Ok((hvcc, lhvc.unwrap_or_default()))
+}
+
+/// The `hvcC` record of a single-layer HEVC stream, from its parameter
+/// sets as an encoder emits them (NAL units without start codes): its VPS,
+/// SPS and PPS. Returned as the record's body.
+pub fn hevc_record(units: &[&[u8]]) -> Result<Vec<u8>, Mp4Error> {
+    Ok(records_of(units, false)?.0)
+}
+
+fn records_of(units: &[&[u8]], two_layers: bool) -> Result<(Vec<u8>, Option<Vec<u8>>), Mp4Error> {
     use std::io::Read;
     let bad = |why: &str| Mp4Error::Atom(format!("parameter sets: {why}"));
     // NAL header: forbidden(1) type(6) layer id(6) temporal id + 1(3).
@@ -83,6 +93,14 @@ pub fn hevc_records(units: &[&[u8]]) -> Result<(Vec<u8>, Vec<u8>), Mp4Error> {
             .collect(),
         ..Hvcc::new()
     };
+    let body = |atom: &dyn Fn(&mut Vec<u8>) -> mp4_atom::Result<()>| -> Result<Vec<u8>, Mp4Error> {
+        let mut out = Vec::new();
+        atom(&mut out).map_err(|e| Mp4Error::Atom(e.to_string()))?;
+        Ok(out[8..].to_vec())
+    };
+    if !two_layers {
+        return Ok((body(&|b| hvcc.encode(b))?, None));
+    }
     let second: Vec<HvcCArray> = [array(33, 1), array(34, 1)]
         .into_iter()
         .filter(|a| !a.nalus.is_empty())
@@ -98,12 +116,7 @@ pub fn hevc_records(units: &[&[u8]]) -> Result<(Vec<u8>, Vec<u8>), Mp4Error> {
         arrays: second,
         ..Default::default()
     };
-    let body = |atom: &dyn Fn(&mut Vec<u8>) -> mp4_atom::Result<()>| -> Result<Vec<u8>, Mp4Error> {
-        let mut out = Vec::new();
-        atom(&mut out).map_err(|e| Mp4Error::Atom(e.to_string()))?;
-        Ok(out[8..].to_vec())
-    };
-    Ok((body(&|b| hvcc.encode(b))?, body(&|b| lhvc.encode(b))?))
+    Ok((body(&|b| hvcc.encode(b))?, Some(body(&|b| lhvc.encode(b))?)))
 }
 
 /// An access unit in Annex B, split between what goes in the sample entry
@@ -131,8 +144,6 @@ pub struct StereoInfo {
 
 /// One spatial film being written.
 pub struct SpatialMuxer {
-    width: u16,
-    height: u16,
     timescale: u32,
     ticks: u32,
     entry: Hvc1,
@@ -201,8 +212,6 @@ impl SpatialMuxer {
             ..Default::default()
         };
         Ok(Self {
-            width,
-            height,
             timescale: fps.max(1) * ticks,
             ticks,
             entry,
@@ -256,393 +265,30 @@ impl SpatialMuxer {
             .collect()
     }
 
+    /// The film, laid out for a viewer ([`crate::film`]): its index first,
+    /// its colour said.
     pub fn finish(self) -> Result<Vec<u8>, Mp4Error> {
-        let atom = |e: mp4_atom::Error| Mp4Error::Atom(e.to_string());
-        let table = Table {
-            width: self.width,
-            height: self.height,
+        let composition = self.composition();
+        let bytes = self.data.len() as u64;
+        let table = crate::film::Table {
+            entry: crate::film::dressed(self.entry.into()),
             timescale: self.timescale,
             durations: vec![self.ticks; self.sizes.len()],
-            composition: self.composition(),
-            entry: self.entry,
+            composition,
             sizes: self.sizes,
             sync: self.sync,
+            start: 0,
         };
-        let mut out = Vec::new();
-        ftyp().encode(&mut out).map_err(atom)?;
-        // The samples' offset depends on the moov's size, which does not
-        // depend on the offset (a 64-bit entry either way).
-        let mut probe = Vec::new();
-        table.moov(0).encode(&mut probe).map_err(atom)?;
-        let first_sample = (out.len() + probe.len() + 8) as u64;
-        table.moov(first_sample).encode(&mut out).map_err(atom)?;
-        Mdat { data: self.data }.encode(&mut out).map_err(atom)?;
+        let mut out = table.head(bytes)?;
+        out.extend_from_slice(&self.data);
         Ok(out)
     }
-}
-
-fn ftyp() -> Ftyp {
-    Ftyp {
-        major_brand: FourCC::new(b"isom"),
-        minor_version: 512,
-        compatible_brands: [b"isom", b"iso2", b"hvc1", b"mp41"]
-            .map(FourCC::new)
-            .to_vec(),
-    }
-}
-
-/// What a spatial film's moov says of its one track.
-struct Table {
-    width: u16,
-    height: u16,
-    timescale: u32,
-    entry: Hvc1,
-    sizes: Vec<u32>,
-    /// 1-based, as `stss` counts.
-    sync: Vec<u32>,
-    durations: Vec<u32>,
-    /// Each sample's presentation against its decoding, in ticks.
-    composition: Vec<i64>,
-}
-
-/// Values as runs: (count, value).
-fn runs<T: PartialEq + Copy>(values: &[T]) -> Vec<(u32, T)> {
-    let mut out: Vec<(u32, T)> = Vec::new();
-    for &v in values {
-        match out.last_mut() {
-            Some((n, last)) if *last == v => *n += 1,
-            _ => out.push((1, v)),
-        }
-    }
-    out
-}
-
-impl Table {
-    fn moov(&self, first_sample: u64) -> Moov {
-        let frames = self.sizes.len() as u32;
-        let media: u64 = self.durations.iter().map(|&d| u64::from(d)).sum();
-        let movie = media * 1000 / u64::from(self.timescale.max(1));
-        let ctts = self.composition.iter().any(|&o| o != 0).then(|| Ctts {
-            entries: runs(&self.composition)
-                .into_iter()
-                .map(|(sample_count, sample_offset)| CttsEntry {
-                    sample_count,
-                    sample_offset,
-                })
-                .collect(),
-        });
-        Moov {
-            mvhd: Mvhd {
-                timescale: 1000,
-                duration: movie,
-                rate: 1.into(),
-                volume: 1.into(),
-                next_track_id: 2,
-                ..Default::default()
-            },
-            trak: vec![Trak {
-                tkhd: Tkhd {
-                    track_id: 1,
-                    duration: movie,
-                    enabled: true,
-                    in_movie: true,
-                    width: self.width.into(),
-                    height: self.height.into(),
-                    ..Default::default()
-                },
-                mdia: Mdia {
-                    mdhd: Mdhd {
-                        timescale: self.timescale,
-                        duration: media,
-                        language: "und".into(),
-                        ..Default::default()
-                    },
-                    hdlr: Hdlr {
-                        handler: FourCC::new(b"vide"),
-                        name: "VideoHandler".into(),
-                    },
-                    minf: Minf {
-                        vmhd: Some(Vmhd::default()),
-                        dinf: Dinf {
-                            dref: Dref {
-                                urls: vec![Url {
-                                    location: "".into(),
-                                }],
-                            },
-                        },
-                        stbl: Stbl {
-                            stsd: Stsd {
-                                codecs: vec![self.entry.clone().into()],
-                            },
-                            stts: Stts {
-                                entries: runs(&self.durations)
-                                    .into_iter()
-                                    .map(|(sample_count, sample_delta)| SttsEntry {
-                                        sample_count,
-                                        sample_delta,
-                                    })
-                                    .collect(),
-                            },
-                            ctts,
-                            stss: Some(Stss {
-                                entries: self.sync.clone(),
-                            }),
-                            stsc: Stsc {
-                                entries: vec![StscEntry {
-                                    first_chunk: 1,
-                                    samples_per_chunk: frames,
-                                    sample_description_index: 1,
-                                }],
-                            },
-                            stsz: Stsz {
-                                samples: StszSamples::Different {
-                                    sizes: self.sizes.clone(),
-                                },
-                            },
-                            stco: None::<Stco>,
-                            co64: Some(Co64 {
-                                entries: vec![first_sample],
-                            }),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                },
-                ..Default::default()
-            }],
-            ..Default::default()
-        }
-    }
-}
-
-/// Where one sample of a spatial film lies, and how it is timed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SampleAt {
-    /// Byte offset in the file.
-    pub offset: u64,
-    pub size: u32,
-    pub key: bool,
-    pub duration: u32,
-    /// Presentation against decoding, in ticks.
-    pub composition: i64,
-}
-
-/// A spatial film's one track, as its moov describes it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SpatialTrack {
-    pub entry: Hvc1,
-    pub timescale: u32,
-    pub samples: Vec<SampleAt>,
-}
-
-impl SpatialTrack {
-    pub fn seconds(&self) -> f64 {
-        let ticks: u64 = self.samples.iter().map(|s| u64::from(s.duration)).sum();
-        ticks as f64 / f64::from(self.timescale.max(1))
-    }
-}
-
-/// The track of the spatial film in `file`: its `moov` read, its `mdat`
-/// left where it is. `Ok(None)` for a film that is not one (not a single
-/// `hvc1` track with a second layer).
-pub fn read_track<R: std::io::Read + std::io::Seek>(
-    file: &mut R,
-) -> Result<Option<SpatialTrack>, Mp4Error> {
-    use std::io::SeekFrom;
-    let io = |e: std::io::Error| Mp4Error::Atom(e.to_string());
-    let atom = |e: mp4_atom::Error| Mp4Error::Atom(e.to_string());
-    let end = file.seek(SeekFrom::End(0)).map_err(io)?;
-    let mut at = 0u64;
-    let mut moov = None;
-    while at + 8 <= end {
-        file.seek(SeekFrom::Start(at)).map_err(io)?;
-        let mut head = [0u8; 16];
-        file.read_exact(&mut head[..8]).map_err(io)?;
-        let size32 = u32::from_be_bytes([head[0], head[1], head[2], head[3]]);
-        let size = match size32 {
-            0 => end - at,
-            1 => {
-                file.read_exact(&mut head[8..]).map_err(io)?;
-                u64::from_be_bytes([
-                    head[8], head[9], head[10], head[11], head[12], head[13], head[14], head[15],
-                ])
-            }
-            n => u64::from(n),
-        };
-        if size < 8 {
-            return Err(Mp4Error::Atom(format!("a box of {size} bytes at {at}")));
-        }
-        if &head[4..8] == b"moov" {
-            file.seek(SeekFrom::Start(at)).map_err(io)?;
-            let mut bytes = vec![0u8; size as usize];
-            file.read_exact(&mut bytes).map_err(io)?;
-            moov = Some(Moov::decode(&mut bytes.as_slice()).map_err(atom)?);
-        }
-        at += size;
-    }
-    let Some(moov) = moov else {
-        return Ok(None);
-    };
-    let Some(trak) = moov.trak.first() else {
-        return Ok(None);
-    };
-    let stbl = &trak.mdia.minf.stbl;
-    let Some(mp4_atom::Codec::Hvc1(entry)) = stbl.stsd.codecs.first() else {
-        return Ok(None);
-    };
-    if entry.lhvc.is_none() {
-        return Ok(None);
-    }
-    let StszSamples::Different { sizes } = &stbl.stsz.samples else {
-        return Err(Mp4Error::Atom("samples all of one size".into()));
-    };
-    let chunks: Vec<u64> = match (&stbl.co64, &stbl.stco) {
-        (Some(c), _) => c.entries.clone(),
-        (None, Some(c)) => c.entries.iter().map(|&o| u64::from(o)).collect(),
-        _ => return Err(Mp4Error::Atom("no chunk offsets".into())),
-    };
-    let expand = |runs: Vec<(u32, i64)>| -> Vec<i64> {
-        runs.into_iter()
-            .flat_map(|(n, v)| std::iter::repeat_n(v, n as usize))
-            .collect()
-    };
-    let durations = expand(
-        stbl.stts
-            .entries
-            .iter()
-            .map(|e| (e.sample_count, i64::from(e.sample_delta)))
-            .collect(),
-    );
-    let composition = stbl.ctts.as_ref().map_or_else(Vec::new, |c| {
-        expand(
-            c.entries
-                .iter()
-                .map(|e| (e.sample_count, e.sample_offset))
-                .collect(),
-        )
-    });
-    let sync: std::collections::HashSet<u32> = stbl
-        .stss
-        .as_ref()
-        .map_or_else(Default::default, |s| s.entries.iter().copied().collect());
-    let mut samples = Vec::with_capacity(sizes.len());
-    for (c, &offset) in chunks.iter().enumerate() {
-        let chunk = c as u32 + 1;
-        let per = stbl
-            .stsc
-            .entries
-            .iter()
-            .rev()
-            .find(|r| r.first_chunk <= chunk)
-            .ok_or_else(|| Mp4Error::Atom("a chunk of no run".into()))?
-            .samples_per_chunk;
-        let mut at = offset;
-        for _ in 0..per {
-            let n = samples.len();
-            let Some(&size) = sizes.get(n) else { break };
-            samples.push(SampleAt {
-                offset: at,
-                size,
-                key: stbl.stss.is_none() || sync.contains(&(n as u32 + 1)),
-                duration: durations.get(n).copied().unwrap_or(0) as u32,
-                composition: composition.get(n).copied().unwrap_or(0),
-            });
-            at += u64::from(size);
-        }
-    }
-    Ok(Some(SpatialTrack {
-        entry: entry.clone(),
-        timescale: trak.mdia.mdhd.timescale,
-        samples,
-    }))
-}
-
-/// Spatial films one after the other into one, streamed from file to file:
-/// the same stream description in each (records, stereo boxes, timescale —
-/// the field of view aside, the first segment's kept), or the join is
-/// refused. Returns the frames written.
-pub fn join(segments: &[std::path::PathBuf], out: &std::path::Path) -> Result<u64, Mp4Error> {
-    use std::io::{Read, Seek, SeekFrom, Write};
-    let io = |e: std::io::Error| Mp4Error::Atom(e.to_string());
-    let atom = |e: mp4_atom::Error| Mp4Error::Atom(e.to_string());
-    let mut tracks = Vec::with_capacity(segments.len());
-    for path in segments {
-        let mut file = std::fs::File::open(path).map_err(io)?;
-        let track = read_track(&mut file)?
-            .ok_or_else(|| Mp4Error::Atom(format!("{}: not a spatial film", path.display())))?;
-        tracks.push((file, track));
-    }
-    let Some((_, first)) = tracks.first() else {
-        return Err(Mp4Error::Atom("nothing to join".into()));
-    };
-    let (entry, timescale) = (first.entry.clone(), first.timescale);
-    // The field of view is what a segment's first camera had, and a
-    // camera's field moves during a film: it says nothing of the encode,
-    // so the film says the first segment's.
-    let with_first_field = |e: &Hvc1| Hvc1 {
-        hfov: entry.hfov.clone(),
-        ..e.clone()
-    };
-    for ((_, t), path) in tracks.iter().zip(segments) {
-        if with_first_field(&t.entry) != entry {
-            return Err(Mp4Error::Mismatch("spatial stream description"));
-        }
-        if t.timescale != timescale {
-            return Err(Mp4Error::Atom(format!(
-                "{}: another timescale",
-                path.display()
-            )));
-        }
-    }
-    let mut table = Table {
-        width: entry.visual.width,
-        height: entry.visual.height,
-        timescale,
-        entry,
-        sizes: Vec::new(),
-        sync: Vec::new(),
-        durations: Vec::new(),
-        composition: Vec::new(),
-    };
-    let mut writer = std::io::BufWriter::new(std::fs::File::create(out).map_err(io)?);
-    let mut head = Vec::new();
-    ftyp().encode(&mut head).map_err(atom)?;
-    let mdat_at = head.len() as u64;
-    // A 64-bit mdat, its size written once the samples are in.
-    head.extend(1u32.to_be_bytes());
-    head.extend(b"mdat");
-    head.extend(0u64.to_be_bytes());
-    writer.write_all(&head).map_err(io)?;
-    let first_sample = head.len() as u64;
-    let mut written = 0u64;
-    let mut buffer = Vec::new();
-    for (file, track) in &mut tracks {
-        for s in &track.samples {
-            buffer.resize(s.size as usize, 0);
-            file.seek(SeekFrom::Start(s.offset)).map_err(io)?;
-            file.read_exact(&mut buffer).map_err(io)?;
-            writer.write_all(&buffer).map_err(io)?;
-            written += u64::from(s.size);
-            table.sizes.push(s.size);
-            if s.key {
-                table.sync.push(table.sizes.len() as u32);
-            }
-            table.durations.push(s.duration);
-            table.composition.push(s.composition);
-        }
-    }
-    let mut moov = Vec::new();
-    table.moov(first_sample).encode(&mut moov).map_err(atom)?;
-    writer.write_all(&moov).map_err(io)?;
-    let mut file = writer.into_inner().map_err(|e| io(e.into_error()))?;
-    file.seek(SeekFrom::Start(mdat_at + 8)).map_err(io)?;
-    file.write_all(&(written + 16).to_be_bytes()).map_err(io)?;
-    Ok(table.sizes.len() as u64)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mp4_atom::{Ftyp, Moov};
 
     /// The records of a spatial film written by Apple's AVFoundation, as
     /// mp4-atom's own test reads them.
@@ -855,10 +501,10 @@ mod tests {
         // during a film, so each segment says a little another.
         segment(&b, 0xb, 5, 10_000_000, 72_269);
         let out = dir.path().join("film.mp4");
-        assert_eq!(join(&[a.clone(), b.clone()], &out).expect("joined"), 11);
+        assert_eq!(crate::film::join(&[a.clone(), b.clone()], &out).expect("joined"), 11);
 
         let mut film = std::fs::File::open(&out).expect("film");
-        let track = read_track(&mut film)
+        let track = crate::film::read_track(&mut film)
             .expect("read")
             .expect("a spatial film");
         let bytes = std::fs::read(&out).expect("bytes");
@@ -885,7 +531,7 @@ mod tests {
             "each segment's key frames, where they were"
         );
         let mut one = std::fs::File::open(&a).expect("a");
-        let alone = read_track(&mut one).expect("read").expect("spatial");
+        let alone = crate::film::read_track(&mut one).expect("read").expect("spatial");
         assert_eq!(
             &track.samples[..6]
                 .iter()
@@ -909,7 +555,7 @@ mod tests {
 
         segment(&c, 0xc, 3, 20_000_000, 72_489);
         assert!(
-            join(&[a, c], &out).is_err(),
+            crate::film::join(&[a, c], &out).is_err(),
             "another baseline is another stream"
         );
     }

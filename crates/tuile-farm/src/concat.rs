@@ -16,12 +16,10 @@
 //! frame, and the join would not know.
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
-use mp4::{
-    AvcConfig, MediaConfig, Mp4Config, Mp4Reader, Mp4Sample, Mp4Writer, TrackConfig, TrackType,
-};
+use mp4::{AvcConfig, MediaConfig, Mp4Config, Mp4Sample, Mp4Writer, TrackConfig, TrackType};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConcatError {
@@ -37,69 +35,28 @@ pub enum ConcatError {
         #[source]
         source: mp4::Error,
     },
-    #[error("{0}: no H.264 video track")]
+    #[error("{0}: no H.264, HEVC or AV1 video track")]
     NoVideo(PathBuf),
     #[error("{path}: {what} differs from the first segment's — not the same encode")]
     Mismatch { path: PathBuf, what: &'static str },
     #[error("nothing to join")]
     Empty,
-    #[error("{path}: spatial film: {why}")]
-    Spatial { path: PathBuf, why: String },
+    #[error("{path}: {why}")]
+    Film { path: PathBuf, why: String },
 }
 
-/// The film at `path` as a spatial film (one `hvc1` track of two layers),
-/// or `None`.
-fn spatial(path: &Path) -> Result<Option<tuile_mp4::spatial::SpatialTrack>, ConcatError> {
+/// The video track of the film at `path`.
+fn track(path: &Path) -> Result<tuile_mp4::film::Track, ConcatError> {
     let mut file = File::open(path).map_err(|source| ConcatError::Io {
         path: path.to_path_buf(),
         source,
     })?;
-    // A film this cannot read as spatial is left to the H.264 reader, which
-    // says what it is not.
-    Ok(tuile_mp4::spatial::read_track(&mut file).ok().flatten())
-}
-
-/// What a film's single video track is made of.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Format {
-    width: u16,
-    height: u16,
-    timescale: u32,
-    sps: Vec<u8>,
-    pps: Vec<u8>,
-}
-
-fn open(path: &Path) -> Result<(Mp4Reader<BufReader<File>>, u32, Format), ConcatError> {
-    let io = |source| ConcatError::Io {
-        path: path.to_path_buf(),
-        source,
-    };
-    let mp4 = |source| ConcatError::Mp4 {
-        path: path.to_path_buf(),
-        source,
-    };
-    let file = File::open(path).map_err(io)?;
-    let size = file.metadata().map_err(io)?.len();
-    let reader = Mp4Reader::read_header(BufReader::new(file), size).map_err(mp4)?;
-    let (id, track) = reader
-        .tracks()
-        .iter()
-        .find(|(_, t)| {
-            matches!(t.track_type(), Ok(TrackType::Video))
-                && t.box_type()
-                    .map(|b| b.to_string() == "avc1")
-                    .unwrap_or(false)
-        })
-        .ok_or_else(|| ConcatError::NoVideo(path.to_path_buf()))?;
-    let format = Format {
-        width: track.width(),
-        height: track.height(),
-        timescale: track.timescale(),
-        sps: track.sequence_parameter_set().map_err(mp4)?.to_vec(),
-        pps: track.picture_parameter_set().map_err(mp4)?.to_vec(),
-    };
-    let id = *id;
-    Ok((reader, id, format))
+    tuile_mp4::film::read_track(&mut file)
+        .map_err(|e| ConcatError::Film {
+            path: path.to_path_buf(),
+            why: e.to_string(),
+        })?
+        .ok_or_else(|| ConcatError::NoVideo(path.to_path_buf()))
 }
 
 /// What a film holds, read from its index — no picture decoded.
@@ -110,31 +67,14 @@ pub struct Probe {
     pub seconds: f64,
 }
 
-/// Frames and duration of a film's video track.
+/// Frames and duration of a film's video track. The track's end is its
+/// samples' durations added up; the header's duration can be padded by a
+/// muxer, and padding is what this measures.
 pub fn probe(path: &Path) -> Result<Probe, ConcatError> {
-    if let Some(track) = spatial(path)? {
-        return Ok(Probe {
-            frames: track.samples.len() as u64,
-            seconds: track.seconds(),
-        });
-    }
-    let (mut reader, id, format) = open(path)?;
-    let mp4 = |source| ConcatError::Mp4 {
-        path: path.to_path_buf(),
-        source,
-    };
-    let count = reader.sample_count(id).map_err(mp4)?;
-    let mut end = 0u64;
-    // The track's end is its last sample's end in decode order; the header's
-    // duration can be padded by the muxer, and padding is what this measures.
-    if count > 0 {
-        if let Some(last) = reader.read_sample(id, count).map_err(mp4)? {
-            end = last.start_time + u64::from(last.duration);
-        }
-    }
+    let track = track(path)?;
     Ok(Probe {
-        frames: u64::from(count),
-        seconds: end as f64 / f64::from(format.timescale.max(1)),
+        frames: track.samples.len() as u64,
+        seconds: track.seconds(),
     })
 }
 
@@ -166,113 +106,27 @@ pub fn check_cadence(probe: Probe, fps: f64) -> Result<(), String> {
     Ok(())
 }
 
-/// Joins `segments`, in the order given, into `out`. Returns the frame count.
+/// Joins `segments`, in the order given, into `out`, laid out for a viewer
+/// ([`tuile_mp4::film::join`]: faststart, its colour said). H.264, HEVC —
+/// a spatial film's two layers included — or AV1. Returns the frame count.
 pub fn concat(segments: &[PathBuf], out: &Path) -> Result<u64, ConcatError> {
-    let first = segments.first().ok_or(ConcatError::Empty)?;
-    // A spatial film (MV-HEVC, two eyes): joined as one.
-    if spatial(first)?.is_some() {
-        return tuile_mp4::spatial::join(segments, out).map_err(|e| ConcatError::Spatial {
-            path: out.to_path_buf(),
-            why: e.to_string(),
-        });
+    if segments.is_empty() {
+        return Err(ConcatError::Empty);
     }
-    let (_, _, format) = open(first)?;
-
-    let out_io = |source| ConcatError::Io {
-        path: out.to_path_buf(),
-        source,
-    };
-    let out_mp4 = |source| ConcatError::Mp4 {
-        path: out.to_path_buf(),
-        source,
-    };
-    let file = File::create(out).map_err(out_io)?;
-    let brand = |s: &str| s.parse().map_err(out_mp4);
-    let config = Mp4Config {
-        major_brand: brand("isom")?,
-        minor_version: 512,
-        compatible_brands: vec![
-            brand("isom")?,
-            brand("iso2")?,
-            brand("avc1")?,
-            brand("mp41")?,
-        ],
-        timescale: 1000,
-    };
-    let mut writer = Mp4Writer::write_start(BufWriter::new(file), &config).map_err(out_mp4)?;
-    writer
-        .add_track(&TrackConfig {
-            track_type: TrackType::Video,
-            timescale: format.timescale,
-            language: "und".into(),
-            media_conf: MediaConfig::AvcConfig(AvcConfig {
-                width: format.width,
-                height: format.height,
-                seq_param_set: format.sps.clone(),
-                pic_param_set: format.pps.clone(),
-            }),
-        })
-        .map_err(out_mp4)?;
-
-    // Where the next segment starts, in the track's timescale.
-    let mut offset = 0u64;
-    let mut frames = 0u64;
+    // Every segment readable as a film first: an error names the segment.
     for path in segments {
-        let (mut reader, id, this) = open(path)?;
-        let mismatch = |what| ConcatError::Mismatch {
-            path: path.clone(),
-            what,
-        };
-        if (this.width, this.height) != (format.width, format.height) {
-            return Err(mismatch("picture size"));
-        }
-        if this.timescale != format.timescale {
-            return Err(mismatch("timescale"));
-        }
-        if this.sps != format.sps {
-            return Err(mismatch("sequence parameter set"));
-        }
-        if this.pps != format.pps {
-            return Err(mismatch("picture parameter set"));
-        }
-        let mp4 = |source| ConcatError::Mp4 {
-            path: path.clone(),
-            source,
-        };
-        let count = reader.sample_count(id).map_err(mp4)?;
-        let mut end = 0u64;
-        // Sample ids are 1-based in the format.
-        for sample_id in 1..=count {
-            let Some(sample) = reader.read_sample(id, sample_id).map_err(mp4)? else {
-                continue;
-            };
-            end = end.max(sample.start_time + u64::from(sample.duration));
-            writer
-                .write_sample(
-                    1,
-                    &Mp4Sample {
-                        start_time: offset + sample.start_time,
-                        duration: sample.duration,
-                        rendering_offset: sample.rendering_offset,
-                        is_sync: sample.is_sync,
-                        bytes: sample.bytes,
-                    },
-                )
-                .map_err(out_mp4)?;
-            frames += 1;
-        }
-        offset += end;
+        track(path)?;
     }
-    writer.write_end().map_err(out_mp4)?;
-    drop(writer);
-    // The writer sums the movie's duration a sample at a time, each cut to
-    // a whole millisecond: a 60 fps film came out 4 % short in every
-    // player. Its exact length, written over that sum.
-    let millis =
-        (offset * 1000 + u64::from(format.timescale) / 2) / u64::from(format.timescale.max(1));
-    // In place: the movie's header, not the pictures, read and written.
-    tuile_mp4::set_movie_duration_in_file(out, millis).map_err(out_io)?;
-    Ok(frames)
+    tuile_mp4::film::join(segments, out).map_err(|e| match e {
+        tuile_mp4::Mp4Error::Mismatch(what) => ConcatError::Mismatch {
+            path: out.to_path_buf(),
+            what,
+        },
+        other => ConcatError::Film {
+            path: out.to_path_buf(),
+            why: other.to_string(),
+        },
+    })
 }
 
 /// A synthetic H.264 segment: real container, placeholder NAL payloads. Enough
@@ -391,7 +245,11 @@ mod tests {
             mp4::Mp4Reader::read_header(std::io::Cursor::new(bytes), size).expect("header");
         assert_eq!(header.duration().as_millis(), 317);
 
-        let (mut reader, id, _) = open(&out).expect("open film");
+        let film = std::fs::read(&out).expect("film");
+        let size = film.len() as u64;
+        let mut reader =
+            mp4::Mp4Reader::read_header(std::io::Cursor::new(film), size).expect("open film");
+        let id = *reader.tracks().keys().next().expect("track");
         let mut previous_end = 0;
         for n in 1..=19u32 {
             let s = reader.read_sample(id, n).expect("read").expect("sample");
@@ -406,6 +264,29 @@ mod tests {
             );
             previous_end = s.start_time + u64::from(s.duration);
         }
+    }
+
+    /// The joined film plays from its first bytes and says its colour,
+    /// whatever its segments said.
+    #[test]
+    fn the_joined_film_is_laid_out_for_a_viewer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = dir.path().join("a.mp4");
+        write_test_segment(&a, 3, SPS, 1).expect("a");
+        let out = dir.path().join("film.mp4");
+        concat(&[a], &out).expect("concat");
+        let bytes = std::fs::read(&out).expect("film");
+        assert_eq!(&bytes[4..8], b"ftyp");
+        let ftyp = u32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        assert_eq!(&bytes[ftyp + 4..ftyp + 8], b"moov", "the index before the pictures");
+        let track = tuile_mp4::film::read_track(&mut std::io::Cursor::new(&bytes))
+            .expect("read")
+            .expect("track");
+        let mp4_atom_colour = match &track.entry {
+            tuile_mp4::film::Entry::Avc1(e) => e.colr.clone(),
+            _ => None,
+        };
+        assert_eq!(mp4_atom_colour, Some(tuile_mp4::film::bt709()));
     }
 
     #[test]
@@ -433,7 +314,7 @@ mod tests {
             matches!(
                 err,
                 ConcatError::Mismatch {
-                    what: "sequence parameter set",
+                    what: "stream description",
                     ..
                 }
             ),

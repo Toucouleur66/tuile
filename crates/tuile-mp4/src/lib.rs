@@ -14,6 +14,7 @@
 //! mismatch is an error, never a film that turns to garbage half-way.
 
 mod av1;
+pub mod film;
 pub mod spatial;
 
 use std::io::Cursor;
@@ -141,7 +142,6 @@ enum Writer {
 pub struct Muxer {
     writer: Writer,
     next: u64,
-    fps: u32,
 }
 
 /// Ticks per frame. 512 is what FFmpeg picks for common rates and divides
@@ -190,7 +190,6 @@ impl Muxer {
         Ok(Self {
             writer,
             next: 0,
-            fps,
         })
     }
 
@@ -244,23 +243,20 @@ impl Muxer {
         self.next
     }
 
+    /// The film, laid out for a viewer ([`film::finished`]): its index
+    /// first, its colour said.
     pub fn finish(self) -> Result<Vec<u8>, Mp4Error> {
-        match self.writer {
-            Writer::Av1(writer) => Ok(writer.finish()),
+        let bytes = match self.writer {
+            Writer::Av1(writer) => writer.finish(),
             Writer::Avc(mut writer, _) => {
                 writer.write_end()?;
-                let mut bytes = writer.into_writer().into_inner();
-                // The `mp4` crate adds up the movie's duration a sample at a
-                // time, each one cut to a whole millisecond: 16 ms a frame at
-                // 60 fps instead of 16.67, and a player stops the film 4 %
-                // early — 288 frames of a two-minute film never shown (1 %
-                // at 30 fps). The exact duration, written over its sum.
-                let millis =
-                    (self.next * 1000 + u64::from(self.fps) / 2) / u64::from(self.fps.max(1));
-                set_movie_duration(&mut bytes, millis);
-                Ok(bytes)
+                writer.into_writer().into_inner()
             }
-        }
+        };
+        // The index is written again from the samples' own durations: the
+        // `mp4` crate's sum of whole milliseconds (16 ms a frame at 60 fps,
+        // a film stopped 4 % early) does not survive it.
+        film::finished(bytes)
     }
 }
 
