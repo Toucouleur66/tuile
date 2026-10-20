@@ -688,3 +688,38 @@ Taken from this study's recommendations where nothing was said:
 
 Measured on a Cloud Run L4: see §9.1.
 
+
+### 9.1 Measured end to end (Cloud Run L4, driver 580.126.20, 20 Oct. 2026)
+
+One job (`tuile-compress-trial`, image `tuile/film:7a86d06`) ran the service
+path a film takes: `tuile-film-serve` with `TUILE_MEZZANINE_STORE` on a GCS
+bucket in europe-west1; every pack of a production run asked of
+`POST /segments` as the `mezzanine` codec into that bucket; the receipts
+deposited in the run store; then `POST /compress` once per delivery
+(gather from GCS → join → NVDEC → dither → one NVENC session → faststart
+mp4 → run store). One L4, segments one after another. The renders carry no
+STL overlays (tuile's own service) and one sun for the whole film
+(`sun: [200, 35]`); "today" is the production `render.mp4` of the same run
+(STL's service, its own sun, its HUD).
+
+| Film | File | Size | Mean rate | Encode |
+|---|---|---|---|---|
+| mobile 720×1280 30 fps, 4266 frames (142 s), run `1572170/…-d539` | today `render.mp4` (H.264, no B, index last, no colour) | 191.7 MB | 10.8 Mb/s | — |
+| | mezzanine (7 segments, HEVC Main10) | 105.8 MB | 6.0 Mb/s | rendered in 314 s |
+| | **`web`** `h264-v1` (default) | **39.2 MB** | 2.2 Mb/s | 16.5 s, 1 pass |
+| | `high` `hevc-main10-v1` | 53.0 MB | 3.0 Mb/s | 15.7 s, 1 pass |
+| HD 1920×1080 30 fps, 5400 frames (180 s), run `1570484/…-620f` | today `render.mp4` (H.264, no B, index last, no colour) | 278.1 MB | 12.4 Mb/s | — |
+| | mezzanine (13 segments) | 536.4 MB | 23.8 Mb/s | rendered in 536 s |
+| | **`high`** `hevc-main10-v1` (default) | **276.4 MB** | 12.3 Mb/s | 45.1 s, 1 pass |
+| | `web` `h264-v1` | 98.2 MB | 4.4 Mb/s | 91.0 s, **2 passes**: 191.3 MB at constant quality, over the 100 MB cap, again at 4.36 Mb/s |
+
+Every delivered file probes as `ftyp, moov, mdat` (faststart), `colr nclx
+1/1/1` limited, B-frames reordered, a key frame every 2 s (`web`) or 1 s
+(`high`), every frame of the joined mezzanine at its cadence. The final
+stage runs at 260 fps (mobile) and 120 fps (HD `high`) on one NVENC
+session, fetch from GCS included in seconds; a compression asked again of
+the same mezzanine costs that, not a render.
+
+What this does not measure: VMAF/CAMBI (§6 is still to run); the
+float → P010 dither at the render node (the mezzanine is NVENC's own 8 → 10
+bits of today's I420); the spatial path (unchanged, not run); 4K.
