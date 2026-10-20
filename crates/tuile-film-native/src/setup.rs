@@ -141,8 +141,27 @@ pub fn sun_at(eye: [f64; 3], azimuth: f64, elevation: f64) -> Vec3 {
     (level * elevation.cos() + local.z_axis * elevation.sin()).as_vec3()
 }
 
+/// `bitrate` (bits a second), or when it is 0 the mean the H.264 profile
+/// gives a `width`×`height` film at `fps`: a bitrate by the picture's size,
+/// not one number for every size.
+pub fn bitrate_for(bitrate: u32, width: u32, height: u32, fps: u32) -> u32 {
+    match bitrate {
+        0 => {
+            tuile_farm::compress::Profile::h264()
+                .bitrates(width, height, f64::from(fps.max(1)))
+                .0
+        }
+        bits => bits,
+    }
+}
+
 /// The film's encoder: the one asked for, or the best this build has — the
-/// machine's own before software.
+/// machine's own before software. `bitrate` in bits a second; 0 for the
+/// encoder's own by the picture's size (`tuile_farm::compress::Profile`'s
+/// rate tables), in place of one number for every size.
+///
+/// `mezzanine` is what a render node writes for the final stage
+/// ([`crate::compress`]): HEVC Main10, near-transparent, by an NVIDIA card.
 pub fn film_sink(path: String, bitrate: u32, codec: Option<&str>) -> Result<Box<dyn Sink>, Error> {
     #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
     if matches!(codec, Some("h264") | None) {
@@ -163,6 +182,11 @@ pub fn film_sink(path: String, bitrate: u32, codec: Option<&str>) -> Result<Box<
             Some("nvenc-av1") | None => {
                 return Ok(Box::new(
                     NvencFilm::at(path, bitrate, NvencCodec::Av1).on_device(device),
+                ))
+            }
+            Some("mezzanine") => {
+                return Ok(Box::new(
+                    NvencFilm::at(path, bitrate, NvencCodec::Mezzanine).on_device(device),
                 ))
             }
             Some("nvenc-mv-hevc") | Some("mv-hevc") => {
@@ -210,5 +234,12 @@ mod tests {
             let asked = placed_sun(eye, Some((270.0, 10.0))).as_dvec3();
             assert!((asked - sun_at(eye, 270.0, 10.0).as_dvec3()).length() < 1e-9);
         }
+    }
+
+    #[test]
+    fn a_film_asked_for_no_bitrate_gets_its_size_s() {
+        assert_eq!(bitrate_for(45_000_000, 3840, 2160, 30), 45_000_000);
+        assert_eq!(bitrate_for(0, 720, 1280, 30), 3_000_000);
+        assert_eq!(bitrate_for(0, 1920, 1080, 30), 6_000_000);
     }
 }

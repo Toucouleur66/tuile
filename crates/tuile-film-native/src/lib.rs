@@ -25,6 +25,7 @@
 //! film's imagery, for its tiles to be measured against.
 
 pub mod av1;
+pub mod compress;
 pub mod engine;
 pub mod extract;
 pub mod meter;

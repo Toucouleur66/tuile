@@ -714,6 +714,29 @@ pub fn hvc1(width: u16, height: u16, hvcc: &[u8]) -> Result<Codec, Mp4Error> {
     }))
 }
 
+/// An AV1 sample entry from the body of the stream's `av1C` record.
+pub fn av01(width: u16, height: u16, av1c: &[u8]) -> Result<Codec, Mp4Error> {
+    let mut boxed = Vec::with_capacity(av1c.len() + 8);
+    boxed.extend(((av1c.len() + 8) as u32).to_be_bytes());
+    boxed.extend(b"av1C");
+    boxed.extend(av1c);
+    let av1c = mp4_atom::Av1c::decode(&mut boxed.as_slice()).map_err(atom)?;
+    Ok(Codec::Av01(mp4_atom::Av01 {
+        visual: mp4_atom::Visual {
+            data_reference_index: 1,
+            width,
+            height,
+            ..Default::default()
+        },
+        av1c,
+        btrt: None,
+        ccst: None,
+        colr: None,
+        pasp: None,
+        taic: None,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

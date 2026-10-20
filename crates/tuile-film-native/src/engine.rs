@@ -25,7 +25,8 @@ pub struct Rendering {
     pub order: Order,
     /// The encoder, by name; `None` for the best this build has.
     pub codec: Option<String>,
-    /// Bits a second.
+    /// Bits a second; 0 for the encoder's own by the picture's size
+    /// ([`crate::setup::bitrate_for`]).
     pub bitrate: u32,
     /// The sun's azimuth and elevation, in degrees, where the film begins.
     /// `None`: the look's own direction.
@@ -42,7 +43,11 @@ pub struct RenderSpec {
     pub scale: f32,
     pub supersample: u32,
     pub codec: String,
-    pub mbps: f64,
+    /// Megabits a second. Absent: the encoder's own by the picture's size —
+    /// not one number for every size (12 Mb/s once made a 720×1280 film
+    /// three times too heavy to share).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mbps: Option<f64>,
     /// The sun's azimuth and elevation, in degrees, where the film begins.
     pub sun: Option<(f64, f64)>,
     pub exposure: Option<f32>,
@@ -167,7 +172,7 @@ impl Default for RenderSpec {
             scale: 1.0,
             supersample: 2,
             codec: "h264".into(),
-            mbps: 12.0,
+            mbps: None,
             sun: None,
             exposure: None,
             contrast: None,
@@ -294,7 +299,7 @@ impl RenderSpec {
         Ok(Rendering {
             order,
             codec: Some(self.codec.clone()),
-            bitrate: (self.mbps * 1e6) as u32,
+            bitrate: self.mbps.map_or(0, |mbps| (mbps * 1e6) as u32),
             sun: self.sun,
         })
     }
