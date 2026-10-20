@@ -168,6 +168,21 @@ fn tell_the_page_the_budget() {
                 decide_p99_ms = d.quantile_upper(990) as f64 / 1000.0,
                 decide_peak_ms = signals.decide_peak_micros as f64 / 1000.0,
                 completions = signals.completions_total,
+                starts = signals
+                    .starts_total
+                    .iter()
+                    .map(|(_, s)| s[0] + s[1])
+                    .sum::<u64>(),
+                cancels_grace = signals.cancels_total[0],
+                cancels_timeout = signals.cancels_total[1],
+                cancels_preempted = signals.cancels_total[2],
+                stale = signals.stale_results_total,
+                drawn_exact = signals.drawn_tiles[0],
+                drawn_held = signals.drawn_tiles[1],
+                drawn_fallback = signals.drawn_tiles[2],
+                lost = signals.lost_tiles,
+                bare = signals.bare_items,
+                underdraped = signals.underdraped_tiles,
                 "the budget's steps"
             );
         }
@@ -190,8 +205,12 @@ fn tell_the_page_the_budget() {
 }
 
 /// Events the server handles back to back before the worker's messages get
-/// their turn: a few milliseconds of work at most.
-const BURST: usize = 16;
+/// their turn: one. A step on the budget is tens of milliseconds of the
+/// worker's one thread near the ground; sixteen of them back to back held
+/// the fetches and the decode pool's replies for half a second, the pool
+/// idle with work queued. Yielding before each step lets everything that
+/// has landed in the meantime be answered by that one step.
+const BURST: usize = 1;
 
 /// A pause on the worker's timer: a macrotask, so the messages queued behind
 /// the server's burst are delivered before it goes on. A promise alone would

@@ -230,7 +230,10 @@ impl Profile {
         let ceiling = if handheld { 384 * MIB } else { 768 * MIB };
         Self {
             gpu_bytes: base.gpu_bytes.min(ceiling),
-            max_local_reads: 8,
+            // A page's "local" reads are its loader's own decoded caches —
+            // memory, no store — and eight of them at once left the network
+            // idle with two thousand tiles wanted near the ground.
+            max_local_reads: 32,
             // `tuile_web::patience::LOAD_ATTEMPT_TIMEOUT` is the same.
             load_timeout_s: 30.0,
             runtime_workers: 1,
