@@ -928,7 +928,9 @@ const FRAMES_AHEAD: usize = 8;
 /// `None` where the frames announced last still hold.
 pub(crate) fn announced(index: usize, len: usize) -> Option<std::ops::Range<usize>> {
     let ahead = frames_ahead();
-    (index % (ahead / 2).max(1) == 0).then(|| (index + 1).min(len)..(index + 1 + ahead).min(len))
+    index
+        .is_multiple_of((ahead / 2).max(1))
+        .then(|| (index + 1).min(len)..(index + 1 + ahead).min(len))
 }
 
 /// The bytes the ground a camera is kept over takes

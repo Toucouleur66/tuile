@@ -182,6 +182,9 @@ where
     Ok(settled.into_iter().map(|(_, s)| s).collect())
 }
 
+/// A reading, with how long its ground took to build and to read.
+type Timed<T> = (T, Duration, Duration);
+
 /// The grounds of frames settled before, built again from their frozen
 /// selections ([`Settled::selected`]) in their order by `drawer` — their
 /// tiles on every core — and each `read` on the rayon pool while the next
@@ -200,8 +203,7 @@ where
     R: Fn(u32, &Arc<Ground>) -> T + Sync,
 {
     let read = &read;
-    let out: Mutex<Vec<(usize, (T, Duration, Duration))>> =
-        Mutex::new(Vec::with_capacity(frames.len()));
+    let out: Mutex<Vec<(usize, Timed<T>)>> = Mutex::new(Vec::with_capacity(frames.len()));
     let out_ref = &out;
     rayon::in_place_scope(|reads| {
         for (index, (number, selected)) in frames.iter().enumerate() {
