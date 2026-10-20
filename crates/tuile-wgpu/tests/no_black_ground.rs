@@ -23,16 +23,15 @@
 //! *is* expected: a test that silently skips for a year is a test that does not
 //! exist.
 
-use std::collections::VecDeque;
-use std::task::{Context, Poll};
+mod support;
 
 use glam::{DVec3, Mat4, Vec3};
 
-use tuile_core::content::{DecodedTileContent, TileContent};
+use support::{exact, fallback, gpu, mesh, select, Scripted};
+use tuile_core::budget::FrameDeadline;
+use tuile_core::content::DecodedTileContent;
 use tuile_core::geo::{geodetic_to_ecef, Geodetic};
-use tuile_core::protocol::{ClientMessage, GeometryStream, ServerMessage, StreamError};
 use tuile_core::source::TileId;
-use tuile_core::traversal::TraversalStats;
 use tuile_terrain::{fill_content, GeographicTilingScheme, TileCoord};
 use tuile_wgpu::{
     ContentPump, GpuContext, TileRenderer, ViewUniform, DEPTH_FORMAT, SAMPLES, TEXTURE_FORMAT,
@@ -41,44 +40,6 @@ use tuile_wgpu::{
 /// Frame size. Small enough to read back in a test, large enough that a missing
 /// tile is thousands of pixels rather than a rounding error.
 const SIZE: u32 = 256;
-
-/// A GPU, or a stated reason there is none.
-///
-/// `TUILE_REQUIRE_GPU=1` turns the skip into a failure. Without that escape a
-/// headless CI would report success for a test it never ran, which is worse
-/// than not having the test.
-fn gpu() -> Option<GpuContext> {
-    match pollster::block_on(GpuContext::headless()) {
-        Ok(gpu) => Some(gpu),
-        Err(e) => {
-            assert!(
-                std::env::var("TUILE_REQUIRE_GPU").is_err(),
-                "TUILE_REQUIRE_GPU is set and there is no usable adapter: {e}"
-            );
-            eprintln!("skipping GPU test: no usable adapter ({e})");
-            None
-        }
-    }
-}
-
-/// A stream that hands the pump a scripted list of messages.
-///
-/// `Pending` once drained, which is exactly what a live server looks like
-/// between arrivals, so the pump takes the same path it does in a session.
-struct Scripted(VecDeque<ServerMessage>);
-
-impl GeometryStream for Scripted {
-    fn send(&self, _msg: ClientMessage) -> Result<(), StreamError> {
-        Ok(())
-    }
-
-    fn poll_message(&mut self, _cx: &mut Context<'_>) -> Poll<Option<ServerMessage>> {
-        match self.0.pop_front() {
-            Some(msg) => Poll::Ready(Some(msg)),
-            None => Poll::Pending,
-        }
-    }
-}
 
 fn content_for(tile: TileId) -> DecodedTileContent {
     let (z, x, y) = tile.terrain_coord();
@@ -177,7 +138,7 @@ fn black_fraction_in_the_middle(gpu: &GpuContext, pump: &mut ContentPump, eye: D
         },
     );
 
-    let (drawn, _) = pump.resolve(&gpu.queue);
+    let (drawn, _) = pump.resolve(gpu);
 
     let mut encoder = gpu
         .device
@@ -279,11 +240,11 @@ fn black_fraction_in_the_middle(gpu: &GpuContext, pump: &mut ContentPump, eye: D
 
 /// **Ground the camera is looking at is never left black.**
 ///
-/// A selection of two sibling tiles, only one of which has arrived, plus their
-/// grandparent. The consumer must draw the grandparent so the sibling that has
-/// not arrived is still covered — and it must do so *even though* the
-/// grandparent also spans the sibling that did arrive, which overlaps and
-/// shimmers.
+/// Two sibling tiles wanted, only one of which has arrived, and their
+/// grandparent held. The budget draws the one that arrived as itself and the
+/// grandparent for the other, under the fallback pass — even though the
+/// grandparent also spans the sibling that did arrive. The pump must draw
+/// both, the ancestor never winning a pixel from the surface that owns it.
 ///
 /// That trade is the point. Two attempts to remove the overlap — stop climbing
 /// to ancestors; refuse only the ancestors that overlap — each passed every
@@ -297,32 +258,19 @@ fn ground_under_the_camera_is_never_black() {
     let neighbour = TileId::from_terrain(3, 5, 4);
     let grandparent = TileId::from_terrain(1, 1, 1);
 
-    let mut stream = Scripted(VecDeque::from([
-        ServerMessage::Select {
-            tiles: selected(&[here, neighbour]),
-            ancestry: tree_shape(&[here, neighbour]),
-            stats: TraversalStats::default(),
-            generation: 0,
-        },
-        ServerMessage::Content {
-            tile: here,
-            ancestry: ancestry(here),
-            content: TileContent::Decoded(content_for(here)),
-        },
-        // The grandparent is resident; the neighbour has not arrived and is the
+    let mut stream = Scripted::new([
+        mesh(here, 1, content_for(here)),
+        // The grandparent is held; the neighbour has not arrived and is the
         // ground that must not go black.
-        ServerMessage::Content {
-            tile: grandparent,
-            ancestry: ancestry(grandparent),
-            content: TileContent::Decoded(content_for(grandparent)),
-        },
-    ]));
+        mesh(grandparent, 2, content_for(grandparent)),
+        select(vec![exact(here), fallback(grandparent, &[neighbour])], 1),
+    ]);
 
     // High above the middle of the pair, looking straight down, so the frame is
     // ground from edge to edge.
     let eye = centre_of(grandparent) * 1.25;
     let mut pump = ContentPump::new(eye);
-    pump.pump(&mut stream, &gpu, 16);
+    pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
 
     let black = black_fraction_in_the_middle(&gpu, &mut pump, eye);
     assert!(
@@ -333,36 +281,29 @@ fn ground_under_the_camera_is_never_black() {
     );
 }
 
-/// The selection, as the server sends it.
-fn selected(tiles: &[TileId]) -> Vec<(TileId, f64)> {
-    tiles.iter().map(|t| (*t, 0.0)).collect()
-}
+/// **A fallback is drawn, not refused**: without it, the same frame is
+/// black where the neighbour is — the measurement the test above stands on,
+/// so that it cannot pass for the wrong reason.
+#[test]
+fn without_the_fallback_the_neighbour_is_black() {
+    let Some(gpu) = gpu() else { return };
 
-/// The shape of the tree around a selection: every tile named, **and every
-/// ancestor of one**, up to the root.
-///
-/// The closure, not one link per tile — a walk climbs *through* tiles it holds
-/// nothing for, so a chain that stops after one step reports the ground as lost.
-/// See `tuile_core::protocol::ServerMessage::Select`.
-fn tree_shape(tiles: &[TileId]) -> Vec<(TileId, tuile_core::protocol::Ancestry)> {
-    let mut out = Vec::new();
-    for tile in tiles {
-        let mut cur = Some(*tile);
-        while let Some(id) = cur {
-            let (z, x, y) = id.terrain_coord();
-            let parent = (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2));
-            out.push((id, tuile_core::protocol::Ancestry { level: z, parent }));
-            cur = parent;
-        }
-    }
-    out
-}
+    let here = TileId::from_terrain(3, 4, 4);
+    let grandparent = TileId::from_terrain(1, 1, 1);
+    let mut stream = Scripted::new([
+        mesh(here, 1, content_for(here)),
+        mesh(grandparent, 2, content_for(grandparent)),
+        select(vec![exact(here)], 1),
+    ]);
+    let eye = centre_of(grandparent) * 1.25;
+    let mut pump = ContentPump::new(eye);
+    pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
 
-/// The terrain ancestry of a tile, as the server states it on the wire.
-fn ancestry(tile: TileId) -> tuile_core::protocol::Ancestry {
-    let (z, x, y) = tile.terrain_coord();
-    tuile_core::protocol::Ancestry {
-        level: z,
-        parent: (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2)),
-    }
+    let black = black_fraction_in_the_middle(&gpu, &mut pump, eye);
+    assert!(
+        black > 0.05,
+        "only {:.1}% black with the neighbour's ground drawn by nothing — the \
+         frame does not see what it is meant to",
+        black * 100.0
+    );
 }

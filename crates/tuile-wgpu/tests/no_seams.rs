@@ -32,16 +32,15 @@
 //! `TUILE_REQUIRE_GPU=1` to turn that skip into a failure, which is what CI
 //! should do wherever a GPU is expected.
 
-use std::collections::VecDeque;
-use std::task::{Context, Poll};
+mod support;
 
 use glam::{DVec3, Mat4, Vec3};
 
-use tuile_core::content::{DecodedTileContent, TileContent};
+use support::{exacts, gpu, mesh, Scripted};
+use tuile_core::budget::FrameDeadline;
+use tuile_core::content::DecodedTileContent;
 use tuile_core::geo::{geodetic_to_ecef, Geodetic};
-use tuile_core::protocol::{ClientMessage, GeometryStream, ServerMessage, StreamError};
 use tuile_core::source::TileId;
-use tuile_core::traversal::TraversalStats;
 use tuile_terrain::{
     skirt_height, to_decoded, to_ground, upsample, GeoRect, GeographicTilingScheme, Header,
     QuantizedMesh, TileCoord,
@@ -54,37 +53,6 @@ use tuile_wgpu::{
 /// Frame size. Larger than the other GPU tests: a seam is one or two pixels
 /// wide, and at 256 the whole defect can hide between two samples.
 const SIZE: u32 = 512;
-
-/// A GPU, or a stated reason there is none.
-fn gpu() -> Option<GpuContext> {
-    match pollster::block_on(GpuContext::headless()) {
-        Ok(gpu) => Some(gpu),
-        Err(e) => {
-            assert!(
-                std::env::var("TUILE_REQUIRE_GPU").is_err(),
-                "TUILE_REQUIRE_GPU is set and there is no usable adapter: {e}"
-            );
-            eprintln!("skipping GPU test: no usable adapter ({e})");
-            None
-        }
-    }
-}
-
-/// A stream that hands the pump a scripted list of messages.
-struct Scripted(VecDeque<ServerMessage>);
-
-impl GeometryStream for Scripted {
-    fn send(&self, _msg: ClientMessage) -> Result<(), StreamError> {
-        Ok(())
-    }
-
-    fn poll_message(&mut self, _cx: &mut Context<'_>) -> Poll<Option<ServerMessage>> {
-        match self.0.pop_front() {
-            Some(msg) => Poll::Ready(Some(msg)),
-            None => Poll::Pending,
-        }
-    }
-}
 
 fn rect_of(tile: TileId) -> GeoRect {
     let (z, x, y) = tile.terrain_coord();
@@ -303,7 +271,7 @@ fn render_and_count(
         },
     );
 
-    let (drawn, _) = pump.resolve(&gpu.queue);
+    let (drawn, _) = pump.resolve(gpu);
 
     let mut encoder = gpu
         .device
@@ -411,24 +379,11 @@ fn render_and_count(
 fn magenta_at_a_lod_boundary(gpu: &GpuContext, skirts: bool) -> u64 {
     let coarse = TileId::from_terrain(4, 17, 10);
     let fine = TileId::from_terrain(5, 33, 21);
-    let mut stream = Scripted(VecDeque::from([
-        ServerMessage::Select {
-            tiles: selected(&[coarse, fine]),
-            ancestry: tree_shape(&[coarse, fine]),
-            stats: TraversalStats::default(),
-            generation: 0,
-        },
-        ServerMessage::Content {
-            tile: coarse,
-            ancestry: ancestry(coarse),
-            content: TileContent::Decoded(textured(coarse, 2, skirts)),
-        },
-        ServerMessage::Content {
-            tile: fine,
-            ancestry: ancestry(fine),
-            content: TileContent::Decoded(textured(fine, 8, skirts)),
-        },
-    ]));
+    let mut stream = Scripted::new([
+        support::select(exacts(&[coarse, fine]), 1),
+        mesh(coarse, 1, textured(coarse, 2, skirts)),
+        mesh(fine, 1, textured(fine, 8, skirts)),
+    ]);
     let seam = on_the_ground(&rect_of(fine), 1.0, 0.5);
     let up = seam.normalize();
     let east = DVec3::Z.cross(up).normalize();
@@ -436,7 +391,7 @@ fn magenta_at_a_lod_boundary(gpu: &GpuContext, skirts: bool) -> u64 {
     let mut pump = ContentPump::new(eye);
     // Skirts are what is asked about: the tiles are not stitched.
     pump.set_stitching(None);
-    pump.pump(&mut stream, gpu, 16);
+    pump.pump(&mut stream, gpu, FrameDeadline::UNBOUNDED);
     magenta_in_the_coverage_view(gpu, &mut pump, eye, seam)
 }
 
@@ -484,24 +439,11 @@ fn holes_at_a_lod_boundary(gpu: &GpuContext, skirts: bool, stitched: bool) -> u6
     let coarse = TileId::from_terrain(4, 17, 10);
     let fine = TileId::from_terrain(5, 33, 21);
 
-    let mut stream = Scripted(VecDeque::from([
-        ServerMessage::Select {
-            tiles: selected(&[coarse, fine]),
-            ancestry: tree_shape(&[coarse, fine]),
-            stats: TraversalStats::default(),
-            generation: 0,
-        },
-        ServerMessage::Content {
-            tile: coarse,
-            ancestry: ancestry(coarse),
-            content: TileContent::Decoded(content_for(coarse, 2, skirts)),
-        },
-        ServerMessage::Content {
-            tile: fine,
-            ancestry: ancestry(fine),
-            content: TileContent::Decoded(content_for(fine, 8, skirts)),
-        },
-    ]));
+    let mut stream = Scripted::new([
+        support::select(exacts(&[coarse, fine]), 1),
+        mesh(coarse, 1, content_for(coarse, 2, skirts)),
+        mesh(fine, 1, content_for(fine, 8, skirts)),
+    ]);
 
     // The middle of the edge the two actually share — which is the middle of
     // the *fine* tile's east edge, not of the coarse tile's west one. Those
@@ -525,7 +467,7 @@ fn holes_at_a_lod_boundary(gpu: &GpuContext, skirts: bool, stitched: bool) -> u6
     let mut pump = ContentPump::new(eye);
     // At once: one frame is drawn, and it is the one looked at.
     pump.set_stitching(stitched.then_some(0));
-    pump.pump(&mut stream, gpu, 16);
+    pump.pump(&mut stream, gpu, FrameDeadline::UNBOUNDED);
     holes_through_the_ground(gpu, &mut pump, eye, seam)
 }
 
@@ -567,31 +509,18 @@ fn uncovered_fragments_along_a_shared_edge(gpu: &GpuContext) -> u64 {
         c
     };
 
-    let mut stream = Scripted(VecDeque::from([
-        ServerMessage::Select {
-            tiles: selected(&[west, east]),
-            ancestry: tree_shape(&[west, east]),
-            stats: TraversalStats::default(),
-            generation: 0,
-        },
-        ServerMessage::Content {
-            tile: west,
-            ancestry: ancestry(west),
-            content: TileContent::Decoded(content(west)),
-        },
-        ServerMessage::Content {
-            tile: east,
-            ancestry: ancestry(east),
-            content: TileContent::Decoded(content(east)),
-        },
-    ]));
+    let mut stream = Scripted::new([
+        support::select(exacts(&[west, east]), 1),
+        mesh(west, 1, content(west)),
+        mesh(east, 1, content(east)),
+    ]);
 
     // Straight down on the middle of the edge they share, high enough that the
     // pair fills the frame from side to side.
     let seam = on_the_ground(&rect_of(east), 0.0, 0.5);
     let eye = seam + seam.normalize() * 120_000.0;
     let mut pump = ContentPump::new(eye);
-    pump.pump(&mut stream, gpu, 16);
+    pump.pump(&mut stream, gpu, FrameDeadline::UNBOUNDED);
     magenta_in_the_coverage_view(gpu, &mut pump, eye, seam)
 }
 
@@ -688,20 +617,11 @@ fn holes_between_cut_tiles(gpu: &GpuContext, as_built: bool, stitched: bool) -> 
     }
 
     let ids: Vec<TileId> = tiles.iter().map(|t| t.0).collect();
-    let mut messages = VecDeque::from([ServerMessage::Select {
-        tiles: selected(&ids),
-        ancestry: tree_shape(&ids),
-        stats: TraversalStats::default(),
-        generation: 0,
-    }]);
+    let mut messages = Vec::from([support::select(exacts(&ids), 1)]);
     for (tile, content) in tiles {
-        messages.push_back(ServerMessage::Content {
-            tile,
-            ancestry: ancestry(tile),
-            content: TileContent::Decoded(content),
-        });
+        messages.push(mesh(tile, 1, content));
     }
-    let mut stream = Scripted(messages);
+    let mut stream = Scripted::new(messages);
 
     // Over the lower side, obliquely: a step is looked into from there.
     let seam = on_the_ground(&scheme.tile_rect(east), 0.0, 1.0 / 6.0);
@@ -712,7 +632,7 @@ fn holes_between_cut_tiles(gpu: &GpuContext, as_built: bool, stitched: bool) -> 
 
     let mut pump = ContentPump::new(eye);
     pump.set_stitching(stitched.then_some(0));
-    pump.pump(&mut stream, gpu, 32);
+    pump.pump(&mut stream, gpu, FrameDeadline::UNBOUNDED);
     holes_through_the_ground(gpu, &mut pump, eye, seam)
 }
 
@@ -791,12 +711,7 @@ fn an_edge_slides_to_its_new_neighbour_and_never_gaps() {
     let children: Vec<TileId> = (0..4)
         .map(|k| TileId::from_terrain(5, 34 + k % 2, 20 + k / 2))
         .collect();
-    let select = |tiles: &[TileId]| ServerMessage::Select {
-        tiles: selected(tiles),
-        ancestry: tree_shape(tiles),
-        stats: TraversalStats::default(),
-        generation: 0,
-    };
+    let select = |tiles: &[TileId]| support::select(exacts(tiles), 1);
     let seam = on_the_ground(&rect_of(fine), 1.0, 0.5);
     let up = seam.normalize();
     let east = DVec3::Z.cross(up).normalize();
@@ -806,20 +721,16 @@ fn an_edge_slides_to_its_new_neighbour_and_never_gaps() {
 
     // Holes in the picture: before the change, then frame by frame after it.
     let holes = |skirts: bool| -> Vec<u64> {
-        let content = |tile: TileId, steps: usize| ServerMessage::Content {
-            tile,
-            ancestry: ancestry(tile),
-            content: TileContent::Decoded(content_for(tile, steps, skirts)),
-        };
-        let mut messages = VecDeque::from([
+        let content = |tile: TileId, steps: usize| mesh(tile, 1, content_for(tile, steps, skirts));
+        let mut messages = Vec::from([
             select(&[coarse, fine]),
             content(coarse, 2),
             content(fine, 8),
         ]);
         messages.extend(children.iter().map(|child| content(*child, 8)));
-        let mut stream = Scripted(messages);
+        let mut stream = Scripted::new(messages);
         let mut pump = ContentPump::new(eye);
-        pump.pump(&mut stream, &gpu, 16);
+        pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
         assert_eq!(
             pump.sliding(),
             0,
@@ -829,8 +740,8 @@ fn an_edge_slides_to_its_new_neighbour_and_never_gaps() {
 
         let mut now: Vec<TileId> = vec![fine];
         now.extend(&children);
-        stream.0.push_back(select(&now));
-        pump.pump(&mut stream, &gpu, 16);
+        stream.inbox.push_back(select(&now));
+        pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
         assert_eq!(
             pump.sliding(),
             1,
@@ -838,7 +749,7 @@ fn an_edge_slides_to_its_new_neighbour_and_never_gaps() {
         );
         for _ in 0..tuile_wgpu::STITCH_SLIDE_FRAMES + 2 {
             seen.push(holes_through_the_ground(&gpu, &mut pump, eye, seam));
-            pump.pump(&mut stream, &gpu, 16);
+            pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
         }
         assert_eq!(pump.sliding(), 0, "the slide ends");
         seen
@@ -864,38 +775,4 @@ fn an_edge_slides_to_its_new_neighbour_and_never_gaps() {
         skirted.iter().all(|n| *n == 0),
         "a frame shows the void: {skirted:?}"
     );
-}
-
-/// The selection, as the server sends it.
-fn selected(tiles: &[TileId]) -> Vec<(TileId, f64)> {
-    tiles.iter().map(|t| (*t, 0.0)).collect()
-}
-
-/// The shape of the tree around a selection: every tile named, **and every
-/// ancestor of one**, up to the root.
-///
-/// The closure, not one link per tile — a walk climbs *through* tiles it holds
-/// nothing for, so a chain that stops after one step reports the ground as lost.
-/// See `tuile_core::protocol::ServerMessage::Select`.
-fn tree_shape(tiles: &[TileId]) -> Vec<(TileId, tuile_core::protocol::Ancestry)> {
-    let mut out = Vec::new();
-    for tile in tiles {
-        let mut cur = Some(*tile);
-        while let Some(id) = cur {
-            let (z, x, y) = id.terrain_coord();
-            let parent = (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2));
-            out.push((id, tuile_core::protocol::Ancestry { level: z, parent }));
-            cur = parent;
-        }
-    }
-    out
-}
-
-/// The terrain ancestry of a tile, as the server states it on the wire.
-fn ancestry(tile: TileId) -> tuile_core::protocol::Ancestry {
-    let (z, x, y) = tile.terrain_coord();
-    tuile_core::protocol::Ancestry {
-        level: z,
-        parent: (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2)),
-    }
 }
