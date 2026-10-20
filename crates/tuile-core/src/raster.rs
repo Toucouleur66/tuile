@@ -1115,7 +1115,10 @@ pub fn imagery_layer_table(layers: &[ImageryLayer], slots: u32) -> Vec<[f32; 4]>
 
 /// [`imagery_layer_table`], from placements alone: what a renderer that keeps
 /// the textures and drops the pixels binds.
-pub fn placement_table(placements: impl IntoIterator<Item = Placement>, slots: u32) -> Vec<[f32; 4]> {
+pub fn placement_table(
+    placements: impl IntoIterator<Item = Placement>,
+    slots: u32,
+) -> Vec<[f32; 4]> {
     let slots = slots as usize;
     let mut table = vec![EMPTY_COVERAGE; 2 * slots];
     for (slot, p) in placements.into_iter().take(slots).enumerate() {

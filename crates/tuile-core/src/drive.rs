@@ -19,9 +19,7 @@
 
 use crate::budget::{DrawSet, ResourceId, Role};
 use crate::content::{DecodedTileContent, DrapeContent};
-use crate::protocol::{
-    ClientMessage, GeometryStream, ResourceContent, ServerMessage, StreamError,
-};
+use crate::protocol::{ClientMessage, GeometryStream, ResourceContent, ServerMessage, StreamError};
 use crate::source::TileId;
 use crate::traversal::{TraversalStats, ViewState};
 use std::collections::{BTreeMap, HashMap, HashSet};

@@ -19,9 +19,9 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use glam::{dvec2, dvec3};
+use tuile_core::budget::{BudgetConfig, Bytes};
 use tuile_core::fetch::FsFetcher;
 use tuile_core::metrics::metrics;
-use tuile_core::budget::{BudgetConfig, Bytes};
 use tuile_core::{
     in_process, ClientMessage, Config, GeometryStream, ResourceContent, ServerMessage, Tileset,
     ViewState,

@@ -351,9 +351,7 @@ fn default_clock() -> Clock {
     #[cfg(target_arch = "wasm32")]
     {
         let ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        Arc::new(move || {
-            Micros(ticks.fetch_add(16_000, std::sync::atomic::Ordering::Relaxed))
-        })
+        Arc::new(move || Micros(ticks.fetch_add(16_000, std::sync::atomic::Ordering::Relaxed)))
     }
 }
 
@@ -1052,9 +1050,8 @@ impl State {
         if let Some(reach) = reach {
             need = need.with_rect(reach.rect);
             // No view: the floor, wanted at its coarsest.
-            let footprint = footprint.or_else(|| {
-                TexelFootprint::new(1.0e9, 1.0, 1.0, reach.texel_l0_m, 1.0).ok()
-            });
+            let footprint = footprint
+                .or_else(|| TexelFootprint::new(1.0e9, 1.0, 1.0, reach.texel_l0_m, 1.0).ok());
             if let Some(footprint) = footprint {
                 need = need.with_imagery(ImageryNeed {
                     footprint,
@@ -1167,8 +1164,7 @@ impl State {
             for r in resources {
                 total += 1;
                 let drawable = self.budget.resource(r).is_some_and(|v| {
-                    matches!(v.state, crate::budget::ResourceState::Drawable)
-                        || v.gpu > Bytes::ZERO
+                    matches!(v.state, crate::budget::ResourceState::Drawable) || v.gpu > Bytes::ZERO
                 });
                 if !drawable {
                     outstanding += 1;
@@ -1395,11 +1391,17 @@ impl State {
         // Deliveries, from the decoded tier, in the plan's priority order.
         for (r, g) in &d.deliver {
             let Some((held, content)) = self.decoded.get(r) else {
-                tracing::error!(?r, "the budget delivered a resource the session does not hold");
+                tracing::error!(
+                    ?r,
+                    "the budget delivered a resource the session does not hold"
+                );
                 continue;
             };
             if held != g {
-                tracing::error!(?r, "the budget delivered another generation than the one held");
+                tracing::error!(
+                    ?r,
+                    "the budget delivered another generation than the one held"
+                );
                 continue;
             }
             let class = match r {
@@ -1476,9 +1478,7 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::budget::{
-        Bytes, DrawSet, GeoRect, LayerId, LayerReach, Policy, Role,
-    };
+    use crate::budget::{Bytes, DrawSet, GeoRect, LayerId, LayerReach, Policy, Role};
     use crate::fetch::FsFetcher;
     use crate::protocol::GeometryStream;
     use crate::source::DrapeReach;
@@ -1612,9 +1612,10 @@ mod tests {
                     }
                     ServerMessage::Evict { resources } => {
                         for r in resources {
-                            let worn = self.draw.items.iter().any(|i| {
-                                i.mesh == r || i.drapes.iter().any(|d| d.resource == r)
-                            });
+                            let worn =
+                                self.draw.items.iter().any(|i| {
+                                    i.mesh == r || i.drapes.iter().any(|d| d.resource == r)
+                                });
                             assert!(!worn, "{r:?} evicted while the draw set still uses it");
                             self.held.remove(&r);
                             self.evicted.push(r);
@@ -1714,7 +1715,10 @@ mod tests {
         CHECKED.with(|c| c.set((0, 0)));
 
         look(&stream, near_view(), 0);
-        assert!(settle(&mut server, &mut stream, &mut consumer), "first view settles");
+        assert!(
+            settle(&mut server, &mut stream, &mut consumer),
+            "first view settles"
+        );
         let (first, descents) = CHECKED.with(|c| c.get());
         assert!(consumer.contents.len() >= 3, "nothing arrived to answer");
         assert!(first >= 2, "{first} passes: the arrivals were not answered");
@@ -1728,7 +1732,10 @@ mod tests {
             std::f64::consts::FRAC_PI_3,
         );
         look(&stream, farther, 1);
-        assert!(settle(&mut server, &mut stream, &mut consumer), "second view settles");
+        assert!(
+            settle(&mut server, &mut stream, &mut consumer),
+            "second view settles"
+        );
         let (total, descents) = CHECKED.with(|c| c.get());
         assert!(total > first, "the second camera was never traversed");
         assert_eq!(descents, 2, "{total} passes under two cameras");
@@ -1886,18 +1893,17 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let tileset = deep_tileset(dir.path());
         let leaves = leaves_of(&tileset);
-        let (mut stream, server) = in_process(
-            tileset,
-            Arc::new(FsFetcher),
-            Config::default(),
-            roomy(),
-        )
-        .expect("budget");
+        let (mut stream, server) =
+            in_process(tileset, Arc::new(FsFetcher), Config::default(), roomy()).expect("budget");
         let mut server = Box::pin(server.run());
         let mut consumer = Consumer::default();
         look(&stream, near_view(), 1);
         assert!(settle(&mut server, &mut stream, &mut consumer));
-        assert_eq!(consumer.exact(), leaves, "the settled frame draws the leaves");
+        assert_eq!(
+            consumer.exact(),
+            leaves,
+            "the settled frame draws the leaves"
+        );
         assert!(consumer.converged, "the budget says the view converged");
         assert!(consumer.errors.is_empty(), "{:?}", consumer.errors);
     }
@@ -1910,13 +1916,8 @@ mod tests {
     fn nothing_is_drawn_before_its_ack() {
         let dir = tempfile::tempdir().expect("tempdir");
         let tileset = deep_tileset(dir.path());
-        let (mut stream, server) = in_process(
-            tileset,
-            Arc::new(FsFetcher),
-            Config::default(),
-            roomy(),
-        )
-        .expect("budget");
+        let (mut stream, server) =
+            in_process(tileset, Arc::new(FsFetcher), Config::default(), roomy()).expect("budget");
         let mut server = Box::pin(server.run());
         let mut consumer = Consumer {
             hold_back: true,
@@ -1933,7 +1934,10 @@ mod tests {
         consumer.hold_back = false;
         // An ack is a client message: the next step answers it.
         assert!(settle(&mut server, &mut stream, &mut consumer));
-        assert!(!consumer.draw.items.is_empty(), "the acks were never answered");
+        assert!(
+            !consumer.draw.items.is_empty(),
+            "the acks were never answered"
+        );
     }
 
     /// **A tile the source cannot serve is retried, and its ground stays
@@ -1948,13 +1952,8 @@ mod tests {
         let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
         let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
         let root = tileset.root();
-        let (mut stream, server) = in_process(
-            tileset,
-            Arc::new(FsFetcher),
-            Config::default(),
-            roomy(),
-        )
-        .expect("budget");
+        let (mut stream, server) =
+            in_process(tileset, Arc::new(FsFetcher), Config::default(), roomy()).expect("budget");
         let mut server = Box::pin(server.run());
         let mut consumer = Consumer::default();
         look(&stream, near_view(), 1);
@@ -1964,7 +1963,11 @@ mod tests {
             "the failure was not reported with its resource"
         );
         assert!(
-            consumer.draw.items.iter().any(|i| i.mesh == ResourceId::Mesh(root)),
+            consumer
+                .draw
+                .items
+                .iter()
+                .any(|i| i.mesh == ResourceId::Mesh(root)),
             "the parent no longer covers the missing child's ground: {:?}",
             consumer.draw.items
         );
@@ -2003,9 +2006,15 @@ mod tests {
             consumer.take(&mut stream, &mut cx);
         }
         consumer.take(&mut stream, &mut cx);
-        assert!(stopped, "the batch session kept running after a failed load");
         assert!(
-            consumer.errors.iter().any(|(r, m)| r.is_some() && !m.is_empty()),
+            stopped,
+            "the batch session kept running after a failed load"
+        );
+        assert!(
+            consumer
+                .errors
+                .iter()
+                .any(|(r, m)| r.is_some() && !m.is_empty()),
             "the session stopped without saying which resource: {:?}",
             consumer.errors
         );
@@ -2169,7 +2178,10 @@ mod tests {
         look(&stream, near_view(), 1);
         assert!(settle(&mut server, &mut stream, &mut consumer));
         assert!(meshes.load(Ordering::SeqCst) > 0);
-        assert!(!drapes.lock().expect("drapes").is_empty(), "no drape was loaded");
+        assert!(
+            !drapes.lock().expect("drapes").is_empty(),
+            "no drape was loaded"
+        );
         assert!(!consumer.draw.items.is_empty());
         for item in &consumer.draw.items {
             assert!(
@@ -2203,7 +2215,11 @@ mod tests {
             let _ = server.as_mut().poll(&mut cx);
             consumer.take(&mut stream, &mut cx);
             for item in &consumer.draw.items {
-                assert!(!item.drapes.is_empty(), "{:?} drawn bare mid-change", item.mesh);
+                assert!(
+                    !item.drapes.is_empty(),
+                    "{:?} drawn bare mid-change",
+                    item.mesh
+                );
             }
         }
         assert!(
@@ -2257,7 +2273,10 @@ mod tests {
         };
         let (pauses, delivered) = run(2);
         assert!(pauses > 0, "the host never had a turn");
-        assert!(delivered >= 7, "the session stopped after a pause: {delivered}");
+        assert!(
+            delivered >= 7,
+            "the session stopped after a pause: {delivered}"
+        );
         assert_eq!(run(1000).0, 0, "paused before its count was reached");
     }
 
@@ -2340,7 +2359,11 @@ mod tests {
         let mut consumer = Consumer::default();
         look(&stream, near_view(), 1);
         settle(&mut server, &mut stream, &mut consumer);
-        assert_eq!(gate.waiting.load(Ordering::SeqCst), 4, "the four leaves wait");
+        assert_eq!(
+            gate.waiting.load(Ordering::SeqCst),
+            4,
+            "the four leaves wait"
+        );
         let selects = consumer.selects;
         gate.open();
         let waker = futures_util::task::noop_waker();
@@ -2433,13 +2456,16 @@ mod tests {
         let mut loads = Loads::new(&Spawn::Tokio(runtime.handle().clone()));
         let mut start = |tile: TileId| {
             let (handle, registration) = AbortHandle::new_pair();
-            let fut: BoxLoadFut =
-                Box::pin(async move {
+            let fut: BoxLoadFut = Box::pin(async move {
+                (
                     (
-                        (ResourceId::Mesh(tile), Generation(1), Ok(Fetched::Mesh(Loaded::Expanded))),
-                        crate::metrics::stamp(),
-                    )
-                });
+                        ResourceId::Mesh(tile),
+                        Generation(1),
+                        Ok(Fetched::Mesh(Loaded::Expanded)),
+                    ),
+                    crate::metrics::stamp(),
+                )
+            });
             loads.push(Abortable::new(fut, registration), &handle);
             handle
         };
@@ -2553,13 +2579,16 @@ mod tests {
         assert!(default_breather(&loads).is_some());
         for tile in [TileId(1), TileId(2)] {
             let (handle, registration) = AbortHandle::new_pair();
-            let fut: BoxLoadFut =
-                Box::pin(async move {
+            let fut: BoxLoadFut = Box::pin(async move {
+                (
                     (
-                        (ResourceId::Mesh(tile), Generation(1), Ok(Fetched::Mesh(Loaded::Expanded))),
-                        crate::metrics::stamp(),
-                    )
-                });
+                        ResourceId::Mesh(tile),
+                        Generation(1),
+                        Ok(Fetched::Mesh(Loaded::Expanded)),
+                    ),
+                    crate::metrics::stamp(),
+                )
+            });
             loads.push(Abortable::new(fut, registration), &handle);
         }
         let mut landed = Vec::new();
@@ -2600,5 +2629,4 @@ mod tests {
             std::f64::consts::FRAC_PI_3,
         )
     }
-
 }

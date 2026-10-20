@@ -97,10 +97,7 @@ pub(super) struct PressureWatch {
 
 impl PressureWatch {
     /// The pressure to act on, if `count` is a signal not acted on yet.
-    pub(super) fn fresh(
-        &mut self,
-        (count, pressure): (u64, Pressure),
-    ) -> Option<Pressure> {
+    pub(super) fn fresh(&mut self, (count, pressure): (u64, Pressure)) -> Option<Pressure> {
         if count == std::mem::replace(&mut self.seen, count) {
             return None;
         }
@@ -469,8 +466,12 @@ mod tests {
     #[test]
     fn the_background_outranks_a_warning() {
         let mut l = phone();
-        assert!(l.background().contains(&Step::Pressure(Pressure::Background)));
-        assert!(l.memory_warning().contains(&Step::Pressure(Pressure::Warning)));
+        assert!(l
+            .background()
+            .contains(&Step::Pressure(Pressure::Background)));
+        assert!(l
+            .memory_warning()
+            .contains(&Step::Pressure(Pressure::Warning)));
         assert!(l.memory_pressure(Pressure::Critical).is_empty());
         assert!(l.calm().is_empty(), "calm while away");
     }
