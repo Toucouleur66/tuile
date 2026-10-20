@@ -867,6 +867,25 @@ impl Budget {
                 out.insert(r, w);
             }
         };
+        // Batch: a frame's drapes are those of what it draws. Batch never
+        // cancels a load it started (I13), so a drape started for a tile the
+        // selection is still settling past — its mesh not in, the tile then
+        // replaced by its children — would be read whatever the frame draws,
+        // and what a bake reads would follow the order its meshes came in.
+        // So no drape but the floor's own is wanted until every mesh the
+        // frame draws and waits on is loaded: the selection it then wears
+        // drapes for is the one the frame draws. A floor tile is no
+        // exception past its own drape: drawn while the selection settles,
+        // the finer drape it asks for is as much a pass's as any other's.
+        let meshes_in = !batch
+            || tiles
+                .iter()
+                .filter(|(_, tn)| matches!(tn.membership, Membership::Drawn | Membership::Blocker))
+                .all(|(t, _)| {
+                    self.entries
+                        .get(&ResourceId::Mesh(*t))
+                        .is_some_and(|e| e.gpu.is_some() || e.cpu.is_some())
+                });
         for (t, tn) in tiles {
             let floor = self.is_floor(tn.need.level);
             let mesh_drawable = self.drawable(ResourceId::Mesh(*t));
@@ -903,6 +922,9 @@ impl Budget {
                         },
                     );
                 }
+            }
+            if !meshes_in {
+                continue;
             }
             for ((_, layer), &n) in drapes.range(tile_layers(*t)) {
                 let drape = ResourceId::drape(*t, *layer, n);
