@@ -39,8 +39,8 @@ use tuile_core::offload::{self, Offload};
 use tuile_core::raster::{self, GeoRect, ImageryCoord, ImageryProvider, RasterError};
 use tuile_core::source::{DrapeReach, LoadError, Loaded, TileId, TileLoader, TileTree};
 use tuile_terrain::{
-    to_ground, Availability, AvailabilityRange, GeographicTilingScheme,
-    LayerJson, TerrainHeights, TerrainSource, TerrainTree, TileCoord,
+    to_ground, Availability, AvailabilityRange, GeographicTilingScheme, LayerJson, TerrainHeights,
+    TerrainSource, TerrainTree, TileCoord,
 };
 
 /// How coarse the guaranteed bottom layer is.
@@ -184,7 +184,6 @@ pub(crate) fn is_opaque_black(tex: &DecodedTexture) -> bool {
         .step_by(step)
         .all(|i| tex.rgba8[i * 4] == 0 && tex.rgba8[i * 4 + 1] == 0 && tex.rgba8[i * 4 + 2] == 0)
 }
-
 
 /// What shows under a mosaic wherever no layer reaches.
 ///
@@ -396,7 +395,11 @@ impl ImageryCache {
 /// `tuile_core::raster::CachedImagery`), which is where the bytes and their
 /// stated lifetimes actually are — this crate composes what the host hands it
 /// and adds no tier of its own.
-#[derive(Debug, Clone)]
+///
+/// Its default is the interactive contract: in particular no deterministic
+/// floor, for a viewer showing blur it did not have to show is a
+/// regression.
+#[derive(Debug, Clone, Default)]
 pub struct GlobeOptions {
     /// When true, terrain only (no imagery) — the geometry debug view.
     pub no_imagery: bool,
@@ -502,22 +505,6 @@ impl HeldDrape {
 impl std::fmt::Debug for HeldDrape {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("HeldDrape(..)")
-    }
-}
-
-impl Default for GlobeOptions {
-    fn default() -> Self {
-        Self {
-            no_imagery: false,
-            max_level: None,
-            imagery_slots: LayerBudget::default(),
-            // Off by default: the interactive contract is the default, and a
-            // viewer showing blur it did not have to show is a regression.
-            deterministic_floor: false,
-            held_drape: None,
-            composed_at: 0,
-            imagery_by_stamp: false,
-        }
     }
 }
 
@@ -988,8 +975,10 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
     /// The provider's level for the budget's imagery level `level` over a
     /// tile at latitude `lat`.
     fn provider_level(&self, scheme: &raster::TilingScheme, level: u32, lat: f64) -> u32 {
-        (i64::from(level) + self.level_offset(scheme, lat))
-            .clamp(i64::from(scheme.minimum_level), i64::from(scheme.maximum_level)) as u32
+        (i64::from(level) + self.level_offset(scheme, lat)).clamp(
+            i64::from(scheme.minimum_level),
+            i64::from(scheme.maximum_level),
+        ) as u32
     }
 
     /// A terrain tile's rectangle, as the imagery's geography.
@@ -1736,7 +1725,6 @@ mod tests {
         }
     }
 
-
     /// The tile `some_ground` is.
     const GROUND: TileCoord = TileCoord {
         level: 8,
@@ -2135,10 +2123,6 @@ mod tests {
             north: r.north - h,
         }
     }
-
-
-
-
 
     #[test]
     fn a_drape_never_asks_for_more_layers_than_a_draw_can_bind() {
