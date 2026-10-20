@@ -2,7 +2,7 @@
 // Copyright (c) lapoule.dev
 
 use glam::{DVec3, Vec3};
-use tuile_atmosphere::{AtmosphereParams, ReferenceIllumination};
+use tuile_atmosphere::{AirTuning, AtmosphereParams, CameraResponse, ReferenceIllumination};
 
 /// How imagery's stored values are read before they are lit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +208,18 @@ pub struct Look {
     /// spread wider, a caster narrower than its penumbra gives a fainter
     /// one, as it does under the sun.
     pub penumbra_scale: f32,
+    /// How the camera meets the light under [`Look::atmosphere`]: its
+    /// auto-exposure's response, its white balance, its meter
+    /// ([`tuile_atmosphere::tuning`]). Not read without one.
+    pub camera: CameraResponse,
+    /// How many times the light of ground of a tenth's reflectance under
+    /// it the air's veil may reach, under [`Look::atmosphere`]: a soft cap.
+    pub veil_bound: f32,
+    /// Steps of the march through the air between the eye and the ground,
+    /// under [`Look::atmosphere`]: below 10 km, and from above it.
+    pub march_steps: [u32; 2],
+    /// The linear luminance where the roll-off of highlights begins.
+    pub highlight_knee: f32,
 }
 
 impl Default for Look {
@@ -231,6 +243,10 @@ impl Default for Look {
             moon_scale: 1.0,
             glare: 1.0,
             penumbra_scale: 1.0,
+            camera: CameraResponse::TODAY,
+            veil_bound: tuile_atmosphere::tuning::DEFAULT_VEIL_BOUND,
+            march_steps: tuile_atmosphere::tuning::DEFAULT_MARCH_STEPS,
+            highlight_knee: tuile_atmosphere::tuning::DEFAULT_HIGHLIGHT_KNEE,
         }
     }
 }
@@ -266,6 +282,31 @@ impl Look {
         }
     }
 
+    /// This look under the tuning values a host read ([`AirTuning`]): the
+    /// camera, the veil's bound, the march and the knee are the tuning's;
+    /// of the reflectance, the exposure, the contrast, the saturation and
+    /// the calibration's lights, those set — the rest stay this look's, so
+    /// that a preset ([`Look::cycles_film`]) keeps its own. An atmosphere
+    /// already drawn becomes the tuning's. A host's flags are applied after
+    /// this, and win.
+    pub fn tuned(self, air: &AirTuning) -> Self {
+        let t = &air.look;
+        Self {
+            camera: air.camera,
+            veil_bound: air.veil_bound,
+            march_steps: air.march_steps,
+            highlight_knee: air.highlight_knee,
+            atmosphere: self.atmosphere.map(|_| air.params),
+            reflectance: t.reflectance.unwrap_or(self.reflectance),
+            exposure_ev: t.exposure_ev.unwrap_or(self.exposure_ev),
+            contrast: t.contrast.unwrap_or(self.contrast),
+            saturation: t.saturation.unwrap_or(self.saturation),
+            sun: t.sun_light.map_or(self.sun, Vec3::from_array),
+            world: t.sky_light.map_or(self.world, Vec3::from_array),
+            ..self
+        }
+    }
+
     /// The linear multiplier the exposure stands for.
     pub fn exposure_scale(&self) -> f32 {
         self.exposure_ev.exp2()
@@ -293,7 +334,7 @@ impl Look {
                 .unwrap_or(self.to_sun),
             sun: Vec3::from_array(lit.sun_rgb),
             world: Vec3::from_array(lit.sky_ambient()),
-            exposure_ev: self.exposure_ev + lit.exposure_offset_ev(),
+            exposure_ev: self.exposure_ev + lit.exposure_offset_ev_under(&self.camera),
             white_balance: self.white_balance * Vec3::from_array(lit.white_balance()),
             haze: match (self.haze, light.air.haze_density) {
                 (Some(haze), Some(density)) => Some(Haze { density, ..haze }),
@@ -465,6 +506,55 @@ mod tests {
         let clear = Look { haze: None, ..look }.lit_by(nowhere);
         assert_eq!(clear.to_sun, look.to_sun);
         assert_eq!(clear.haze, None);
+    }
+
+    #[test]
+    fn a_look_tuned_by_nothing_is_the_look() {
+        let none = AirTuning::default();
+        assert_eq!(Look::default().tuned(&none), Look::default());
+        assert_eq!(Look::cycles_film().tuned(&none), Look::cycles_film());
+        let drawn = Look {
+            atmosphere: Some(AtmosphereParams::default()),
+            ..Look::default()
+        };
+        assert_eq!(drawn.tuned(&none), drawn);
+    }
+
+    #[test]
+    fn a_tuned_look_takes_what_is_set_and_keeps_the_rest() {
+        let air = AirTuning::from_lookup(|k| {
+            match k {
+                "TUILE_AIR_REFLECTANCE" => Some("4"),
+                "TUILE_LOOK_CONTRAST" => Some("1.2"),
+                "TUILE_AIR_EXPOSURE_FOLLOWS" => Some("0.5"),
+                "TUILE_AIR_VEIL_BOUND" => Some("3"),
+                "TUILE_AIR_MARCH_STEPS" => Some("20"),
+                "TUILE_LOOK_HIGHLIGHT_KNEE" => Some("0.7"),
+                "TUILE_AIR_TURBIDITY" => Some("1.4"),
+                _ => None,
+            }
+            .map(String::from)
+        })
+        .expect("in range");
+        let base = Look {
+            atmosphere: Some(AtmosphereParams::default()),
+            ..Look::cycles_film()
+        };
+        let tuned = base.tuned(&air);
+        assert_eq!(tuned.reflectance, 4.0);
+        assert_eq!(tuned.contrast, 1.2);
+        assert_eq!(tuned.exposure_ev, base.exposure_ev, "the preset's own");
+        assert_eq!(tuned.imagery, Imagery::AsStored);
+        assert_eq!(tuned.camera.follows, 0.5);
+        assert_eq!((tuned.veil_bound, tuned.march_steps), (3.0, [20, 24]));
+        assert_eq!(tuned.highlight_knee, 0.7);
+        let t = tuned.atmosphere.expect("drawn").turbidity();
+        assert!((t - 1.4).abs() < 1e-12, "{t}");
+        // The camera reaches the exposure a frame's light gives.
+        let mut light = FrameLight::of(&tuned);
+        light.illumination.ev100 = tuile_atmosphere::DAYLIGHT_EV100 + 2.0;
+        let lit = tuned.lit_by(light);
+        assert!((lit.exposure_ev - (tuned.exposure_ev - 1.0)).abs() < 1e-6);
     }
 
     #[test]

@@ -37,6 +37,8 @@
 //!   ground marched over them, and a moment's [`ReferenceIllumination`]
 //!   worked out from them. [`params`] says what the air is made of and
 //!   which sphere it is laid on.
+//! - [`tuning`] — every setting of the air as a tuning value: read from the
+//!   environment by a native host, today's constant by default.
 //! - [`sky`] — the air with nothing behind it but space. A colour of its own,
 //!   drawn as a shell, turning over from blue through orange to dark with the
 //!   hour.
@@ -66,15 +68,18 @@ pub mod moon;
 pub mod params;
 pub mod sky;
 pub mod sun;
+pub mod tuning;
 
-pub use aerial::{AerialPerspective, WGSL};
+pub use aerial::{AerialAir, AerialPerspective, WGSL};
 pub use hillaire::{Calibration, LutAtmosphere, SkyLight};
 #[allow(deprecated)]
 pub use illumination::MAX_ADAPTATION_EV;
 pub use illumination::{
-    shown_ev, Moonlight, ReferenceIllumination, DAYLIGHT_EV100, EXPOSURE_FOLLOWS, NIGHT_DEPTH_EV,
+    shown_ev, CameraResponse, Moonlight, ReferenceIllumination, DAYLIGHT_EV100, EXPOSURE_FOLLOWS,
+    NIGHT_DEPTH_EV,
 };
 pub use moon::{celestial_to_ecef, moon_irradiance, Moon, MoonSeen};
 pub use params::{AtmosphereFrame, AtmosphereParams};
 pub use sky::SkyShell;
 pub use sun::{Sun, SunSeen};
+pub use tuning::{AirTuning, LookTuning, TuningError};

@@ -49,6 +49,10 @@ pub struct AtmosphereUniform {
     pub earth: [f32; 4],
     /// x: the sun's disc's scale; y: the Moon's; z: the glare's strength.
     pub discs: [f32; 4],
+    /// x: the veil's bound ([`tuile_film::Look::veil_bound`]); y, z: the
+    /// march's steps under 10 km and from over it
+    /// ([`tuile_film::Look::march_steps`]); w: nothing.
+    pub tuning: [f32; 4],
 }
 
 /// The share of the full Moon's light its night side sends back by the
@@ -175,6 +179,12 @@ impl AtmosphereUniform {
                 look.sun_scale.max(0.0),
                 look.moon_scale.max(0.0),
                 look.glare.max(0.0),
+                0.0,
+            ],
+            tuning: [
+                look.veil_bound,
+                look.march_steps[0] as f32,
+                look.march_steps[1] as f32,
                 0.0,
             ],
         }
