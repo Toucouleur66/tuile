@@ -115,8 +115,13 @@ pub struct PreparedTile {
     /// look at it. See [`Self::rebase`].
     rebased_to: std::cell::Cell<DVec3>,
     _textures: Vec<GpuImagery>,
-    /// The drapes this tile wears, batched into the passes that bind them,
-    /// held so the shared textures and their tables outlive the dressing.
+    /// The imagery the content carries itself (a loader that drapes its own
+    /// meshes, or a mesh a consumer dressed on the CPU): always worn, under
+    /// whatever drapes the tile is dressed with.
+    own: Vec<DrapedLayer>,
+    /// What this tile wears — its own imagery, then its drapes — batched into
+    /// the passes that bind them, held so the shared textures and their
+    /// tables outlive the dressing.
     _imagery: Vec<ImageryPass>,
     /// What the tile is dressed with: each drape and the uv transform it is
     /// worn through. Empty while undressed.
@@ -266,7 +271,11 @@ impl PreparedTile {
         if key == self.dressing && !self._imagery.is_empty() {
             return;
         }
-        let mut layers: Vec<(Placement, &Arc<GpuImagery>, ImageryCoord, u32)> = Vec::new();
+        let mut layers: Vec<(Placement, &Arc<GpuImagery>, ImageryCoord, u32)> = self
+            .own
+            .iter()
+            .map(|l| (l.placement, &l.texture, l.coord, l.source))
+            .collect();
         for (_, drape, uv) in drapes {
             for l in &drape.layers {
                 let placed = if *uv == UvTransform::IDENTITY {
@@ -382,9 +391,29 @@ pub fn prepare(
         .collect();
     let mut gpu_bytes: usize = textures.iter().map(|t| t.bytes).sum();
 
-    // Undressed: one pass carrying the base colour, every slot masked out.
-    // The drapes it wears are bound when it is drawn — see `dress`.
-    let passes = passes(gpu, &[]);
+    // The imagery the content carries itself, uploaded once per imagery
+    // tile however many tiles name it. Most content carries none: it is
+    // drawn undressed — one pass, the base colour, every slot masked out —
+    // and the drapes it wears are bound when it is drawn (`dress`).
+    let own: Vec<DrapedLayer> = content
+        .imagery
+        .iter()
+        .filter(|l| l.is_visible())
+        .map(|l| DrapedLayer {
+            placement: l.placement(),
+            texture: gpu.shared_imagery(l.source, l.coord, || upload_texture(gpu, &l.texture)),
+            coord: l.coord,
+            source: l.source,
+        })
+        .collect();
+    let worn: Vec<(Placement, &Arc<GpuImagery>, ImageryCoord, u32)> = own
+        .iter()
+        .map(|l| (l.placement, &l.texture, l.coord, l.source))
+        .collect();
+    let passes = passes(gpu, &worn);
+    let sharpest_imagery_level = own.iter().map(|l| l.coord.level).max();
+    let imagery_source = own.iter().map(|l| l.source).max();
+    drop(worn);
 
     // Each mesh with its normals, made where it has none: what is uploaded,
     // and what a mesh that gains vertices is made again from.
@@ -407,8 +436,8 @@ pub fn prepare(
     let cell = edges.cell();
 
     PreparedTile {
-        sharpest_imagery_level: None,
-        imagery_source: None,
+        sharpest_imagery_level,
+        imagery_source,
         meshes,
         tile_bg,
         tile_buf,
@@ -423,6 +452,7 @@ pub fn prepare(
         // frame for nothing.
         rebased_to: std::cell::Cell::new(render_origin),
         _textures: textures,
+        own,
         _imagery: passes,
         dressing: Vec::new(),
         gpu_bytes,
