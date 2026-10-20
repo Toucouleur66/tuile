@@ -41,8 +41,7 @@ impl TerrainSource for Served {
     }
 }
 
-/// One small picture for every imagery tile: a stand-in is refused where
-/// no picture is in memory, so there has to be one.
+/// One small picture for every imagery tile.
 struct OnePicture;
 
 /// A 4 × 4 PNG of one colour.
@@ -99,7 +98,7 @@ fn loader_over(tiles: &[(TileCoord, usize)]) -> Arc<dyn TileLoader> {
         .as_bytes(),
     )
     .expect("layer.json");
-    let (_tree, loader, _detail, _heights) =
+    let (_tree, loader, _heights) =
         globe(Served(served), OnePicture, layer, GlobeOptions::default());
     loader
 }
@@ -186,34 +185,4 @@ fn a_loaded_tile_is_closed_against_a_neighbour_several_levels_coarser() {
              steps of up to {step:.1} m"
         );
     }
-}
-
-#[test]
-fn a_stand_in_is_closed_as_the_tile_it_stands_for() {
-    // Stand-ins of level 17 over level-13 terrain, against a loaded tile of
-    // level 9: the steps of a coast, and a surface four levels above its
-    // rectangle.
-    let coarse = tile_at(9, LON, LAT);
-    let fine = TileCoord::new(13, (coarse.x << 4) - 1, (coarse.y << 4) + 8);
-    let loader = loader_over(&[(fine, 32), (coarse, 16)]);
-    // What is in memory when a stand-in is asked for: the terrain tile
-    // itself, and the pictures over it.
-    let _ = loaded(&loader, fine);
-    let west: Vec<_> = along(fine, 17, Side::East)
-        .into_iter()
-        .map(|t| {
-            let stand_in = loader
-                .fill(id(t))
-                .unwrap_or_else(|| panic!("no stand-in for {t:?}"));
-            (t, stand_in)
-        })
-        .collect();
-    let east = vec![(coarse, loaded(&loader, coarse))];
-    let (cast, through, step) = rays(&west, &east);
-    assert!(cast > 500, "the scene has few steps to look into: {cast}");
-    assert_eq!(
-        through, 0,
-        "{through} of {cast} rays pass between stand-ins and their neighbour, through steps of \
-         up to {step:.1} m"
-    );
 }

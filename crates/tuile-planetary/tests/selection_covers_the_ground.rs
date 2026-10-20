@@ -26,7 +26,7 @@ use std::collections::HashSet;
 use glam::{DVec2, DVec3};
 use tuile_core::geo::{ecef_to_geodetic, enu_frame, geodetic_to_ecef, Geodetic, WGS84_A};
 use tuile_core::source::{TileId, TileTree};
-use tuile_core::traversal::{traverse, Config, ResidencyView, TraversalOutput, ViewState};
+use tuile_core::traversal::{traverse, Config, ResidentSet, TraversalOutput, ViewState};
 use tuile_terrain::LayerJson;
 
 /// Everything is available to here, everywhere — the coarse world.
@@ -93,8 +93,8 @@ fn boundary_layer() -> LayerJson {
 /// so an unbounded walk heads for level 22 across the whole planet and
 /// never returns — measured as a test that outlived every timeout it was
 /// given. Residency to the availability ceiling is what the scenario needs.
-fn all_resident(tree: &dyn TileTree) -> ResidencyView {
-    let mut residency = ResidencyView::default();
+fn all_resident(tree: &dyn TileTree) -> ResidentSet {
+    let mut residency = ResidentSet::default();
     let mut stack: Vec<TileId> = tree.roots();
     while let Some(id) = stack.pop() {
         residency.insert(id);
@@ -161,8 +161,7 @@ fn covered(selected: &HashSet<(u32, u64, u64)>, max_level: u32, geo: Geodetic) -
 fn every_visible_ground_point_is_selected() {
     let tree = tuile_planetary::terrain_tree(boundary_layer());
     let residency = all_resident(tree.as_ref());
-    let mut config = Config::interactive_globe(Some(4));
-    config.stand_ins = false; // the recorder's exact-rendering profile
+    let config = Config::interactive_globe();
 
     // The recorder's target: on the ground just west of the availability
     // boundary, inside the fine window — where the flight was.
