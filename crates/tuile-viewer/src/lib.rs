@@ -130,6 +130,14 @@ mod web;
 #[cfg(target_arch = "wasm32")]
 use web as shell;
 
+/// The door a Rust host comes in by on the web: the viewer on a canvas, with
+/// an application owning each frame ([`frame_host`]).
+///
+/// The function rather than the module: what a host is promised is this call,
+/// and the shell around it is the viewer's own business.
+#[cfg(target_arch = "wasm32")]
+pub use web::page::start_with_host;
+
 pub use embed::{
     credential, renamed_by_environment, Identity, ImageryChoice, MissingCredential, Sources,
     TerrainChoice, ViewerHost,
