@@ -2134,67 +2134,89 @@ mod batch {
             }
             need
         };
-        let mut read: Vec<(&str, BTreeSet<ResourceId>)> = Vec::new();
-        for (name, pick) in [
+        let orders: [(&str, Pick); 6] = [
             ("in order", first),
             ("in reverse", last),
             ("meshes first", meshes_first),
             ("drapes first", drapes_first),
             ("finest first", finest_first),
             ("coarsest first", coarsest_first),
-        ] {
-            // One load of each class in flight: which drapes find a slot
-            // while a pass still draws a tile then turns on the order.
-            let mut c = BudgetConfig::batch();
-            c.pinned_level = None;
-            c.max_in_flight[Class::TerrainMesh] = 1;
-            c.max_in_flight[Class::Drape] = 1;
-            let mut r = Rig::new(c);
-            let mut loaded = BTreeSet::new();
-            let mut started = BTreeSet::new();
-            let mut worn = None;
-            for _ in 0..200 {
-                let d = r.step(&pass(&loaded));
-                started.extend(
-                    d.start
-                        .iter()
-                        .map(|s| s.resource)
-                        .filter(|r| matches!(r, ResourceId::Drape { .. })),
-                );
-                if d.frame_ready {
-                    worn = Some(
-                        d.draw
-                            .items
+        ];
+        // Without a floor, and with the roots in it: a floor tile's own
+        // drape is read whatever the order, the finer one it asks for while
+        // a pass draws it is not.
+        for pinned in [None, Some(3)] {
+            let mut read: Vec<(&str, BTreeSet<ResourceId>)> = Vec::new();
+            for (name, pick) in orders {
+                // Slots saturated, as behind one fetch in flight: which
+                // drapes find one while a pass still draws a tile then turns
+                // on the order. Two drape slots, one per root, so the
+                // floor's own drapes never wait on each other.
+                let mut c = BudgetConfig::batch();
+                c.pinned_level = pinned;
+                c.max_in_flight[Class::TerrainMesh] = 1;
+                c.max_in_flight[Class::Drape] = 2;
+                let mut r = Rig::new(c);
+                let mut loaded = BTreeSet::new();
+                let mut started = BTreeSet::new();
+                let mut worn = None;
+                for _ in 0..200 {
+                    let d = r.step(&pass(&loaded));
+                    started.extend(
+                        d.start
                             .iter()
-                            .flat_map(|i| i.drapes.iter().map(|x| x.resource))
-                            .collect::<BTreeSet<_>>(),
+                            .map(|s| s.resource)
+                            .filter(|r| matches!(r, ResourceId::Drape { .. })),
                     );
-                    break;
+                    if d.frame_ready {
+                        worn = Some(
+                            d.draw
+                                .items
+                                .iter()
+                                .flat_map(|i| i.drapes.iter().map(|x| x.resource))
+                                .collect::<BTreeSet<_>>(),
+                        );
+                        break;
+                    }
+                    r.upload(&d);
+                    // One load comes back.
+                    if !r.pending.is_empty() {
+                        let done = pick(&r.pending);
+                        let gen = r.pending.remove(&done).expect("pending");
+                        r.b.on_loaded(done, gen, est(done));
+                        loaded.insert(done);
+                    }
                 }
-                r.upload(&d);
-                // One load comes back.
-                if !r.pending.is_empty() {
-                    let done = pick(&r.pending);
-                    let gen = r.pending.remove(&done).expect("pending");
-                    r.b.on_loaded(done, gen, est(done));
-                    loaded.insert(done);
-                }
+                let worn = worn.unwrap_or_else(|| {
+                    panic!("{name}, floor {pinned:?}: the frame was never made")
+                });
+                let kids: BTreeSet<ResourceId> = roots
+                    .iter()
+                    .flat_map(|root| children(*root))
+                    .map(|k| dr(k, level(k)))
+                    .collect();
+                assert_eq!(
+                    worn, kids,
+                    "{name}, floor {pinned:?}: the frame wears its children's drapes"
+                );
+                let floor: BTreeSet<ResourceId> = match pinned {
+                    Some(p) => roots.iter().map(|root| dr(*root, p)).collect(),
+                    None => BTreeSet::new(),
+                };
+                let expected: BTreeSet<ResourceId> = worn.union(&floor).copied().collect();
+                assert_eq!(
+                    started, expected,
+                    "{name}, floor {pinned:?}: a drape was read that neither the frame \
+                     nor the floor wears"
+                );
+                read.push((name, started));
             }
-            let worn = worn.unwrap_or_else(|| panic!("{name}: the frame was never made"));
-            let kids: BTreeSet<ResourceId> = roots
-                .iter()
-                .flat_map(|root| children(*root))
-                .map(|k| dr(k, level(k)))
-                .collect();
-            assert_eq!(worn, kids, "{name}: the frame wears its children's drapes");
-            assert_eq!(
-                started, worn,
-                "{name}: a drape was read that the frame does not wear"
-            );
-            read.push((name, started));
-        }
-        for (name, drapes) in &read[1..] {
-            assert_eq!(drapes, &read[0].1, "{name} read other drapes than in order");
+            for (name, drapes) in &read[1..] {
+                assert_eq!(
+                    drapes, &read[0].1,
+                    "{name}, floor {pinned:?}: other drapes read than in order"
+                );
+            }
         }
     }
 

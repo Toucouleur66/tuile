@@ -872,9 +872,11 @@ impl Budget {
         // selection is still settling past — its mesh not in, the tile then
         // replaced by its children — would be read whatever the frame draws,
         // and what a bake reads would follow the order its meshes came in.
-        // So outside the floor no drape is wanted until every mesh the frame
-        // draws and waits on is loaded: the selection it then wears drapes
-        // for is the one the frame draws.
+        // So no drape but the floor's own is wanted until every mesh the
+        // frame draws and waits on is loaded: the selection it then wears
+        // drapes for is the one the frame draws. A floor tile is no
+        // exception past its own drape: drawn while the selection settles,
+        // the finer drape it asks for is as much a pass's as any other's.
         let meshes_in = !batch
             || tiles
                 .iter()
@@ -921,7 +923,7 @@ impl Budget {
                     );
                 }
             }
-            if !meshes_in && !floor {
+            if !meshes_in {
                 continue;
             }
             for ((_, layer), &n) in drapes.range(tile_layers(*t)) {
