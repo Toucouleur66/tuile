@@ -79,7 +79,7 @@ use std::time::Duration;
 
 use web_time::Instant;
 
-pub use log::{Observer, Pictures};
+pub use log::{BudgetTopics, Observer, Pictures};
 pub use series::{Action, Finger, Pressure, Series};
 pub use tuile_core::metrics::Snapshot;
 pub use verdict::{Obligations, Report, Verdict};
@@ -586,7 +586,8 @@ impl Headless {
             limits,
             start,
             history: Vec::new(),
-            observers: Vec::new(),
+            // The budget's account of every step, in every run's log.
+            observers: vec![Box::new(BudgetTopics)],
             log,
             socket: None,
             _claim: claim,
