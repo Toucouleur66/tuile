@@ -231,11 +231,10 @@ pub async fn gather(
     let began = std::time::Instant::now();
     // Counted by reading the written film back, not by adding up what went
     // in: the number that matters is the one a player will find.
-    let probe = join(locals.clone(), film.clone()).await?;
+    // Each segment let go once it is in: where the disk is memory, the
+    // film and its segments are never held whole twice.
+    let probe = join(locals, film.clone(), true).await?;
     let join_seconds = began.elapsed().as_secs_f64();
-    for local in &locals {
-        let _ = tokio::fs::remove_file(local).await;
-    }
     let got = probe.frames;
     if got != expected {
         return Err(AssembleError::FrameCount { got, expected });
@@ -318,9 +317,10 @@ fn check_receipts(receipts: &[Receipt], task_count: u32) -> Result<Vec<u64>, Ass
 async fn join(
     segments: Vec<PathBuf>,
     film: PathBuf,
+    consume: bool,
 ) -> Result<crate::concat::Probe, AssembleError> {
     tokio::task::spawn_blocking(move || {
-        crate::concat::concat(&segments, &film)?;
+        crate::concat::concat_into(&segments, &film, consume)?;
         Ok(crate::concat::probe(&film)?)
     })
     .await
@@ -483,6 +483,7 @@ mod tests {
         };
         assert_eq!(frames, 7);
         assert!(path.starts_with(work.path()));
+        assert!(!work.path().join("seg0.mp4").exists(), "each segment let go once joined");
         assert!(!receipts.exists(&run.film()).await.expect("exists"), "nothing uploaded");
         assert!(
             gather(&receipts, &receipts, &run, 2, work.path(), None).await.is_err(),
