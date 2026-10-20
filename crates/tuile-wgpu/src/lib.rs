@@ -42,7 +42,9 @@ mod webgl2;
 
 pub use context::{ContextError, GpuContext, DEPTH_FORMAT, SAMPLES, TEXTURE_FORMAT};
 pub use overlay::{OverlayRenderer, OverlayVertex};
-pub use prepare::{prepare, prepare_drape, PreparedDrape, PreparedMesh, PreparedTile, Vertex, STITCH_ROWS};
+pub use prepare::{
+    prepare, prepare_drape, PreparedDrape, PreparedMesh, PreparedTile, Vertex, STITCH_ROWS,
+};
 pub use pump::{ContentPump, Drawn, Resolution, STITCH_SLIDE_FRAMES, UPLOAD_SHARE_PERMILLE};
 pub use readback::Readback;
 pub use renderer::{LineVertex, TileRenderer, ViewUniform};

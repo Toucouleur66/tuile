@@ -491,10 +491,7 @@ mod tests {
             &mut to,
         );
         assert!(to.gate.as_ref().is_some_and(Gate::is_shut));
-        assert_eq!(
-            to.did,
-            ["pressure Background", "suspend", "release"]
-        );
+        assert_eq!(to.did, ["pressure Background", "suspend", "release"]);
 
         to.did.clear();
         carry(

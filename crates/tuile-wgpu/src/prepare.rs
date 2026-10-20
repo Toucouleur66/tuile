@@ -256,11 +256,13 @@ impl PreparedTile {
     /// the layers of each, placed in this tile's uv square, in stacking
     /// order. Nothing is uploaded — the drapes' textures are bound — and a
     /// tile already dressed so is left as it is.
-    pub fn dress(&mut self, gpu: &GpuContext, drapes: &[(ResourceId, &PreparedDrape, UvTransform)]) {
-        let key: Vec<(ResourceId, [u64; 4])> = drapes
-            .iter()
-            .map(|(r, _, uv)| (*r, uv_bits(*uv)))
-            .collect();
+    pub fn dress(
+        &mut self,
+        gpu: &GpuContext,
+        drapes: &[(ResourceId, &PreparedDrape, UvTransform)],
+    ) {
+        let key: Vec<(ResourceId, [u64; 4])> =
+            drapes.iter().map(|(r, _, uv)| (*r, uv_bits(*uv))).collect();
         if key == self.dressing && !self._imagery.is_empty() {
             return;
         }
