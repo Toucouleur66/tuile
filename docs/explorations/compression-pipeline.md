@@ -257,7 +257,6 @@ maps its names onto them. Memory note: no STL names in tuile.
 | UX name (FR) | Id | Codec / profile | Depth / chroma | Rate control | GOP | Container | For |
 |---|---|---|---|---|---|---|---|
 | **Partage** (default) | `web` | H.264 High, level by size (4.0 / 4.2 / 5.1 / 5.2) | 8-bit 4:2:0, **dithered from the 10-bit mezzanine** | CQ (NVENC VBR with `targetQuality`) + max-rate cap; if the film's size exceeds the profile cap → re-encode VBR at cap/duration | 2 s closed, 3 B (B as reference), lookahead 32, spatial + temporal AQ | mp4 `isom/avc1/mp41`, **faststart**, `colr nclx` 1/1/1 limited, `pasp` 1:1 | WhatsApp, Instagram, browsers, old Android: plays everywhere |
-| **Partage — moderne** (option, or automatic as a second source on the site) | `web-av1` | AV1 Main, level 4.0/4.1/5.0/5.1 | **10-bit** 4:2:0 | CQ + cap, multipass quarter-res, lookahead | 2 s, AV1 key = sequence header repeated | mp4 `av01`, faststart, `colr` | the site's `<video>` in Chrome/Firefox/Edge, ≈ 40–50 % lighter than H.264 at equal VMAF *(to measure)*. Safari plays AV1 only with hardware decode (A17 Pro / M3 and later), so it is not a sharing file |
 | **Haute qualité** | `high` | HEVC Main10, `hvc1` (L4.1 / 5.0 / 5.1, Main tier) | 10-bit 4:2:0 | CQ high + cap; UHQ tuning if speed allows; full-res multipass | 1 s, 4 B, lookahead + `lookaheadLevel`, temporal filter (needs `frameIntervalP ≥ 5`) | mp4 or mov `hvc1`, faststart, `colr` | iPhone/Mac (Photos, Final Cut), YouTube/Vimeo upload, a TV |
 | **Montage / master** | `master` | the **mezzanine itself**, remuxed with faststart (HEVC Main10, 1 s GOP, high rate) | 10-bit 4:2:0 | — (no re-encode) | 1 s closed | mov/mp4 `hvc1` | editing (Resolve, Premiere, FCP decode HEVC 10-bit in hardware), archiving. ProRes only from a Mac (§5.3) |
 | **Spatial** (format `spatial_hd`, not a separate compression) | `spatial-web` / `spatial-high` | MV-HEVC (two layers, Main), `hvc1` + eye metadata | 8-bit 4:2:0 today (MV-HEVC Main10 *to verify* on NVENC 13 and on Apple players) | VBR/CQ, multipass off as today | 1 s | mov/mp4 spatial (`tuile_mp4::spatial`) | Vision Pro in depth; iPhone plays it flat |
@@ -276,7 +275,6 @@ of our content, in Mb/s *(to calibrate in §6, targets in §6.2)*:
 | Profile | 720×1280 30 | 1080p30 | 1080p60 | 4K30 | 4K60 |
 |---|---|---|---|---|---|
 | `web` H.264 (mean / cap) | 3 / 5 | 6 / 10 | 9 / 14 | 25 / 40 | 38 / 60 |
-| `web-av1` AV1 10-bit | 1.8 / 3 | 3.5 / 6 | 5 / 8 | 14 / 24 | 22 / 36 |
 | `high` HEVC Main10 | 6 / 10 | 14 / 24 | 20 / 32 | 45 / 70 | 65 / 100 |
 | `master` (mezzanine) | ≈ 15 | ≈ 30–50 | ≈ 45–70 | ≈ 100–150 | ≈ 150–220 |
 | spatial MV-HEVC (both eyes, 1080p eyes) | — | 20 web / 40 high | 30 / 60 | — | — |
@@ -322,10 +320,7 @@ Banding comes from three places, and each one has its own fix:
 3. **The encoder.** At low rates it flattens smooth areas and erases the
    dither. **Fix:** spatial AQ (lower QP on flat blocks) plus temporal AQ,
    a minimum quality (QP ceiling) on flat areas, and 10-bit codecs wherever the
-   profile allows (`web-av1`, `high`). The AV1 film grain table
-   (`filmGrainParams` exists in NVENC 13) is a lead to explore: the decoder
-   re-synthesises a grain that masks banding at no cost in bits. It is not a
-   default.
+   profile allows (`high`).
 
 The banding measure is **CAMBI** (Netflix, part of libvmaf), not VMAF.
 VMAF is not very sensitive to banding (§6).
@@ -380,15 +375,15 @@ VMAF is not very sensitive to banding (§6).
 
 ### 4.3 NVENC settings per profile (proposed starting points)
 
-| | Mezzanine (render node) | `web` H.264 | `web-av1` | `high` HEVC10 |
-|---|---|---|---|---|
-| Preset / tuning | P5 / HQ | P6 / HQ | P6 / HQ | P7 / UHQ (P6/HQ if UHQ is too slow at 4K60) |
-| RC | CONSTQP ≈ 16–20 (or VBR `targetQuality`) | VBR `targetQuality` ≈ 23–26, `maxBitRate` = cap | VBR `targetQuality` ≈ 30–36 (AV1 scale), cap | VBR `targetQuality` ≈ 20–22, cap |
-| multiPass | off | full-res | quarter-res | full-res |
-| Lookahead | off (in-order output kept here, no state across segments) | 32 | 32, level 2 | 32, level 3 |
-| AQ | spatial | spatial + temporal | spatial + temporal | spatial + temporal |
-| B-frames | 3, B ref middle | 3, B ref middle | (AV1: altref / numBwdRefs) | 4, B ref middle, `tfLevel` 4 |
-| GOP | 1 s, IDR | 2 s, IDR | 2 s | 1 s |
+| | Mezzanine (render node) | `web` H.264 | `high` HEVC10 |
+|---|---|---|---|
+| Preset / tuning | P5 / HQ | P6 / HQ | P7 / UHQ (P6/HQ if UHQ is too slow at 4K60) |
+| RC | CONSTQP ≈ 16–20 (or VBR `targetQuality`) | VBR `targetQuality` ≈ 23–26, `maxBitRate` = cap | VBR `targetQuality` ≈ 20–22, cap |
+| multiPass | off | full-res | full-res |
+| Lookahead | off (in-order output kept here, no state across segments) | 32 | 32, level 3 |
+| AQ | spatial | spatial + temporal | spatial + temporal |
+| B-frames | 3, B ref middle | 3, B ref middle | 4, B ref middle, `tfLevel` 4 |
+| GOP | 1 s, IDR | 2 s, IDR | 1 s |
 
 The `targetQuality` values are guesses to be calibrated (§6). Lookahead and
 B-frames break the "one picture in, one out" loop in `nvenc.rs`. The final
@@ -508,7 +503,7 @@ Plus 720×1280 (the mobile format) on E1, scored with VMAF's phone model.
 |---|---|---|---|---|
 | mezzanine | ≥ 98.5 | ≥ 96 | ≤ 1 | PSNR-Y ≥ 48 dB |
 | `high` | ≥ 96 | ≥ 92 | ≤ 2 | |
-| `web` / `web-av1` | ≥ 93 | ≥ 85 | ≤ 4 | SSIM on the E3 HUD crop ≥ 0.97 |
+| `web` | ≥ 93 | ≥ 85 | ≤ 4 | SSIM on the E3 HUD crop ≥ 0.97 |
 | spatial | ≥ 93 per eye | ≥ 85 | ≤ 4 | |
 
 These targets are measured **mezzanine → profile** *and* **reference →
@@ -517,7 +512,7 @@ what the mezzanine costs.
 
 ### 6.4 Runs
 
-1. **Rate-quality curves.** For each excerpt × codec (H.264, HEVC10, AV1-10)
+1. **Rate-quality curves.** For each excerpt × codec (H.264, HEVC10)
    × preset (P4, P6, P7 / UHQ), sweep `targetQuality` / QP (6–8 points) and
    plot VMAF and CAMBI against the bitrate. Those curves fix §3.2 and §4.3.
 2. **A/B on the current state.** Today's H.264 P4 VBR 12 Mb/s with no B and
@@ -556,8 +551,6 @@ once the tests prove it, with no switch (memory: no switches):
 - **Compression `web` (Partage), H.264 High 8-bit, faststart, BT.709
   tagged, CQ + cap per resolution.** It is the default because a shared film
   has to play everywhere.
-- The site's player can also offer `web-av1` as a second `<source>`. That is
-  a later improvement, computed from the same mezzanine at no extra cost.
 - Spatial: the `spatial_hd` format only, with `spatial-web` by default.
 
 ### 7.3 UX and API
