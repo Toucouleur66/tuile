@@ -698,7 +698,10 @@ mod tests {
         ] {
             assert!(!text.contains(gone), "{gone} in {text}");
         }
-        assert!(text.contains("mie_anisotropy: 0.8, ozone_absorption"), "{text}");
+        assert!(
+            text.contains("mie_anisotropy: 0.8, ozone_absorption"),
+            "{text}"
+        );
     }
 
     #[test]

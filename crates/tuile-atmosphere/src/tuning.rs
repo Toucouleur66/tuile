@@ -437,8 +437,7 @@ impl AirTuning {
         let v = AerialAir::default();
         let rgb32 = |a: [f64; 3]| a.map(|x| x as f32);
         let viewer = AerialAir {
-            rayleigh_scattering: three(&RAYLEIGH_SCATTERING)?
-                .map_or(v.rayleigh_scattering, rgb32),
+            rayleigh_scattering: three(&RAYLEIGH_SCATTERING)?.map_or(v.rayleigh_scattering, rgb32),
             rayleigh_scale_height: f(one(&RAYLEIGH_SCALE_HEIGHT)?, v.rayleigh_scale_height),
             mie_scattering: f(one(&VIEWER_MIE_SCATTERING)?, v.mie_scattering),
             mie_scale_height: f(one(&MIE_SCALE_HEIGHT)?, v.mie_scale_height),
@@ -492,7 +491,10 @@ fn numbers(knob: &Knob, text: &str) -> Result<Vec<f64>, TuningError> {
                 .map_err(|_| refuse(format!("{p:?} is not a number")))?;
             let (lo, hi) = knob.range;
             if !n.is_finite() || n < lo || n > hi {
-                return Err(refuse(format!("{p} is outside [{lo}, {hi}]: {}", knob.what)));
+                return Err(refuse(format!(
+                    "{p} is outside [{lo}, {hi}]: {}",
+                    knob.what
+                )));
             }
             Ok(n)
         })
