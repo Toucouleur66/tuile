@@ -139,9 +139,52 @@ pub async fn assemble(
     work: &Path,
     fps: Option<f64>,
 ) -> Result<Outcome, AssembleError> {
-    let receipts = read_receipts(store, run).await?;
+    match gather(store, store, run, task_count, work, fps).await? {
+        Gathered::Waiting { done, of } => Ok(Outcome::Waiting { done, of }),
+        Gathered::Joined { path, frames, .. } => {
+            let bytes = store.put(&path, &run.film()).await?;
+            Ok(Outcome::Assembled {
+                key: run.film(),
+                frames,
+                bytes,
+            })
+        }
+    }
+}
+
+/// The film joined on this machine, not uploaded.
+#[derive(Debug, PartialEq)]
+pub enum Gathered {
+    /// Not every task has deposited its receipt yet.
+    Waiting { done: usize, of: u32 },
+    /// The film, at `path` under the work directory.
+    Joined {
+        path: PathBuf,
+        frames: u64,
+        bytes: u64,
+        /// The segments' fetch, seconds.
+        fetch_seconds: f64,
+        /// Their join, seconds.
+        join_seconds: f64,
+    },
+}
+
+/// What [`assemble`] does short of the upload: the receipts read from
+/// `receipts`, the segments they vouch for fetched from `segments` (the
+/// same store, or the one that keeps a render's mezzanine), checked, and
+/// joined into `work/render.mp4` — counted by reading the film back, and
+/// with `fps`, its cadence checked.
+pub async fn gather(
+    receipts_store: &dyn RunStore,
+    segments_store: &dyn RunStore,
+    run: &RunKeys,
+    task_count: u32,
+    work: &Path,
+    fps: Option<f64>,
+) -> Result<Gathered, AssembleError> {
+    let receipts = read_receipts(receipts_store, run).await?;
     if receipts.len() < task_count as usize {
-        return Ok(Outcome::Waiting {
+        return Ok(Gathered::Waiting {
             done: receipts.len(),
             of: task_count,
         });
@@ -151,7 +194,7 @@ pub async fn assemble(
 
     // Every vouched-for segment, present and plausible, before downloading a
     // single byte of any of them.
-    let listed = store.list(&run.prefix).await?;
+    let listed = segments_store.list(&run.prefix).await?;
     for g in &segments {
         let key = run.segment(*g);
         match listed.iter().find(|e| e.key == key) {
@@ -169,23 +212,30 @@ pub async fn assemble(
             path: work.to_path_buf(),
             source,
         })?;
+    let began = std::time::Instant::now();
     // Segments in parallel, each itself in parallel ranges: the store's own
     // concurrency bounds the parts in flight per segment, four segments at a
     // time (`TUILE_ASSEMBLE_SEGMENTS`) bound the whole.
     let locals: Vec<PathBuf> = stream::iter(segments.iter().copied())
         .map(|g| async move {
             let local = work.join(format!("seg{g}.mp4"));
-            store.get(&run.segment(g), &local).await?;
+            segments_store.get(&run.segment(g), &local).await?;
             Ok::<_, StoreError>(local)
         })
         .buffered(crate::assemble_segments())
         .try_collect()
         .await?;
+    let fetch_seconds = began.elapsed().as_secs_f64();
 
     let film = work.join("render.mp4");
+    let began = std::time::Instant::now();
     // Counted by reading the written film back, not by adding up what went
     // in: the number that matters is the one a player will find.
-    let probe = join(locals, film.clone()).await?;
+    let probe = join(locals.clone(), film.clone()).await?;
+    let join_seconds = began.elapsed().as_secs_f64();
+    for local in &locals {
+        let _ = tokio::fs::remove_file(local).await;
+    }
     let got = probe.frames;
     if got != expected {
         return Err(AssembleError::FrameCount { got, expected });
@@ -193,11 +243,19 @@ pub async fn assemble(
     if let Some(fps) = fps {
         crate::concat::check_cadence(probe, fps).map_err(AssembleError::Cadence)?;
     }
-    let bytes = store.put(&film, &run.film()).await?;
-    Ok(Outcome::Assembled {
-        key: run.film(),
+    let bytes = tokio::fs::metadata(&film)
+        .await
+        .map_err(|source| AssembleError::Io {
+            path: film.clone(),
+            source,
+        })?
+        .len();
+    Ok(Gathered::Joined {
+        path: film,
         frames: got,
         bytes,
+        fetch_seconds,
+        join_seconds,
     })
 }
 
@@ -384,4 +442,57 @@ mod tests {
             "{err}"
         );
     }
+
+    /// A render's segments kept in another store than its receipts (its
+    /// mezzanine, near the cards): read from there, joined here, not
+    /// uploaded anywhere.
+    #[tokio::test]
+    async fn segments_are_gathered_from_their_own_store_and_joined_here() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let receipts =
+            crate::ObjectRunStore::local(&root.path().join("run"), crate::Tuning::default())
+                .expect("store");
+        let mezzanine =
+            crate::ObjectRunStore::local(&root.path().join("mezz"), crate::Tuning::default())
+                .expect("store");
+        let run = RunKeys::new("renders/r", "e1");
+        let src = root.path().join("r.json");
+        for (t, first, last) in [(0u32, 1u64, 4u64), (1, 5, 7)] {
+            std::fs::write(
+                &src,
+                serde_json::to_vec(&receipt(t, first, last, &[u64::from(t)])).expect("json"),
+            )
+            .expect("write");
+            store_put(&receipts, &src, &run.receipt(t)).await;
+            let seg = root.path().join(format!("s{t}.mp4"));
+            crate::concat::write_test_segment(
+                &seg,
+                (last + 1 - first) as u32,
+                &[0x67, 0x64, 0x00, 0x0c, 0xac, 0xd9, 0x42],
+                t as u8,
+            )
+            .expect("segment");
+            store_put(&mezzanine, &seg, &run.segment(u64::from(t))).await;
+        }
+        let work = tempfile::tempdir().expect("tempdir");
+        let gathered = gather(&receipts, &mezzanine, &run, 2, work.path(), None)
+            .await
+            .expect("gather");
+        let Gathered::Joined { path, frames, .. } = gathered else {
+            panic!("joined: {gathered:?}")
+        };
+        assert_eq!(frames, 7);
+        assert!(path.starts_with(work.path()));
+        assert!(!receipts.exists(&run.film()).await.expect("exists"), "nothing uploaded");
+        assert!(
+            gather(&receipts, &receipts, &run, 2, work.path(), None).await.is_err(),
+            "the segments are not in the run store"
+        );
+    }
+
+    async fn store_put(store: &crate::ObjectRunStore, from: &Path, key: &str) {
+        use crate::RunStore;
+        store.put(from, key).await.expect("put");
+    }
 }
+
