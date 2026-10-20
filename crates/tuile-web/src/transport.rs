@@ -129,15 +129,15 @@ impl Drop for Attempt {
 type Answer = (u16, Bytes, Option<u64>);
 
 /// The bytes of one response, or the reason there are none — asked as many
-/// times as [`patience`] allows.
-async fn get(url: &Url, bearer: Option<&str>) -> Result<Answer, String> {
+/// times as [`patience`] allows `asker`.
+async fn get(url: &Url, bearer: Option<&str>, asker: patience::Asker) -> Result<Answer, String> {
     let mut attempt = 1;
     loop {
         let (ended, outcome) = match get_once(url, bearer).await {
             Ok(answer) => (patience::Ended::Answered(answer.0), Ok(answer)),
             Err((ended, why)) => (ended, Err(why)),
         };
-        match patience::again(attempt, ended) {
+        match patience::again(asker, attempt, ended) {
             Some(pause) => {
                 tracing::debug!(%url, attempt, ?ended, "asking again");
                 sleep(pause).await;
@@ -240,10 +240,14 @@ impl TileFetcher for WebFetcher {
     }
 
     async fn fetch_cacheable(&self, url: &Url) -> Result<Fetched<Bytes>, FetchError> {
-        let (status, bytes, max_age) = get(url, None).await.map_err(|message| FetchError::Io {
-            url: url.clone(),
-            message,
-        })?;
+        // A tile load: its retries are the budget's.
+        let (status, bytes, max_age) =
+            get(url, None, patience::Asker::Load)
+                .await
+                .map_err(|message| FetchError::Io {
+                    url: url.clone(),
+                    message,
+                })?;
         // 404 is a fact about the data — the ocean has no terrain tile — and the
         // engine has a distinct arm for it that stops the re-asking. Collapsing
         // it into a transport error would make every absent tile a permanent
@@ -274,7 +278,7 @@ pub struct WebIonHttp;
 #[async_trait(?Send)]
 impl IonHttp for WebIonHttp {
     async fn get(&self, url: &Url, bearer: Option<&str>) -> Result<HttpResponse, IonError> {
-        let (status, body, max_age) = get(url, bearer)
+        let (status, body, max_age) = get(url, bearer, patience::Asker::Session)
             .await
             .map_err(|e| IonError::Transport(format!("{url}: {e}")))?;
         Ok(HttpResponse {
