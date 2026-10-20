@@ -513,3 +513,36 @@ fn a_default_films_pictures_are_the_same_to_the_byte() {
 }
 
 const FROZEN_DEFAULT_FILM: &str = "c203a130175f25bd";
+
+/// A film under the physical atmosphere, byte for byte: the ground through
+/// a day's air, the horizon at noon and at a low sun. Frozen from main
+/// before the air's settings became tuning values (44ccf58): with no
+/// `TUILE_AIR_*` value set, every one of them is today's constant, and the
+/// pictures must not move by a bit. Held on the adapter it was frozen on
+/// only, as [`a_default_films_pictures_are_the_same_to_the_byte`].
+#[test]
+fn an_atmosphere_films_pictures_are_the_same_to_the_byte() {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for elevation in [45.0, 3.0] {
+        let Some(mut film) = film(atmospheric(elevation)) else {
+            return;
+        };
+        let key = square(&mut film);
+        let down = draw(&mut film, true, &[key]);
+        let along = draw(&mut film, false, &[]);
+        for b in down.iter().chain(&along) {
+            hash = (hash ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    let (backend, name) = adapter().unwrap_or((wgpu::Backend::Noop, String::new()));
+    println!("ATMOSPHERE-FILM-DIGEST {hash:016x} on {backend:?} {name}");
+    if backend != wgpu::Backend::Metal || !name.starts_with("Apple") {
+        eprintln!(
+            "SKIP: the atmosphere film's digest is frozen on an Apple GPU, not on {backend:?} {name}"
+        );
+        return;
+    }
+    assert_eq!(format!("{hash:016x}"), FROZEN_ATMOSPHERE_FILM);
+}
+
+const FROZEN_ATMOSPHERE_FILM: &str = "bbb7a58f3eecfc7d";
