@@ -51,7 +51,7 @@ use futures_channel::mpsc::UnboundedSender;
 use futures_core::Stream;
 use futures_util::future::{poll_fn, AbortHandle, Abortable, Aborted};
 use futures_util::stream::FuturesUnordered;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
@@ -750,14 +750,35 @@ struct Flight {
 
 /// The loader's presence index, as the budget's oracle, with every answer
 /// noted for the step's record.
+///
+/// Answers are kept for [`PRESENCE_FOR`]: the budget asks of every drape it
+/// weighs, at every level it weighs it, at every step, and a loader answers
+/// a drape by working out every imagery tile it would stack — in a browser's
+/// worker, two thirds of the thread near the ground, the loads' own replies
+/// waiting seconds behind it. A store's index changes by what is fetched
+/// into it, which a load answers anyway; an answer a second old misplaces a
+/// read between the store and the network at worst, never a tile.
 struct Presences<'a> {
     loader: &'a dyn TileLoader,
     asked: std::cell::RefCell<Vec<(ResourceId, Presence)>>,
+    kept: &'a std::cell::RefCell<HashMap<ResourceId, (Presence, Micros)>>,
+    now: Micros,
 }
+
+/// How long the loader's answer about one resource is kept.
+const PRESENCE_FOR: Micros = Micros::from_millis(1_000);
 
 impl PresenceOracle for Presences<'_> {
     fn holds(&self, r: ResourceId) -> Presence {
-        let p = self.loader.holds(r);
+        let kept = self.kept.borrow().get(&r).copied();
+        let p = match kept {
+            Some((p, at)) if self.now.since(at) < PRESENCE_FOR => p,
+            _ => {
+                let p = self.loader.holds(r);
+                self.kept.borrow_mut().insert(r, (p, self.now));
+                p
+            }
+        };
         self.asked.borrow_mut().push((r, p));
         p
     }
@@ -773,6 +794,8 @@ struct State {
     /// Where each of them stands in the budget's order, as of the last step:
     /// for a pool that orders the work they wait on.
     ranks: crate::offload::LoadRanks,
+    /// The loader's recent answers about presence (see [`Presences`]).
+    presence: std::cell::RefCell<HashMap<ResourceId, (Presence, Micros)>>,
     /// The decoded copies the budget counts (its decoded tier): delivered
     /// from here, again after an eviction, until the budget releases them.
     decoded: BTreeMap<ResourceId, (Generation, ResourceContent)>,
@@ -818,6 +841,7 @@ impl State {
             meter,
             in_flight: BTreeMap::new(),
             ranks: crate::offload::LoadRanks::default(),
+            presence: std::cell::RefCell::default(),
             decoded: BTreeMap::new(),
             events: Vec::new(),
             epoch: 0,
@@ -1292,9 +1316,18 @@ impl State {
             camera_moved = camera_moved,
         );
         let need = self.need(host);
+        // Taken for the decision and put back after it. Bounded: what has
+        // gone stale goes once the map has grown.
+        let kept = std::cell::RefCell::new(std::mem::take(self.presence.get_mut()));
+        if kept.borrow().len() > 16_384 {
+            kept.borrow_mut()
+                .retain(|_, (_, at)| now.since(*at) < PRESENCE_FOR);
+        }
         let presence = Presences {
             loader: host.loader.as_ref(),
             asked: std::cell::RefCell::new(Vec::new()),
+            kept: &kept,
+            now,
         };
         let deciding = crate::metrics::stamp();
         let d = self
@@ -1337,6 +1370,7 @@ impl State {
         // The record, for every sink at once.
         let events = std::mem::take(&mut self.events);
         let asked = presence.asked.into_inner();
+        *self.presence.get_mut() = kept.into_inner();
         if let Ok(mut meter) = self.meter.lock() {
             meter.step(&StepRecord {
                 step: self.steps - 1,
@@ -2051,6 +2085,51 @@ mod tests {
             consumer.errors
         );
         assert!(matches!(stream.poll_message(&mut cx), Poll::Ready(None)));
+    }
+
+    /// **The loader is asked about a resource's presence once a second at
+    /// most**, however many steps weigh it: answering a drape costs the
+    /// loader its imagery mosaic, and asking it at every step of a settling
+    /// view took two thirds of a browser worker's thread. A clock that never
+    /// moves keeps every answer.
+    #[test]
+    fn presence_is_asked_once_within_its_window() {
+        struct Counting(
+            TilesetLoader<FsFetcher>,
+            Arc<std::sync::Mutex<HashMap<ResourceId, u32>>>,
+        );
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        impl TileLoader for Counting {
+            async fn load(&self, id: TileId) -> Result<Loaded, LoadError> {
+                self.0.load(id).await
+            }
+            fn holds(&self, r: ResourceId) -> crate::budget::Presence {
+                *self.1.lock().expect("asked").entry(r).or_default() += 1;
+                crate::budget::Presence::Absent
+            }
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let arena = Arc::new(RwLock::new(deep_tileset(dir.path())));
+        let tree: Box<dyn TileTree> = Box::new(TilesetTree::new(Arc::clone(&arena)));
+        let asked = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let loader = Counting(
+            TilesetLoader::new(arena, Arc::new(FsFetcher)),
+            Arc::clone(&asked),
+        );
+        let (mut stream, server) =
+            in_process_with(tree, Arc::new(loader), Config::default(), roomy()).expect("budget");
+        let server = server.with_clock(Arc::new(|| Micros(1)));
+        let mut server = Box::pin(server.run());
+        let mut consumer = Consumer::default();
+        look(&stream, near_view(), 1);
+        settle(&mut server, &mut stream, &mut consumer);
+        look(&stream, far_view(), 2);
+        settle(&mut server, &mut stream, &mut consumer);
+        let asked = asked.lock().expect("asked");
+        assert!(!asked.is_empty(), "nothing was asked");
+        let most = asked.values().copied().max().unwrap_or(0);
+        assert_eq!(most, 1, "a resource asked {most} times within one window");
     }
 
     /// **The loads in flight are ranked in the budget's order, and each
