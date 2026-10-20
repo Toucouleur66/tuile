@@ -30,7 +30,7 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "fs", "io-util", "time", "rt"] }
 tracing = { workspace = true }
-tuile-core = { version = "0.9.1", path = "../tuile-core" }
+tuile-core = { version = "0.9.2", path = "../tuile-core" }
 url = { workspace = true }
 
 [dev-dependencies]
