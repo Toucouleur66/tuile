@@ -128,11 +128,11 @@ struct Want {
     level: u32,
 }
 
-/// One wanted tile's need, merged.
-#[derive(Clone, Debug)]
-struct TileNeed {
+/// One wanted tile's need, merged: borrowed from the step's input.
+#[derive(Clone, Copy, Debug)]
+struct TileNeed<'a> {
     membership: Membership,
-    need: Need,
+    need: &'a Need,
     q: Quantised,
 }
 
@@ -156,7 +156,7 @@ enum Job {
     Deliver,
 }
 
-fn sort_key(n: &TileNeed) -> impl Ord + '_ {
+fn sort_key<'n>(n: &'n TileNeed<'_>) -> impl Ord + 'n {
     let img = n
         .need
         .imagery
@@ -445,12 +445,12 @@ impl Budget {
     }
 
     // 2. The need.
-    fn read_need(
+    fn read_need<'a>(
         &mut self,
-        input: &FrameInput<'_>,
+        input: &FrameInput<'a>,
         st: &mut BudgetStats,
-    ) -> BTreeMap<TileId, TileNeed> {
-        let mut tiles: BTreeMap<TileId, TileNeed> = BTreeMap::new();
+    ) -> BTreeMap<TileId, TileNeed<'a>> {
+        let mut tiles: BTreeMap<TileId, TileNeed<'a>> = BTreeMap::new();
         for (m, t, n) in input.need.entries() {
             let q = Quantised::of(n);
             if q.rejected {
@@ -458,13 +458,18 @@ impl Budget {
             }
             let cand = TileNeed {
                 membership: m,
-                need: n.clone(),
+                need: n,
                 q,
             };
-            match tiles.get(&t) {
-                Some(cur) if sort_key(cur) >= sort_key(&cand) => {}
-                _ => {
-                    tiles.insert(t, cand);
+            // The best wins; of equals, the first.
+            match tiles.entry(t) {
+                std::collections::btree_map::Entry::Vacant(v) => {
+                    v.insert(cand);
+                }
+                std::collections::btree_map::Entry::Occupied(mut o) => {
+                    if sort_key(o.get()) < sort_key(&cand) {
+                        o.insert(cand);
+                    }
                 }
             }
             self.tiles.insert(
@@ -505,7 +510,7 @@ impl Budget {
     /// (I14, I15). Batch takes the exact level, a function of the frame.
     fn drape_needs(
         &mut self,
-        tiles: &BTreeMap<TileId, TileNeed>,
+        tiles: &BTreeMap<TileId, TileNeed<'_>>,
         presence: &dyn PresenceOracle,
     ) -> BTreeMap<(TileId, LayerId), u32> {
         let mut out = BTreeMap::new();
@@ -561,7 +566,7 @@ impl Budget {
 
     /// Every floor tile the need lists is drawable with its floor drape
     /// of every layer it wears (P1.1), and the need lists one at least.
-    fn floor_in(&self, tiles: &BTreeMap<TileId, TileNeed>) -> bool {
+    fn floor_in(&self, tiles: &BTreeMap<TileId, TileNeed<'_>>) -> bool {
         let mut any = false;
         let all = tiles
             .iter()
@@ -744,7 +749,7 @@ impl Budget {
     /// ancestor.
     fn select(
         &self,
-        tiles: &BTreeMap<TileId, TileNeed>,
+        tiles: &BTreeMap<TileId, TileNeed<'_>>,
         drapes: &BTreeMap<(TileId, LayerId), u32>,
         ancestry: &[(TileId, TileId, u32)],
         cap: Option<u32>,
@@ -797,7 +802,7 @@ impl Budget {
     // 3. The draw set.
     fn build_draw(
         &self,
-        tiles: &BTreeMap<TileId, TileNeed>,
+        tiles: &BTreeMap<TileId, TileNeed<'_>>,
         drapes: &BTreeMap<(TileId, LayerId), u32>,
         floor_in: bool,
         st: &mut BudgetStats,
@@ -913,7 +918,7 @@ impl Budget {
     /// What the step wants loaded or delivered.
     fn wants(
         &self,
-        tiles: &BTreeMap<TileId, TileNeed>,
+        tiles: &BTreeMap<TileId, TileNeed<'_>>,
         drapes: &BTreeMap<(TileId, LayerId), u32>,
         draw: &DrawSet,
     ) -> BTreeMap<ResourceId, Want> {
@@ -1848,7 +1853,7 @@ impl Budget {
         &self,
         eff: &Eff,
         keys: &BTreeMap<ResourceId, PriorityKey>,
-        tiles: &BTreeMap<TileId, TileNeed>,
+        tiles: &BTreeMap<TileId, TileNeed<'_>>,
         drapes: &BTreeMap<(TileId, LayerId), u32>,
     ) -> UploadPlan {
         // Group: the blockers of one parent (meshes and drapes), else a
@@ -2175,7 +2180,7 @@ impl Budget {
     fn prune(
         &mut self,
         now: Micros,
-        tiles: &BTreeMap<TileId, TileNeed>,
+        tiles: &BTreeMap<TileId, TileNeed<'_>>,
         wants: &BTreeMap<ResourceId, Want>,
         drapes: &BTreeMap<(TileId, LayerId), u32>,
     ) -> u32 {
