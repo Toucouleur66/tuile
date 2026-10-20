@@ -30,8 +30,8 @@ use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use mp4_atom::{
-    Co64, Codec, Ctts, CttsEntry, Decode, Dinf, Dref, Edts, Elst, ElstEntry, Encode, FourCC,
-    Ftyp, Hdlr, Mdhd, Mdia, Minf, Moov, Mvhd, Pasp, Stbl, Stco, Stsc, StscEntry, Stsd, Stss, Stsz,
+    Co64, Codec, Ctts, CttsEntry, Decode, Dinf, Dref, Edts, Elst, ElstEntry, Encode, FourCC, Ftyp,
+    Hdlr, Mdhd, Mdia, Minf, Moov, Mvhd, Pasp, Stbl, Stco, Stsc, StscEntry, Stsd, Stss, Stsz,
     StszSamples, Stts, SttsEntry, Tkhd, Trak, Url, Vmhd,
 };
 
@@ -53,7 +53,12 @@ pub fn bt709() -> Colr {
 /// The sample entry with what a player should not have to guess: its colour
 /// ([`bt709`]) and square pixels, where the entry does not say otherwise.
 pub fn dressed(entry: Codec) -> Codec {
-    let pasp = || Some(Pasp { h_spacing: 1, v_spacing: 1 });
+    let pasp = || {
+        Some(Pasp {
+            h_spacing: 1,
+            v_spacing: 1,
+        })
+    };
     match entry {
         Codec::Avc1(mut e) => {
             e.colr = e.colr.or_else(|| Some(bt709()));
@@ -258,9 +263,7 @@ fn ftyp(entry: &Codec) -> Ftyp {
     Ftyp {
         major_brand: FourCC::new(b"isom"),
         minor_version: 512,
-        compatible_brands: [b"isom", b"iso2", codec, b"mp41"]
-            .map(FourCC::new)
-            .to_vec(),
+        compatible_brands: [b"isom", b"iso2", codec, b"mp41"].map(FourCC::new).to_vec(),
     }
 }
 
@@ -802,11 +805,23 @@ mod tests {
             panic!("avc1")
         };
         assert_eq!(entry.colr, Some(bt709()));
-        assert_eq!(entry.pasp, Some(Pasp { h_spacing: 1, v_spacing: 1 }));
-        assert!(entry.avcc.ext.is_some(), "a High profile record says its depth");
+        assert_eq!(
+            entry.pasp,
+            Some(Pasp {
+                h_spacing: 1,
+                v_spacing: 1
+            })
+        );
+        assert!(
+            entry.avcc.ext.is_some(),
+            "a High profile record says its depth"
+        );
         let at = stbl.co64.as_ref().expect("co64").entries[0] as usize;
         assert_eq!(&file[at..at + 6], [0, 0, 0, 2, 0x65, 0]);
-        assert!(stbl.ctts.is_none() && moov.trak[0].edts.is_none(), "nothing reordered");
+        assert!(
+            stbl.ctts.is_none() && moov.trak[0].edts.is_none(),
+            "nothing reordered"
+        );
         assert_eq!(moov.mvhd.duration, 67, "two frames at 30 fps, rounded");
         assert!(!dir.path().join("f.mp4.samples").exists());
         // Another reader of mp4 finds the same two samples.
@@ -836,8 +851,12 @@ mod tests {
             .collect();
         assert_eq!(shown, [0, 3, 1, 2]);
         assert_eq!(track.start, 512, "one frame decoded ahead");
-        let mut w = FilmWriter::create(dir.path().join("x.mp4"), avc1(64, 48, SPS, PPS).unwrap(), 30)
-            .expect("writer");
+        let mut w = FilmWriter::create(
+            dir.path().join("x.mp4"),
+            avc1(64, 48, SPS, PPS).unwrap(),
+            30,
+        )
+        .expect("writer");
         w.push(&[0], true, 0).unwrap();
         w.push(&[1], false, 0).unwrap();
         assert!(w.finish().is_err(), "a frame shown twice is refused");
@@ -848,7 +867,11 @@ mod tests {
     #[test]
     fn segments_join_into_one_film_that_plays_from_its_first_bytes() {
         let dir = tempfile::tempdir().expect("dir");
-        let a = written(dir.path(), "a.mp4", &[(0xa0, true, 0), (0xa1, false, 2), (0xa2, false, 1)]);
+        let a = written(
+            dir.path(),
+            "a.mp4",
+            &[(0xa0, true, 0), (0xa1, false, 2), (0xa2, false, 1)],
+        );
         let b = written(dir.path(), "b.mp4", &[(0xb0, true, 0), (0xb1, false, 1)]);
         let out = dir.path().join("film.mp4");
         assert_eq!(join(&[a.clone(), b], &out).expect("joined"), 5);
@@ -869,7 +892,11 @@ mod tests {
             .enumerate()
             .map(|(i, s)| (i as i64 * 512 + s.composition - track.start) / 512)
             .collect();
-        assert_eq!(shown, [0, 2, 1, 3, 4], "the second segment shown after the first");
+        assert_eq!(
+            shown,
+            [0, 2, 1, 3, 4],
+            "the second segment shown after the first"
+        );
         assert!((track.seconds() - 5.0 / 30.0).abs() < 1e-9);
 
         let other = dir.path().join("o.mp4");
@@ -901,7 +928,9 @@ mod tests {
             panic!("avc1")
         };
         assert_eq!(entry.colr, Some(bt709()));
-        let track = read_track(&mut std::io::Cursor::new(&film)).unwrap().unwrap();
+        let track = read_track(&mut std::io::Cursor::new(&film))
+            .unwrap()
+            .unwrap();
         let s = track.samples[1];
         assert_eq!(&film[s.offset as usize..][..6], [0, 0, 0, 2, 0x41, 8]);
     }
@@ -926,12 +955,17 @@ mod tests {
             .expect("writer");
         w.push(&[0, 0, 0, 2, 0x26, 0x01], true, 0).expect("push");
         w.finish().expect("finish");
-        let track = read_track(&mut File::open(&path).unwrap()).unwrap().unwrap();
+        let track = read_track(&mut File::open(&path).unwrap())
+            .unwrap()
+            .unwrap();
         let Codec::Hvc1(entry) = &track.entry else {
             panic!("hvc1")
         };
         assert!(entry.lhvc.is_none());
-        assert_eq!(entry.hvcc.general_profile_idc, apple.hvcc.general_profile_idc);
+        assert_eq!(
+            entry.hvcc.general_profile_idc,
+            apple.hvcc.general_profile_idc
+        );
         assert_eq!(entry.colr, Some(bt709()));
         assert_eq!(track.width_height(), Some((1920, 1080)));
     }

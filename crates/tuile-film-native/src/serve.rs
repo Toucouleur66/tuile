@@ -873,29 +873,47 @@ mod tests {
         let dir = tempfile::tempdir().expect("dir");
         std::fs::write(dir.path().join("catalog.json"), br#"{"layers": []}"#).expect("catalog");
         let tuning = tuile_farm::Tuning::default;
-        let runs = Arc::new(ObjectRunStore::local(&dir.path().join("runs"), tuning()).expect("store"));
+        let runs =
+            Arc::new(ObjectRunStore::local(&dir.path().join("runs"), tuning()).expect("store"));
         let mezzanine =
             Arc::new(ObjectRunStore::local(&dir.path().join("mezz"), tuning()).expect("store"));
         let tiles: Arc<dyn tuile_repository::Objects> =
             Arc::new(ObjectRunStore::local(dir.path(), tuning()).expect("store"));
-        let mut service = Service::new(runs.clone(), tiles, dir.path().join("cache"), Limits::default());
+        let mut service = Service::new(
+            runs.clone(),
+            tiles,
+            dir.path().join("cache"),
+            Limits::default(),
+        );
         service.mezzanine = Some(mezzanine.clone());
         let keys = RunKeys::new("1557732/20261020T1000Z-ab12", "video-9-run");
         let scratch = dir.path().join("scratch");
         std::fs::create_dir_all(&scratch).expect("scratch");
         for (task, first, last) in [(0u32, 1u64, 3u64), (1, 4, 5)] {
             let segment = scratch.join(format!("{task}.mp4"));
-            let entry = tuile_mp4::film::avc1(64, 48, &[0x67, 0x64, 0, 0x28], &[0x68]).expect("entry");
+            let entry =
+                tuile_mp4::film::avc1(64, 48, &[0x67, 0x64, 0, 0x28], &[0x68]).expect("entry");
             let mut w = tuile_mp4::film::FilmWriter::create(&segment, entry, 30).expect("writer");
             for i in 0..(last + 1 - first) {
-                w.push(&[0, 0, 0, 2, 0x65, i as u8], i == 0, i).expect("push");
+                w.push(&[0, 0, 0, 2, 0x65, i as u8], i == 0, i)
+                    .expect("push");
             }
             w.finish().expect("finish");
-            mezzanine.put(&segment, &keys.segment(u64::from(task))).await.expect("segment");
+            mezzanine
+                .put(&segment, &keys.segment(u64::from(task)))
+                .await
+                .expect("segment");
             let receipt = scratch.join(format!("{task}.json"));
-            let r = Receipt { task, first, last, segments: vec![u64::from(task)] };
+            let r = Receipt {
+                task,
+                first,
+                last,
+                segments: vec![u64::from(task)],
+            };
             std::fs::write(&receipt, serde_json::to_vec(&r).expect("json")).expect("receipt");
-            runs.put(&receipt, &keys.receipt(task)).await.expect("receipt");
+            runs.put(&receipt, &keys.receipt(task))
+                .await
+                .expect("receipt");
         }
         let order: CompressOrder = serde_json::from_value(serde_json::json!({
             "run": "1557732/20261020T1000Z-ab12", "render_id": "video-9-run", "chunks": 2,
@@ -908,7 +926,11 @@ mod tests {
         assert_eq!(done.frames, 5);
         assert!(runs.exists(&done.key).await.expect("exists"));
         let refused = service
-            .compress(&CompressOrder { chunks: 3, delivery: Delivery::Copy, ..order })
+            .compress(&CompressOrder {
+                chunks: 3,
+                delivery: Delivery::Copy,
+                ..order
+            })
             .await
             .expect_err("a chunk missing");
         assert!(refused.to_string().contains("not all in"), "{refused}");

@@ -44,11 +44,14 @@ fn probe(path: &Path) -> Result<String, Error> {
         }
         at += size;
     }
-    let track = tuile_mp4::film::read_track(&mut std::io::Cursor::new(&bytes))?
-        .ok_or("no video track")?;
+    let track =
+        tuile_mp4::film::read_track(&mut std::io::Cursor::new(&bytes))?.ok_or("no video track")?;
     let (codec, depth, colr) = match &track.entry {
         tuile_mp4::film::Entry::Avc1(e) => (
-            format!("H.264 profile {} level {}", e.avcc.avc_profile_indication, e.avcc.avc_level_indication),
+            format!(
+                "H.264 profile {} level {}",
+                e.avcc.avc_profile_indication, e.avcc.avc_level_indication
+            ),
             e.avcc.ext.as_ref().map_or(8, |x| x.bit_depth_luma),
             e.colr.clone(),
         ),
@@ -57,12 +60,20 @@ fn probe(path: &Path) -> Result<String, Error> {
                 "HEVC profile {} level {}{}",
                 e.hvcc.general_profile_idc,
                 e.hvcc.general_level_idc,
-                if e.lhvc.is_some() { ", two layers (MV-HEVC)" } else { "" }
+                if e.lhvc.is_some() {
+                    ", two layers (MV-HEVC)"
+                } else {
+                    ""
+                }
             ),
             e.hvcc.bit_depth_luma_minus8 + 8,
             e.colr.clone(),
         ),
-        tuile_mp4::film::Entry::Av01(e) => ("AV1".to_string(), if e.av1c.high_bitdepth { 10 } else { 8 }, e.colr.clone()),
+        tuile_mp4::film::Entry::Av01(e) => (
+            "AV1".to_string(),
+            if e.av1c.high_bitdepth { 10 } else { 8 },
+            e.colr.clone(),
+        ),
         _ => ("other".to_string(), 0, None),
     };
     let (w, h) = track.width_height().unwrap_or((0, 0));
@@ -70,10 +81,9 @@ fn probe(path: &Path) -> Result<String, Error> {
     let keys = track.samples.iter().filter(|s| s.key).count();
     let seconds = track.seconds();
     let reordered = track.samples.iter().any(|s| s.composition != 0);
-    let fps = track
-        .samples
-        .first()
-        .map_or(0.0, |s| f64::from(track.timescale) / f64::from(s.duration.max(1)));
+    let fps = track.samples.first().map_or(0.0, |s| {
+        f64::from(track.timescale) / f64::from(s.duration.max(1))
+    });
     Ok(format!(
         "{}: {:.1} MB, boxes {}{}\n  {codec}, {w}×{h}, {depth} bits, colour {}\n  {frames} frames at {fps:.2} fps, {seconds:.3} s, {keys} key frames (one every {:.2} s), {:.2} Mb/s{}",
         path.display(),
@@ -132,7 +142,9 @@ async fn run(args: &[String]) -> Result<(), Error> {
     let mut fps = None;
     let mut words = rest.iter();
     while let Some(word) = words.next() {
-        let value = words.next().ok_or_else(|| format!("{word} needs a value"))?;
+        let value = words
+            .next()
+            .ok_or_else(|| format!("{word} needs a value"))?;
         match word.as_str() {
             "--cap-mb" => cap = Some((value.parse::<f64>()? * 1e6) as u64),
             "--fps" => fps = Some(value.parse::<u32>()?),
@@ -171,7 +183,8 @@ async fn run(args: &[String]) -> Result<(), Error> {
         .ok()
         .and_then(|d| d.parse().ok())
         .unwrap_or(0);
-    let done = tuile_film_native::compress::compress(&local_in, &local_out, &delivery, fps, device)?;
+    let done =
+        tuile_film_native::compress::compress(&local_in, &local_out, &delivery, fps, device)?;
     println!(
         "{}: {} frames, {:.1} MB, {} pass(es), {:.1} s",
         delivery.key(),
@@ -196,7 +209,10 @@ async fn run(args: &[String]) -> Result<(), Error> {
 fn main() -> ExitCode {
     dotenvy::dotenv().ok();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
         Ok(runtime) => runtime,
         Err(e) => {
             eprintln!("tuile-film-compress: runtime: {e}");

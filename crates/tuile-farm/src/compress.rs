@@ -387,7 +387,10 @@ mod tests {
     fn a_delivery_is_named_and_keyed_by_its_version() {
         let web = Delivery::named("h264", Some(100_000_000)).expect("h264");
         assert_eq!(web.key(), "h264-v1");
-        assert_eq!(film_key("1557732/20261020T1012Z-ab12/", &web), "1557732/20261020T1012Z-ab12/films/h264-v1.mp4");
+        assert_eq!(
+            film_key("1557732/20261020T1012Z-ab12/", &web),
+            "1557732/20261020T1012Z-ab12/films/h264-v1.mp4"
+        );
         assert_eq!(Delivery::named("copy", None), Some(Delivery::Copy));
         assert_eq!(Delivery::named("av1", None), None);
         let order: CompressOrder = serde_json::from_value(serde_json::json!({
@@ -396,10 +399,17 @@ mod tests {
         }))
         .expect("an order");
         assert_eq!((order.segments, order.out.clone()), (Store::Run, None));
-        let again: CompressOrder =
-            serde_json::from_str(&serde_json::to_string(&CompressOrder { delivery: web, ..order }).unwrap())
-                .unwrap();
-        assert!(matches!(again.delivery, Delivery::Encode { ref profile } if profile.size_cap_bytes == Some(100_000_000)));
+        let again: CompressOrder = serde_json::from_str(
+            &serde_json::to_string(&CompressOrder {
+                delivery: web,
+                ..order
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            matches!(again.delivery, Delivery::Encode { ref profile } if profile.size_cap_bytes == Some(100_000_000))
+        );
     }
 
     #[test]

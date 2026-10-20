@@ -187,10 +187,7 @@ impl Muxer {
                 Writer::Avc(writer, sets)
             }
         };
-        Ok(Self {
-            writer,
-            next: 0,
-        })
+        Ok(Self { writer, next: 0 })
     }
 
     /// Fails unless a slice encoded as `codec` can join this film: the same

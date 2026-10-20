@@ -113,7 +113,7 @@ pub fn concat(segments: &[PathBuf], out: &Path) -> Result<u64, ConcatError> {
     concat_into(segments, out, false)
 }
 
-/// [`concat`], each segment's file removed once it is copied when `consume`
+/// [`concat()`], each segment's file removed once it is copied when `consume`
 /// is set ([`tuile_mp4::film::join_into`]).
 pub fn concat_into(segments: &[PathBuf], out: &Path, consume: bool) -> Result<u64, ConcatError> {
     if segments.is_empty() {
@@ -284,7 +284,11 @@ mod tests {
         let bytes = std::fs::read(&out).expect("film");
         assert_eq!(&bytes[4..8], b"ftyp");
         let ftyp = u32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
-        assert_eq!(&bytes[ftyp + 4..ftyp + 8], b"moov", "the index before the pictures");
+        assert_eq!(
+            &bytes[ftyp + 4..ftyp + 8],
+            b"moov",
+            "the index before the pictures"
+        );
         let track = tuile_mp4::film::read_track(&mut std::io::Cursor::new(&bytes))
             .expect("read")
             .expect("track");

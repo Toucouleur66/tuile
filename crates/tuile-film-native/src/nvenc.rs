@@ -122,7 +122,11 @@ impl Input {
         let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
         // Each plane: its rows' bytes, its rows, and the pitch they go at.
         let planes: Vec<(usize, usize, usize)> = match self {
-            Input::Iyuv => vec![(width, height, pitch), (cw, ch, pitch / 2), (cw, ch, pitch / 2)],
+            Input::Iyuv => vec![
+                (width, height, pitch),
+                (cw, ch, pitch / 2),
+                (cw, ch, pitch / 2),
+            ],
             Input::Nv12 => vec![(width, height, pitch), (2 * cw, ch, pitch)],
             Input::P010 => vec![(2 * width, height, pitch), (4 * cw, ch, pitch)],
         };
@@ -134,7 +138,8 @@ impl Input {
         let (mut from, mut to) = (0, 0);
         for (row, rows, p) in planes {
             for r in 0..rows {
-                out[to + r * p..to + r * p + row].copy_from_slice(&tight[from + r * row..from + (r + 1) * row]);
+                out[to + r * p..to + r * p + row]
+                    .copy_from_slice(&tight[from + r * row..from + (r + 1) * row]);
             }
             from += row * rows;
             to += p * rows;
@@ -177,7 +182,13 @@ pub struct Spec {
 impl Spec {
     /// A profile's spec for a `width`×`height` film at `fps`, its pictures
     /// handed as `input`; `rate` in place of the profile's own.
-    pub fn of(profile: &Profile, input: Input, size: (usize, usize), fps: u32, rate: Option<Rate>) -> Self {
+    pub fn of(
+        profile: &Profile,
+        input: Input,
+        size: (usize, usize),
+        fps: u32,
+        rate: Option<Rate>,
+    ) -> Self {
         let (_, max) = profile.bitrates(size.0 as u32, size.1 as u32, f64::from(fps));
         Self {
             out: match profile.codec {
@@ -486,7 +497,11 @@ pub fn encode(
             };
             let result = session.encode_picture(&mut inputs[slot], &mut outputs[slot], params);
             if frame.shown < 3 {
-                step(&format!("picture {}: {:?}", frame.shown, result.as_ref().err().map(|e| e.kind())));
+                step(&format!(
+                    "picture {}: {:?}",
+                    frame.shown,
+                    result.as_ref().err().map(|e| e.kind())
+                ));
             }
             match result {
                 // Asked for more input, or not: either way the picture is
@@ -546,7 +561,12 @@ pub struct Package {
 }
 
 impl Package {
-    pub fn at(path: impl Into<PathBuf>, out: Out, size: (usize, usize), fps: u32) -> Result<Self, String> {
+    pub fn at(
+        path: impl Into<PathBuf>,
+        out: Out,
+        size: (usize, usize),
+        fps: u32,
+    ) -> Result<Self, String> {
         Ok(Self {
             path: path.into(),
             out,
@@ -566,19 +586,30 @@ impl Package {
             Out::H264 => {
                 if self.writer.is_none() {
                     let units = nal_units(data);
-                    let of = |kind: u8| units.iter().find(|u| u.first().is_some_and(|b| b & 0x1f == kind)).map(|u| u.to_vec());
+                    let of = |kind: u8| {
+                        units
+                            .iter()
+                            .find(|u| u.first().is_some_and(|b| b & 0x1f == kind))
+                            .map(|u| u.to_vec())
+                    };
                     let (sps, pps) = of(7)
                         .zip(of(8))
                         .ok_or("NVENC: the first picture carries no parameter sets")?;
-                    self.open(tuile_mp4::film::avc1(width, height, &sps, &pps).map_err(|e| e.to_string())?)?;
+                    self.open(
+                        tuile_mp4::film::avc1(width, height, &sps, &pps)
+                            .map_err(|e| e.to_string())?,
+                    )?;
                 }
                 annex_b_to_avcc(data)
             }
             Out::Hevc => {
                 let (parameters, units) = tuile_mp4::spatial::entry_units(data);
                 if self.writer.is_none() {
-                    let record = tuile_mp4::spatial::hevc_record(&parameters).map_err(|e| format!("NVENC: {e}"))?;
-                    self.open(tuile_mp4::film::hvc1(width, height, &record).map_err(|e| e.to_string())?)?;
+                    let record = tuile_mp4::spatial::hevc_record(&parameters)
+                        .map_err(|e| format!("NVENC: {e}"))?;
+                    self.open(
+                        tuile_mp4::film::hvc1(width, height, &record).map_err(|e| e.to_string())?,
+                    )?;
                 }
                 let mut sample = Vec::with_capacity(data.len());
                 for unit in units {
@@ -594,7 +625,9 @@ impl Package {
                         .find(|(kind, _)| *kind == 1)
                         .and_then(|(_, header)| av1c_of(header))
                         .ok_or("NVENC: the first picture carries no sequence header this reads")?;
-                    self.open(tuile_mp4::film::av01(width, height, &record).map_err(|e| e.to_string())?)?;
+                    self.open(
+                        tuile_mp4::film::av01(width, height, &record).map_err(|e| e.to_string())?,
+                    )?;
                 }
                 // The binding says a sample does not carry the temporal
                 // delimiter an encoder heads each unit with.
@@ -608,7 +641,8 @@ impl Package {
     }
 
     fn open(&mut self, entry: tuile_mp4::film::Entry) -> Result<(), String> {
-        self.writer = Some(FilmWriter::create(&self.path, entry, self.fps).map_err(|e| e.to_string())?);
+        self.writer =
+            Some(FilmWriter::create(&self.path, entry, self.fps).map_err(|e| e.to_string())?);
         Ok(())
     }
 
@@ -1095,14 +1129,39 @@ mod tests {
         let mezzanine = NvencFilm::at("m.mp4", 0, NvencCodec::Mezzanine)
             .spec((1920, 1080), 30)
             .expect("spec");
-        assert_eq!((mezzanine.out, mezzanine.bit_depth, mezzanine.input), (Out::Hevc, 10, Input::Iyuv));
+        assert_eq!(
+            (mezzanine.out, mezzanine.bit_depth, mezzanine.input),
+            (Out::Hevc, 10, Input::Iyuv)
+        );
         assert_eq!(mezzanine.gop, 30);
-        assert!(matches!(mezzanine.rate, Rate::Quality { max: 60_000_000, .. }));
-        let mobile = NvencFilm::at("w.mp4", 0, NvencCodec::H264).spec((720, 1280), 30).expect("spec");
-        assert_eq!(mobile.rate, Rate::Vbr { average: 3_000_000, max: 5_000_000 });
+        assert!(matches!(
+            mezzanine.rate,
+            Rate::Quality {
+                max: 60_000_000,
+                ..
+            }
+        ));
+        let mobile = NvencFilm::at("w.mp4", 0, NvencCodec::H264)
+            .spec((720, 1280), 30)
+            .expect("spec");
+        assert_eq!(
+            mobile.rate,
+            Rate::Vbr {
+                average: 3_000_000,
+                max: 5_000_000
+            }
+        );
         assert_eq!(mobile.b_frames, 3);
-        let asked = NvencFilm::at("w.mp4", 45_000_000, NvencCodec::H264).spec((3840, 2160), 30).expect("spec");
-        assert_eq!(asked.rate, Rate::Vbr { average: 45_000_000, max: 90_000_000 });
+        let asked = NvencFilm::at("w.mp4", 45_000_000, NvencCodec::H264)
+            .spec((3840, 2160), 30)
+            .expect("spec");
+        assert_eq!(
+            asked.rate,
+            Rate::Vbr {
+                average: 45_000_000,
+                max: 90_000_000
+            }
+        );
         let mut h264 = asked.clone();
         h264.input = Input::P010;
         // SAFETY: a config of plain values; all zero is a valid one.

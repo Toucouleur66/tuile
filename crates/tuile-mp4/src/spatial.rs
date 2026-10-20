@@ -501,7 +501,10 @@ mod tests {
         // during a film, so each segment says a little another.
         segment(&b, 0xb, 5, 10_000_000, 72_269);
         let out = dir.path().join("film.mp4");
-        assert_eq!(crate::film::join(&[a.clone(), b.clone()], &out).expect("joined"), 11);
+        assert_eq!(
+            crate::film::join(&[a.clone(), b.clone()], &out).expect("joined"),
+            11
+        );
 
         let mut film = std::fs::File::open(&out).expect("film");
         let track = crate::film::read_track(&mut film)
@@ -531,7 +534,9 @@ mod tests {
             "each segment's key frames, where they were"
         );
         let mut one = std::fs::File::open(&a).expect("a");
-        let alone = crate::film::read_track(&mut one).expect("read").expect("spatial");
+        let alone = crate::film::read_track(&mut one)
+            .expect("read")
+            .expect("spatial");
         assert_eq!(
             &track.samples[..6]
                 .iter()
