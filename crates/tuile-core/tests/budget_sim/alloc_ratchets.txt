@@ -1,0 +1,3 @@
+still-internal-allocs-per-step 6492
+motion-internal-allocs-per-step-p99 7255
+bytes-per-tracked-resource 550

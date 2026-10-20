@@ -49,6 +49,12 @@ tempfile = { workspace = true }
 # The budget's properties (protection, total order, ledger, determinism,
 # cancellation) over random need and arrival sequences.
 proptest = { workspace = true }
+# What one budget `decide` costs, mean and percentiles (`benches/budget_decide.rs`).
+criterion = { workspace = true }
+
+[[bench]]
+name = "budget_decide"
+harness = false
 
 [features]
 default = []

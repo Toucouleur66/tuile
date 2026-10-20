@@ -10,7 +10,7 @@ use super::server::{Profile, Sim};
 use super::world::{Camera, SIDE};
 
 /// A tour that orbits, pans, zooms and turns, looping every four minutes.
-fn tour(t: f64) -> Camera {
+pub fn tour(t: f64) -> Camera {
     let u = t % 240.0;
     let base = Camera {
         x: 0.62 * SIDE,
