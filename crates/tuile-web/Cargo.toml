@@ -20,8 +20,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
 
-tuile-core = { version = "0.9.2", path = "../tuile-core" }
-tuile-cesium-ion = { version = "0.9.2", path = "../tuile-cesium-ion" }
+tuile-core = { version = "0.10.0", path = "../tuile-core" }
+tuile-cesium-ion = { version = "0.10.0", path = "../tuile-cesium-ion" }
 
 # The browser is the only target this crate has: everything below exists solely
 # there, and building it for a native host would produce a library that cannot
