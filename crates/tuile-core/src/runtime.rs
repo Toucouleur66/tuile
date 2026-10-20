@@ -869,16 +869,20 @@ impl State {
                 let released = self.budget.release_beyond(Bytes(bytes));
                 self.events.push(BudgetEvent::ReleaseBeyond(
                     Bytes(bytes),
-                    released.len() as u32,
+                    released.gpu.len() as u32,
                 ));
-                if !released.is_empty() {
+                // Let go whole: the decoded copy goes with the consumer's.
+                for r in &released.decoded {
+                    self.decoded.remove(r);
+                }
+                if !released.gpu.is_empty() {
                     crate::metrics::metrics()
                         .tiles_evicted
-                        .add(released.len() as u64);
+                        .add(released.gpu.len() as u64);
                     // A send to a consumer that has gone is noticed at the
                     // next step, which stops the session.
                     let _ = tx.unbounded_send(ServerMessage::Evict {
-                        resources: released,
+                        resources: released.gpu,
                     });
                 }
                 return false;

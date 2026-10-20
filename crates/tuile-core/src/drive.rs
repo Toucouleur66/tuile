@@ -89,6 +89,12 @@ impl SceneState {
         self.started && (self.frame_ready || self.converged)
     }
 
+    /// Whether the last `Select` said the frame is ready: every mesh and
+    /// drape it draws held (batch, I13).
+    pub fn frame_ready(&self) -> bool {
+        self.started && self.frame_ready
+    }
+
     /// What to draw: the last draw set.
     pub fn draw(&self) -> &DrawSet {
         &self.draw
@@ -151,18 +157,27 @@ impl BulkFrame {
 }
 
 /// A mesh's content wearing a draw item's drapes, as layers in its own uv
-/// square. Shared by every consumer that composes on the CPU.
+/// square, above any imagery the mesh carries itself (a loader that drapes
+/// its meshes). Shared by every consumer that composes on the CPU.
+///
+/// A worn drape that was **withheld** — its tiles never fetched, because
+/// the consumer said it holds the composed drape — names itself in
+/// [`DecodedTileContent::withheld_drape`]: the consumer must resolve it.
+/// Only a tile's own drape (identity uv) can be named so; the composed
+/// drape a consumer holds is a whole tile's.
 pub fn dress(
     mesh: &DecodedTileContent,
     item: &crate::budget::DrawItem,
     drapes: &HashMap<ResourceId, Arc<DrapeContent>>,
 ) -> DecodedTileContent {
     let mut content = mesh.clone();
-    content.imagery.clear();
     for choice in &item.drapes {
         let Some(drape) = drapes.get(&choice.resource) else {
             continue;
         };
+        if drape.withheld && choice.uv == crate::budget::UvTransform::IDENTITY {
+            content.withheld_drape = Some(drape.identity);
+        }
         content
             .imagery
             .extend(drape.tiles.iter().filter_map(|l| l.through(choice.uv)));
@@ -313,6 +328,102 @@ mod tests {
             dvec2(1024.0, 768.0),
             std::f64::consts::FRAC_PI_3,
         )
+    }
+
+    fn bare_content() -> DecodedTileContent {
+        DecodedTileContent {
+            meshes: Vec::new(),
+            textures: Vec::new(),
+            imagery: Vec::new(),
+            withheld_drape: None,
+            local_origin_ecef: glam::DVec3::ZERO,
+            transform_local: glam::Mat4::IDENTITY,
+        }
+    }
+
+    fn imagery_tile(x: u64) -> crate::raster::ImageryLayer {
+        let rect = crate::raster::GeoRect {
+            west: 0.0,
+            south: 0.0,
+            east: 1.0,
+            north: 1.0,
+        };
+        crate::raster::ImageryLayer::placed(
+            crate::raster::ImageryCoord { level: 3, x, y: 0 },
+            Arc::new(crate::content::DecodedTexture {
+                width: 1,
+                height: 1,
+                rgba8: vec![0, 0, 0, 255],
+            }),
+            &rect,
+            &rect,
+        )
+    }
+
+    fn worn(
+        tile: TileId,
+        drape: &DrapeContent,
+    ) -> (
+        crate::budget::DrawItem,
+        HashMap<ResourceId, Arc<DrapeContent>>,
+    ) {
+        let resource = ResourceId::drape(tile, drape.layer, drape.level);
+        let item = crate::budget::DrawItem {
+            mesh: ResourceId::Mesh(tile),
+            role: Role::Exact,
+            drapes: vec![crate::budget::DrapeChoice {
+                resource,
+                layer: drape.layer,
+                level: drape.level,
+                uv: crate::budget::UvTransform::IDENTITY,
+            }],
+            serves: vec![tile],
+        };
+        (item, HashMap::from([(resource, Arc::new(drape.clone()))]))
+    }
+
+    /// **Dressing adds the drapes a mesh wears to what it carries**: a
+    /// loader that drapes its meshes itself keeps its imagery, under the
+    /// worn drapes — clearing it left such a mesh bare.
+    #[test]
+    fn dressing_keeps_the_imagery_a_mesh_carries() {
+        let tile = TileId(7);
+        let mut mesh = bare_content();
+        mesh.imagery.push(imagery_tile(0));
+        let drape = DrapeContent {
+            layer: crate::budget::LayerId(0),
+            level: 3,
+            tiles: vec![imagery_tile(1)],
+            floor_tiles: 0,
+            identity: 11,
+            withheld: false,
+        };
+        let (item, drapes) = worn(tile, &drape);
+        let dressed = dress(&mesh, &item, &drapes);
+        let coords: Vec<u64> = dressed.imagery.iter().map(|l| l.coord.x).collect();
+        assert_eq!(coords, vec![0, 1]);
+        assert_eq!(dressed.withheld_drape, None);
+    }
+
+    /// **A worn drape that was withheld names itself on the dressed mesh**:
+    /// its tiles were never fetched because the consumer holds the composed
+    /// drape, and a dressed mesh with no imagery and no name would be bare
+    /// ground nobody is told about.
+    #[test]
+    fn a_withheld_drape_names_itself_on_the_dressed_mesh() {
+        let tile = TileId(7);
+        let drape = DrapeContent {
+            layer: crate::budget::LayerId(0),
+            level: 3,
+            tiles: Vec::new(),
+            floor_tiles: 0,
+            identity: 0xfeed,
+            withheld: true,
+        };
+        let (item, drapes) = worn(tile, &drape);
+        let dressed = dress(&bare_content(), &item, &drapes);
+        assert!(dressed.imagery.is_empty());
+        assert_eq!(dressed.withheld_drape, Some(0xfeed));
     }
 
     #[test]

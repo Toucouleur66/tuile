@@ -2164,17 +2164,19 @@ impl Budget {
         visited
     }
 
-    pub(super) fn release_beyond_impl(&mut self, target: Bytes) -> Vec<ResourceId> {
+    pub(super) fn release_beyond_impl(&mut self, target: Bytes) -> super::Released {
         let total = |l: &Ledger| {
             Class::ALL
                 .iter()
                 .fold(Bytes::ZERO, |a, &c| a.plus(l.gpu[c]))
         };
+        // Whatever holds a copy — on the GPU, or only decoded (a copy an
+        // earlier release or sweep demoted) — and was not needed last.
         let mut cands: Vec<_> = self
             .entries
             .iter()
             .filter(|(r, e)| {
-                e.gpu.is_some()
+                (e.gpu.is_some() || e.cpu.is_some())
                     && e.transit.is_none()
                     && !self.wanted_last.contains(r)
                     && !self.is_floor(e.level)
@@ -2187,14 +2189,19 @@ impl Budget {
             })
             .collect();
         cands.sort();
-        let mut out = Vec::new();
+        let mut out = super::Released::default();
         for (_, r) in cands {
-            if total(&self.ledger) <= target {
+            if total(&self.ledger) <= target && self.ledger.decoded <= target {
                 break;
             }
             if let Some(e) = self.entries.get_mut(&r) {
-                e.take_gpu(&mut self.ledger);
-                out.push(r);
+                // Whole: both copies, in one place in the one order.
+                if e.take_gpu(&mut self.ledger).is_some() {
+                    out.gpu.push(r);
+                }
+                if e.take_cpu(&mut self.ledger).is_some() {
+                    out.decoded.push(r);
+                }
             }
         }
         out

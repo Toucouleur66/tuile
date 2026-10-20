@@ -102,6 +102,15 @@ pub struct Ledger {
     pub in_transit: Bytes,
 }
 
+/// What [`Budget::release_beyond`] let go of.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Released {
+    /// The GPU copies the consumer drops (announced as `Evict`).
+    pub gpu: Vec<ResourceId>,
+    /// The decoded copies the session drops from its decoded tier.
+    pub decoded: Vec<ResourceId>,
+}
+
 /// An arrival, recorded between steps and applied at the next one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Event {
@@ -307,10 +316,13 @@ impl Budget {
         self.thermal = t;
     }
 
-    /// Batch, between frames: evicts what the last step did not need, in
-    /// eviction order, until the GPU holds at most `target` bytes. Returns
-    /// the GPU copies to drop. Deterministic.
-    pub fn release_beyond(&mut self, target: Bytes) -> Vec<ResourceId> {
+    /// Batch, between frames: lets go of what the last step did not need,
+    /// in eviction order, until the GPU and the decoded tier each hold at
+    /// most `target` bytes. Each resource let go is let go whole, both its
+    /// copies: a batch's decoded target is unbounded, so a copy left there
+    /// would never go, and an in-process consumer's copy is the allocation
+    /// the decoded one shares. Deterministic.
+    pub fn release_beyond(&mut self, target: Bytes) -> Released {
         self.release_beyond_impl(target)
     }
 
