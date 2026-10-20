@@ -152,10 +152,25 @@ const SIGNALS_EVERY_MS: i32 = 500;
 /// published new ones, for its overlay.
 fn tell_the_page_the_budget() {
     let last: std::rc::Rc<std::cell::RefCell<Option<Glance>>> = std::rc::Rc::default();
+    let steps = std::cell::Cell::new(0u64);
     let tick = Closure::<dyn FnMut()>::new(move || {
         let Some(signals) = tuile_core::metrics::budget() else {
             return;
         };
+        // Where the worker's one thread goes, for its console: the budget's
+        // decisions share it with every fetch and decode reply.
+        if signals.decide_micros.count != steps.get() {
+            let d = &signals.decide_micros;
+            let n = d.count.saturating_sub(steps.replace(d.count));
+            tracing::info!(
+                steps = n,
+                decide_mean_ms = d.sum as f64 / d.count.max(1) as f64 / 1000.0,
+                decide_p99_ms = d.quantile_upper(990) as f64 / 1000.0,
+                decide_peak_ms = signals.decide_peak_micros as f64 / 1000.0,
+                completions = signals.completions_total,
+                "the budget's steps"
+            );
+        }
         let glance = Glance::of(&signals);
         if last.borrow().as_ref() != Some(&glance) {
             post(&ToPage::Signals {

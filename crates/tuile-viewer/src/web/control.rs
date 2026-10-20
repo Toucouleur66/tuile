@@ -75,6 +75,8 @@ pub(crate) struct Glance {
     pub local_reads: u32,
     pub evictions_total: [[u64; 4]; 4],
     pub uploads_total: [u64; 4],
+    pub cancels_total: [u64; 3],
+    pub failures_total: [[u64; 2]; 4],
     pub drawn_tiles: [u32; 3],
     pub lost_tiles: u32,
     pub bare_items: u32,
@@ -96,6 +98,8 @@ impl Glance {
             local_reads: s.local_reads,
             evictions_total: s.evictions_total.0,
             uploads_total: s.uploads_total.0,
+            cancels_total: s.cancels_total,
+            failures_total: s.failures_total.0,
             drawn_tiles: s.drawn_tiles,
             lost_tiles: s.lost_tiles,
             bare_items: s.bare_items,
@@ -118,6 +122,8 @@ impl Glance {
         s.local_reads = self.local_reads;
         s.evictions_total = PerClass(self.evictions_total);
         s.uploads_total = PerClass(self.uploads_total);
+        s.cancels_total = self.cancels_total;
+        s.failures_total = PerClass(self.failures_total);
         s.drawn_tiles = self.drawn_tiles;
         s.lost_tiles = self.lost_tiles;
         s.bare_items = self.bare_items;

@@ -78,6 +78,13 @@ pub(crate) struct Profile {
     /// density 2; a phone's ⅔, the same 2 at its density 3. A window moved
     /// between displays then asks for nothing new.
     pub sse_threshold: f64,
+    /// How long one load may take before the budget cancels and retries it,
+    /// seconds: the budget's `load_timeout`. A desktop's 4 s; a page's
+    /// longer, its loads crossing a proxy and waiting on a few decode
+    /// workers — at 4 s a browser cancelled two hundred loads in forty
+    /// seconds that would have landed, and the ground near the eye never
+    /// sharpened.
+    pub load_timeout_s: f64,
     /// Threads of the async runtime: network, store, the server.
     pub runtime_workers: usize,
     /// Its blocking pool: the store's file I/O.
@@ -134,6 +141,7 @@ impl Profile {
             max_local_reads: 32,
             imagery_over_terrain_cap: 2,
             sse_threshold: 1.0,
+            load_timeout_s: 4.0,
             runtime_workers: cores,
             blocking_threads: 512,
             decode_threads: cores.saturating_sub(1).max(1),
@@ -166,6 +174,7 @@ impl Profile {
             // The low clamp drapes one level over its terrain, the rest two.
             imagery_over_terrain_cap: if gpu_bytes <= 192 * MIB { 1 } else { 2 },
             sse_threshold: 2.0 / 3.0,
+            load_timeout_s: 4.0,
             runtime_workers: 2,
             blocking_threads: 4,
             // Leave the main thread and the runtime a core each.
@@ -222,6 +231,8 @@ impl Profile {
         Self {
             gpu_bytes: base.gpu_bytes.min(ceiling),
             max_local_reads: 8,
+            // `tuile_web::patience::LOAD_ATTEMPT_TIMEOUT` is the same.
+            load_timeout_s: 30.0,
             runtime_workers: 1,
             blocking_threads: 1,
             decode_threads: 1,
@@ -264,6 +275,7 @@ impl Profile {
         b.pinned_level = Some(self.pinned_level);
         b.max_local_reads = self.max_local_reads;
         b.imagery_over_terrain_cap = self.imagery_over_terrain_cap;
+        b.load_timeout = tuile_core::budget::Micros((self.load_timeout_s * 1e6) as u64);
         b
     }
 

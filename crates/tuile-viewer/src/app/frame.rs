@@ -623,15 +623,23 @@ impl fmt::Display for BudgetLine {
             .iter()
             .map(|(_, e)| e.iter().sum::<u64>())
             .sum();
+        let failed: u64 = s
+            .failures_total
+            .iter()
+            .map(|(_, f)| f.iter().sum::<u64>())
+            .sum();
         write!(
             f,
-            "budget {:.0}/{:.0} MiB (hard {:.0}), {} in flight + {} local, {} evicted, scale {:.2}, {}",
+            "budget {:.0}/{:.0} MiB (hard {:.0}), {} in flight + {} local, {} evicted, \
+             {} timed out, {} failed, scale {:.2}, {}",
             mib(held),
             mib(self.1),
             mib(self.2),
             flight,
             s.local_reads,
             evicted,
+            s.cancels_total[1],
+            failed,
             f64::from(s.sse_scale_milli) / 1000.0,
             if s.converged { "converged" } else { "settling" }
         )
