@@ -536,6 +536,9 @@ impl Headless {
         });
         let (requests, queue) = std::sync::mpsc::channel();
         let config = ViewerConfig {
+            // A scripted session drives through the control API's own
+            // commands, not through a frame host.
+            frame_host: None,
             controller: tuile_camera::CameraController::new(
                 crate::start::StartView::from(start.view).camera(),
             )

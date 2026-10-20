@@ -68,6 +68,12 @@ const AMBIENT: f32 = 0.5;
 /// seconds into the window's life on a phone.
 pub struct ViewerConfig {
     pub controller: CameraController,
+    /// An embedding application that owns each frame: asked for the camera
+    /// before the frame is prepared, and given events before the controls.
+    ///
+    /// `None` is the viewer as it has always been — a person's gestures, the
+    /// ease and the floor. See [`crate::frame_host`].
+    pub frame_host: Option<Box<dyn crate::frame_host::FrameHost>>,
     pub title: String,
     /// The host's imagery layers, and which of them the session opens on.
     pub layers: &'static [crate::embed::ImageryChoice],
@@ -301,6 +307,16 @@ pub struct App {
     requests: std::sync::mpsc::Receiver<crate::steer::Request>,
     /// A glide under way, which any gesture ends.
     flight: Option<flight::Flight>,
+    /// An embedding application that owns the frame: it is asked for the
+    /// camera before each one, and sees events before the controls do.
+    ///
+    /// Boxed rather than a type parameter so the shells, the control API and
+    /// the tests all keep one `App`: a host is an option a session has or has
+    /// not, not a different application.
+    frame_host: Option<Box<dyn crate::frame_host::FrameHost>>,
+    /// Poses the host asked to be traversed without drawing, from the last
+    /// frame it spoke. Replaced wholesale each time it does.
+    preload: Vec<crate::frame_host::PreloadView>,
     /// Tiles drawn in the last frame, and whether all were the ones selected.
     drawn: (usize, bool),
     /// The last thing said to the person, and when.
@@ -361,6 +377,8 @@ impl App {
             located: false,
             requests,
             flight: None,
+            frame_host: config.frame_host.take(),
+            preload: Vec::new(),
             drawn: (0, false),
             notice: None,
             title_shown: String::new(),
@@ -680,10 +698,22 @@ impl App {
         // The display's density: the need is counted in logical pixels
         // (D-L1), so a window moved between displays asks for nothing new.
         let scale = self.active.as_ref().map_or(1.0, |a| a.scale);
-        self.eyes()
+        let mut views: Vec<_> = self
+            .eyes()
             .iter()
             .map(|eye| eye.view_state(viewport).with_scale(scale))
-            .collect()
+            .collect();
+        // A host's preload views join the union: traversed, so their tiles
+        // are asked for, and never drawn — nothing downstream reads past the
+        // eyes. They are added after, so an empty list leaves the selection
+        // exactly as it was and a session without a host is untouched.
+        views.extend(self.preload.iter().map(|view| {
+            // The height is the drawn frame's; only the shape differs, and a
+            // view's need is counted in pixels.
+            let size = glam::DVec2::new(height * view.aspect.max(1e-6), height);
+            view.pose.view_state(size).with_scale(scale)
+        }));
+        views
     }
 
     /// The application is back in front: the lifecycle's way back.
