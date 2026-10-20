@@ -35,6 +35,12 @@ pub(crate) fn pool_size(most: Option<u32>, hardware: Option<f64>) -> usize {
 pub(crate) trait Queued {
     /// Whether anyone still waits for it.
     fn wanted(&self) -> bool;
+    /// Where the load waiting on it stands in the budget's order, 0 first;
+    /// `u32::MAX` when it is not ranked — after every ranked job, in the
+    /// order they came.
+    fn rank(&self) -> u32 {
+        u32::MAX
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,18 +156,33 @@ impl<J: Queued> Scheduler<J> {
         self.workers.get(worker) == Some(&Worker::Starting)
     }
 
-    /// The first job still wanted, for `worker`, which is busy with it — or
-    /// idle when there is none. The jobs nobody wants are dropped on the way.
+    /// The job still wanted that the budget ranks first, for `worker`, which
+    /// is busy with it — or idle when there is none. Equal ranks go in the
+    /// order they came. The jobs nobody wants are dropped on the way.
+    ///
+    /// The ranks are read now, not when a job was queued: the budget ranks
+    /// its loads again at every step, and a load the camera has left falls
+    /// behind the one it now looks at while both wait.
     fn next_for(&mut self, worker: usize) -> Option<Dispatch<J>> {
-        while let Some(job) = self.queue.pop_front() {
-            if job.wanted() {
+        let before = self.queue.len();
+        self.queue.retain(Queued::wanted);
+        self.dropped += (before - self.queue.len()) as u64;
+        let first = self
+            .queue
+            .iter()
+            .enumerate()
+            .min_by_key(|(at, job)| (job.rank(), *at))
+            .map(|(at, _)| at);
+        match first.and_then(|at| self.queue.remove(at)) {
+            Some(job) => {
                 self.workers[worker] = Worker::Busy;
-                return Some(Dispatch { worker, job });
+                Some(Dispatch { worker, job })
             }
-            self.dropped += 1;
+            None => {
+                self.workers[worker] = Worker::Idle;
+                None
+            }
         }
-        self.workers[worker] = Worker::Idle;
-        None
     }
 }
 
@@ -196,6 +217,41 @@ mod tests {
         );
         assert_eq!(pool_size(None, Some(f64::NAN)), 1);
         assert_eq!(pool_size(Some(0), Some(10.0)), 0, "0 starts none");
+    }
+
+    /// A job ranked by the budget.
+    #[derive(Debug, PartialEq)]
+    struct Ranked(u32, u32);
+
+    impl Queued for Ranked {
+        fn wanted(&self) -> bool {
+            true
+        }
+        fn rank(&self) -> u32 {
+            self.1
+        }
+    }
+
+    /// **Queued jobs go in the budget's order**: the load it ranks first is
+    /// decoded first, whatever order the jobs came in; unranked jobs after
+    /// every ranked one, in the order they came.
+    #[test]
+    fn queued_jobs_go_in_the_budgets_order() {
+        let mut s = Scheduler::new(1);
+        for job in [
+            Ranked(1, 5),
+            Ranked(2, u32::MAX),
+            Ranked(3, 1),
+            Ranked(4, u32::MAX),
+            Ranked(5, 3),
+        ] {
+            assert!(s.submit(job).expect("alive").is_none());
+        }
+        let mut order = vec![s.ready(0).expect("a job").job.0];
+        while let Some(d) = s.finished(0) {
+            order.push(d.job.0);
+        }
+        assert_eq!(order, vec![3, 5, 1, 2, 4]);
     }
 
     /// Nothing runs before a worker has loaded; the first to load takes the

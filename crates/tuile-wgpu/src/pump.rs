@@ -35,6 +35,9 @@ use tuile_core::source::TileId;
 use tuile_core::traversal::TraversalStats;
 use tuile_core::traversal::ViewState;
 
+/// What an upload does to the pump once its bytes are let in.
+type Keep = Box<dyn FnOnce(&mut ContentPump)>;
+
 /// A delivery waiting for its frame.
 struct Queued {
     gen: Generation,
@@ -511,7 +514,7 @@ impl ContentPump {
         // of epoch is new before old, in place.
         let replaced = self.held.get(&r).map_or(0, |h| h.bytes);
         let limit = self.hard_limit[q.class];
-        let (bytes, store): (u64, Box<dyn FnOnce(&mut Self)>) = match &q.content {
+        let (bytes, store): (u64, Keep) = match &q.content {
             ResourceContent::Mesh(content) => {
                 let tile = r.tile();
                 let prepared = prepare(gpu, content, self.render_origin);
