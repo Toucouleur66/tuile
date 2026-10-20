@@ -31,7 +31,7 @@ use std::collections::HashSet;
 
 use glam::dvec2;
 use tuile_core::source::{TileId, TileTree};
-use tuile_core::traversal::{traverse, Config, ResidencyView, TraversalOutput, ViewState};
+use tuile_core::traversal::{traverse, Config, Residency, ResidentSet, TraversalOutput, ViewState};
 use tuile_terrain::layer::LayerJson;
 use tuile_terrain::tiling::{GeographicTilingScheme, TileCoord};
 use tuile_terrain::tree::TerrainTree;
@@ -58,13 +58,10 @@ fn farm_config() -> Config {
     Config {
         maximum_screen_space_error: 3.0,
         forbid_holes: true,
-        stand_ins: false,
         uniform_detail: true,
         uniform_detail_radius: 8.0,
         cull: true,
         horizon_culling: true,
-        loading_descendant_limit: u32::MAX,
-        pinned_level: Some(5),
         preload_siblings: false,
         ..Config::default()
     }
@@ -179,7 +176,7 @@ fn every_sample_of_visible_ground_is_covered_by_something_selected() {
     let views = [view];
     let scheme = GeographicTilingScheme::default();
 
-    let mut residency = ResidencyView::default();
+    let mut residency = ResidentSet::default();
     // The pinned floor stays resident for the life of a session, whatever the
     // ceilings say — that is the guarantee the fallback chain rests on.
     for x in 0..scheme.tiles_x(5) {

@@ -31,15 +31,16 @@ pub use switch::SwitchableImagery;
 use async_trait::async_trait;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use tuile_core::content::DecodedTexture;
+use tuile_core::budget::{LayerId, LayerReach, Presence, ResourceId};
+use tuile_core::content::{DecodedTexture, DrapeContent};
 use tuile_core::fetch::FetchError;
 use tuile_core::geo::WGS84_A;
 use tuile_core::offload::{self, Offload};
 use tuile_core::raster::{self, GeoRect, ImageryCoord, ImageryProvider, RasterError};
-use tuile_core::source::{LoadError, Loaded, TileId, TileLoader, TileTree};
+use tuile_core::source::{DrapeReach, LoadError, Loaded, TileId, TileLoader, TileTree};
 use tuile_terrain::{
-    level_geometric_error, to_ground, Availability, AvailabilityRange, GeographicTilingScheme,
-    LayerJson, TerrainHeights, TerrainSource, TerrainTree, TileCoord,
+    to_ground, Availability, AvailabilityRange, GeographicTilingScheme, LayerJson, TerrainHeights,
+    TerrainSource, TerrainTree, TileCoord,
 };
 
 /// How coarse the guaranteed bottom layer is.
@@ -184,18 +185,10 @@ pub(crate) fn is_opaque_black(tex: &DecodedTexture) -> bool {
         .all(|i| tex.rgba8[i * 4] == 0 && tex.rgba8[i * 4 + 1] == 0 && tex.rgba8[i * 4 + 2] == 0)
 }
 
-/// What a tile is painted when no imagery covers it.
-///
-/// A light green nothing in an aerial photograph is: not vegetation, which is
-/// darker and never uniform; not haze; not snow. Seeing it on the globe names
-/// the fault immediately instead of leaving a pale patch to be argued about.
-const MISSING_IMAGERY_COLOUR: [f32; 4] = [0.55, 0.95, 0.55, 1.0];
-
 /// What shows under a mosaic wherever no layer reaches.
 ///
 /// A muted slate, close to deep water and to ground in shadow — the two things
-/// most of a globe is. Distinct from [`MISSING_IMAGERY_COLOUR`], which marks a
-/// tile that got *no* imagery at all and is meant to be seen.
+/// most of a globe is.
 const UNCOVERED_GROUND: [f32; 4] = [0.16, 0.20, 0.24, 1.0];
 
 /// Extends the top and bottom rows of an imagery grid to the poles.
@@ -213,70 +206,6 @@ const UNCOVERED_GROUND: [f32; 4] = [0.16, 0.20, 0.24, 1.0];
 /// *coverage* does that, and the clamping sampler supplies the rest — texture
 /// coordinates past the tile resolve to its edge, which is what a polar cap
 /// looks like anyway.
-/// What a cache-only drape can honestly show for one tile: the sharpest
-/// **complete** level as the floor, and over it the sharpest level holding
-/// anything at all, taken **partially**.
-///
-/// The one decision that matters is in the word "partially". The previous
-/// policy collected a level's textures into an `Option<Vec<_>>`, so a single
-/// missing tile discarded every sibling that *was* in hand and the walk fell a
-/// level — repeatedly, down to whatever level happened to be complete. Measured
-/// in the viewer: 3550 stand-ins built that way, 84 of them covered by exactly
-/// one image, while 1469 level-19 textures sat decoded in the cache. On screen
-/// each was a flat rectangle wearing the fine grid of an upsampled mesh.
-///
-/// Floor first, partial after: later layers win in the shader, so the sharp
-/// tiles paint over the floor exactly where they exist and the floor shows
-/// through everywhere else. Coverage outranks sharpness — the floor is never
-/// trimmed for the budget; the partial is.
-///
-/// Pure, and injected with `has` rather than the cache, so the policy is
-/// testable without a provider, a network or a lock.
-fn stand_in_layers(
-    scheme: &raster::TilingScheme,
-    geo: &GeoRect,
-    budget: u32,
-    sharpest: u32,
-    has: impl Fn(ImageryCoord) -> bool,
-) -> Vec<(ImageryCoord, [f32; 4])> {
-    let mut partial: Option<Vec<(ImageryCoord, [f32; 4])>> = None;
-    let mut level = sharpest.min(scheme.maximum_level);
-    loop {
-        let mosaic = scheme.mosaic_at_level(geo, level, budget);
-        let coords = mosaic.tiles();
-        let covers = mosaic.coverage(scheme, geo);
-        let present: Vec<(ImageryCoord, [f32; 4])> = coords
-            .iter()
-            .copied()
-            .zip(covers.iter().copied())
-            .filter(|(c, _)| has(*c))
-            .collect();
-        if !coords.is_empty() && present.len() == coords.len() {
-            // The floor. Everything under this tile is covered; the sharper
-            // partial — recorded at a strictly finer level, since a complete
-            // level returns here — goes on top, within the budget.
-            let mut out = present;
-            if let Some(sharp) = partial {
-                let room = (budget as usize).saturating_sub(out.len());
-                out.extend(sharp.into_iter().take(room));
-            }
-            return out;
-        }
-        if partial.is_none() && !present.is_empty() {
-            partial = Some(present);
-        }
-        if mosaic.level <= scheme.minimum_level {
-            // No complete level anywhere on the way down: the partial alone is
-            // still better than nothing — uncovered ground shows the base
-            // colour, which is exactly what it would have shown anyway.
-            return partial.unwrap_or_default();
-        }
-        // `mosaic_at_level` may have coarsened itself to fit the budget;
-        // follow it rather than re-walking levels it already skipped.
-        level = mosaic.level - 1;
-    }
-}
-
 fn to_the_pole(mut rect: GeoRect, coord: ImageryCoord, rows: u64) -> GeoRect {
     use std::f64::consts::FRAC_PI_2;
     if coord.y == 0 {
@@ -286,30 +215,6 @@ fn to_the_pole(mut rect: GeoRect, coord: ImageryCoord, rows: u64) -> GeoRect {
         rect.south = -FRAC_PI_2;
     }
     rect
-}
-
-/// Shared, host-updated imagery detail target: the desired ground texel
-/// spacing (metres per texel) for draped imagery, which the app recomputes from
-/// the camera each frame (≈ `2·altitude·tan(fovy/2) / viewport_height`). The
-/// loader reads it so imagery refines with **altitude** — a giant mosaic up
-/// close, coarse from orbit — decoupled from the terrain LOD. Default (unset)
-/// falls back to matching the terrain's geometric error.
-#[derive(Clone, Default)]
-pub struct ImageryDetail(Arc<std::sync::atomic::AtomicU64>);
-
-impl ImageryDetail {
-    /// Sets the desired ground texel spacing (metres/texel). Smaller ⇒ finer
-    /// imagery. Call each frame from the host with the current camera.
-    pub fn set_target_texel_spacing(&self, metres: f64) {
-        self.0
-            .store(metres.to_bits(), std::sync::atomic::Ordering::Relaxed);
-    }
-
-    fn target(&self) -> Option<f64> {
-        let bits = self.0.load(std::sync::atomic::Ordering::Relaxed);
-        let v = f64::from_bits(bits);
-        (bits != 0 && v.is_finite() && v > 0.0).then_some(v)
-    }
 }
 
 /// Shared, host-declared count of imagery layers one drape may carry.
@@ -490,7 +395,11 @@ impl ImageryCache {
 /// `tuile_core::raster::CachedImagery`), which is where the bytes and their
 /// stated lifetimes actually are — this crate composes what the host hands it
 /// and adds no tier of its own.
-#[derive(Debug, Clone)]
+///
+/// Its default is the interactive contract: in particular no deterministic
+/// floor, for a viewer showing blur it did not have to show is a
+/// regression.
+#[derive(Debug, Clone, Default)]
 pub struct GlobeOptions {
     /// When true, terrain only (no imagery) — the geometry debug view.
     pub no_imagery: bool,
@@ -514,17 +423,6 @@ pub struct GlobeOptions {
     /// A handle rather than a number because the renderer usually does not
     /// exist yet when the loader is built — see [`LayerBudget`].
     pub imagery_slots: LayerBudget,
-    /// How many levels finer than the terrain a drape may go.
-    ///
-    /// The camera-distance rule, made per-tile without the loader knowing the
-    /// camera: under a distance-proportional terrain selection, a tile's
-    /// terrain level already encodes its distance, so "imagery at the level
-    /// the camera distance asks for" is `terrain_level + boost` — near tiles
-    /// go deep, far tiles stay proportionally coarse, and neighbours at one
-    /// terrain level share one imagery level instead of quantising into an
-    /// exposure checkerboard. `u32::MAX` (the default) leaves the layer
-    /// budget as the only limit, which is today's behaviour.
-    pub imagery_boost_cap: u32,
     /// Whether the coarse layer under a drape is chosen by geometry alone.
     ///
     /// **This is the difference between a render that reproduces and one that
@@ -610,23 +508,6 @@ impl std::fmt::Debug for HeldDrape {
     }
 }
 
-impl Default for GlobeOptions {
-    fn default() -> Self {
-        Self {
-            no_imagery: false,
-            max_level: None,
-            imagery_slots: LayerBudget::default(),
-            imagery_boost_cap: u32::MAX,
-            // Off by default: the interactive contract is the default, and a
-            // viewer showing blur it did not have to show is a regression.
-            deterministic_floor: false,
-            held_drape: None,
-            composed_at: 0,
-            imagery_by_stamp: false,
-        }
-    }
-}
-
 /// What every asker of one imagery tile is answered: the coord served and its
 /// texture, or why there is none.
 type ImageryAnswer = Result<(ImageryCoord, Arc<DecodedTexture>), String>;
@@ -638,20 +519,35 @@ type ImageryAnswer = Result<(ImageryCoord, Arc<DecodedTexture>), String>;
 /// itself, at the same moment: a browser showed the same quadkeys two and
 /// three times over, each holding a connection, and serialised them behind
 /// its cache lock — the pending requests under which the page stopped.
-#[derive(Default)]
-struct ImageryInFlight(Mutex<HashMap<(u64, ImageryCoord), Vec<Waiter>>>);
+///
+/// The same holds of terrain: every tile past the source's data is cut from
+/// its ancestor, and a whole block of them loading at once fetched that one
+/// ancestor once each — a browser showed one terrain tile requested 23 times,
+/// many of them at once ([`TerrainInFlight`]).
+struct InFlight<K, A>(Mutex<HashMap<K, Vec<futures_channel::oneshot::Sender<A>>>>);
 
-/// Where a waiting asker is told the answer.
-type Waiter = futures_channel::oneshot::Sender<ImageryAnswer>;
-
-/// Whether an asker fetches, or waits for the one that does.
-enum Turn {
-    Lead,
-    Wait(futures_channel::oneshot::Receiver<ImageryAnswer>),
+impl<K, A> Default for InFlight<K, A> {
+    fn default() -> Self {
+        Self(Mutex::new(HashMap::new()))
+    }
 }
 
-impl ImageryInFlight {
-    fn join(&self, key: (u64, ImageryCoord)) -> Turn {
+type ImageryInFlight = InFlight<(u64, ImageryCoord), ImageryAnswer>;
+
+/// What every asker of one terrain tile is answered: its mesh, or why not.
+type TerrainAnswer = Result<Arc<tuile_terrain::QuantizedMesh>, String>;
+
+/// The terrain tiles being fetched or built, by coord.
+type TerrainInFlight = InFlight<TileCoord, TerrainAnswer>;
+
+/// Whether an asker fetches, or waits for the one that does.
+enum Turn<A> {
+    Lead,
+    Wait(futures_channel::oneshot::Receiver<A>),
+}
+
+impl<K: std::hash::Hash + Eq + Copy, A: Clone> InFlight<K, A> {
+    fn join(&self, key: K) -> Turn<A> {
         let mut flights = self.0.lock().unwrap_or_else(|e| e.into_inner());
         match flights.get_mut(&key) {
             Some(waiting) => {
@@ -676,13 +572,13 @@ impl ImageryInFlight {
 /// The asker that fetches. Dropped without [`Leading::finish`] — cancelled —
 /// it lets go of the tile, and its waiters' channels close: the next of them
 /// fetches.
-struct Leading<'a> {
-    flight: &'a ImageryInFlight,
-    key: (u64, ImageryCoord),
+struct Leading<'a, K: std::hash::Hash + Eq, A> {
+    flight: &'a InFlight<K, A>,
+    key: K,
 }
 
-impl Leading<'_> {
-    fn finish(self, answer: &ImageryAnswer) {
+impl<K: std::hash::Hash + Eq, A: Clone> Leading<'_, K, A> {
+    fn finish(self, answer: &A) {
         let waiting = self
             .flight
             .0
@@ -696,7 +592,7 @@ impl Leading<'_> {
     }
 }
 
-impl Drop for Leading<'_> {
+impl<K: std::hash::Hash + Eq, A> Drop for Leading<'_, K, A> {
     fn drop(&mut self) {
         self.flight
             .0
@@ -717,19 +613,6 @@ pub struct PlanetaryLoader<T: TerrainSource, I: ImageryProvider> {
     cache: Mutex<ImageryCache>,
     /// Decoded terrain meshes, so an upsample chain is walked once.
     meshes: Mutex<MeshCache>,
-    /// Meshes built for **stand-ins**, kept apart from [`Self::meshes`] on
-    /// purpose.
-    ///
-    /// A stand-in's mesh is an upsample of an ancestor — the same surface, over
-    /// the missing tile's own ground. Putting it in the real cache would make
-    /// [`Self::terrain_mesh`] return it on the next request and never fetch the
-    /// tile it stands in for: the approximation would become permanent, and the
-    /// globe would stop refining at exactly the tiles a camera lingers on.
-    ///
-    /// Its own cache, so the rungs of a walk are still shared between siblings —
-    /// which is what keeps a burst of stand-ins from re-clipping the same
-    /// ancestor once per tile.
-    fill_meshes: Mutex<MeshCache>,
     /// Shared with the tree: each terrain tile's `metadata` extension reveals
     /// the availability of its descendants, folded in here so traversal can
     /// keep refining toward the finest LOD.
@@ -737,14 +620,14 @@ pub struct PlanetaryLoader<T: TerrainSource, I: ImageryProvider> {
     /// What each mesh and each imagery tile was made from, noted as it is
     /// fetched.
     provenance: Arc<Provenance>,
-    /// Host-updated imagery detail target (drives imagery level by altitude).
-    detail: ImageryDetail,
     /// Shared with the host's camera: each decoded tile's relief, so the eye can
     /// be kept above the ground rather than above the ellipsoid.
     heights: Arc<TerrainHeights>,
     /// The imagery tiles being fetched, so a tile several terrain tiles want
     /// at once is fetched once: see [`ImageryInFlight`].
     fetching: ImageryInFlight,
+    /// The terrain tiles being fetched or built, likewise.
+    building: TerrainInFlight,
     /// Where decoding and resampling run.
     ///
     /// Not a detail of taste: the server is one future, so any CPU work left in
@@ -970,45 +853,39 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
     /// No new detail is invented. The tile has its ancestor's shape described by
     /// fewer triangles per unit of ground — the mesh stops improving where the
     /// data stops, while the imagery draped on it keeps sharpening.
-    /// A stand-in's mesh: the nearest ancestor already in memory, upsampled onto
-    /// `coord`'s own rectangle.
-    ///
-    /// **The whole point is that it is not a plane.** A stand-in used to be four
-    /// corner heights with a ruled surface between them, and that is what made
-    /// the mechanism unusable: where some tiles get a stand-in and others fall
-    /// back to an ancestor — which happens whenever this returns `None` — the
-    /// ancestor's *real relief* and the neighbours' *flat* stand-ins occupy the
-    /// same ground, and the depth test picks a winner per pixel. On screen: large
-    /// flat patches of coarse colour with ridges punching through them in ragged
-    /// outlines that follow the terrain rather than the tile grid.
-    ///
-    /// [`tuile_terrain::upsample`] gives "a mesh of exactly the same surface over
-    /// exactly the child's ground", so there is no relief for anything to punch
-    /// through: the stand-in and the ancestor it came from are the same surface.
-    ///
-    /// Synchronous and cache-only by contract — this runs inside the traversal.
-    /// One level at a time, each rung kept in [`Self::fill_meshes`], so a burst
-    /// of siblings clips their shared parent once rather than once each.
-    fn stand_in_mesh(&self, coord: TileCoord) -> Option<Arc<tuile_terrain::QuantizedMesh>> {
-        // The real thing, if it happens to be decoded: a stand-in for a tile
-        // whose mesh is already here needs no approximation at all.
-        if let Some(mesh) = self.meshes.lock().ok()?.get(coord) {
-            return Some(mesh);
-        }
-        if let Some(mesh) = self.fill_meshes.lock().ok()?.get(coord) {
-            return Some(mesh);
-        }
-        if coord.level == 0 {
-            return None;
-        }
-        let parent = TileCoord::new(coord.level - 1, coord.x / 2, coord.y / 2);
-        let from = self.stand_in_mesh(parent)?;
-        let built = Arc::new(tuile_terrain::upsample(&from, parent, coord)?);
-        self.fill_meshes.lock().ok()?.put(coord, Arc::clone(&built));
-        Some(built)
+    fn terrain_mesh<'a>(&'a self, coord: TileCoord) -> MeshFuture<'a> {
+        Box::pin(async move {
+            if let Some(mesh) = self.meshes.lock().expect("mesh cache").get(coord) {
+                return Ok(mesh);
+            }
+            // One fetch or build per tile at a time: whoever else wants it
+            // waits for that one's answer. A leader dropped — its load
+            // cancelled — lets the tile go, and the next asker leads.
+            loop {
+                match self.building.join(coord) {
+                    Turn::Wait(answer) => match answer.await {
+                        Ok(answer) => return answer.map_err(LoadError::Failed),
+                        Err(futures_channel::oneshot::Canceled) => continue,
+                    },
+                    Turn::Lead => {
+                        let lead = Leading {
+                            flight: &self.building,
+                            key: coord,
+                        };
+                        let answer = self.terrain_mesh_once(coord).await.map_err(|e| match e {
+                            LoadError::Failed(why) => why,
+                            other => other.to_string(),
+                        });
+                        lead.finish(&answer);
+                        return answer.map_err(LoadError::Failed);
+                    }
+                }
+            }
+        })
     }
 
-    fn terrain_mesh<'a>(&'a self, coord: TileCoord) -> MeshFuture<'a> {
+    /// [`Self::terrain_mesh`], for the one asker that fetches or builds.
+    fn terrain_mesh_once<'a>(&'a self, coord: TileCoord) -> MeshFuture<'a> {
         Box::pin(async move {
             if let Some(mesh) = self.meshes.lock().expect("mesh cache").get(coord) {
                 return Ok(mesh);
@@ -1123,8 +1000,94 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         })
     }
 
-    /// Drapes `content` with the imagery being served, whole and from one
-    /// imagery set.
+    /// The ground under one texel of a 256-texel tile at terrain level 0:
+    /// what the budget's imagery levels count from. A budget level `L` is the
+    /// imagery whose texels are this halved `L` times, so it compares with
+    /// the terrain's own level (spec §4).
+    fn texel_l0(&self) -> f64 {
+        WGS84_A * std::f64::consts::TAU / (256.0 * self.scheme.root_tiles_x as f64)
+    }
+
+    /// How many levels the provider's grid sits above the budget's at
+    /// latitude `lat`: the provider's level for budget level `L` is
+    /// `L + offset`, clamped to what it serves.
+    fn level_offset(&self, scheme: &raster::TilingScheme, lat: f64) -> i64 {
+        let lat_factor = match scheme.projection {
+            raster::Projection::WebMercator => lat.cos(),
+            raster::Projection::Geographic => 1.0,
+        };
+        let level_zero = WGS84_A * std::f64::consts::TAU * lat_factor
+            / (f64::from(scheme.tile_size) * scheme.root_tiles_x as f64);
+        (level_zero / self.texel_l0()).max(1e-12).log2().round() as i64
+    }
+
+    /// The provider's level for the budget's imagery level `level` over a
+    /// tile at latitude `lat`.
+    fn provider_level(&self, scheme: &raster::TilingScheme, level: u32, lat: f64) -> u32 {
+        (i64::from(level) + self.level_offset(scheme, lat)).clamp(
+            i64::from(scheme.minimum_level),
+            i64::from(scheme.maximum_level),
+        ) as u32
+    }
+
+    /// A terrain tile's rectangle, as the imagery's geography.
+    fn georect(&self, coord: TileCoord) -> GeoRect {
+        let rect = self.scheme.tile_rect(coord);
+        GeoRect {
+            west: rect.west,
+            south: rect.south,
+            east: rect.east,
+            north: rect.north,
+        }
+    }
+
+    /// Whether a tile's mesh is in hand without the network: decoded here,
+    /// held by the terrain store, or — past the source's data — built from
+    /// an ancestor that is.
+    fn mesh_held(&self, coord: TileCoord) -> bool {
+        let mut at = coord;
+        // Upsampled tiles climb to the data they come from; the source's
+        // data is a handful of levels from any tile.
+        for _ in 0..32 {
+            if self
+                .meshes
+                .lock()
+                .map(|m| m.get(at).is_some())
+                .unwrap_or(false)
+            {
+                return true;
+            }
+            let known = self.availability.range_count() > 0;
+            if !known || self.availability.is_available(at) {
+                return self.terrain.holds(at);
+            }
+            if at.level == 0 {
+                return false;
+            }
+            at = TileCoord::new(at.level - 1, at.x / 2, at.y / 2);
+        }
+        false
+    }
+
+    /// The imagery tiles `id`'s drape at the budget's `level` would be made
+    /// of — the floor under it first — without fetching any.
+    fn drape_coords(&self, id: TileId, level: u32) -> Vec<ImageryCoord> {
+        let (z, x, y) = id.terrain_coord();
+        let rect = self.georect(TileCoord::new(z, x, y));
+        let scheme = self.imagery.tiling_scheme();
+        let lat = 0.5 * (rect.south + rect.north);
+        let mosaic = scheme.mosaic_at_level(
+            &rect,
+            self.provider_level(&scheme, level, lat),
+            self.opts.imagery_slots.get() - 1,
+        );
+        let mut coords = vec![self.opts.floor_under(&scheme, &rect, &self.cache)];
+        coords.extend(mosaic.tiles());
+        coords
+    }
+
+    /// Composes `id`'s drape of `layer` at the budget's imagery `level`,
+    /// whole and from one imagery set.
     ///
     /// A drape is several fetches, and a provider that can be switched
     /// ([`ImageryProvider::generation`]) may be switched between two of them.
@@ -1133,58 +1096,45 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
     /// rectangles. So the generation is read before and after, and a drape
     /// that straddled a switch is thrown away and built again; every layer of
     /// the one that is kept is stamped with the generation it belongs to.
-    async fn drape(
+    async fn compose(
         &self,
-        content: &mut tuile_core::DecodedTileContent,
-        rect: &GeoRect,
-        terrain_level: u32,
         id: TileId,
-    ) -> Result<(), LoadError> {
+        layer: LayerId,
+        level: u32,
+    ) -> Result<DrapeContent, LoadError> {
+        let (z, x, y) = id.terrain_coord();
+        let rect = self.georect(TileCoord::new(z, x, y));
         loop {
             let generation = self.imagery.generation();
-            content.withheld_drape = None;
-            content.imagery.clear();
-            self.drape_once(content, rect, terrain_level, id).await?;
+            let mut drape = self.compose_once(&rect, id, layer, level).await?;
             if self.imagery.generation() == generation {
-                for layer in &mut content.imagery {
+                for tile in &mut drape.tiles {
                     // Truncated on purpose: an identity among the imagery sets
                     // one session holds at once, of which there are two.
-                    layer.source = generation as u32;
+                    tile.source = generation as u32;
                 }
-                return Ok(());
+                return Ok(drape);
             }
         }
     }
 
-    async fn drape_once(
+    async fn compose_once(
         &self,
-        content: &mut tuile_core::DecodedTileContent,
         rect: &GeoRect,
-        terrain_level: u32,
         id: TileId,
-    ) -> Result<(), LoadError> {
+        layer: LayerId,
+        budget_level: u32,
+    ) -> Result<DrapeContent, LoadError> {
         // The cache is turned to the imagery being served before anything
         // looks into it — `floor_under` below does, by its own lock.
         drop(self.decoded());
         let scheme = self.imagery.tiling_scheme();
-        // Start from the imagery level whose texel spacing matches the terrain
-        // tile's geometric error (Cesium's getLevelWithMaximumTexelSpacing)…
-        let ge = level_geometric_error(terrain_level, WGS84_A, self.scheme.root_tiles_x);
+        // The level the budget asked for, on the provider's grid: chosen per
+        // tile from how large a texel looks on screen, independently of the
+        // terrain level (I10) — not from a global altitude, not frozen when
+        // the mesh loads.
         let lat = 0.5 * (rect.south + rect.north);
-        let base = scheme.level_for_texel_spacing(ge, lat);
-        // …then refine with the camera ALTITUDE, beyond the terrain LOD, up to
-        // the provider's max. Where terrain data runs out (Cesium World Terrain
-        // caps around z13 over Europe) the mesh stays coarse but the ground
-        // stays sharp. How far that can go is now bounded only by how many
-        // textures one *tile* binds across its passes — `imagery_layer_budget`
-        // of `GlobeOptions::imagery_slots` — where it used to be bounded by a
-        // per-tile memory cost that no longer exists.
-        let level = match self.detail.target() {
-            Some(texel) => scheme.level_for_texel_spacing(texel, lat).max(base),
-            None => base,
-        }
-        .min(scheme.maximum_level)
-        .min(base.saturating_add(self.opts.imagery_boost_cap));
+        let level = self.provider_level(&scheme, budget_level, lat);
         // One slot is reserved for a coarse layer underneath everything else.
         //
         // What **one draw** binds, not what the passes could carry.
@@ -1199,6 +1149,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         // has to be asked for on its own, with the memory and the fetch count
         // in front of it.
         let mosaic = scheme.mosaic_at_level(rect, level, self.opts.imagery_slots.get() - 1);
+        let terrain_level = id.terrain_coord().0;
         // The four numbers that decide how sharp the ground gets, in the order
         // they constrain each other: what the terrain's own error asks for, what
         // the camera's altitude asks for, what was requested, and what survived
@@ -1207,7 +1158,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         // imagery cannot go deeper than the mesh it drapes.
         tracing::debug!(
             terrain_level,
-            matched = base,
+            budget_level,
             wanted = level,
             got = mosaic.level,
             tiles = mosaic.tile_count(),
@@ -1236,12 +1187,18 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                 self.opts.composed_at,
             );
             if held.holds(id.0, identity) {
-                // `withheld_drape` is what stops an empty `imagery` from being
-                // read as "this ground has no picture". The consumer must
-                // resolve it; there is no fallback here, deliberately.
-                content.withheld_drape = Some(identity);
+                // `withheld` is what stops an empty drape from being read as
+                // "this ground has no picture". The consumer must resolve it;
+                // there is no fallback here, deliberately.
                 tuile_core::metrics::metrics().drapes_withheld.inc();
-                return Ok(());
+                return Ok(DrapeContent {
+                    layer,
+                    level: budget_level,
+                    tiles: Vec::new(),
+                    floor_tiles: 0,
+                    identity,
+                    withheld: true,
+                });
             }
         }
 
@@ -1303,6 +1260,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         // otherwise perfect imagery. See `ImageryMosaic::coverage`.
         let coverage = mosaic.coverage(&scheme, rect);
         let floor_layers = layers.len();
+        let floor_tiles = floor_layers;
         let mut dropped = 0usize;
         // `zip` stops at the shorter of the two and says nothing. If the mosaic
         // ever hands back fewer rectangles than tiles, the surplus tiles are
@@ -1349,7 +1307,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         // on its own.**
         //
         // Not the same fault as no imagery at all, which is counted just below
-        // and painted marker green. Here the tile *has* a layer, so every
+        // just below. Here the tile *has* a layer, so every
         // instrument reads it as covered — and what it has is one coarse image
         // stretched over ground it does not describe, which at any depth is a
         // rectangle of flat colour with straight tile-aligned edges. That is a
@@ -1405,37 +1363,10 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                 wanted = level,
                 got = mosaic.level,
                 mosaic_tiles = mosaic.tile_count(),
-                "NO IMAGERY over this tile: drawn in marker green"
+                "NO IMAGERY over this tile: the drape is empty"
             );
             tuile_core::metrics::metrics().tiles_without_imagery.inc();
         }
-        for mesh in &mut content.meshes {
-            // Terrain owns no base-colour texture; the layers are the ground.
-            mesh.material.base_color_texture = None;
-            mesh.material.base_color_factor = if layers.is_empty() {
-                MISSING_IMAGERY_COLOUR
-            } else {
-                // What shows wherever the mosaic does not reach.
-                //
-                // It was white, by default, and white is the worst possible
-                // choice: a fragment that no layer covers — a hairline between
-                // two layers' masks, a corner the mosaic's budget cut — came out
-                // as a **bright** line over the imagery. On screen it read as a
-                // glowing grid drawn on the ground, and it was reported as one.
-                //
-                // The reference implementation has the same fallback and never
-                // shows it, because `Globe.baseColor` is a dark blue. Same
-                // reasoning here: whatever is not covered should be the colour
-                // of unremarkable ground, so a gap of one pixel costs a pixel
-                // nobody notices instead of announcing itself.
-                //
-                // This makes a gap invisible; it does not close one. `D` cycles
-                // to the coverage view, which paints magenta wherever no layer
-                // reaches, and that is where to look for the cause.
-                UNCOVERED_GROUND
-            };
-        }
-        content.imagery = layers;
 
         // **Do the layers actually reach the ground, or merely exist?**
         //
@@ -1450,10 +1381,10 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         // The union must reach both corners. `placed` gives the floor the whole
         // tile with `EDGE_REACH` past each side, so this can only fail if the
         // floor is missing *and* the mosaic's own rectangles fall short.
-        if !content.imagery.is_empty() {
+        if !layers.is_empty() {
             let (mut umin, mut vmin) = (f32::INFINITY, f32::INFINITY);
             let (mut umax, mut vmax) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
-            for l in &content.imagery {
+            for l in &layers {
                 umin = umin.min(l.coverage[0]);
                 vmin = vmin.min(l.coverage[1]);
                 umax = umax.max(l.coverage[2]);
@@ -1462,7 +1393,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
             if umin > 0.0 || vmin > 0.0 || umax < 1.0 || vmax < 1.0 {
                 tracing::warn!(
                     z = terrain_level,
-                    layers = content.imagery.len(),
+                    layers = layers.len(),
                     umin,
                     vmin,
                     umax,
@@ -1472,7 +1403,18 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                 );
             }
         }
-        Ok(())
+        let identity = tuile_core::raster::drape_identity(
+            layers.iter().map(|l| l.coord),
+            self.opts.composed_at,
+        );
+        Ok(DrapeContent {
+            layer,
+            level: budget_level,
+            tiles: layers,
+            floor_tiles,
+            identity,
+            withheld: false,
+        })
     }
 }
 
@@ -1481,133 +1423,10 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
 impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
     for PlanetaryLoader<T, I>
 {
-    /// A stand-in surface for a tile that is selected and has not arrived.
-    ///
-    /// Built entirely from what is already in memory — the shared relief for the
-    /// corner heights, the decoded-imagery cache for the coarse layer under it —
-    /// so it costs no request and answers in the same breath it was asked. That
-    /// is the requirement: it stands in for the frames between "the camera is
-    /// looking here" and "the tile arrived", and anything that waits has missed
-    /// them.
-    ///
-    /// The heights are the four corners of the tile's own rectangle, sampled
-    /// from whatever terrain has already streamed in — usually a coarser
-    /// ancestor covering the same ground, which is exactly the surface the
-    /// stand-in should sit on. Where nothing is known the ellipsoid is used;
-    /// sea level is wrong for a mountain and wrong by less than the tile is
-    /// wide, which is all the accuracy a surface living for three frames needs.
-    ///
-    /// The imagery is the same coarse floor the real tile will be draped with,
-    /// **taken from the cache and never fetched**. A miss simply means no layer:
-    /// the fill then draws marker green, which is the honest colour for ground
-    /// nobody has a picture of, and still an improvement on the two things it
-    /// replaces — black, or an ancestor overlapping its own descendants.
-    fn fill(&self, id: TileId) -> Option<tuile_core::DecodedTileContent> {
-        let (z, x, y) = id.terrain_coord();
-        let coord = TileCoord::new(z, x, y);
-        let rect = self.scheme.tile_rect(coord);
-        // The surface of the nearest ancestor already in memory, restated over
-        // this tile's own rectangle. Never a plane — see `stand_in_mesh`.
-        let mesh = self.stand_in_mesh(coord)?;
-        let mut content = to_ground(&mesh, &rect);
-
-        let geo = GeoRect {
-            west: rect.west,
-            south: rect.south,
-            east: rect.east,
-            north: rect.north,
-        };
-        let scheme = self.imagery.tiling_scheme();
-        // Cache only, and never a fetch: `fetch_imagery` would be correct and
-        // would also await a network round trip, which is the one thing this
-        // function may not do.
-        //
-        // **The sharpest mosaic every tile of which is already decoded**, not one
-        // coarse layer. A single ancestor tile was the old answer, and it is what
-        // made a stand-in read as a flat rectangle of uniform colour: a level-4
-        // image sampled over the ground of a level-16 tile is one colour, and one
-        // flat colour laid over real terrain is as noticeable as the artefact it
-        // was replacing. The mosaic is the same construction a real drape uses —
-        // same coverage chaining, same `substituted` placement — so a stand-in
-        // differs from the tile it stands for in sharpness and in nothing else.
-        //
-        // Sharpest first: the loop stops at the first level whose every tile is
-        // in hand, and the coarsest levels are a handful of tiles for the whole
-        // planet, so it always terminates on something.
-        let budget = self.opts.imagery_slots.get().saturating_sub(1).max(1);
-        let deepest = scheme.containing_tile(&geo);
-        let from = (deepest.level + 2).min(scheme.maximum_level);
-        if let Ok(mut cache) = self.cache.lock() {
-            // Only what the imagery being served has decoded: just after a
-            // switch that is nothing, the stand-in is refused below, and the
-            // consumer keeps the ancestor it has — still wearing the old
-            // picture, which is the point.
-            let generation = self.imagery.generation();
-            cache.turn_to(generation);
-            // The floor-plus-partial pick — see `stand_in_layers` for why
-            // "partial" is the word that matters here.
-            for (served, covers) in
-                stand_in_layers(&scheme, &geo, budget, from, |c| cache.get(&c).is_some())
-            {
-                let Some(texture) = cache.get(&served) else {
-                    continue;
-                };
-                let layer = raster::ImageryLayer::substituted(
-                    served,
-                    texture,
-                    &geo,
-                    &to_the_pole(
-                        scheme.tile_rect(served),
-                        served,
-                        scheme.tiles_at(served.level).1,
-                    ),
-                    covers,
-                );
-                if layer.is_visible() {
-                    content.imagery.push(layer.from_source(generation as u32));
-                }
-            }
-        }
-        // No picture anywhere on the way up: refuse rather than emit a flat
-        // marker-green patch. A stand-in exists to be less noticeable than what
-        // it replaces, and a bright green rectangle over real terrain is not —
-        // measured on screen, and worse than the ancestor it displaced. The
-        // consumer keeps whatever it had for one more frame.
-        if content.imagery.is_empty() {
-            return None;
-        }
-        // **The one imagery path with no instrument on it.**
-        //
-        // `drape` counts five different ways its layers can come up short;
-        // this counted none, so a stand-in that covered its ground with a
-        // single very coarse image looked, from every log and every metric,
-        // exactly like one that covered it properly. On screen it is a flat
-        // rectangle of one colour with a *finely tessellated* grid inside it —
-        // the upsampled mesh — which is why it reads as a deep tile that failed
-        // rather than as the approximation it is.
-        //
-        // The mosaic here is cache-only by contract, so it settles on the
-        // sharpest level every tile of which is already decoded. When that is
-        // several levels above the ground being covered, one texel is stretched
-        // across the whole tile.
-        if content.imagery.len() < 4 {
-            tracing::warn!(
-                z,
-                x,
-                y,
-                layers = content.imagery.len(),
-                "THIN STAND-IN: covered by {} imagery layer(s), so the ground is \
-                 close to one flat colour",
-                content.imagery.len()
-            );
-        }
-        Some(content)
-    }
-
     /// Pulls the coarse pyramid into the store before the camera asks for it.
     ///
     /// Terrain and imagery both, level by level from the top, because the
-    /// fallback chain needs both: a mesh with no imagery draws marker green,
+    /// fallback chain needs both: a mesh with no imagery draws bare,
     /// imagery with no mesh draws nothing at all.
     ///
     /// Availability is consulted first for terrain, so ground the source does
@@ -1687,36 +1506,93 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
         // is clamped against sharpens for free as the globe refines.
         self.heights.record(coord, qm.header.max_height);
         let rect = self.scheme.tile_rect(coord);
-        // Skirts, at the size both reference implementations use.
-        //
-        // They were switched on once before and produced broad horizontal smears
-        // across every slope, and were switched off again with the size blamed.
-        // The size was not the fault. `mesh.edges` arrives in whatever order the
-        // server wrote it — the format guarantees none — and the first version
-        // stitched each wall out of the list as given, joining whatever happened
-        // to be adjacent *in the list*. That draws triangles clean across the
-        // tile. The reference sorts each edge before stitching, for exactly this
-        // reason, and so does `append_skirts` now; three tests hold it, the
-        // winding, and the outward splay that keeps two neighbours' walls from
-        // landing in the same plane.
-        //
-        // A wall is textured by the column of texels above it and lit by the
-        // same normal, so where one does show through it is the colour of the
-        // ground it hangs from rather than a stripe of something else.
+        // Skirts, at the size both reference implementations use. `mesh.edges`
+        // arrives in whatever order the server wrote it, and `append_skirts`
+        // sorts each edge before stitching it into a wall.
         let mut content = to_ground(&qm, &rect);
         if !self.opts.no_imagery {
-            let georect = GeoRect {
-                west: rect.west,
-                south: rect.south,
-                east: rect.east,
-                north: rect.north,
-            };
-            self.drape(&mut content, &georect, z, id).await?;
+            for mesh in &mut content.meshes {
+                // Terrain owns no base-colour texture: its drapes are the
+                // ground, loaded on their own (`load_drape`). What shows
+                // wherever no layer reaches is the colour of unremarkable
+                // ground, so a gap of one pixel costs a pixel nobody notices
+                // instead of announcing itself — `D` cycles to the coverage
+                // view, which paints magenta there.
+                mesh.material.base_color_texture = None;
+                mesh.material.base_color_factor = UNCOVERED_GROUND;
+            }
         }
         tuile_core::metrics::metrics()
             .load_seconds
             .record(started.elapsed());
         Ok(Loaded::Content(content))
+    }
+
+    /// The imagery that drapes a terrain tile: one layer, the provider's,
+    /// reaching as deep as it serves over the tile's latitude.
+    fn drapes(&self, id: TileId) -> Option<DrapeReach> {
+        if self.opts.no_imagery {
+            return None;
+        }
+        let (z, x, y) = id.terrain_coord();
+        let rect = self.georect(TileCoord::new(z, x, y));
+        let scheme = self.imagery.tiling_scheme();
+        let lat = 0.5 * (rect.south + rect.north);
+        let deepest =
+            (i64::from(scheme.maximum_level) - self.level_offset(&scheme, lat)).max(0) as u32;
+        Some(DrapeReach {
+            texel_l0_m: self.texel_l0(),
+            rect: tuile_core::budget::GeoRect {
+                west: rect.west,
+                south: rect.south,
+                east: rect.east,
+                north: rect.north,
+            },
+            layers: vec![LayerReach {
+                layer: LayerId(0),
+                max_level: deepest,
+            }],
+        })
+    }
+
+    async fn load_drape(
+        &self,
+        id: TileId,
+        layer: LayerId,
+        level: u32,
+    ) -> Result<DrapeContent, LoadError> {
+        let started = tuile_core::metrics::stamp();
+        let drape = self.compose(id, layer, level).await?;
+        tuile_core::metrics::metrics()
+            .load_seconds
+            .record(started.elapsed());
+        Ok(drape)
+    }
+
+    /// Whether the terrain store holds a tile's mesh (or the ancestor it is
+    /// built from, past the source's data), and whether the imagery store
+    /// holds every tile of a drape: asked of their indexes, never read.
+    fn holds(&self, r: ResourceId) -> Presence {
+        let held = match r {
+            ResourceId::Mesh(t) => {
+                let (z, x, y) = t.terrain_coord();
+                self.mesh_held(TileCoord::new(z, x, y))
+            }
+            ResourceId::Drape { tile, level, .. } => {
+                // The coords first: choosing the floor reads the cache under
+                // its own lock, which must not be held here yet.
+                let coords = self.drape_coords(tile, level);
+                let cache = self.decoded();
+                coords
+                    .into_iter()
+                    .all(|c| cache.has(&c) || self.imagery.holds(c))
+            }
+        };
+        if held {
+            Presence::Stored
+        } else {
+            Presence::Absent
+        }
     }
 }
 
@@ -1726,23 +1602,18 @@ pub fn terrain_tree(layer: LayerJson) -> Box<dyn TileTree> {
 }
 
 /// Crosses an already-resolved terrain source and imagery provider into a
-/// `(tree, loader, detail, heights)` ready for `tuile_core::runtime::in_process_with`.
-/// `layer` is the terrain's `layer.json` (the host resolves it). The returned
-/// [`ImageryDetail`] is the host's handle to drive imagery resolution by camera
-/// altitude each frame; the returned [`TerrainHeights`] is the surface to hand
-/// a camera controller so it stays above the ground. Pure: the host has already
-/// chosen backends + transport.
+/// `(tree, loader, heights)` ready for `tuile_core::runtime::in_process_with`.
+/// `layer` is the terrain's `layer.json` (the host resolves it). The loader
+/// loads each terrain tile's mesh and, as resources of their own, its drapes
+/// at the imagery level the session's budget asks for; the returned
+/// [`TerrainHeights`] is the surface to hand a camera controller so it stays
+/// above the ground. Pure: the host has already chosen backends + transport.
 pub fn globe<T, I>(
     terrain: T,
     imagery: I,
     layer: LayerJson,
     opts: GlobeOptions,
-) -> (
-    Box<dyn TileTree>,
-    Arc<dyn TileLoader>,
-    ImageryDetail,
-    Arc<TerrainHeights>,
-)
+) -> (Box<dyn TileTree>, Arc<dyn TileLoader>, Arc<TerrainHeights>)
 where
     T: TerrainSource + 'static,
     I: ImageryProvider + 'static,
@@ -1762,27 +1633,20 @@ pub fn globe_on<T, I>(
     layer: LayerJson,
     opts: GlobeOptions,
     offload: Arc<dyn Offload>,
-) -> (
-    Box<dyn TileTree>,
-    Arc<dyn TileLoader>,
-    ImageryDetail,
-    Arc<TerrainHeights>,
-)
+) -> (Box<dyn TileTree>, Arc<dyn TileLoader>, Arc<TerrainHeights>)
 where
     T: TerrainSource + 'static,
     I: ImageryProvider + 'static,
 {
-    let (tree, loader, detail, heights, _) =
-        globe_with_provenance(terrain, imagery, layer, opts, offload);
-    (tree, loader, detail, heights)
+    let (tree, loader, heights, _) = globe_with_provenance(terrain, imagery, layer, opts, offload);
+    (tree, loader, heights)
 }
 
-/// What [`globe_with_provenance`] hands back: [`globe_on`]'s four, and the
+/// What [`globe_with_provenance`] hands back: [`globe_on`]'s three, and the
 /// provenance record the loader fills.
 pub type GlobeWithProvenance = (
     Box<dyn TileTree>,
     Arc<dyn TileLoader>,
-    ImageryDetail,
     Arc<TerrainHeights>,
     Arc<Provenance>,
 );
@@ -1829,7 +1693,6 @@ where
         TerrainTree::with_availability(layer, Arc::clone(&availability))
             .with_max_level(deepest_useful),
     );
-    let detail = ImageryDetail::default();
     let heights = Arc::new(TerrainHeights::new(scheme));
     let loader: Arc<dyn TileLoader> = Arc::new(PlanetaryLoader {
         terrain,
@@ -1838,17 +1701,14 @@ where
         opts,
         cache: Mutex::new(ImageryCache::new(512)),
         meshes: Mutex::new(MeshCache::new(512)),
-        // Smaller than the real cache: these are approximations with a short
-        // life, replaced the moment the tile they stand in for arrives.
-        fill_meshes: Mutex::new(MeshCache::new(256)),
         fetching: ImageryInFlight::default(),
+        building: TerrainInFlight::default(),
         availability,
         provenance: Arc::clone(&provenance),
-        detail: detail.clone(),
         heights: Arc::clone(&heights),
         offload,
     });
-    (tree, loader, detail, heights, provenance)
+    (tree, loader, heights, provenance)
 }
 
 #[cfg(test)]
@@ -1879,6 +1739,68 @@ mod tests {
         }
     }
 
+    /// A terrain source that has nothing, says so after a turn of the
+    /// executor (so that loads overlap), and counts every request.
+    struct Barren(std::sync::atomic::AtomicUsize);
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl tuile_terrain::TerrainSource for Barren {
+        async fn fetch_tile(
+            &self,
+            coord: TileCoord,
+        ) -> Result<tuile_core::fetch::Fetched<Vec<u8>>, tuile_terrain::TerrainSourceError>
+        {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut turned = false;
+            futures_util::future::poll_fn(|cx| {
+                if turned {
+                    std::task::Poll::Ready(())
+                } else {
+                    turned = true;
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+            Err(tuile_terrain::TerrainSourceError::no_such_tile(format!(
+                "{coord:?}"
+            )))
+        }
+    }
+
+    /// **One terrain tile is asked for once at a time**, however many loads
+    /// need it together: two siblings built from the same ancestors fetch
+    /// each ancestor once between them — four requests, not six. A browser
+    /// showed one terrain tile requested 23 times, many of them at once.
+    #[test]
+    fn concurrent_loads_ask_for_a_shared_ancestor_once() {
+        let scheme = GeographicTilingScheme::default();
+        let loader = PlanetaryLoader {
+            terrain: Barren(std::sync::atomic::AtomicUsize::new(0)),
+            imagery: CountingImagery(std::sync::atomic::AtomicUsize::new(0)),
+            scheme,
+            opts: GlobeOptions::default(),
+            cache: Mutex::new(ImageryCache::new(8)),
+            meshes: Mutex::new(MeshCache::new(8)),
+            fetching: ImageryInFlight::default(),
+            building: TerrainInFlight::default(),
+            availability: Arc::new(tuile_terrain::Availability::default()),
+            provenance: Arc::default(),
+            heights: Arc::new(TerrainHeights::new(scheme)),
+            offload: offload::inline(),
+        };
+        let (a, b) = futures_executor::block_on(futures_util::future::join(
+            loader.terrain_mesh(TileCoord::new(2, 0, 0)),
+            loader.terrain_mesh(TileCoord::new(2, 1, 0)),
+        ));
+        assert!(a.is_err() && b.is_err(), "the source has nothing");
+        assert_eq!(
+            loader.terrain.0.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "two siblings, their parent and the root, once each"
+        );
+    }
+
     /// A terrain source that is never reached: `drape` does not touch it.
     struct NoTerrain;
 
@@ -1907,41 +1829,28 @@ mod tests {
             },
             cache: Mutex::new(ImageryCache::new(8)),
             meshes: Mutex::new(MeshCache::new(8)),
-            fill_meshes: Mutex::new(MeshCache::new(8)),
             fetching: ImageryInFlight::default(),
+            building: TerrainInFlight::default(),
             availability: Arc::new(tuile_terrain::Availability::default()),
             provenance: Arc::default(),
-            detail: ImageryDetail::default(),
             heights: Arc::new(TerrainHeights::new(scheme)),
             offload: offload::inline(),
         }
     }
 
-    fn some_ground() -> GeoRect {
-        let scheme = GeographicTilingScheme::default();
-        let rect = scheme.tile_rect(TileCoord::new(8, 130, 90));
-        GeoRect {
-            west: rect.west,
-            south: rect.south,
-            east: rect.east,
-            north: rect.north,
-        }
+    /// The tile `some_ground` is.
+    const GROUND: TileCoord = TileCoord {
+        level: 8,
+        x: 130,
+        y: 90,
+    };
+
+    fn ground_id() -> TileId {
+        TileId::from_terrain(GROUND.level, GROUND.x, GROUND.y)
     }
 
-    fn drape_once(
-        loader: &PlanetaryLoader<NoTerrain, CountingImagery>,
-    ) -> tuile_core::DecodedTileContent {
-        let mut content = tuile_core::DecodedTileContent {
-            withheld_drape: None,
-            meshes: Vec::new(),
-            textures: Vec::new(),
-            imagery: Vec::new(),
-            local_origin_ecef: glam::DVec3::ZERO,
-            transform_local: glam::Mat4::IDENTITY,
-        };
-        let _ =
-            futures_executor::block_on(loader.drape(&mut content, &some_ground(), 8, TileId(7)));
-        content
+    fn drape_once(loader: &PlanetaryLoader<NoTerrain, CountingImagery>) -> Option<DrapeContent> {
+        futures_executor::block_on(loader.compose(ground_id(), LayerId(0), 9)).ok()
     }
 
     /// An imagery set that is one flat shade everywhere, on the geographic
@@ -2007,14 +1916,34 @@ mod tests {
             opts: GlobeOptions::default(),
             cache: Mutex::new(ImageryCache::new(64)),
             meshes: Mutex::new(MeshCache::new(8)),
-            fill_meshes: Mutex::new(MeshCache::new(8)),
             fetching: ImageryInFlight::default(),
+            building: TerrainInFlight::default(),
             availability: Arc::new(tuile_terrain::Availability::default()),
             provenance: Arc::default(),
-            detail: ImageryDetail::default(),
             heights: Arc::new(TerrainHeights::new(scheme)),
             offload: offload::inline(),
         }
+    }
+
+    /// **Asking whether a drape is held never waits on the loader's own
+    /// cache.** The budget asks the presence oracle from inside its step,
+    /// synchronously; choosing a drape's floor reads the decoded-imagery cache
+    /// under its lock, and the question once held that same lock around it —
+    /// a session that hung on its first step, with nothing in its log.
+    #[test]
+    fn asking_whether_a_drape_is_held_does_not_deadlock() {
+        let gate = Arc::new(futures_util::lock::Mutex::new(()));
+        let loader = Arc::new(gated_loader(gate));
+        let asking = Arc::clone(&loader);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let answer = asking.holds(ResourceId::drape(ground_id(), LayerId(0), 9));
+            let _ = tx.send(answer);
+        });
+        let answer = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the presence query never returned");
+        assert_eq!(answer, Presence::Absent, "nothing is stored anywhere");
     }
 
     const SHARED: ImageryCoord = ImageryCoord {
@@ -2110,28 +2039,19 @@ mod tests {
             opts: GlobeOptions::default(),
             cache: Mutex::new(ImageryCache::new(64)),
             meshes: Mutex::new(MeshCache::new(8)),
-            fill_meshes: Mutex::new(MeshCache::new(8)),
             fetching: ImageryInFlight::default(),
+            building: TerrainInFlight::default(),
             availability: Arc::new(tuile_terrain::Availability::default()),
             provenance: Arc::default(),
-            detail: ImageryDetail::default(),
             heights: Arc::new(TerrainHeights::new(scheme)),
             offload: offload::inline(),
         };
         let drape = || {
-            let mut content = tuile_core::DecodedTileContent {
-                withheld_drape: None,
-                meshes: Vec::new(),
-                textures: Vec::new(),
-                imagery: Vec::new(),
-                local_origin_ecef: glam::DVec3::ZERO,
-                transform_local: glam::Mat4::IDENTITY,
-            };
-            futures_executor::block_on(loader.drape(&mut content, &some_ground(), 8, TileId(7)))
+            let content = futures_executor::block_on(loader.compose(ground_id(), LayerId(0), 9))
                 .expect("a drape");
-            assert!(!content.imagery.is_empty(), "nothing was draped");
+            assert!(!content.tiles.is_empty(), "nothing was draped");
             content
-                .imagery
+                .tiles
                 .iter()
                 .map(|layer| (layer.source, layer.coord, layer.texture.rgba8[0]))
                 .collect::<Vec<_>>()
@@ -2182,17 +2102,17 @@ mod tests {
     #[test]
     fn a_held_drape_is_never_requested() {
         let loader = a_loader(Some(HeldDrape::new(|_, _| true)));
-        let content = drape_once(&loader);
+        let content = drape_once(&loader).expect("a withheld drape");
         assert_eq!(
             loader.imagery.0.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "the loader asked for imagery it was told the consumer holds"
         );
         assert!(
-            content.withheld_drape.is_some(),
+            content.withheld,
             "nothing was fetched and nothing says why — this is bare ground"
         );
-        assert!(content.imagery.is_empty(), "no layers were attached");
+        assert!(content.tiles.is_empty(), "no layers were attached");
     }
 
     /// And the same ground, unheld, does ask — otherwise the test above would
@@ -2205,9 +2125,11 @@ mod tests {
             loader.imagery.0.load(std::sync::atomic::Ordering::SeqCst) > 0,
             "nothing was requested for a drape nobody holds"
         );
+        // The provider refuses everything, so the drape fails; it is not
+        // reported withheld.
         assert!(
-            content.withheld_drape.is_none(),
-            "nothing was withheld, so the field must stay clear"
+            content.is_none_or(|c| !c.withheld),
+            "nothing was withheld, so the flag must stay clear"
         );
     }
 
@@ -2315,114 +2237,6 @@ mod tests {
             south: r.south + h,
             north: r.north - h,
         }
-    }
-
-    /// **One missing tile at the sharp level no longer discards its siblings.**
-    ///
-    /// The previous policy collected a level into `Option<Vec<_>>`, so a single
-    /// cache miss dropped every sibling that was in hand and the walk fell to
-    /// whatever level happened to be complete — measured at 84 stand-ins
-    /// covered by exactly one image while the sharp textures sat decoded in the
-    /// cache. The pick must keep the three present tiles and floor them with
-    /// the complete coarser level, floor first so the sharp ones paint over it.
-    #[test]
-    fn a_missing_sharp_tile_keeps_its_siblings_over_a_coarser_floor() {
-        let scheme = raster::TilingScheme::web_mercator();
-        let parent = ImageryCoord {
-            level: 9,
-            x: 261,
-            y: 178,
-        };
-        let geo = inset(&scheme, parent);
-        // The four level-10 children of `parent`; one of them is missing.
-        let missing = ImageryCoord {
-            level: 10,
-            x: 523,
-            y: 357,
-        };
-        let has = |c: ImageryCoord| c == parent || (c.level == 10 && c != missing);
-
-        let picked = stand_in_layers(&scheme, &geo, 8, 10, has);
-
-        assert_eq!(
-            picked.first().map(|(c, _)| *c),
-            Some(parent),
-            "the complete coarser level floors the pick, and comes first so the \
-             sharp tiles paint over it: {picked:?}"
-        );
-        let sharp: Vec<_> = picked.iter().filter(|(c, _)| c.level == 10).collect();
-        assert_eq!(
-            sharp.len(),
-            3,
-            "the three cached siblings survive their missing fourth: {picked:?}"
-        );
-        assert!(
-            !picked.iter().any(|(c, _)| *c == missing),
-            "the missing tile itself is not invented"
-        );
-    }
-
-    /// A complete sharp level needs no floor: it is its own.
-    #[test]
-    fn a_complete_sharp_level_is_taken_whole_and_alone() {
-        let scheme = raster::TilingScheme::web_mercator();
-        let parent = ImageryCoord {
-            level: 9,
-            x: 261,
-            y: 178,
-        };
-        let geo = inset(&scheme, parent);
-        let picked = stand_in_layers(&scheme, &geo, 8, 10, |c| c.level == 10);
-        assert_eq!(
-            picked.len(),
-            4,
-            "the four children, nothing else: {picked:?}"
-        );
-        assert!(picked.iter().all(|(c, _)| c.level == 10));
-    }
-
-    /// An empty cache yields an empty pick — the caller then refuses the
-    /// stand-in outright, which is its documented behaviour.
-    #[test]
-    fn nothing_cached_yields_nothing() {
-        let scheme = raster::TilingScheme::web_mercator();
-        let parent = ImageryCoord {
-            level: 9,
-            x: 261,
-            y: 178,
-        };
-        let geo = inset(&scheme, parent);
-        assert!(stand_in_layers(&scheme, &geo, 8, 10, |_| false).is_empty());
-    }
-
-    /// Coverage outranks sharpness: when floor plus partial exceed the budget,
-    /// the partial is trimmed and the floor is not.
-    #[test]
-    fn the_floor_is_never_trimmed_for_the_budget() {
-        let scheme = raster::TilingScheme::web_mercator();
-        // A small rect straddling the shared edge of two level-9 tiles: two
-        // tiles at level 9, two at level 10.
-        let west = scheme.tile_rect(ImageryCoord {
-            level: 9,
-            x: 261,
-            y: 178,
-        });
-        let h = west.height() * 0.01;
-        let w = west.width() * 0.01;
-        let geo = GeoRect {
-            west: west.east - w,
-            east: west.east + w,
-            south: west.south + west.height() * 0.45,
-            north: west.north - west.height() * 0.45 - h,
-        };
-        // Both level-9 tiles cached, one of the two level-10 ones.
-        let has = |c: ImageryCoord| c.level == 9 || (c.level == 10 && c.x == 522);
-        let picked = stand_in_layers(&scheme, &geo, 2, 10, has);
-        assert_eq!(picked.len(), 2, "the budget holds: {picked:?}");
-        assert!(
-            picked.iter().all(|(c, _)| c.level == 9),
-            "what fits is the floor, whole — sharpness is what gets trimmed: {picked:?}"
-        );
     }
 
     #[test]

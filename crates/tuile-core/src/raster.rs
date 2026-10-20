@@ -997,6 +997,30 @@ impl ImageryLayer {
         self
     }
 
+    /// Where it sits in its tile's uv square.
+    pub fn placement(&self) -> Placement {
+        Placement {
+            coverage: self.coverage,
+            translation: self.translation,
+            scale: self.scale,
+        }
+    }
+
+    /// The same layer, placed in a descendant tile's uv square rather than
+    /// its owner's: see [`Placement::through`]. `None` when it covers none
+    /// of the descendant.
+    pub fn through(&self, uv: crate::budget::UvTransform) -> Option<Self> {
+        let p = self.placement().through(uv)?;
+        Some(Self {
+            coord: self.coord,
+            source: self.source,
+            texture: Arc::clone(&self.texture),
+            coverage: p.coverage,
+            translation: p.translation,
+            scale: p.scale,
+        })
+    }
+
     /// Whether this layer covers any of the geometry tile at all.
     ///
     /// A degenerate coverage rectangle means the two rectangles only touched at
@@ -1005,6 +1029,57 @@ impl ImageryLayer {
     /// texture binding and contributes no pixels, so it is worth dropping.
     pub fn is_visible(&self) -> bool {
         self.coverage[2] > self.coverage[0] && self.coverage[3] > self.coverage[1]
+    }
+}
+
+/// Where one imagery layer sits in a tile's uv square: the part it covers,
+/// and the affine map into its texture. The half of an [`ImageryLayer`] a
+/// renderer binds, without the pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Placement {
+    /// `[u_min, v_min, u_max, v_max]`, v growing southward.
+    pub coverage: [f32; 4],
+    /// `texture_uv = tile_uv * scale + translation`.
+    pub translation: [f32; 2],
+    pub scale: [f32; 2],
+}
+
+impl Placement {
+    /// The same placement in a descendant tile's uv square: `uv` maps the
+    /// descendant's uv into the owner's (`owner = offset + uv × scale`, the
+    /// budget's [`UvTransform`](crate::budget::UvTransform)). How a tile
+    /// wears an ancestor's drape while its own is not drawable yet — the same
+    /// textures, no copy, each layer masked to what it covers of the tile.
+    /// `None` when it covers none of the descendant.
+    pub fn through(self, uv: crate::budget::UvTransform) -> Option<Self> {
+        let (s, o) = (uv.scale, uv.offset);
+        if !(s[0] > 0.0 && s[1] > 0.0) {
+            return None;
+        }
+        let c = self.coverage;
+        let u = |x: f32| ((f64::from(x) - o[0]) / s[0]) as f32;
+        let v = |y: f32| ((f64::from(y) - o[1]) / s[1]) as f32;
+        let coverage = [u(c[0]), v(c[1]), u(c[2]), v(c[3])];
+        let reaches = coverage[2] >= 0.0
+            && coverage[0] <= 1.0
+            && coverage[3] >= 0.0
+            && coverage[1] <= 1.0
+            && coverage[2] > coverage[0]
+            && coverage[3] > coverage[1];
+        if !reaches {
+            return None;
+        }
+        Some(Self {
+            coverage,
+            translation: [
+                (o[0] * f64::from(self.scale[0]) + f64::from(self.translation[0])) as f32,
+                (o[1] * f64::from(self.scale[1]) + f64::from(self.translation[1])) as f32,
+            ],
+            scale: [
+                (s[0] * f64::from(self.scale[0])) as f32,
+                (s[1] * f64::from(self.scale[1])) as f32,
+            ],
+        })
     }
 }
 
@@ -1035,16 +1110,20 @@ pub const EMPTY_COVERAGE: [f32; 4] = [1.0, 1.0, 0.0, 0.0];
 /// whether the shader is WGSL, GLSL or a scene-graph material. Only the binding
 /// mechanics differ.
 pub fn imagery_layer_table(layers: &[ImageryLayer], slots: u32) -> Vec<[f32; 4]> {
+    placement_table(layers.iter().map(ImageryLayer::placement), slots)
+}
+
+/// [`imagery_layer_table`], from placements alone: what a renderer that keeps
+/// the textures and drops the pixels binds.
+pub fn placement_table(
+    placements: impl IntoIterator<Item = Placement>,
+    slots: u32,
+) -> Vec<[f32; 4]> {
     let slots = slots as usize;
     let mut table = vec![EMPTY_COVERAGE; 2 * slots];
-    for (slot, layer) in layers.iter().take(slots).enumerate() {
-        table[2 * slot] = layer.coverage;
-        table[2 * slot + 1] = [
-            layer.translation[0],
-            layer.translation[1],
-            layer.scale[0],
-            layer.scale[1],
-        ];
+    for (slot, p) in placements.into_iter().take(slots).enumerate() {
+        table[2 * slot] = p.coverage;
+        table[2 * slot + 1] = [p.translation[0], p.translation[1], p.scale[0], p.scale[1]];
     }
     table
 }
@@ -1370,6 +1449,14 @@ pub trait ImageryProvider: Send + Sync {
         crate::storage::Stamp::Unknown
     }
 
+    /// Whether a local store holds the tile, asked of its index without
+    /// reading it, synchronously: see [`ContentStore::holds`]. The default
+    /// knows of no store.
+    fn holds(&self, coord: ImageryCoord) -> bool {
+        let _ = coord;
+        false
+    }
+
     /// The decoded tile. Provided: every provider decodes the same way.
     async fn fetch_tile(
         &self,
@@ -1465,6 +1552,10 @@ impl<P: ImageryProvider> ImageryProvider for CachedImagery<P> {
     /// asked — it would have to fetch the bytes to say anything.
     async fn fetch_tile_stamp(&self, coord: ImageryCoord) -> crate::storage::Stamp {
         self.store.stamp(&self.key(coord)).await
+    }
+
+    fn holds(&self, coord: ImageryCoord) -> bool {
+        self.store.holds(&self.key(coord))
     }
 
     async fn fetch_tile_bytes(&self, coord: ImageryCoord) -> Result<Fetched<Bytes>, RasterError> {

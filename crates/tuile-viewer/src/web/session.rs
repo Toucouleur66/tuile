@@ -4,26 +4,29 @@
 //! The page's session: a worker running the geometry server, and the handles
 //! the application drives it through — under the names the desktop's have.
 //!
-//! On a desktop the window and the loader share memory: the imagery detail is
-//! an atomic both read, the gate a notification both see. A page and its
-//! worker share nothing, so each handle here is a small proxy that posts what
-//! the application did to the worker, which does it to the loader's own
-//! handle (see [`super::control`]). The application cannot tell the
-//! difference, which is the point.
+//! On a desktop the window and the loader share memory: the slot count is an
+//! atomic both read, the gate a notification both see. A page and its worker
+//! share nothing, so each handle here is a small proxy that posts what the
+//! application did to the worker, which does it to the loader's own handle
+//! (see [`super::control`]). The application cannot tell the difference,
+//! which is the point. What the budget hears — the camera, the
+//! acknowledgements, the memory and thermal signals — travels on the stream
+//! itself; what it says of itself comes back for the overlay.
 //!
 //! Relief is the one thing that travels the other way. The camera stands on
 //! the terrain's heights, which the desktop's loader records as it decodes;
 //! here the page records them from the content it is handed — each terrain
 //! tile's highest vertex — before the content goes on to the GPU.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use tuile_core::content::TileContent;
-use tuile_core::protocol::{ClientMessage, GeometryStream, ServerMessage, StreamError};
+use tuile_core::protocol::{
+    ClientMessage, GeometryStream, ResourceContent, ServerMessage, StreamError,
+};
 use tuile_planetary::LayerBudget;
 use tuile_terrain::{GeographicTilingScheme, TerrainHeights, TileCoord};
 use tuile_web::post::{Connection, WorkerStream};
@@ -76,7 +79,6 @@ impl Drop for Link {
 /// A session that is up: its stream, and the handles the window adopts.
 pub(crate) struct Started {
     pub stream: PageStream,
-    pub detail: Detail,
     pub heights: Arc<TerrainHeights>,
     pub layer_budget: Budget,
     pub switcher: Switcher,
@@ -95,6 +97,13 @@ impl Started {
 
     /// Nor anything to open again.
     pub(crate) fn resume_store(&self) {}
+
+    /// The session's meter lives in the worker, beside the budget it
+    /// measures; the page reads the signals it publishes instead (see
+    /// [`ToPage::Signals`]).
+    pub(crate) fn meter(&self) -> Option<tuile_core::runtime::SharedMeter> {
+        None
+    }
 }
 
 /// The stream, with the relief recorded on the way past.
@@ -111,13 +120,13 @@ impl GeometryStream for PageStream {
     fn poll_message(&mut self, cx: &mut Context<'_>) -> Poll<Option<ServerMessage>> {
         let polled = self.inner.poll_message(cx);
         if let Poll::Ready(Some(ServerMessage::Content {
-            tile,
-            content: TileContent::Decoded(decoded),
+            resource,
+            content: ResourceContent::Mesh(decoded),
             ..
         })) = &polled
         {
             if let Some(highest) = highest_point(decoded) {
-                let (z, x, y) = tile.terrain_coord();
+                let (z, x, y) = resource.tile().terrain_coord();
                 self.heights.record(TileCoord::new(z, x, y), highest);
             }
         }
@@ -138,26 +147,6 @@ fn highest_point(content: &tuile_core::content::DecodedTileContent) -> Option<f3
         .reduce(f32::max)
 }
 
-/// The imagery detail the loader drapes at, forwarded when it changes.
-#[derive(Clone, Default)]
-pub(crate) struct Detail {
-    link: Option<Rc<Link>>,
-    sent: Rc<Cell<u64>>,
-}
-
-impl Detail {
-    /// See `tuile_planetary::ImageryDetail::set_target_texel_spacing`. Called
-    /// every frame; posted only when the number moved.
-    pub(crate) fn set_target_texel_spacing(&self, metres: f64) {
-        let Some(link) = self.link.as_ref() else {
-            return;
-        };
-        if self.sent.replace(metres.to_bits()) != metres.to_bits() {
-            link.post(&ToWorker::Detail { metres });
-        }
-    }
-}
-
 /// How many imagery layers a drape may carry, as the device says.
 #[derive(Clone, Default)]
 pub(crate) struct Budget {
@@ -170,7 +159,7 @@ impl Budget {
     pub(crate) fn set_from_device(&self, max_sampled_textures_per_stage: u32) {
         self.local.set_from_device(max_sampled_textures_per_stage);
         if let Some(link) = self.link.as_ref() {
-            link.post(&ToWorker::Budget {
+            link.post(&ToWorker::Slots {
                 reported: max_sampled_textures_per_stage,
             });
         }
@@ -273,6 +262,11 @@ pub(crate) fn start(plan: &Plan) -> Launch {
             Ok(ToPage::Switched { layer, outcome }) => {
                 answers.borrow_mut().push_back((layer, outcome));
             }
+            // The worker's budget, published here as a desktop's session
+            // publishes its own: the overlay reads it the same way.
+            Ok(ToPage::Signals { glance }) => {
+                tuile_core::metrics::publish_budget(glance.signals());
+            }
             Err(e) => tracing::error!("the worker said something unreadable: {e}"),
         }
     };
@@ -315,10 +309,6 @@ fn started(
         stream: PageStream {
             inner: stream,
             heights: Arc::clone(&heights),
-        },
-        detail: Detail {
-            link: Some(Rc::clone(&link)),
-            sent: Rc::default(),
         },
         heights,
         layer_budget: Budget {

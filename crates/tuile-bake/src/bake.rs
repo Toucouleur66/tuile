@@ -272,9 +272,9 @@ pub fn bake_frames(
 /// `traversal` et ne portait que la première, ce qui laissait passer deux
 /// collisions mesurées le 17 septembre 2026 sur la même orbite :
 ///
-/// * boost d'imagerie 1 et 2 → même digest `9fb2b0f3559debc6`. Le plafond de
-///   boost est une option du chargeur, pas de la traversée, donc
-///   `exact_traversal` ne le voit pas.
+/// * boost d'imagerie 1 et 2 → même digest `9fb2b0f3559debc6`. Le plafond
+///   d'imagerie est un réglage du budget, pas de la traversée, donc
+///   `exact_traversal` ne le voit pas : il entre par `budget_settings`.
 /// * asset d'imagerie 2 (Bing) et 3954 (Sentinel) → même digest, pour la même
 ///   raison.
 ///
@@ -282,10 +282,10 @@ pub fn bake_frames(
 /// compositions séparées finissent par diverger.
 pub fn bake_settings(config: &GlobeConfig, resolved: &tuile_core::traversal::Config) -> String {
     format!(
-        "{resolved:?}\nterrain={}\nimagery={:?}\nimagery_boost={}",
+        "{resolved:?}\nterrain={}\nimagery={:?}\n{}",
         config.terrain_asset_id,
         config.imagery_asset_id,
-        crate::imagery_boost_cap(),
+        crate::budget_settings(&crate::exact_budget(config.session.budget.clone())),
     )
 }
 

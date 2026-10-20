@@ -19,22 +19,26 @@
 //! - **resigning** (a call, the control centre pulled down) stops drawing and
 //!   holds new loads at the [`crate::gate::Gate`];
 //! - **the background** also lets go of the surface and its render targets
-//!   (tens of megabytes at full resolution and four samples) and asks the
-//!   server to trim its residency to a quarter of the budget — never the
-//!   tiles the view draws or their ancestors, so the globe comes back covered;
+//!   (tens of megabytes at full resolution and four samples) and tells the
+//!   server's budget it is in the background (`Pressure::Background`): its
+//!   targets shrink to what the view draws and the floor, never past them,
+//!   so the globe comes back covered;
 //! - **activating** brings the surface back first, then opens the gate and
-//!   asks for a frame: the surface exists before anything draws into it.
+//!   asks for a frame: the surface exists before anything draws into it; the
+//!   budget is told the pressure is over.
 //!
 //! A desktop only ever sees its window covered and uncovered, and does what it
 //! always did: stops drawing while covered.
 //!
-//! A browser tab sits between the two. Hidden, it holds its loads and trims
-//! like a phone — a tab in the background is still the user's memory — but
+//! A browser tab sits between the two. Hidden, it holds its loads and gives
+//! memory back like a phone — a tab in the background is still the user's memory — but
 //! keeps its surface, which a page cannot rebuild cheaply (a WebGL2 device is
 //! bound to its canvas), and comes straight back to the front when shown
 //! again: a page has no separate "activate".
 //!
 //! Pure: events in, [`Step`]s out. The window carries the steps out.
+
+use crate::profile::Pressure;
 
 /// Where the application stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,8 +55,9 @@ pub(super) enum Step {
     PauseLoads,
     /// Let them go.
     ResumeLoads,
-    /// Ask the server to let go of residency beyond this many bytes.
-    Trim(usize),
+    /// Hand the server's budget the platform's memory signal: its targets
+    /// shrink by it, never past what the view draws and the floor.
+    Pressure(Pressure),
     /// Write the tile store down and close it: the system ends background
     /// applications without a word, and an unclosed store loses its memory
     /// tier.
@@ -78,10 +83,8 @@ pub(super) struct Lifecycle {
     release_surface: bool,
     surface_released: bool,
     store_suspended: bool,
-    /// Bytes to trim to on a memory warning, and in the background.
-    trim_on_warning: usize,
-    trim_in_background: usize,
-    trim_on_critical: usize,
+    /// The memory signal last handed to the budget.
+    pressure: Pressure,
 }
 
 /// Acts once on each memory signal a system counts — Android's
@@ -94,14 +97,11 @@ pub(super) struct PressureWatch {
 
 impl PressureWatch {
     /// The pressure to act on, if `count` is a signal not acted on yet.
-    pub(super) fn fresh(
-        &mut self,
-        (count, pressure): (u64, crate::profile::Pressure),
-    ) -> Option<crate::profile::Pressure> {
+    pub(super) fn fresh(&mut self, (count, pressure): (u64, Pressure)) -> Option<Pressure> {
         if count == std::mem::replace(&mut self.seen, count) {
             return None;
         }
-        (pressure != crate::profile::Pressure::Nominal).then_some(pressure)
+        (pressure != Pressure::Normal).then_some(pressure)
     }
 }
 
@@ -113,10 +113,14 @@ impl Lifecycle {
             release_surface: profile.release_surface_in_background,
             surface_released: false,
             store_suspended: false,
-            trim_on_warning: profile.trim_on_warning(),
-            trim_in_background: profile.trim_in_background(),
-            trim_on_critical: profile.trim_on_critical_pressure(),
+            pressure: Pressure::Normal,
         }
+    }
+
+    /// The step that hands `pressure` to the budget, when it is news.
+    fn press(&mut self, pressure: Pressure) -> Option<Step> {
+        (std::mem::replace(&mut self.pressure, pressure) != pressure)
+            .then_some(Step::Pressure(pressure))
     }
 
     pub(super) fn phase(&self) -> Phase {
@@ -153,7 +157,7 @@ impl Lifecycle {
         if was == Phase::Active {
             steps.push(Step::PauseLoads);
         }
-        steps.push(Step::Trim(self.trim_in_background));
+        steps.extend(self.press(Pressure::Background));
         if !std::mem::replace(&mut self.store_suspended, true) {
             steps.push(Step::SuspendStore);
         }
@@ -198,13 +202,26 @@ impl Lifecycle {
         if self.pause_when_away && was != Phase::Active {
             steps.push(Step::ResumeLoads);
         }
+        // Back in front: whatever squeezed the budget while away is over.
+        steps.extend(self.press(Pressure::Normal));
         steps.push(Step::Redraw);
         steps
     }
 
-    /// The system is short of memory.
-    pub(super) fn memory_warning(&self) -> Vec<Step> {
-        vec![Step::Trim(self.trim_on_warning)]
+    /// The system is short of memory: a warning, unless something heavier
+    /// is in force — the background squeezes harder, and a warning received
+    /// there is not news.
+    pub(super) fn memory_warning(&mut self) -> Vec<Step> {
+        self.memory_pressure(Pressure::Warning)
+    }
+
+    /// The memory signal has gone quiet for long enough: the budget's
+    /// targets come back, in front only — the background keeps its own.
+    pub(super) fn calm(&mut self) -> Vec<Step> {
+        if self.phase != Phase::Active {
+            return Vec::new();
+        }
+        self.press(Pressure::Normal).into_iter().collect()
     }
 
     /// The system took the window's surface away: Android does, whenever the
@@ -218,14 +235,14 @@ impl Lifecycle {
         steps
     }
 
-    /// The system says how short of memory it is.
-    pub(super) fn memory_pressure(&self, pressure: crate::profile::Pressure) -> Vec<Step> {
-        use crate::profile::Pressure;
-        match pressure {
-            Pressure::Nominal => Vec::new(),
-            Pressure::Warning => self.memory_warning(),
-            Pressure::Critical => vec![Step::Trim(self.trim_on_critical)],
+    /// The system says how short of memory it is: handed to the budget as
+    /// it is, a lighter signal never overriding a heavier one still in force
+    /// (the background's own is the heaviest).
+    pub(super) fn memory_pressure(&mut self, pressure: Pressure) -> Vec<Step> {
+        if pressure == Pressure::Normal || pressure <= self.pressure {
+            return Vec::new();
         }
+        self.press(pressure).into_iter().collect()
     }
 }
 
@@ -265,7 +282,7 @@ mod tests {
         assert_eq!(
             l.background(),
             [
-                Step::Trim(p.trim_in_background()),
+                Step::Pressure(Pressure::Background),
                 Step::SuspendStore,
                 Step::ReleaseSurface
             ]
@@ -284,10 +301,12 @@ mod tests {
                 Step::RestoreSurface,
                 Step::ResumeStore,
                 Step::ResumeLoads,
+                Step::Pressure(Pressure::Normal),
                 Step::Redraw
             ]
         );
         assert!(l.may_draw());
+        let _ = p;
     }
 
     /// Pulling the control centre down and letting it go: inactive and back,
@@ -313,7 +332,7 @@ mod tests {
     /// A desktop's covered window stops drawing and keeps everything else.
     #[test]
     fn a_desktop_window_covered_and_uncovered() {
-        let mut l = Lifecycle::new(&Profile::desktop());
+        let mut l = Lifecycle::new(&Profile::desktop_with(16 << 30));
         assert!(l.background().is_empty());
         assert!(!l.may_draw());
         assert_eq!(l.foreground(), [Step::Redraw]);
@@ -331,7 +350,7 @@ mod tests {
             l.background(),
             [
                 Step::PauseLoads,
-                Step::Trim(p.trim_in_background()),
+                Step::Pressure(Pressure::Background),
                 Step::SuspendStore
             ]
         );
@@ -339,7 +358,12 @@ mod tests {
         assert!(l.background().is_empty(), "said twice, done once");
         assert_eq!(
             l.foreground(),
-            [Step::ResumeStore, Step::ResumeLoads, Step::Redraw]
+            [
+                Step::ResumeStore,
+                Step::ResumeLoads,
+                Step::Pressure(Pressure::Normal),
+                Step::Redraw
+            ]
         );
         assert!(l.may_draw());
         assert_eq!(l.phase(), Phase::Active);
@@ -362,13 +386,13 @@ mod tests {
     /// first, then the store, then loads, then a frame.
     #[test]
     fn android_takes_the_surface_away_and_gives_it_back() {
-        let (mut l, p) = android();
+        let (mut l, _) = android();
         assert!(l.may_draw());
         assert_eq!(
             l.surface_lost(),
             [
                 Step::PauseLoads,
-                Step::Trim(p.trim_in_background()),
+                Step::Pressure(Pressure::Background),
                 Step::SuspendStore,
                 Step::ReleaseSurface
             ]
@@ -381,6 +405,7 @@ mod tests {
                 Step::RestoreSurface,
                 Step::ResumeStore,
                 Step::ResumeLoads,
+                Step::Pressure(Pressure::Normal),
                 Step::Redraw
             ]
         );
@@ -400,23 +425,28 @@ mod tests {
         assert_eq!(l.activate()[0], Step::RestoreSurface);
     }
 
-    /// Pressure, as Android grades it: nothing at nominal, half the budget on
-    /// a warning, a quarter when critical — never the view's own tiles, which
-    /// the server keeps whatever the number.
+    /// Pressure, as Android grades it, handed to the budget: nothing at
+    /// normal, the grade otherwise — and a lighter grade never relaxes a
+    /// heavier one still in force; calm, in front, brings the budget back.
     #[test]
-    fn memory_pressure_trims_by_how_short_the_system_is() {
-        use crate::profile::Pressure;
-        let (l, p) = android();
-        assert!(l.memory_pressure(Pressure::Nominal).is_empty());
+    fn memory_pressure_is_handed_to_the_budget_by_its_grade() {
+        let (mut l, _) = android();
+        assert!(l.memory_pressure(Pressure::Normal).is_empty());
         assert_eq!(
             l.memory_pressure(Pressure::Warning),
-            [Step::Trim(p.trim_on_warning())]
+            [Step::Pressure(Pressure::Warning)]
         );
         assert_eq!(
             l.memory_pressure(Pressure::Critical),
-            [Step::Trim(p.trim_on_critical_pressure())]
+            [Step::Pressure(Pressure::Critical)]
         );
-        assert_eq!(l.memory_pressure(Pressure::Warning), l.memory_warning());
+        assert!(
+            l.memory_pressure(Pressure::Warning).is_empty(),
+            "a warning relaxed a critical signal"
+        );
+        assert_eq!(l.calm(), [Step::Pressure(Pressure::Normal)]);
+        assert!(l.calm().is_empty(), "said twice, done once");
+        assert_eq!(l.memory_warning(), [Step::Pressure(Pressure::Warning)]);
     }
 
     /// Each signal is acted on once, however often the count is read; the
@@ -425,27 +455,30 @@ mod tests {
     fn each_pressure_signal_is_acted_on_once() {
         use crate::profile::Pressure;
         let mut w = PressureWatch::default();
-        assert_eq!(w.fresh((0, Pressure::Nominal)), None);
+        assert_eq!(w.fresh((0, Pressure::Normal)), None);
         assert_eq!(w.fresh((1, Pressure::Critical)), Some(Pressure::Critical));
         assert_eq!(w.fresh((1, Pressure::Critical)), None, "read again");
         assert_eq!(w.fresh((2, Pressure::Critical)), Some(Pressure::Critical));
-        assert_eq!(w.fresh((3, Pressure::Nominal)), None, "the window hidden");
+        assert_eq!(w.fresh((3, Pressure::Normal)), None, "the window hidden");
         assert_eq!(w.fresh((4, Pressure::Warning)), Some(Pressure::Warning));
     }
 
+    /// The background squeezes the budget harder than a warning, and a
+    /// warning received there is not news.
     #[test]
-    fn a_memory_warning_trims_to_half_the_budget() {
-        let l = phone();
-        let p = Profile::handheld(
-            DeviceMemory {
-                physical: 6 << 30,
-                available: Some(3 << 30),
-            },
-            6,
-        );
-        assert_eq!(
-            l.memory_warning(),
-            [Step::Trim(p.resident_budget_bytes / 2)]
-        );
+    fn the_background_outranks_a_warning() {
+        let mut l = phone();
+        assert!(l
+            .background()
+            .contains(&Step::Pressure(Pressure::Background)));
+        assert!(l.memory_warning().is_empty(), "a warning is lighter");
+        assert!(l.memory_pressure(Pressure::Critical).is_empty());
+        assert!(l.calm().is_empty(), "calm while away");
+        // In front, a warning is news.
+        let mut l = phone();
+        assert!(l
+            .memory_warning()
+            .contains(&Step::Pressure(Pressure::Warning)));
+        assert!(l.memory_warning().is_empty(), "the same warning again");
     }
 }

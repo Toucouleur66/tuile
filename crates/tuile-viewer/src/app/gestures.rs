@@ -35,6 +35,10 @@ const REFINING_RADIUS: f64 = 9.0;
 const TURN_SECONDS: f64 = 1.0;
 /// How often the device's temperature and power saving are read.
 const READ_THE_DEVICE_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+/// How long a memory signal must stay quiet before the budget gets its
+/// targets back: long enough that a system still short of memory says so
+/// again first.
+const CALM_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl App {
     /// One finger event from the window.
@@ -136,7 +140,7 @@ impl App {
             warm,
             selected: resolution.exact + resolution.coarser + resolution.lost,
             lost: resolution.lost,
-            coarser: resolution.coarser + resolution.stand_ins,
+            coarser: resolution.coarser,
             loading: self
                 .active
                 .as_ref()
@@ -286,10 +290,28 @@ impl App {
         if let Some(pressure) = self.pressure.fresh(crate::device::pressure()) {
             tracing::warn!(
                 ?pressure,
-                "the system is short of memory; trimming the residency"
+                "the system is short of memory; the budget shrinks"
             );
             crate::journal::note(&format!("memory pressure: {pressure:?}"));
+            self.squeezed_at = Some(now);
             let steps = self.lifecycle.memory_pressure(pressure);
+            self.carry_out(steps);
+        }
+        self.calm_down(now);
+    }
+
+    /// A memory signal that has gone quiet for long enough gives the budget
+    /// its targets back — in front only; the background keeps its own.
+    pub(super) fn calm_down(&mut self, now: Instant) {
+        let quiet = self
+            .squeezed_at
+            .is_some_and(|at| now.duration_since(at) >= CALM_AFTER);
+        if quiet {
+            let steps = self.lifecycle.calm();
+            if !steps.is_empty() {
+                tracing::info!("memory pressure over; the budget's targets come back");
+                self.squeezed_at = None;
+            }
             self.carry_out(steps);
         }
     }
@@ -316,6 +338,11 @@ impl App {
                     * 1000.0,
                 "device state"
             );
+            if thermal != self.thermal {
+                // The budget slows its uploads and its requests, and
+                // coarsens its detail, as the device heats.
+                self.send(ClientMessage::Thermal(thermal));
+            }
             self.thermal = thermal;
             self.low_power = low_power;
         }
@@ -329,9 +356,6 @@ pub(super) trait Carry {
     fn gate(&self) -> Option<&crate::shell::Gate>;
     /// A message to the server, best effort.
     fn send(&mut self, message: ClientMessage);
-    /// The current camera to the server again, so it runs a pass — the pass
-    /// is what announces the evictions a trim decided.
-    fn resend_view(&mut self);
     fn release_surface(&mut self);
     fn restore_surface(&mut self);
     /// Write the tile store down and close it, off the window's thread.
@@ -354,13 +378,11 @@ pub(super) fn carry(steps: Vec<Step>, to: &mut impl Carry) {
                     gate.open();
                 }
             }
-            Step::Trim(budget_bytes) => {
-                tracing::info!(
-                    budget_mib = budget_bytes >> 20,
-                    "residency trimmed to the budget"
-                );
-                to.send(ClientMessage::Trim { budget_bytes });
-                to.resend_view();
+            // The message is a step of its own on the server: the budget's
+            // targets shrink, and its evictions are announced at once.
+            Step::Pressure(pressure) => {
+                tracing::info!(?pressure, "memory pressure handed to the budget");
+                to.send(ClientMessage::Pressure(pressure));
             }
             Step::SuspendStore => to.suspend_store(),
             Step::ResumeStore => to.resume_store(),
@@ -380,13 +402,6 @@ impl Carry for App {
         if let Some(session) = self.session.as_mut() {
             // Best effort: a closed stream means the session is over.
             let _ = session.stream.send(message);
-        }
-    }
-
-    fn resend_view(&mut self) {
-        let views = self.eye_views();
-        if let (Some(active), Some(session)) = (self.active.as_mut(), self.session.as_mut()) {
-            active.pump.send_view(&mut session.stream, &views);
         }
     }
 
@@ -436,12 +451,9 @@ mod tests {
         }
         fn send(&mut self, message: ClientMessage) {
             self.did.push(match message {
-                ClientMessage::Trim { budget_bytes } => format!("trim {budget_bytes}"),
+                ClientMessage::Pressure(p) => format!("pressure {p:?}"),
                 other => format!("{other:?}"),
             });
-        }
-        fn resend_view(&mut self) {
-            self.did.push("view".into());
         }
         fn release_surface(&mut self) {
             self.did.push("release".into());
@@ -461,8 +473,8 @@ mod tests {
     }
 
     /// Each step reaches the thing it names: the gate shuts and opens, a
-    /// trim goes to the server followed by the view that makes it act, the
-    /// surface goes and comes back before the frame.
+    /// memory signal goes to the server's budget, the surface goes and comes
+    /// back before the frame.
     #[test]
     fn each_step_reaches_what_it_names() {
         let mut to = Recorded {
@@ -472,14 +484,14 @@ mod tests {
         carry(
             vec![
                 Step::PauseLoads,
-                Step::Trim(1 << 20),
+                Step::Pressure(crate::profile::Pressure::Background),
                 Step::SuspendStore,
                 Step::ReleaseSurface,
             ],
             &mut to,
         );
         assert!(to.gate.as_ref().is_some_and(Gate::is_shut));
-        assert_eq!(to.did, ["trim 1048576", "view", "suspend", "release"]);
+        assert_eq!(to.did, ["pressure Background", "suspend", "release"]);
 
         to.did.clear();
         carry(

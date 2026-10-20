@@ -67,6 +67,17 @@ pub trait ContentStore: Send + Sync {
         let _ = key;
         Stamp::Unknown
     }
+
+    /// Whether the store holds a value under `key`, asked of its index
+    /// **without reading the value, synchronously**: the graphics budget's
+    /// presence oracle (spec §4b), asked of every resource it is about to
+    /// schedule, so that nothing held locally is fetched from the network
+    /// again (I14). A hint, never a promise: a `get` may still miss. The
+    /// default knows of nothing.
+    fn holds(&self, key: &str) -> bool {
+        let _ = key;
+        false
+    }
 }
 
 /// What a store knows of a value it was not asked to read: see

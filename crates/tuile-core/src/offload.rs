@@ -36,7 +36,81 @@
 //! }
 //! ```
 
-use std::sync::Arc;
+use std::cell::Cell;
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+
+use crate::budget::ResourceId;
+
+// Const already; clippy on Android's target reads the expansion otherwise.
+#[allow(clippy::missing_const_for_thread_local)]
+mod loading_slot {
+    use super::*;
+    thread_local! {
+        pub(super) static LOADING: Cell<Option<ResourceId>> = const { Cell::new(None) };
+    }
+}
+use loading_slot::LOADING;
+
+/// The resource whose load is being polled on this thread, if any: what a
+/// job submitted from inside a load is for. A pool that orders its queue
+/// reads it at submission, and asks [`LoadRanks`] where that load stands.
+pub fn loading() -> Option<ResourceId> {
+    LOADING.with(Cell::get)
+}
+
+/// A load's future, naming its resource to [`loading`] while it is polled.
+pub struct ForLoad<F> {
+    resource: ResourceId,
+    inner: Pin<Box<F>>,
+}
+
+impl<F: Future> ForLoad<F> {
+    pub fn new(resource: ResourceId, inner: F) -> Self {
+        Self {
+            resource,
+            inner: Box::pin(inner),
+        }
+    }
+}
+
+impl<F: Future> Future for ForLoad<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        let resource = self.resource;
+        let before = LOADING.with(|l| l.replace(Some(resource)));
+        let out = self.inner.as_mut().poll(cx);
+        LOADING.with(|l| l.set(before));
+        out
+    }
+}
+
+/// Where each load in flight stands in the budget's priority order, as of
+/// its latest step: 0 first. Shared between the session that ranks and a
+/// pool that orders the work those loads wait on — a decode pool, which
+/// would otherwise take its jobs in the order they came, and keep a load the
+/// camera has left ahead of the one it now looks at.
+#[derive(Clone, Debug, Default)]
+pub struct LoadRanks(Arc<Mutex<HashMap<ResourceId, u32>>>);
+
+impl LoadRanks {
+    /// Where `resource`'s load stands, if it is in flight and ranked.
+    pub fn rank(&self, resource: ResourceId) -> Option<u32> {
+        self.0.lock().ok()?.get(&resource).copied()
+    }
+
+    /// Replaces the ranks: the loads in flight, in priority order.
+    pub fn publish(&self, in_order: impl IntoIterator<Item = ResourceId>) {
+        if let Ok(mut ranks) = self.0.lock() {
+            ranks.clear();
+            ranks.extend(in_order.into_iter().zip(0u32..));
+        }
+    }
+}
 
 /// A unit of blocking work. Owns everything it touches, so it can cross to
 /// whatever thread the host chooses.
@@ -569,6 +643,31 @@ mod tests {
         drop(rx);
         assert!(!reply.wanted());
         reply.send(Ok(Vec::new()));
+    }
+
+    /// **A load names itself while it is polled, and only then**: what a
+    /// pool reads to know which load a job is for.
+    #[test]
+    fn a_load_names_itself_while_it_is_polled() {
+        let r = ResourceId::Mesh(crate::source::TileId(7));
+        assert_eq!(loading(), None);
+        let seen = futures_executor::block_on(ForLoad::new(r, async { loading() }));
+        assert_eq!(seen, Some(r));
+        assert_eq!(loading(), None, "nothing named once the poll returns");
+    }
+
+    /// The ranks are the order they were published in, and only those.
+    #[test]
+    fn ranks_follow_the_published_order() {
+        let ranks = LoadRanks::default();
+        let (a, b) = (
+            ResourceId::Mesh(crate::source::TileId(1)),
+            ResourceId::Mesh(crate::source::TileId(2)),
+        );
+        ranks.publish([b, a]);
+        assert_eq!((ranks.rank(b), ranks.rank(a)), (Some(0), Some(1)));
+        ranks.publish([a]);
+        assert_eq!((ranks.rank(a), ranks.rank(b)), (Some(0), None));
     }
 
     /// Native loaders are `Send` futures: the seam must not make them less.

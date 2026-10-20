@@ -136,6 +136,11 @@ pub struct BudgetConfig {
     /// A load unanswered this long is cancelled and handled as a transient
     /// failure, so a stalled host never holds a slot for ever. Batch: the
     /// failure ends the session.
+    ///
+    /// A tuning value, the host's to set: it must cover the whole retry
+    /// envelope of the client the loads go through (every attempt and
+    /// backoff of one tile), or a load the client would still have saved is
+    /// cut short. `batch` and `interactive` start from a default.
     pub load_timeout: Micros,
     /// LOD relaxation under overflow.
     pub relax: Relaxation,

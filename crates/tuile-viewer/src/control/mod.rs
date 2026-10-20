@@ -79,7 +79,7 @@ use std::time::Duration;
 
 use web_time::Instant;
 
-pub use log::{Observer, Pictures};
+pub use log::{BudgetTopics, Observer, Pictures};
 pub use series::{Action, Finger, Pressure, Series};
 pub use tuile_core::metrics::Snapshot;
 pub use verdict::{Obligations, Report, Verdict};
@@ -250,12 +250,11 @@ impl Device {
 /// The numbers the run's profile holds it to, as today's viewer has them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
-    /// Decoded content the geometry server keeps resident, bytes.
+    /// The GPU memory the session's graphics budget is sized from, bytes:
+    /// the sum of its classes' hard limits, which nothing it holds crosses.
     pub resident_bytes: u64,
-    /// Tiles it keeps resident.
-    pub resident_tiles: u64,
-    /// Tiles uploaded to the GPU in one frame, at most.
-    pub uploads_per_frame: u64,
+    /// The budget's floor, the level loaded first and never evicted.
+    pub pinned_level: Option<u32>,
 }
 
 /// What a run starts from.
@@ -412,11 +411,7 @@ impl State {
     /// [`Headless::settle`] watches over frames.
     pub fn complete(&self) -> bool {
         let m = &self.metrics;
-        self.drew
-            && m.frame_exact > 0
-            && m.frame_lost == 0
-            && m.frame_coarser == 0
-            && m.frame_stand_ins == 0
+        self.drew && m.frame_exact > 0 && m.frame_lost == 0 && m.frame_coarser == 0
     }
 
     /// Whether nothing is loading and nothing waits to be uploaded.
@@ -504,10 +499,10 @@ impl Headless {
         crate::embed::adopt(start.host.identity(), start.host.imagery());
         let layers = crate::embed::layers();
         let profile = start.device.profile();
+        let budget = profile.budget();
         let limits = Limits {
-            resident_bytes: profile.resident_budget_bytes as u64,
-            resident_tiles: profile.resident_tile_limit as u64,
-            uploads_per_frame: profile.uploads.tiles as u64,
+            resident_bytes: profile.gpu_bytes,
+            pinned_level: budget.pinned_level,
         };
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(profile.runtime_workers)
@@ -517,14 +512,15 @@ impl Headless {
             .build()
             .map_err(|e| Refused::Session(e.to_string()))?;
         let handle = runtime.handle().clone();
-        let pinned = Some(profile.pinned_level);
+        let pinned = budget.pinned_level;
         let plan = crate::native::launch::Plan {
             host: Arc::clone(&start.host),
             terrain: start.host.terrain(),
             layers,
             opening: 0,
             store: start.store.clone(),
-            config: profile.traversal(pinned),
+            config: profile.traversal(),
+            budget,
             profile: profile.clone(),
             timeout: crate::launch::START_TIMEOUT,
         };
@@ -574,6 +570,9 @@ impl Headless {
         m.eye_ground_pixels.clear();
         m.eye_black_pixels.clear();
         let began = Instant::now();
+        let mut app = app;
+        // Each frame's upload deadline is the display's the run says it has.
+        app.refresh_hz = (start.refresh_hz.round() as u32).clamp(1, 1000);
         Ok(Self {
             app,
             requests,
@@ -587,7 +586,8 @@ impl Headless {
             limits,
             start,
             history: Vec::new(),
-            observers: Vec::new(),
+            // The budget's account of every step, in every run's log.
+            observers: vec![Box::new(BudgetTopics)],
             log,
             socket: None,
             _claim: claim,

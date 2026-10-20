@@ -1,13 +1,27 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! The geometry server: traversal + scheduling + fetch + decode,
-//! orchestrated around the pure [`traverse`](crate::traversal::traverse) function.
+//! The geometry server: traversal, the graphics budget, fetch and decode,
+//! orchestrated around the pure [`traverse`](crate::traversal::traverse)
+//! function and the pure [`crate::budget::Budget`].
 //!
 //! This is a LOGICAL server, not a network server: [`in_process`] binds it
 //! to a consumer over channels (the fully decoded liaison). Network
-//! middleware (M2, `tuile-server`) drives the same loop and serializes the
+//! middleware (`tuile-server`) drives the same loop and serializes the
 //! protocol — glb on the wire.
+//!
+//! # One step
+//!
+//! Every coalesced burst of client messages and of arrivals is answered by one
+//! step: the tree's deferred edits are applied, the traversal walks the views
+//! against the budget's residency and lists what it needs — drawn, the
+//! children a hold waits on, the ancestor chain, the floor — and the budget
+//! decides once (`decide`). The decisions are executed in order: loads started
+//! and cancelled, decoded content delivered, the draw set and the upload plan
+//! sent, GPU copies evicted after the draw that stops using them. Arrivals
+//! between two steps are recorded with the budget and applied at the next.
+//! The budget lives here, with the session (D-A5): its inputs are messages
+//! only, so it runs the same in-process, in a worker or across a socket.
 //!
 //! Runtime-agnostic by default: no tokio, no spawning. The whole server is
 //! one future ([`GeometryServer::run`]) multiplexing client messages and
@@ -16,29 +30,41 @@
 //! it a runtime handle instead and every load runs as a task of its own —
 //! see [`Spawn`].
 
-use crate::cache::ResidentCache;
-use crate::content::TileContent;
+use crate::budget::{
+    Budget, BudgetConfig, BudgetEvent, BudgetMeter, BudgetObserver, Bytes, Class, ConfigError,
+    Decisions, Failure, FrameInput, Generation, ImageryNeed, Micros, Need, NeedSet, Presence,
+    PresenceOracle, ResourceId, StepRecord, TexelFootprint,
+};
+use crate::content::{DecodedTileContent, DrapeContent};
 use crate::fetch::TileFetcher;
 use crate::protocol::{
-    in_process_pair, ClientMessage, InProcessStream, Priming, ServerEndpoint, ServerMessage,
+    in_process_pair, Ancestry, ClientMessage, InProcessStream, Priming, ResourceContent,
+    ServerEndpoint, ServerMessage,
 };
 use crate::source::{LoadError, Loaded, TileId, TileLoader, TileTree};
 use crate::tiles3d::{TilesetLoader, TilesetTree};
 use crate::tileset::Tileset;
 use crate::traversal::{
-    traverse_with, Config, NearestContent, ResidencyView, TraversalOutput, ViewState,
+    traverse_with, Config, NearestContent, PriorityGroup, TraversalOutput, ViewState,
 };
 use futures_channel::mpsc::UnboundedSender;
 use futures_core::Stream;
 use futures_util::future::{poll_fn, AbortHandle, Abortable, Aborted};
 use futures_util::stream::FuturesUnordered;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::task::Poll;
 
-type LoadMsg = (TileId, Result<Loaded, LoadError>);
+/// What a load produced: a tile's mesh (or the news that it grew the tree),
+/// or a tile's drape.
+enum Fetched {
+    Mesh(Loaded),
+    Drape(DrapeContent),
+}
+
+type LoadMsg = (ResourceId, Generation, Result<Fetched, LoadError>);
 /// A load's result and the moment its own future resolved — what the loop
 /// measures [`arrival_wait_seconds`](crate::metrics::Metrics::arrival_wait_seconds)
 /// from when it gets round to handling it.
@@ -308,6 +334,36 @@ pub type Pause = Pin<Box<dyn Future<Output = ()>>>;
 /// Makes a [`Pause`].
 pub type Breather = Arc<dyn Fn() -> Pause + Send + Sync>;
 
+/// The session's time, as the budget reads it: microseconds from an origin
+/// the host chooses. The budget never reads a clock; the session hands it
+/// this one's answer at every step.
+pub type Clock = Arc<dyn Fn() -> Micros + Send + Sync>;
+
+/// A monotonic clock from now. On wasm, where the standard clock panics, a
+/// host passes its own ([`GeometryServer::with_clock`]); this one then
+/// counts steps as 16 ms each, so a session still ages.
+fn default_clock() -> Clock {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let origin = std::time::Instant::now();
+        Arc::new(move || Micros(origin.elapsed().as_micros().min(u128::from(u64::MAX)) as u64))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        Arc::new(move || Micros(ticks.fetch_add(16_000, std::sync::atomic::Ordering::Relaxed)))
+    }
+}
+
+/// The budget's signals, shared between the session that decides and the
+/// executor that draws: the session records each step, the executor each
+/// render frame, and any sink — the metrics endpoint, an overlay, a test —
+/// reads the same numbers (spec §16).
+pub type SharedMeter = Arc<Mutex<BudgetMeter>>;
+
+/// How often the session copies its signals to the process's metrics.
+const PUBLISH_EVERY: Micros = Micros::from_millis(500);
+
 /// Creates a geometry server for a **3D Tiles** tileset, bound in-process to
 /// one consumer. Convenience over [`in_process_with`]: it wraps the tileset in
 /// a shared arena and builds the [`TilesetTree`]/[`TilesetLoader`] pair.
@@ -319,122 +375,56 @@ pub fn in_process<F: TileFetcher + 'static>(
     tileset: Tileset,
     fetcher: Arc<F>,
     config: Config,
-) -> (InProcessStream, GeometryServer) {
+    budget: BudgetConfig,
+) -> Result<(InProcessStream, GeometryServer), ConfigError> {
     let arena = Arc::new(RwLock::new(tileset));
     let tree: Box<dyn TileTree> = Box::new(TilesetTree::new(Arc::clone(&arena)));
     let loader: Arc<dyn TileLoader> = Arc::new(TilesetLoader::new(arena, fetcher));
-    in_process_with(tree, loader, config)
+    in_process_with(tree, loader, config, budget)
 }
 
 /// Creates a geometry server over **any** tile source: a [`TileTree`] for the
-/// traversal and a [`TileLoader`] for async content. This is the seam the
-/// globe (terrain × imagery) and compositions plug into — the server knows
-/// neither glb nor terrain nor grafting.
+/// traversal and a [`TileLoader`] for async content, under the graphics
+/// budget `budget`. This is the seam the globe (terrain × imagery) and
+/// compositions plug into — the server knows neither glb nor terrain nor
+/// grafting.
 pub fn in_process_with(
     tree: Box<dyn TileTree>,
     loader: Arc<dyn TileLoader>,
     config: Config,
-) -> (InProcessStream, GeometryServer) {
+    budget: BudgetConfig,
+) -> Result<(InProcessStream, GeometryServer), ConfigError> {
+    let meter: SharedMeter = Arc::new(Mutex::new(BudgetMeter::new(&budget)));
+    let budget = Budget::new(budget)?;
     let (client, endpoint) = in_process_pair();
-    let cache = ResidentCache::pinning(
-        config.resident_budget_bytes,
-        config.resident_tile_limit,
-        config.pinned_level,
-    );
-    (
+    Ok((
         client,
         GeometryServer {
             tree,
             loader,
-            config,
             endpoint,
-            cache,
-            residency: ResidencyView::default(),
-            in_flight: HashMap::new(),
-            started: HashMap::new(),
-            epochs: HashMap::new(),
-            refreshing: HashSet::new(),
-            settled_epoch: 0,
-            acked: HashSet::new(),
-            filled: HashSet::new(),
-            priming: Vec::new(),
-            priming_outstanding: HashSet::new(),
-            priming_state: Priming::default(),
-            priming_reported: None,
-            views: Vec::new(),
-            view_generation: 0,
-            out: TraversalOutput::default(),
-            selected: HashSet::new(),
-            rendered_last: HashSet::new(),
-            chosen_before: HashSet::new(),
-            near: NearestContent::default(),
-            view_moved: false,
-            frame: 0,
-            primed: false,
-            breather: None,
             spawn: Spawn::Inline,
+            breather: None,
+            clock: default_clock(),
+            state: State::new(config, budget, meter),
         },
-    )
+    ))
 }
 
-/// One streaming session: owns the tile tree, loader, residency and in-flight
-/// state for one consumer. N sessions = N servers sharing nothing mutable.
+/// One streaming session: owns the tile tree, the loader, the budget and the
+/// in-flight state for one consumer. N sessions = N servers sharing nothing
+/// mutable.
 pub struct GeometryServer {
     tree: Box<dyn TileTree>,
     loader: Arc<dyn TileLoader>,
-    config: Config,
     endpoint: ServerEndpoint,
-    cache: ResidentCache,
-    residency: ResidencyView,
-    in_flight: HashMap<TileId, AbortHandle>,
-    /// The loader's [`epoch`](TileLoader::epoch) when each in-flight load was
-    /// started — what its content will be recorded as, whatever the loader
-    /// has moved on to by the time it lands.
-    started: HashMap<TileId, u64>,
-    /// The epoch each resident tile's content was loaded under. A tile whose
-    /// entry is not the loader's present epoch is out of date and due a
-    /// refresh — see [`Session::refresh`].
-    epochs: HashMap<TileId, u64>,
-    /// In-flight loads that are refreshes of a tile already resident, rather
-    /// than first loads. They are not cancelled by a camera move, and one
-    /// that fails costs the new picture, not the session.
-    refreshing: HashSet<TileId>,
-    /// The epoch every resident tile is known to be at, so a settled session
-    /// pays one comparison a pass for the mechanism and nothing else.
-    settled_epoch: u64,
-    /// Tiles the consumer has confirmed it holds, from `ClientMessage::Ack`.
-    ///
-    /// The server's residency is not the consumer's: content is sent, then
-    /// queued, then uploaded within a per-frame budget, and every step of that
-    /// is a frame where the tile is resident here and absent there. That gap is
-    /// what a stand-in covers, and an ack is the only report of it.
-    acked: HashSet<TileId>,
-    /// Tiles a stand-in has been sent for, so it is sent once and taken back
-    /// when its ground stops being looked at.
-    filled: HashSet<TileId>,
-    priming: Vec<TileId>,
-    priming_outstanding: HashSet<TileId>,
-    priming_state: Priming,
-    priming_reported: Option<Priming>,
-    views: Vec<ViewState>,
-    view_generation: u64,
-    out: TraversalOutput,
-    selected: HashSet<TileId>,
-    rendered_last: HashSet<TileId>,
-    chosen_before: HashSet<TileId>,
-    /// The scene-wide distance a uniform-detail pass is priced at, kept from
-    /// one pass to the next while the camera and the tree's shape hold still.
-    near: NearestContent,
-    view_moved: bool,
-    frame: u64,
-    /// Whether the coarse pyramid has been asked for yet. See
-    /// [`Session::prime`].
-    primed: bool,
+    /// Where the loads run. See [`Spawn`].
+    spawn: Spawn,
     /// Handing the host its turn: after this many events in a row with no
     /// wait between them, the pause. See [`GeometryServer::with_breather`].
     breather: Option<(usize, Breather)>,
-    /// Where the loads run. See [`Spawn`].
-    spawn: Spawn,
+    clock: Clock,
+    state: State,
 }
 
 /// Takes back what a session said of itself, once it has gone.
@@ -458,9 +448,7 @@ impl Drop for Gone {
             &m.gaps,
             &m.resident_bytes,
             &m.imagery_bytes,
-            &m.imagery_textures,
             &m.loads_in_flight,
-            &m.tiles_filled,
             &m.priming_total,
             &m.priming_pending,
             &m.priming_unavailable,
@@ -483,58 +471,73 @@ impl GeometryServer {
     /// back, by awaiting `pause()`.
     ///
     /// A load answered from memory completes on its first poll, and so does
-    /// the traversal it triggers, and the next load: a burst can run for
-    /// seconds without the loop ever waiting. On a desktop's thread pool that
-    /// costs a core. In a browser's worker, which has one thread and receives
-    /// the camera as messages, it is a server that hears nothing — no camera,
-    /// no acks — while it works, and a page that stops refining under a
-    /// moving view. The worker's pause is a timer, which lets its messages in.
+    /// the step it triggers, and the next load: a burst can run for seconds
+    /// without the loop ever waiting. On a desktop's thread pool that costs a
+    /// core. In a browser's worker, which has one thread and receives the
+    /// camera as messages, it is a server that hears nothing — no camera, no
+    /// acks — while it works. The worker's pause is a timer, which lets its
+    /// messages in.
     #[must_use]
     pub fn with_breather(mut self, every: usize, pause: Breather) -> Self {
         self.breather = Some((every.max(1), pause));
         self
     }
 
+    /// Reads the session's time from `clock` rather than the default
+    /// monotonic one: a browser's `performance.now`, a test's stepped
+    /// clock. The budget's grace times, timeouts, relaxation and retries all
+    /// run on it.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// The budget's signals, shared: what an executor records its frames
+    /// into and what an overlay, a metrics sink or a test reads.
+    pub fn meter(&self) -> SharedMeter {
+        Arc::clone(&self.state.meter)
+    }
+
+    /// Where each load in flight stands in the budget's priority order, as
+    /// of its latest step — for a host's pool that orders the work those
+    /// loads wait on (a browser's decode workers), reading
+    /// [`crate::offload::loading`] when a job is submitted.
+    pub fn load_ranks(&self) -> crate::offload::LoadRanks {
+        self.state.ranks.clone()
+    }
+
+    /// The budget this session runs on.
+    pub fn budget_config(&self) -> &BudgetConfig {
+        self.state.budget.config()
+    }
+
     /// Runs the session until the consumer goes away.
-    pub async fn run(mut self) {
+    pub async fn run(self) {
         let _gone = Gone;
-        let mut loads = Loads::new(&self.spawn);
+        let GeometryServer {
+            tree,
+            loader,
+            endpoint,
+            spawn,
+            breather,
+            clock,
+            mut state,
+        } = self;
+        let mut loads = Loads::new(&spawn);
         if loads.spawns() {
             // A load landing on another thread must not reshape the tree under
             // a pass: its edits wait for the top of the next one.
-            self.tree.defer_edits();
+            tree.defer_edits();
         }
-        let breather = self.breather.take().or_else(|| default_breather(&loads));
+        let breather = breather.or_else(|| default_breather(&loads));
         let mut busy = 0usize;
-        let mut rx = self.endpoint.rx;
-        let tx = self.endpoint.tx.clone();
-        let mut session = Session {
-            tree: self.tree.as_ref(),
-            loader: &self.loader,
-            config: &self.config,
-            cache: &mut self.cache,
-            residency: &mut self.residency,
-            in_flight: &mut self.in_flight,
-            started: &mut self.started,
-            epochs: &mut self.epochs,
-            refreshing: &mut self.refreshing,
-            settled_epoch: &mut self.settled_epoch,
-            priming: &mut self.priming,
-            priming_outstanding: &mut self.priming_outstanding,
-            priming_state: &mut self.priming_state,
-            priming_reported: &mut self.priming_reported,
-            views: &mut self.views,
-            view_generation: &mut self.view_generation,
-            out: &mut self.out,
-            selected: &mut self.selected,
-            rendered_last: &mut self.rendered_last,
-            chosen_before: &mut self.chosen_before,
-            near: &mut self.near,
-            acked: &mut self.acked,
-            filled: &mut self.filled,
-            view_moved: &mut self.view_moved,
-            frame: &mut self.frame,
-            primed: &mut self.primed,
+        let mut rx = endpoint.rx;
+        let tx = endpoint.tx.clone();
+        let host = Host {
+            tree: tree.as_ref(),
+            loader: &loader,
+            clock: &clock,
         };
 
         enum Event {
@@ -545,19 +548,26 @@ impl GeometryServer {
 
         // Which source gets looked at first, flipped every iteration.
         //
-        // A fixed order starves one side or the other. Loads first — the
-        // original — meant that while completions kept arriving the camera was
-        // never read at all, and every decision was taken on a view it had
-        // already left: measured with the altitude climbing from 235 km to
-        // 4274 km while `selected`, `visited` and `culled` did not move a
-        // single count. Client first starves the mirror image, since a viewer
-        // sends a state every frame and completions would go unread.
+        // A fixed order starves one side or the other. Loads first meant that
+        // while completions kept arriving the camera was never read at all,
+        // and every decision was taken on a view it had already left. Client
+        // first starves the mirror image, since a viewer sends a state every
+        // frame and completions would go unread.
         //
         // Alternating costs a branch. Within one side, what is already waiting
         // is taken together: the camera's burst keeps only its last state, and
-        // the loads that have landed are delivered before the one traversal
-        // that answers them all (`drain_ready`).
+        // the loads that have landed are recorded before the one step that
+        // answers them all (`drain_ready`).
         let mut client_first = true;
+
+        // The floor first, before any view: a step at once, with nothing to
+        // see yet, lists the pinned levels and starts their loads — so the
+        // ground every fallback lands on is on its way before the first
+        // camera arrives.
+        if let Err(stop) = state.step(&host, &tx, &mut loads) {
+            tracing::error!(reason = stop.why("starting"), "geometry server stopping");
+            return;
+        }
 
         loop {
             // Whether this turn had to wait: a turn that waited has given the
@@ -599,27 +609,22 @@ impl GeometryServer {
                 }
             }
 
-            // Why this session ended, named rather than implied.
-            //
-            // Every one of these used to be a bare `break`. A server that has
-            // stopped is then indistinguishable from a server with nothing to
-            // do: same silence, same last log line, and a consumer that keeps
-            // sending into a channel nobody reads (`let _ = stream.send(..)`).
-            // A whole afternoon went into deciding, from the outside, whether
-            // this loop was still turning. It says so now.
+            // Why this session ended, named rather than implied: a server
+            // that has stopped is otherwise indistinguishable from a server
+            // with nothing to do.
             let ended: Option<String> = match event {
                 Event::Client(first) => {
-                    let mut dirty = session.on_client(first);
+                    let mut dirty = state.on_client(first, &tx);
                     // Coalesce the burst: a viewer sends a state per frame, and
-                    // only the last one is worth traversing for.
+                    // only the last one is worth deciding for.
                     while let Ok(more) = rx.try_recv() {
-                        dirty |= session.on_client(more);
+                        dirty |= state.on_client(more, &tx);
                     }
                     if dirty {
-                        session
-                            .retraverse(&tx, &mut loads)
+                        state
+                            .step(&host, &tx, &mut loads)
                             .err()
-                            .map(|stop| stop.why("answering a camera move"))
+                            .map(|stop| stop.why("answering the consumer"))
                     } else {
                         None
                     }
@@ -628,23 +633,17 @@ impl GeometryServer {
                     let m = crate::metrics::metrics();
                     m.arrival_wait_seconds.record(landed.elapsed());
                     // Coalesce the arrivals, as the camera's burst is above:
-                    // every completion that is already ready is delivered
-                    // before the one traversal that answers them all.
-                    match session
-                        .on_load_done(msg, &tx)
-                        .and_then(|()| drain_ready(&mut session, &mut loads, &tx))
-                    {
-                        Err(stop) => Some(stop.why("delivering a tile")),
-                        Ok(more) => {
-                            m.arrivals_per_pass.record(1 + more);
-                            session
-                                .retraverse(&tx, &mut loads)
-                                .err()
-                                .map(|stop| stop.why("answering an arrival"))
-                        }
-                    }
+                    // every completion that is already ready is recorded
+                    // before the one step that answers them all.
+                    state.on_load_done(msg, &tx);
+                    let more = drain_ready(&mut state, &mut loads, &tx);
+                    m.arrivals_per_pass.record(1 + more);
+                    state
+                        .step(&host, &tx, &mut loads)
+                        .err()
+                        .map(|stop| stop.why("answering an arrival"))
                 }
-                // Cancelled load: cleaned up at abort time.
+                // Cancelled load: the budget cancelled it, and forgot it then.
                 Event::Load(Err(Aborted)) => None,
                 Event::Closed => Some("the client hung up".to_string()),
             };
@@ -658,46 +657,43 @@ impl GeometryServer {
             }
         }
         // Spawned loads outlive the loop otherwise: nobody would read them.
-        for handle in session.in_flight.values() {
-            handle.abort();
+        for flight in state.in_flight.values() {
+            flight.handle.abort();
         }
     }
 }
 
-/// Delivers every load completion that is already ready, without waiting.
+/// Records every load completion that is already ready, without waiting.
 ///
-/// A traversal ran on every single arrival before this: a burst of tiles
-/// answered from memory or from a warm store cost one full walk from the
-/// roots each, and the walk is what the loop spends its time in. Each of
-/// those passes but the last was superseded before anything could act on
-/// it — a consumer drains every queued message before it draws, so it only
-/// ever saw the last `Select` of the burst anyway.
-///
-/// Bounded by the fetch cap: at most that many loads can be in flight, so
-/// a drain cannot outlast the burst it was called for, and the camera is
-/// read again after it. A batch counts as one event for the breather.
-/// Returns how many it delivered, for `arrivals_per_pass`.
-fn drain_ready(
-    session: &mut Session<'_>,
-    loads: &mut Loads,
-    tx: &UnboundedSender<ServerMessage>,
-) -> Result<u64, Stop> {
+/// Each of a burst's arrivals answered by a step of its own would decide on
+/// the first and re-decide on every one after it — a consumer drains every
+/// queued message before it draws, so it only ever acts on the last. Bounded
+/// by the budget's quotas: at most that many loads can be in flight, so a
+/// drain cannot outlast the burst it was called for, and the camera is read
+/// again after it. A batch counts as one event for the breather. Returns how
+/// many it recorded, for `arrivals_per_pass`.
+fn drain_ready(state: &mut State, loads: &mut Loads, tx: &UnboundedSender<ServerMessage>) -> u64 {
     let m = crate::metrics::metrics();
-    let mut delivered = 0;
-    for _ in 0..session.config.maximum_simultaneous_fetches {
+    let cfg = state.budget.config();
+    let bound = cfg
+        .max_in_flight
+        .iter()
+        .fold(cfg.max_local_reads, |a, (_, n)| a.saturating_add(n));
+    let mut recorded = 0;
+    for _ in 0..bound {
         match loads.try_next() {
             Some(Ok((msg, landed))) => {
                 m.arrival_wait_seconds.record(landed.elapsed());
-                session.on_load_done(msg, tx)?;
-                delivered += 1;
+                state.on_load_done(msg, tx);
+                recorded += 1;
             }
-            // Cancelled: cleaned up at abort time, as in the loop.
+            // Cancelled: forgotten when it was cancelled, as in the loop.
             Some(Err(Aborted)) => {}
             // Nothing in flight, or nothing ready yet.
             None => break,
         }
     }
-    Ok(delivered)
+    recorded
 }
 
 /// The pause a session takes when its host gave none: for spawned loads, a
@@ -713,65 +709,17 @@ fn default_breather(_loads: &Loads) -> Option<(usize, Breather)> {
     None
 }
 
-/// Borrowed view of the server state for the message handlers.
-struct Session<'a> {
-    tree: &'a dyn TileTree,
-    loader: &'a Arc<dyn TileLoader>,
-    config: &'a Config,
-    cache: &'a mut ResidentCache,
-    residency: &'a mut ResidencyView,
-    in_flight: &'a mut HashMap<TileId, AbortHandle>,
-    started: &'a mut HashMap<TileId, u64>,
-    epochs: &'a mut HashMap<TileId, u64>,
-    refreshing: &'a mut HashSet<TileId>,
-    settled_epoch: &'a mut u64,
-    /// Coarse tiles asked for once at startup; drained as fetch slots free up.
-    priming: &'a mut Vec<TileId>,
-    /// Every primed tile that has not yet been answered — still queued above,
-    /// or in flight. A tile leaves this set exactly once, when its content is
-    /// delivered or when the session gives up on it, which is what makes
-    /// [`Priming::settled`] a condition a host can wait on. Kept apart from the
-    /// queue because a tile popped from the queue is not yet resolved, and it
-    /// was that gap the window used to hang in.
-    priming_outstanding: &'a mut HashSet<TileId>,
-    /// What the coarse pyramid looks like right now, and what was last sent —
-    /// so the report goes out on a change rather than on every pass.
-    priming_state: &'a mut Priming,
-    priming_reported: &'a mut Option<Priming>,
-    views: &'a mut Vec<ViewState>,
-    view_generation: &'a mut u64,
-    out: &'a mut TraversalOutput,
-    /// What this pass touched: the frontier, every ancestor of it, and
-    /// everything it asked for. Never a victim — the reference implementation's
-    /// "used this frame", which it will go over its cap rather than reclaim.
-    selected: &'a mut HashSet<TileId>,
-    /// What the previous pass drew. Consulted by the descendant limit — see
-    /// [`crate::traversal::Config::loading_descendant_limit`].
-    rendered_last: &'a mut HashSet<TileId>,
-    /// What the last pass under the previous views chose at its own level:
-    /// the refine hysteresis's memory (`Config::refine_hysteresis`). Moved on
-    /// only when the camera moves, so every pass of one frame refines against
-    /// the same memory and the frame it settles on does not depend on how
-    /// its tiles arrived.
-    chosen_before: &'a mut HashSet<TileId>,
-    near: &'a mut NearestContent,
-    acked: &'a mut HashSet<TileId>,
-    filled: &'a mut HashSet<TileId>,
-    /// Set when the camera moved, which is the only time in-flight loads may be
-    /// cancelled. Nothing else reads it: residency is ordered by use, not by
-    /// which view asked.
-    view_moved: &'a mut bool,
-    frame: &'a mut u64,
-    primed: &'a mut bool,
-}
-
 /// Why the run loop unwinds. Both end the session; only the reason differs,
 /// and only the reason is worth a log line.
 enum Stop {
     /// The consumer went away: nothing left to send to.
     Gone,
-    /// A tile could not be loaded, after the transport had already retried it.
-    LoadFailed { tile: TileId, message: String },
+    /// The session cannot go on: a batch frame's load failed (a film never
+    /// ships a hole), or the tree could not take a load's edit.
+    Failed {
+        resource: Option<ResourceId>,
+        message: String,
+    },
 }
 
 impl Stop {
@@ -779,235 +727,582 @@ impl Stop {
     fn why(&self, during: &str) -> String {
         match self {
             Self::Gone => format!("the consumer went away while {during}"),
-            Self::LoadFailed { tile, message } => format!(
-                "tile {tile:?} could not be loaded and the transport had \
-                 already retried it, so the session ends here rather than \
-                 serving ground with a hole in it: {message}"
+            Self::Failed { resource, message } => format!(
+                "{resource:?} could not be loaded, so the session ends here \
+                 rather than serving ground with a hole in it: {message}"
             ),
         }
     }
 }
 
-impl Session<'_> {
-    /// Returns true when a re-traversal is needed.
-    fn on_client(&mut self, msg: ClientMessage) -> bool {
+/// What a step reads but does not own.
+struct Host<'a> {
+    tree: &'a dyn TileTree,
+    loader: &'a Arc<dyn TileLoader>,
+    clock: &'a Clock,
+}
+
+/// A load in flight: its generation, and how to stop it.
+struct Flight {
+    gen: Generation,
+    handle: AbortHandle,
+}
+
+/// The loader's presence index, as the budget's oracle, with every answer
+/// noted for the step's record.
+///
+/// Answers are kept for [`PRESENCE_FOR`]: the budget asks of every drape it
+/// weighs, at every level it weighs it, at every step, and a loader answers
+/// a drape by working out every imagery tile it would stack — in a browser's
+/// worker, two thirds of the thread near the ground, the loads' own replies
+/// waiting seconds behind it. A store's index changes by what is fetched
+/// into it, which a load answers anyway; an answer a second old misplaces a
+/// read between the store and the network at worst, never a tile.
+struct Presences<'a> {
+    loader: &'a dyn TileLoader,
+    asked: std::cell::RefCell<Vec<(ResourceId, Presence)>>,
+    kept: &'a std::cell::RefCell<HashMap<ResourceId, (Presence, Micros)>>,
+    now: Micros,
+}
+
+/// How long the loader's answer about one resource is kept.
+const PRESENCE_FOR: Micros = Micros::from_millis(1_000);
+
+impl PresenceOracle for Presences<'_> {
+    fn holds(&self, r: ResourceId) -> Presence {
+        let kept = self.kept.borrow().get(&r).copied();
+        let p = match kept {
+            Some((p, at)) if self.now.since(at) < PRESENCE_FOR => p,
+            _ => {
+                let p = self.loader.holds(r);
+                self.kept.borrow_mut().insert(r, (p, self.now));
+                p
+            }
+        };
+        self.asked.borrow_mut().push((r, p));
+        p
+    }
+}
+
+/// The session's state, owned: everything a step reads and changes.
+struct State {
+    config: Config,
+    budget: Budget,
+    meter: SharedMeter,
+    /// Loads in flight, by resource.
+    in_flight: BTreeMap<ResourceId, Flight>,
+    /// Where each of them stands in the budget's order, as of the last step:
+    /// for a pool that orders the work they wait on.
+    ranks: crate::offload::LoadRanks,
+    /// The loader's recent answers about presence (see [`Presences`]).
+    presence: std::cell::RefCell<HashMap<ResourceId, (Presence, Micros)>>,
+    /// The decoded copies the budget counts (its decoded tier): delivered
+    /// from here, again after an eviction, until the budget releases them.
+    decoded: BTreeMap<ResourceId, (Generation, ResourceContent)>,
+    /// What the host handed the budget since the last step, for its record.
+    events: Vec<BudgetEvent>,
+    /// The loader's epoch the drapes were last refreshed for.
+    epoch: u64,
+    views: Vec<ViewState>,
+    view_generation: u64,
+    /// Set when the camera moved since the last step.
+    view_moved: bool,
+    out: TraversalOutput,
+    /// What the last step drew, for the traversal's hold logic.
+    rendered_last: HashSet<TileId>,
+    /// What the last pass under the previous views chose at its own level:
+    /// the refine hysteresis's memory (`Config::refine_hysteresis`). Moved on
+    /// only when the camera moves, so every pass of one frame refines against
+    /// the same memory.
+    chosen_before: HashSet<TileId>,
+    /// The scene-wide distance a uniform-detail pass is priced at, kept from
+    /// one pass to the next while the camera and the tree's shape hold still.
+    near: NearestContent,
+    /// The relaxation the budget fed back, thousandths (1000 = none).
+    sse_scale_milli: u32,
+    /// The floor, by the tree's shape at the last look: every tile at or
+    /// above the pinned level that has content.
+    floor: Vec<TileId>,
+    floor_revision: Option<Option<u64>>,
+    priming_reported: Option<Priming>,
+    frame: u64,
+    steps: u64,
+    published_at: Option<Micros>,
+    /// The platform's signals as last handed to the budget, for its record.
+    pressure: crate::budget::Pressure,
+    thermal: crate::budget::Thermal,
+}
+
+impl State {
+    fn new(config: Config, budget: Budget, meter: SharedMeter) -> Self {
+        State {
+            config,
+            budget,
+            meter,
+            in_flight: BTreeMap::new(),
+            ranks: crate::offload::LoadRanks::default(),
+            presence: std::cell::RefCell::default(),
+            decoded: BTreeMap::new(),
+            events: Vec::new(),
+            epoch: 0,
+            views: Vec::new(),
+            view_generation: 0,
+            view_moved: false,
+            out: TraversalOutput::default(),
+            rendered_last: HashSet::new(),
+            chosen_before: HashSet::new(),
+            near: NearestContent::default(),
+            sse_scale_milli: 1_000,
+            floor: Vec::new(),
+            floor_revision: None,
+            priming_reported: None,
+            frame: 0,
+            steps: 0,
+            published_at: None,
+            pressure: crate::budget::Pressure::Normal,
+            thermal: crate::budget::Thermal::Nominal,
+        }
+    }
+
+    /// Hands a client message to the budget. Returns whether a step is due.
+    fn on_client(&mut self, msg: ClientMessage, tx: &UnboundedSender<ServerMessage>) -> bool {
         match msg {
             ClientMessage::ViewerState { views, generation } => {
-                *self.views = views;
-                *self.view_generation = generation;
-                // A new camera position: the traversal it triggers starts a new
-                // generation, and the one it displaces becomes history rather
-                // than being forgotten.
-                *self.view_moved = true;
-                true
+                self.views = views;
+                self.view_generation = generation;
+                self.view_moved = true;
             }
-            // Recorded, not acted on: it changes nothing about what to load —
-            // residency is server-side — and it is the only evidence of what
-            // the consumer actually holds, which is what decides whether a
-            // stand-in is needed. It used to be dropped here.
-            ClientMessage::Ack { tile } => {
-                self.acked.insert(tile);
-                // The ack is the proof the stand-in is gone: real geometry is
-                // filed under the same id, so uploading it replaced the fill
-                // on the consumer's side. Nothing left to take back.
-                self.filled.remove(&tile);
-                false
+            ClientMessage::Ack {
+                resource,
+                gen,
+                bytes,
+            } => {
+                self.budget.on_drawable(resource, gen, Bytes(bytes));
+                self.events
+                    .push(BudgetEvent::Drawable(resource, gen, Bytes(bytes)));
             }
-            ClientMessage::Cancel { tile } => {
-                if let Some(handle) = self.in_flight.remove(&tile) {
-                    handle.abort();
-                    self.started.remove(&tile);
-                    self.refreshing.remove(&tile);
+            ClientMessage::Discarded { resource, gen } => {
+                self.budget.on_discarded(resource, gen);
+                self.events.push(BudgetEvent::Discarded(resource, gen));
+            }
+            ClientMessage::Pressure(p) => {
+                self.pressure = p;
+                self.budget.set_pressure(p);
+                self.events.push(BudgetEvent::Pressure(p));
+            }
+            ClientMessage::Thermal(t) => {
+                self.thermal = t;
+                self.budget.set_thermal(t);
+                self.events.push(BudgetEvent::Thermal(t));
+            }
+            ClientMessage::Retarget { total_bytes } => {
+                self.budget.retarget(Bytes(total_bytes));
+                self.events.push(BudgetEvent::Retarget(Bytes(total_bytes)));
+            }
+            // Between frames, now: against what the last step drew.
+            // Announced as any eviction is.
+            ClientMessage::ReleaseBeyond { bytes } => {
+                let released = self.budget.release_beyond(Bytes(bytes));
+                self.events.push(BudgetEvent::ReleaseBeyond(
+                    Bytes(bytes),
+                    released.gpu.len() as u32,
+                ));
+                // Let go whole: the decoded copy goes with the consumer's.
+                for r in &released.decoded {
+                    self.decoded.remove(r);
                 }
-                false
-            }
-            // Swept now, against what the last pass protected — the frame
-            // the consumer just saw converge — and not at the next pass,
-            // whose views depend on whether the next camera has arrived
-            // yet. Forgotten here as the pass forgets what it reclaims;
-            // announced with the next pass's `Evict`.
-            ClientMessage::Trim { budget_bytes } => {
-                let released = self
-                    .cache
-                    .release_beyond(budget_bytes, self.selected)
-                    .to_vec();
-                for tile in &released {
-                    self.residency.remove(*tile);
-                    self.epochs.remove(tile);
-                    self.acked.remove(tile);
-                    self.filled.remove(tile);
+                if !released.gpu.is_empty() {
+                    crate::metrics::metrics()
+                        .tiles_evicted
+                        .add(released.gpu.len() as u64);
+                    // A send to a consumer that has gone is noticed at the
+                    // next step, which stops the session.
+                    let _ = tx.unbounded_send(ServerMessage::Evict {
+                        resources: released.gpu,
+                    });
                 }
-                tracing::info!(
-                    budget_mib = budget_bytes >> 20,
-                    released = released.len(),
-                    kept = self.residency.len(),
-                    "trimmed the residency"
-                );
-                false
+                return false;
+            }
+        }
+        true
+    }
+
+    /// A load ended: its content becomes the budget's decoded copy, or its
+    /// failure is the budget's to retry.
+    fn on_load_done(&mut self, (r, gen, result): LoadMsg, tx: &UnboundedSender<ServerMessage>) {
+        let m = crate::metrics::metrics();
+        // Only the load the budget is waiting for: a result that lands after
+        // its load was cancelled is not this generation's any more.
+        match self.in_flight.get(&r) {
+            Some(f) if f.gen == gen => {
+                self.in_flight.remove(&r);
+            }
+            _ => return,
+        }
+        m.loads_in_flight.set(self.in_flight.len() as u64);
+        match result {
+            Ok(fetched) => {
+                let (content, cost) = match fetched {
+                    Fetched::Mesh(Loaded::Content(c)) => {
+                        let cost = c.cost();
+                        (ResourceContent::Mesh(Arc::new(c)), cost)
+                    }
+                    // The load grew the tree (an external tileset grafted):
+                    // nothing to draw here, the revealed children load on
+                    // their own. Recorded as an empty mesh, so the budget
+                    // counts the tile resident, as the traversal does.
+                    Fetched::Mesh(Loaded::Expanded) => {
+                        let empty = DecodedTileContent {
+                            meshes: Vec::new(),
+                            textures: Vec::new(),
+                            imagery: Vec::new(),
+                            withheld_drape: None,
+                            local_origin_ecef: glam::DVec3::ZERO,
+                            transform_local: glam::Mat4::IDENTITY,
+                        };
+                        let cost = empty.cost();
+                        (ResourceContent::Mesh(Arc::new(empty)), cost)
+                    }
+                    Fetched::Drape(d) => {
+                        let cost = d.cost();
+                        (ResourceContent::Drape(Arc::new(d)), cost)
+                    }
+                };
+                m.loads_completed.inc();
+                crate::det!("load_ok", resource = format!("{r:?}"));
+                self.decoded.insert(r, (gen, content));
+                self.budget.on_loaded(r, gen, cost);
+                self.events.push(BudgetEvent::Loaded(r, gen, cost));
+            }
+            Err(e) => {
+                m.loads_failed.inc();
+                crate::det!("load_err", resource = format!("{r:?}"));
+                tracing::warn!(?r, "load failed: {e}");
+                self.budget.on_failed(r, gen, Failure::Transient);
+                self.events
+                    .push(BudgetEvent::Failed(r, gen, Failure::Transient));
+                let _ = tx.unbounded_send(ServerMessage::Error {
+                    resource: Some(r),
+                    message: e.to_string(),
+                });
             }
         }
     }
 
-    /// Sends a stand-in for every selected tile the consumer does not hold, and
-    /// takes back the ones whose ground it has stopped looking at.
-    ///
-    /// # The gap
-    ///
-    /// A tile is selected only once it is resident *here*. It is drawn only once
-    /// it is uploaded *there*, and between the two lie a channel, a queue and a
-    /// per-frame upload budget. In those frames the consumer falls back to the
-    /// nearest ancestor it holds — which covers the missing tile's siblings as
-    /// well, so two approximations of one hillside end up over the same ground
-    /// and the depth test picks a winner per pixel. That is the shimmer.
-    ///
-    /// An ack is the only report of that gap, which is why one is now kept.
-    ///
-    /// # Bookkeeping
-    ///
-    /// Sent once per tile, and taken back when the tile leaves the selection.
-    /// A stand-in is *not* evicted when the real content arrives: the consumer
-    /// files both under the same id, so the real one simply replaces it. The set
-    /// is bounded by the selection, so a session cannot accumulate them.
-    fn fill_the_gaps(&mut self, tx: &UnboundedSender<ServerMessage>) -> Result<(), Stop> {
-        let mut sent = Vec::new();
-        for (tile, _) in self.out.selected.iter() {
-            if self.acked.contains(tile) || self.filled.contains(tile) {
+    /// What the tree says of a tile, for the wire.
+    fn ancestry(tree: &dyn TileTree, tile: TileId) -> Ancestry {
+        Ancestry {
+            level: tree.level(tile),
+            parent: tree.parent(tile),
+        }
+    }
+
+    /// The floor: every tile with content down to the budget's pinned level,
+    /// listed every step so it is loaded first and never evicted. Walked
+    /// again only when the tree's shape may have changed.
+    fn floor(&mut self, tree: &dyn TileTree) -> &[TileId] {
+        let revision = tree.revision();
+        if self.floor_revision != Some(revision) || revision.is_none() {
+            self.floor_revision = Some(revision);
+            self.floor.clear();
+            if let Some(pinned) = self.budget.config().pinned_level {
+                let mut frontier = tree.roots();
+                for _ in 0..=pinned {
+                    let mut next = Vec::new();
+                    for tile in frontier {
+                        if tree.properties(tile).has_content {
+                            self.floor.push(tile);
+                        }
+                        next.extend(tree.children(tile));
+                    }
+                    if next.is_empty() {
+                        break;
+                    }
+                    frontier = next;
+                }
+            }
+        }
+        &self.floor
+    }
+
+    /// One tile's need, over every view: the largest screen-space error and
+    /// centrality, the smallest distance, and the finest imagery footprint
+    /// any view gives it (spec §13.3).
+    fn need_of(host: &Host<'_>, views: &[ViewState], tau: f64, tile: TileId) -> Need {
+        let tree = host.tree;
+        let props = tree.properties(tile);
+        let mut need = Need::new(tree.level(tile), tree.mesh_class(tile));
+        if let Some(p) = tree.parent(tile) {
+            need = need.with_parent(p);
+        }
+        let center = props.bounding_volume.center();
+        let mut distance = f64::INFINITY;
+        let mut sse = 0.0f64;
+        let mut centrality = 0.0f64;
+        let mut footprint: Option<TexelFootprint> = None;
+        let reach = host.loader.drapes(tile);
+        for v in views {
+            let d = props.bounding_volume.distance_to_point(v.position());
+            distance = distance.min(d);
+            sse = sse.max(v.screen_space_error(props.geometric_error, d));
+            let to = center - v.position();
+            let len = to.length();
+            let cos_off = if len > 1e-9 {
+                (to / len).dot(v.direction()).clamp(-1.0, 1.0)
+            } else {
+                1.0
+            };
+            centrality = centrality.max((1.0 + cos_off) / 2.0);
+            if let Some(reach) = &reach {
+                // The surface's normal is the globe's up at the tile: a
+                // texel seen obliquely covers fewer pixels.
+                let up = center.normalize_or_zero();
+                let cos_obliquity = if len > 1e-9 && up != glam::DVec3::ZERO {
+                    (to / len).dot(up).abs().clamp(0.05, 1.0)
+                } else {
+                    1.0
+                };
+                if let Ok(fp) = TexelFootprint::new(
+                    d.max(1.0),
+                    cos_obliquity,
+                    v.focal_px(),
+                    reach.texel_l0_m,
+                    1.0,
+                ) {
+                    if footprint.is_none_or(|f| fp.ratio() > f.ratio()) {
+                        footprint = Some(fp);
+                    }
+                }
+            }
+        }
+        if views.is_empty() {
+            distance = 0.0;
+        }
+        let excess = if sse > 0.0 && tau > 0.0 {
+            (sse / tau).log2().clamp(-16.0, 16.0)
+        } else {
+            -16.0
+        };
+        need = need
+            .with_sse_excess(excess as f32)
+            .with_centrality(centrality as f32)
+            .with_distance(distance.min(f64::from(f32::MAX)) as f32);
+        if let Some(reach) = reach {
+            need = need.with_rect(reach.rect);
+            // No view: the floor, wanted at its coarsest.
+            let footprint = footprint
+                .or_else(|| TexelFootprint::new(1.0e9, 1.0, 1.0, reach.texel_l0_m, 1.0).ok());
+            if let Some(footprint) = footprint {
+                need = need.with_imagery(ImageryNeed {
+                    footprint,
+                    layers: reach.layers,
+                });
+            }
+        }
+        need
+    }
+
+    /// This step's need, from the traversal's output (spec §5, §11.1):
+    /// drawn — what the traversal draws or wants drawn; blockers — what a
+    /// held REPLACE waits on, resident or not; ancestors — the chain of
+    /// everything listed, what the traversal preloads, and the floor.
+    fn need(&mut self, host: &Host<'_>) -> NeedSet {
+        let tree = host.tree;
+        let tau = self.config.maximum_screen_space_error * f64::from(self.sse_scale_milli) / 1000.0;
+        let blockers: BTreeSet<TileId> = self.out.blockers.iter().copied().collect();
+        let mut drawn: BTreeSet<TileId> = self.out.selected.iter().map(|(t, _)| *t).collect();
+        for r in &self.out.requests {
+            if r.group != PriorityGroup::Preload && !blockers.contains(&r.tile) {
+                drawn.insert(r.tile);
+            }
+        }
+        let blockers: BTreeSet<TileId> = blockers.difference(&drawn).copied().collect();
+        let mut ancestors: BTreeSet<TileId> = BTreeSet::new();
+        for t in drawn.iter().chain(&blockers) {
+            let mut cur = tree.parent(*t);
+            while let Some(p) = cur {
+                if drawn.contains(&p) || blockers.contains(&p) || !ancestors.insert(p) {
+                    break;
+                }
+                cur = tree.parent(p);
+            }
+        }
+        // Structural tiles carry nothing to load.
+        ancestors.retain(|t| tree.properties(*t).has_content);
+        for r in &self.out.requests {
+            if r.group == PriorityGroup::Preload
+                && !drawn.contains(&r.tile)
+                && !blockers.contains(&r.tile)
+            {
+                ancestors.insert(r.tile);
+            }
+        }
+        let floor: Vec<TileId> = self.floor(tree).to_vec();
+        for t in floor {
+            if !drawn.contains(&t) && !blockers.contains(&t) {
+                ancestors.insert(t);
+            }
+        }
+        let views = &self.views;
+        let list = |set: &BTreeSet<TileId>| -> Vec<(TileId, Need)> {
+            set.iter()
+                .map(|t| (*t, Self::need_of(host, views, tau, *t)))
+                .collect()
+        };
+        NeedSet {
+            drawn: list(&drawn),
+            blockers: list(&blockers),
+            ancestors: list(&ancestors),
+            ring: Vec::new(),
+        }
+    }
+
+    /// Starts one load the budget decided on.
+    fn start(&mut self, host: &Host<'_>, r: ResourceId, gen: Generation, loads: &mut Loads) {
+        let loader = Arc::clone(host.loader);
+        let (handle, registration) = AbortHandle::new_pair();
+        // Named while it is polled: the work it hands a pool says which load
+        // it is for, and the pool orders it by that load's rank.
+        let fut: BoxLoadFut = Box::pin(Woken::new(
+            crate::offload::ForLoad::new(r, async move {
+                let result = match r {
+                    ResourceId::Mesh(t) => loader.load(t).await.map(Fetched::Mesh),
+                    ResourceId::Drape { tile, layer, level } => loader
+                        .load_drape(tile, layer, level)
+                        .await
+                        .map(Fetched::Drape),
+                };
+                (r, gen, result)
+            }),
+            &crate::metrics::metrics().load_wake_wait_seconds,
+        ));
+        loads.push(Abortable::new(fut, registration), &handle);
+        self.in_flight.insert(r, Flight { gen, handle });
+        let m = crate::metrics::metrics();
+        m.loads_started.inc();
+        m.loads_by_level.inc(host.tree.level(r.tile()));
+        m.loads_in_flight.set(self.in_flight.len() as u64);
+    }
+
+    /// The floor's progress, for a host that holds its first frame back
+    /// until the ground is covered: every floor mesh and drape the budget
+    /// lists, and those not yet on the GPU.
+    fn priming(&self, need: &NeedSet) -> Priming {
+        let pinned = self.budget.config().pinned_level;
+        let mut total = 0u32;
+        let mut outstanding = 0u32;
+        for (_, t, n) in need.entries() {
+            if !pinned.is_some_and(|p| n.level <= p) {
                 continue;
             }
-            // Synchronous and cache-only by contract: this runs inside the
-            // traversal, and a stand-in that waited on the network would arrive
-            // together with the tile it was standing in for.
-            if let Some(content) = self.loader.fill(*tile) {
-                self.filled.insert(*tile);
-                sent.push((*tile, content));
+            let mut resources = vec![ResourceId::Mesh(t)];
+            if let Some(img) = &n.imagery {
+                resources.extend(
+                    img.layers
+                        .iter()
+                        .map(|l| ResourceId::drape(t, l.layer, n.level)),
+                );
+            }
+            for r in resources {
+                total += 1;
+                let drawable = self.budget.resource(r).is_some_and(|v| {
+                    matches!(v.state, crate::budget::ResourceState::Drawable) || v.gpu > Bytes::ZERO
+                });
+                if !drawable {
+                    outstanding += 1;
+                }
             }
         }
-        let just_sent = sent.len();
-        for (tile, content) in sent {
-            tx.unbounded_send(ServerMessage::Fill {
-                tile,
-                ancestry: self.ancestry(tile),
-                content,
-            })
-            .map_err(|_| Stop::Gone)?;
-        }
-
-        // Ground the camera has left: take those stand-ins back, so the
-        // consumer does not keep a surface for every tile ever briefly
-        // selected — a leak the server cannot see, because it never charged
-        // itself for any of them.
-        //
-        // **As a `Retire`, never as an `Evict`.** `Content` is sent once per
-        // residency, so an `Evict` reaching a consumer whose real copy is
-        // still in its upload queue destroys the only delivery there will
-        // ever be — the ground then wears its stand-in for as long as the
-        // cache holds the tile. Two guards were tried before this message
-        // existed and both leaked: clearing `filled` when the content is sent
-        // races the traversal in between, and sparing acked tiles turns
-        // `filled` into a set nothing ever prunes (measured at 3912 and
-        // climbing). `Retire` removes the race by construction: the consumer
-        // drops only what it holds as a stand-in, so sending it on stale
-        // knowledge costs nothing.
-        let stale: Vec<TileId> = self
-            .filled
-            .iter()
-            .copied()
-            .filter(|t| !self.selected.contains(t))
-            .collect();
-        for tile in &stale {
-            self.filled.remove(tile);
-        }
-        if !stale.is_empty() {
-            tracing::debug!(
-                taken = stale.len(),
-                held = self.filled.len(),
-                "stand-ins retired"
-            );
-            tx.unbounded_send(ServerMessage::Retire { tiles: stale })
-                .map_err(|_| Stop::Gone)?;
-        }
-        if just_sent > 0 {
-            tracing::debug!(just_sent, held = self.filled.len(), "stand-in surfaces");
-        }
-        crate::metrics::metrics()
-            .tiles_filled
-            .set(self.filled.len() as u64);
-        Ok(())
-    }
-
-    /// What the tree knows about a tile, for the wire.
-    ///
-    /// One place, so no emission site is tempted to derive it from the handle —
-    /// which is the mistake this whole change exists to remove.
-    fn ancestry(&self, tile: TileId) -> crate::protocol::Ancestry {
-        crate::protocol::Ancestry {
-            level: self.tree.level(tile),
-            parent: self.tree.parent(tile),
+        Priming {
+            total,
+            unavailable: 0,
+            outstanding,
         }
     }
 
-    fn retraverse(
+    /// One step: traverse, list the need, decide once, execute.
+    fn step(
         &mut self,
+        host: &Host<'_>,
         tx: &UnboundedSender<ServerMessage>,
         loads: &mut Loads,
     ) -> Result<(), Stop> {
-        // Whether this pass was provoked by the camera or by a tile arriving.
-        // It decides one thing only: whether in-flight loads may be cancelled
-        // below. Consumed here, so a pass provoked by an arrival does not
-        // inherit the last camera move's licence to cancel.
-        let camera_moved = std::mem::take(self.view_moved);
-        // What loads changed in the tree's shape since the last pass, applied
-        // before anything reads it — so the whole pass walks one tree. Nothing
-        // is held unless loads run as tasks (`Spawn`); inline, the edits have
-        // already landed, between passes, as they always did.
-        if let Some((tile, why)) = self.tree.apply_deferred_edits().into_iter().next() {
-            return self.fail(tile, why, tx);
+        let tree = host.tree;
+        let camera_moved = std::mem::take(&mut self.view_moved);
+        // What loads changed in the tree's shape since the last step, applied
+        // before anything reads it — so the whole step walks one tree.
+        if let Some((tile, why)) = tree.apply_deferred_edits().into_iter().next() {
+            let message = format!("the tree could not take {tile:?}: {why}");
+            let _ = tx.unbounded_send(ServerMessage::Error {
+                resource: Some(ResourceId::Mesh(tile)),
+                message: message.clone(),
+            });
+            return Err(Stop::Failed {
+                resource: Some(ResourceId::Mesh(tile)),
+                message,
+            });
         }
-        *self.frame += 1;
-        self.prime();
-        // Open a new pass before anything is touched: from here on, every tile
-        // this traversal reaches is off limits to the sweep at the end of it.
-        self.cache.start_pass();
+        self.frame += 1;
+        self.steps += 1;
+        // A change of what the loader drapes (a switch of imagery) refreshes
+        // every drape, new before old; meshes are untouched.
+        let epoch = host.loader.epoch();
+        if epoch != self.epoch {
+            self.epoch = epoch;
+            self.budget.new_epoch(Class::Drape, None);
+            self.events.push(BudgetEvent::NewEpoch(Class::Drape, None));
+        }
         if camera_moved {
             // `out` still holds the last pass under the views just left.
             self.chosen_before.clear();
             self.chosen_before.extend(self.out.chosen.iter().copied());
         }
+        // This step's arrivals first, so the traversal walks what they made
+        // drawable; `decide` below, at the same instant, decides as if it had
+        // applied them itself.
+        let now = (host.clock)();
+        self.budget.apply_arrivals(now);
+        // The traversal, relaxed as the budget asks, against the budget's
+        // residency: what is drawable (interactive) or loaded (batch).
+        let config = Config {
+            maximum_screen_space_error: self.config.maximum_screen_space_error
+                * f64::from(self.sse_scale_milli)
+                / 1000.0,
+            ..self.config.clone()
+        };
         let started = crate::metrics::stamp();
-        traverse_with(
-            self.tree,
-            self.residency,
-            self.views,
-            self.config,
-            *self.frame,
-            self.rendered_last,
-            self.chosen_before,
-            self.near,
-            self.out,
-        );
+        {
+            let residency = self.budget.residency();
+            traverse_with(
+                tree,
+                &residency,
+                &self.views,
+                &config,
+                self.frame,
+                &self.rendered_last,
+                &self.chosen_before,
+                &mut self.near,
+                &mut self.out,
+            );
+        }
         let walked = started.elapsed();
         // Every pass of every session these tests drive is checked against
         // the reference pass, which works everything out from scratch.
         #[cfg(test)]
-        tests::matches_the_reference_pass(self);
-        // What this pass actually put on screen, for the next one to consult.
-        // A held REPLACE only cuts its subtree loose when it has nothing of its
-        // own drawn yet — once it is on screen there is no black to avoid, and
-        // cutting off then would stall refinement rather than accelerate it.
-        self.rendered_last.clear();
-        self.rendered_last
-            .extend(self.out.selected.iter().map(|(tile, _)| *tile));
-        // Every pass, with everything that decided it.
-        //
-        // A selection is meant to be a function of (stage, time). It is not,
-        // and this is the trace that shows why: the passes of one render are
-        // printed in order, so two runs of the SAME frame can be diffed pass
-        // by pass and the exact pass where they part company can be named.
-        // Without it the only observable was the final tile count, which says
-        // that two runs disagreed but never where.
+        tests::matches_the_reference_pass(
+            tree,
+            &self.budget.residency(),
+            &self.views,
+            &config,
+            self.frame,
+            &self.rendered_last,
+            &self.chosen_before,
+            &self.near,
+            &self.out,
+        );
         crate::det!(
             "pass",
-            n = *self.frame,
+            n = self.frame,
             selected = self.out.selected.len(),
             sel_digest = crate::determinism::digest(self.out.selected.iter().map(|(t, _)| t.0)),
             requested = self.out.requests.len(),
@@ -1015,573 +1310,247 @@ impl Session<'_> {
             visited = self.out.stats.visited,
             culled = self.out.stats.culled,
             gaps = self.out.stats.gaps,
-            // The two counters that say the traversal answered the CLOCK
-            // rather than the scene. `deferred_subtrees` above zero means a
-            // hold cancelled its subtree because the network was slow, which
-            // is how one frame selected 106 tiles on five runs and 7 on the
-            // sixth. Untraced, it took an afternoon to find; traced, it is one
-            // line of the diff.
             deferred = self.out.stats.deferred_subtrees,
             held_but_drawn = self.out.stats.held_but_drawn,
-            resident = self.residency.len(),
             in_flight = self.in_flight.len(),
-            priming_left = self.priming.len(),
             camera_moved = camera_moved,
         );
+        let need = self.need(host);
+        // Taken for the decision and put back after it. Bounded: what has
+        // gone stale goes once the map has grown.
+        let kept = std::cell::RefCell::new(std::mem::take(self.presence.get_mut()));
+        if kept.borrow().len() > 16_384 {
+            kept.borrow_mut()
+                .retain(|_, (_, at)| now.since(*at) < PRESENCE_FOR);
+        }
+        let presence = Presences {
+            loader: host.loader.as_ref(),
+            asked: std::cell::RefCell::new(Vec::new()),
+            kept: &kept,
+            now,
+        };
+        let deciding = crate::metrics::stamp();
+        let d = self
+            .budget
+            .decide(FrameInput::new(self.frame, now, &need).with_presence(&presence));
+        let decide_wall = Micros(deciding.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
+        self.sse_scale_milli = d.sse_scale_milli;
+
         let m = crate::metrics::metrics();
         m.traversals.inc();
         m.traversal_seconds.record(walked);
         m.tiles_visited.set(u64::from(self.out.stats.visited));
         m.tiles_culled.set(u64::from(self.out.stats.culled));
-        m.tiles_selected.set(u64::from(self.out.stats.selected));
+        m.tiles_selected.set(d.draw.items.len() as u64);
         m.gaps.set(u64::from(self.out.stats.gaps));
         m.selected_by_level.clear();
-        for (tile, _) in &self.out.selected {
-            m.selected_by_level.inc(self.tree.level(*tile));
+        for item in &d.draw.items {
+            m.selected_by_level.inc(tree.level(item.mesh.tile()));
         }
         m.queued_by_level.clear();
-        for req in &self.out.requests {
-            m.queued_by_level.inc(self.tree.level(req.tile));
+        for s in &d.start {
+            m.queued_by_level.inc(tree.level(s.resource.tile()));
         }
+        let ledger = self.budget.ledger();
+        m.resident_bytes.set(
+            Class::ALL
+                .iter()
+                .fold(Bytes::ZERO, |a, c| a.plus(ledger.gpu[*c]))
+                .0,
+        );
+        m.imagery_bytes.set(ledger.gpu[Class::Drape].0);
 
-        // `selected` is the *protected* set: what the budget may not evict.
-        // The frontier is always in it — never drop what is on screen.
-        self.selected.clear();
-        for (t, _) in &self.out.selected {
-            self.selected.insert(*t);
-            self.cache.touch(*t);
-        }
-        // Pin the path from each selected tile up to the root: keep ancestors
-        // resident (protected from eviction, kept LRU-warm) so the consumer
-        // always has a coarser fallback to draw while finer tiles stream in —
-        // no holes. Pinned, but NOT sent as selection (they're not the
-        // frontier; the consumer renders them only where finer tiles are not
-        // ready yet).
-        //
-        // The whole chain, not a band near the frontier. A traversal asks for
-        // every ancestor it does not have, so an unpinned one is evicted and
-        // re-requested at once: the session then spends itself reloading the
-        // same tiles — 44k loads for 1.2k tiles, in the run that proved it —
-        // and never converges. When the working set genuinely exceeds the
-        // budget the cache goes over it instead, which is degraded but
-        // progressing.
-        let frontier: Vec<TileId> = self.out.selected.iter().map(|(t, _)| *t).collect();
-        for tile in frontier {
-            let mut ancestor = self.tree.parent(tile);
-            while let Some(a) = ancestor {
-                if !self.selected.insert(a) {
-                    break; // this ancestor (and its chain) is already pinned
-                }
-                self.cache.touch(a);
-                ancestor = self.tree.parent(a);
+        let result = self.execute(host, &d, tx, loads);
+
+        // What was drawn, for the next pass's hold logic.
+        self.rendered_last.clear();
+        self.rendered_last
+            .extend(d.draw.items.iter().map(|i| i.mesh.tile()));
+
+        // The record, for every sink at once.
+        let events = std::mem::take(&mut self.events);
+        let asked = presence.asked.into_inner();
+        *self.presence.get_mut() = kept.into_inner();
+        if let Ok(mut meter) = self.meter.lock() {
+            meter.step(&StepRecord {
+                step: self.steps - 1,
+                frame: self.frame,
+                now,
+                views_changed: camera_moved,
+                eyes: self.views.len().min(255) as u8,
+                need: &need,
+                events: &events,
+                presence: &asked,
+                decisions: &d,
+                ledger,
+                pressure: self.pressure,
+                thermal: self.thermal,
+                decide_wall: Some(decide_wall),
+            });
+            if self
+                .published_at
+                .is_none_or(|at| now.since(at) >= PUBLISH_EVERY)
+            {
+                self.published_at = Some(now);
+                crate::metrics::publish_budget(meter.publish());
             }
         }
-        // Whatever this traversal still asks for is protected too. Evicting a
-        // tile the very next traversal re-requests is thrash: it would load,
-        // evict something else, be requested again, and the session would spin
-        // forever without converging. When the working set genuinely does not
-        // fit, the cache goes over budget instead (its documented fallback) —
-        // degraded, but progressing.
-        for req in &self.out.requests {
-            self.selected.insert(req.tile);
+        // The loads in flight, in the budget's order of this step; those it
+        // no longer ranks (not wanted, waiting out their grace) after them.
+        let mut ranked: Vec<(Option<crate::budget::PriorityKey>, ResourceId)> = self
+            .in_flight
+            .keys()
+            .map(|r| (self.budget.resource(*r).and_then(|v| v.priority), *r))
+            .collect();
+        ranked.sort_by(|a, b| match (&a.0, &b.0) {
+            (Some(x), Some(y)) => x.cmp(y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.1.cmp(&b.1),
+        });
+        self.ranks.publish(ranked.into_iter().map(|(_, r)| r));
+        let priming = self.priming(&need);
+        let mm = crate::metrics::metrics();
+        mm.priming_total.set(u64::from(priming.total));
+        mm.priming_pending.set(u64::from(priming.outstanding));
+        mm.priming_done.set(u64::from(priming.settled()));
+        if self.priming_reported != Some(priming) {
+            self.priming_reported = Some(priming);
+            tx.unbounded_send(ServerMessage::Priming(priming))
+                .map_err(|_| Stop::Gone)?;
         }
-        // And so is what a held REPLACE is waiting on. Those are resident, not
-        // drawn and not requested — the one category a residency built from
-        // "selected plus requested" cannot see — so without this they are swept
-        // and asked for again on the very next pass, for ever.
-        for tile in &self.out.awaiting {
-            self.selected.insert(*tile);
-            self.cache.touch(*tile);
-        }
-        // The protected set just changed, so content held only by the view the
-        // camera has left is now the most depletable thing in the cache. Doing
-        // this here — and not only when a load lands — is what lets a settled
-        // camera give memory back at all.
-        let mut reclaimed = self.cache.take_released();
-        reclaimed.extend(self.cache.trim(self.selected));
-        for tile in &reclaimed {
-            self.residency.remove(*tile);
-            self.epochs.remove(tile);
-            // Same hygiene as the insert-path eviction: the `Evict` below takes
-            // the consumer's copy and its stand-in alike, so both records stop
-            // being true here. `acked` left behind is the worse of the two — it
-            // suppresses the stand-in the next time this ground is looked at,
-            // and grows for the life of the session.
-            self.acked.remove(tile);
-            self.filled.remove(tile);
-        }
-        // Counted here as well as on insert. This is now the path that reclaims
-        // most of what a session gives back — expiry fires while there is still
-        // budget headroom, so an insert-only count would have kept reading zero
-        // and said nothing had been freed.
+        result
+    }
+
+    /// Executes one step's decisions, in their order: cancels, deliveries,
+    /// releases, starts, the draw set and the plan, then the evictions —
+    /// after the draw that stops using them.
+    fn execute(
+        &mut self,
+        host: &Host<'_>,
+        d: &Decisions,
+        tx: &UnboundedSender<ServerMessage>,
+        loads: &mut Loads,
+    ) -> Result<(), Stop> {
+        let tree = host.tree;
         let m = crate::metrics::metrics();
-        m.tiles_evicted.add(reclaimed.len() as u64);
-        m.resident_bytes.set(self.cache.used_bytes() as u64);
-        let (textures, imagery_bytes) = self.cache.imagery_bytes();
-        m.imagery_textures.set(textures as u64);
-        m.imagery_bytes.set(imagery_bytes as u64);
-        // Selection first, reclaim second — and the order is load-bearing.
-        //
-        // A consumer drains every queued message in one go before it draws, so
-        // it applies both in the same frame whatever the order. But it walks up
-        // from each selected tile to the nearest ancestor it actually holds, and
-        // draws that when the fine tile has not landed. Reclaim first and that
-        // ancestor can be gone before the selection naming it is even read: the
-        // ground it was covering has nothing left to fall back to, and goes
-        // black. Announcing what is wanted before taking anything away costs a
-        // line and removes the window entirely.
+        // Cancels: a load in flight is stopped; a delivery not yet uploaded
+        // is the consumer's to drop.
+        let mut withdrawn = Vec::new();
+        for (r, g) in &d.cancel {
+            match self.in_flight.get(r) {
+                Some(f) if f.gen == *g => {
+                    f.handle.abort();
+                    self.in_flight.remove(r);
+                    m.loads_cancelled.inc();
+                }
+                _ => withdrawn.push((*r, *g)),
+            }
+        }
+        m.loads_in_flight.set(self.in_flight.len() as u64);
+        if !withdrawn.is_empty() {
+            tx.unbounded_send(ServerMessage::Cancel {
+                resources: withdrawn,
+            })
+            .map_err(|_| Stop::Gone)?;
+        }
+        // Deliveries, from the decoded tier, in the plan's priority order.
+        for (r, g) in &d.deliver {
+            let Some((held, content)) = self.decoded.get(r) else {
+                tracing::error!(
+                    ?r,
+                    "the budget delivered a resource the session does not hold"
+                );
+                continue;
+            };
+            if held != g {
+                tracing::error!(
+                    ?r,
+                    "the budget delivered another generation than the one held"
+                );
+                continue;
+            }
+            let class = match r {
+                ResourceId::Mesh(t) => tree.mesh_class(*t),
+                ResourceId::Drape { .. } => Class::Drape,
+            };
+            tx.unbounded_send(ServerMessage::Content {
+                resource: *r,
+                gen: *g,
+                class,
+                ancestry: Self::ancestry(tree, r.tile()),
+                content: content.clone(),
+            })
+            .map_err(|_| Stop::Gone)?;
+        }
+        for r in &d.release {
+            self.decoded.remove(r);
+        }
+        for s in &d.start {
+            self.start(host, s.resource, s.gen, loads);
+        }
+        // The draw set, with the shape of the tree around it.
+        let mut named: BTreeSet<TileId> = BTreeSet::new();
+        for item in &d.draw.items {
+            named.insert(item.mesh.tile());
+            named.extend(item.serves.iter().copied());
+            named.extend(item.drapes.iter().map(|x| x.resource.tile()));
+        }
         let selecting = crate::metrics::stamp();
         let sent = tx.unbounded_send(ServerMessage::Select {
-            tiles: self.out.selected.clone(),
-            // `self.selected` is the protected closure — the frontier, the chain
-            // from each of its tiles up to the root, what is requested and what
-            // a held REPLACE waits on. That is exactly the set a consumer's walk
-            // can pass through, so it is exactly the set whose shape it needs.
-            ancestry: self
-                .selected
-                .iter()
-                .map(|tile| (*tile, self.ancestry(*tile)))
+            draw: d.draw.clone(),
+            plan: d.upload_plan.clone(),
+            ancestry: named
+                .into_iter()
+                .map(|t| (t, Self::ancestry(tree, t)))
                 .collect(),
             stats: self.out.stats,
-            generation: *self.view_generation,
+            hard_limit: d.stats.hard_limit,
+            frame_ready: d.frame_ready,
+            converged: d.stats.converged,
+            lost: d.stats.lost,
+            bare: d.stats.bare,
+            generation: self.view_generation,
         });
         m.select_seconds.record(selecting.elapsed());
         sent.map_err(|_| Stop::Gone)?;
-        if !reclaimed.is_empty() {
-            tx.unbounded_send(ServerMessage::Evict { tiles: reclaimed })
-                .map_err(|_| Stop::Gone)?;
+        if !d.evict.is_empty() {
+            m.tiles_evicted.add(d.evict.len() as u64);
+            crate::det!(
+                "evict",
+                count = d.evict.len(),
+                digest = crate::determinism::digest(d.evict.iter().map(|r| r.tile().0)),
+            );
+            tx.unbounded_send(ServerMessage::Evict {
+                resources: d.evict.clone(),
+            })
+            .map_err(|_| Stop::Gone)?;
         }
-        if self.config.stand_ins {
-            self.fill_the_gaps(tx)?;
+        if let Some(fatal) = &d.fatal {
+            let resource = match fatal {
+                crate::budget::SessionError::LoadFailed(r) => Some(*r),
+            };
+            let message = fatal.to_string();
+            tx.unbounded_send(ServerMessage::Error {
+                resource,
+                message: message.clone(),
+            })
+            .map_err(|_| Stop::Gone)?;
+            return Err(Stop::Failed { resource, message });
         }
-
-        // Cancel in-flight loads the camera has moved away from — and only
-        // then.
-        //
-        // A traversal runs on **every load completion**, not only on a camera
-        // move, and cancelling on all of them livelocks. One tile arrives, the
-        // pass re-runs, `forbid_holes` rolls back a different branch, other
-        // tiles fall out of the request set and are killed; the next pass asks
-        // for them again, they are spawned again, and the pass after that kills
-        // them again. Nothing ever finishes. The symptom is a request count
-        // frozen at some number, a selection that stops following the camera,
-        // and — the part that cost the most time — *no log output at all*, since
-        // every load dies before it can say anything.
-        //
-        // A load provoked by a tile arriving is still wanted; the pass simply
-        // reordered what it needs first. Only a camera move can make one
-        // pointless, and even then finishing is often cheaper than restarting.
-        // A primed tile is never stale, whatever the camera does. It is not
-        // wanted for this view — it is the floor every view falls back to — so
-        // it appears in no request set, and killing it would drop it out of the
-        // pyramid for good: popped from the queue, aborted, never re-asked, and
-        // a host counting arrivals waits on it for ever.
-        if camera_moved {
-            let wanted: HashSet<TileId> = self.out.requests.iter().map(|r| r.tile).collect();
-            let stale: Vec<TileId> = self
-                .in_flight
-                .keys()
-                // Nor is a refresh: it is wanted by no view in particular and
-                // by every view that will ever look at its tile, and the old
-                // picture is on screen until it lands.
-                .filter(|t| {
-                    !wanted.contains(t)
-                        && !self.priming_outstanding.contains(t)
-                        && !self.refreshing.contains(t)
-                })
-                .copied()
-                .collect();
-            for t in stale {
-                if let Some(handle) = self.in_flight.remove(&t) {
-                    handle.abort();
-                    self.started.remove(&t);
-                    crate::metrics::metrics().loads_cancelled.inc();
-                }
-            }
-        }
-
-        // The coarse pyramid first, for as long as there is any of it left.
-        //
-        // Nothing it competes with is on screen: the host holds its window back
-        // until this is on the GPU, so a frontier tile fetched now is a tile
-        // fetched for nobody. It is finite — a few thousand tiles — and drains
-        // once, at the start of a session, after which this costs a branch.
-        while let Some(&tile) = self.priming.last() {
-            if self.in_flight.len() >= self.config.maximum_simultaneous_fetches {
-                break;
-            }
-            self.priming.pop();
-            // Answered before its turn came round: the traversal asked for
-            // it first. Resolved here rather than left outstanding for a load
-            // that will never be started.
-            if self.residency.is_resident(tile) {
-                self.resolve_primed(tile, true);
-                continue;
-            }
-            if self.in_flight.contains_key(&tile) {
-                continue;
-            }
-            // Protected like anything else asked for, so a sweep between now
-            // and its arrival cannot make the work pointless.
-            self.selected.insert(tile);
-            self.start(tile, loads);
-        }
-        // Spawn new loads, highest priority first, within the cap. The
-        // traversal only requests tiles that have content, so the loader is
-        // never asked to load a structural-empty tile.
-        let wanted: Vec<TileId> = self.out.requests.iter().map(|r| r.tile).collect();
-        for tile in wanted {
-            if self.in_flight.len() >= self.config.maximum_simultaneous_fetches {
-                break;
-            }
-            if self.residency.is_resident(tile) || self.in_flight.contains_key(&tile) {
-                continue;
-            }
-            self.start(tile, loads);
-        }
-
-        // Last, with whatever slots the view itself left free.
-        self.refresh(loads);
-
-        if *self.primed && self.priming_outstanding.is_empty() {
-            crate::metrics::metrics().priming_done.set(1);
-        }
-        self.report_priming(tx)?;
         Ok(())
     }
-
-    /// Starts loading `tile`, and notes the epoch it was started under.
-    fn start(&mut self, tile: TileId, loads: &mut Loads) {
-        let loader = Arc::clone(self.loader);
-        // Read here and not when the load lands: the loader may move on while
-        // the load is in flight, and content begun under the old epoch must be
-        // recorded as old — recorded as new, it would never be refreshed, and
-        // the ground would keep the previous picture for good. The other error
-        // is harmless: content that turns out newer than its record is
-        // refreshed once more than it needed.
-        self.started.insert(tile, loader.epoch());
-        let (handle, registration) = AbortHandle::new_pair();
-        let fut: BoxLoadFut = Box::pin(Woken::new(
-            async move { (tile, loader.load(tile).await) },
-            &crate::metrics::metrics().load_wake_wait_seconds,
-        ));
-        loads.push(Abortable::new(fut, registration), &handle);
-        self.in_flight.insert(tile, handle);
-        let m = crate::metrics::metrics();
-        m.loads_started.inc();
-        m.loads_by_level.inc(self.tree.level(tile));
-        m.loads_in_flight.set(self.in_flight.len() as u64);
-    }
-
-    /// Loads again every resident tile whose content is from an earlier
-    /// [`epoch`](TileLoader::epoch) of the loader — a globe told to drape
-    /// other imagery — **without ever letting go of the content it has.**
-    ///
-    /// # The order is the whole point
-    ///
-    /// The obvious way to change what every tile shows is to drop the tiles
-    /// and let the traversal ask for them again. That is a globe with nothing
-    /// on it for as long as the network takes, and nothing on it is black.
-    /// So nothing is dropped. An out-of-date tile stays resident, stays in
-    /// the selection and stays with the consumer; its replacement is loaded
-    /// beside it and sent as a second [`ServerMessage::Content`] under the
-    /// same id, which a consumer applies by building the new surface and only
-    /// then releasing the old — one filing, replaced in place. At every
-    /// instant each tile has exactly one picture: the old one, then the new.
-    ///
-    /// # Coarse first, what is looked at first
-    ///
-    /// The protected set — the frontier, its ancestors, what a held `REPLACE`
-    /// waits on — goes before everything else, and within each group the
-    /// coarsest tiles go first: one coarse tile repaints a whole region, and
-    /// it is also the fallback every finer tile climbs to, so the change
-    /// reads as the globe turning over and then sharpening, not as confetti.
-    /// The rest of the residency follows; it is not on screen, but it is what
-    /// the camera returns to.
-    ///
-    /// Refreshes take only the fetch slots the view's own requests left free:
-    /// ground that has no picture at all outranks ground that has last
-    /// epoch's.
-    fn refresh(&mut self, loads: &mut Loads) {
-        let now = self.loader.epoch();
-        if *self.settled_epoch == now {
-            return;
-        }
-        let mut stale: Vec<(bool, u32, TileId)> = self
-            .epochs
-            .iter()
-            .filter(|(tile, epoch)| **epoch != now && !self.in_flight.contains_key(*tile))
-            .map(|(tile, _)| (!self.selected.contains(tile), self.tree.level(*tile), *tile))
-            .collect();
-        // Nothing out of date, and nothing in flight that will be recorded as
-        // out of date when it lands: the turn-over is complete.
-        if stale.is_empty() && self.started.values().all(|epoch| *epoch == now) {
-            *self.settled_epoch = now;
-            tracing::info!(epoch = now, "every resident tile is at the loader's epoch");
-            return;
-        }
-        // Protected before the rest, coarse before fine, and the id last so
-        // that two runs refresh in the same order.
-        stale.sort_unstable_by_key(|(unprotected, level, tile)| (*unprotected, *level, tile.0));
-        for (_, _, tile) in stale {
-            if self.in_flight.len() >= self.config.maximum_simultaneous_fetches {
-                break;
-            }
-            self.refreshing.insert(tile);
-            self.start(tile, loads);
-        }
-    }
-
-    /// Asks for the whole coarse pyramid, once, at the start of a session.
-    ///
-    /// These tiles are pinned in the residency and are what every fallback
-    /// walks up to, so they should be on the GPU before anything needs them —
-    /// not discovered by a camera that happens to fly over them. Measured
-    /// without this, on ground already flown several times: level 5 held 291 of
-    /// its 1024 tiles and level 3 held none at all, so a fast movement fell
-    /// through the safety net onto bare ground.
-    ///
-    /// They are **requested, not selected**. `prepared` and `selection` are
-    /// separate sets in the consumer, so a tile whose content arrives is
-    /// uploaded and held without being drawn — which is exactly what a fallback
-    /// is: ready, and invisible until something needs it.
-    ///
-    /// The count is bounded by the tree, not by the view: `4^level` tiles, so
-    /// 1365 of them through level 5, about 480 MiB of imagery on the GPU
-    /// against a budget measured in gigabytes.
-    fn prime(&mut self) {
-        if *self.primed {
-            return;
-        }
-        let m = crate::metrics::metrics();
-        let Some(level) = self.config.pinned_level else {
-            *self.primed = true;
-            // Nothing to wait for, so anyone gating on this may start at once.
-            m.priming_done.set(1);
-            return;
-        };
-        *self.primed = true;
-
-        let mut wanted = Vec::new();
-        let mut frontier = self.tree.roots();
-        for _ in 0..=level {
-            let mut next = Vec::new();
-            for tile in frontier {
-                if self.tree.properties(tile).has_content {
-                    wanted.push(tile);
-                }
-                next.extend(self.tree.children(tile));
-            }
-            if next.is_empty() {
-                break;
-            }
-            frontier = next;
-        }
-        // The coarse pyramid is the floor the whole selection stands on, and
-        // its membership depends on `tree.children()` — which is exactly the
-        // thing that changes shape as availability arrives. A pyramid that
-        // differs between two runs is a selection that will differ too.
-        crate::det!(
-            "prime",
-            through_level = level,
-            tiles = wanted.len(),
-            digest = crate::determinism::digest(wanted.iter().map(|t| t.0)),
-        );
-        tracing::info!(
-            through_level = level,
-            tiles = wanted.len(),
-            "priming the coarse pyramid onto the GPU"
-        );
-        m.priming_total.set(wanted.len() as u64);
-        self.priming_state.total = wanted.len() as u32;
-        self.priming_outstanding.extend(wanted.iter().copied());
-        *self.priming = wanted;
-    }
-
-    /// Marks a primed tile as answered — delivered, or given up on.
-    ///
-    /// Called on **every** terminal outcome of a load, because the count a host
-    /// waits on has to fall to zero however the tile ended. A tile the source
-    /// does not serve is resolved, not pending: it will never be on the GPU, and
-    /// a gate that keeps waiting for it is a gate that never opens.
-    fn resolve_primed(&mut self, tile: TileId, arrived: bool) {
-        if !self.priming_outstanding.remove(&tile) {
-            return;
-        }
-        if !arrived {
-            self.priming_state.unavailable += 1;
-        }
-    }
-
-    /// Sends the coarse-pyramid count when it has moved.
-    fn report_priming(&mut self, tx: &UnboundedSender<ServerMessage>) -> Result<(), Stop> {
-        self.priming_state.outstanding = self.priming_outstanding.len() as u32;
-        let m = crate::metrics::metrics();
-        m.priming_pending
-            .set(u64::from(self.priming_state.outstanding));
-        m.priming_unavailable
-            .set(u64::from(self.priming_state.unavailable));
-        if *self.priming_reported == Some(*self.priming_state) {
-            return Ok(());
-        }
-        *self.priming_reported = Some(*self.priming_state);
-        tx.unbounded_send(ServerMessage::Priming(*self.priming_state))
-            .map_err(|_| Stop::Gone)
-    }
-
-    fn on_load_done(
-        &mut self,
-        (tile, result): LoadMsg,
-        tx: &UnboundedSender<ServerMessage>,
-    ) -> Result<(), Stop> {
-        self.in_flight.remove(&tile);
-        let epoch = self.started.remove(&tile).unwrap_or(0);
-        let refresh = self.refreshing.remove(&tile);
-        let m = crate::metrics::metrics();
-        m.loads_in_flight.set(self.in_flight.len() as u64);
-        // A refresh whose tile was evicted while it was in flight has nothing
-        // left to replace. Admitting it would bring back, unasked, a tile the
-        // budget had just let go of.
-        if refresh && !self.residency.is_resident(tile) {
-            return Ok(());
-        }
-        match result {
-            // A refresh that fails costs the new picture and nothing else:
-            // the tile keeps the content it has, which is the whole reason it
-            // was kept. Ending the session over it — the rule for a first
-            // load, where the alternative is a hole — would trade ground that
-            // is merely out of date for no ground at all. It is not retried:
-            // recorded at the epoch it was attempted under, it waits for the
-            // next change or for its own eviction.
-            Err(e) if refresh => {
-                m.loads_failed.inc();
-                self.epochs.insert(tile, epoch);
-                tracing::error!(?tile, "refresh failed, the tile keeps its content: {e}");
-                tx.unbounded_send(ServerMessage::Error {
-                    tile: Some(tile),
-                    message: format!("refresh failed, the tile keeps its content: {e}"),
-                })
-                .map_err(|_| Stop::Gone)
-            }
-            Err(e) => {
-                m.loads_failed.inc();
-                crate::det!("load_err", tile = tile.0, level = self.tree.level(tile));
-                self.fail(tile, e.to_string(), tx)
-            }
-            // Topology grew in place (external tileset grafted): the graft
-            // cleared the host's content, so the next traversal won't
-            // re-request it; the revealed children load on their own. Nothing
-            // will ever be uploaded for this tile, so a pyramid waiting on it
-            // is waiting on nothing.
-            Ok(Loaded::Expanded) => {
-                self.resolve_primed(tile, false);
-                Ok(())
-            }
-            Ok(Loaded::Content(decoded)) => {
-                let size = decoded.byte_size();
-                // Imagery is charged separately because it is shared: what this
-                // tile costs the budget is its geometry plus whatever share of
-                // the draped textures no other resident tile is already paying.
-                let imagery: Vec<_> = decoded
-                    .imagery
-                    .iter()
-                    .map(|l| (l.coord, l.texture.resident_bytes()))
-                    .collect();
-                // The level comes from the tree, which is the only thing that
-                // can read an opaque handle — see `TileTree::level`.
-                let evicted =
-                    self.cache
-                        .insert(tile, self.tree.level(tile), size, &imagery, self.selected);
-                m.loads_completed.inc();
-                m.tiles_evicted.add(evicted.len() as u64);
-                m.resident_bytes.set(self.cache.used_bytes() as u64);
-                let (textures, bytes) = self.cache.imagery_bytes();
-                m.imagery_textures.set(textures as u64);
-                m.imagery_bytes.set(bytes as u64);
-                for e in &evicted {
-                    self.residency.remove(*e);
-                    self.epochs.remove(e);
-                    // The consumer is about to drop it too, so its ack stops
-                    // being true. Left behind, it would suppress the stand-in
-                    // the next time this ground is looked at. The same goes for
-                    // `filled`: an `Evict` takes the stand-in with everything
-                    // else, so tracking it past this point is fiction.
-                    self.acked.remove(e);
-                    self.filled.remove(e);
-                }
-                if !evicted.is_empty() {
-                    crate::det!(
-                        "evict",
-                        count = evicted.len(),
-                        digest = crate::determinism::digest(evicted.iter().map(|t| t.0)),
-                    );
-                    tx.unbounded_send(ServerMessage::Evict { tiles: evicted })
-                        .map_err(|_| Stop::Gone)?;
-                }
-                self.residency.insert(tile);
-                self.epochs.insert(tile, epoch);
-                self.resolve_primed(tile, true);
-                // Arrivals are genuinely unordered — the network decides. On
-                // its own event name so a comparison can drop it and still
-                // compare every decision that was taken.
-                crate::det!(
-                    "load_ok",
-                    tile = tile.0,
-                    level = self.tree.level(tile),
-                    resident = self.residency.len(),
-                );
-                tx.unbounded_send(ServerMessage::Content {
-                    tile,
-                    ancestry: self.ancestry(tile),
-                    content: TileContent::Decoded(decoded),
-                })
-                .map_err(|_| Stop::Gone)?;
-                Ok(())
-            }
-        }
-    }
-
-    /// A tile that could not be loaded ends the session.
-    ///
-    /// There used to be a set of given-up-on tiles here instead, and it was the
-    /// most expensive twelve lines in the repository. It was never emptied, so
-    /// a tile lost to one dropped socket was lost for as long as the process
-    /// lived; it was consulted by the traversal, so the shape of the ground
-    /// silently depended on which requests had happened to fail; and it let the
-    /// session carry on pretending, which is how a render shipped forty-eight
-    /// black frames instead of stopping on the first one. Two nodes rendering
-    /// the same frame would not even agree with each other — the reproducibility
-    /// the whole design is for, traded away for a hidden mutable set.
-    ///
-    /// So the tile is not remembered: the transport has already retried (see
-    /// `is_retryable_transport`), and a failure that survives that is not a
-    /// hiccup. The consumer is told which tile and why, and then the stream
-    /// closes under it, which is a thing a caller cannot ignore.
-    fn fail(
-        &mut self,
-        tile: TileId,
-        message: String,
-        tx: &UnboundedSender<ServerMessage>,
-    ) -> Result<(), Stop> {
-        // Sent before unwinding: a bare closed channel says a tile is missing
-        // without ever saying which, and that was a whole afternoon once.
-        tx.unbounded_send(ServerMessage::Error {
-            tile: Some(tile),
-            message: message.clone(),
-        })
-        .map_err(|_| Stop::Gone)?;
-        Err(Stop::LoadFailed { tile, message })
-    }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::budget::{Bytes, DrawSet, GeoRect, LayerId, LayerReach, Policy, Role};
     use crate::fetch::FsFetcher;
     use crate::protocol::GeometryStream;
-    use futures_util::task::LocalSpawnExt;
+    use crate::source::DrapeReach;
+    use crate::traversal::Residency;
     use glam::{dvec2, dvec3};
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use url::Url;
 
     thread_local! {
@@ -1593,66 +1562,231 @@ mod tests {
     /// The pass the session just ran, run again from scratch with
     /// [`crate::traversal::traverse`], and the two compared. Called on every
     /// pass of every session the tests in this module drive.
-    pub(super) fn matches_the_reference_pass(s: &Session<'_>) {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn matches_the_reference_pass(
+        tree: &dyn TileTree,
+        residency: &dyn Residency,
+        views: &[ViewState],
+        config: &Config,
+        frame: u64,
+        rendered_last: &HashSet<TileId>,
+        chosen_before: &HashSet<TileId>,
+        near: &NearestContent,
+        out: &TraversalOutput,
+    ) {
         let mut fresh = TraversalOutput::default();
         crate::traversal::traverse(
-            s.tree,
-            s.residency,
-            s.views,
-            s.config,
-            *s.frame,
-            s.rendered_last,
-            s.chosen_before,
+            tree,
+            residency,
+            views,
+            config,
+            frame,
+            rendered_last,
+            chosen_before,
             &mut fresh,
         );
-        let at = format!("pass {}", *s.frame);
-        assert_eq!(s.out.selected, fresh.selected, "{at}: selection");
-        assert_eq!(s.out.requests, fresh.requests, "{at}: requests");
-        assert_eq!(s.out.awaiting, fresh.awaiting, "{at}: awaiting");
-        assert_eq!(s.out.chosen, fresh.chosen, "{at}: chosen");
-        assert_eq!(s.out.stats, fresh.stats, "{at}: stats");
-        if s.config.uniform_detail {
-            CHECKED.with(|c| c.set((c.get().0 + 1, s.near.descents())));
+        let at = format!("pass {frame}");
+        assert_eq!(out.selected, fresh.selected, "{at}: selection");
+        assert_eq!(out.requests, fresh.requests, "{at}: requests");
+        assert_eq!(out.awaiting, fresh.awaiting, "{at}: awaiting");
+        assert_eq!(out.blockers, fresh.blockers, "{at}: blockers");
+        assert_eq!(out.chosen, fresh.chosen, "{at}: chosen");
+        assert_eq!(out.stats, fresh.stats, "{at}: stats");
+        if config.uniform_detail {
+            CHECKED.with(|c| c.set((c.get().0 + 1, near.descents())));
         }
+    }
+
+    /// A roomy interactive budget with no floor: every test here says what
+    /// it pins.
+    fn roomy() -> BudgetConfig {
+        let mut b = BudgetConfig::interactive(Bytes::mib(512));
+        b.pinned_level = None;
+        b
+    }
+
+    /// The consumer every test drives: it holds what it is delivered, acks
+    /// it with its estimated bytes (unless told to hold back), drops what is
+    /// cancelled and evicted, and checks the protocol's promises on every
+    /// message — nothing drawn that it does not hold, nothing evicted that the
+    /// draw set of the same step still uses.
+    #[derive(Default)]
+    struct Consumer {
+        held: BTreeMap<ResourceId, Generation>,
+        queued: BTreeMap<ResourceId, (Generation, u64)>,
+        draw: DrawSet,
+        selects: usize,
+        contents: Vec<ResourceId>,
+        evicted: Vec<ResourceId>,
+        errors: Vec<(Option<ResourceId>, String)>,
+        ready: bool,
+        converged: bool,
+        /// Acks withheld while true.
+        hold_back: bool,
+    }
+
+    impl Consumer {
+        fn take(&mut self, stream: &mut InProcessStream, cx: &mut std::task::Context<'_>) -> bool {
+            let mut got = false;
+            while let Poll::Ready(Some(msg)) = stream.poll_message(cx) {
+                got = true;
+                match msg {
+                    ServerMessage::Content {
+                        resource,
+                        gen,
+                        content,
+                        ..
+                    } => {
+                        let bytes = match &content {
+                            ResourceContent::Mesh(m) => m.cost().gpu.0,
+                            ResourceContent::Drape(d) => d.cost().gpu.0,
+                        };
+                        self.contents.push(resource);
+                        self.queued.insert(resource, (gen, bytes));
+                    }
+                    ServerMessage::Cancel { resources } => {
+                        for (r, g) in resources {
+                            if self.queued.get(&r).is_some_and(|q| q.0 == g) {
+                                self.queued.remove(&r);
+                            }
+                        }
+                    }
+                    ServerMessage::Select {
+                        draw,
+                        frame_ready,
+                        converged,
+                        ..
+                    } => {
+                        for item in &draw.items {
+                            assert!(
+                                self.held.contains_key(&item.mesh),
+                                "{:?} drawn before the consumer acknowledged it",
+                                item.mesh
+                            );
+                            for d in &item.drapes {
+                                assert!(
+                                    self.held.contains_key(&d.resource),
+                                    "{:?} worn before the consumer acknowledged it",
+                                    d.resource
+                                );
+                            }
+                        }
+                        self.draw = draw;
+                        self.ready = frame_ready;
+                        self.converged = converged;
+                        self.selects += 1;
+                    }
+                    ServerMessage::Evict { resources } => {
+                        for r in resources {
+                            let worn =
+                                self.draw.items.iter().any(|i| {
+                                    i.mesh == r || i.drapes.iter().any(|d| d.resource == r)
+                                });
+                            assert!(!worn, "{r:?} evicted while the draw set still uses it");
+                            self.held.remove(&r);
+                            self.evicted.push(r);
+                        }
+                    }
+                    ServerMessage::Error { resource, message } => {
+                        self.errors.push((resource, message))
+                    }
+                    ServerMessage::Priming(_) => {}
+                }
+            }
+            if !self.hold_back {
+                for (r, (gen, bytes)) in std::mem::take(&mut self.queued) {
+                    self.held.insert(r, gen);
+                    let _ = stream.send(ClientMessage::Ack {
+                        resource: r,
+                        gen,
+                        bytes,
+                    });
+                }
+            }
+            got
+        }
+
+        /// The tiles drawn as themselves.
+        fn exact(&self) -> HashSet<TileId> {
+            self.draw
+                .items
+                .iter()
+                .filter(|i| i.role == Role::Exact)
+                .map(|i| i.mesh.tile())
+                .collect()
+        }
+    }
+
+    /// Steps a session by hand until it goes quiet, the consumer answering
+    /// as it goes. Returns whether it settled.
+    fn settle(
+        server: &mut Pin<Box<impl Future<Output = ()>>>,
+        stream: &mut InProcessStream,
+        consumer: &mut Consumer,
+    ) -> bool {
+        const MAX_STEPS: usize = 4_000;
+        const QUIET_STEPS: usize = 8;
+        let waker = futures_util::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut quiet = 0usize;
+        for _ in 0..MAX_STEPS {
+            let _ = server.as_mut().poll(&mut cx);
+            let got = consumer.take(stream, &mut cx);
+            quiet = if got { 0 } else { quiet + 1 };
+            if quiet > QUIET_STEPS {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn look(stream: &InProcessStream, view: ViewState, generation: u64) {
+        stream
+            .send(ClientMessage::ViewerState {
+                views: vec![view],
+                generation,
+            })
+            .expect("send");
+    }
+
+    fn deep_tileset(dir: &std::path::Path) -> Tileset {
+        let url = write_deep_fixture(dir);
+        let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
+        Tileset::from_json_bytes(&bytes, &url).expect("tileset")
+    }
+
+    fn leaves_of(tileset: &Tileset) -> HashSet<TileId> {
+        tileset
+            .tile(tileset.root())
+            .children
+            .iter()
+            .flat_map(|m| tileset.tile(*m).children.clone())
+            .collect()
     }
 
     /// **A session prices a still camera once, and selects as a fresh pass
     /// would on every pass.**
-    ///
-    /// Every arrival is answered by a pass, and under uniform detail every
-    /// pass used to repeat the descent along the line of sight. Here the
-    /// session runs to convergence twice — one camera, then another — with
-    /// each of its passes checked against the reference by
-    /// `matches_the_reference_pass`, and it may descend once per camera.
     #[test]
     fn a_still_camera_is_priced_once_per_camera() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let url = write_deep_fixture(dir.path());
-        let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
-        let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
+        let tileset = deep_tileset(dir.path());
         let config = Config {
             uniform_detail: true,
-            pinned_level: None,
             ..Config::default()
         };
-        let (mut stream, server) = in_process(tileset, Arc::new(FsFetcher), config);
+        let (mut stream, server) =
+            in_process(tileset, Arc::new(FsFetcher), config, roomy()).expect("budget");
         let mut server = Box::pin(server.run());
+        let mut consumer = Consumer::default();
         CHECKED.with(|c| c.set((0, 0)));
 
-        stream
-            .send(ClientMessage::ViewerState {
-                views: vec![near_view()],
-                generation: 0,
-            })
-            .expect("send");
-        let (loaded, _) = settle(&mut server, &mut stream).expect("first view settles");
-        let (first, descents) = CHECKED.with(|c| c.get());
+        look(&stream, near_view(), 0);
         assert!(
-            loaded >= 3,
-            "only {loaded} tiles: nothing arrived to answer"
+            settle(&mut server, &mut stream, &mut consumer),
+            "first view settles"
         );
-        // Siblings answered from disk land together and share a pass, so
-        // two is the least: the camera's, and the arrivals'.
+        let (first, descents) = CHECKED.with(|c| c.get());
+        assert!(consumer.contents.len() >= 3, "nothing arrived to answer");
         assert!(first >= 2, "{first} passes: the arrivals were not answered");
         assert_eq!(descents, 1, "{first} passes under one camera");
 
@@ -1663,13 +1797,11 @@ mod tests {
             dvec2(1024.0, 768.0),
             std::f64::consts::FRAC_PI_3,
         );
-        stream
-            .send(ClientMessage::ViewerState {
-                views: vec![farther],
-                generation: 1,
-            })
-            .expect("send");
-        settle(&mut server, &mut stream).expect("second view settles");
+        look(&stream, farther, 1);
+        assert!(
+            settle(&mut server, &mut stream, &mut consumer),
+            "second view settles"
+        );
         let (total, descents) = CHECKED.with(|c| c.get());
         assert!(total > first, "the second camera was never traversed");
         assert_eq!(descents, 2, "{total} passes under two cameras");
@@ -1772,90 +1904,6 @@ mod tests {
         Url::from_file_path(&path).expect("url")
     }
 
-    /// The same fixture with one child's content missing from disk — a tile the
-    /// source will never serve, which over a globe is most of an ocean.
-    fn write_fixture_missing_one_child(dir: &std::path::Path) -> Url {
-        let url = write_fixture(dir);
-        std::fs::remove_file(dir.join("b.glb")).expect("remove b");
-        url
-    }
-
-    /// A tile the source cannot serve ends the session, loudly.
-    ///
-    /// This asserted the opposite until 2026-09-08, and the opposite was a
-    /// disaster. The session used to write the tile down in a `failed` set,
-    /// stop asking for it, and carry on: the pyramid settled, the gate opened,
-    /// and the ground simply had a hole in it that nothing downstream could
-    /// see. On the farm that hole reached the procedural as "the frame did not
-    /// converge", which emits nothing at all — forty-eight black frames, shipped
-    /// as a video, because one endpoint dropped three connections.
-    ///
-    /// The transport retries a transient failure before we ever hear about it
-    /// (`is_retryable_transport`), so a failure that reaches here is real. The
-    /// contract is now: say which tile, say why, and stop. A caller that is
-    /// waiting on a stream gets a closed stream, which it cannot mistake for
-    /// success.
-    #[test]
-    fn a_tile_the_source_cannot_serve_ends_the_session() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let url = write_fixture_missing_one_child(dir.path());
-        let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
-        let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
-
-        // Level 0 and 1: the root and its two children, one of which has no
-        // content on disk.
-        let config = Config {
-            pinned_level: Some(1),
-            ..Config::default()
-        };
-        let (mut stream, server) = in_process(tileset, Arc::new(FsFetcher), config);
-        let mut server = Box::pin(server.run());
-
-        stream
-            .send(ClientMessage::ViewerState {
-                views: vec![near_view()],
-                generation: 0,
-            })
-            .expect("send");
-
-        const MAX_STEPS: usize = 2_000;
-        let waker = futures_util::task::noop_waker();
-        let mut cx = std::task::Context::from_waker(&waker);
-        let mut reported: Option<(Option<TileId>, String)> = None;
-        let mut stopped = false;
-        for _ in 0..MAX_STEPS {
-            if !stopped && server.as_mut().poll(&mut cx).is_ready() {
-                stopped = true;
-            }
-            while let Poll::Ready(Some(msg)) = stream.poll_message(&mut cx) {
-                if let ServerMessage::Error { tile, message } = msg {
-                    reported.get_or_insert((tile, message));
-                }
-            }
-            if stopped {
-                break;
-            }
-        }
-
-        assert!(
-            stopped,
-            "the session kept running after a tile it can never serve"
-        );
-        let (tile, message) =
-            reported.expect("the session stopped without ever saying which tile it could not load");
-        assert!(tile.is_some(), "an unattributed failure is not actionable");
-        assert!(
-            !message.is_empty(),
-            "the reason has to travel with the failure"
-        );
-        // And the stream is closed under the consumer, so nothing downstream
-        // can read the truncated selection as a finished one.
-        assert!(
-            matches!(stream.poll_message(&mut cx), Poll::Ready(None)),
-            "the stream stayed open after the session ended"
-        );
-    }
-
     /// A three-level REPLACE tileset: root → two mids → four leaves. Deep
     /// enough that selecting the leaves leaves an ancestor (the root) outside
     /// the pinned band.
@@ -1901,162 +1949,540 @@ mod tests {
         Url::from_file_path(&path).expect("url")
     }
 
-    /// Steps a session by hand until it goes quiet, returning
-    /// `(loads, evictions)` — or `None` if it never settled.
-    ///
-    /// Hand-stepping rather than running to quiescence because a session can
-    /// fail to converge (evicting a tile the next traversal re-requests), and a
-    /// test must report that as a failure rather than hang. `FsFetcher`
-    /// resolves inline, so every poll makes progress: the bound is a step
-    /// count, not a timeout.
-    fn settle(
-        server: &mut Pin<Box<impl Future<Output = ()>>>,
-        stream: &mut InProcessStream,
-    ) -> Option<(usize, Vec<TileId>)> {
-        const MAX_STEPS: usize = 2_000;
-        const QUIET_STEPS: usize = 8;
-        let waker = futures_util::task::noop_waker();
-        let mut cx = std::task::Context::from_waker(&waker);
-        let (mut loaded, mut quiet) = (0usize, 0usize);
-        let mut evicted: Vec<TileId> = Vec::new();
-        for _ in 0..MAX_STEPS {
-            let _ = server.as_mut().poll(&mut cx);
-            let mut got = false;
-            while let Poll::Ready(Some(msg)) = stream.poll_message(&mut cx) {
-                got = true;
-                match msg {
-                    ServerMessage::Content { .. } => loaded += 1,
-                    ServerMessage::Evict { tiles } => evicted.extend(tiles),
-                    _ => {}
-                }
-            }
-            quiet = if got { 0 } else { quiet + 1 };
-            if quiet > QUIET_STEPS {
-                return Some((loaded, evicted));
-            }
-        }
-        None
+    /// **The session converges to the leaves, drawing only what the consumer
+    /// holds.** Every `Select` names acknowledged resources only (checked by
+    /// the consumer on every message), the parent is drawn while its
+    /// children load, and the settled draw set is the four leaves, each as
+    /// itself.
+    #[test]
+    fn the_session_converges_drawing_only_what_the_consumer_holds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tileset = deep_tileset(dir.path());
+        let leaves = leaves_of(&tileset);
+        let (mut stream, server) =
+            in_process(tileset, Arc::new(FsFetcher), Config::default(), roomy()).expect("budget");
+        let mut server = Box::pin(server.run());
+        let mut consumer = Consumer::default();
+        look(&stream, near_view(), 1);
+        assert!(settle(&mut server, &mut stream, &mut consumer));
+        assert_eq!(
+            consumer.exact(),
+            leaves,
+            "the settled frame draws the leaves"
+        );
+        assert!(consumer.converged, "the budget says the view converged");
+        assert!(consumer.errors.is_empty(), "{:?}", consumer.errors);
     }
 
-    /// **A stand-in that has been replaced is not evicted.**
-    ///
-    /// `Fill` and `Content` are filed under the same id by the consumer, so the
-    /// real thing simply replaces the stand-in when it lands. The server has to
-    /// notice: it keeps a `filled` set so it can take a stand-in back when the
-    /// camera leaves that ground, and if the tile is still in that set once its
-    /// real content has been sent, the take-back names real geometry.
-    ///
-    /// What that costs, measured in the viewer before this test existed: the
-    /// consumer drops the tile, the server still holds it resident and still has
-    /// its ack, so it sends neither `Content` (resident) nor `Fill` (acked)
-    /// when the ground is looked at again. The walk climbs to an ancestor and
-    /// stays there — **28 tiles drawn coarse with nothing loading and no error
-    /// reported**, stable, for as long as the session ran. On screen that is
-    /// blurry rectangles with straight tile-aligned edges, which is a different
-    /// artefact from the ragged organic outlines of two surfaces fighting, and
-    /// was mistaken for it.
+    /// **Nothing is drawn before it is acknowledged.** A consumer that
+    /// holds back its acks gets content delivered and an empty draw set —
+    /// never a resource it has not uploaded — and the ground appears as soon
+    /// as the acks arrive.
     #[test]
-    fn a_stand_in_that_has_been_replaced_is_not_evicted() {
+    fn nothing_is_drawn_before_its_ack() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let url = write_deep_fixture(dir.path());
+        let tileset = deep_tileset(dir.path());
+        let (mut stream, server) =
+            in_process(tileset, Arc::new(FsFetcher), Config::default(), roomy()).expect("budget");
+        let mut server = Box::pin(server.run());
+        let mut consumer = Consumer {
+            hold_back: true,
+            ..Consumer::default()
+        };
+        look(&stream, near_view(), 1);
+        settle(&mut server, &mut stream, &mut consumer);
+        assert!(!consumer.contents.is_empty(), "something was delivered");
+        assert!(
+            consumer.draw.items.is_empty(),
+            "drawn without an ack: {:?}",
+            consumer.draw.items
+        );
+        consumer.hold_back = false;
+        // An ack is a client message: the next step answers it.
+        assert!(settle(&mut server, &mut stream, &mut consumer));
+        assert!(
+            !consumer.draw.items.is_empty(),
+            "the acks were never answered"
+        );
+    }
+
+    /// **A tile the source cannot serve is retried, and its ground stays
+    /// covered.** Interactive: the failure is reported with the resource it
+    /// concerns, the session keeps running, and the missing child's ground
+    /// is drawn by its parent (the budget's fallback) rather than left bare.
+    #[test]
+    fn a_failed_load_is_retried_and_its_ground_stays_covered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = write_fixture(dir.path());
+        std::fs::remove_file(dir.path().join("b.glb")).expect("remove b");
         let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
         let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
+        let root = tileset.root();
+        let (mut stream, server) =
+            in_process(tileset, Arc::new(FsFetcher), Config::default(), roomy()).expect("budget");
+        let mut server = Box::pin(server.run());
+        let mut consumer = Consumer::default();
+        look(&stream, near_view(), 1);
+        settle(&mut server, &mut stream, &mut consumer);
+        assert!(
+            consumer.errors.iter().any(|(r, _)| r.is_some()),
+            "the failure was not reported with its resource"
+        );
+        assert!(
+            consumer
+                .draw
+                .items
+                .iter()
+                .any(|i| i.mesh == ResourceId::Mesh(root)),
+            "the parent no longer covers the missing child's ground: {:?}",
+            consumer.draw.items
+        );
+        // Still answering.
+        let before = consumer.selects;
+        look(&stream, far_view(), 2);
+        settle(&mut server, &mut stream, &mut consumer);
+        assert!(consumer.selects > before, "the session stopped answering");
+    }
 
-        /// Real content for everything, and a stand-in on demand.
-        struct Standing(Arc<dyn TileLoader>);
+    /// **A batch session ends on a failed load**: a film never ships a hole.
+    /// The consumer is told which resource and why, and the stream closes.
+    #[test]
+    fn a_batch_session_ends_on_a_failed_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = write_fixture(dir.path());
+        std::fs::remove_file(dir.path().join("b.glb")).expect("remove b");
+        let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
+        let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
+        let mut batch = BudgetConfig::batch();
+        batch.pinned_level = None;
+        assert_eq!(batch.policy, Policy::Batch);
+        let (mut stream, server) =
+            in_process(tileset, Arc::new(FsFetcher), Config::default(), batch).expect("budget");
+        let mut server = Box::pin(server.run());
+        let waker = futures_util::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut consumer = Consumer::default();
+        look(&stream, near_view(), 1);
+        let mut stopped = false;
+        for _ in 0..2_000 {
+            if server.as_mut().poll(&mut cx).is_ready() {
+                stopped = true;
+                break;
+            }
+            consumer.take(&mut stream, &mut cx);
+        }
+        consumer.take(&mut stream, &mut cx);
+        assert!(
+            stopped,
+            "the batch session kept running after a failed load"
+        );
+        assert!(
+            consumer
+                .errors
+                .iter()
+                .any(|(r, m)| r.is_some() && !m.is_empty()),
+            "the session stopped without saying which resource: {:?}",
+            consumer.errors
+        );
+        assert!(matches!(stream.poll_message(&mut cx), Poll::Ready(None)));
+    }
 
+    /// **A cancelled load is aborted for real, and a resource is never
+    /// loaded twice at once.** A loader whose loads never answer records
+    /// each load's start and the drop of its future — which is what aborts
+    /// the request under it (a browser's `AbortController`, a native
+    /// client's connection). The camera leaves the ground those loads were
+    /// for; once their grace has passed, every one of them is dropped within
+    /// the step that cancels it, and at no moment are two loads of one tile
+    /// alive together.
+    #[test]
+    fn a_cancelled_load_is_aborted_and_never_overlaps_its_restart() {
+        use std::sync::atomic::AtomicU64;
+        #[derive(Default)]
+        struct Live {
+            alive: std::collections::HashMap<TileId, u32>,
+            overlap: u32,
+            started: u32,
+            dropped: u32,
+        }
+        struct Guard(Arc<std::sync::Mutex<Live>>, TileId);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let mut l = self.0.lock().expect("live");
+                l.dropped += 1;
+                if let Some(n) = l.alive.get_mut(&self.1) {
+                    *n -= 1;
+                }
+            }
+        }
+        struct Hanging(Arc<std::sync::Mutex<Live>>);
         #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
         #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
-        impl TileLoader for Standing {
+        impl TileLoader for Hanging {
+            async fn load(&self, id: TileId) -> Result<Loaded, LoadError> {
+                {
+                    let mut l = self.0.lock().expect("live");
+                    l.started += 1;
+                    let n = l.alive.entry(id).or_default();
+                    *n += 1;
+                    if *n > 1 {
+                        l.overlap += 1;
+                    }
+                }
+                let _guard = Guard(Arc::clone(&self.0), id);
+                futures_util::future::pending().await
+            }
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tileset = deep_tileset(dir.path());
+        let live = Arc::new(std::sync::Mutex::new(Live::default()));
+        let tree: Box<dyn TileTree> = Box::new(TilesetTree::new(Arc::new(RwLock::new(tileset))));
+        let now = Arc::new(AtomicU64::new(0));
+        let clock = Arc::clone(&now);
+        let (mut stream, server) = in_process_with(
+            tree,
+            Arc::new(Hanging(Arc::clone(&live))),
+            Config::default(),
+            roomy(),
+        )
+        .expect("budget");
+        let server = server.with_clock(Arc::new(move || Micros(clock.load(Ordering::SeqCst))));
+        let mut server = Box::pin(server.run());
+        let mut consumer = Consumer::default();
+        look(&stream, near_view(), 1);
+        settle(&mut server, &mut stream, &mut consumer);
+        let started = live.lock().expect("live").started;
+        assert!(started > 0, "nothing started");
+        // Away, long enough for the grace to pass; the steps that follow
+        // cancel what the near view wanted.
+        for (k, view) in [far_view(), near_view(), far_view()]
+            .into_iter()
+            .enumerate()
+        {
+            now.fetch_add(2_000_000, Ordering::SeqCst);
+            look(&stream, view, 2 + k as u64);
+            settle(&mut server, &mut stream, &mut consumer);
+        }
+        let l = live.lock().expect("live");
+        assert!(l.dropped > 0, "no cancelled load was dropped");
+        assert_eq!(
+            l.overlap, 0,
+            "{} loads overlapped a live one of their tile",
+            l.overlap
+        );
+        let alive: u32 = l.alive.values().sum();
+        assert_eq!(
+            alive + l.dropped,
+            l.started,
+            "a load neither alive nor dropped"
+        );
+    }
+
+    /// **The loader is asked about a resource's presence once a second at
+    /// most**, however many steps weigh it: answering a drape costs the
+    /// loader its imagery mosaic, and asking it at every step of a settling
+    /// view took two thirds of a browser worker's thread. A clock that never
+    /// moves keeps every answer.
+    #[test]
+    fn presence_is_asked_once_within_its_window() {
+        struct Counting(
+            TilesetLoader<FsFetcher>,
+            Arc<std::sync::Mutex<HashMap<ResourceId, u32>>>,
+        );
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        impl TileLoader for Counting {
             async fn load(&self, id: TileId) -> Result<Loaded, LoadError> {
                 self.0.load(id).await
             }
-            fn fill(&self, _id: TileId) -> Option<crate::content::DecodedTileContent> {
-                Some(crate::content::DecodedTileContent {
-                    withheld_drape: None,
-                    meshes: Vec::new(),
-                    textures: Vec::new(),
-                    imagery: Vec::new(),
-                    local_origin_ecef: glam::DVec3::ZERO,
-                    transform_local: glam::Mat4::IDENTITY,
-                })
+            fn holds(&self, r: ResourceId) -> crate::budget::Presence {
+                *self.1.lock().expect("asked").entry(r).or_default() += 1;
+                crate::budget::Presence::Absent
             }
         }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let arena = Arc::new(RwLock::new(deep_tileset(dir.path())));
+        let tree: Box<dyn TileTree> = Box::new(TilesetTree::new(Arc::clone(&arena)));
+        let asked = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let loader = Counting(
+            TilesetLoader::new(arena, Arc::new(FsFetcher)),
+            Arc::clone(&asked),
+        );
+        let (mut stream, server) =
+            in_process_with(tree, Arc::new(loader), Config::default(), roomy()).expect("budget");
+        let server = server.with_clock(Arc::new(|| Micros(1)));
+        let mut server = Box::pin(server.run());
+        let mut consumer = Consumer::default();
+        look(&stream, near_view(), 1);
+        settle(&mut server, &mut stream, &mut consumer);
+        look(&stream, far_view(), 2);
+        settle(&mut server, &mut stream, &mut consumer);
+        let asked = asked.lock().expect("asked");
+        assert!(!asked.is_empty(), "nothing was asked");
+        let most = asked.values().copied().max().unwrap_or(0);
+        assert_eq!(most, 1, "a resource asked {most} times within one window");
+    }
 
+    /// **The loads in flight are ranked in the budget's order, and each
+    /// names itself to the work it hands a pool**: what a decode pool orders
+    /// its queue by. A loader that never answers keeps every load in flight;
+    /// each one notes the resource [`crate::offload::loading`] names while
+    /// it is polled, and every one of those is ranked, the ranks a
+    /// permutation of the loads.
+    #[test]
+    fn loads_in_flight_are_ranked_and_name_themselves() {
+        struct Noting(Arc<std::sync::Mutex<Vec<ResourceId>>>);
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        impl TileLoader for Noting {
+            async fn load(&self, _id: TileId) -> Result<Loaded, LoadError> {
+                if let Some(r) = crate::offload::loading() {
+                    self.0.lock().expect("noted").push(r);
+                }
+                futures_util::future::pending().await
+            }
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tileset = deep_tileset(dir.path());
+        let noted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut stream, server) = in_process_with(
+            Box::new(tileset),
+            Arc::new(Noting(Arc::clone(&noted))),
+            Config::default(),
+            roomy(),
+        )
+        .expect("budget");
+        let ranks = server.load_ranks();
+        let mut server = Box::pin(server.run());
+        let mut consumer = Consumer::default();
+        look(&stream, near_view(), 1);
+        settle(&mut server, &mut stream, &mut consumer);
+        let noted = noted.lock().expect("noted").clone();
+        assert!(!noted.is_empty(), "no load named itself");
+        let mut seen: Vec<u32> = noted
+            .iter()
+            .map(|r| ranks.rank(*r).expect("a load in flight is ranked"))
+            .collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..noted.len() as u32).collect::<Vec<_>>());
+    }
+
+    /// **A release between frames is announced** as any eviction, and takes
+    /// nothing the last step drew.
+    #[test]
+    fn a_release_beyond_is_announced_and_spares_what_is_drawn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tileset = deep_tileset(dir.path());
+        let mut batch = BudgetConfig::batch();
+        batch.pinned_level = None;
+        let (mut stream, server) =
+            in_process(tileset, Arc::new(FsFetcher), Config::default(), batch).expect("budget");
+        let mut server = Box::pin(server.run());
+        let mut consumer = Consumer::default();
+        look(&stream, near_view(), 1);
+        assert!(settle(&mut server, &mut stream, &mut consumer));
+        assert!(consumer.ready, "the batch frame is ready");
+        // Another view: the first one's leaves are no longer needed.
+        look(&stream, far_view(), 2);
+        assert!(settle(&mut server, &mut stream, &mut consumer));
+        let drawn: HashSet<ResourceId> = consumer.draw.items.iter().map(|i| i.mesh).collect();
+        stream
+            .send(ClientMessage::ReleaseBeyond { bytes: 0 })
+            .expect("send");
+        assert!(settle(&mut server, &mut stream, &mut consumer));
+        assert!(!consumer.evicted.is_empty(), "nothing was released");
+        for r in &consumer.evicted {
+            assert!(!drawn.contains(r), "{r:?} released while drawn");
+        }
+    }
+
+    /// A tileset whose tiles are draped: each tile's drape is one imagery
+    /// tile placed over it, of a layer that reaches level 4, and the drape's
+    /// pixels change with the loader's epoch.
+    struct Draped {
+        inner: TilesetLoader<FsFetcher>,
+        arena: crate::tiles3d::SharedTileset,
+        epoch: Arc<AtomicU64>,
+        meshes: Arc<AtomicUsize>,
+        drapes: Arc<Mutex<Vec<ResourceId>>>,
+    }
+
+    impl Draped {
+        /// A footprint in the budget's radians that nests as the fixture's
+        /// spheres do: the root's square holds its children's.
+        fn rect(&self, id: TileId) -> GeoRect {
+            let ts = self.arena.read().expect("arena");
+            let c = ts.properties(id).bounding_volume.center().x;
+            let half = match ts.level(id) {
+                0 => 100.0,
+                1 => 50.0,
+                _ => 25.0,
+            };
+            GeoRect {
+                west: (c - half) * 1e-4,
+                east: (c + half) * 1e-4,
+                south: -half * 1e-4,
+                north: half * 1e-4,
+            }
+        }
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    impl TileLoader for Draped {
+        async fn load(&self, id: TileId) -> Result<Loaded, LoadError> {
+            self.meshes.fetch_add(1, Ordering::SeqCst);
+            self.inner.load(id).await
+        }
+        fn drapes(&self, id: TileId) -> Option<DrapeReach> {
+            Some(DrapeReach {
+                texel_l0_m: 1.0e4,
+                rect: self.rect(id),
+                layers: vec![LayerReach {
+                    layer: LayerId(0),
+                    max_level: 4,
+                }],
+            })
+        }
+        async fn load_drape(
+            &self,
+            id: TileId,
+            layer: LayerId,
+            level: u32,
+        ) -> Result<DrapeContent, LoadError> {
+            self.drapes
+                .lock()
+                .expect("drapes")
+                .push(ResourceId::drape(id, layer, level));
+            let texture = Arc::new(crate::content::DecodedTexture {
+                width: 4,
+                height: 4,
+                rgba8: vec![self.epoch.load(Ordering::SeqCst) as u8; 64],
+            });
+            let tile = crate::raster::GeoRect {
+                west: 0.0,
+                south: 0.0,
+                east: 1.0,
+                north: 1.0,
+            };
+            Ok(DrapeContent {
+                layer,
+                level,
+                tiles: vec![crate::raster::ImageryLayer::placed(
+                    crate::raster::ImageryCoord { level, x: 0, y: 0 },
+                    texture,
+                    &tile,
+                    &tile,
+                )],
+                floor_tiles: 0,
+                identity: u64::from(level),
+                withheld: false,
+            })
+        }
+        fn epoch(&self) -> u64 {
+            self.epoch.load(Ordering::SeqCst)
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn draped_session(
+        dir: &std::path::Path,
+    ) -> (
+        InProcessStream,
+        GeometryServer,
+        Arc<AtomicU64>,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<ResourceId>>>,
+    ) {
+        let tileset = deep_tileset(dir);
         let arena = Arc::new(RwLock::new(tileset));
         let tree: Box<dyn TileTree> = Box::new(TilesetTree::new(Arc::clone(&arena)));
-        let inner: Arc<dyn TileLoader> = Arc::new(TilesetLoader::new(arena, Arc::new(FsFetcher)));
-        let (mut stream, server) = in_process_with(
-            tree,
-            Arc::new(Standing(inner)) as Arc<dyn TileLoader>,
-            Config {
-                pinned_level: None,
-                ..Config::default()
-            },
-        );
-        let mut server = Box::pin(server.run());
+        let epoch = Arc::new(AtomicU64::new(1));
+        let meshes = Arc::new(AtomicUsize::new(0));
+        let drapes = Arc::new(Mutex::new(Vec::new()));
+        let loader: Arc<dyn TileLoader> = Arc::new(Draped {
+            inner: TilesetLoader::new(Arc::clone(&arena), Arc::new(FsFetcher)),
+            arena,
+            epoch: Arc::clone(&epoch),
+            meshes: Arc::clone(&meshes),
+            drapes: Arc::clone(&drapes),
+        });
+        let (stream, server) =
+            in_process_with(tree, loader, Config::default(), roomy()).expect("budget");
+        (stream, server, epoch, meshes, drapes)
+    }
 
+    /// **A drape is a load of its own, and every drawn item is dressed.**
+    /// Once the view has settled, every drawn tile wears a drape of the layer
+    /// it needs (I1 extended by D-A1), the drapes were loaded beside the
+    /// meshes, and nothing bare is drawn.
+    #[test]
+    fn drapes_are_their_own_loads_and_dress_every_drawn_tile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut stream, server, _, meshes, drapes) = draped_session(dir.path());
+        let mut server = Box::pin(server.run());
+        let mut consumer = Consumer::default();
+        look(&stream, near_view(), 1);
+        assert!(settle(&mut server, &mut stream, &mut consumer));
+        assert!(meshes.load(Ordering::SeqCst) > 0);
+        assert!(
+            !drapes.lock().expect("drapes").is_empty(),
+            "no drape was loaded"
+        );
+        assert!(!consumer.draw.items.is_empty());
+        for item in &consumer.draw.items {
+            assert!(
+                item.drapes.iter().any(|d| d.layer == LayerId(0)),
+                "{:?} drawn bare",
+                item.mesh
+            );
+        }
+    }
+
+    /// **A change of imagery redrapes without reloading a mesh, and without
+    /// a bare frame.** The loader's epoch moves on: every drawn drape is
+    /// loaded again, new before old — each draw set in between still dresses
+    /// every item — and no mesh is fetched a second time (I10).
+    #[test]
+    fn a_change_of_imagery_redrapes_without_reloading_a_mesh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut stream, server, epoch, meshes, drapes) = draped_session(dir.path());
+        let mut server = Box::pin(server.run());
+        let mut consumer = Consumer::default();
+        look(&stream, near_view(), 1);
+        assert!(settle(&mut server, &mut stream, &mut consumer));
+        let meshes_before = meshes.load(Ordering::SeqCst);
+        let drapes_before = drapes.lock().expect("drapes").len();
+        epoch.store(2, Ordering::SeqCst);
+        // Any message prompts a step; the step sees the new epoch.
+        look(&stream, near_view(), 2);
         let waker = futures_util::task::noop_waker();
         let mut cx = std::task::Context::from_waker(&waker);
-        let mut delivered: HashSet<TileId> = HashSet::new();
-        let mut wrongly_taken: Vec<TileId> = Vec::new();
-
-        // Look somewhere, then look elsewhere: the second view is what makes the
-        // first view's ground leave the selection, which is when a stand-in is
-        // taken back.
-        for view in [near_view(), far_view()] {
-            stream
-                .send(ClientMessage::ViewerState {
-                    views: vec![view],
-                    generation: 0,
-                })
-                .expect("send");
-            for _ in 0..256 {
-                let _ = server.as_mut().poll(&mut cx);
-                while let Poll::Ready(Some(msg)) = stream.poll_message(&mut cx) {
-                    match msg {
-                        ServerMessage::Content { tile, .. } => {
-                            delivered.insert(tile);
-                            // A real consumer acks what it uploads; a stand-in
-                            // is never acked, which is what the server relies on.
-                            let _ = stream.send(ClientMessage::Ack { tile });
-                        }
-                        ServerMessage::Evict { tiles } => {
-                            for t in tiles {
-                                if delivered.contains(&t) {
-                                    wrongly_taken.push(t);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+        for _ in 0..2_000 {
+            let _ = server.as_mut().poll(&mut cx);
+            consumer.take(&mut stream, &mut cx);
+            for item in &consumer.draw.items {
+                assert!(
+                    !item.drapes.is_empty(),
+                    "{:?} drawn bare mid-change",
+                    item.mesh
+                );
             }
         }
-
         assert!(
-            wrongly_taken.is_empty(),
-            "the server took back {} tiles whose real content it had already \
-             sent: {wrongly_taken:?}. The consumer drops them, the server still \
-             holds them resident and acked, and that ground is coarse for the \
-             rest of the session",
-            wrongly_taken.len()
+            drapes.lock().expect("drapes").len() > drapes_before,
+            "the drapes were not refreshed"
+        );
+        assert_eq!(
+            meshes.load(Ordering::SeqCst),
+            meshes_before,
+            "a change of imagery reloaded a mesh"
         );
     }
 
-    /// **A server answered from memory still hands its host a turn.** Every
-    /// load here completes on its first poll, so the loop never has to wait;
-    /// with a breather every two events it pauses all the same, and the
-    /// session goes on to deliver everything after each pause.
-    ///
-    /// Every two, not four: arrivals that are ready together are one event
-    /// (`drain_ready`), so this seven-tile session is a handful of events
-    /// in a row — the camera, the root, its children, their children — and
-    /// four of them back to back no longer happens without a wait between.
+    /// **A server answered from memory still hands its host a turn.**
     #[test]
     fn a_busy_server_hands_its_host_a_turn() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
         /// Ready on the second poll: a turn given back to the executor.
         struct Yield(bool);
         impl Future for Yield {
@@ -2073,19 +2499,12 @@ mod tests {
 
         let run = |every: usize| -> (usize, usize) {
             let dir = tempfile::tempdir().expect("tempdir");
-            let url = write_deep_fixture(dir.path());
-            let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
-            let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
+            let tileset = deep_tileset(dir.path());
             let pauses = Arc::new(AtomicUsize::new(0));
             let counted = Arc::clone(&pauses);
-            let (mut stream, server) = in_process(
-                tileset,
-                Arc::new(FsFetcher),
-                Config {
-                    pinned_level: None,
-                    ..Config::default()
-                },
-            );
+            let (mut stream, server) =
+                in_process(tileset, Arc::new(FsFetcher), Config::default(), roomy())
+                    .expect("budget");
             let server = server.with_breather(
                 every,
                 Arc::new(move || {
@@ -2094,25 +2513,10 @@ mod tests {
                 }),
             );
             let mut server = Box::pin(server.run());
-            let waker = futures_util::task::noop_waker();
-            let mut cx = std::task::Context::from_waker(&waker);
-            stream
-                .send(ClientMessage::ViewerState {
-                    views: vec![near_view()],
-                    generation: 0,
-                })
-                .expect("send");
-            let mut delivered = 0usize;
-            for _ in 0..256 {
-                let _ = server.as_mut().poll(&mut cx);
-                while let Poll::Ready(Some(msg)) = stream.poll_message(&mut cx) {
-                    if let ServerMessage::Content { tile, .. } = msg {
-                        delivered += 1;
-                        let _ = stream.send(ClientMessage::Ack { tile });
-                    }
-                }
-            }
-            (pauses.load(Ordering::SeqCst), delivered)
+            let mut consumer = Consumer::default();
+            look(&stream, near_view(), 0);
+            settle(&mut server, &mut stream, &mut consumer);
+            (pauses.load(Ordering::SeqCst), consumer.contents.len())
         };
         let (pauses, delivered) = run(2);
         assert!(pauses > 0, "the host never had a turn");
@@ -2120,8 +2524,6 @@ mod tests {
             delivered >= 7,
             "the session stopped after a pause: {delivered}"
         );
-        // A breather that never comes due takes no pause: the count is of
-        // events back to back, and this session has fewer than a thousand.
         assert_eq!(run(1000).0, 0, "paused before its count was reached");
     }
 
@@ -2164,367 +2566,109 @@ mod tests {
         }
     }
 
-    /// **Loads that land together are answered by one traversal.**
-    ///
-    /// Four leaves are asked for at once and held behind a gate; when it opens
-    /// all four are ready on the same turn. One pass per arrival — what the
-    /// loop did before it drained them — walked the tree four times, and three
-    /// of those selections were superseded before a consumer, which drains
-    /// every queued message before it draws, could ever see them. In
-    /// production that was ~110 000 traversals per pod in ten minutes.
-    ///
-    /// What this does not cover: whether fewer intermediate passes change the
-    /// final selection of a real flight (the hysteresis reads the previous
-    /// pass). That is the bake goldens' job.
+    /// **Loads that land together are answered by one step.** Four leaves
+    /// are held behind a gate; when it opens all four are ready on the same
+    /// turn, and one decision answers them all.
     #[test]
-    fn loads_that_land_together_are_answered_by_one_traversal() {
-        use std::sync::atomic::Ordering;
-
+    fn loads_that_land_together_are_answered_by_one_step() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let url = write_deep_fixture(dir.path());
-        let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
-        let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
-        let root = tileset.root();
-        let leaves: HashSet<TileId> = tileset
-            .tile(root)
-            .children
-            .iter()
-            .flat_map(|m| tileset.tile(*m).children.clone())
-            .collect();
-        assert_eq!(leaves.len(), 4);
+        let tileset = deep_tileset(dir.path());
+        let leaves = leaves_of(&tileset);
 
         /// Real content, the leaves only once the gate is open.
-        struct Held(Arc<dyn TileLoader>, HashSet<TileId>, Arc<Gate>);
-
+        struct Gated {
+            inner: TilesetLoader<FsFetcher>,
+            leaves: HashSet<TileId>,
+            gate: Arc<Gate>,
+        }
         #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
         #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
-        impl TileLoader for Held {
+        impl TileLoader for Gated {
             async fn load(&self, id: TileId) -> Result<Loaded, LoadError> {
-                if self.1.contains(&id) {
-                    self.2.pass().await;
+                if self.leaves.contains(&id) {
+                    self.gate.pass().await;
                 }
-                self.0.load(id).await
+                self.inner.load(id).await
             }
         }
 
         let gate = Gate::closed();
         let arena = Arc::new(RwLock::new(tileset));
         let tree: Box<dyn TileTree> = Box::new(TilesetTree::new(Arc::clone(&arena)));
-        let inner: Arc<dyn TileLoader> = Arc::new(TilesetLoader::new(arena, Arc::new(FsFetcher)));
-        let (mut stream, server) = in_process_with(
-            tree,
-            Arc::new(Held(inner, leaves.clone(), Arc::clone(&gate))) as Arc<dyn TileLoader>,
-            Config {
-                pinned_level: None,
-                ..Config::default()
-            },
-        );
+        let loader: Arc<dyn TileLoader> = Arc::new(Gated {
+            inner: TilesetLoader::new(arena, Arc::new(FsFetcher)),
+            leaves: leaves.clone(),
+            gate: Arc::clone(&gate),
+        });
+        let (mut stream, server) =
+            in_process_with(tree, loader, Config::default(), roomy()).expect("budget");
         let mut server = Box::pin(server.run());
-        stream
-            .send(ClientMessage::ViewerState {
-                views: vec![near_view()],
-                generation: 0,
-            })
-            .expect("send");
-
-        // Steps the session until it goes quiet, counting what it sent.
-        fn step(
-            server: &mut Pin<Box<impl Future<Output = ()>>>,
-            stream: &mut InProcessStream,
-        ) -> (usize, HashSet<TileId>) {
-            let waker = futures_util::task::noop_waker();
-            let mut cx = std::task::Context::from_waker(&waker);
-            let (mut selections, mut arrived) = (0usize, HashSet::new());
-            for _ in 0..32 {
-                assert!(server.as_mut().poll(&mut cx).is_pending(), "session ended");
-                while let Poll::Ready(Some(msg)) = stream.poll_message(&mut cx) {
-                    match msg {
-                        ServerMessage::Select { .. } => selections += 1,
-                        ServerMessage::Content { tile, .. } => {
-                            arrived.insert(tile);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            (selections, arrived)
-        }
-
-        let (_, before) = step(&mut server, &mut stream);
+        let mut consumer = Consumer::default();
+        look(&stream, near_view(), 1);
+        settle(&mut server, &mut stream, &mut consumer);
         assert_eq!(
             gate.waiting.load(Ordering::SeqCst),
             4,
-            "every leaf is asked for before the gate opens (arrived: {before:?})"
+            "the four leaves wait"
         );
-        assert!(before.is_disjoint(&leaves));
-
+        let selects = consumer.selects;
         gate.open();
-        let (selections, arrived) = step(&mut server, &mut stream);
-        assert_eq!(arrived, leaves, "all four leaves landed");
-        assert_eq!(
-            selections, 1,
-            "four arrivals ready on the same turn are answered by one traversal"
-        );
-    }
-
-    /// Records the tiles whose load was dropped before it finished — what a
-    /// cancel does to a load.
-    struct Unfinished {
-        tile: TileId,
-        dropped: Arc<Mutex<Vec<TileId>>>,
-        finished: bool,
-    }
-
-    impl Drop for Unfinished {
-        fn drop(&mut self) {
-            if !self.finished {
-                self.dropped.lock().expect("dropped").push(self.tile);
-            }
-        }
-    }
-
-    /// Real content; the tiles in `held` only once the gate opens, and a
-    /// note of every load dropped unfinished.
-    struct Holding {
-        inner: Arc<dyn TileLoader>,
-        held: HashSet<TileId>,
-        gate: Arc<Gate>,
-        dropped: Arc<Mutex<Vec<TileId>>>,
-    }
-
-    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
-    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
-    impl TileLoader for Holding {
-        async fn load(&self, id: TileId) -> Result<Loaded, LoadError> {
-            let mut guard = Unfinished {
-                tile: id,
-                dropped: Arc::clone(&self.dropped),
-                finished: false,
-            };
-            if self.held.contains(&id) {
-                self.gate.pass().await;
-            }
-            let loaded = self.inner.load(id).await;
-            guard.finished = true;
-            loaded
-        }
-    }
-
-    /// A session over `tileset` whose loader holds `held` behind a gate.
-    #[allow(clippy::type_complexity)]
-    fn holding_session(
-        tileset: Tileset,
-        held: HashSet<TileId>,
-        config: Config,
-    ) -> (
-        InProcessStream,
-        Pin<Box<impl Future<Output = ()>>>,
-        Arc<Gate>,
-        Arc<Mutex<Vec<TileId>>>,
-    ) {
-        let gate = Gate::closed();
-        let dropped = Arc::new(Mutex::new(Vec::new()));
-        let arena = Arc::new(RwLock::new(tileset));
-        let tree: Box<dyn TileTree> = Box::new(TilesetTree::new(Arc::clone(&arena)));
-        let inner: Arc<dyn TileLoader> = Arc::new(TilesetLoader::new(arena, Arc::new(FsFetcher)));
-        let loader = Holding {
-            inner,
-            held,
-            gate: Arc::clone(&gate),
-            dropped: Arc::clone(&dropped),
-        };
-        let (stream, server) = in_process_with(tree, Arc::new(loader), config);
-        (stream, Box::pin(server.run()), gate, dropped)
-    }
-
-    /// What one stretch of polling produced, in order.
-    #[derive(Debug, Default)]
-    struct Heard {
-        /// The generation of every `Select`, in order.
-        selections: Vec<u64>,
-        /// Content delivered, and how many selections had gone out before it.
-        contents: Vec<(TileId, usize)>,
-    }
-
-    fn listen(
-        server: &mut Pin<Box<impl Future<Output = ()>>>,
-        stream: &mut InProcessStream,
-        polls: usize,
-    ) -> Heard {
         let waker = futures_util::task::noop_waker();
         let mut cx = std::task::Context::from_waker(&waker);
-        let mut heard = Heard::default();
-        for _ in 0..polls {
-            assert!(server.as_mut().poll(&mut cx).is_pending(), "session ended");
-            while let Poll::Ready(Some(msg)) = stream.poll_message(&mut cx) {
-                match msg {
-                    ServerMessage::Select { generation, .. } => heard.selections.push(generation),
-                    ServerMessage::Content { tile, .. } => {
-                        heard.contents.push((tile, heard.selections.len()));
-                    }
-                    ServerMessage::Error { message, .. } => unreachable!("error: {message}"),
-                    _ => {}
-                }
+        // One poll: the four arrivals are recorded and answered together.
+        let _ = server.as_mut().poll(&mut cx);
+        let mut arrivals = Vec::new();
+        while let Poll::Ready(Some(msg)) = stream.poll_message(&mut cx) {
+            match msg {
+                ServerMessage::Content { resource, .. } => arrivals.push(resource),
+                ServerMessage::Select { .. } => consumer.selects += 1,
+                _ => {}
             }
         }
-        heard
+        assert_eq!(arrivals.len(), 4, "the four leaves delivered");
+        assert_eq!(consumer.selects - selects, 1, "one step for four arrivals");
     }
 
-    fn look(stream: &InProcessStream, view: ViewState, generation: u64) {
-        stream
-            .send(ClientMessage::ViewerState {
-                views: vec![view],
-                generation,
-            })
-            .expect("send");
-    }
-
-    /// The two-leaf fixture, its root and its leaves.
-    fn two_leaves(dir: &std::path::Path) -> (Tileset, TileId, HashSet<TileId>) {
-        let url = write_fixture(dir);
+    /// **A graft is walked and its content drawn.** The external tileset's
+    /// root arrives as an expanded tile; the next step walks the grafted
+    /// tree and its content is delivered and drawn.
+    #[test]
+    fn an_external_tileset_is_grafted_and_its_leaf_drawn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = write_external(dir.path());
         let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
         let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
-        let root = tileset.root();
-        let leaves = tileset.tile(root).children.iter().copied().collect();
-        (tileset, root, leaves)
-    }
-
-    fn unpinned() -> Config {
-        Config {
-            pinned_level: None,
-            ..Config::default()
-        }
-    }
-
-    /// **The camera and the loads take turns.** A camera and two arrivals
-    /// are ready on the same turn; which is answered first follows the turn
-    /// order, which alternates. The same session started twice, the second
-    /// with one extra event before (an ack) — the order is flipped, so
-    /// across the two the arrivals are answered first once and the camera
-    /// once. A loop that always read the camera first never answers the
-    /// arrivals first; one that always read the loads never the camera.
-    #[test]
-    fn the_camera_and_the_arrivals_take_turns() {
-        let first_answered = |extra_event: bool| -> u64 {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let (tileset, root, leaves) = two_leaves(dir.path());
-            let (mut stream, mut server, gate, _) = holding_session(tileset, leaves, unpinned());
-            look(&stream, near_view(), 1);
-            let before = listen(&mut server, &mut stream, 16);
-            assert!(before.contents.iter().any(|(t, _)| *t == root));
-            assert_eq!(gate.waiting.load(std::sync::atomic::Ordering::SeqCst), 2);
-            if extra_event {
-                stream.send(ClientMessage::Ack { tile: root }).expect("ack");
-                listen(&mut server, &mut stream, 4);
-            }
-            // Both sides ready on the same turn.
-            gate.open();
-            look(&stream, near_view(), 2);
-            let after = listen(&mut server, &mut stream, 16);
-            assert_eq!(after.contents.len(), 2, "both leaves landed: {after:?}");
-            // Answered by a pass still on generation 1: the arrivals went
-            // first. On generation 2: the camera did.
-            after.selections[0]
-        };
-        let firsts: HashSet<u64> = [first_answered(false), first_answered(true)].into();
-        assert_eq!(
-            firsts,
-            HashSet::from([1, 2]),
-            "the camera and the arrivals each went first once"
-        );
-    }
-
-    /// **A camera state and an ack in one burst still move the picture.** The
-    /// burst is coalesced; the ack asks for nothing, the camera for a pass,
-    /// and the pass is owed if any message in it asked.
-    #[test]
-    fn a_camera_coalesced_with_an_ack_is_still_answered() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (tileset, root, leaves) = two_leaves(dir.path());
-        let (mut stream, mut server, _gate, _) = holding_session(tileset, leaves, unpinned());
+        let host = tileset.root();
+        let arena = Arc::new(RwLock::new(tileset));
+        let tree: Box<dyn TileTree> = Box::new(TilesetTree::new(Arc::clone(&arena)));
+        let loader: Arc<dyn TileLoader> =
+            Arc::new(TilesetLoader::new(Arc::clone(&arena), Arc::new(FsFetcher)));
+        let (mut stream, server) =
+            in_process_with(tree, loader, Config::default(), roomy()).expect("budget");
+        let mut server = Box::pin(server.run());
+        let mut consumer = Consumer::default();
         look(&stream, near_view(), 1);
-        listen(&mut server, &mut stream, 16);
-        look(&stream, far_view(), 2);
-        stream.send(ClientMessage::Ack { tile: root }).expect("ack");
-        let heard = listen(&mut server, &mut stream, 16);
-        assert_eq!(heard.selections, vec![2], "one pass, for the new camera");
-    }
-
-    /// **A camera move cancels the loads it no longer wants, and only
-    /// those.** Both leaves are in flight behind a gate. The same view again
-    /// still wants them: nothing is dropped. A view far enough that the root
-    /// alone suffices wants neither: both are.
-    #[test]
-    fn a_camera_move_cancels_only_what_it_stopped_wanting() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (tileset, _root, leaves) = two_leaves(dir.path());
-        let (mut stream, mut server, gate, dropped) =
-            holding_session(tileset, leaves.clone(), unpinned());
-        look(&stream, near_view(), 1);
-        listen(&mut server, &mut stream, 16);
-        assert_eq!(gate.waiting.load(std::sync::atomic::Ordering::SeqCst), 2);
-
-        look(&stream, near_view(), 2);
-        listen(&mut server, &mut stream, 16);
+        assert!(settle(&mut server, &mut stream, &mut consumer));
+        let grafted: Vec<TileId> = consumer
+            .contents
+            .iter()
+            .map(|r| r.tile())
+            .filter(|t| arena.read().expect("arena").parent(*t) == Some(host))
+            .collect();
         assert!(
-            dropped.lock().expect("dropped").is_empty(),
-            "a camera that still wants the leaves kept them"
+            !grafted.is_empty(),
+            "the grafted root's content never arrived: {:?}",
+            consumer.contents
         );
-
-        look(&stream, far_view(), 3);
-        listen(&mut server, &mut stream, 16);
-        let gone: HashSet<TileId> = dropped.lock().expect("dropped").iter().copied().collect();
-        assert_eq!(gone, leaves, "a camera that wants neither dropped both");
+        assert!(
+            consumer.exact().contains(&grafted[0]),
+            "the grafted root is not drawn: {:?}",
+            consumer.draw.items
+        );
+        assert!(consumer.errors.is_empty(), "{:?}", consumer.errors);
     }
 
-    /// **No more loads in flight than the cap, and up to it.** Every tile
-    /// is held, so nothing in flight ever finishes. With room for two, two
-    /// wait — not none, not more; with room for plenty, more than two do,
-    /// so it was the cap that stopped them. With the coarse pyramid and
-    /// without: its loads and the view's are capped alike.
-    #[test]
-    fn loads_in_flight_fill_the_cap_and_stop_there() {
-        let waiting = |pinned_level: Option<u32>, cap: usize, view: ViewState| {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let url = write_deep_fixture(dir.path());
-            let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
-            let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
-            let every: HashSet<TileId> = tileset.tiles().map(|(id, _)| id).collect();
-            let (mut stream, mut server, gate, _) = holding_session(
-                tileset,
-                every,
-                Config {
-                    pinned_level,
-                    maximum_simultaneous_fetches: cap,
-                    ..Config::default()
-                },
-            );
-            look(&stream, view, 1);
-            listen(&mut server, &mut stream, 16);
-            gate.waiting.load(std::sync::atomic::Ordering::SeqCst)
-        };
-        for pinned_level in [Some(1), None] {
-            assert_eq!(
-                waiting(pinned_level, 2, near_view()),
-                2,
-                "pinned {pinned_level:?}"
-            );
-            assert!(
-                waiting(pinned_level, 64, near_view()) > 2,
-                "pinned {pinned_level:?}"
-            );
-        }
-        // From far off the view wants the root alone, so what fills the cap
-        // is the pyramid's own loads: the root and its two children.
-        assert_eq!(waiting(None, 64, far_view()), 1, "the view alone");
-        assert_eq!(waiting(Some(1), 2, far_view()), 2, "the pyramid, capped");
-        assert_eq!(waiting(Some(1), 64, far_view()), 3, "the whole pyramid");
-    }
-
-    /// A tileset whose root is an external tileset: the load grafts, and the
-    /// grafted root is the content.
-    #[cfg(all(feature = "rt-tokio", not(target_arch = "wasm32")))]
-    fn write_external_fixture(dir: &std::path::Path) -> Url {
+    fn write_external(dir: &std::path::Path) -> Url {
         let glb = crate::content::tests::test_glb();
         std::fs::write(dir.join("a.glb"), &glb).expect("write a");
         std::fs::write(
@@ -2546,139 +2690,6 @@ mod tests {
         Url::from_file_path(&path).expect("url")
     }
 
-    /// **Loads as tasks: a graft waits for the top of a pass.** The server
-    /// asks its tree to hold edits once, before anything is spawned, and
-    /// applies them at the top of every pass; the external tileset grafted by
-    /// a load running on another worker is then walked by the next pass whole,
-    /// and its content arrives, on a multi-thread runtime, with the server
-    /// itself a task on it.
-    #[cfg(all(feature = "rt-tokio", not(target_arch = "wasm32")))]
-    #[test]
-    fn loads_as_tasks_graft_between_passes_and_converge() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        /// Counts what the server asks of the tree's edits.
-        struct Recording {
-            inner: TilesetTree,
-            deferred: Arc<AtomicUsize>,
-            applied: Arc<AtomicUsize>,
-        }
-        impl TileTree for Recording {
-            fn roots(&self) -> Vec<TileId> {
-                self.inner.roots()
-            }
-            fn children(&self, id: TileId) -> Vec<TileId> {
-                self.inner.children(id)
-            }
-            fn properties(&self, id: TileId) -> crate::source::TileProperties {
-                self.inner.properties(id)
-            }
-            fn parent(&self, id: TileId) -> Option<TileId> {
-                self.inner.parent(id)
-            }
-            fn level(&self, id: TileId) -> u32 {
-                self.inner.level(id)
-            }
-            fn defer_edits(&self) {
-                self.deferred.fetch_add(1, Ordering::SeqCst);
-                self.inner.defer_edits();
-            }
-            fn apply_deferred_edits(&self) -> Vec<(TileId, String)> {
-                self.applied.fetch_add(1, Ordering::SeqCst);
-                self.inner.apply_deferred_edits()
-            }
-        }
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let url = write_external_fixture(dir.path());
-        let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
-        let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
-        let root = tileset.root();
-        let arena = Arc::new(RwLock::new(tileset));
-        let (deferred, applied) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-        let tree: Box<dyn TileTree> = Box::new(Recording {
-            inner: TilesetTree::new(Arc::clone(&arena)),
-            deferred: Arc::clone(&deferred),
-            applied: Arc::clone(&applied),
-        });
-        let loader: Arc<dyn TileLoader> =
-            Arc::new(TilesetLoader::new(Arc::clone(&arena), Arc::new(FsFetcher)));
-
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
-            .build()
-            .expect("runtime");
-        let (mut stream, server) = in_process_with(
-            tree,
-            loader,
-            Config {
-                pinned_level: None,
-                ..Config::default()
-            },
-        );
-        let server = server.with_spawn(Spawn::Tokio(runtime.handle().clone()));
-        let running = runtime.spawn(server.run());
-
-        // A session that never walks the graft goes quiet rather than failing:
-        // a watchdog turns that into a failure instead of a hang.
-        let watchdog =
-            runtime.spawn_blocking(|| std::thread::sleep(std::time::Duration::from_secs(20)));
-        let (grafted, passes) = runtime.block_on(async {
-            let session = async {
-                stream
-                    .send(ClientMessage::ViewerState {
-                        views: vec![near_view()],
-                        generation: 0,
-                    })
-                    .expect("send");
-                let mut passes = 0usize;
-                let mut grafted = None;
-                while let Some(msg) = stream.next_message().await {
-                    match msg {
-                        ServerMessage::Content { tile, .. } => grafted = Some(tile),
-                        ServerMessage::Select { tiles, .. } => {
-                            passes += 1;
-                            if grafted.is_some_and(|g| tiles.iter().any(|(t, _)| *t == g)) {
-                                break;
-                            }
-                        }
-                        ServerMessage::Error { message, .. } => {
-                            unreachable!("unexpected error: {message}")
-                        }
-                        _ => {}
-                    }
-                }
-                (grafted, passes)
-            };
-            tokio::select! {
-                outcome = session => outcome,
-                _ = watchdog => panic!("the grafted tileset was never walked"),
-            }
-        });
-        drop(stream);
-        let grafted = grafted.expect("the grafted root's content arrived");
-        assert_eq!(
-            arena.read().expect("arena").parent(grafted),
-            Some(root),
-            "the content is the grafted root's"
-        );
-        assert_eq!(
-            deferred.load(Ordering::SeqCst),
-            1,
-            "edits held once, up front"
-        );
-        assert!(
-            applied.load(Ordering::SeqCst) >= passes,
-            "held edits applied at the top of every pass: {} for {passes}",
-            applied.load(Ordering::SeqCst)
-        );
-        runtime
-            .block_on(running)
-            .expect("the server ends when the client goes");
-        // Not waiting on the watchdog's sleep.
-        runtime.shutdown_background();
-    }
-
     /// **A result that lands after its load was cancelled is the news of the
     /// cancel.** A task cannot take back what it has sent; the abort handle
     /// that travels with the result says whether the loop still wants it.
@@ -2692,8 +2703,16 @@ mod tests {
         let mut loads = Loads::new(&Spawn::Tokio(runtime.handle().clone()));
         let mut start = |tile: TileId| {
             let (handle, registration) = AbortHandle::new_pair();
-            let fut: BoxLoadFut =
-                Box::pin(async move { ((tile, Ok(Loaded::Expanded)), crate::metrics::stamp()) });
+            let fut: BoxLoadFut = Box::pin(async move {
+                (
+                    (
+                        ResourceId::Mesh(tile),
+                        Generation(1),
+                        Ok(Fetched::Mesh(Loaded::Expanded)),
+                    ),
+                    crate::metrics::stamp(),
+                )
+            });
             loads.push(Abortable::new(fut, registration), &handle);
             handle
         };
@@ -2715,7 +2734,12 @@ mod tests {
         cancelled.abort();
         let mut outcomes: Vec<(u64, bool)> = landed
             .into_iter()
-            .map(|(msg, handle)| (msg.0 .0 .0, tasks::Tasks::screen((msg, handle)).is_ok()))
+            .map(|(msg, handle)| {
+                (
+                    msg.0 .0.tile().0,
+                    tasks::Tasks::screen((msg, handle)).is_ok(),
+                )
+            })
             .collect();
         outcomes.sort_unstable();
         assert_eq!(outcomes, vec![(1, true), (2, false)]);
@@ -2738,12 +2762,9 @@ mod tests {
         }
     }
 
-    /// **Inline, nothing is deferred and no pause is added.** The edits of a
-    /// load have landed between two passes by construction, as they always
-    /// did, and the host keeps the only say over pauses.
+    /// **Inline, nothing is deferred and no pause is added.**
     #[test]
     fn inline_loads_neither_defer_edits_nor_pause() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         struct Counting(Arc<AtomicUsize>);
         impl TileTree for Counting {
             fn roots(&self) -> Vec<TileId> {
@@ -2779,11 +2800,14 @@ mod tests {
         let (mut stream, server) = in_process_with(
             Box::new(Counting(Arc::clone(&deferred))),
             Arc::new(Never),
-            unpinned(),
-        );
+            Config::default(),
+            roomy(),
+        )
+        .expect("budget");
         let mut server = Box::pin(server.run());
+        let mut consumer = Consumer::default();
         look(&stream, near_view(), 1);
-        listen(&mut server, &mut stream, 4);
+        settle(&mut server, &mut stream, &mut consumer);
         assert_eq!(deferred.load(Ordering::SeqCst), 0, "inline defers nothing");
         assert!(default_breather(&Loads::new(&Spawn::Inline)).is_none());
     }
@@ -2802,8 +2826,16 @@ mod tests {
         assert!(default_breather(&loads).is_some());
         for tile in [TileId(1), TileId(2)] {
             let (handle, registration) = AbortHandle::new_pair();
-            let fut: BoxLoadFut =
-                Box::pin(async move { ((tile, Ok(Loaded::Expanded)), crate::metrics::stamp()) });
+            let fut: BoxLoadFut = Box::pin(async move {
+                (
+                    (
+                        ResourceId::Mesh(tile),
+                        Generation(1),
+                        Ok(Fetched::Mesh(Loaded::Expanded)),
+                    ),
+                    crate::metrics::stamp(),
+                )
+            });
             loads.push(Abortable::new(fut, registration), &handle);
         }
         let mut landed = Vec::new();
@@ -2813,832 +2845,14 @@ mod tests {
                 std::time::Instant::now() < deadline,
                 "try_next never handed over what had landed"
             );
-            if let Some(Ok(((tile, _), _))) = loads.try_next() {
-                landed.push(tile.0);
+            if let Some(Ok(((r, _, _), _))) = loads.try_next() {
+                landed.push(r.tile().0);
             }
             std::thread::yield_now();
         }
         landed.sort_unstable();
         assert_eq!(landed, vec![1, 2]);
         assert!(loads.try_next().is_none(), "nothing more");
-    }
-
-    /// **A request the network never answers costs one slot, not the
-    /// session.** One leaf's load never completes — a browser `fetch` with no
-    /// answer, before transports bounded their requests. With room for two
-    /// loads at once, every other tile still arrives through the other slot,
-    /// the leaf's parent stays selected over its ground — the ancestor drawn,
-    /// not a hole — and the server keeps answering views.
-    #[test]
-    fn a_load_that_never_answers_holds_one_slot_and_the_ancestor_stays() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let url = write_deep_fixture(dir.path());
-        let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
-        let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
-        let root = tileset.root();
-        let mids = tileset.tile(root).children.clone();
-        let stalled = tileset.tile(mids[0]).children[0];
-        let others: Vec<TileId> = mids
-            .iter()
-            .flat_map(|m| tileset.tile(*m).children.clone())
-            .filter(|t| *t != stalled)
-            .collect();
-
-        /// Real content for every tile but one, which never answers.
-        struct Silent(Arc<dyn TileLoader>, TileId);
-
-        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
-        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
-        impl TileLoader for Silent {
-            async fn load(&self, id: TileId) -> Result<Loaded, LoadError> {
-                if id == self.1 {
-                    return futures_util::future::pending().await;
-                }
-                self.0.load(id).await
-            }
-        }
-
-        let arena = Arc::new(RwLock::new(tileset));
-        let tree: Box<dyn TileTree> = Box::new(TilesetTree::new(Arc::clone(&arena)));
-        let inner: Arc<dyn TileLoader> = Arc::new(TilesetLoader::new(arena, Arc::new(FsFetcher)));
-        let (mut stream, server) = in_process_with(
-            tree,
-            Arc::new(Silent(inner, stalled)) as Arc<dyn TileLoader>,
-            Config {
-                pinned_level: None,
-                maximum_simultaneous_fetches: 2,
-                ..Config::default()
-            },
-        );
-        let mut server = Box::pin(server.run());
-        let waker = futures_util::task::noop_waker();
-        let mut cx = std::task::Context::from_waker(&waker);
-        let mut delivered: HashSet<TileId> = HashSet::new();
-        let mut selected: HashSet<TileId> = HashSet::new();
-        let mut selections = 0usize;
-        // The camera keeps sending views, as a frame loop does.
-        for _ in 0..64 {
-            stream
-                .send(ClientMessage::ViewerState {
-                    views: vec![near_view()],
-                    generation: 0,
-                })
-                .expect("the server still listens");
-            for _ in 0..16 {
-                assert!(
-                    server.as_mut().poll(&mut cx).is_pending(),
-                    "the session ended over one silent request"
-                );
-                while let Poll::Ready(Some(msg)) = stream.poll_message(&mut cx) {
-                    match msg {
-                        ServerMessage::Content { tile, .. } => {
-                            delivered.insert(tile);
-                            let _ = stream.send(ClientMessage::Ack { tile });
-                        }
-                        ServerMessage::Select { tiles, .. } => {
-                            selections += 1;
-                            selected = tiles.into_iter().map(|(t, _)| t).collect();
-                        }
-                        ServerMessage::Error { message, .. } => {
-                            unreachable!("unexpected error: {message}")
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        for tile in &others {
-            assert!(
-                delivered.contains(tile),
-                "{tile:?} never arrived past the silent load"
-            );
-        }
-        assert!(!delivered.contains(&stalled));
-        assert!(
-            selected.contains(&mids[0]),
-            "the silent leaf's parent stands over its ground: {selected:?}"
-        );
-        assert!(selections > 1, "selections kept coming");
-    }
-
-    /// **Taking back a stand-in must never cost the consumer real content.**
-    ///
-    /// `Content` is sent exactly once per residency: the server marks the tile
-    /// resident and never re-sends it. So anything that makes the consumer
-    /// discard that one delivery — including its copy still waiting in the
-    /// upload queue, which is the state `Evict` explicitly purges — loses the
-    /// tile for as long as the server's cache holds it. Measured in the viewer:
-    /// 1853 tiles taken back in one flight, 232 of them re-issued a stand-in
-    /// right after, coarse for the rest of the session with nothing loading.
-    ///
-    /// The consumer that matters here is the honest one: it uploads on a
-    /// budget, so its ack arrives *later* than the content. This test holds
-    /// that gap open by never acking, and asserts the server still never sends
-    /// an `Evict` for a tile whose content it has delivered — a take-back of
-    /// the stand-in must travel as [`ServerMessage::Retire`], which the
-    /// consumer applies only to surfaces it holds *as stand-ins*.
-    #[test]
-    fn a_stand_in_take_back_never_travels_as_evict() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let url = write_deep_fixture(dir.path());
-        let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
-        let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
-
-        struct Standing(Arc<dyn TileLoader>);
-        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
-        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
-        impl TileLoader for Standing {
-            async fn load(&self, id: TileId) -> Result<Loaded, LoadError> {
-                self.0.load(id).await
-            }
-            fn fill(&self, _id: TileId) -> Option<crate::content::DecodedTileContent> {
-                Some(crate::content::DecodedTileContent {
-                    withheld_drape: None,
-                    meshes: Vec::new(),
-                    textures: Vec::new(),
-                    imagery: Vec::new(),
-                    local_origin_ecef: glam::DVec3::ZERO,
-                    transform_local: glam::Mat4::IDENTITY,
-                })
-            }
-        }
-
-        let arena = Arc::new(RwLock::new(tileset));
-        let tree: Box<dyn TileTree> = Box::new(TilesetTree::new(Arc::clone(&arena)));
-        let inner: Arc<dyn TileLoader> = Arc::new(TilesetLoader::new(arena, Arc::new(FsFetcher)));
-        let (mut stream, server) = in_process_with(
-            tree,
-            Arc::new(Standing(inner)) as Arc<dyn TileLoader>,
-            Config {
-                pinned_level: None,
-                ..Config::default()
-            },
-        );
-        let mut server = Box::pin(server.run());
-
-        let waker = futures_util::task::noop_waker();
-        let mut cx = std::task::Context::from_waker(&waker);
-        let mut delivered: HashSet<TileId> = HashSet::new();
-        let mut evicted_after_delivery: Vec<TileId> = Vec::new();
-
-        // Look somewhere, then elsewhere — the move is what makes the first
-        // view's stand-ins leave the selection. **Never ack**: the upload queue
-        // of a real consumer is exactly this window, held open.
-        for view in [near_view(), far_view()] {
-            stream
-                .send(ClientMessage::ViewerState {
-                    views: vec![view],
-                    generation: 0,
-                })
-                .expect("send");
-            for _ in 0..256 {
-                let _ = server.as_mut().poll(&mut cx);
-                while let Poll::Ready(Some(msg)) = stream.poll_message(&mut cx) {
-                    match msg {
-                        ServerMessage::Content { tile, .. } => {
-                            delivered.insert(tile);
-                        }
-                        ServerMessage::Evict { tiles } => {
-                            for t in tiles {
-                                if delivered.contains(&t) {
-                                    evicted_after_delivery.push(t);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        assert!(
-            evicted_after_delivery.is_empty(),
-            "{} tiles were named by an Evict after their one Content delivery, \
-             with no cache pressure to justify it: the consumer purges them from \
-             its upload queue and the server never re-sends — that ground is a \
-             stand-in for the rest of the session. A stand-in take-back must be \
-             a Retire. Tiles: {evicted_after_delivery:?}",
-            evicted_after_delivery.len()
-        );
-    }
-
-    /// A turn must not re-stream its own wake.
-    ///
-    /// The tiles the camera has just left are the ones it is most likely to want
-    /// back, and evicting them the instant they leave the frustum was measured at
-    /// 150 reloads over the second half of an orbit. What keeps them is headroom
-    /// and nothing else: an LRU only evicts when it is over its cap, so with room
-    /// for both working sets the previous view's tiles simply stay, ordered
-    /// behind the current one's and ahead of anything older.
-    ///
-    /// This is where a ring of "recent camera positions" used to be — a second
-    /// mechanism protecting what ordering already protects, and one that, when
-    /// it was also allowed to *evict*, threw away 93 185 tiles in a session.
-    /// A consumer that has not acknowledged a selected tile is sent a stand-in.
-    ///
-    /// The trigger is the *consumer's* gap, not the server's: a tile is selected
-    /// only once it is resident here, and drawn only once it is uploaded there.
-    /// Between the two lie a channel, a queue and an upload budget, and in those
-    /// frames the consumer falls back to an ancestor that also covers the
-    /// missing tile's siblings — two surfaces over one patch of ground.
-    ///
-    /// This test never acks, which is the extreme of that gap and the only shape
-    /// a test can hold still. Written first against "selected but not resident",
-    /// where it failed with "the view selected nothing to stand in for" — a
-    /// condition that cannot occur, because selection implies residency.
-    #[test]
-    fn a_tile_the_consumer_has_not_acknowledged_gets_a_stand_in() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let url = write_deep_fixture(dir.path());
-        let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
-        let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
-
-        /// Real content for everything, and a stand-in on demand. Both halves
-        /// matter: without content nothing is ever selected, and without a fill
-        /// there is nothing to observe.
-        struct Standing(Arc<dyn TileLoader>);
-
-        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
-        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
-        impl TileLoader for Standing {
-            async fn load(&self, id: TileId) -> Result<Loaded, LoadError> {
-                self.0.load(id).await
-            }
-            fn fill(&self, _id: TileId) -> Option<crate::content::DecodedTileContent> {
-                Some(crate::content::DecodedTileContent {
-                    withheld_drape: None,
-                    meshes: Vec::new(),
-                    textures: Vec::new(),
-                    imagery: Vec::new(),
-                    local_origin_ecef: glam::DVec3::ZERO,
-                    transform_local: glam::Mat4::IDENTITY,
-                })
-            }
-        }
-
-        let arena = Arc::new(RwLock::new(tileset));
-        let tree: Box<dyn TileTree> = Box::new(TilesetTree::new(Arc::clone(&arena)));
-        let inner: Arc<dyn TileLoader> = Arc::new(TilesetLoader::new(arena, Arc::new(FsFetcher)));
-        let (mut stream, server) = in_process_with(
-            tree,
-            Arc::new(Standing(inner)) as Arc<dyn TileLoader>,
-            // The default configuration, deliberately: stand-ins are on by
-            // default, and a test that switched them on itself would keep
-            // passing after the default was quietly turned back off.
-            Config {
-                pinned_level: None,
-                ..Config::default()
-            },
-        );
-        let mut server = Box::pin(server.run());
-        stream
-            .send(ClientMessage::ViewerState {
-                views: vec![near_view()],
-                generation: 0,
-            })
-            .expect("send");
-
-        // Drive to quiescence without ever acking, which is what a consumer
-        // whose uploads never finish looks like from here.
-        let waker = futures_util::task::noop_waker();
-        let mut cx = std::task::Context::from_waker(&waker);
-        let mut selected: Vec<TileId> = Vec::new();
-        let mut filled: HashSet<TileId> = HashSet::new();
-        for _ in 0..64 {
-            let _ = server.as_mut().poll(&mut cx);
-            while let Poll::Ready(Some(msg)) = stream.poll_message(&mut cx) {
-                match msg {
-                    ServerMessage::Select { tiles, .. } => {
-                        selected = tiles.iter().map(|(t, _)| *t).collect();
-                    }
-                    ServerMessage::Fill { tile, .. } => {
-                        filled.insert(tile);
-                    }
-                    ServerMessage::Evict { tiles } => {
-                        for t in tiles {
-                            filled.remove(&t);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        assert!(!selected.is_empty(), "the view selected nothing");
-        for tile in &selected {
-            assert!(
-                filled.contains(tile),
-                "{tile:?} is selected and unacknowledged, and got no stand-in \
-                 (stand-ins: {filled:?})"
-            );
-        }
-    }
-
-    /// A loader whose content changes when it is told to, as a globe's does
-    /// when its imagery is switched. Each tile's content carries the epoch it
-    /// was loaded under — in its origin, which nothing here reads — so a
-    /// consumer can tell the old picture from the new.
-    struct Turning {
-        inner: Arc<dyn TileLoader>,
-        epoch: Arc<std::sync::atomic::AtomicU64>,
-    }
-
-    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
-    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
-    impl TileLoader for Turning {
-        async fn load(&self, id: TileId) -> Result<Loaded, LoadError> {
-            let epoch = self.epoch.load(std::sync::atomic::Ordering::SeqCst);
-            match self.inner.load(id).await? {
-                Loaded::Content(mut content) => {
-                    content.local_origin_ecef = dvec3(epoch as f64, 0.0, 0.0);
-                    Ok(Loaded::Content(content))
-                }
-                other => Ok(other),
-            }
-        }
-
-        fn epoch(&self) -> u64 {
-            self.epoch.load(std::sync::atomic::Ordering::SeqCst)
-        }
-    }
-
-    /// **Changing what every tile shows never leaves a tile showing nothing.**
-    ///
-    /// The consumer here is the simplest honest one: it files content under
-    /// its tile, replaces what was there, and drops a tile only on `Evict`.
-    /// After every step of the server — every frame, in a viewer — each tile
-    /// of the selection must be held. The loader's epoch is then moved on,
-    /// as a switch of imagery does, and the same must stay true at every step
-    /// until every selected tile holds the new content.
-    ///
-    /// Seen failing with the old content dropped first — an `Evict` ahead of
-    /// each refresh, the "drop and re-request" implementation: 'selected and
-    /// held by nobody' on the first step after the change.
-    ///
-    /// Also held: the turn-over is coarse first, the new content replaces the
-    /// old under the same id with no eviction in between, and a tile is
-    /// refreshed once.
-    #[test]
-    fn a_change_of_epoch_replaces_every_tile_without_ever_dropping_one() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let url = write_deep_fixture(dir.path());
-        let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
-        let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
-        let arena = Arc::new(RwLock::new(tileset));
-        let tree: Box<dyn TileTree> = Box::new(TilesetTree::new(Arc::clone(&arena)));
-        let levels = TilesetTree::new(Arc::clone(&arena));
-        let inner: Arc<dyn TileLoader> = Arc::new(TilesetLoader::new(arena, Arc::new(FsFetcher)));
-        let epoch = Arc::new(AtomicU64::new(0));
-        let (mut stream, server) = in_process_with(
-            tree,
-            Arc::new(Turning {
-                inner,
-                epoch: Arc::clone(&epoch),
-            }) as Arc<dyn TileLoader>,
-            Config {
-                pinned_level: None,
-                stand_ins: false,
-                ..Config::default()
-            },
-        );
-        let mut server: Pin<Box<dyn Future<Output = ()>>> = Box::pin(server.run());
-        let waker = futures_util::task::noop_waker();
-        let mut cx = std::task::Context::from_waker(&waker);
-
-        // What the consumer holds: tile → the epoch of the content filed there.
-        let mut held: HashMap<TileId, u64> = HashMap::new();
-        let mut selected: Vec<TileId> = Vec::new();
-        // Every delivery after the change, in order: (level, tile).
-        let mut turned: Vec<(u32, TileId)> = Vec::new();
-        let mut evicted_after_the_change = 0usize;
-
-        let mut step = |server: &mut Pin<Box<dyn Future<Output = ()>>>,
-                        stream: &mut InProcessStream,
-                        held: &mut HashMap<TileId, u64>,
-                        selected: &mut Vec<TileId>,
-                        turned: &mut Vec<(u32, TileId)>,
-                        evicted: &mut usize,
-                        changed: bool| {
-            stream
-                .send(ClientMessage::ViewerState {
-                    views: vec![near_view()],
-                    generation: 0,
-                })
-                .expect("send");
-            let _ = server.as_mut().poll(&mut cx);
-            while let Poll::Ready(Some(msg)) = stream.poll_message(&mut cx) {
-                match msg {
-                    ServerMessage::Select { tiles, .. } => {
-                        *selected = tiles.iter().map(|(t, _)| *t).collect();
-                    }
-                    ServerMessage::Content { tile, content, .. } => {
-                        let TileContent::Decoded(decoded) = content else {
-                            unreachable!("in-process content is decoded")
-                        };
-                        let at = decoded.local_origin_ecef.x as u64;
-                        if changed {
-                            turned.push((levels.level(tile), tile));
-                        }
-                        held.insert(tile, at);
-                        stream.send(ClientMessage::Ack { tile }).expect("ack");
-                    }
-                    ServerMessage::Evict { tiles } => {
-                        for t in tiles {
-                            held.remove(&t);
-                            if changed {
-                                *evicted += 1;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            // The frame: everything selected has something to draw.
-            for tile in selected.iter() {
-                assert!(
-                    held.contains_key(tile),
-                    "{tile:?} is selected and held by nobody (changed: {changed})"
-                );
-            }
-        };
-
-        for _ in 0..64 {
-            step(
-                &mut server,
-                &mut stream,
-                &mut held,
-                &mut selected,
-                &mut turned,
-                &mut evicted_after_the_change,
-                false,
-            );
-        }
-        assert!(selected.len() > 1, "the view settled on {selected:?}");
-        assert!(held.values().all(|at| *at == 0));
-        let before: HashSet<TileId> = held.keys().copied().collect();
-
-        // The switch.
-        epoch.store(1, Ordering::SeqCst);
-        for _ in 0..64 {
-            step(
-                &mut server,
-                &mut stream,
-                &mut held,
-                &mut selected,
-                &mut turned,
-                &mut evicted_after_the_change,
-                true,
-            );
-        }
-
-        // Every tile held is now the new content — the selection, and the
-        // ancestors a consumer falls back to.
-        for (tile, at) in &held {
-            assert_eq!(*at, 1, "{tile:?} still shows the old content");
-        }
-        assert_eq!(
-            held.keys().copied().collect::<HashSet<_>>(),
-            before,
-            "the change added or lost tiles"
-        );
-        assert_eq!(evicted_after_the_change, 0, "a refresh evicts nothing");
-        // Coarse first, and once each.
-        let order: Vec<u32> = turned.iter().map(|(level, _)| *level).collect();
-        let mut sorted = order.clone();
-        sorted.sort_unstable();
-        assert_eq!(order, sorted, "the turn-over was not coarse first");
-        assert_eq!(turned.len(), before.len(), "refreshed {turned:?}");
-    }
-
-    #[test]
-    fn tiles_the_camera_just_left_survive_the_next_move() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let url = write_deep_fixture(dir.path());
-        let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
-        let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
-
-        // Room for the whole fixture, which is the point: nothing is over any
-        // ceiling, so nothing may be reclaimed.
-        let config = Config::default();
-        let (mut stream, server) = in_process(tileset, Arc::new(FsFetcher), config);
-        let mut server = Box::pin(server.run());
-
-        stream
-            .send(ClientMessage::ViewerState {
-                views: vec![near_view()],
-                generation: 0,
-            })
-            .expect("send");
-        let near_selection = selection_after(&mut server, &mut stream);
-        assert!(
-            near_selection.len() > 1,
-            "the near view selected several tiles"
-        );
-
-        stream
-            .send(ClientMessage::ViewerState {
-                views: vec![far_view()],
-                generation: 0,
-            })
-            .expect("send");
-        let (_, evicted) = settle(&mut server, &mut stream).expect("far view settles");
-
-        let lost: Vec<_> = evicted
-            .iter()
-            .filter(|t| near_selection.contains(t))
-            .collect();
-        assert!(
-            lost.is_empty(),
-            "the camera moved once and already lost {lost:?} from where it came"
-        );
-    }
-
-    /// Drives one view to quiescence and reports what it settled on.
-    fn selection_after(
-        server: &mut Pin<Box<impl Future<Output = ()>>>,
-        stream: &mut InProcessStream,
-    ) -> HashSet<TileId> {
-        const MAX_STEPS: usize = 2_000;
-        let waker = futures_util::task::noop_waker();
-        let mut cx = std::task::Context::from_waker(&waker);
-        let mut selection = HashSet::new();
-        let mut quiet = 0;
-        for _ in 0..MAX_STEPS {
-            let _ = server.as_mut().poll(&mut cx);
-            let mut got = false;
-            while let Poll::Ready(Some(msg)) = stream.poll_message(&mut cx) {
-                got = true;
-                if let ServerMessage::Select { tiles, .. } = msg {
-                    selection = tiles.iter().map(|(t, _)| *t).collect();
-                }
-            }
-            quiet = if got { 0 } else { quiet + 1 };
-            if quiet > 8 {
-                break;
-            }
-        }
-        selection
-    }
-
-    /// A loader that refuses to serve the same tile past a sane number of
-    /// times.
-    ///
-    /// The failure this guards against is a livelock, and a livelock here does
-    /// not fail a test on its own. `settle` gives up after a fixed number of
-    /// steps and returns whatever it saw, so a server reloading the same tile
-    /// for ever looks, from the outside, exactly like one that finished: the
-    /// selection is right, the eviction counts are plausible, and nothing
-    /// asserts. It is only visible against the network, which a test does not
-    /// have. Counting loads is what turns it into an assertion — and the count
-    /// has to be per tile, since the totals alone stay unremarkable.
-    struct CountingLoader {
-        inner: Arc<dyn TileLoader>,
-        counts: Arc<Mutex<HashMap<TileId, usize>>>,
-    }
-
-    /// Generous: a tile may legitimately be loaded again after the camera has
-    /// genuinely left and come back. Nothing converging comes near this.
-    const SANE_RELOADS: usize = 20;
-
-    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
-    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
-    impl TileLoader for CountingLoader {
-        async fn load(&self, tile: TileId) -> Result<Loaded, LoadError> {
-            let seen = {
-                let mut counts = self.counts.lock().expect("counts");
-                let seen = counts.entry(tile).or_insert(0);
-                *seen += 1;
-                *seen
-            };
-            assert!(
-                seen <= SANE_RELOADS,
-                "{tile:?} has been loaded {seen} times: the server is expiring \
-                 content it is about to ask for again"
-            );
-            self.inner.load(tile).await
-        }
-    }
-
-    /// Expiry must not reclaim what the current camera position still needs.
-    ///
-    /// One camera position takes many passes to settle, and a tile that has just
-    /// arrived is often selected by none of them — `forbid_holes` draws its
-    /// parent until all four siblings are ready. It is then resident, not
-    /// selected, and no longer requested. Recording only the newest pass's needs
-    /// drops it from the sole generation that ever named it; expiry takes it;
-    /// the next pass asks for it again. Nothing converges, and because the loads
-    /// resolve inside the same poll, nothing yields either.
-    #[test]
-    fn a_still_camera_does_not_expire_what_it_is_about_to_ask_for() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let url = write_deep_fixture(dir.path());
-        let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
-        let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
-
-        let arena = Arc::new(RwLock::new(tileset));
-        let tree: Box<dyn TileTree> = Box::new(TilesetTree::new(Arc::clone(&arena)));
-        let counts = Arc::new(Mutex::new(HashMap::new()));
-        let loader: Arc<dyn TileLoader> = Arc::new(CountingLoader {
-            inner: Arc::new(TilesetLoader::new(arena, Arc::new(FsFetcher))),
-            counts: Arc::clone(&counts),
-        });
-
-        // A cap low enough that the LRU must evict while the view is still
-        // filling in — the configuration in which a reload cycle is easiest to
-        // close, since eviction and loading are then happening at once.
-        let config = Config {
-            resident_tile_limit: 3,
-            // The fixture is three levels deep, so the default pinned floor
-            // would cover all of it and nothing could ever be reclaimed. The
-            // pin is a production guarantee, not a property under test here.
-            pinned_level: None,
-            ..Config::default()
-        };
-        let (mut stream, server) = in_process_with(tree, loader, config);
-        let mut server = Box::pin(server.run());
-
-        stream
-            .send(ClientMessage::ViewerState {
-                views: vec![near_view()],
-                generation: 0,
-            })
-            .expect("send");
-        settle(&mut server, &mut stream).expect("a still camera settles");
-
-        let counts = counts.lock().expect("counts");
-        assert!(!counts.is_empty(), "the near view loaded something");
-        for (tile, seen) in counts.iter() {
-            assert_eq!(
-                *seen, 1,
-                "{tile:?} was loaded {seen} times for one camera position"
-            );
-        }
-    }
-
-    /// A camera going back and forth over a cache too small for both views has
-    /// to converge, not oscillate. Each move evicts what the other view wanted;
-    /// the guarantee is that every pass still reaches quiescence rather than
-    /// evicting and reloading inside a single traversal.
-    #[test]
-    fn a_camera_moving_back_and_forth_converges() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let url = write_deep_fixture(dir.path());
-        let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
-        let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
-
-        let config = Config {
-            resident_tile_limit: 2,
-            // The fixture is three levels deep, so the default pinned floor
-            // would cover all of it and nothing could ever be reclaimed. The
-            // pin is a production guarantee, not a property under test here.
-            pinned_level: None,
-            ..Config::default()
-        };
-        let (mut stream, server) = in_process(tileset, Arc::new(FsFetcher), config);
-        let mut server = Box::pin(server.run());
-
-        for view in [near_view(), far_view(), near_view(), far_view()] {
-            stream
-                .send(ClientMessage::ViewerState {
-                    views: vec![view],
-                    generation: 0,
-                })
-                .expect("send");
-            settle(&mut server, &mut stream).expect("settles");
-        }
-    }
-
-    /// The cap is what bounds a session: park the camera somewhere that needs
-    /// fewer tiles than it holds, and the ones it left must be reclaimed.
-    #[test]
-    fn tiles_left_behind_by_the_camera_are_evicted() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let url = write_deep_fixture(dir.path());
-        let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
-        let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
-
-        // Room for a working set, not for the whole tree: the tiles the camera
-        // leaves behind are what has to go. The count is the ceiling that
-        // matters — the fixture's tiles are 3-vertex triangles, so no plausible
-        // byte budget would ever separate them.
-        let config = Config {
-            resident_tile_limit: 3,
-            // The fixture is three levels deep, so the default pinned floor
-            // would cover all of it and nothing could ever be reclaimed. The
-            // pin is a production guarantee, not a property under test here.
-            pinned_level: None,
-            ..Config::default()
-        };
-        let (mut stream, server) = in_process(tileset, Arc::new(FsFetcher), config);
-        let mut server = Box::pin(server.run());
-
-        stream
-            .send(ClientMessage::ViewerState {
-                views: vec![near_view()],
-                generation: 0,
-            })
-            .expect("send");
-        let (loaded, _) = settle(&mut server, &mut stream).expect("first view settles");
-        assert!(
-            loaded > 1,
-            "the near view loaded several tiles (got {loaded})"
-        );
-
-        // Pull far back and stay there. The far view needs fewer tiles than the
-        // near one did, so what it stops selecting stops being protected, and
-        // scores lowest for the camera's new distance.
-        let moves = 3;
-        let mut evicted = Vec::new();
-        for _ in 0..moves {
-            stream
-                .send(ClientMessage::ViewerState {
-                    views: vec![far_view()],
-                    generation: 0,
-                })
-                .expect("send");
-            let (_, dropped) = settle(&mut server, &mut stream).expect("far view settles");
-            evicted.extend(dropped);
-        }
-
-        assert!(
-            !evicted.is_empty(),
-            "after {moves} moves away, the tiles left behind were still not reclaimed"
-        );
-    }
-
-    /// Depletion order is by what a tile is worth from where the camera *is*,
-    /// which is both its depth and its distance in one number — its
-    /// screen-space error.
-    ///
-    /// Pull back until the root alone satisfies the error, and the leaves the
-    /// near view pulled in are worth almost nothing while the coarse tiles
-    /// covering the same ground are worth a great deal. So the leaves must go
-    /// first and the coarse tiles last, whatever order they arrived in. Age
-    /// alone gets this backwards on a zoom-out: the root is the *oldest* tile
-    /// in the cache and the leaves are the newest.
-    #[test]
-    fn depletion_takes_the_deepest_tiles_before_the_coarse_ones() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let url = write_deep_fixture(dir.path());
-        let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
-        let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
-
-        // A second view of the same tileset, to read each tile's geometric error
-        // back out — the test must not hard-code which id is a leaf.
-        let reference = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
-        let tree = TilesetTree::new(Arc::new(RwLock::new(reference)));
-        let error_of = |t: TileId| tree.properties(t).geometric_error;
-
-        // Tight enough that the sweep has to cross a level. A cap that only
-        // forces it to drop a couple of leaves proves nothing about order —
-        // every candidate has the same geometric error, and any sweep at all
-        // looks correct.
-        let config = Config {
-            resident_tile_limit: 2,
-            // The fixture is three levels deep, so the default pinned floor
-            // would cover all of it and nothing could ever be reclaimed. The
-            // pin is a production guarantee, not a property under test here.
-            pinned_level: None,
-            ..Config::default()
-        };
-        let (mut stream, server) = in_process(tileset, Arc::new(FsFetcher), config);
-        let mut server = Box::pin(server.run());
-
-        stream
-            .send(ClientMessage::ViewerState {
-                views: vec![near_view()],
-                generation: 0,
-            })
-            .expect("send");
-        settle(&mut server, &mut stream).expect("the near view settles");
-
-        stream
-            .send(ClientMessage::ViewerState {
-                views: vec![far_view()],
-                generation: 0,
-            })
-            .expect("send");
-        let (_, evicted) = settle(&mut server, &mut stream).expect("the far view settles");
-        assert!(!evicted.is_empty(), "pulling back reclaimed nothing at all");
-
-        // Deepest first: a smaller geometric error is a finer tile, and the
-        // sweep must work its way up the pyramid, never down.
-        //
-        // This fixture has three levels and drops a whole level at a time, so
-        // every tile in one sweep tends to share a geometric error and the
-        // ordering here cannot, on its own, tell the weight apart from plain
-        // recency — checked, and it passes either way. It stands as a regression
-        // guard; what proves the weight is
-        // [`the_depletion_weight_rises_with_depth_and_with_distance`].
-        let errors: Vec<f64> = evicted.iter().map(|t| error_of(*t)).collect();
-        for pair in errors.windows(2) {
-            assert!(
-                pair[0] <= pair[1],
-                "the sweep took a coarser tile before a finer one: {errors:?}"
-            );
-        }
     }
 
     fn near_view() -> ViewState {
@@ -3661,163 +2875,5 @@ mod tests {
             dvec2(1024.0, 768.0),
             std::f64::consts::FRAC_PI_3,
         )
-    }
-
-    #[test]
-    fn end_to_end_session_converges_to_leaves() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let url = write_fixture(dir.path());
-        let bytes = std::fs::read(url.to_file_path().expect("path")).expect("read");
-        let tileset = Tileset::from_json_bytes(&bytes, &url).expect("tileset");
-        let root = tileset.root();
-        let leaves = tileset.tile(root).children.clone();
-
-        let (mut stream, server) = in_process(tileset, Arc::new(FsFetcher), Config::default());
-
-        let mut pool = futures_executor::LocalPool::new();
-        pool.spawner().spawn_local(server.run()).expect("spawn");
-
-        let expected: HashSet<TileId> = leaves.iter().copied().collect();
-        let final_selection = pool.run_until(async move {
-            stream
-                .send(ClientMessage::ViewerState {
-                    views: vec![near_view()],
-                    generation: 0,
-                })
-                .expect("send");
-
-            let mut contents: Vec<TileId> = Vec::new();
-            let mut last_select: Vec<(TileId, f64)> = Vec::new();
-            while let Some(msg) = stream.next_message().await {
-                match msg {
-                    ServerMessage::Content { tile, content, .. } => {
-                        assert!(
-                            matches!(content, TileContent::Decoded(_)),
-                            "in-process content is always decoded"
-                        );
-                        contents.push(tile);
-                    }
-                    ServerMessage::Retire { .. } => {}
-                    // Stand-ins are not content: this test counts what actually
-                    // arrived, and folding them in would let it pass on
-                    // approximations.
-                    ServerMessage::Fill { .. } => {}
-                    ServerMessage::Select { tiles, .. } => {
-                        last_select = tiles;
-                        // Steady state: both leaves selected, nothing pending.
-                        let sel: HashSet<TileId> = last_select.iter().map(|(t, _)| *t).collect();
-                        if sel == expected {
-                            break;
-                        }
-                    }
-                    ServerMessage::Error { message, .. } => {
-                        unreachable!("unexpected error: {message}")
-                    }
-                    ServerMessage::Evict { .. } | ServerMessage::Priming(_) => {}
-                }
-            }
-            (contents, last_select)
-        });
-
-        let (contents, selection) = final_selection;
-        let sel: HashSet<TileId> = selection.iter().map(|(t, _)| *t).collect();
-        assert_eq!(sel, leaves.iter().copied().collect::<HashSet<_>>());
-        assert!(!sel.contains(&root), "REPLACE: leaves displaced the root");
-        assert!(
-            contents.len() >= 2,
-            "both leaves must have been decoded (got {contents:?})"
-        );
-    }
-
-    #[test]
-    fn external_tileset_is_grafted_and_its_leaf_rendered() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let glb = crate::content::tests::test_glb();
-        std::fs::create_dir(dir.path().join("sub")).expect("mkdir");
-        std::fs::write(dir.path().join("sub/leaf.glb"), &glb).expect("write");
-        // The external root resolves its content against ITS json, in sub/.
-        std::fs::write(
-            dir.path().join("sub/external.json"),
-            r#"{ "asset": { "version": "1.1" }, "geometricError": 4,
-                 "root": { "boundingVolume": { "sphere": [0,0,0,80] },
-                           "geometricError": 0, "content": { "uri": "leaf.glb" } } }"#,
-        )
-        .expect("write external");
-        let root_json = r#"{
-          "asset": { "version": "1.1" }, "geometricError": 200,
-          "root": { "boundingVolume": { "sphere": [0,0,0,100] },
-                    "geometricError": 0, "refine": "REPLACE",
-                    "content": { "uri": "sub/external.json" } }
-        }"#;
-        let path = dir.path().join("tileset.json");
-        std::fs::write(&path, root_json).expect("write root");
-        let url = Url::from_file_path(&path).expect("url");
-        let tileset = Tileset::from_json_bytes(root_json.as_bytes(), &url).expect("ts");
-
-        let (mut stream, server) = in_process(tileset, Arc::new(FsFetcher), Config::default());
-        let mut pool = futures_executor::LocalPool::new();
-        pool.spawner().spawn_local(server.run()).expect("spawn");
-
-        let saw_content = pool.run_until(async move {
-            stream
-                .send(ClientMessage::ViewerState {
-                    views: vec![near_view()],
-                    generation: 0,
-                })
-                .expect("send");
-            while let Some(msg) = stream.next_message().await {
-                match msg {
-                    // The grafted external leaf must arrive decoded.
-                    ServerMessage::Content { content, .. } => {
-                        return matches!(content, TileContent::Decoded(_));
-                    }
-                    ServerMessage::Error { message, .. } => {
-                        unreachable!("unexpected error: {message}")
-                    }
-                    _ => {}
-                }
-            }
-            false
-        });
-        assert!(saw_content, "external tileset leaf decoded end-to-end");
-    }
-
-    #[test]
-    fn missing_content_reports_error_not_panic() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let tileset_json = r#"{
-          "asset": { "version": "1.1" },
-          "geometricError": 200,
-          "root": {
-            "boundingVolume": { "sphere": [0, 0, 0, 100] },
-            "geometricError": 0,
-            "refine": "REPLACE",
-            "content": { "uri": "missing.glb" }
-          }
-        }"#;
-        let path = dir.path().join("tileset.json");
-        std::fs::write(&path, tileset_json).expect("write");
-        let url = Url::from_file_path(&path).expect("url");
-        let tileset = Tileset::from_json_bytes(tileset_json.as_bytes(), &url).expect("tileset");
-
-        let (mut stream, server) = in_process(tileset, Arc::new(FsFetcher), Config::default());
-        let mut pool = futures_executor::LocalPool::new();
-        pool.spawner().spawn_local(server.run()).expect("spawn");
-
-        let got_error = pool.run_until(async move {
-            stream
-                .send(ClientMessage::ViewerState {
-                    views: vec![near_view()],
-                    generation: 0,
-                })
-                .expect("send");
-            while let Some(msg) = stream.next_message().await {
-                if let ServerMessage::Error { tile, .. } = msg {
-                    return tile.is_some();
-                }
-            }
-            false
-        });
-        assert!(got_error, "fetch failure must surface as a typed Error");
     }
 }

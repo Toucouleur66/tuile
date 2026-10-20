@@ -11,19 +11,20 @@
 //! What it pins down is the loop **as it is**: every arrival is waited on
 //! once, and arrivals that are ready together share one pass — a tile and its
 //! siblings answered from disk land on the same turn, so `arrivals_per_pass`
-//! exceeds one and `traversals` falls below the arrivals. Before arrivals were
-//! coalesced each one bought its own pass (1/1, and traversals = arrivals + 1);
-//! this test is where that change announced itself.
+//! exceeds one. Before arrivals were coalesced each one bought its own pass
+//! (1/1); this test is where that change announced itself.
 
 use std::future::Future;
 use std::sync::Arc;
 use std::task::Poll;
 
 use glam::{dvec2, dvec3};
+use tuile_core::budget::{BudgetConfig, Bytes};
 use tuile_core::fetch::FsFetcher;
 use tuile_core::metrics::metrics;
 use tuile_core::{
-    in_process, ClientMessage, Config, GeometryStream, ServerMessage, Tileset, ViewState,
+    in_process, ClientMessage, Config, GeometryStream, ResourceContent, ServerMessage, Tileset,
+    ViewState,
 };
 use url::Url;
 
@@ -128,11 +129,15 @@ fn near_view() -> ViewState {
 #[test]
 fn every_arrival_is_waited_on_once_and_siblings_share_a_pass() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = Config {
-        pinned_level: None,
-        ..Config::default()
-    };
-    let (mut stream, server) = in_process(tileset(dir.path()), Arc::new(FsFetcher), config);
+    let mut budget = BudgetConfig::interactive(Bytes::mib(256));
+    budget.pinned_level = None;
+    let (mut stream, server) = in_process(
+        tileset(dir.path()),
+        Arc::new(FsFetcher),
+        Config::default(),
+        budget,
+    )
+    .expect("a valid budget");
     let mut server = Box::pin(server.run());
     stream
         .send(ClientMessage::ViewerState {
@@ -151,8 +156,26 @@ fn every_arrival_is_waited_on_once_and_siblings_share_a_pass() {
         let mut got = false;
         while let Poll::Ready(Some(msg)) = stream.poll_message(&mut cx) {
             got = true;
-            if let ServerMessage::Content { .. } = msg {
+            // The consumer: everything delivered is uploaded at once.
+            if let ServerMessage::Content {
+                resource,
+                gen,
+                content,
+                ..
+            } = msg
+            {
                 contents += 1;
+                let bytes = match &content {
+                    ResourceContent::Mesh(m) => m.cost().gpu.0,
+                    ResourceContent::Drape(d) => d.cost().gpu.0,
+                };
+                stream
+                    .send(ClientMessage::Ack {
+                        resource,
+                        gen,
+                        bytes,
+                    })
+                    .expect("ack");
             }
         }
         quiet = if got { 0 } else { quiet + 1 };
@@ -187,8 +210,9 @@ fn every_arrival_is_waited_on_once_and_siblings_share_a_pass() {
         "no pass answered more than one arrival"
     );
 
-    // The passes are those, plus the one the camera asked for.
-    assert_eq!(m.traversals.get(), per_pass.count() + 1);
+    // The passes are those, plus the ones the camera and the acknowledgements
+    // asked for.
+    assert!(m.traversals.get() > per_pass.count());
     assert_eq!(m.traversal_seconds.count(), m.traversals.get());
     // Every pass ends with a Select, and each is timed.
     assert_eq!(m.select_seconds.count(), m.traversals.get());

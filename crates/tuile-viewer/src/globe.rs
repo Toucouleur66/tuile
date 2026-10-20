@@ -17,9 +17,7 @@ use tuile_core::offload::Offload;
 use tuile_core::raster::{CachedImagery, ImageryProvider};
 use tuile_core::source::{TileLoader, TileTree};
 use tuile_core::storage::ContentStore;
-use tuile_planetary::{
-    globe_on, GlobeOptions, Held, ImageryDetail, LayerBudget, Sources, SwitchableImagery,
-};
+use tuile_planetary::{globe_on, GlobeOptions, Held, LayerBudget, Sources, SwitchableImagery};
 use tuile_terrain::{CachedTerrain, TerrainSource};
 
 use crate::embed::{ImageryChoice, TerrainChoice};
@@ -28,7 +26,6 @@ use crate::embed::{ImageryChoice, TerrainChoice};
 pub(crate) struct Globe {
     pub tree: Box<dyn TileTree>,
     pub loader: Arc<dyn TileLoader>,
-    pub detail: ImageryDetail,
     /// The relief the camera stands on. A page records its own from the
     /// content it is sent, on the other side of the worker.
     #[cfg(not(target_arch = "wasm32"))]
@@ -183,15 +180,13 @@ pub(crate) async fn assemble(
         }),
         ..Default::default()
     };
-    let (tree, loader, detail, heights) =
-        globe_on(Held(ground), switch.clone(), layer, opts, decode);
+    let (tree, loader, heights) = globe_on(Held(ground), switch.clone(), layer, opts, decode);
     // The worker's relief stays in the worker: the page keeps its own.
     #[cfg(target_arch = "wasm32")]
     drop(heights);
     Ok(Globe {
         tree,
         loader,
-        detail,
         #[cfg(not(target_arch = "wasm32"))]
         heights,
         budget,

@@ -9,22 +9,32 @@
 //!   in poll form; consumers `.await` messages.
 //! - **Sending is synchronous and non-blocking** — `send` is called from
 //!   render loops (a `ViewerState` per frame) which must never await.
-//! - Consumer-side `Content` is always [`TileContent::Decoded`]; raw glb is
-//!   what network bindings put on the wire (M2).
+//! - Consumer-side `Content` is decoded ([`ResourceContent`]): a mesh or a
+//!   drape, each a resource of its own; raw glb is what network bindings put
+//!   on the wire (M2).
 //!
 //! Bindings: [`InProcessStream`] here (channels, zero serialization); the
 //! WebSocket binding lives in `tuile-server`/clients (M2). The static HTTP
 //! mode is this same in-process binding running over an HTTP fetcher.
 
-use crate::content::TileContent;
+use crate::budget::{
+    Bytes, Class, DrawSet, Generation, PerClass, Pressure, ResourceId, Thermal, UploadPlan,
+};
+use crate::content::{DecodedTileContent, DrapeContent};
 use crate::source::TileId;
 use crate::traversal::{TraversalStats, ViewState};
 use futures_channel::mpsc;
 use futures_core::Stream;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 /// Consumer → geometry server.
+///
+/// Everything the graphics budget hears from the consumer and the platform
+/// travels here, in order with the acknowledgements, so a session replays:
+/// the views, what reached the GPU and with how many bytes, what could not,
+/// and the platform's memory and thermal signals.
 #[derive(Debug, Clone)]
 pub enum ClientMessage {
     /// Camera update; one [`ViewState`] per view (stereo = two).
@@ -39,17 +49,34 @@ pub enum ClientMessage {
         /// heuristic. Interactive hosts may send 0 and never look.
         generation: u64,
     },
-    /// The consumer materialized this tile (GPU upload done).
-    Ack { tile: TileId },
-    /// The consumer no longer wants this in-flight tile.
-    Cancel { tile: TileId },
-    /// If the residency holds more than `budget_bytes`, let go, once, of all
-    /// of it but what the current views select, their ancestors and what
-    /// they wait on. For a consumer that gathers a frame exactly, with no
-    /// budget while it converges, and bounds what frames leave behind
-    /// between them. The tiles let go are announced with
-    /// [`ServerMessage::Evict`] as any others.
-    Trim { budget_bytes: usize },
+    /// The consumer uploaded `resource` of generation `gen`: it is on the
+    /// GPU and drawable, and holds `bytes` there — the actual bytes, which
+    /// replace the budget's estimate in its ledger.
+    Ack {
+        resource: ResourceId,
+        gen: Generation,
+        bytes: u64,
+    },
+    /// The consumer dropped a delivered resource without uploading it (an
+    /// upload that failed, or that would have crossed its class's hard
+    /// limit). It stays undrawn and is delivered again later.
+    Discarded {
+        resource: ResourceId,
+        gen: Generation,
+    },
+    /// The platform's memory signal: a warning, a critical warning, the
+    /// background, or back to normal.
+    Pressure(Pressure),
+    /// The platform's thermal state.
+    Thermal(Thermal),
+    /// The memory this session may use changed (the device's available
+    /// memory, a browser's report, a remote consumer's declaration): every
+    /// class's target, overflow and hard limit follow.
+    Retarget { total_bytes: u64 },
+    /// Batch, between frames: let go of GPU copies the last step did not need
+    /// until the GPU holds at most `bytes`. Deterministic; announced with
+    /// [`ServerMessage::Evict`].
+    ReleaseBeyond { bytes: u64 },
 }
 
 /// What the tree knows about a tile, travelling with every message that names
@@ -66,9 +93,7 @@ pub enum ClientMessage {
 ///
 /// So a consumer cannot answer "how deep is this tile" or "what is its parent"
 /// by looking at the handle. It tried anyway — by shifting the bits — and got 0
-/// for every arena index, which meant a 3D Tiles session had **no fallback
-/// chain at all**: the walk in the consumer climbed, found nothing, and counted
-/// every unready tile as lost. Lost is the black square.
+/// for every arena index.
 ///
 /// [`TileTree`]: crate::source::TileTree
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,121 +101,96 @@ pub struct Ancestry {
     /// Depth in the tree, roots at 0. See [`crate::source::TileTree::level`].
     pub level: u32,
     /// The tile one level up, or `None` at a root.
-    ///
-    /// One step, not the whole chain: a chain per tile would be the same
-    /// ancestors repeated across every message. The consumer accumulates the
-    /// links instead, and every tile it is ever handed contributes its own — so
-    /// a walk climbs as far as the server has actually told it about, which is
-    /// exactly as far as it can usefully go.
     pub parent: Option<TileId>,
 }
 
+/// The content of one resource: a tile's mesh, or a tile's drape (D-A2).
+///
+/// Shared rather than owned: the server keeps the decoded copy for as long as
+/// its budget does (the decoded tier), so a resource evicted from the GPU and
+/// wanted again is delivered again without a fetch or a decode.
+#[derive(Debug, Clone)]
+pub enum ResourceContent {
+    /// A tile's geometry (and the textures it owns), never draped.
+    Mesh(Arc<DecodedTileContent>),
+    /// A tile's imagery of one layer at one level, its own resource: a tile's
+    /// imagery changes without resending its mesh.
+    Drape(Arc<DrapeContent>),
+}
+
 /// Geometry server → consumer.
+///
+/// The consumer is the budget's executor: it uploads what is delivered in
+/// the plan's order within its frame's deadline, acknowledges each upload
+/// with its bytes, draws the draw set and drops what is evicted after the
+/// draw that stops using it.
 #[derive(Debug, Clone)]
 pub enum ServerMessage {
-    /// Full selection for the current viewer state (tile + current SSE), plus
-    /// traversal stats for overlays.
+    /// One decision step: what to draw, in what order to upload, and the
+    /// shape of the tree around it.
     Select {
-        tiles: Vec<(TileId, f64)>,
-        /// The shape of the tree around this selection: every tile named above,
-        /// **and every ancestor of one**, with what the tree says about it.
-        ///
-        /// The closure, not one link per selected tile. A consumer that lacks a
-        /// tile climbs to the nearest ancestor it holds, and that climb passes
-        /// *through* tiles it holds nothing for and has never been told about —
-        /// so a single parent link per selection breaks the chain at the first
-        /// such tile and the walk reports the ground as lost, which is the black
-        /// square. Measured with exactly that shape:
-        /// `ground_under_the_camera_is_never_black` went to 100 % black.
-        ///
-        /// The server already materialises this set every traversal — it is what
-        /// it protects from eviction — so sending it costs a walk of a set it
-        /// has in hand, and roughly doubles a message that was already one entry
-        /// per selected tile.
+        /// Every drawn mesh with its role and the drapes it wears, built
+        /// from acknowledged resources only: drawable by construction. Apply
+        /// it before the step's [`ServerMessage::Evict`] — new before old.
+        draw: DrawSet,
+        /// The uploads this step plans, in priority order, with their swap
+        /// groups.
+        plan: UploadPlan,
+        /// The shape of the tree around this draw set: every tile it names
+        /// and every ancestor of one, with what the tree says about it.
         ancestry: Vec<(TileId, Ancestry)>,
         stats: TraversalStats,
-        /// The [`ClientMessage::ViewerState::generation`] these tiles answer.
+        /// Each class's effective hard limit, which the consumer never
+        /// crosses: an upload that would is refused with
+        /// [`ClientMessage::Discarded`].
+        hard_limit: PerClass<Bytes>,
+        /// Batch: every mesh and drape the frame needs is drawable, exactly.
+        frame_ready: bool,
+        /// Every wanted tile is drawn exactly, wearing the drapes it needs,
+        /// with no work left for the view (I3).
+        converged: bool,
+        /// Wanted tiles the draw set covers with nothing (must be 0 once the
+        /// floor is in, I1): ground left black.
+        lost: u32,
+        /// Drawn items that do not wear every layer they need (must be 0,
+        /// I1 as D-A1 extends it): ground left bare.
+        bare: u32,
+        /// The [`ClientMessage::ViewerState::generation`] this answers.
         generation: u64,
     },
-    /// Content for a tile. Always `Decoded` on the consumer side.
-    ///
-    /// Carries its own [`Ancestry`] rather than leaning on a preceding
-    /// `Select`, because not every tile that gets content is selected: the
-    /// coarse pyramid is **requested, not selected** — it is the floor every
-    /// fallback lands on — so a consumer that learned levels only from
-    /// selections would hold the whole pyramid and be unable to say what any of
-    /// it was.
-    ///
-    /// Sent once when a tile becomes resident — and **again, under the same
-    /// id, when the server refreshes it**: the loader's content changed
-    /// ([`TileLoader::epoch`](crate::source::TileLoader::epoch)) and this is
-    /// the new version of a tile the consumer already holds. A consumer
-    /// replaces in place, and in this order: build the new surface, file it
-    /// under the id, and only then release the one it displaces. There is no
-    /// `Evict` between the two and there must be no frame between them either.
+    /// A resource's decoded content, to upload. Carries its own
+    /// [`Ancestry`] because not every resource delivered is drawn: the floor
+    /// is loaded before anything stands on it.
     Content {
-        tile: TileId,
+        resource: ResourceId,
+        gen: Generation,
+        /// The class it is charged to.
+        class: Class,
         ancestry: Ancestry,
-        content: TileContent,
+        content: ResourceContent,
     },
-    /// A **stand-in** surface for a tile the consumer has not got yet.
-    ///
-    /// Its own variant rather than a flag on [`ServerMessage::Content`], for two
-    /// reasons. A consumer must be able to *refuse* it — a stand-in racing the
-    /// real content it was covering for would otherwise overwrite it, since both
-    /// are filed under the same tile — and a variant makes that decision
-    /// unavoidable at the match rather than optional at a boolean. And a backend
-    /// that would rather draw an ancestor can ignore the message entirely and
-    /// lose nothing but sharpness.
-    ///
-    /// Occupies exactly the tile's own rectangle, which is the point: the
-    /// alternative, drawing the nearest ready ancestor, also covers the siblings
-    /// that did arrive, and two surfaces over one patch of ground fight in the
-    /// depth buffer.
-    Fill {
-        tile: TileId,
-        ancestry: Ancestry,
-        content: crate::content::DecodedTileContent,
+    /// Delivered, not yet uploaded: drop it (its generation, so a later
+    /// delivery of the same resource is kept).
+    Cancel {
+        resources: Vec<(ResourceId, Generation)>,
     },
-    /// These tiles left residency; release their resources.
-    ///
-    /// **Everything** goes: the prepared surface, and any copy still waiting in
-    /// the consumer's upload queue. That totality is correct here — the server
-    /// dropped the tile from its own residency and will re-request and re-send
-    /// it when the ground is next needed — and it is exactly why this message
-    /// must never be used to take back a stand-in: see [`ServerMessage::Retire`].
-    Evict { tiles: Vec<TileId> },
-    /// Take back the **stand-ins** for these tiles, and nothing else.
-    ///
-    /// Its own variant for the same reason [`ServerMessage::Fill`] is one: the
-    /// two acts that were folded into [`ServerMessage::Evict`] have different
-    /// blast radii, and the consumer cannot tell them apart from the message.
-    /// `Content` is sent **once** per residency — the server marks the tile
-    /// resident and never re-sends — so an `Evict` that reaches a consumer
-    /// whose real copy is still in its upload queue destroys the only delivery
-    /// there will ever be. The ground then wears its stand-in for as long as
-    /// the server's cache holds the tile: measured at 1853 tiles taken back in
-    /// one flight, 232 of them re-issued a stand-in immediately after, coarse
-    /// with nothing loading and nothing failed.
-    ///
-    /// A consumer honours this by dropping only what it holds **as a
-    /// stand-in** — surfaces flagged as fills, queued fill uploads — and never
-    /// touching real content, prepared or queued. A tile it does not hold as a
-    /// stand-in is a no-op, which makes the message safe to send on stale
-    /// knowledge.
-    Retire { tiles: Vec<TileId> },
-    /// Non-fatal failure (a tile failed to fetch or decode).
+    /// These GPU copies leave: release them, after the draw of the step
+    /// that announced them — which no longer uses them.
+    Evict { resources: Vec<ResourceId> },
+    /// A failure: a resource that could not be loaded (the budget retries it
+    /// interactively), or the reason a batch session ends.
     Error {
-        tile: Option<TileId>,
+        resource: Option<ResourceId>,
         message: String,
     },
-    /// How the coarse pyramid is going. Sent whenever the count changes, so a
-    /// host holding its first frame back learns the shape of the wait on the
-    /// session's first pass and every change after it.
+    /// How the floor is going. Sent whenever the count changes, so a host
+    /// holding its first frame back learns the shape of the wait on the
+    /// session's first step and every change after it.
     Priming(Priming),
 }
 
-/// The state of the coarse pyramid a session primes at startup.
+/// The state of the floor a session loads first: the pinned levels, mesh
+/// and drape, that every fallback lands on.
 ///
 /// A host that holds its first frame back until the pyramid is on the GPU needs
 /// a condition it can actually **reach**, and "every primed tile is on the GPU"
@@ -314,16 +314,28 @@ mod tests {
     #[test]
     fn in_process_round_trip_and_close() {
         let (mut client, mut server) = in_process_pair();
+        let mesh = ResourceId::Mesh(TileId(7));
         client
-            .send(ClientMessage::Ack { tile: TileId(7) })
+            .send(ClientMessage::Ack {
+                resource: mesh,
+                gen: Generation(3),
+                bytes: 1024,
+            })
             .expect("send");
         let got = server.rx.try_recv().expect("recv");
-        assert!(matches!(got, ClientMessage::Ack { tile: TileId(7) }));
+        assert!(matches!(
+            got,
+            ClientMessage::Ack {
+                resource,
+                gen: Generation(3),
+                bytes: 1024,
+            } if resource == mesh
+        ));
 
         server
             .tx
             .unbounded_send(ServerMessage::Evict {
-                tiles: vec![TileId(7)],
+                resources: vec![mesh],
             })
             .expect("send");
         let msg = client.next_message().now_or_never().expect("ready");
@@ -336,7 +348,10 @@ mod tests {
             .expect("ready")
             .is_none());
         assert!(client
-            .send(ClientMessage::Cancel { tile: TileId(1) })
+            .send(ClientMessage::Discarded {
+                resource: mesh,
+                gen: Generation(3),
+            })
             .is_err());
     }
 }

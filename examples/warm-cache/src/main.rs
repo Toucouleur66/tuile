@@ -91,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
     // something nobody will read.
     let store = Arc::new(FoyerStore::shared(&tuile_bing::cache_name(&style)).await?);
     let shared = Arc::clone(&store) as Arc<dyn ContentStore>;
-    let (_tree, loader, _detail, _heights) = globe_on(
+    let (_tree, loader, _heights) = globe_on(
         CachedTerrain::new(terrain, Arc::clone(&shared), "ion-cwt"),
         CachedImagery::new(bing, shared, tuile_bing::cache_namespace(&style)),
         layer,

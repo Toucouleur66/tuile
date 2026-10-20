@@ -50,6 +50,7 @@ const SUMMARY_EVERY: Duration = Duration::from_secs(10);
 
 thread_local! {
     static POOL: RefCell<Option<Pool>> = const { RefCell::new(None) };
+    static RANKS: RefCell<Option<tuile_core::offload::LoadRanks>> = const { RefCell::new(None) };
     static STATS: RefCell<Stats> = RefCell::new(Stats::new());
 }
 
@@ -97,6 +98,7 @@ impl Remote for WebDecode {
                 input,
                 reply,
                 asked: started,
+                load: tuile_core::offload::loading(),
             };
             match pool.schedule.submit(job) {
                 Ok(Some(dispatch)) => pool.dispatch(dispatch),
@@ -200,12 +202,35 @@ struct Pending {
     input: Vec<u8>,
     reply: Reply,
     asked: Instant,
+    /// The load waiting on it, named when it was submitted
+    /// (`tuile_core::offload::loading`).
+    load: Option<tuile_core::budget::ResourceId>,
 }
 
 impl Queued for Pending {
     fn wanted(&self) -> bool {
         self.reply.wanted()
     }
+
+    /// The load's rank in the session's latest step: see [`follow`].
+    fn rank(&self) -> u32 {
+        let Some(load) = self.load else {
+            return u32::MAX;
+        };
+        RANKS.with(|r| {
+            r.borrow()
+                .as_ref()
+                .and_then(|ranks| ranks.rank(load))
+                .unwrap_or(u32::MAX)
+        })
+    }
+}
+
+/// Orders the pool's queue by the session's ranks of its loads in flight:
+/// the decoding a load the camera now looks at waits on goes before the
+/// decoding of one it has left.
+pub(crate) fn follow(ranks: tuile_core::offload::LoadRanks) {
+    RANKS.with(|r| *r.borrow_mut() = Some(ranks));
 }
 
 /// What a worker is running.

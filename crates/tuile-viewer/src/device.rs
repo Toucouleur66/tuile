@@ -51,7 +51,7 @@ mod system {
     use crate::profile::{DeviceMemory, Pressure, Thermal};
 
     pub(super) fn pressure() -> (u64, Pressure) {
-        (0, Pressure::Nominal)
+        (0, Pressure::Normal)
     }
 
     extern "C" {
@@ -126,16 +126,41 @@ mod system {
     use crate::profile::{Pressure, Thermal};
 
     pub(super) fn pressure() -> (u64, Pressure) {
-        (0, Pressure::Nominal)
+        (0, Pressure::Normal)
+    }
+
+    /// The machine's memory: what the desktop's budget is a share of. Asked
+    /// of the system once, without `unsafe` — `sysctl` on a Mac, the kernel's
+    /// `/proc/meminfo` on Linux — and eight gibibytes when neither answers.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn memory() -> crate::profile::DeviceMemory {
+        static PHYSICAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let physical = *PHYSICAL.get_or_init(|| physical().unwrap_or(8 << 30));
+        crate::profile::DeviceMemory {
+            physical,
+            available: None,
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub(super) fn memory() -> crate::profile::DeviceMemory {
-        crate::profile::DeviceMemory {
-            // Unused off a phone, where the profile is not sized from memory.
-            physical: 8 << 30,
-            available: None,
+    fn physical() -> Option<u64> {
+        if cfg!(target_os = "macos") {
+            let out = std::process::Command::new("/usr/sbin/sysctl")
+                .args(["-n", "hw.memsize"])
+                .output()
+                .ok()?;
+            return String::from_utf8_lossy(&out.stdout).trim().parse().ok();
         }
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let kib: u64 = meminfo
+            .lines()
+            .find_map(|l| l.strip_prefix("MemTotal:"))?
+            .trim()
+            .trim_end_matches("kB")
+            .trim()
+            .parse()
+            .ok()?;
+        Some(kib * 1024)
     }
 
     pub(super) fn thermal() -> Thermal {

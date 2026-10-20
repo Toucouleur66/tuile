@@ -383,12 +383,14 @@ pub unsafe extern "C" fn tuile_session_frame(
 
         let views: Vec<ViewStateParams> = views
             .iter()
-            .map(|v| ViewStateParams {
-                position: DVec3::from_array(v.position),
-                direction: DVec3::from_array(v.direction),
-                up: DVec3::from_array(v.up),
-                viewport_px: DVec2::from_array(v.viewport_px),
-                fovy_rad: v.fovy_rad,
+            .map(|v| {
+                ViewStateParams::perspective(
+                    DVec3::from_array(v.position),
+                    DVec3::from_array(v.direction),
+                    DVec3::from_array(v.up),
+                    DVec2::from_array(v.viewport_px),
+                    v.fovy_rad,
+                )
             })
             .collect();
 

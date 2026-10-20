@@ -20,7 +20,7 @@ use tuile_bing::{BingImageryProvider, BingMetadata};
 use tuile_cesium_ion::{tms::TmsImagery, AssetEndpoint, IonClient, IonTerrainSource};
 use tuile_core::offload;
 use tuile_native_fetchers::{NativeHttp, RetryConfig, TransportConfig};
-use tuile_planetary::{globe_with_provenance, GlobeOptions, Held, ImageryDetail, LayerBudget};
+use tuile_planetary::{globe_with_provenance, GlobeOptions, Held, LayerBudget};
 
 /// Where a globe's tiles come from, when the host brings its own sources:
 /// defined beside the crossing it feeds, and re-exported here because this is
@@ -43,15 +43,6 @@ fn decode_pool() -> Arc<dyn offload::Offload> {
     Arc::new(offload::ThreadPool::with_threads(threads))
 }
 
-/// How many levels finer than the terrain the baked imagery may go.
-///
-/// Default +1, and that number is a MEMORY decision as much as a sharpness
-/// one: each extra level quadruples the imagery held per terrain tile (+4
-/// run locally ballooned to 60 GB allocated on a frame that never
-/// converged; measured the hard way). `TUILE_IMAGERY_BOOST=0` disables the
-/// boost outright — imagery exactly matches the terrain level — and a farm
-/// job raises it to taste, where the RAM is real. Whatever the value, it
-/// stays proportional per tile: one imagery level per terrain level, the
 /// How deep the quadtree may divide, from `TUILE_MAX_LEVEL`.
 ///
 /// Unset means "as deep as the imagery provider goes", which is the right
@@ -63,24 +54,6 @@ fn max_level() -> Option<u32> {
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .filter(|level| *level > 0)
-}
-
-/// checkerboard's cure.
-///
-/// Publique parce que le digest de scène doit la lire.
-///
-/// Ce plafond décide de combien de niveaux l'imagerie descend sous le terrain,
-/// donc il décide du CONTENU d'un pack. Il n'entrait pourtant pas dans le
-/// digest : mesuré le 17 septembre 2026, deux cuissons de la même trajectoire
-/// à boost 1 et boost 2 portaient le même nom de scène, `9fb2b0f3559debc6`, et
-/// se seraient donc répondu l'une pour l'autre. Il n'est pas lu par
-/// `exact_traversal` — c'est une option du chargeur, pas de la traversée — donc
-/// il fallait aller le chercher ici.
-pub fn imagery_boost_cap() -> u32 {
-    std::env::var("TUILE_IMAGERY_BOOST")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(1)
 }
 
 /// ion's asset id for Cesium World Terrain.
@@ -225,15 +198,15 @@ impl Session {
         // Sources resolve on the session's own runtime rather than a temporary
         // one, so the connection pool and cache that serve this call are the
         // same ones that will serve every tile afterwards.
-        let (tree, loader, detail, heights, provenance) = runtime.block_on(resolve(&config))?;
+        let (tree, loader, heights, provenance) = runtime.block_on(resolve(&config))?;
 
         let mut session_config = config.session.clone();
         session_config.dataset = config.dataset_name();
+        // Each tile's drape is loaded at the level the budget asks of it —
+        // the views' own texel footprint over that tile, not the terrain's
+        // level — so exposure seams between imagery capture batches do not
+        // line up with terrain level boundaries.
         let mut session = Session::from_parts(runtime, tree, loader, session_config)?;
-        // The session drives imagery resolution from the camera each frame —
-        // decoupled from terrain LOD, so exposure seams between imagery
-        // capture batches stop lining up with terrain level boundaries.
-        session.set_imagery_detail(detail);
         session.set_heights(heights);
         // What each tile is made from, for a pack that refers to the tile
         // store instead of — or beside — carrying the tiles.
@@ -404,7 +377,6 @@ async fn resolve(
     (
         Box<dyn tuile_core::source::TileTree>,
         Arc<dyn tuile_core::source::TileLoader>,
-        ImageryDetail,
         Arc<tuile_terrain::TerrainHeights>,
         Arc<tuile_planetary::Provenance>,
     ),
@@ -442,7 +414,6 @@ async fn resolve(
             no_imagery,
             max_level: max_level(),
             imagery_slots: imagery_slots.clone(),
-            imagery_boost_cap: imagery_boost_cap(),
             deterministic_floor: true,
             held_drape: config.held_drape.clone(),
             composed_at: config.session.bake_max_size,
@@ -498,7 +469,7 @@ async fn resolve(
         // thread polling the server, and `globe()`'s inline offload would put
         // every tile's decode on that same thread — measured at sixty-four
         // loads in flight and one core busy.
-        let (tree, loader, detail, heights, provenance) = globe_with_provenance(
+        let (tree, loader, heights, provenance) = globe_with_provenance(
             terrain,
             NoImagery,
             layer,
@@ -506,7 +477,6 @@ async fn resolve(
                 no_imagery: true,
                 max_level: max_level(),
                 imagery_slots: imagery_slots.clone(),
-                imagery_boost_cap: imagery_boost_cap(),
                 deterministic_floor: true,
                 held_drape: config.held_drape.clone(),
                 composed_at: config.session.bake_max_size,
@@ -514,7 +484,7 @@ async fn resolve(
             },
             decode_pool(),
         );
-        return Ok((tree, loader, detail, heights, provenance));
+        return Ok((tree, loader, heights, provenance));
     };
 
     // An imagery of the host's over ion's terrain: asked of it, as a
@@ -534,7 +504,6 @@ async fn resolve(
             no_imagery: false,
             max_level: max_level(),
             imagery_slots,
-            imagery_boost_cap: imagery_boost_cap(),
             deterministic_floor: true,
             held_drape: config.held_drape.clone(),
             composed_at: config.session.bake_max_size,
@@ -563,7 +532,6 @@ async fn resolve(
         no_imagery: false,
         max_level: max_level(),
         imagery_slots,
-        imagery_boost_cap: imagery_boost_cap(),
         // On, and not a knob. Everything else in this crate is exact by
         // construction — `exact_traversal` refuses stand-ins and forbids
         // holes for the same reason — and a coarse layer chosen from
@@ -585,7 +553,7 @@ async fn resolve(
     // un asset qui n'est pas Bing. `externalType` absent veut dire
     // TileMapService, exactement la branche par défaut de cesium-native
     // (`IonRasterOverlay.cpp`, le `else` après `BING`).
-    let (tree, loader, detail, heights, provenance) = match endpoint.external_type.as_deref() {
+    let (tree, loader, heights, provenance) = match endpoint.external_type.as_deref() {
         None => {
             let tms = TmsImagery::from_endpoint(ion, imagery_asset_id as u64, endpoint)
                 .await
@@ -625,7 +593,7 @@ async fn resolve(
             })
         }
     };
-    Ok((tree, loader, detail, heights, provenance))
+    Ok((tree, loader, heights, provenance))
 }
 
 /// An imagery asset, opened and not yet asked for a tile: what it is, as

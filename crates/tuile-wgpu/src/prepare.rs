@@ -4,12 +4,20 @@
 //! Decoded content → GPU resources. This is the crate's implementation of
 //! the core's `PrepareRenderResources` contract: the core decodes, this
 //! materializes.
+//!
+//! A tile's mesh and its drapes are resources of their own (D-A2): a mesh is
+//! uploaded undressed ([`prepare`]), a drape on its own ([`prepare_drape`]),
+//! and a mesh is dressed with the drapes the budget's draw set says it wears
+//! — its own, or an ancestor's through a uv transform — when it is drawn
+//! ([`PreparedTile::dress`]). Dressing binds the drapes' textures; it uploads
+//! nothing.
 
 use crate::context::{GpuContext, GpuImagery, IMAGERY_BINDING_0, TEXTURE_FORMAT};
 use glam::{DVec3, Mat4, Vec3};
 use std::sync::Arc;
-use tuile_core::content::{DecodedMesh, DecodedTexture, DecodedTileContent};
-use tuile_core::raster;
+use tuile_core::budget::{LayerId, ResourceId, UvTransform};
+use tuile_core::content::{DecodedMesh, DecodedTexture, DecodedTileContent, DrapeContent};
+use tuile_core::raster::{self, ImageryCoord, Placement};
 use wgpu::util::DeviceExt;
 
 /// Bytes per texel in [`TEXTURE_FORMAT`].
@@ -107,25 +115,30 @@ pub struct PreparedTile {
     /// look at it. See [`Self::rebase`].
     rebased_to: std::cell::Cell<DVec3>,
     _textures: Vec<GpuImagery>,
-    /// Imagery this tile drapes, batched into the passes that bind it, held so
-    /// the shared textures and their tables outlive the tile. Which tile holds
-    /// the last reference is what frees the memory.
+    /// The imagery the content carries itself (a loader that drapes its own
+    /// meshes, or a mesh a consumer dressed on the CPU): always worn, under
+    /// whatever drapes the tile is dressed with.
+    own: Vec<DrapedLayer>,
+    /// What this tile wears — its own imagery, then its drapes — batched into
+    /// the passes that bind them, held so the shared textures and their
+    /// tables outlive the dressing.
     _imagery: Vec<ImageryPass>,
+    /// What the tile is dressed with: each drape and the uv transform it is
+    /// worn through. Empty while undressed.
+    dressing: Vec<(ResourceId, [u64; 4])>,
     /// Approximate GPU memory of this tile, bytes — **excluding draped
-    /// imagery**, for the reason [`DecodedTileContent::byte_size`] gives: a
-    /// texture twenty tiles share is not twenty textures. Ask
-    /// `ImageryTextures::live` for that side of the total.
+    /// imagery**, which is its drapes' own (see [`PreparedDrape`]).
     pub gpu_bytes: usize,
-    /// The deepest imagery level draped over this tile, if any — the measure
-    /// of how sharp its ground can look. A tile whose sharpest layer sits
+    /// The deepest imagery level of what the tile wears, if anything — the
+    /// measure of how sharp its ground can look. A tile whose sharpest layer sits
     /// several levels above its own is a smear: one texel stretched over the
     /// whole surface. A recorder gates on the gap; a viewer tolerates it for
     /// the frames the drape needs to catch up.
     pub sharpest_imagery_level: Option<u32>,
-    /// Which imagery set this tile is draped with, when it is draped at all:
-    /// the newest [`source`](tuile_core::raster::ImageryLayer::source) among
-    /// its layers. What a host reads to know how far a switch of imagery has
-    /// crossed the screen.
+    /// Which imagery set this tile is dressed with, when it is dressed at
+    /// all: the newest [`source`](tuile_core::raster::ImageryLayer::source)
+    /// among its layers. What a host reads to know how far a switch of
+    /// imagery has crossed the screen.
     pub imagery_source: Option<u32>,
 }
 
@@ -233,6 +246,71 @@ impl PreparedTile {
         &self.stitching.told
     }
 
+    /// What the tile is dressed with: each drape it wears and the bits of the
+    /// uv transform it is worn through.
+    pub fn dressing(&self) -> &[(ResourceId, [u64; 4])] {
+        &self.dressing
+    }
+
+    /// Whether the tile wears `drape`.
+    pub fn wears(&self, drape: ResourceId) -> bool {
+        self.dressing.iter().any(|(r, _)| *r == drape)
+    }
+
+    /// Dresses the tile with `drapes`, each worn through its uv transform:
+    /// the layers of each, placed in this tile's uv square, in stacking
+    /// order. Nothing is uploaded — the drapes' textures are bound — and a
+    /// tile already dressed so is left as it is.
+    pub fn dress(
+        &mut self,
+        gpu: &GpuContext,
+        drapes: &[(ResourceId, &PreparedDrape, UvTransform)],
+    ) {
+        let key: Vec<(ResourceId, [u64; 4])> =
+            drapes.iter().map(|(r, _, uv)| (*r, uv_bits(*uv))).collect();
+        if key == self.dressing && !self._imagery.is_empty() {
+            return;
+        }
+        let mut layers: Vec<(Placement, &Arc<GpuImagery>, ImageryCoord, u32)> = self
+            .own
+            .iter()
+            .map(|l| (l.placement, &l.texture, l.coord, l.source))
+            .collect();
+        for (_, drape, uv) in drapes {
+            for l in &drape.layers {
+                let placed = if *uv == UvTransform::IDENTITY {
+                    Some(l.placement)
+                } else {
+                    l.placement.through(*uv)
+                };
+                if let Some(p) = placed {
+                    layers.push((p, &l.texture, l.coord, l.source));
+                }
+            }
+        }
+        self.sharpest_imagery_level = layers.iter().map(|(_, _, c, _)| c.level).max();
+        self.imagery_source = layers.iter().map(|(_, _, _, s)| *s).max();
+        let passes = passes(gpu, &layers);
+        for (prepared, mesh) in self.meshes.iter_mut().zip(&self.source) {
+            let (bgs, bufs) = materials(gpu, mesh, &self._textures, &passes);
+            prepared.material_bgs = bgs;
+            prepared._material_bufs = bufs;
+        }
+        self._imagery = passes;
+        self.dressing = key;
+    }
+
+    /// Takes every drape off: the tile shows its base colour (and the
+    /// textures it owns) until it is dressed again. What an evicted drape's
+    /// wearers are left in, so its textures are let go of with it.
+    pub fn undress(&mut self, gpu: &GpuContext) {
+        if self.dressing.is_empty() {
+            return;
+        }
+        self.dress(gpu, &[]);
+        self.dressing.clear();
+    }
+
     /// Whether any mesh here carries more layers than one draw could bind.
     ///
     /// Asked before switching pipelines rather than discovered mesh by mesh: a
@@ -313,59 +391,29 @@ pub fn prepare(
         .collect();
     let mut gpu_bytes: usize = textures.iter().map(|t| t.bytes).sum();
 
-    // Imagery it merely references: uploaded once per imagery tile, however
-    // many geometry tiles name it. This is where the memory win lands, and it
-    // is why the upload is keyed by coord rather than by tile.
-    //
-    // Split into passes rather than truncated. What one draw cannot bind, a
-    // second draw over the same geometry carries — see
-    // [`raster::MAX_IMAGERY_PASSES`]. Truncating was the old answer and it lost
-    // the *sharpest* layers, which is the half of the mosaic worth having.
-    let slots = gpu.imagery_slots as usize;
-    let passes: Vec<ImageryPass> = content
+    // The imagery the content carries itself, uploaded once per imagery
+    // tile however many tiles name it. Most content carries none: it is
+    // drawn undressed — one pass, the base colour, every slot masked out —
+    // and the drapes it wears are bound when it is drawn (`dress`).
+    let own: Vec<DrapedLayer> = content
         .imagery
-        .chunks(slots)
-        .take(raster::MAX_IMAGERY_PASSES as usize)
-        .map(|batch| ImageryPass {
-            textures: batch
-                .iter()
-                .map(|layer| {
-                    gpu.shared_imagery(layer.source, layer.coord, || {
-                        upload_texture(gpu, &layer.texture)
-                    })
-                })
-                .collect(),
-            table: gpu
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("tuile imagery layers"),
-                    contents: bytemuck::cast_slice(&raster::imagery_layer_table(
-                        batch,
-                        gpu.imagery_slots,
-                    )),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                }),
+        .iter()
+        .filter(|l| l.is_visible())
+        .map(|l| DrapedLayer {
+            placement: l.placement(),
+            texture: gpu.shared_imagery(l.source, l.coord, || upload_texture(gpu, &l.texture)),
+            coord: l.coord,
+            source: l.source,
         })
         .collect();
-    // Content with no imagery at all still needs one pass: it has a base colour
-    // to draw, and every slot masks itself out.
-    let passes = if passes.is_empty() {
-        vec![ImageryPass {
-            textures: Vec::new(),
-            table: gpu
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("tuile imagery layers"),
-                    contents: bytemuck::cast_slice(&raster::imagery_layer_table(
-                        &[],
-                        gpu.imagery_slots,
-                    )),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                }),
-        }]
-    } else {
-        passes
-    };
+    let worn: Vec<(Placement, &Arc<GpuImagery>, ImageryCoord, u32)> = own
+        .iter()
+        .map(|l| (l.placement, &l.texture, l.coord, l.source))
+        .collect();
+    let passes = passes(gpu, &worn);
+    let sharpest_imagery_level = own.iter().map(|l| l.coord.level).max();
+    let imagery_source = own.iter().map(|l| l.source).max();
+    drop(worn);
 
     // Each mesh with its normals, made where it has none: what is uploaded,
     // and what a mesh that gains vertices is made again from.
@@ -388,8 +436,8 @@ pub fn prepare(
     let cell = edges.cell();
 
     PreparedTile {
-        sharpest_imagery_level: content.imagery.iter().map(|l| l.coord.level).max(),
-        imagery_source: content.imagery.iter().map(|l| l.source).max(),
+        sharpest_imagery_level,
+        imagery_source,
         meshes,
         tile_bg,
         tile_buf,
@@ -404,8 +452,102 @@ pub fn prepare(
         // frame for nothing.
         rebased_to: std::cell::Cell::new(render_origin),
         _textures: textures,
+        own,
         _imagery: passes,
+        dressing: Vec::new(),
         gpu_bytes,
+    }
+}
+
+/// One imagery tile of a drape on the GPU: where it sits in its tile, and
+/// the shared texture.
+pub(crate) struct DrapedLayer {
+    pub(crate) placement: Placement,
+    pub(crate) texture: Arc<GpuImagery>,
+    pub(crate) coord: ImageryCoord,
+    pub(crate) source: u32,
+}
+
+/// A drape on the GPU: its imagery tiles' textures, shared with every other
+/// drape that names them, and where each sits in its tile.
+pub struct PreparedDrape {
+    /// The layer it is of.
+    pub layer: LayerId,
+    /// The budget's imagery level.
+    pub level: u32,
+    pub(crate) layers: Vec<DrapedLayer>,
+    /// What it is charged: the budget's estimate of its textures, the shared
+    /// floor excepted — what [`DrapeContent::cost`] says.
+    pub gpu_bytes: u64,
+}
+
+/// Uploads a drape: each of its imagery tiles once however many drapes name
+/// it (keyed by imagery set and coord), and its placements.
+pub fn prepare_drape(gpu: &GpuContext, drape: &DrapeContent) -> PreparedDrape {
+    let layers = drape
+        .tiles
+        .iter()
+        .filter(|l| l.is_visible())
+        .map(|l| DrapedLayer {
+            placement: l.placement(),
+            texture: gpu.shared_imagery(l.source, l.coord, || upload_texture(gpu, &l.texture)),
+            coord: l.coord,
+            source: l.source,
+        })
+        .collect();
+    PreparedDrape {
+        layer: drape.layer,
+        level: drape.level,
+        layers,
+        gpu_bytes: drape.cost().gpu.0,
+    }
+}
+
+/// A uv transform's bits, for telling dressings apart.
+fn uv_bits(uv: UvTransform) -> [u64; 4] {
+    [
+        uv.scale[0].to_bits(),
+        uv.scale[1].to_bits(),
+        uv.offset[0].to_bits(),
+        uv.offset[1].to_bits(),
+    ]
+}
+
+/// The imagery passes that bind `layers`, in stacking order: as many as one
+/// draw can bind per pass, at most `MAX_IMAGERY_PASSES`. Never none: content
+/// with no imagery still has one pass, carrying its base colour, every slot
+/// masking itself out.
+fn passes(
+    gpu: &GpuContext,
+    layers: &[(Placement, &Arc<GpuImagery>, ImageryCoord, u32)],
+) -> Vec<ImageryPass> {
+    let slots = gpu.imagery_slots as usize;
+    let table = |batch: &[(Placement, &Arc<GpuImagery>, ImageryCoord, u32)]| {
+        gpu.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("tuile imagery layers"),
+                contents: bytemuck::cast_slice(&raster::placement_table(
+                    batch.iter().map(|l| l.0),
+                    gpu.imagery_slots,
+                )),
+                usage: wgpu::BufferUsages::UNIFORM,
+            })
+    };
+    let passes: Vec<ImageryPass> = layers
+        .chunks(slots.max(1))
+        .take(raster::MAX_IMAGERY_PASSES as usize)
+        .map(|batch| ImageryPass {
+            textures: batch.iter().map(|l| Arc::clone(l.1)).collect(),
+            table: table(batch),
+        })
+        .collect();
+    if passes.is_empty() {
+        vec![ImageryPass {
+            textures: Vec::new(),
+            table: table(&[]),
+        }]
+    } else {
+        passes
     }
 }
 
@@ -474,18 +616,32 @@ fn prepare_mesh(
 ) -> PreparedMesh {
     let (vertex_buf, index_buf, bytes) = mesh_buffers(gpu, mesh);
     *gpu_bytes += bytes;
+    let (material_bgs, material_bufs) = materials(gpu, mesh, textures, passes);
+    PreparedMesh {
+        vertex_buf,
+        index_buf,
+        index_count: mesh.indices.len() as u32,
+        material_bgs,
+        _material_bufs: material_bufs,
+    }
+}
 
+/// One bind group per imagery pass for `mesh`. They differ in two things
+/// and only two: which batch of layers is bound, and whether the shader is
+/// told this is the first pass — which is what decides that a later pass
+/// starts from nothing and writes only where its own layers reached.
+fn materials(
+    gpu: &GpuContext,
+    mesh: &DecodedMesh,
+    textures: &[GpuImagery],
+    passes: &[ImageryPass],
+) -> (Vec<wgpu::BindGroup>, Vec<wgpu::Buffer>) {
     let texture_view = mesh
         .material
         .base_color_texture
         .and_then(|i| textures.get(i))
         .map(|t| &t.view)
         .unwrap_or(&gpu.white_view);
-
-    // One bind group per pass. They differ in two things and only two: which
-    // batch of layers is bound, and whether the shader is told this is the first
-    // pass — which is what decides that a later pass starts from nothing and
-    // writes only where its own layers reached.
     let mut material_bufs = Vec::with_capacity(passes.len());
     let mut material_bgs = Vec::with_capacity(passes.len());
     for (index, imagery) in passes.iter().enumerate() {
@@ -541,14 +697,7 @@ fn prepare_mesh(
         }));
         material_bufs.push(material_buf);
     }
-
-    PreparedMesh {
-        vertex_buf,
-        index_buf,
-        index_count: mesh.indices.len() as u32,
-        material_bgs,
-        _material_bufs: material_bufs,
-    }
+    (material_bgs, material_bufs)
 }
 
 /// A mesh's vertex and index buffers, and their size in bytes.

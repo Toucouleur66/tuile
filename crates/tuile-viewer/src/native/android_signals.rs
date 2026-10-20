@@ -45,13 +45,13 @@ mod trim {
 /// A level the platform adds later is read by where it falls between these.
 pub(crate) fn pressure_of_trim(level: i32) -> Pressure {
     match level {
-        trim::UI_HIDDEN => Pressure::Nominal,
+        trim::UI_HIDDEN => Pressure::Normal,
         l if l >= trim::MODERATE => Pressure::Critical,
         l if l >= trim::BACKGROUND => Pressure::Warning,
         l if l > trim::UI_HIDDEN => Pressure::Warning,
         l if l >= trim::RUNNING_CRITICAL => Pressure::Critical,
         l if l >= trim::RUNNING_MODERATE => Pressure::Warning,
-        _ => Pressure::Nominal,
+        _ => Pressure::Normal,
     }
 }
 
@@ -184,12 +184,12 @@ mod tests {
     /// among them.
     #[test]
     fn trim_levels_read_as_pressure() {
-        use Pressure::{Critical, Nominal, Warning};
-        assert_eq!(pressure_of_trim(0), Nominal);
+        use Pressure::{Critical, Normal, Warning};
+        assert_eq!(pressure_of_trim(0), Normal);
         assert_eq!(pressure_of_trim(trim::RUNNING_MODERATE), Warning);
         assert_eq!(pressure_of_trim(trim::RUNNING_LOW), Warning);
         assert_eq!(pressure_of_trim(trim::RUNNING_CRITICAL), Critical);
-        assert_eq!(pressure_of_trim(trim::UI_HIDDEN), Nominal);
+        assert_eq!(pressure_of_trim(trim::UI_HIDDEN), Normal);
         assert_eq!(pressure_of_trim(trim::BACKGROUND), Warning);
         assert_eq!(pressure_of_trim(trim::MODERATE), Critical);
         assert_eq!(pressure_of_trim(trim::COMPLETE), Critical);
@@ -197,12 +197,12 @@ mod tests {
         assert_eq!(pressure_of_trim(12), Warning);
         assert_eq!(pressure_of_trim(30), Warning);
         assert_eq!(pressure_of_trim(100), Critical);
-        assert_eq!(pressure_of_trim(-1), Nominal);
+        assert_eq!(pressure_of_trim(-1), Normal);
     }
 
     #[test]
     fn the_trim_signal_unpacks_into_a_count_and_a_level() {
-        assert_eq!(unpack_trim(0), (0, Pressure::Nominal));
+        assert_eq!(unpack_trim(0), (0, Pressure::Normal));
         assert_eq!(unpack_trim((3 << 32) | 15), (3, Pressure::Critical));
         assert_eq!(unpack_trim((1 << 32) | 5), (1, Pressure::Warning));
     }

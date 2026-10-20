@@ -15,6 +15,7 @@ use futures_executor::LocalPool;
 use futures_util::task::LocalSpawnExt;
 use glam::{DVec2, Mat4, Vec3};
 use std::sync::Arc;
+use tuile_core::budget::FrameDeadline;
 use tuile_core::fetch::FsFetcher;
 use tuile_core::geo::{ecef_to_geodetic, enu_frame};
 use tuile_core::protocol::{ClientMessage, GeometryStream};
@@ -22,7 +23,7 @@ use tuile_core::runtime::in_process;
 use tuile_core::tileset::Tileset;
 use tuile_core::traversal::{Config, ViewState};
 use tuile_wgpu::{
-    ContentPump, GpuContext, TileRenderer, ViewUniform, DEPTH_FORMAT, TEXTURE_FORMAT,
+    ContentPump, GpuContext, PreparedTile, TileRenderer, ViewUniform, DEPTH_FORMAT, TEXTURE_FORMAT,
 };
 
 fn main() {
@@ -75,7 +76,15 @@ fn main() {
     );
 
     // Run the geometry server in-process on a local executor.
-    let (mut stream, server) = in_process(tileset, Arc::new(FsFetcher), Config::default());
+    // A snapshot is a bulk frame: the batch budget, ready only when every
+    // mesh it draws is held.
+    let (mut stream, server) = in_process(
+        tileset,
+        Arc::new(FsFetcher),
+        Config::default(),
+        tuile_core::budget::BudgetConfig::batch(),
+    )
+    .expect("the batch budget is valid");
     let mut pool = LocalPool::new();
     pool.spawner().spawn_local(server.run()).expect("spawn");
 
@@ -87,25 +96,20 @@ fn main() {
     let view_state: ViewState =
         ViewState::perspective(eye, center - eye, up, viewport, 45f64.to_radians());
 
-    // Drive the session: feed the camera, let the server fetch+decode, pump
-    // GPU uploads. Stop once the selection is fully resident and stable.
-    let mut stable = 0;
+    // Drive the session: feed the camera, let the server fetch and decode,
+    // upload everything delivered. Stop once the server says the frame is
+    // ready: every mesh it draws on the GPU.
+    stream
+        .send(ClientMessage::ViewerState {
+            views: vec![view_state],
+            generation: 1,
+        })
+        .expect("send viewer state");
     for _ in 0..600 {
-        stream
-            .send(ClientMessage::ViewerState {
-                views: vec![view_state],
-                generation: 0,
-            })
-            .expect("send viewer state");
         pool.run_until_stalled();
-        pump.pump(&mut stream, &gpu, 64);
-        if !pump.selection.is_empty() && pump.missing() == 0 {
-            stable += 1;
-            if stable > 3 {
-                break;
-            }
-        } else {
-            stable = 0;
+        pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
+        if pump.frame_ready && pump.generation_selected() >= 1 {
+            break;
         }
     }
 
@@ -113,11 +117,11 @@ fn main() {
         tracing::warn!("server error: {err}");
     }
     tracing::info!(
-        "selected {} tiles, {} prepared, {} bytes GPU, {} still missing",
-        pump.selection.len(),
+        "{} drawn, {} prepared, {} bytes GPU, ready: {}",
+        pump.draw_set().items.len(),
         pump.prepared_count(),
         pump.gpu_bytes,
-        pump.missing(),
+        pump.frame_ready,
     );
 
     // Render one frame.
@@ -137,7 +141,8 @@ fn main() {
     };
     renderer.set_view(&gpu.queue, &view);
 
-    let pixels = render_to_png(&gpu, &renderer, &pump, size);
+    let (drawn, _) = pump.resolve(&gpu);
+    let pixels = render_to_png(&gpu, &renderer, &drawn.exact, size);
     image::RgbaImage::from_raw(size, size, pixels)
         .expect("image")
         .save(&out_path)
@@ -148,7 +153,7 @@ fn main() {
 fn render_to_png(
     gpu: &GpuContext,
     renderer: &TileRenderer,
-    pump: &ContentPump,
+    tiles: &[&PreparedTile],
     size: u32,
 ) -> Vec<u8> {
     let color = gpu.device.create_texture(&wgpu::TextureDescriptor {
@@ -216,7 +221,7 @@ fn render_to_png(
             }),
             ..Default::default()
         });
-        renderer.render(&mut pass, pump.visible(), false);
+        renderer.render(&mut pass, tiles.iter().copied(), false);
     }
 
     let bytes_per_row = size * 4;

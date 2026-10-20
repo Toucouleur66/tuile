@@ -76,8 +76,23 @@ impl TileLoader for Gated {
     }
 
     /// Never I/O, so never held.
-    fn fill(&self, id: TileId) -> Option<tuile_core::content::DecodedTileContent> {
-        self.inner.fill(id)
+    fn drapes(&self, id: TileId) -> Option<tuile_core::source::DrapeReach> {
+        self.inner.drapes(id)
+    }
+
+    async fn load_drape(
+        &self,
+        id: TileId,
+        layer: tuile_core::budget::LayerId,
+        level: u32,
+    ) -> Result<tuile_core::content::DrapeContent, LoadError> {
+        self.gate.passed().await;
+        self.inner.load_drape(id, layer, level).await
+    }
+
+    /// An index, never a read, so never held.
+    fn holds(&self, r: tuile_core::budget::ResourceId) -> tuile_core::budget::Presence {
+        self.inner.holds(r)
     }
 
     async fn warm_up(&self, through_level: u32) {

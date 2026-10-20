@@ -93,7 +93,7 @@ struct Attempt {
 }
 
 impl Attempt {
-    fn start() -> Result<Self, String> {
+    fn start(timeout: std::time::Duration) -> Result<Self, String> {
         let controller = web_sys::AbortController::new().map_err(|e| js_message(&e))?;
         let timed_out = std::rc::Rc::new(std::cell::Cell::new(false));
         let expire = {
@@ -103,7 +103,7 @@ impl Attempt {
                 controller.abort();
             })
         };
-        let millis = i32::try_from(patience::ATTEMPT_TIMEOUT.as_millis()).unwrap_or(i32::MAX);
+        let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
         let timer = set_timeout(expire.as_ref().unchecked_ref(), millis);
         Ok(Self {
             controller,
@@ -129,15 +129,15 @@ impl Drop for Attempt {
 type Answer = (u16, Bytes, Option<u64>);
 
 /// The bytes of one response, or the reason there are none — asked as many
-/// times as [`patience`] allows.
-async fn get(url: &Url, bearer: Option<&str>) -> Result<Answer, String> {
+/// times as [`patience`] allows `asker`.
+async fn get(url: &Url, bearer: Option<&str>, asker: patience::Asker) -> Result<Answer, String> {
     let mut attempt = 1;
     loop {
-        let (ended, outcome) = match get_once(url, bearer).await {
+        let (ended, outcome) = match get_once(url, bearer, asker).await {
             Ok(answer) => (patience::Ended::Answered(answer.0), Ok(answer)),
             Err((ended, why)) => (ended, Err(why)),
         };
-        match patience::again(attempt, ended) {
+        match patience::again(asker, attempt, ended) {
             Some(pause) => {
                 tracing::debug!(%url, attempt, ?ended, "asking again");
                 sleep(pause).await;
@@ -149,9 +149,14 @@ async fn get(url: &Url, bearer: Option<&str>) -> Result<Answer, String> {
 }
 
 /// One attempt.
-async fn get_once(url: &Url, bearer: Option<&str>) -> Result<Answer, (patience::Ended, String)> {
+async fn get_once(
+    url: &Url,
+    bearer: Option<&str>,
+    asker: patience::Asker,
+) -> Result<Answer, (patience::Ended, String)> {
     let failed = |e: String| (patience::Ended::Failed, e);
-    let attempt = Attempt::start().map_err(failed)?;
+    let timeout = patience::attempt_timeout(asker);
+    let attempt = Attempt::start(timeout).map_err(failed)?;
     let opts = web_sys::RequestInit::new();
     opts.set_method("GET");
     // Tiles are served cross-origin (ion, Bing) and answer with permissive CORS
@@ -175,7 +180,7 @@ async fn get_once(url: &Url, bearer: Option<&str>) -> Result<Answer, (patience::
         let why = if attempt.timed_out.get() {
             (
                 patience::Ended::TimedOut,
-                format!("no answer within {:?}", patience::ATTEMPT_TIMEOUT),
+                format!("no answer within {timeout:?}"),
             )
         } else {
             (patience::Ended::Failed, js_message(&e))
@@ -240,10 +245,14 @@ impl TileFetcher for WebFetcher {
     }
 
     async fn fetch_cacheable(&self, url: &Url) -> Result<Fetched<Bytes>, FetchError> {
-        let (status, bytes, max_age) = get(url, None).await.map_err(|message| FetchError::Io {
-            url: url.clone(),
-            message,
-        })?;
+        // A tile load: its retries are the budget's.
+        let (status, bytes, max_age) =
+            get(url, None, patience::Asker::Load)
+                .await
+                .map_err(|message| FetchError::Io {
+                    url: url.clone(),
+                    message,
+                })?;
         // 404 is a fact about the data — the ocean has no terrain tile — and the
         // engine has a distinct arm for it that stops the re-asking. Collapsing
         // it into a transport error would make every absent tile a permanent
@@ -274,7 +283,7 @@ pub struct WebIonHttp;
 #[async_trait(?Send)]
 impl IonHttp for WebIonHttp {
     async fn get(&self, url: &Url, bearer: Option<&str>) -> Result<HttpResponse, IonError> {
-        let (status, body, max_age) = get(url, bearer)
+        let (status, body, max_age) = get(url, bearer, patience::Asker::Session)
             .await
             .map_err(|e| IonError::Transport(format!("{url}: {e}")))?;
         Ok(HttpResponse {

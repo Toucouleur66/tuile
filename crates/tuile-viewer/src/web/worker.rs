@@ -5,13 +5,16 @@
 //! the desktop's is.
 //!
 //! The same [`crate::globe::assemble`] over the page's sources, the same gate
-//! in front of the loader, the same `GeometryServer`, run by the worker's
-//! event loop. What differs is only what a worker has: no tile store, and one
-//! thread — so decoding goes to the decode workers this one starts
-//! ([`super::decode`]), where a desktop hands it to a pool of threads. The
-//! stream to the page is
-//! [`tuile_web::post::serve`]; what the page asks beside it arrives as
-//! [`ToWorker`] and is done to the loader's own handles.
+//! in front of the loader, the same `GeometryServer` on the same budget —
+//! the profile's, sized from the device's memory — run by the worker's event
+//! loop on the worker's clock. What differs is only what a worker has: no
+//! tile store, and one thread — so decoding goes to the decode workers this
+//! one starts ([`super::decode`]), in the budget's order, where a desktop
+//! hands it to a pool of threads. The stream to the page is
+//! [`tuile_web::post::serve`]: the camera, the acknowledgements and their
+//! bytes, the memory and thermal signals; what the page asks beside it
+//! arrives as [`ToWorker`] and is done to the loader's own handles, and the
+//! budget's signals go back as [`ToPage::Signals`] for the page's overlay.
 
 use std::sync::Arc;
 
@@ -19,7 +22,7 @@ use tuile_core::source::TileLoader;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
-use super::control::{ToPage, ToWorker};
+use super::control::{Glance, ToPage, ToWorker};
 use super::options::{ProfileChoice, SourcesSpec};
 use super::sources::PageSources;
 use crate::gate::{Gate, Gated};
@@ -94,17 +97,30 @@ async fn start(spec: SourcesSpec, opening: usize, profile: Profile) -> Result<()
         inner: globe.loader,
         gate: gate.clone(),
     });
-    let config = profile.traversal(Some(profile.pinned_level));
-    let (stream, server) = tuile_core::runtime::in_process_with(globe.tree, loader, config);
+    let (stream, server) = tuile_core::runtime::in_process_with(
+        globe.tree,
+        loader,
+        profile.traversal(),
+        profile.budget(),
+    )
+    .map_err(|e| format!("the budget: {e}"))?;
+    tracing::info!(
+        gpu_mib = profile.gpu_bytes >> 20,
+        "the session's budget, from the device's memory"
+    );
     // The worker's one thread is also where the page's messages arrive — the
     // camera, the acks: a burst answered from memory must let them in.
-    let server = server.with_breather(BURST, Arc::new(breathe));
+    let server = server
+        .with_breather(BURST, Arc::new(breathe))
+        .with_clock(clock());
+    // The decode pool takes its jobs in the order the budget ranks the loads
+    // waiting on them.
+    super::decode::follow(server.load_ranks());
     wasm_bindgen_futures::spawn_local(async move {
         server.run().await;
         tracing::info!("the geometry server has stopped");
     });
     let handles = Handles {
-        detail: globe.detail,
         budget: globe.budget,
         layers: globe.layers,
         choices: layers,
@@ -114,12 +130,90 @@ async fn start(spec: SourcesSpec, opening: usize, profile: Profile) -> Result<()
     // The worker is the session: the connection lasts as long as it does.
     std::mem::forget(connection);
     post(&ToPage::Started);
+    tell_the_page_the_budget();
     Ok(())
 }
 
+/// The session's clock: the worker's own monotonic time. The core's default
+/// on wasm counts steps, not time — a budget timing its loads out on it
+/// would cancel them by the number of steps they took.
+fn clock() -> tuile_core::runtime::Clock {
+    let origin = web_time::Instant::now();
+    Arc::new(move || {
+        tuile_core::budget::Micros(origin.elapsed().as_micros().min(u128::from(u64::MAX)) as u64)
+    })
+}
+
+/// How often the budget's signals go to the page: as often as the session
+/// publishes them.
+const SIGNALS_EVERY_MS: i32 = 500;
+
+/// Posts the budget's signals to the page whenever the session has
+/// published new ones, for its overlay.
+fn tell_the_page_the_budget() {
+    let last: std::rc::Rc<std::cell::RefCell<Option<Glance>>> = std::rc::Rc::default();
+    let steps = std::cell::Cell::new(0u64);
+    let tick = Closure::<dyn FnMut()>::new(move || {
+        let Some(signals) = tuile_core::metrics::budget() else {
+            return;
+        };
+        // Where the worker's one thread goes, for its console: the budget's
+        // decisions share it with every fetch and decode reply.
+        if signals.decide_micros.count != steps.get() {
+            let d = &signals.decide_micros;
+            let n = d.count.saturating_sub(steps.replace(d.count));
+            tracing::info!(
+                steps = n,
+                decide_mean_ms = d.sum as f64 / d.count.max(1) as f64 / 1000.0,
+                decide_p99_ms = d.quantile_upper(990) as f64 / 1000.0,
+                decide_peak_ms = signals.decide_peak_micros as f64 / 1000.0,
+                completions = signals.completions_total,
+                starts = signals
+                    .starts_total
+                    .iter()
+                    .map(|(_, s)| s[0] + s[1])
+                    .sum::<u64>(),
+                cancels_grace = signals.cancels_total[0],
+                cancels_timeout = signals.cancels_total[1],
+                cancels_preempted = signals.cancels_total[2],
+                stale = signals.stale_results_total,
+                drawn_exact = signals.drawn_tiles[0],
+                drawn_held = signals.drawn_tiles[1],
+                drawn_fallback = signals.drawn_tiles[2],
+                lost = signals.lost_tiles,
+                bare = signals.bare_items,
+                underdraped = signals.underdraped_tiles,
+                evictions = ?signals.evictions_total.0,
+                bytes = ?signals.bytes.0,
+                targets = ?signals.target_bytes.0,
+                "the budget's steps"
+            );
+        }
+        let glance = Glance::of(&signals);
+        if last.borrow().as_ref() != Some(&glance) {
+            post(&ToPage::Signals {
+                glance: Box::new(glance.clone()),
+            });
+            *last.borrow_mut() = Some(glance);
+        }
+    });
+    if let Err(e) = scope().set_interval_with_callback_and_timeout_and_arguments_0(
+        tick.as_ref().unchecked_ref(),
+        SIGNALS_EVERY_MS,
+    ) {
+        tracing::warn!("the page will not see the budget: {e:?}");
+    }
+    // Lives as long as the worker.
+    tick.forget();
+}
+
 /// Events the server handles back to back before the worker's messages get
-/// their turn: a few milliseconds of work at most.
-const BURST: usize = 16;
+/// their turn: one. A step on the budget is tens of milliseconds of the
+/// worker's one thread near the ground; sixteen of them back to back held
+/// the fetches and the decode pool's replies for half a second, the pool
+/// idle with work queued. Yielding before each step lets everything that
+/// has landed in the meantime be answered by that one step.
+const BURST: usize = 1;
 
 /// A pause on the worker's timer: a macrotask, so the messages queued behind
 /// the server's burst are delivered before it goes on. A promise alone would
@@ -135,7 +229,6 @@ fn breathe() -> tuile_core::runtime::Pause {
 
 /// The loader's handles, which the page's messages act on.
 struct Handles {
-    detail: tuile_planetary::ImageryDetail,
     budget: tuile_planetary::LayerBudget,
     layers: Layers,
     choices: Vec<crate::embed::ImageryChoice>,
@@ -145,8 +238,7 @@ struct Handles {
 impl Handles {
     fn heard(&self, value: JsValue) {
         match serde_wasm_bindgen::from_value::<ToWorker>(value) {
-            Ok(ToWorker::Detail { metres }) => self.detail.set_target_texel_spacing(metres),
-            Ok(ToWorker::Budget { reported }) => self.budget.set_from_device(reported),
+            Ok(ToWorker::Slots { reported }) => self.budget.set_from_device(reported),
             Ok(ToWorker::Pause { paused: true }) => self.gate.shut(),
             Ok(ToWorker::Pause { paused: false }) => self.gate.open(),
             Ok(ToWorker::Imagery { layer }) => {

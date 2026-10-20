@@ -133,3 +133,56 @@ impl SessionLog {
         Ok(self.path)
     }
 }
+
+/// The budget's signals, step by step, on `/budget/step`: what it holds by
+/// class, its targets and hard limits, its loads (in flight, local, started,
+/// completed, cancelled by reason, failed), its evictions by class and
+/// reason, what it drew by role, the ground lost and bare, its relaxation,
+/// the platform's signals it heard, and whether the view converged. Read
+/// from the session's published signals (`tuile_core::metrics::budget`),
+/// which every run has: a red run is opened with the budget's account of it
+/// beside the pictures.
+pub struct BudgetTopics;
+
+impl Observer for BudgetTopics {
+    fn topic(&self) -> &str {
+        "/budget/step"
+    }
+
+    fn observe(&mut self, _state: &State) -> serde_json::Value {
+        let Some(s) = tuile_core::metrics::budget() else {
+            return serde_json::Value::Null;
+        };
+        serde_json::json!({
+            "bytes": s.bytes.0,
+            "decoded_bytes": s.decoded_bytes,
+            "target_bytes": s.target_bytes.0,
+            "hard_limit_bytes": s.hard_limit_bytes.0,
+            "in_flight": s.in_flight.0,
+            "local_reads": s.local_reads,
+            "starts_total": s.starts_total.0,
+            "completions_total": s.completions_total,
+            "cancels_total": {"grace": s.cancels_total[0], "timeout": s.cancels_total[1], "preempted": s.cancels_total[2]},
+            "failures_total": s.failures_total.0,
+            "stale_results_total": s.stale_results_total,
+            "evictions_total": s.evictions_total.0,
+            "releases_total": s.releases_total.0,
+            "drawn_tiles": {"exact": s.drawn_tiles[0], "held": s.drawn_tiles[1], "fallback": s.drawn_tiles[2]},
+            "lost_tiles": s.lost_tiles,
+            "bare_items": s.bare_items,
+            "underdraped_tiles": s.underdraped_tiles,
+            "imagery_over_terrain": s.imagery_over_terrain,
+            "floor_in": s.floor_in,
+            "sse_scale_milli": s.sse_scale_milli,
+            "pressure_level": s.pressure_level,
+            "thermal_level": s.thermal_level,
+            "uploads_total": s.uploads_total.0,
+            "upload_bytes_total": s.upload_bytes_total.0,
+            "deadline_deferrals_total": s.deadline_deferrals_total,
+            "thrash_total": s.thrash_total,
+            "rereads_total": s.rereads_total,
+            "swap_gaps_total": s.swap_gaps_total,
+            "converged": s.converged,
+        })
+    }
+}

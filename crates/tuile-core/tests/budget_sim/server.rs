@@ -785,7 +785,7 @@ impl Sim {
                     .map(|i| (i.mesh, i.drapes.first().map(|x| x.resource)))
                     .collect();
                 let release = self.budget.release_beyond(Bytes::mib(256));
-                for r in &release {
+                for r in &release.gpu {
                     if let Some(b) = self.gpu.drawable.remove(r) {
                         let c = match r {
                             ResourceId::Mesh(_) => Class::TerrainMesh,

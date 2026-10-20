@@ -219,7 +219,6 @@ pub(crate) const DIAGNOSTICS: [(&str, &str); 4] = [
 
 pub struct App {
     controller: CameraController,
-    detail: crate::shell::Detail,
     layer_budget: crate::shell::Budget,
     title: String,
     /// Where the sun is for the instant the scene is lit at. Resolved once: the
@@ -258,6 +257,9 @@ pub struct App {
     resolution: Option<tuile_wgpu::Resolution>,
     /// Tiles uploaded on the last frame.
     uploaded: usize,
+    /// The display's refresh, frames a second: what a frame's upload
+    /// deadline is made of (I18). The monitor's when the window knows it.
+    pub(crate) refresh_hz: u32,
     /// The device's temperature and power saving, and when they were read.
     thermal: crate::profile::Thermal,
     low_power: bool,
@@ -266,6 +268,9 @@ pub struct App {
     /// background too, where the system's trims matter most.
     pressure: lifecycle::PressureWatch,
     pressure_read: Option<web_time::Instant>,
+    /// When the last memory signal was handed to the budget: see
+    /// `calm_down`.
+    squeezed_at: Option<web_time::Instant>,
 
     // The rest is grouped by the module that owns it, so that a field and the
     // code that reads it are never in different files. Each of these is defined
@@ -363,7 +368,6 @@ impl App {
             ended_by: None,
             remembers: config.remembers,
             controller: config.controller.clone(),
-            detail: Default::default(),
             layer_budget: Default::default(),
             title: config.title.clone(),
             sun: tuile_atmosphere::Sun::at_unix_seconds(config.lit_at_unix_seconds),
@@ -385,6 +389,8 @@ impl App {
             low_power: false,
             device_read: None,
             pressure: lifecycle::PressureWatch::default(),
+            squeezed_at: None,
+            refresh_hz: 60,
             pressure_read: None,
             pointer: input::Pointer::default(),
             views: input::Views::default(),
@@ -507,11 +513,13 @@ impl App {
     }
 
     /// Takes over a session that has come up: its stream, the relief the
-    /// camera stands on, the imagery detail the loader reads, how many layers
-    /// a drape may carry.
+    /// camera stands on, how many layers a drape may carry, and the budget's
+    /// meter the pump records its frames into.
     fn adopt(&mut self, started: crate::shell::Started) {
         self.controller = self.controller.clone().with_ground(started.heights.clone());
-        self.detail = started.detail.clone();
+        if let (Some(active), Some(meter)) = (self.active.as_mut(), started.meter()) {
+            active.pump.observe(meter);
+        }
         self.layer_budget = started.layer_budget.clone();
         self.fit_the_layer_budget();
         // Away already: the loads wait until the application is back.
@@ -669,9 +677,12 @@ impl App {
     fn eye_views(&self) -> Vec<tuile_core::traversal::ViewState> {
         let (width, height) = self.viewport();
         let viewport = glam::DVec2::new(width, height);
+        // The display's density: the need is counted in logical pixels
+        // (D-L1), so a window moved between displays asks for nothing new.
+        let scale = self.active.as_ref().map_or(1.0, |a| a.scale);
         self.eyes()
             .iter()
-            .map(|eye| eye.view_state(viewport))
+            .map(|eye| eye.view_state(viewport).with_scale(scale))
             .collect()
     }
 
@@ -699,8 +710,9 @@ impl App {
 
     /// The system says it is short of memory.
     pub(crate) fn short_of_memory(&mut self) {
-        tracing::warn!("memory warning; trimming the residency");
+        tracing::warn!("memory warning; the budget shrinks");
         crate::journal::note("memory warning");
+        self.squeezed_at = Some(web_time::Instant::now());
         let steps = self.lifecycle.memory_warning();
         self.carry_out(steps);
     }
@@ -708,6 +720,7 @@ impl App {
     /// The system says how short of memory it is, as Android grades it.
     #[cfg(feature = "control")]
     pub(crate) fn under_pressure(&mut self, pressure: crate::profile::Pressure) {
+        self.squeezed_at = Some(web_time::Instant::now());
         let steps = self.lifecycle.memory_pressure(pressure);
         self.carry_out(steps);
     }
