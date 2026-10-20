@@ -519,7 +519,7 @@ impl Headless {
             layers,
             opening: 0,
             store: start.store.clone(),
-            config: tuile_core::traversal::Config::interactive_globe(),
+            config: profile.traversal(),
             budget,
             profile: profile.clone(),
             timeout: crate::launch::START_TIMEOUT,

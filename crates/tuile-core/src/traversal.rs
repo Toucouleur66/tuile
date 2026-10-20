@@ -78,23 +78,59 @@ impl Fov {
     }
 }
 
-/// The serializable construction parameters of a [`ViewState`].
-///
-/// A symmetric perspective at scale 1 only, today: a lens of four angles
-/// travels as its vertical extent, and its scale is not carried. The wire
-/// form of an asymmetric eye comes with the protocol of spec §15.2.
+/// The serializable construction parameters of a [`ViewState`]: what crosses
+/// a wire and a tape (spec §15.3). A symmetric perspective, or a lens of four
+/// angles (`fov`), at a display scale.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ViewStateParams {
     pub position: DVec3,
     pub direction: DVec3,
     pub up: DVec3,
     pub viewport_px: DVec2,
+    /// The vertical field of view; for a lens of four angles, its vertical
+    /// extent.
     pub fovy_rad: f64,
+    /// The four angles of an asymmetric lens (a headset's eye); `None` for a
+    /// symmetric perspective.
+    #[serde(default)]
+    pub fov: Option<Fov>,
+    /// Physical pixels per logical point; 1 when unsaid.
+    #[serde(default = "unit_scale")]
+    pub scale: f64,
+}
+
+fn unit_scale() -> f64 {
+    1.0
+}
+
+impl ViewStateParams {
+    /// A symmetric perspective at scale 1.
+    pub fn perspective(
+        position: DVec3,
+        direction: DVec3,
+        up: DVec3,
+        viewport_px: DVec2,
+        fovy_rad: f64,
+    ) -> Self {
+        Self {
+            position,
+            direction,
+            up,
+            viewport_px,
+            fovy_rad,
+            fov: None,
+            scale: 1.0,
+        }
+    }
 }
 
 impl From<ViewStateParams> for ViewState {
     fn from(p: ViewStateParams) -> Self {
-        Self::perspective(p.position, p.direction, p.up, p.viewport_px, p.fovy_rad)
+        let view = match p.fov {
+            Some(fov) => Self::from_fov(p.position, p.direction, p.up, p.viewport_px, fov),
+            None => Self::perspective(p.position, p.direction, p.up, p.viewport_px, p.fovy_rad),
+        };
+        view.with_scale(p.scale)
     }
 }
 
@@ -106,6 +142,8 @@ impl From<ViewState> for ViewStateParams {
             up: v.up,
             viewport_px: v.viewport_px,
             fovy_rad: v.fovy_rad,
+            fov: v.fov,
+            scale: v.scale,
         }
     }
 }

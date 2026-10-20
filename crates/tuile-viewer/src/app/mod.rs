@@ -677,9 +677,12 @@ impl App {
     fn eye_views(&self) -> Vec<tuile_core::traversal::ViewState> {
         let (width, height) = self.viewport();
         let viewport = glam::DVec2::new(width, height);
+        // The display's density: the need is counted in logical pixels
+        // (D-L1), so a window moved between displays asks for nothing new.
+        let scale = self.active.as_ref().map_or(1.0, |a| a.scale);
         self.eyes()
             .iter()
-            .map(|eye| eye.view_state(viewport))
+            .map(|eye| eye.view_state(viewport).with_scale(scale))
             .collect()
     }
 

@@ -214,7 +214,7 @@ fn session(embedder: Arc<dyn ViewerHost>) -> anyhow::Result<()> {
         // ground is missing, each of the two things that can remove it has to
         // be switchable off on its own.
         horizon_culling: std::env::var("TUILE_NO_HORIZON_CULL").is_err(),
-        ..Config::interactive_globe()
+        ..profile.traversal()
     };
     // Everything between here and a running server is network, and runs on
     // the runtime: see `launch`. The host's credentials and sources, the
