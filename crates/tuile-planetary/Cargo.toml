@@ -17,8 +17,8 @@ futures-channel = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
-tuile-core = { version = "0.11.0", path = "../tuile-core" }
-tuile-terrain = { version = "0.11.0", path = "../tuile-terrain" }
+tuile-core = { version = "0.12.0", path = "../tuile-core" }
+tuile-terrain = { version = "0.12.0", path = "../tuile-terrain" }
 
 [dev-dependencies]
 image = { workspace = true }
