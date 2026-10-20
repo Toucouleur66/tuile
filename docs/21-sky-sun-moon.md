@@ -42,6 +42,19 @@ the Moon from the frame's own eye.
   the limb is a band a few degrees thick that no table row can hold.
 - The air between eye and ground takes 24 steps bunched towards the ground
   once the eye is over 10 km: the dense air is at the end of a long path.
+- The air reads the ground **the mesh means**, not the flat triangle drawn.
+  A triangle between three vertices on the ground is a chord: inside a
+  facet of 5° (the first levels of tiles, which a zoom-out draws) it lies
+  up to 12 km under that ground. The air, the ground's own light and the
+  veil's bound are read at the drawn point raised by how far the triangle
+  lies under its vertices' heights carried across it; shadows, towns and
+  the probe of holes keep the drawn point. Read at the chord, a sea seen
+  from orbit had a blotch of haze in each facet and a darker lattice
+  through its vertices (video-54's last seconds). The look's closed-form
+  haze reads the same point; the viewer's air reads the vertices' heights
+  as the rasteriser carries them across the triangle. Where triangles are
+  a kilometre across the two agree to four centimetres, and near ground is
+  drawn as it was (`tuile-film-gpu/tests/coarse_ground.rs`).
 - All atmosphere tables are 32-bit floats read by a hand-written bilinear:
   a night is ten orders of magnitude under a day, below what half floats
   hold. Lights are pre-exposed into the HDR target for the same reason.

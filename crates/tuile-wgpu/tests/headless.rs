@@ -17,6 +17,10 @@ fn gpu() -> Option<GpuContext> {
     match pollster::block_on(GpuContext::headless()) {
         Ok(gpu) => Some(gpu),
         Err(e) => {
+            assert!(
+                std::env::var("TUILE_REQUIRE_GPU").is_err(),
+                "TUILE_REQUIRE_GPU is set and there is no usable adapter: {e}"
+            );
             eprintln!("SKIP headless render test: {e}");
             None
         }
@@ -598,5 +602,124 @@ fn untextured_mesh_without_normals_gets_computed_normals() {
     assert!(
         center[0] > 200 && center[1] > 200 && center[2] > 200,
         "center = {center:?} (computed normals should give full lambert)"
+    );
+}
+
+/// The pattern a coarse mesh leaves in a picture: the standard deviation of
+/// its luma less its Gaussian blur of `sigma` pixels, over the box `2·sigma`
+/// in from every edge — what varies faster than `sigma` across the frame.
+/// In 8-bit levels, on the stored (encoded) values.
+fn pattern(frame: &Frame, sigma: f32) -> f64 {
+    let luma: image::ImageBuffer<image::Luma<f32>, Vec<f32>> =
+        image::ImageBuffer::from_fn(SIZE, SIZE, |x, y| {
+            let [r, g, b, _] = frame.px(x, y).map(f32::from);
+            image::Luma([0.2126 * r + 0.7152 * g + 0.0722 * b])
+        });
+    let smooth = image::imageops::blur(&luma, sigma);
+    let inner = (2.0 * sigma).ceil() as u32;
+    let (mut n, mut sum, mut sum_sq) = (0.0f64, 0.0f64, 0.0f64);
+    for y in inner..SIZE - inner {
+        for x in inner..SIZE - inner {
+            let fine = f64::from(luma.get_pixel(x, y).0[0] - smooth.get_pixel(x, y).0[0]);
+            n += 1.0;
+            sum += fine;
+            sum_sq += fine * fine;
+        }
+    }
+    let mean = sum / n;
+    (sum_sq / n - mean * mean).max(0.0).sqrt()
+}
+
+/// A dark tableland 4 000 m up, 20° a side, cut into facets of 5° — the
+/// coarse terrain of the first levels a zoom-out draws — seen straight down
+/// from 1 500 km through the air.
+///
+/// A flat facet between three vertices on the ground is a chord: inside,
+/// it lies up to 12 km under the ground its vertices are on. The air reads
+/// the ground's height from the vertices, carried across the triangle; read
+/// at the chord, each facet's middle was ground at sea level under the
+/// whole of the aerosols, and the tableland came out hazed over but for a
+/// dark star at each vertex, where the chord still stood over sea level.
+/// Over a sea the chord's heights below zero clamp to the vertices' own,
+/// zero, which is why the viewer's seas never showed it.
+///
+/// Measured on an Apple M2 (Metal): 1.35 levels read at the chord, 0.15
+/// read at the heights the vertices give.
+#[test]
+fn a_coarse_tableland_seen_from_orbit_through_the_air_shows_none_of_its_facets() {
+    let Some(gpu) = gpu() else { return };
+    let renderer = TileRenderer::new(&gpu, wgpu::TextureFormat::Rgba8UnormSrgb);
+    let eye_height = 1_500_000.0f64;
+    let ground = 4_000.0f64;
+    let radius = tuile_core::geo::WGS84_A;
+    // Render space: the eye at the origin, up +Z, the planet's centre one
+    // radius and the eye's height below — `air_at`'s globe.
+    let centre = dvec3(0.0, 0.0, -(radius + eye_height));
+    let origin = centre + dvec3(0.0, 0.0, radius + ground);
+    let (cells, side) = (4u32, 20f64.to_radians());
+    let (mut positions, mut normals) = (Vec::new(), Vec::new());
+    for row in 0..=cells {
+        for column in 0..=cells {
+            let u = side * (f64::from(column) / f64::from(cells) - 0.5);
+            let v = side * (f64::from(row) / f64::from(cells) - 0.5);
+            let up = dvec3(u.sin() * v.cos(), v.sin(), u.cos() * v.cos());
+            let at = centre + up * (radius + ground) - origin;
+            positions.push(at.as_vec3().to_array());
+            normals.push(up.as_vec3().to_array());
+        }
+    }
+    let corner = |row: u32, column: u32| row * (cells + 1) + column;
+    let mut indices = Vec::new();
+    for row in 0..cells {
+        for column in 0..cells {
+            let (sw, se, ne, nw) = (
+                corner(row, column),
+                corner(row, column + 1),
+                corner(row + 1, column + 1),
+                corner(row + 1, column),
+            );
+            indices.extend([sw, se, ne, sw, ne, nw]);
+        }
+    }
+    let content = DecodedTileContent {
+        withheld_drape: None,
+        meshes: vec![DecodedMesh {
+            uvs: Some(vec![[0.0, 0.0]; positions.len()]),
+            positions,
+            normals: Some(normals),
+            indices,
+            material: MaterialDesc {
+                base_color_factor: [DARK_SURFACE, DARK_SURFACE, DARK_SURFACE, 1.0],
+                base_color_texture: None,
+            },
+        }],
+        textures: Vec::new(),
+        imagery: Vec::new(),
+        local_origin_ecef: origin,
+        transform_local: Mat4::IDENTITY,
+    };
+    let proj = Mat4::perspective_rh(60f32.to_radians(), 1.0, 10_000.0, 1.0e7);
+    let view = Mat4::look_at_rh(Vec3::ZERO, Vec3::NEG_Z, Vec3::Y);
+    let uniform = ViewUniform {
+        view_proj: (proj * view).to_cols_array(),
+        // The sun straight down, as `air_at`'s: the air over the tableland
+        // fully lit.
+        sun_dir: [0.0, 0.0, -1.0, 0.0],
+        params: [0.25, 0.0, 0.0, 0.0],
+        atmosphere: air_at(eye_height as f32, 1.0),
+    };
+    let tile = prepare(&gpu, &content, DVec3::ZERO);
+    let frame = render_frame(&gpu, &renderer, &[&tile], &uniform);
+    frame.save("headless-air-coarse-tableland.png");
+    let centre_px = frame.px(SIZE / 2, SIZE / 2);
+    assert!(
+        centre_px[2] > 20,
+        "the tableland is drawn under the air: {centre_px:?}"
+    );
+    let spread = pattern(&frame, 12.0);
+    eprintln!("pattern {spread:.3} levels");
+    assert!(
+        spread < 0.6,
+        "the facets show through the air: a pattern of {spread:.3} levels"
     );
 }

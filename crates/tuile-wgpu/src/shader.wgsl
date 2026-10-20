@@ -157,6 +157,11 @@ struct VsOut {
     // in f32 loses metres; render space keeps the magnitudes small enough that
     // it does not, which is the same reason the positions were rebased.
     @location(2) world: vec3f,
+    // The vertex's height over the air's sphere, for the air: interpolated
+    // across the triangle it is the ground the mesh means, where `world`
+    // is the flat triangle's — a chord, kilometres under the ground inside
+    // a coarse tile's facets. See `aerial_perspective`.
+    @location(3) height: f32,
 }
 
 @vertex
@@ -167,6 +172,7 @@ fn vs_main(in: VsIn) -> VsOut {
     out.normal = (tile.model * vec4f(in.normal, 0.0)).xyz;
     out.uv = in.uv;
     out.world = world.xyz;
+    out.height = length(world.xyz - view.air.earth.xyz) - view.air.earth.w;
     return out;
 }
 /// thing left behind.
@@ -249,7 +255,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     if (mode == DIAGNOSTIC_UNLIT) {
         return vec4f(albedo.rgb, opacity);
     }
-    return vec4f(aerial_perspective(lit, in.world, view.air), albedo.a);
+    return vec4f(aerial_perspective(lit, in.world, in.height, view.air), albedo.a);
 }
 
 /// What the air between the eye and this fragment does to its colour.

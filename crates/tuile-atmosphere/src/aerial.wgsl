@@ -98,7 +98,19 @@ fn air_column(height_a: f32, height_b: f32, distance: f32, scale_height: f32) ->
     return exp(-low / scale_height) * falling_mean(x) * distance;
 }
 
-fn aerial_perspective(lit: vec3f, world: vec3f, air: Air) -> vec3f {
+/// The air between the eye and `world`, a fragment in render space, laid
+/// over `lit`, the fragment's own light.
+///
+/// `height` is the ground's height over the air's sphere (`air.earth`) as the
+/// mesh means it: its vertices' heights, carried across the triangle — the
+/// rasteriser's interpolation of a height each vertex works out. Never
+/// `world`'s own: a coarse tile's flat triangle between three vertices on
+/// the ground is a chord, kilometres under that ground inside it, and read
+/// there the air under each facet's middle was air at sea level — a blotch
+/// of haze a facet, a darker lattice through the vertices, on high ground
+/// seen from far off. Where triangles are small the two agree to
+/// centimetres.
+fn aerial_perspective(lit: vec3f, world: vec3f, height: f32, air: Air) -> vec3f {
     let strength = air.mie.w;
     // Uniform across the draw: it comes from a uniform buffer, and nothing
     // inside samples a texture, so branching here is free and legal.
@@ -109,7 +121,7 @@ fn aerial_perspective(lit: vec3f, world: vec3f, air: Air) -> vec3f {
     let to_eye = air.eye.xyz - world;
     let distance = length(to_eye);
     let up = normalize(world - air.earth.xyz);
-    let ground_height = max(length(world - air.earth.xyz) - air.earth.w, 0.0);
+    let ground_height = max(height, 0.0);
     let eye_height = air.eye.w;
 
     // How much air is actually on this ray, integrated rather than averaged.

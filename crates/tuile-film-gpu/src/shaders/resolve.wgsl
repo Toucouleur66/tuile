@@ -73,6 +73,36 @@ fn lerp3(b: vec2f, x: vec2f, y: vec2f, z: vec2f) -> vec2f {
 // reach: see `resolve`.
 const VEIL_BOUND: f32 = 6.0;
 
+// The ground the triangle means where the pixel meets it, for the air: `p`,
+// moved along the vertical by how far the flat triangle lies under the
+// ground its vertices' heights describe.
+//
+// A terrain tile's vertices are on the ground, and its heights run linearly
+// between them; the flat triangle between three vertices is a chord. Inside
+// a facet of 5° — the first levels of tiles, which a zoom-out draws — it
+// lies up to 12 km under that ground. Read there, the air under each
+// facet's middle ended in kilometres of sea-level air, and a sea seen from
+// orbit was a blotch of haze a facet, a darker lattice through its
+// vertices. Where triangles are small the two are all but one point: a
+// facet a kilometre across lies at most four centimetres under.
+//
+// Heights over a sphere about `centre`. What a point rises above the first
+// vertex, `a`, is a difference of squares over a sum, so that no f32
+// subtracts two radii: the sag is good to a centimetre for a facet of
+// hundreds of kilometres, and is nothing at all at the vertices, where its
+// terms are the same arithmetic. `held` is where the pixel is on the
+// triangle: `p = a + held.x * e1 + held.y * e2`.
+fn meant_ground(p: vec3f, a: vec3f, e1: vec3f, e2: vec3f, held: vec2f, centre: vec3f) -> vec3f {
+    let q = a - centre;
+    let w = held.x * e1 + held.y * e2;
+    let r = length(q);
+    let rise1 = (2.0 * dot(q, e1) + dot(e1, e1)) / (length(q + e1) + r);
+    let rise2 = (2.0 * dot(q, e2) + dot(e2, e2)) / (length(q + e2) + r);
+    let rise = (2.0 * dot(q, w) + dot(w, w)) / (length(q + w) + r);
+    let sag = held.x * rise1 + held.y * rise2 - rise;
+    return p + normalize(q + w) * sag;
+}
+
 @compute @workgroup_size(RESOLVE_GROUP)
 fn resolve(@builtin(global_invocation_id) id: vec3u) {
     let slot = current.slot;
@@ -169,6 +199,18 @@ fn resolve(@builtin(global_invocation_id) id: vec3u) {
         let reach = select(2.0e6, 4.0e6, physical);
         let known = all((bitcast<vec3u>(p) & vec3u(0x7f800000u)) != vec3u(0x7f800000u))
             && all(abs(p) < vec3f(reach));
+        // The ground the triangle means, where the air reads it: its own
+        // light, the air between, the veil's bound. Shadows, city lights
+        // and the probe of holes keep the drawn point — the sun's map was
+        // drawn from the same triangles.
+        var ground = p;
+        if (physical) {
+            ground = meant_ground(p, a, e1, e2, held, atmosphere.centre.xyz);
+        } else if (frame.haze.w != 0.0) {
+            // The haze's own sphere: through the eye, about the centre
+            // `air_left` curves the ground away from.
+            ground = meant_ground(p, a, e1, e2, held, -frame.local_up.xyz * (0.5 / frame.haze.z));
+        }
         var lit = 1.0;
         if (known && frame.shadow.x > 0.0 && cos > 0.0) {
             // A shadow takes the sun, and only the sun: the dome lights
@@ -183,7 +225,7 @@ fn resolve(@builtin(global_invocation_id) id: vec3u) {
             // The ground's own light, where it is: its sun and Moon through
             // the air above it, its sky — so that a terminator a frame
             // shows falls where it is, the night side lit by the night.
-            let x = p - atmosphere.centre.xyz;
+            let x = ground - atmosphere.centre.xyz;
             let r = length(x);
             let light = ground_light(r - atmosphere.centre.w, x / r, normal, ambient, lit);
             // Never darker than ground of a fortieth's reflectance: a night
@@ -196,7 +238,7 @@ fn resolve(@builtin(global_invocation_id) id: vec3u) {
             // What the air leaves of the ground, and its own light for the
             // rest. Written out: air that takes nothing leaves the ground
             // exactly as it was.
-            let left = air_left(p);
+            let left = air_left(ground);
             radiance = radiance * left + frame.horizon.xyz * (1.0 - left);
         }
         if (known && physical) {
@@ -205,7 +247,7 @@ fn resolve(@builtin(global_invocation_id) id: vec3u) {
             // towards the eye under the sun and the Moon — with, at night,
             // the floor's share of the sky's, so that far ground fades to
             // the night sky.
-            let air = air_between(p);
+            let air = air_between(ground);
             var veil = air.inscattered * atmosphere.illuminance.xyz;
             {
                 // The veil bounded: never more than a few times the light of
@@ -216,7 +258,7 @@ fn resolve(@builtin(global_invocation_id) id: vec3u) {
                 // would go. A soft bound: the veil it leaves keeps its
                 // colour and its gradient with distance.
                 let luma = vec3f(0.2126, 0.7152, 0.0722);
-                let x = p - atmosphere.centre.xyz;
+                let x = ground - atmosphere.centre.xyz;
                 let r = length(x);
                 let lit = ground_light(r - atmosphere.centre.w, x / r, x / r, ambient, 1.0);
                 let texel = 0.1 * atmosphere.illuminance.y / (ATMOSPHERE_PI * max(atmosphere.ground.y, 1e-30));
