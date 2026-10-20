@@ -2870,6 +2870,7 @@ impl FilmGpu {
                 sun: base.sun.to_array(),
                 sky: base.world.to_array(),
                 reflectance: base.reflectance,
+                camera: base.camera,
             },
         );
         let mut lit = FrameLight::new(sky.illumination, light.air);

@@ -52,6 +52,9 @@ pub struct AtmosphereParams {
     pub mie_absorption: f64,
     pub mie_scale_height: f64,
     pub mie_anisotropy: f64,
+    /// The share of the light aerosols take that they scatter rather than
+    /// absorb: what [`Self::with_mie_extinction`] splits an extinction by.
+    pub mie_albedo: f64,
     /// Ozone absorption at its densest, per metre, RGB, and its tent.
     pub ozone_absorption: [f64; 3],
     pub ozone_centre: f64,
@@ -71,6 +74,7 @@ impl Default for AtmosphereParams {
             mie_absorption: 0.0,
             mie_scale_height: MIE_SCALE_HEIGHT,
             mie_anisotropy: MIE_ANISOTROPY,
+            mie_albedo: MIE_SINGLE_SCATTERING_ALBEDO,
             ozone_absorption: OZONE_ABSORPTION,
             ozone_centre: OZONE_CENTRE,
             ozone_half_width: OZONE_HALF_WIDTH,
@@ -95,13 +99,31 @@ impl AtmosphereParams {
         self.with_mie_extinction(depth / self.mie_scale_height)
     }
 
+    /// With aerosols of optical depth `depth` straight up from sea level, in
+    /// the green — the model's 550 nm (Bruneton 2017's wavelengths are 680,
+    /// 550 and 440 nm): what a sun photometer such as AERONET's reports as
+    /// the aerosol optical depth at 550 nm. Spread over the aerosols' scale
+    /// height, it is an extinction of `depth / mie_scale_height` per metre
+    /// at sea level; against turbidity, `depth = (T − 1) · τ_R`, `τ_R` the
+    /// molecules' own depth ([`Self::rayleigh_depth`], 0.108 by default).
+    /// The model's aerosols are grey: the same depth in every channel.
+    pub fn with_aerosol_depth(self, depth: f64) -> Self {
+        self.with_mie_extinction(depth.max(0.0) / self.mie_scale_height)
+    }
+
+    /// The aerosols' optical depth straight up from sea level, in the green:
+    /// [`Self::with_aerosol_depth`]'s inverse.
+    pub fn aerosol_depth(&self) -> f64 {
+        (self.mie_scattering + self.mie_absorption) * self.mie_scale_height
+    }
+
     /// With aerosols that take `extinction` per metre at sea level, of which
-    /// they scatter [`MIE_SINGLE_SCATTERING_ALBEDO`].
+    /// they scatter [`Self::mie_albedo`].
     pub fn with_mie_extinction(self, extinction: f64) -> Self {
         let extinction = extinction.max(0.0);
         Self {
-            mie_scattering: extinction * MIE_SINGLE_SCATTERING_ALBEDO,
-            mie_absorption: extinction * (1.0 - MIE_SINGLE_SCATTERING_ALBEDO),
+            mie_scattering: extinction * self.mie_albedo,
+            mie_absorption: extinction * (1.0 - self.mie_albedo),
             ..self
         }
     }
@@ -232,5 +254,30 @@ mod tests {
                 .mie_scattering,
             0.0
         );
+    }
+
+    #[test]
+    fn an_aerosol_depth_is_turbidity_in_other_units() {
+        let p = AtmosphereParams::default();
+        // Today's clear day: turbidity 2, aerosols as deep as the molecules.
+        assert!((p.aerosol_depth() - p.rayleigh_depth()).abs() < 1e-15);
+        assert!((p.rayleigh_depth() - 0.108_464).abs() < 1e-9);
+        let clear = p.with_aerosol_depth(0.06);
+        assert!((clear.aerosol_depth() - 0.06).abs() < 1e-15);
+        assert!((clear.turbidity() - (1.0 + 0.06 / p.rayleigh_depth())).abs() < 1e-12);
+        // Spread over the scale height: the extinction at sea level.
+        let e = clear.mie_scattering + clear.mie_absorption;
+        assert!((e - 0.06 / MIE_SCALE_HEIGHT).abs() < 1e-18);
+    }
+
+    #[test]
+    fn the_aerosols_albedo_splits_their_extinction() {
+        let p = AtmosphereParams {
+            mie_albedo: 0.95,
+            ..AtmosphereParams::default()
+        }
+        .with_mie_extinction(1e-4);
+        assert!((p.mie_scattering - 0.95e-4).abs() < 1e-18);
+        assert!((p.mie_absorption - 0.05e-4).abs() < 1e-18);
     }
 }

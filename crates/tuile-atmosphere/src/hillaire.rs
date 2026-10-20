@@ -30,7 +30,7 @@ use std::f64::consts::PI;
 use glam::{DMat3, DVec3};
 use tuile_core::geo::{enu_frame, Geodetic};
 
-use crate::illumination::{Moonlight, ReferenceIllumination, DAYLIGHT_EV100};
+use crate::illumination::{CameraResponse, Moonlight, ReferenceIllumination, DAYLIGHT_EV100};
 use crate::params::{AtmosphereFrame, AtmosphereParams};
 
 /// The GPU twin: the tables' parametrisations and the marches, as WGSL
@@ -720,6 +720,7 @@ impl LutAtmosphere {
             }
         };
         let mut metered = level;
+        let meter = calibration.camera.meter_reflectance;
         if !metering.is_empty() {
             let mut sum = [0.0; 3];
             let mut counted = 0usize;
@@ -748,7 +749,7 @@ impl LutAtmosphere {
                             }
                         }
                         [0, 1, 2].map(|c| {
-                            l[c] * agree(c) * through[c] + added[c] * scale[c] / METER_REFLECTANCE
+                            l[c] * agree(c) * through[c] + added[c] * scale[c] / meter
                         })
                     }
                     Metered::Sky { eye, direction } => {
@@ -769,7 +770,7 @@ impl LutAtmosphere {
                                 l[c] += m[c] * strength;
                             }
                         }
-                        [0, 1, 2].map(|c| l[c] * scale[c] / METER_REFLECTANCE)
+                        [0, 1, 2].map(|c| l[c] * scale[c] / meter)
                     }
                 };
                 counted += 1;
@@ -801,7 +802,7 @@ impl LutAtmosphere {
         // least light, not an added one: it changes nothing lit by more.
         let least_light = f64::from(ReferenceIllumination::SHOWN_FLOOR)
             * wanted
-            * f64::from(x - crate::illumination::shown_ev(x)).exp2();
+            * f64::from(x - calibration.camera.shown_ev(x)).exp2();
         let least = tint.map(|t| t * least_light.max(floor_light) / luminance(tint));
         for c in 0..3 {
             sky_sh[0][c] += added[c] as f32;
@@ -841,7 +842,7 @@ impl LutAtmosphere {
                 sun_rgb,
                 sky_sh,
                 white,
-                adaptation: ReferenceIllumination::WHITE_ADAPTATION,
+                adaptation: calibration.camera.white_adaptation,
                 ev100,
                 compensation_ev: moment.compensation_ev,
                 night_floor: ReferenceIllumination::NIGHT_FLOOR,
@@ -1008,6 +1009,9 @@ pub struct Calibration {
     /// imagery as it stands to the ground it shows. The ground's light is
     /// not: under the reference the imagery is lit as it always was.
     pub reflectance: f32,
+    /// How the camera meets the light: its exposure's response, its white
+    /// balance, its meter.
+    pub camera: CameraResponse,
 }
 
 /// One moment's light, as [`LutAtmosphere::light`] works it out: the
@@ -1212,6 +1216,7 @@ mod tests {
         sun: [2.5, 2.45, 2.3],
         sky: [0.72, 0.76, 0.8],
         reflectance: 1.0,
+        camera: CameraResponse::TODAY,
     };
 
     fn day(to_sun_ecef: DVec3) -> Moment {

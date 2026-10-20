@@ -84,6 +84,10 @@ struct Atmosphere {
     earth: vec4f,
     // x: the sun's disc's scale; y: the Moon's; z: the glare's strength.
     discs: vec4f,
+    // x: the veil's bound; y, z: the steps of the air between the eye and
+    // the ground, under 10 km and from over it; w: nothing. Tuning values
+    // a host reads (`tuning.rs`), never the shader.
+    tuning: vec4f,
 }
 
 const ATMOSPHERE_PI: f32 = 3.14159265358979;
@@ -94,12 +98,12 @@ const MULTI_SCATTERING_SIZE: vec2f = vec2f(32.0, 32.0);
 const IRRADIANCE_SIZE: vec2f = vec2f(256.0, 16.0);
 const SKY_VIEW_SIZE: vec2f = vec2f(192.0, 108.0);
 const SUN_ANGULAR_RADIUS: f32 = 0.004652;
-// Steps of the air between the eye and the ground: `docs/19` keeps the
-// march short; the tables carry the light, the steps only the density.
-const AERIAL_STEPS: u32 = 12u;
-// From high up, the air between eye and ground is a long path of which the
-// dense part is the last: twice the steps, bunched towards the ground.
-const AERIAL_STEPS_HIGH: u32 = 24u;
+// Steps of the air between the eye and the ground, `atmosphere.tuning.y`
+// (12 by default): `docs/19` keeps the march short; the tables carry the
+// light, the steps only the density. From high up — over AERIAL_HIGH — the
+// air between eye and ground is a long path of which the dense part is the
+// last: `tuning.z` steps (twice as many by default), bunched towards the
+// ground.
 const AERIAL_HIGH: f32 = 10000.0;
 const SKY_STEPS: u32 = 30u;
 
@@ -288,8 +292,8 @@ fn air_between(p: vec3f) -> AirRay {
     let t0 = max(air_entry(eye_height, dot(normalize(o), d)), 0.0);
     if (t0 >= length_) { return ray; }
     let high = eye_height > AERIAL_HIGH;
-    var steps = AERIAL_STEPS;
-    if (high) { steps = AERIAL_STEPS_HIGH; }
+    var steps = u32(atmosphere.tuning.y);
+    if (high) { steps = u32(atmosphere.tuning.z); }
     let span = length_ - t0;
     var t_prev = 0.0;
     for (var i = 0u; i < steps; i++) {

@@ -115,7 +115,62 @@ impl Default for AerialPerspective {
     }
 }
 
+/// The viewer's air: what [`AerialPerspective`] is made of. Tuning values
+/// (`crate::tuning`), today's constants by default. The molecules and the
+/// aerosols' scale height are the film's own ([`crate::AtmosphereParams`]'s
+/// defaults); the aerosols' density and anisotropy are the viewer's, and set
+/// to the film's they make the two agree.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AerialAir {
+    /// Rayleigh scattering per metre at sea level, RGB.
+    pub rayleigh_scattering: [f32; 3],
+    pub rayleigh_scale_height: f32,
+    /// Mie *scattering* per metre at sea level — not extinction: the
+    /// closed form takes no absorption.
+    pub mie_scattering: f32,
+    pub mie_scale_height: f32,
+    pub mie_anisotropy: f32,
+    /// What the optical depth is scaled by; 0 draws no air.
+    pub strength: f32,
+}
+
+impl Default for AerialAir {
+    fn default() -> Self {
+        Self {
+            rayleigh_scattering: RAYLEIGH_SCATTERING,
+            rayleigh_scale_height: RAYLEIGH_SCALE_HEIGHT,
+            mie_scattering: MIE_SCATTERING,
+            mie_scale_height: MIE_SCALE_HEIGHT,
+            mie_anisotropy: MIE_ANISOTROPY,
+            strength: 1.0,
+        }
+    }
+}
+
 impl AerialPerspective {
+    /// For an eye at `eye_ecef`, with tiles rebased onto `render_origin`,
+    /// lit by `sun`, through `air` — its strength scaled by `strength` (the
+    /// viewer's checkbox: 0 or 1).
+    pub fn of_air(
+        eye_ecef: DVec3,
+        render_origin: DVec3,
+        sun: &Sun,
+        air: &AerialAir,
+        strength: f32,
+    ) -> Self {
+        let r = air.rayleigh_scattering;
+        Self {
+            rayleigh: [r[0], r[1], r[2], air.rayleigh_scale_height],
+            mie: [
+                air.mie_scattering,
+                air.mie_scale_height,
+                air.mie_anisotropy,
+                air.strength * strength,
+            ],
+            ..Self::new(eye_ecef, render_origin, sun, strength)
+        }
+    }
+
     /// For an eye at `eye_ecef`, with tiles rebased onto `render_origin`, lit by
     /// `sun`.
     ///
@@ -155,6 +210,7 @@ impl AerialPerspective {
         }
     }
 
+    /// Whether any air is drawn.
     pub fn is_enabled(&self) -> bool {
         self.mie[3] > 0.0
     }

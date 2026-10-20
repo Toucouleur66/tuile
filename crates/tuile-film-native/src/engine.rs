@@ -205,6 +205,12 @@ impl RenderSpec {
     /// The rendering it asks for. A colour that is not three values, none
     /// below zero, is refused.
     pub fn rendering(&self) -> Result<Rendering, Error> {
+        self.rendering_under(&tuile_atmosphere::AirTuning::from_env()?)
+    }
+
+    /// [`Self::rendering`] under the air's settings `air`, rather than the
+    /// environment's: what the look starts from, the spec's own over them.
+    pub fn rendering_under(&self, air: &tuile_atmosphere::AirTuning) -> Result<Rendering, Error> {
         use crate::setup::rgb;
         let mut order = Order {
             scale: self.scale,
@@ -231,6 +237,9 @@ impl RenderSpec {
             .as_deref()
             .map(tuile_tape::Clock::parse)
             .transpose()?;
+        // The air's settings, today's where the environment states none:
+        // what the look starts from, the spec's own over them.
+        order.look = order.look.tuned(air);
         if let Some(scale) = self.sun_scale {
             order.look.sun_scale = scale;
         }
@@ -254,7 +263,7 @@ impl RenderSpec {
             );
         }
         if self.atmosphere || self.turbidity.is_some() {
-            order.look.atmosphere = Some(tuile_film::AtmosphereParams::default());
+            order.look.atmosphere = Some(air.params);
             order.look.turbidity = self.turbidity;
         }
         let look = &mut order.look;
@@ -323,12 +332,19 @@ pub fn film_prefix(packs: &str, rendering: &Rendering) -> String {
 #[cfg(test)]
 const FROZEN_DEFAULT_LOOK: &str = "ff9e7af3dbfa95e5";
 
-const LATER_FIELDS: [&str; 5] = [
+const LATER_FIELDS: [&str; 10] = [
     ", clock: None",
     ", sun_scale: 1.0",
     ", moon_scale: 1.0",
     ", glare: 1.0",
     ", penumbra_scale: 1.0",
+    // The air's settings as tuning values (`tuile_atmosphere::tuning`):
+    // at today's constants, the name a film had before they were.
+    ", mie_albedo: 0.8999999999999999",
+    ", camera: CameraResponse { follows: 0.75, night_depth_ev: 3.0, white_adaptation: 0.35, meter_reflectance: 0.18 }",
+    ", veil_bound: 6.0",
+    ", march_steps: [12, 24]",
+    ", highlight_knee: 0.5",
 ];
 
 /// The text a rendering is named by: everything but which frames are
@@ -632,6 +648,29 @@ mod tests {
             |r| r.bitrate = 45_000_000,
             |r| r.sun = Some((255.0, 10.0)),
             |r| r.order.stereo = Some(tuile_film::Stereo::default()),
+            |r| r.order.look.camera.follows = 0.6,
+            |r| r.order.look.camera.meter_reflectance = 0.25,
+            |r| r.order.look.veil_bound = 3.0,
+            |r| r.order.look.march_steps = [16, 24],
+            |r| r.order.look.highlight_knee = 0.6,
+            |r| r.order.look.reflectance = 5.0,
+            |r| r.order.look.atmosphere = Some(tuile_film::AtmosphereParams::default()),
+            |r| {
+                r.order.look.atmosphere = Some(tuile_film::AtmosphereParams {
+                    mie_albedo: 0.95,
+                    ..tuile_film::AtmosphereParams::default()
+                })
+            },
+            |r| {
+                r.order.look.atmosphere =
+                    Some(tuile_film::AtmosphereParams::default().with_aerosol_depth(0.06))
+            },
+            |r| {
+                r.order.look.atmosphere = Some(tuile_film::AtmosphereParams {
+                    mie_scale_height: 2000.0,
+                    ..tuile_film::AtmosphereParams::default()
+                })
+            },
         ] {
             let mut changed = rendering();
             change(&mut changed);
@@ -640,5 +679,67 @@ mod tests {
         others.push(film);
         let distinct: std::collections::HashSet<&String> = others.iter().collect();
         assert_eq!(distinct.len(), others.len(), "{others:?}");
+    }
+
+    #[test]
+    fn at_todays_air_an_atmosphere_film_keeps_the_name_it_had() {
+        // The tuning values' fields at their defaults are left out of the
+        // name, so an atmosphere film's text is the one it was before they
+        // existed, field for field.
+        let mut r = rendering();
+        r.order.look.atmosphere = Some(tuile_film::AtmosphereParams::default());
+        let text = canonical(&r);
+        for gone in [
+            "mie_albedo",
+            "camera:",
+            "veil_bound",
+            "march_steps",
+            "highlight_knee",
+        ] {
+            assert!(!text.contains(gone), "{gone} in {text}");
+        }
+        assert!(text.contains("mie_anisotropy: 0.8, ozone_absorption"), "{text}");
+    }
+
+    #[test]
+    fn the_air_s_settings_reach_the_rendering_and_its_name() {
+        let air = tuile_atmosphere::AirTuning::from_lookup(|k| {
+            match k {
+                "TUILE_AIR_AOD_550" => Some("0.05"),
+                "TUILE_AIR_VEIL_BOUND" => Some("4"),
+                "TUILE_LOOK_EXPOSURE_EV" => Some("0.5"),
+                _ => None,
+            }
+            .map(String::from)
+        })
+        .expect("in range");
+        let spec = RenderSpec {
+            atmosphere: true,
+            sun: Some((180.0, 40.0)),
+            ..RenderSpec::default()
+        };
+        let tuned = spec.rendering_under(&air).expect("tuned");
+        let look = tuned.order.look;
+        assert_eq!(look.atmosphere, Some(air.params));
+        assert_eq!((look.veil_bound, look.exposure_ev), (4.0, 0.5));
+        // The spec's own flags win over the environment's.
+        let flagged = RenderSpec {
+            exposure: Some(1.5),
+            ..spec.clone()
+        }
+        .rendering_under(&air)
+        .expect("flagged");
+        assert_eq!(flagged.order.look.exposure_ev, 1.5);
+        let today = spec
+            .rendering_under(&tuile_atmosphere::AirTuning::default())
+            .expect("today");
+        assert_eq!(
+            today.order.look.atmosphere,
+            Some(tuile_film::AtmosphereParams::default())
+        );
+        assert_ne!(
+            film_prefix("packs/abc.references", &tuned),
+            film_prefix("packs/abc.references", &today)
+        );
     }
 }
