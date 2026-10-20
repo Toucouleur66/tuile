@@ -601,3 +601,80 @@ fn a_completing_script_brings_the_floor_in() {
     assert!(decided_something(&tr));
     assert!(tr.iter().any(|r| r.floor_in));
 }
+
+/// I2, a counterexample `only_the_protected_set_overflows` found on
+/// 2026-10-20 (random seed), shrunk by proptest and kept as it came.
+///
+/// At step 15, the first under critical pressure, the pool's target falls to
+/// 1 556 425 bytes: the terrain holds 1 024 000, all protected, so the drape's
+/// effective target is its floor, 40 % of the pool, 622 570. The drapes hold
+/// two unprotected drapes of 349 524, 699 048 bytes: evicting one would leave
+/// 349 524, under the floor, so the sweep keeps both (`evict_pooled`: for the
+/// pool's sake, only down to its floor) and I2 breaks by less than one drape.
+/// The specification asks both — I2's unprotected bytes within the target,
+/// and §15.1's sweep with no member below its floor — and at one resource's
+/// granularity they cannot both hold here: which yields is a specification
+/// decision.
+#[test]
+#[ignore = "red: I2 against the pool floor at one resource's granularity (spec §15.1 vs I2), Laurent's decision"]
+fn only_the_protected_set_overflows_under_critical_pressure() {
+    use Op::*;
+    let ops = [
+        Step(14221606094138882575),
+        Fail(9247058294758764962),
+        Step(407097014948790927),
+        Step(4602890098571774514),
+        Wait(467),
+        Fail(2380909755978544125),
+        Load(2931322212256554779),
+        Step(476479648722239456),
+        Load(5583206321300288920),
+        Fail(2551855388808382338),
+        Step(14912161159751138441),
+        Step(7362518111398382727),
+        Wait(484),
+        Load(6195026662679607468),
+        Step(9641043605914621264),
+        Fail(1977524987867638),
+        Fail(0),
+        Step(87764535625442709),
+        Upload(981173675061591633),
+        Load(4002932718903631496),
+        Step(2106386299728441571),
+        Step(7251024675101495551),
+        Upload(0),
+        Step(488645390518),
+        Upload(0),
+        Upload(0),
+        Step(905582427387015119),
+        Thermal(0),
+        Upload(0),
+        Step(1618427100598063901),
+        Fail(647557445613936138),
+        Load(10851023134809040177),
+        Step(1636695720543371659),
+        Load(0),
+        Load(0),
+        Upload(2008301256151071165),
+        Step(907489178961695111),
+        Pressure(2),
+        Step(0),
+        Step(0),
+        Step(0),
+        Step(0),
+        Step(0),
+    ];
+    let tr = trace(interactive(), &ops);
+    for (k, rec) in tr.iter().enumerate() {
+        let s = &rec.d.stats;
+        for class in Class::ALL {
+            assert!(
+                s.gpu[class].minus(s.protected[class]) <= s.target[class],
+                "step {k}, {class:?}: {} bytes on the GPU, {} protected, target {}",
+                s.gpu[class].0,
+                s.protected[class].0,
+                s.target[class].0
+            );
+        }
+    }
+}
