@@ -124,12 +124,21 @@ impl WorkerStream {
         let (to_page, inbox) = mpsc::unbounded();
         let connection = connect(
             port.clone(),
-            move |bytes| match wire::decode_server(&bytes) {
-                Ok(message) => {
-                    // A closed inbox is a stream its host has dropped.
-                    let _ = to_page.unbounded_send(message);
+            move |bytes| match wire::unframe(&bytes) {
+                Ok(messages) => {
+                    for bytes in messages {
+                        match wire::decode_server(bytes) {
+                            // A closed inbox is a stream its host has dropped.
+                            Ok(message) => {
+                                let _ = to_page.unbounded_send(message);
+                            }
+                            Err(e) => {
+                                tracing::error!("a message from the worker did not read back: {e}")
+                            }
+                        }
+                    }
                 }
-                Err(e) => tracing::error!("a message from the worker did not read back: {e}"),
+                Err(e) => tracing::error!("a frame from the worker did not read back: {e}"),
             },
             host,
         );
@@ -139,7 +148,14 @@ impl WorkerStream {
         // returns to the browser, and ends with the stream.
         wasm_bindgen_futures::spawn_local(async move {
             while let Some(message) = outgoing.next().await {
-                port.post(&wire::encode_client(&message));
+                // Everything sent by now goes in one post: a frame's
+                // acknowledgements and its camera, decided on once (see
+                // `wire::frame`).
+                let mut batch = vec![wire::encode_client(&message)];
+                while let Ok(more) = outgoing.try_recv() {
+                    batch.push(wire::encode_client(&more));
+                }
+                port.post(&wire::frame(&batch));
             }
         });
         (Self { outbox, inbox }, connection)
@@ -174,13 +190,24 @@ pub fn serve(stream: InProcessStream, host: impl FnMut(JsValue) + 'static) -> Co
     let sending = Rc::clone(&stream);
     let connection = connect(
         port.clone(),
-        move |bytes| match wire::decode_client(&bytes) {
-            Ok(message) => {
-                if sending.borrow().send(message).is_err() {
-                    tracing::warn!("the geometry server has stopped; a message was dropped");
+        move |bytes| match wire::unframe(&bytes) {
+            Ok(messages) => {
+                for bytes in messages {
+                    match wire::decode_client(bytes) {
+                        Ok(message) => {
+                            if sending.borrow().send(message).is_err() {
+                                tracing::warn!(
+                                    "the geometry server has stopped; a message was dropped"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("a message from the page did not read back: {e}")
+                        }
+                    }
                 }
             }
-            Err(e) => tracing::error!("a message from the page did not read back: {e}"),
+            Err(e) => tracing::error!("a frame from the page did not read back: {e}"),
         },
         host,
     );
@@ -188,7 +215,14 @@ pub fn serve(stream: InProcessStream, host: impl FnMut(JsValue) + 'static) -> Co
         while let Some(message) =
             futures_util::future::poll_fn(|cx| stream.borrow_mut().poll_message(cx)).await
         {
-            port.post(&wire::encode_server(&message));
+            // What the server has sent by now goes in one post.
+            let mut batch = vec![wire::encode_server(&message)];
+            let waker = futures_util::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            while let Poll::Ready(Some(more)) = stream.borrow_mut().poll_message(&mut cx) {
+                batch.push(wire::encode_server(&more));
+            }
+            port.post(&wire::frame(&batch));
         }
     });
     connection

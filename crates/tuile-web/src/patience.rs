@@ -11,7 +11,13 @@
 //! the browser, kept apart from the `fetch` calls so that it can be tested on
 //! any host.
 //!
-//! - Every attempt is given [`ATTEMPT_TIMEOUT`], then aborted.
+//! - Every attempt is given its asker's [`attempt_timeout`], then aborted.
+//!   The timer runs from the `fetch` call, so it counts the time the request
+//!   waits for one of the browser's few connections per host: a tile load,
+//!   whose drape asks for a mosaic of imagery tiles at once, is given as long
+//!   as the budget gives the load ([`LOAD_ATTEMPT_TIMEOUT`]) — at 12 s, a
+//!   view near the ground queued hundreds of requests behind six connections
+//!   per host and timed most of them out, the drapes failing whole.
 //! - A **tile load** is asked once ([`Asker::Load`]). Its retries are the
 //!   budget's: a failed or timed-out load is retried with a backoff
 //!   (`FailurePolicy::RetryBackoff`) while it is still wanted, and its time
@@ -26,8 +32,22 @@
 
 use std::time::Duration;
 
-/// How long one attempt may take, headers and body together.
+/// How long one attempt of a session request may take, headers and body
+/// together.
 pub const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// How long one attempt of a tile load may take: the browser profile's load
+/// timeout, so the transport never gives up on a load the budget still
+/// waits for.
+pub const LOAD_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long one attempt of `asker` may take.
+pub fn attempt_timeout(asker: Asker) -> Duration {
+    match asker {
+        Asker::Load => LOAD_ATTEMPT_TIMEOUT,
+        Asker::Session => ATTEMPT_TIMEOUT,
+    }
+}
 
 /// Attempts in all for a session request, the first included.
 pub const ATTEMPTS: u32 = 3;
@@ -52,7 +72,7 @@ const LONGEST_PAUSE: Duration = Duration::from_secs(3);
 pub enum Ended {
     /// The origin answered with this status.
     Answered(u16),
-    /// No answer within [`ATTEMPT_TIMEOUT`]: aborted.
+    /// No answer within the attempt's timeout: aborted.
     TimedOut,
     /// The browser could not reach the origin.
     Failed,
@@ -81,7 +101,7 @@ pub fn longest(asker: Asker) -> Duration {
     let mut total = Duration::ZERO;
     let mut attempt = 1;
     loop {
-        total += ATTEMPT_TIMEOUT;
+        total += attempt_timeout(asker);
         match again(asker, attempt, Ended::TimedOut) {
             Some(pause) => total += pause,
             None => return total,
@@ -138,7 +158,7 @@ mod tests {
         ] {
             assert_eq!(again(Load, 1, ended), None, "{ended:?}");
         }
-        assert_eq!(longest(Load), ATTEMPT_TIMEOUT);
+        assert_eq!(longest(Load), LOAD_ATTEMPT_TIMEOUT);
     }
 
     /// A request that never answers holds what waits on it for less than a

@@ -434,6 +434,35 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerMessage, WireError> {
     Ok(message)
 }
 
+/// Several messages in one buffer, as one `postMessage` carries them: each
+/// prefixed with its length.
+///
+/// One message per post made one event per message on the other side — a
+/// frame's acknowledgements, dozens of them, each its own event, and the
+/// geometry server deciding once per event on a worker's single thread: the
+/// decisions starved the fetches and decodes they were waiting on. A frame's
+/// messages now cross together and are decided on once.
+pub fn frame(messages: &[Vec<u8>]) -> Vec<u8> {
+    let mut w = Writer::default();
+    w.len(messages.len());
+    for m in messages {
+        w.bytes(m);
+    }
+    w.0
+}
+
+/// The messages of a [`frame`], each still encoded.
+pub fn unframe(bytes: &[u8]) -> Result<Vec<&[u8]>, WireError> {
+    let mut r = Reader::new(bytes);
+    let n = r.len()?;
+    let mut out = Vec::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        out.push(r.bytes()?);
+    }
+    r.finish()?;
+    Ok(out)
+}
+
 #[derive(Default)]
 struct Writer(Vec<u8>);
 
@@ -1346,6 +1375,33 @@ mod tests {
         for message in messages {
             let back = decode_client(&encode_client(&message)).expect("reads back");
             assert_eq!(format!("{back:?}"), format!("{message:?}"));
+        }
+    }
+
+    /// A frame carries its messages whole and in order, and a damaged one
+    /// is refused.
+    #[test]
+    fn a_frame_carries_its_messages_in_order() {
+        let messages = [
+            ClientMessage::ReleaseBeyond { bytes: 3 },
+            ClientMessage::Ack {
+                resource: ResourceId::Mesh(TileId(9)),
+                gen: Generation(2),
+                bytes: 77,
+            },
+            ClientMessage::Retarget { total_bytes: 5 },
+        ];
+        let encoded: Vec<Vec<u8>> = messages.iter().map(encode_client).collect();
+        let framed = frame(&encoded);
+        let back: Vec<String> = unframe(&framed)
+            .expect("unframes")
+            .into_iter()
+            .map(|b| format!("{:?}", decode_client(b).expect("reads back")))
+            .collect();
+        let want: Vec<String> = messages.iter().map(|m| format!("{m:?}")).collect();
+        assert_eq!(back, want);
+        for cut in 0..framed.len() {
+            assert!(unframe(&framed[..cut]).is_err(), "cut at {cut}");
         }
     }
 
