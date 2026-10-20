@@ -29,8 +29,10 @@ pub struct SessionConfig {
     /// [`BudgetConfig::batch`] — unbounded, exact, never cancelling what a
     /// frame needs. A frame is answered when the server says every mesh and
     /// drape it needs is held (`frame_ready`, I13); a load that takes longer
-    /// than its `load_timeout` (120 s) or fails ends the session with the
-    /// reason (`FailurePolicy::EndSession`): a bake never ships a hole.
+    /// than its `load_timeout` or fails ends the session with the reason
+    /// (`FailurePolicy::EndSession`): a bake never ships a hole. The
+    /// timeout is 120 s by default and the host's to set — here, or by
+    /// `TUILE_LOAD_TIMEOUT_S` — to cover its client's retry envelope.
     /// [`exact_budget`] applies the environment's knobs to it.
     pub budget: BudgetConfig,
     /// Longest a single frame may take to become ready.
@@ -1694,6 +1696,10 @@ pub fn exact_traversal(mut config: Config) -> Config {
 ///   cold frame's cost. `-1` leaves no floor.
 /// - `TUILE_IMAGERY_BOOST` is how many levels a drape may climb above its
 ///   terrain tile (`imagery_over_terrain_cap`).
+/// - `TUILE_LOAD_TIMEOUT_S` is how long one load may take before the
+///   session ends on it (`load_timeout`, 120 s in `BudgetConfig::batch`):
+///   set it to cover the retry envelope of the client the tiles come
+///   through, every attempt and backoff of one tile.
 ///
 /// Public for the same reason as [`exact_traversal`]: what decides a
 /// frame's content goes into the name of the scene a pack is the bake of
@@ -1712,6 +1718,13 @@ pub fn exact_budget(mut budget: BudgetConfig) -> BudgetConfig {
         .parse::<u32>()
     {
         budget.imagery_over_terrain_cap = cap;
+    }
+    if let Some(seconds) = std::env::var("TUILE_LOAD_TIMEOUT_S")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|s| s.is_finite() && *s > 0.0)
+    {
+        budget.load_timeout = tuile_core::budget::Micros((seconds * 1e6) as u64);
     }
     budget
 }
