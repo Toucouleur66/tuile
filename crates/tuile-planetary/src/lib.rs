@@ -519,20 +519,35 @@ type ImageryAnswer = Result<(ImageryCoord, Arc<DecodedTexture>), String>;
 /// itself, at the same moment: a browser showed the same quadkeys two and
 /// three times over, each holding a connection, and serialised them behind
 /// its cache lock — the pending requests under which the page stopped.
-#[derive(Default)]
-struct ImageryInFlight(Mutex<HashMap<(u64, ImageryCoord), Vec<Waiter>>>);
+///
+/// The same holds of terrain: every tile past the source's data is cut from
+/// its ancestor, and a whole block of them loading at once fetched that one
+/// ancestor once each — a browser showed one terrain tile requested 23 times,
+/// many of them at once ([`TerrainInFlight`]).
+struct InFlight<K, A>(Mutex<HashMap<K, Vec<futures_channel::oneshot::Sender<A>>>>);
 
-/// Where a waiting asker is told the answer.
-type Waiter = futures_channel::oneshot::Sender<ImageryAnswer>;
-
-/// Whether an asker fetches, or waits for the one that does.
-enum Turn {
-    Lead,
-    Wait(futures_channel::oneshot::Receiver<ImageryAnswer>),
+impl<K, A> Default for InFlight<K, A> {
+    fn default() -> Self {
+        Self(Mutex::new(HashMap::new()))
+    }
 }
 
-impl ImageryInFlight {
-    fn join(&self, key: (u64, ImageryCoord)) -> Turn {
+type ImageryInFlight = InFlight<(u64, ImageryCoord), ImageryAnswer>;
+
+/// What every asker of one terrain tile is answered: its mesh, or why not.
+type TerrainAnswer = Result<Arc<tuile_terrain::QuantizedMesh>, String>;
+
+/// The terrain tiles being fetched or built, by coord.
+type TerrainInFlight = InFlight<TileCoord, TerrainAnswer>;
+
+/// Whether an asker fetches, or waits for the one that does.
+enum Turn<A> {
+    Lead,
+    Wait(futures_channel::oneshot::Receiver<A>),
+}
+
+impl<K: std::hash::Hash + Eq + Copy, A: Clone> InFlight<K, A> {
+    fn join(&self, key: K) -> Turn<A> {
         let mut flights = self.0.lock().unwrap_or_else(|e| e.into_inner());
         match flights.get_mut(&key) {
             Some(waiting) => {
@@ -557,13 +572,13 @@ impl ImageryInFlight {
 /// The asker that fetches. Dropped without [`Leading::finish`] — cancelled —
 /// it lets go of the tile, and its waiters' channels close: the next of them
 /// fetches.
-struct Leading<'a> {
-    flight: &'a ImageryInFlight,
-    key: (u64, ImageryCoord),
+struct Leading<'a, K: std::hash::Hash + Eq, A> {
+    flight: &'a InFlight<K, A>,
+    key: K,
 }
 
-impl Leading<'_> {
-    fn finish(self, answer: &ImageryAnswer) {
+impl<K: std::hash::Hash + Eq, A: Clone> Leading<'_, K, A> {
+    fn finish(self, answer: &A) {
         let waiting = self
             .flight
             .0
@@ -577,7 +592,7 @@ impl Leading<'_> {
     }
 }
 
-impl Drop for Leading<'_> {
+impl<K: std::hash::Hash + Eq, A> Drop for Leading<'_, K, A> {
     fn drop(&mut self) {
         self.flight
             .0
@@ -611,6 +626,8 @@ pub struct PlanetaryLoader<T: TerrainSource, I: ImageryProvider> {
     /// The imagery tiles being fetched, so a tile several terrain tiles want
     /// at once is fetched once: see [`ImageryInFlight`].
     fetching: ImageryInFlight,
+    /// The terrain tiles being fetched or built, likewise.
+    building: TerrainInFlight,
     /// Where decoding and resampling run.
     ///
     /// Not a detail of taste: the server is one future, so any CPU work left in
@@ -837,6 +854,38 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
     /// fewer triangles per unit of ground — the mesh stops improving where the
     /// data stops, while the imagery draped on it keeps sharpening.
     fn terrain_mesh<'a>(&'a self, coord: TileCoord) -> MeshFuture<'a> {
+        Box::pin(async move {
+            if let Some(mesh) = self.meshes.lock().expect("mesh cache").get(coord) {
+                return Ok(mesh);
+            }
+            // One fetch or build per tile at a time: whoever else wants it
+            // waits for that one's answer. A leader dropped — its load
+            // cancelled — lets the tile go, and the next asker leads.
+            loop {
+                match self.building.join(coord) {
+                    Turn::Wait(answer) => match answer.await {
+                        Ok(answer) => return answer.map_err(LoadError::Failed),
+                        Err(futures_channel::oneshot::Canceled) => continue,
+                    },
+                    Turn::Lead => {
+                        let lead = Leading {
+                            flight: &self.building,
+                            key: coord,
+                        };
+                        let answer = self.terrain_mesh_once(coord).await.map_err(|e| match e {
+                            LoadError::Failed(why) => why,
+                            other => other.to_string(),
+                        });
+                        lead.finish(&answer);
+                        return answer.map_err(LoadError::Failed);
+                    }
+                }
+            }
+        })
+    }
+
+    /// [`Self::terrain_mesh`], for the one asker that fetches or builds.
+    fn terrain_mesh_once<'a>(&'a self, coord: TileCoord) -> MeshFuture<'a> {
         Box::pin(async move {
             if let Some(mesh) = self.meshes.lock().expect("mesh cache").get(coord) {
                 return Ok(mesh);
@@ -1653,6 +1702,7 @@ where
         cache: Mutex::new(ImageryCache::new(512)),
         meshes: Mutex::new(MeshCache::new(512)),
         fetching: ImageryInFlight::default(),
+        building: TerrainInFlight::default(),
         availability,
         provenance: Arc::clone(&provenance),
         heights: Arc::clone(&heights),
@@ -1689,6 +1739,68 @@ mod tests {
         }
     }
 
+    /// A terrain source that has nothing, says so after a turn of the
+    /// executor (so that loads overlap), and counts every request.
+    struct Barren(std::sync::atomic::AtomicUsize);
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl tuile_terrain::TerrainSource for Barren {
+        async fn fetch_tile(
+            &self,
+            coord: TileCoord,
+        ) -> Result<tuile_core::fetch::Fetched<Vec<u8>>, tuile_terrain::TerrainSourceError>
+        {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut turned = false;
+            futures_util::future::poll_fn(|cx| {
+                if turned {
+                    std::task::Poll::Ready(())
+                } else {
+                    turned = true;
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+            Err(tuile_terrain::TerrainSourceError::no_such_tile(format!(
+                "{coord:?}"
+            )))
+        }
+    }
+
+    /// **One terrain tile is asked for once at a time**, however many loads
+    /// need it together: two siblings built from the same ancestors fetch
+    /// each ancestor once between them — four requests, not six. A browser
+    /// showed one terrain tile requested 23 times, many of them at once.
+    #[test]
+    fn concurrent_loads_ask_for_a_shared_ancestor_once() {
+        let scheme = GeographicTilingScheme::default();
+        let loader = PlanetaryLoader {
+            terrain: Barren(std::sync::atomic::AtomicUsize::new(0)),
+            imagery: CountingImagery(std::sync::atomic::AtomicUsize::new(0)),
+            scheme,
+            opts: GlobeOptions::default(),
+            cache: Mutex::new(ImageryCache::new(8)),
+            meshes: Mutex::new(MeshCache::new(8)),
+            fetching: ImageryInFlight::default(),
+            building: TerrainInFlight::default(),
+            availability: Arc::new(tuile_terrain::Availability::default()),
+            provenance: Arc::default(),
+            heights: Arc::new(TerrainHeights::new(scheme)),
+            offload: offload::inline(),
+        };
+        let (a, b) = futures_executor::block_on(futures_util::future::join(
+            loader.terrain_mesh(TileCoord::new(2, 0, 0)),
+            loader.terrain_mesh(TileCoord::new(2, 1, 0)),
+        ));
+        assert!(a.is_err() && b.is_err(), "the source has nothing");
+        assert_eq!(
+            loader.terrain.0.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "two siblings, their parent and the root, once each"
+        );
+    }
+
     /// A terrain source that is never reached: `drape` does not touch it.
     struct NoTerrain;
 
@@ -1718,6 +1830,7 @@ mod tests {
             cache: Mutex::new(ImageryCache::new(8)),
             meshes: Mutex::new(MeshCache::new(8)),
             fetching: ImageryInFlight::default(),
+            building: TerrainInFlight::default(),
             availability: Arc::new(tuile_terrain::Availability::default()),
             provenance: Arc::default(),
             heights: Arc::new(TerrainHeights::new(scheme)),
@@ -1804,6 +1917,7 @@ mod tests {
             cache: Mutex::new(ImageryCache::new(64)),
             meshes: Mutex::new(MeshCache::new(8)),
             fetching: ImageryInFlight::default(),
+            building: TerrainInFlight::default(),
             availability: Arc::new(tuile_terrain::Availability::default()),
             provenance: Arc::default(),
             heights: Arc::new(TerrainHeights::new(scheme)),
@@ -1926,6 +2040,7 @@ mod tests {
             cache: Mutex::new(ImageryCache::new(64)),
             meshes: Mutex::new(MeshCache::new(8)),
             fetching: ImageryInFlight::default(),
+            building: TerrainInFlight::default(),
             availability: Arc::new(tuile_terrain::Availability::default()),
             provenance: Arc::default(),
             heights: Arc::new(TerrainHeights::new(scheme)),
