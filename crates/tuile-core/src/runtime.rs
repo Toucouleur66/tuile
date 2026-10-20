@@ -2293,6 +2293,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn draped_session(
         dir: &std::path::Path,
     ) -> (
