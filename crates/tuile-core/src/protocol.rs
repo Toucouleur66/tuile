@@ -76,6 +76,14 @@ pub enum ClientMessage {
     /// until the GPU holds at most `bytes`. Deterministic; announced with
     /// [`ServerMessage::Evict`].
     ReleaseBeyond { bytes: u64 },
+    /// Batch: the views of the frames to come, in their order, known in
+    /// advance. Their tiles are the need's prefetch ring: loaded with what
+    /// the current views leave of the load slots, preempted by anything
+    /// they wait on, never drawn, never awaited by a frame — and needed,
+    /// so a [`ClientMessage::ReleaseBeyond`] keeps them. What a frame
+    /// selects is the same with or without them; only when its tiles
+    /// arrive changes. Replaces the views ahead given before; empty, none.
+    Ahead { views: Vec<ViewState> },
 }
 
 /// What the tree knows about a tile, travelling with every message that names
