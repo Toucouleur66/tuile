@@ -306,6 +306,7 @@ mod tests {
             opening: 0,
             store: std::env::temp_dir().join("launch-test"),
             config: tuile_core::traversal::Config::default(),
+            budget: crate::profile::Profile::desktop().budget(),
             profile: crate::profile::Profile::desktop(),
             timeout: crate::launch::START_TIMEOUT,
         }
