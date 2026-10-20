@@ -119,12 +119,10 @@ impl Profile {
     /// The desktop application: a quarter of the machine's memory for the
     /// GPU's ground, between 1 and 4 GiB — what unified memory carries
     /// beside a compositor and a browser.
+    /// A page's is [`Self::browser`].
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn desktop() -> Self {
-        #[cfg(not(target_arch = "wasm32"))]
-        let physical = crate::device::memory().physical;
-        #[cfg(target_arch = "wasm32")]
-        let physical = 16 * 1024 * MIB;
-        Self::desktop_with(physical)
+        Self::desktop_with(crate::device::memory().physical)
     }
 
     /// [`Self::desktop`] on a machine of `physical` bytes.

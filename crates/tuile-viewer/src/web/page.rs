@@ -112,7 +112,7 @@ pub fn start_viewer(
     let profile = Profile::browser(handheld, options.device_memory);
     tracing::info!(
         handheld,
-        resident_mib = profile.resident_budget_bytes >> 20,
+        gpu_mib = profile.gpu_bytes >> 20,
         backend = ?options.backend,
         "browser profile"
     );
