@@ -34,8 +34,10 @@ use glam::DVec2;
 use tuile_bing::{BingImageryProvider, BingMetadata};
 use tuile_camera::GlobeCamera;
 use tuile_cesium_ion::{AssetEndpoint, IonClient, IonTerrainSource};
-use tuile_core::content::TileContent;
-use tuile_core::protocol::{ClientMessage, GeometryStream, ServerMessage};
+use tuile_core::budget::{BudgetConfig, Bytes, ResourceId, Role};
+use tuile_core::content::{DecodedTileContent, DrapeContent};
+use tuile_core::drive::SceneState;
+use tuile_core::protocol::{ClientMessage, GeometryStream, ResourceContent, ServerMessage};
 use tuile_core::raster::CachedImagery;
 use tuile_core::runtime::in_process_with;
 use tuile_core::source::TileId;
@@ -54,9 +56,9 @@ const LON_DEG: f64 = 6.50;
 const ALTITUDE_M: f64 = 6_000.0;
 /// Well below the horizon, so the view always has ground in it.
 const PITCH: f64 = 0.6;
-/// The viewer's own lens — the probe measures what the viewer will pay, and the
-/// imagery detail target goes as `tan(fovy / 2)`, so a probe on a different lens
-/// measures a different globe.
+/// The viewer's own lens — the probe measures what the viewer will pay, and
+/// each tile's imagery need goes as `tan(fovy / 2)`, so a probe on a
+/// different lens measures a different globe.
 const FOVY: f64 = tuile_camera::DEFAULT_GLOBE_FOVY;
 
 /// Bearings sampled around the turn. 24 is every 15°: fine enough that
@@ -69,14 +71,6 @@ const PNG_SIZE: u32 = 720;
 /// How long one bearing may take to settle before the probe moves on. A view
 /// that never settles is itself the finding, so this is a bound, not a wait.
 const MAX_SETTLE_MESSAGES: usize = 200_000;
-
-/// Silence that suggests the server has finished answering a view.
-///
-/// Generous on purpose: a bearing's answer is a burst of network fetches, and
-/// gaps of a second between messages are ordinary. Too short a window and the
-/// probe walks away mid-burst, reporting an empty bearing — which reads as a
-/// clean orbit and is worse than no measurement at all.
-const QUIET: std::time::Duration = std::time::Duration::from_millis(2_500);
 
 /// Longest a single bearing may take. Reaching it means the view never
 /// converged, which is a finding rather than a failure.
@@ -181,7 +175,7 @@ async fn main() -> Result<()> {
     // configuration rather than a stripped-down one.
     let foyer = Arc::new(FoyerStore::shared("tiles").await?);
     let store = Arc::clone(&foyer) as Arc<dyn ContentStore>;
-    let (tree, loader, detail, _heights) = globe_on(
+    let (tree, loader, _heights) = globe_on(
         CachedTerrain::new(terrain, Arc::clone(&store), "ion-cwt"),
         CachedImagery::new(bing, Arc::clone(&store), "bing-aerial"),
         layer,
@@ -191,12 +185,15 @@ async fn main() -> Result<()> {
 
     let config = Config {
         maximum_screen_space_error: 2.0,
-        maximum_simultaneous_fetches: 64,
-        resident_budget_bytes: 3072 * 1024 * 1024,
         ..Config::default()
     };
     let sse = config.maximum_screen_space_error;
-    let (mut stream, server) = in_process_with(tree, loader, config);
+    let (mut stream, server) = in_process_with(
+        tree,
+        loader,
+        config,
+        BudgetConfig::interactive(Bytes::mib(3072)),
+    )?;
     let server = tokio::spawn(server.run());
 
     // One synchronous handshake, only when images were asked for. Blocking a
@@ -208,7 +205,7 @@ async fn main() -> Result<()> {
     let renderer = gpu.as_ref().map(|g| TileRenderer::new(g, TEXTURE_FORMAT));
 
     let mut ledger = Ledger::default();
-    let mut contents = HashMap::new();
+    let mut held = Held::default();
 
     tracing::info!(
         "orbiting {LAT_DEG}°N {LON_DEG}°E at {ALTITUDE_M:.0} m, {STEPS} bearings, \
@@ -218,18 +215,15 @@ async fn main() -> Result<()> {
     for step in 0..STEPS {
         let bearing = std::f64::consts::TAU * f64::from(step) / f64::from(STEPS);
         let camera = camera_at(bearing);
-        // Drive imagery detail exactly as the viewer does, or the probe would
-        // measure a different scene from the one that misbehaves.
-        let target_texel = 2.0 * camera.altitude() * (camera.fovy * 0.5).tan() / VIEWPORT.1;
-        detail.set_target_texel_spacing(target_texel);
 
         let mut cost = StepCost::default();
         let selected = settle(
             &mut stream,
             camera.view_state(DVec2::new(VIEWPORT.0, VIEWPORT.1)),
+            step + 1,
             &mut ledger,
             &mut cost,
-            &mut contents,
+            &mut held,
         )
         .await?;
         cost.selected = selected.len() as u32;
@@ -246,12 +240,12 @@ async fn main() -> Result<()> {
 
         if let (Some(gpu), Some(renderer)) = (gpu.as_ref(), renderer.as_ref()) {
             let path = format!("orbit-{step:02}.png");
-            render_step(gpu, renderer, &camera, &selected, &contents, &path)?;
+            render_step(gpu, renderer, &camera, &selected, &held.dressed, &path)?;
         }
     }
 
     report(&ledger);
-    report_imagery(&contents);
+    report_imagery(&held.dressed);
     // Same order as the viewer: let the server see the session end before the
     // store closes, or its flusher shouts into a channel nobody holds.
     drop(stream);
@@ -262,87 +256,126 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Sends a view and drains the server until it stops producing content for it,
-/// returning the final selection.
+/// What the probe holds of the stream: each mesh and drape as delivered, and
+/// each drawn tile dressed with the drapes it wears — what is drawn.
+#[derive(Default)]
+struct Held {
+    meshes: HashMap<TileId, Arc<DecodedTileContent>>,
+    drapes: HashMap<ResourceId, Arc<DrapeContent>>,
+    dressed: HashMap<TileId, DecodedTileContent>,
+}
+
+/// Sends a view and drains the server until it reports the view converged,
+/// acknowledging every delivery as held, and returns the tiles drawn.
 async fn settle<S: GeometryStream + Unpin>(
     stream: &mut S,
     view: tuile_core::traversal::ViewState,
+    generation: u32,
     ledger: &mut Ledger,
     cost: &mut StepCost,
-    contents: &mut HashMap<TileId, tuile_core::DecodedTileContent>,
+    held: &mut Held,
 ) -> Result<Vec<TileId>> {
+    let generation = u64::from(generation);
     stream.send(ClientMessage::ViewerState {
         views: vec![view],
-        generation: 0,
+        generation,
     })?;
 
-    let mut selection: Vec<TileId> = Vec::new();
+    let mut scene = SceneState::default();
     let mut messages = 0usize;
     let deadline = std::time::Instant::now() + MAX_BEARING;
+    let converged = |scene: &SceneState| scene.generation() >= generation && scene.is_complete();
 
-    while messages < MAX_SETTLE_MESSAGES {
+    while messages < MAX_SETTLE_MESSAGES && !converged(&scene) {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         if left.is_zero() {
             break;
         }
-        let msg = match tokio::time::timeout(QUIET.min(left), stream.next_message()).await {
+        let msg = match tokio::time::timeout(left, stream.next_message()).await {
             Ok(Some(msg)) => msg,
-            Ok(None) => break,
-            Err(_) => {
-                // Quiet. Settled only if the view is actually satisfied;
-                // otherwise the server is still working and we wait.
-                let missing = selection
-                    .iter()
-                    .filter(|t| !contents.contains_key(t))
-                    .count();
-                if !selection.is_empty() && missing == 0 {
-                    break;
-                }
-                continue;
-            }
+            Ok(None) | Err(_) => break,
         };
         messages += 1;
+        scene.apply(&msg);
         match msg {
-            ServerMessage::Select { tiles, .. } => {
-                selection = tiles.iter().map(|(t, _)| *t).collect();
-            }
-            ServerMessage::Content { tile, content, .. } => {
-                ledger.on_content(tile, cost);
-                if let TileContent::Decoded(decoded) = content {
-                    contents.insert(tile, decoded);
+            ServerMessage::Content {
+                resource,
+                gen,
+                content,
+                ..
+            } => {
+                let bytes = match &content {
+                    ResourceContent::Mesh(m) => m.cost().gpu,
+                    ResourceContent::Drape(d) => d.cost().gpu,
+                };
+                match content {
+                    ResourceContent::Mesh(mesh) => {
+                        ledger.on_content(resource.tile(), cost);
+                        held.meshes.insert(resource.tile(), mesh);
+                    }
+                    ResourceContent::Drape(drape) => {
+                        held.drapes.insert(resource, drape);
+                    }
                 }
+                stream.send(ClientMessage::Ack {
+                    resource,
+                    gen,
+                    bytes: bytes.0,
+                })?;
             }
-            // A probe measures what the session really streams; a stand-in is
-            // synthesised locally and would flatter every number it touched.
-            ServerMessage::Fill { .. } => {}
-            // No stand-in was kept, so there is none to take back.
-            ServerMessage::Retire { .. } => {}
-            ServerMessage::Evict { tiles } => {
-                for t in &tiles {
-                    contents.remove(t);
+            ServerMessage::Evict { resources } => {
+                let tiles: Vec<TileId> = resources
+                    .iter()
+                    .filter_map(|r| match r {
+                        ResourceId::Mesh(t) => Some(*t),
+                        ResourceId::Drape { .. } => None,
+                    })
+                    .collect();
+                for r in &resources {
+                    match r {
+                        ResourceId::Mesh(t) => {
+                            held.meshes.remove(t);
+                            held.dressed.remove(t);
+                        }
+                        ResourceId::Drape { .. } => {
+                            held.drapes.remove(r);
+                        }
+                    }
                 }
                 ledger.on_evict(&tiles, cost);
             }
-            ServerMessage::Error { tile, message } => {
-                tracing::warn!("server error on {tile:?}: {message}");
+            ServerMessage::Error { resource, message } => {
+                tracing::warn!("server error on {resource:?}: {message}");
             }
+            // Delivered and taken back before it was held: never counted.
             // The probe shows no window, so it holds nothing back on the
             // coarse pyramid's account.
-            ServerMessage::Priming(_) => {}
+            ServerMessage::Cancel { .. }
+            | ServerMessage::Select { .. }
+            | ServerMessage::Priming(_) => {}
         }
     }
-    if std::time::Instant::now() >= deadline || messages >= MAX_SETTLE_MESSAGES {
-        let missing = selection
-            .iter()
-            .filter(|t| !contents.contains_key(t))
-            .count();
+    let drawn: Vec<_> = scene
+        .draw()
+        .items
+        .iter()
+        .filter(|item| item.role != Role::Fallback)
+        .collect();
+    if !converged(&scene) {
         tracing::warn!(
-            "bearing never went quiet after {messages} messages ({missing} of \
-             {} selected tiles still missing) — the session is churning, not converging",
-            selection.len()
+            "bearing never converged after {messages} messages ({} tiles drawn) — the \
+             session is churning, not converging",
+            drawn.len()
         );
     }
-    Ok(selection)
+    let drapes = held.drapes.clone();
+    for item in &drawn {
+        if let Some(mesh) = held.meshes.get(&item.mesh.tile()) {
+            let dressed = tuile_core::drive::dress(mesh, item, &drapes);
+            held.dressed.insert(item.mesh.tile(), dressed);
+        }
+    }
+    Ok(drawn.iter().map(|item| item.mesh.tile()).collect())
 }
 
 /// What the imagery covering this orbit costs, held once versus held per tile.
