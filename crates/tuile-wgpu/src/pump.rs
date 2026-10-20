@@ -802,17 +802,27 @@ impl ContentPump {
                 .collect();
             for tile in floor {
                 if !dressed.contains(&tile) {
-                    let own: Vec<(ResourceId, &PreparedDrape)> = self
-                        .drapes
-                        .iter()
-                        .filter(|(r, d)| r.tile() == tile && d.level == level)
-                        .map(|(r, d)| (*r, d))
-                        .collect();
-                    if own.is_empty() {
-                        continue;
+                    // The finest drape of its own it holds, per layer — or
+                    // none: a floor tile is drawn bare rather than left out.
+                    // The budget asks a floor tile's drape at the level the
+                    // view needs, so it may hold a finer one than the
+                    // backdrop's level, or none yet; leaving such a tile out
+                    // showed the sky through the planet on a turn the draw
+                    // set had not caught up with.
+                    let mut own: BTreeMap<
+                        tuile_core::budget::LayerId,
+                        (ResourceId, &PreparedDrape),
+                    > = BTreeMap::new();
+                    for (r, d) in self.drapes.iter().filter(|(r, _)| r.tile() == tile) {
+                        let finer = own
+                            .get(&d.layer)
+                            .is_none_or(|(_, held)| d.level > held.level);
+                        if finer {
+                            own.insert(d.layer, (*r, d));
+                        }
                     }
                     let wear: Vec<(ResourceId, &PreparedDrape, tuile_core::budget::UvTransform)> =
-                        own.into_iter()
+                        own.into_values()
                             .map(|(r, d)| (r, d, tuile_core::budget::UvTransform::IDENTITY))
                             .collect();
                     if let Some(mesh) = self.prepared.get_mut(&tile) {

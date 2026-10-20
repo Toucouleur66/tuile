@@ -72,6 +72,19 @@ PATTERNS = {
                                             ("resize", 390, 844), ("wait", 3.0),
                                             ("resize", 844, 390)], 15.0),
     "still": ("P7 still near the ground, 20 s", [("set", NEUCH, 0.0)], 20.0),
+    # A hand on a mouse: yaw at 150°/s while the pitch sweeps 20° → 80° in a
+    # second, back again, then a fast turn — every frame checked for holes in
+    # the geometry view while it moves.
+    # The same with the mouse itself, as a person drives it: a right-drag
+    # turns and tilts (0.005 rad a pixel), a left-drag pans the grabbed point.
+    "hand": ("P4 a hand on the mouse: right-drag turn and tilt, left-drag pan", [
+        ("set", dict(NEUCH, pitch=30), 0.0), ("wait", 10.0), ("geometry",),
+        ("mouse", "right", 520, -260, 1.0), ("mouse", "right", 520, 260, 1.0),
+        ("mouse", "left", 900, 300, 1.0), ("mouse", "right", -600, 0, 1.0)], 20.0),
+    "drag": ("P4 a hand's drag: yaw and tilt together", [
+        ("set", dict(NEUCH, pitch=20), 0.0), ("wait", 10.0), ("geometry",),
+        ("drag", 150.0, 20.0, 80.0, 1.0), ("drag", 150.0, 80.0, 20.0, 1.0),
+        ("drag", 180.0, 30.0, 30.0, 1.5)], 20.0),
     "warm": ("P1 warm relaunch at the plateau", [("set", NEUCH, 0.0), ("wait", 15.0), ("reload", NEUCH)], 20.0),
 }
 
@@ -143,8 +156,13 @@ class Page:
     async def ev(self, js):
         return await self.call("Runtime.evaluate", expression=js, awaitPromise=True, returnByValue=True)
 
-    async def shot(self):
-        r = await self.call("Page.captureScreenshot", format="png")
+    async def shot(self, scale=None):
+        if scale:
+            m = (await self.ev("[innerWidth, innerHeight]"))["result"]["value"]
+            r = await self.call("Page.captureScreenshot", format="png",
+                                clip={"x": 0, "y": 0, "width": m[0], "height": m[1], "scale": scale})
+        else:
+            r = await self.call("Page.captureScreenshot", format="png")
         return base64.b64decode(r["data"])
 
 
@@ -211,8 +229,79 @@ async def pattern(args, ws_url, name):
             await asyncio.sleep(0.25)
         backend = r.get("result", {}).get("value")
         moved_at = time.time()
+        moving_holes = []          # (t, black, total) per frame shot while moving
+        geometry_on = False
         for step in steps:
             kind = step[0]
+            if kind == "geometry":
+                for _ in range(3):
+                    await page.call("Input.dispatchKeyEvent", type="keyDown", key="d", text="d")
+                    await page.call("Input.dispatchKeyEvent", type="keyUp", key="d")
+                geometry_on = True
+                await asyncio.sleep(0.5)
+                continue
+            if kind == "mouse":
+                _, button, dx, dy, secs = step
+                m = (await page.ev("[innerWidth, innerHeight]"))["result"]["value"]
+                x, y = m[0] * 0.45, m[1] * 0.5
+                mask = {"left": 1, "right": 2}[button]
+                await page.call("Input.dispatchMouseEvent", type="mousePressed", x=x, y=y,
+                                button=button, buttons=mask, clickCount=1)
+                t0 = time.time()
+
+                async def drag_mouse():
+                    nonlocal x, y
+                    while time.time() - t0 < secs:
+                        x += dx / 60.0
+                        y += dy / 60.0
+                        await page.call("Input.dispatchMouseEvent", type="mouseMoved", x=x, y=y,
+                                        button=button, buttons=mask)
+                        await asyncio.sleep(1 / 60)
+                    await page.call("Input.dispatchMouseEvent", type="mouseReleased", x=x, y=y,
+                                    button=button, buttons=0, clickCount=1)
+
+                mover = asyncio.create_task(drag_mouse())
+                while not mover.done():
+                    png = await page.shot(scale=0.25)
+                    black, total = holes(png, step=1)
+                    moving_holes.append((round(time.time() - moved_at, 2), black, total))
+                    if black and len([h for h in moving_holes if h[1]]) <= 5:
+                        open(os.path.join(out, f"hole-{len(moving_holes)}.png"), "wb").write(png)
+                await mover
+                # The glide after the release, watched too.
+                t1 = time.time()
+                while time.time() - t1 < 1.5:
+                    png = await page.shot(scale=0.25)
+                    black, total = holes(png, step=1)
+                    moving_holes.append((round(time.time() - moved_at, 2), black, total))
+                    if black and len([h for h in moving_holes if h[1]]) <= 5:
+                        open(os.path.join(out, f"hole-{len(moving_holes)}.png"), "wb").write(png)
+                moved_at = time.time()
+                continue
+            if kind == "drag":
+                _, rate, p0, p1, secs = step
+                v = (await page.ev("viewer.getView()"))["result"]["value"]
+                t0 = time.time()
+
+                async def move():
+                    while (t := time.time() - t0) < secs:
+                        v["heading"] = (v["heading"] + rate / 60.0) % 360
+                        v["pitch"] = p0 + (p1 - p0) * min(t / secs, 1.0)
+                        await page.ev(f"viewer.setView({json.dumps(v)})")
+                        await asyncio.sleep(1 / 60)
+
+                mover = asyncio.create_task(move())
+                # Shots as fast as the browser gives them, a quarter size:
+                # the hole is the frame a hand sees, not the one after.
+                while not mover.done():
+                    png = await page.shot(scale=0.25)
+                    black, total = holes(png, step=1)
+                    moving_holes.append((round(time.time() - moved_at, 2), black, total))
+                    if black and len([h for h in moving_holes if h[1]]) <= 5:
+                        open(os.path.join(out, f"hole-{len(moving_holes)}.png"), "wb").write(png)
+                await mover
+                moved_at = time.time()
+                continue
             if kind == "set":
                 await page.ev(f"viewer.setView({json.dumps(step[1])})")
                 moved_at = time.time()
@@ -277,7 +366,7 @@ async def pattern(args, ws_url, name):
         normal = await page.shot()
         open(os.path.join(out, "normal.png"), "wb").write(normal)
         # The geometry view: black is ground no mesh covers.
-        for _ in range(3):
+        for _ in range(0 if geometry_on else 3):
             await page.call("Input.dispatchKeyEvent", type="keyDown", key="d", text="d")
             await page.call("Input.dispatchKeyEvent", type="keyUp", key="d")
         await asyncio.sleep(0.5)
@@ -288,8 +377,12 @@ async def pattern(args, ws_url, name):
     log.close()
     last = page.status[-1][1] if page.status else {}
     held, hard = int(last.get("held", 0)), int(last.get("hard", 0)) or 1 << 30
+    worst_moving = max((h[1] for h in moving_holes), default=0)
+    holed_frames = sum(1 for h in moving_holes if h[1])
     checks = {
-        "coverage": (black == 0, f"{black} of {total} sampled ground pixels with no mesh"),
+        "coverage": (black == 0 and worst_moving == 0,
+                     f"{black} of {total} sampled ground pixels with no mesh at rest; "
+                     f"{holed_frames} of {len(moving_holes)} frames with holes while moving, worst {worst_moving}"),
         "convergence": (converged_at is not None and converged_at <= bound,
                         f"converged in {converged_at:.1f} s against {bound:.0f} s" if converged_at is not None
                         else f"not converged within {bound + LOAD_TIMEOUT_S:.0f} s ({last.get('loading', '?')} loading)"),

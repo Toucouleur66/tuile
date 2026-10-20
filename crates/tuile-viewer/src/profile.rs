@@ -227,7 +227,13 @@ impl Profile {
         } else {
             Self::desktop_with((memory_gib.unwrap_or(8.0).max(1.0) * GIB) as u64)
         };
-        let ceiling = if handheld { 384 * MIB } else { 768 * MIB };
+        // A desktop page near the ground at density 2 wants more than 768 MiB
+        // of ground: held at the pool's target there, a drag evicted five
+        // thousand tiles in a few seconds and the ground flickered back and
+        // forth between its levels. A desktop browser's GPU is the machine's;
+        // 1.5 GiB is what a quarter of 8 GiB — the most `deviceMemory` ever
+        // reports — and the desktop's own quarter rule give.
+        let ceiling = if handheld { 384 * MIB } else { 1536 * MIB };
         Self {
             gpu_bytes: base.gpu_bytes.min(ceiling),
             // A page's "local" reads are its loader's own decoded caches —
@@ -395,8 +401,10 @@ mod tests {
     fn a_browser_fits_a_tab_and_belongs_to_its_page() {
         let desktop = Profile::browser(false, Some(16.0));
         let phone = Profile::browser(true, Some(4.0));
+        // Under a wasm32 heap's 4 GiB with room to spare: the page keeps its
+        // meshes' CPU copies, the worker its decoded tier (a quarter).
+        assert!(desktop.gpu_bytes <= 1536 * MIB);
         for p in [&desktop, &phone] {
-            assert!(p.gpu_bytes <= 768 * MIB);
             assert_eq!(p.pinned_level, crate::backdrop::BASE_LEVEL);
             assert!(!p.hold_window_until_warm && p.render_on_demand);
             assert!(p.pause_loads_when_hidden && !p.release_surface_in_background);

@@ -183,6 +183,9 @@ fn tell_the_page_the_budget() {
                 lost = signals.lost_tiles,
                 bare = signals.bare_items,
                 underdraped = signals.underdraped_tiles,
+                evictions = ?signals.evictions_total.0,
+                bytes = ?signals.bytes.0,
+                targets = ?signals.target_bytes.0,
                 "the budget's steps"
             );
         }
