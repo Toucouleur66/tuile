@@ -161,11 +161,24 @@ pub fn bitrate_for(bitrate: u32, width: u32, height: u32, fps: u32) -> u32 {
 /// rate tables), in place of one number for every size.
 ///
 /// `mezzanine` is what a render node writes for the final stage
-/// ([`crate::compress`]): HEVC Main10, near-transparent, by an NVIDIA card.
+/// ([`crate::compress`]): HEVC Main10, near-transparent, by an NVIDIA card
+/// or a Mac's VideoToolbox.
 pub fn film_sink(path: String, bitrate: u32, codec: Option<&str>) -> Result<Box<dyn Sink>, Error> {
     #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
     if matches!(codec, Some("h264") | None) {
-        return Ok(Box::new(crate::H264Film::at(path, bitrate)));
+        return Ok(Box::new(crate::VtFilm::at(
+            path,
+            bitrate,
+            crate::VtCodec::H264,
+        )));
+    }
+    #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+    if codec == Some("mezzanine") {
+        return Ok(Box::new(crate::VtFilm::at(
+            path,
+            bitrate,
+            crate::VtCodec::Mezzanine,
+        )));
     }
     #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
     if codec == Some("mv-hevc") {

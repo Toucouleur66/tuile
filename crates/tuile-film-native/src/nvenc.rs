@@ -27,6 +27,10 @@ use std::sync::mpsc::{sync_channel, SyncSender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::encode::{node_spec, NodeCodec};
+pub use crate::encode::{Encoded, Frame, Input, Out, Package, Rate, Spec};
+use crate::sink::Sink;
+use crate::Error;
 use cudarc::driver::CudaContext;
 use nvidia_video_codec_sdk::sys::nvEncodeAPI::{
     GUID, HEVC_3D_REFERENCE_DISPLAY_INFO, NV_ENC_BFRAME_REF_MODE, NV_ENC_BIT_DEPTH,
@@ -43,13 +47,6 @@ use nvidia_video_codec_sdk::{
     CodecPictureParams, EncodeError, EncodePictureParams, Encoder, EncoderInitParams, EncoderInput,
     ErrorKind,
 };
-use tuile_farm::compress::{Profile, VideoCodec};
-use tuile_mp4::film::{FilmWriter, Written};
-use tuile_mp4::{annex_b_to_avcc, nal_units};
-
-use crate::av1::{av1c_of, obus};
-use crate::sink::Sink;
-use crate::Error;
 
 /// What the card is asked to encode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,7 +55,7 @@ pub enum NvencCodec {
     H264,
     /// HEVC Main10, near-transparent, a closed GOP a second: the
     /// mezzanine a render node writes for the final stage
-    /// ([`Profile::mezzanine`]).
+    /// (`tuile_farm::compress::Profile::mezzanine`).
     Mezzanine,
     /// The two eyes of a film as the two layers of one HEVC stream, with
     /// the stereo metadata a headset reads: a spatial film. Blackwell cards
@@ -69,190 +66,35 @@ pub enum NvencCodec {
 /// Pictures waiting for the encoder before the render waits for it.
 const WAITING: usize = 4;
 
-/// The codec of a stream, as the encode loop and the film's sample entry
-/// see it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Out {
-    H264,
-    Hevc,
-    Av1,
-}
-
-/// How pictures are handed to the encoder, rows tightly packed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Input {
-    /// Planar 4:2:0, 8 bits: Y, then U, then V.
-    Iyuv,
-    /// Y, then U and V interleaved, 8 bits.
-    Nv12,
-    /// As NV12, 16-bit little-endian samples, the 10 bits in the high ones.
-    P010,
-}
-
-impl Input {
-    fn format(self) -> NV_ENC_BUFFER_FORMAT {
-        match self {
-            Input::Iyuv => NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_IYUV,
-            Input::Nv12 => NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12,
-            Input::P010 => NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV420_10BIT,
-        }
-    }
-
-    fn bit_depth(self) -> u8 {
-        match self {
-            Input::P010 => 10,
-            Input::Iyuv | Input::Nv12 => 8,
-        }
-    }
-
-    /// Bytes of one tightly packed picture.
-    pub fn bytes(self, (width, height): (usize, usize)) -> usize {
-        let chroma = 2 * width.div_ceil(2) * height.div_ceil(2);
-        let samples = width * height + chroma;
-        if self == Input::P010 {
-            2 * samples
-        } else {
-            samples
-        }
-    }
-
-    /// The picture laid out at the buffer's `pitch` (bytes a row): the
-    /// rows the encoder reads.
-    fn pitched(self, tight: &[u8], (width, height): (usize, usize), pitch: usize) -> Vec<u8> {
-        let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
-        // Each plane: its rows' bytes, its rows, and the pitch they go at.
-        let planes: Vec<(usize, usize, usize)> = match self {
-            Input::Iyuv => vec![
-                (width, height, pitch),
-                (cw, ch, pitch / 2),
-                (cw, ch, pitch / 2),
-            ],
-            Input::Nv12 => vec![(width, height, pitch), (2 * cw, ch, pitch)],
-            Input::P010 => vec![(2 * width, height, pitch), (4 * cw, ch, pitch)],
-        };
-        let total: usize = planes.iter().map(|&(_, rows, p)| rows * p).sum();
-        if planes.iter().all(|&(row, _, p)| row == p) {
-            return tight.to_vec();
-        }
-        let mut out = vec![0u8; total];
-        let (mut from, mut to) = (0, 0);
-        for (row, rows, p) in planes {
-            for r in 0..rows {
-                out[to + r * p..to + r * p + row]
-                    .copy_from_slice(&tight[from + r * row..from + (r + 1) * row]);
-            }
-            from += row * rows;
-            to += p * rows;
-        }
-        out
+/// The encoder's buffer format for pictures handed as `input`.
+fn buffer_format(input: Input) -> NV_ENC_BUFFER_FORMAT {
+    match input {
+        Input::Iyuv => NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_IYUV,
+        Input::Nv12 => NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12,
+        Input::P010 => NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV420_10BIT,
     }
 }
 
-/// How the bitrate is held.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Rate {
-    /// A constant quality (NVENC's `targetQuality`), under a ceiling in bits
-    /// a second.
-    Quality { quality: u8, max: u32 },
-    /// A mean bitrate and its ceiling, bits a second.
-    Vbr { average: u32, max: u32 },
-}
-
-/// Everything an encode session is opened with.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Spec {
-    pub out: Out,
-    /// Bits a sample of the stream: 8, or 10 (HEVC, AV1).
-    pub bit_depth: u8,
-    pub input: Input,
-    pub size: (usize, usize),
-    pub fps: u32,
-    /// 1 (fastest) to 7 (best).
-    pub preset: u8,
-    pub rate: Rate,
-    /// Frames between two IDRs.
-    pub gop: u32,
-    pub b_frames: u8,
-    pub lookahead: u8,
-    pub spatial_aq: bool,
-    pub temporal_aq: bool,
-    pub multipass: bool,
-}
-
-impl Spec {
-    /// A profile's spec for a `width`×`height` film at `fps`, its pictures
-    /// handed as `input`; `rate` in place of the profile's own.
-    pub fn of(
-        profile: &Profile,
-        input: Input,
-        size: (usize, usize),
-        fps: u32,
-        rate: Option<Rate>,
-    ) -> Self {
-        let (_, max) = profile.bitrates(size.0 as u32, size.1 as u32, f64::from(fps));
-        Self {
-            out: match profile.codec {
-                VideoCodec::H264 => Out::H264,
-                VideoCodec::Hevc => Out::Hevc,
-            },
-            bit_depth: profile.bit_depth,
-            input,
-            size,
-            fps: fps.max(1),
-            preset: profile.preset,
-            rate: rate.unwrap_or(Rate::Quality {
-                quality: profile.quality,
-                max,
-            }),
-            gop: profile.gop_frames(fps.max(1)),
-            b_frames: profile.b_frames,
-            lookahead: profile.lookahead,
-            spatial_aq: profile.spatial_aq,
-            temporal_aq: profile.temporal_aq,
-            multipass: profile.multipass,
-        }
-    }
-
-    fn guid(&self) -> GUID {
-        match self.out {
-            Out::H264 => NV_ENC_CODEC_H264_GUID,
-            Out::Hevc => NV_ENC_CODEC_HEVC_GUID,
-            Out::Av1 => NV_ENC_CODEC_AV1_GUID,
-        }
-    }
-
-    fn preset_guid(&self) -> GUID {
-        match self.preset {
-            0 | 1 => NV_ENC_PRESET_P1_GUID,
-            2 => NV_ENC_PRESET_P2_GUID,
-            3 => NV_ENC_PRESET_P3_GUID,
-            4 => NV_ENC_PRESET_P4_GUID,
-            5 => NV_ENC_PRESET_P5_GUID,
-            6 => NV_ENC_PRESET_P6_GUID,
-            _ => NV_ENC_PRESET_P7_GUID,
-        }
-    }
-
-    /// Buffers in the pool: every picture the encoder may hold before it
-    /// hands one back — its lookahead, its B-frames — and a few more.
-    fn buffers(&self) -> usize {
-        usize::from(self.lookahead) + usize::from(self.b_frames) + 4
+/// The codec `spec` encodes, as NVENC names it.
+fn guid(spec: &Spec) -> GUID {
+    match spec.out {
+        Out::H264 => NV_ENC_CODEC_H264_GUID,
+        Out::Hevc => NV_ENC_CODEC_HEVC_GUID,
+        Out::Av1 => NV_ENC_CODEC_AV1_GUID,
     }
 }
 
-/// One picture for the encoder: tightly packed in its spec's input layout,
-/// and the frame of the film it is shown as.
-pub struct Frame {
-    pub data: Vec<u8>,
-    pub shown: u64,
-}
-
-/// One picture out of the encoder, in decoding order: Annex B (H.264,
-/// HEVC) or a temporal unit (AV1), and the frame it is shown as.
-pub struct Encoded {
-    pub data: Vec<u8>,
-    pub key: bool,
-    pub shown: u64,
+/// `spec`'s preset, P1 to P7.
+fn preset_guid(spec: &Spec) -> GUID {
+    match spec.preset {
+        0 | 1 => NV_ENC_PRESET_P1_GUID,
+        2 => NV_ENC_PRESET_P2_GUID,
+        3 => NV_ENC_PRESET_P3_GUID,
+        4 => NV_ENC_PRESET_P4_GUID,
+        5 => NV_ENC_PRESET_P5_GUID,
+        6 => NV_ENC_PRESET_P6_GUID,
+        _ => NV_ENC_PRESET_P7_GUID,
+    }
 }
 
 fn told(e: EncodeError) -> String {
@@ -412,7 +254,7 @@ pub fn encode(
     let cuda = CudaContext::new(device).map_err(|e| format!("CUDA device {device}: {e:?}"))?;
     let encoder = Encoder::initialize_with_cuda(cuda).map_err(told)?;
     step("encoder open");
-    let guid = spec.guid();
+    let guid = guid(spec);
     if !encoder.get_encode_guids().map_err(told)?.contains(&guid) {
         return Err(format!("NVENC: this card does not encode {:?}", spec.out));
     }
@@ -428,7 +270,7 @@ pub fn encode(
         }
     }
     let tuning = NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_HIGH_QUALITY;
-    let preset = spec.preset_guid();
+    let preset = preset_guid(spec);
     let mut config = encoder
         .get_preset_config(guid, preset, tuning)
         .map_err(told)?
@@ -443,7 +285,7 @@ pub fn encode(
         .enable_picture_type_decision()
         .encode_config(&mut config);
     let session = encoder
-        .start_session(spec.input.format(), init)
+        .start_session(buffer_format(spec.input), init)
         .map_err(told)?;
     step("session started");
     let pool = spec.buffers();
@@ -549,111 +391,6 @@ fn read(out: Out, output: &mut nvidia_video_codec_sdk::Bitstream<'_>) -> Result<
     })
 }
 
-/// Encoded pictures into a film laid out for a viewer: its sample entry
-/// made from the first picture's parameter sets (or AV1 sequence header),
-/// each picture a sample shown where the encoder said.
-pub struct Package {
-    path: PathBuf,
-    out: Out,
-    size: (u16, u16),
-    fps: u32,
-    writer: Option<FilmWriter>,
-}
-
-impl Package {
-    pub fn at(
-        path: impl Into<PathBuf>,
-        out: Out,
-        size: (usize, usize),
-        fps: u32,
-    ) -> Result<Self, String> {
-        Ok(Self {
-            path: path.into(),
-            out,
-            size: (
-                u16::try_from(size.0).map_err(|e| e.to_string())?,
-                u16::try_from(size.1).map_err(|e| e.to_string())?,
-            ),
-            fps,
-            writer: None,
-        })
-    }
-
-    pub fn take(&mut self, encoded: Encoded) -> Result<(), String> {
-        let (width, height) = self.size;
-        let data = encoded.data.as_slice();
-        let sample = match self.out {
-            Out::H264 => {
-                if self.writer.is_none() {
-                    let units = nal_units(data);
-                    let of = |kind: u8| {
-                        units
-                            .iter()
-                            .find(|u| u.first().is_some_and(|b| b & 0x1f == kind))
-                            .map(|u| u.to_vec())
-                    };
-                    let (sps, pps) = of(7)
-                        .zip(of(8))
-                        .ok_or("NVENC: the first picture carries no parameter sets")?;
-                    self.open(
-                        tuile_mp4::film::avc1(width, height, &sps, &pps)
-                            .map_err(|e| e.to_string())?,
-                    )?;
-                }
-                annex_b_to_avcc(data)
-            }
-            Out::Hevc => {
-                let (parameters, units) = tuile_mp4::spatial::entry_units(data);
-                if self.writer.is_none() {
-                    let record = tuile_mp4::spatial::hevc_record(&parameters)
-                        .map_err(|e| format!("NVENC: {e}"))?;
-                    self.open(
-                        tuile_mp4::film::hvc1(width, height, &record).map_err(|e| e.to_string())?,
-                    )?;
-                }
-                let mut sample = Vec::with_capacity(data.len());
-                for unit in units {
-                    sample.extend((unit.len() as u32).to_be_bytes());
-                    sample.extend_from_slice(unit);
-                }
-                sample
-            }
-            Out::Av1 => {
-                if self.writer.is_none() {
-                    let record = obus(data)
-                        .into_iter()
-                        .find(|(kind, _)| *kind == 1)
-                        .and_then(|(_, header)| av1c_of(header))
-                        .ok_or("NVENC: the first picture carries no sequence header this reads")?;
-                    self.open(
-                        tuile_mp4::film::av01(width, height, &record).map_err(|e| e.to_string())?,
-                    )?;
-                }
-                // The binding says a sample does not carry the temporal
-                // delimiter an encoder heads each unit with.
-                data.strip_prefix(&[0x12, 0x00]).unwrap_or(data).to_vec()
-            }
-        };
-        let writer = self.writer.as_mut().ok_or("the film was not opened")?;
-        writer
-            .push(&sample, encoded.key, encoded.shown)
-            .map_err(|e| e.to_string())
-    }
-
-    fn open(&mut self, entry: tuile_mp4::film::Entry) -> Result<(), String> {
-        self.writer =
-            Some(FilmWriter::create(&self.path, entry, self.fps).map_err(|e| e.to_string())?);
-        Ok(())
-    }
-
-    pub fn finish(self) -> Result<Written, String> {
-        self.writer
-            .ok_or("a film of no picture")?
-            .finish()
-            .map_err(|e| e.to_string())
-    }
-}
-
 /// The film as an mp4, by NVENC.
 pub struct NvencFilm {
     path: PathBuf,
@@ -700,43 +437,15 @@ impl NvencFilm {
     /// the bitrate asked for, else the H.264 profile's by the picture's
     /// size.
     fn spec(&self, size: (usize, usize), fps: u32) -> Result<Spec, String> {
-        let asked = |profile: &Profile| match self.bitrate {
-            0 => {
-                let (average, max) = profile.bitrates(size.0 as u32, size.1 as u32, f64::from(fps));
-                Rate::Vbr { average, max }
-            }
-            bits => Rate::Vbr {
-                average: bits,
-                max: bits.saturating_mul(2),
-            },
-        };
-        Ok(match self.codec {
-            NvencCodec::Mezzanine => {
-                let profile = Profile::mezzanine();
-                let rate = (self.bitrate > 0).then(|| asked(&profile));
-                Spec::of(&profile, Input::Iyuv, size, fps, rate)
-            }
-            NvencCodec::H264 => {
-                let profile = Profile::h264();
-                // A render node's own H.264: the profile's B-frames and
-                // lookahead, at the bitrate asked for, no second pass.
-                let mut spec = Spec::of(&profile, Input::Iyuv, size, fps, Some(asked(&profile)));
-                spec.multipass = false;
-                spec.preset = 4;
-                spec
-            }
-            NvencCodec::Av1 => {
-                let profile = Profile::h264();
-                let mut spec = Spec::of(&profile, Input::Iyuv, size, fps, Some(asked(&profile)));
-                spec.out = Out::Av1;
-                spec.b_frames = 0;
-                spec.lookahead = 0;
-                spec.multipass = false;
-                spec.preset = 4;
-                spec
-            }
+        let node = match self.codec {
+            NvencCodec::Mezzanine => NodeCodec::Mezzanine,
+            NvencCodec::H264 => NodeCodec::H264,
+            NvencCodec::Av1 => NodeCodec::Av1,
             NvencCodec::MvHevc => return Err("NVENC: MV-HEVC is a film of two eyes".into()),
-        })
+        };
+        // Eight bits handed in; ten out of the mezzanine is NVENC's own
+        // conversion.
+        Ok(node_spec(node, self.bitrate, Input::Iyuv, size, fps))
     }
 }
 
@@ -1101,68 +810,20 @@ mod tests {
         assert!(is_sync(Out::Av1, NV_ENC_PIC_TYPE_I));
     }
 
-    /// Each plane's rows at the buffer's pitch, the planes one after the
-    /// other — and a buffer as wide as the picture takes it as it is.
+    /// A render node's codec gives the shared spec, handed eight bits; an
+    /// H.264 session from ten bits is refused.
     #[test]
-    fn a_picture_is_laid_out_at_the_buffer_s_pitch() {
-        let size = (4, 2);
-        let nv12: Vec<u8> = (0..Input::Nv12.bytes(size) as u8).collect();
-        assert_eq!(Input::Nv12.pitched(&nv12, size, 4), nv12);
-        let wide = Input::Nv12.pitched(&nv12, size, 8);
-        assert_eq!(wide.len(), 8 * 3);
-        assert_eq!(&wide[..4], &[0, 1, 2, 3]);
-        assert_eq!(&wide[8..12], &[4, 5, 6, 7]);
-        assert_eq!(&wide[16..20], &[8, 9, 10, 11], "the chroma's row");
-        let p010 = vec![1u8; Input::P010.bytes(size)];
-        assert_eq!(Input::P010.pitched(&p010, size, 16).len(), 16 * 3);
-        let iyuv: Vec<u8> = (0..Input::Iyuv.bytes(size) as u8).collect();
-        let wide = Input::Iyuv.pitched(&iyuv, size, 8);
-        assert_eq!(wide.len(), 8 * 2 + 2 * 4);
-        assert_eq!(&wide[16..18], &[8, 9], "U at half the pitch");
-        assert_eq!(&wide[20..22], &[10, 11], "then V");
-    }
-
-    /// The mezzanine is the profile's; a render node's own H.264 keeps the
-    /// bitrate it is asked for, and its size's when asked for none.
-    #[test]
-    fn a_render_node_s_encode_follows_its_codec_and_its_picture_s_size() {
+    fn a_render_node_s_encode_is_the_shared_spec_and_h264_takes_eight_bits() {
         let mezzanine = NvencFilm::at("m.mp4", 0, NvencCodec::Mezzanine)
             .spec((1920, 1080), 30)
             .expect("spec");
         assert_eq!(
-            (mezzanine.out, mezzanine.bit_depth, mezzanine.input),
-            (Out::Hevc, 10, Input::Iyuv)
+            mezzanine,
+            node_spec(NodeCodec::Mezzanine, 0, Input::Iyuv, (1920, 1080), 30)
         );
-        assert_eq!(mezzanine.gop, 30);
-        assert!(matches!(
-            mezzanine.rate,
-            Rate::Quality {
-                max: 60_000_000,
-                ..
-            }
-        ));
-        let mobile = NvencFilm::at("w.mp4", 0, NvencCodec::H264)
-            .spec((720, 1280), 30)
-            .expect("spec");
-        assert_eq!(
-            mobile.rate,
-            Rate::Vbr {
-                average: 3_000_000,
-                max: 5_000_000
-            }
-        );
-        assert_eq!(mobile.b_frames, 3);
-        let asked = NvencFilm::at("w.mp4", 45_000_000, NvencCodec::H264)
+        let mut h264 = NvencFilm::at("w.mp4", 45_000_000, NvencCodec::H264)
             .spec((3840, 2160), 30)
             .expect("spec");
-        assert_eq!(
-            asked.rate,
-            Rate::Vbr {
-                average: 45_000_000,
-                max: 90_000_000
-            }
-        );
-        let mut h264 = asked.clone();
         h264.input = Input::P010;
         // SAFETY: a config of plain values; all zero is a valid one.
         let mut config: NV_ENC_CONFIG = unsafe { std::mem::zeroed() };
