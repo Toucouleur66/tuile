@@ -272,9 +272,13 @@ impl ContentStore for FoyerStore {
 
 /// A [`FoyerStore`] that can be closed and opened again behind one handle.
 ///
-/// A store keeps its most recent entries in memory and writes them to disk
-/// when memory lets go of them, or when it is closed. A desktop closes it on
-/// the way out. A phone's application is never shut down: it goes to the
+/// It is a [keeping](FoyerStore::keeping) store: every entry is written to
+/// the disk as it is put. A store that writes on eviction keeps its most
+/// recent entries in memory only, and closing it pours them all into the
+/// disk queue at once, which drops most of them: measured, 240 of a
+/// session's 1 537 tiles found by the next launch after a clean flush, and
+/// the rest fetched again over a store the index rightly said did not hold
+/// them. A desktop closes it on the way out. A phone's application is never shut down: it goes to the
 /// background and is ended there without a word, and whatever the memory tier
 /// held is lost — measured on a device: a session's tiles, none of them found
 /// by the next launch. So the host suspends the store when it leaves the
@@ -291,7 +295,7 @@ pub struct SuspendableStore {
 impl SuspendableStore {
     /// Opens the store with `config`.
     pub async fn open(config: StoreConfig) -> Result<Self, StoreError> {
-        let store = FoyerStore::with_config(config.clone()).await?;
+        let store = FoyerStore::keeping(config.clone()).await?;
         Ok(Self {
             config,
             live: std::sync::Mutex::new(Some(store)),
@@ -317,7 +321,7 @@ impl SuspendableStore {
         if self.current().is_some() {
             return Ok(());
         }
-        let store = FoyerStore::with_config(self.config.clone()).await?;
+        let store = FoyerStore::keeping(self.config.clone()).await?;
         if let Ok(mut live) = self.live.lock() {
             if live.is_none() {
                 *live = Some(store);
@@ -773,6 +777,49 @@ mod tests {
             blocks_found_after_reopening(true, 530, 700 << 10).await,
             530
         );
+    }
+
+    /// A warm relaunch over a viewer's store: a session's tiles — 1 537, the
+    /// count a warm relaunch measured fetching again — put as they arrive,
+    /// all of them still in the memory tier when the store is flushed on the
+    /// way out, then the store opened again by the next launch. Every tile is
+    /// there: what the index answers absent the next launch fetches.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_flushed_viewer_store_has_every_tile_on_the_next_launch() {
+        const TILES: usize = 1_537;
+        const EACH: usize = 64 << 10;
+        let dir = tempfile::tempdir().expect("dir");
+        let cfg = || StoreConfig {
+            dir: dir.path().to_path_buf(),
+            memory_bytes: 256 << 20,
+            disk_bytes: 4 << 30,
+            default_ttl: None,
+        };
+        let first = SuspendableStore::open(cfg()).await.expect("store");
+        for i in 0..TILES {
+            first
+                .put(&format!("tile/{i}"), Bytes::from(vec![i as u8; EACH]), None)
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        first.close().await.expect("flushed");
+        drop(first);
+        let next = SuspendableStore::open(cfg()).await.expect("reopened");
+        let mut held = 0;
+        let mut found = 0;
+        for i in 0..TILES {
+            let key = format!("tile/{i}");
+            held += usize::from(next.holds(&key));
+            if next
+                .get(&key)
+                .await
+                .is_some_and(|b| b.len() == EACH && b[0] == i as u8)
+            {
+                found += 1;
+            }
+        }
+        next.close().await.expect("closed");
+        assert_eq!((held, found), (TILES, TILES), "(indexed, read back)");
     }
 
     /// Measured, not asserted: what the default store keeps of the same.
