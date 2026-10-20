@@ -2073,6 +2073,61 @@ mod batch {
         }
     }
 
+    /// I13 with the frames ahead: the need's ring (what the views of the
+    /// frames to come select, loaded beside the frame) loads meshes only.
+    /// A frame ahead's selection is still settling, and batch never cancels
+    /// a load it started, so a drape asked for it would be read whatever
+    /// that frame draws; its drapes are asked when it is the frame. And the
+    /// ring's meshes, never drawn by this frame, do not hold the frame's own
+    /// drapes back.
+    #[test]
+    fn a_batch_ring_loads_meshes_only_and_holds_no_drape_back() {
+        let mut r = Rig::batch();
+        let here = t(3, 2, 2);
+        let ahead = t(3, 4, 4);
+        let mut need = drawn_draped(&[here], 6);
+        need.ring.push((ahead, draped(ahead, 6)));
+        let first = r.step(&need);
+        assert!(
+            first
+                .start
+                .iter()
+                .all(|s| matches!(s.resource, ResourceId::Mesh(_))),
+            "a drape started before the frame's meshes were in: {:?}",
+            first.start
+        );
+        // The frame's mesh lands; the ring's stays in flight.
+        r.load_where(|res| res == mesh(here));
+        let mut started: Vec<ResourceId> = first.start.iter().map(|s| s.resource).collect();
+        for _ in 0..10 {
+            let d = r.step(&need);
+            started.extend(d.start.iter().map(|s| s.resource));
+            r.load_where(|res| matches!(res, ResourceId::Drape { .. }) || res == mesh(here));
+            r.upload(&d);
+        }
+        assert!(
+            started.contains(&mesh(ahead)),
+            "the ring's mesh was loaded ahead"
+        );
+        assert!(
+            started.contains(&dr(here, 6)),
+            "the ring's mesh in flight held the frame's drape back: {started:?}"
+        );
+        // The ring's mesh lands too: still no drape for it.
+        r.load_where(|res| res == mesh(ahead));
+        for _ in 0..10 {
+            let d = r.step(&need);
+            started.extend(d.start.iter().map(|s| s.resource));
+            r.complete(&d);
+        }
+        assert!(
+            !started
+                .iter()
+                .any(|s| matches!(s, ResourceId::Drape { tile, .. } if *tile == ahead)),
+            "a drape was asked for a frame ahead: {started:?}"
+        );
+    }
+
     /// I13: what a batch frame reads does not depend on the order its loads
     /// come back in. A stand-in for the traversal refines a tile once its
     /// mesh is in — holding it, its four children waited on, until they all
