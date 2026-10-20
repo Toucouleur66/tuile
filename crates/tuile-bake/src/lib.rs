@@ -45,6 +45,7 @@
 pub mod bake;
 #[cfg(test)]
 mod by_index_tests;
+mod drawer;
 mod globe;
 mod ground;
 pub mod local_store;
@@ -53,17 +54,19 @@ pub mod open;
 
 pub mod packed;
 mod session;
+pub mod settle;
 pub mod tape;
 pub mod tiles;
 
+pub use drawer::{GroundDrawer, Selected};
 pub use globe::{
     asset_of_namespace, duration_or, source_namespace, GlobeConfig, GlobeError, ReferenceFetched,
     ReferenceImagery, Sources, SourcesHandle, TileCache, BING_AERIAL, CESIUM_WORLD_TERRAIN,
 };
 pub use packed::PackedError;
 pub use session::{
-    budget_settings, exact_budget, exact_traversal, EncodedTexture, Finish, Frame, FrameError,
-    GroundMemory, Session, SessionConfig, TileGeometry,
+    budget_settings, exact_budget, exact_traversal, pose_view, EncodedTexture, Finish, Frame,
+    FrameError, GroundMemory, Session, SessionConfig, TileGeometry,
 };
 /// What a caller already holds, so a bake never fetches it twice. See
 /// [`GlobeConfig::held_drape`].
