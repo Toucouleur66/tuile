@@ -311,14 +311,21 @@ fn a_slow_zoom_in_converges_at_the_deepest_level() {
     }
 }
 
-/// P2.4 on the phone (512 MiB). Red under the pooled ledger: over the
-/// mountains, at 400 m, the pool full (terrain and imagery at the pool's
-/// target, protected bytes under target + overflow), loads still trickle in
-/// against evictions eight seconds after the stop, and the relaxation starts
-/// only then; under the fixed 40/60 split it converged within 8 s. The
-/// phone's bound is D-P1's, open.
+/// P2.4 on the phone (512 MiB). Red under the pooled ledger, and bound by
+/// throughput under either ledger (measured 2026-10-21, seed 88): eight
+/// meshes and eight drapes in flight on the phone's 8 MB/s fill the view at
+/// 400 m over the mountains at a steady ~60 starts a second, and the view
+/// converges only once the relaxation has raised the SSE scale enough to
+/// shrink the need. Under the fixed 40/60 split the terrain class hit its
+/// 118 MiB target at 13 s and the relaxation started at 15.5 s: converged
+/// 7.3 s after the stop, at scale 2.53, 248 tiles exact. Under the pool the
+/// terrain grows into what the imagery leaves (152 MiB), the relaxation
+/// starts at 17 s: converged 10.1 s after the stop, at scale 2.08, 330 tiles
+/// exact — sharper, later. No load is lost or repeated (no thrash). Meeting
+/// 8 s means moving the bound (D-P1) or relaxing earlier than the pool is
+/// full: Laurent's decision.
 #[test]
-#[ignore = "red: pooled ledger, the phone's slow dive unconverged 8 s after the stop (D-A3 follow-up, D-P1)"]
+#[ignore = "throughput-bound: 10.1 s after the stop under the pool (7.3 s under the old split, by relaxing earlier); the 8 s bound or the relaxation is D-P1's, open"]
 fn a_slow_zoom_in_converges_at_the_deepest_level_on_a_phone() {
     slow_dive_converges(Profile::handheld(), 88, Micros::from_secs(8));
 }
