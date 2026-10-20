@@ -483,10 +483,18 @@ mod tests {
         };
         assert_eq!(frames, 7);
         assert!(path.starts_with(work.path()));
-        assert!(!work.path().join("seg0.mp4").exists(), "each segment let go once joined");
-        assert!(!receipts.exists(&run.film()).await.expect("exists"), "nothing uploaded");
         assert!(
-            gather(&receipts, &receipts, &run, 2, work.path(), None).await.is_err(),
+            !work.path().join("seg0.mp4").exists(),
+            "each segment let go once joined"
+        );
+        assert!(
+            !receipts.exists(&run.film()).await.expect("exists"),
+            "nothing uploaded"
+        );
+        assert!(
+            gather(&receipts, &receipts, &run, 2, work.path(), None)
+                .await
+                .is_err(),
             "the segments are not in the run store"
         );
     }
@@ -496,4 +504,3 @@ mod tests {
         store.put(from, key).await.expect("put");
     }
 }
-

@@ -58,8 +58,8 @@ pub fn p016_to_nv12(p016: &[u8], (width, height): (usize, usize)) -> Vec<u8> {
             let line = &p016[at..at + 2 * row];
             at += 2 * row;
             let pattern = &table[((y + 32 * plane) % 64) * 64..][..64];
-            for (x, sample) in line.chunks_exact(2).enumerate() {
-                let ten = u16::from_le_bytes([sample[0], sample[1]]) >> 6;
+            for (x, sample) in line.as_chunks::<2>().0.iter().enumerate() {
+                let ten = u16::from_le_bytes(*sample) >> 6;
                 let eight = (ten + u16::from(pattern[x % 64])) >> 2;
                 out.push(eight.min(255) as u8);
             }
@@ -90,7 +90,12 @@ impl Stream {
         let mut sets = Vec::new();
         let (length, hevc, bit_depth) = match &track.entry {
             tuile_mp4::film::Entry::Avc1(e) => {
-                for unit in e.avcc.sequence_parameter_sets.iter().chain(&e.avcc.picture_parameter_sets) {
+                for unit in e
+                    .avcc
+                    .sequence_parameter_sets
+                    .iter()
+                    .chain(&e.avcc.picture_parameter_sets)
+                {
                     start(unit, &mut sets);
                 }
                 let depth = e.avcc.ext.as_ref().map_or(8, |x| x.bit_depth_luma);
@@ -98,14 +103,20 @@ impl Stream {
             }
             tuile_mp4::film::Entry::Hvc1(e) => {
                 if e.lhvc.is_some() {
-                    return Err("a spatial film's two layers are delivered as they are, not decoded".into());
+                    return Err(
+                        "a spatial film's two layers are delivered as they are, not decoded".into(),
+                    );
                 }
                 for array in &e.hvcc.arrays {
                     for unit in &array.nalus {
                         start(unit, &mut sets);
                     }
                 }
-                (usize::from(e.hvcc.length_size_minus_one) + 1, true, e.hvcc.bit_depth_luma_minus8 + 8)
+                (
+                    usize::from(e.hvcc.length_size_minus_one) + 1,
+                    true,
+                    e.hvcc.bit_depth_luma_minus8 + 8,
+                )
             }
             _ => return Err("only H.264 and HEVC films are decoded here".into()),
         };
@@ -272,7 +283,8 @@ mod gpu {
         began: std::time::Instant,
     ) -> Result<Compressed, crate::Error> {
         let mut file = std::fs::File::open(joined)?;
-        let track = tuile_mp4::film::read_track(&mut file)?.ok_or("no video track in the joined film")?;
+        let track =
+            tuile_mp4::film::read_track(&mut file)?.ok_or("no video track in the joined film")?;
         let stream = Stream::of(track)?;
         let size = stream.size().ok_or("a track of no size")?;
         let fps = fps.max(1);
@@ -285,7 +297,13 @@ mod gpu {
         };
         let seconds = stream.frames() as f64 / f64::from(fps);
         let mut passes = 1;
-        let mut written = pass(joined, &stream, out, &Spec::of(profile, input, size, fps, None), device)?;
+        let mut written = pass(
+            joined,
+            &stream,
+            out,
+            &Spec::of(profile, input, size, fps, None),
+            device,
+        )?;
         if let Some(cap) = profile.size_cap_bytes.filter(|&cap| written.bytes > cap) {
             let average = profile.capped_bitrate(seconds).ok_or("a cap of no rate")?;
             let (_, ceiling) = profile.bitrates(size.0 as u32, size.1 as u32, f64::from(fps));
@@ -298,7 +316,13 @@ mod gpu {
                 average,
                 max: ceiling.min(average.saturating_mul(3) / 2).max(average),
             };
-            written = pass(joined, &stream, out, &Spec::of(profile, input, size, fps, Some(rate)), device)?;
+            written = pass(
+                joined,
+                &stream,
+                out,
+                &Spec::of(profile, input, size, fps, Some(rate)),
+                device,
+            )?;
             passes = 2;
         }
         Ok(Compressed {
@@ -404,7 +428,10 @@ mod tests {
         let top = p016_to_nv12(&p016(&vec![1023u16; w * h + chroma]), size);
         assert!(top.iter().all(|&v| v == 255));
         let exact = p016_to_nv12(&p016(&vec![512u16; w * h + chroma]), size);
-        assert!(exact.iter().all(|&v| v == 128), "a whole step stays where it is");
+        assert!(
+            exact.iter().all(|&v| v == 128),
+            "a whole step stays where it is"
+        );
     }
 
     /// A gradient of a few eight-bit steps across a picture: its ten-bit
@@ -413,14 +440,19 @@ mod tests {
     fn a_smooth_gradient_stays_smooth_in_eight_bits() {
         let (w, h) = (256usize, 64usize);
         let chroma = 2 * (w / 2) * (h / 2);
-        let mut values: Vec<u16> = (0..h).flat_map(|_| (0..w).map(|x| 400 + (x as u16) / 16)).collect();
+        let mut values: Vec<u16> = (0..h)
+            .flat_map(|_| (0..w).map(|x| 400 + (x as u16) / 16))
+            .collect();
         values.extend(std::iter::repeat_n(512u16, chroma));
         let eight = p016_to_nv12(&p016(&values), (w, h));
         // Column means follow the ten-bit ramp to a tenth of a step.
         for x in (0..w).step_by(16) {
             let column: f64 = (0..h).map(|y| f64::from(eight[y * w + x])).sum::<f64>() / h as f64;
             let truth = f64::from(400 + (x as u16) / 16) / 4.0;
-            assert!((column - truth).abs() < 0.15, "column {x}: {column} for {truth}");
+            assert!(
+                (column - truth).abs() < 0.15,
+                "column {x}: {column} for {truth}"
+            );
         }
     }
 
@@ -433,23 +465,37 @@ mod tests {
         let (sps, pps) = ([0x67u8, 0x64, 0x00, 0x28, 0xac], [0x68u8, 0xeb]);
         let entry = tuile_mp4::film::avc1(64, 48, &sps, &pps).expect("entry");
         let mut w = tuile_mp4::film::FilmWriter::create(&path, entry, 30).expect("writer");
-        w.push(&[0, 0, 0, 2, 0x65, 1, 0, 0, 0, 1, 0x06], true, 0).expect("push");
+        w.push(&[0, 0, 0, 2, 0x65, 1, 0, 0, 0, 1, 0x06], true, 0)
+            .expect("push");
         w.push(&[0, 0, 0, 2, 0x41, 2], false, 1).expect("push");
         w.finish().expect("finish");
         let mut file = std::fs::File::open(&path).expect("film");
-        let track = tuile_mp4::film::read_track(&mut file).expect("read").expect("track");
+        let track = tuile_mp4::film::read_track(&mut file)
+            .expect("read")
+            .expect("track");
         let stream = Stream::of(track).expect("stream");
-        assert_eq!((stream.hevc, stream.bit_depth, stream.frames()), (false, 8, 2));
+        assert_eq!(
+            (stream.hevc, stream.bit_depth, stream.frames()),
+            (false, 8, 2)
+        );
         assert_eq!(stream.size(), Some((64, 48)));
         let first = stream.access_unit(&mut file, 0).expect("first");
         assert_eq!(
             first,
             [
-                &[0u8, 0, 0, 1][..], &sps, &[0, 0, 0, 1], &pps, &[0, 0, 0, 1, 0x65, 1], &[0, 0, 0, 1, 0x06]
+                &[0u8, 0, 0, 1][..],
+                &sps,
+                &[0, 0, 0, 1],
+                &pps,
+                &[0, 0, 0, 1, 0x65, 1],
+                &[0, 0, 0, 1, 0x06]
             ]
             .concat()
         );
-        assert_eq!(stream.access_unit(&mut file, 1).expect("second"), [0, 0, 0, 1, 0x41, 2]);
+        assert_eq!(
+            stream.access_unit(&mut file, 1).expect("second"),
+            [0, 0, 0, 1, 0x41, 2]
+        );
     }
 
     /// A tuning variable changes its one setting and nothing else; a value
@@ -478,12 +524,17 @@ mod tests {
         let entry = tuile_mp4::film::avc1(64, 48, &[0x67, 0x64, 0, 0x28], &[0x68]).expect("entry");
         let mut w = tuile_mp4::film::FilmWriter::create(&joined, entry, 30).expect("writer");
         for i in 0..3u8 {
-            w.push(&[0, 0, 0, 1, i], i == 0, u64::from(i)).expect("push");
+            w.push(&[0, 0, 0, 1, i], i == 0, u64::from(i))
+                .expect("push");
         }
         w.finish().expect("finish");
         let out = dir.path().join("out.mp4");
-        let done = compress(&joined, &out, &tuile_farm::compress::Delivery::Copy, 30, 0).expect("copy");
+        let done =
+            compress(&joined, &out, &tuile_farm::compress::Delivery::Copy, 30, 0).expect("copy");
         assert_eq!((done.frames, done.passes), (3, 0));
-        assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&joined).unwrap());
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            std::fs::read(&joined).unwrap()
+        );
     }
 }

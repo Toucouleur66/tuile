@@ -786,7 +786,9 @@ mod tests {
     fn the_mezzanine_store_is_a_bucket_a_directory_or_the_run_store() {
         let dir = tempfile::tempdir().expect("dir");
         assert!(ObjectRunStore::mezzanine_at(None).expect("none").is_none());
-        assert!(ObjectRunStore::mezzanine_at(Some("  ")).expect("blank").is_none());
+        assert!(ObjectRunStore::mezzanine_at(Some("  "))
+            .expect("blank")
+            .is_none());
         let local = ObjectRunStore::mezzanine_at(Some(dir.path().to_str().unwrap()))
             .expect("dir")
             .expect("a store");

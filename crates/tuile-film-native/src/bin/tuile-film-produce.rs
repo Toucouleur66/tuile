@@ -572,7 +572,10 @@ mod tests {
         // gives it, whichever the machine has.
         assert_eq!(args.codec, "h264");
         let rendering = rendering(&args, None).expect("rendering");
-        assert_eq!(rendering.bitrate, 0, "the encoder's own, by the picture's size");
+        assert_eq!(
+            rendering.bitrate, 0,
+            "the encoder's own, by the picture's size"
+        );
         assert!(rendering.order.look.haze.is_none());
     }
 

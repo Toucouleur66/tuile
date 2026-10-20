@@ -197,7 +197,11 @@ impl SpatialFilm {
             properties.insert(
                 key(AVVideoAverageBitRateKey)?,
                 // Both eyes: what a spatial film is asked for unless told.
-                &NSNumber::new_u32(if self.bitrate == 0 { 30_000_000 } else { self.bitrate }),
+                &NSNumber::new_u32(if self.bitrate == 0 {
+                    30_000_000
+                } else {
+                    self.bitrate
+                }),
             );
             properties.insert(
                 key(AVVideoExpectedSourceFrameRateKey)?,

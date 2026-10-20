@@ -191,7 +191,8 @@ impl Sink for Av1Film {
             matrix_coefficients: MatrixCoefficients::BT709,
         });
         enc.time_base = Rational::new(1, u64::from(fps.max(1)));
-        enc.bitrate = crate::setup::bitrate_for(self.bitrate, width, height, fps).min(i32::MAX as u32) as i32;
+        enc.bitrate =
+            crate::setup::bitrate_for(self.bitrate, width, height, fps).min(i32::MAX as u32) as i32;
         // Packets out in the order pictures went in: the muxer wants them
         // so, and nothing here should sit on a film's worth of raw frames.
         enc.low_latency = true;

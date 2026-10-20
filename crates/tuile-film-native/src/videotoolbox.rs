@@ -237,7 +237,10 @@ impl Sink for H264Film {
                 .ok_or("a number could not be made")
         };
         let (rate, interval, per_second) = (
-            number(crate::setup::bitrate_for(self.bitrate, width, height, fps).min(i32::MAX as u32) as i32)?,
+            number(
+                crate::setup::bitrate_for(self.bitrate, width, height, fps).min(i32::MAX as u32)
+                    as i32,
+            )?,
             number((2 * self.fps) as i32)?,
             number(self.fps as i32)?,
         );
