@@ -685,6 +685,17 @@ Taken from this study's recommendations where nothing was said:
   and `--probe`: what a player finds in a film).
 - **Spatial** is unchanged: MV-HEVC segments, joined (now faststart and
   colour-tagged by the join), delivered as they are (`copy`).
+- **The Mac** (`videotoolbox.rs`, §5.3 built): the encoder's spec, its
+  pictures in and out and the film they make are shared by both backends
+  (`encode.rs`: `Spec`, `node_spec`, `Package`), and so is the delivery
+  loop (`compress::deliver`: constant quality, then the cap). `VtFilm`
+  writes the mezzanine (HEVC Main10 from P010, the render's eight bits made
+  ten exactly) or H.264; `compress` decodes with VTDecompressionSession and
+  encodes in one VTCompressionSession — reordering on, an IDR forced at
+  every GOP, BT.709 said, faststart. Spatial on the Mac is `SpatialFilm`'s
+  MV-HEVC, joined and delivered as a copy. No `master-prores`: the muxer
+  writes mp4 only, and a ProRes `mov` would be a second muxer for a profile
+  kept out of the product.
 
 Measured on a Cloud Run L4: see §9.1.
 
@@ -723,3 +734,41 @@ the same mezzanine costs that, not a render.
 What this does not measure: VMAF/CAMBI (§6 is still to run); the
 float → P010 dither at the render node (the mezzanine is NVENC's own 8 → 10
 bits of today's I420); the spatial path (unchanged, not run); 4K.
+
+### 9.2 The Mac path measured (M2, 20 Oct. 2026)
+
+The L4's mezzanine of the mobile run (§9.1, the seven segments fetched
+from GCS and joined) compressed on the Mac, and scored by PSNR-Y against
+that mezzanine, decoded by the Mac (`examples/film-psnr.rs`):
+
+| Film | Size | Mean rate | PSNR-Y mean / P1 / worst | Encode |
+|---|---|---|---|---|
+| `web` on the Mac | 37.0 MB | 2.08 Mb/s | 46.1 / 43.2 / 42.7 dB | 10.5 s (406 fps) |
+| `web` on the L4 | 39.2 MB | 2.20 Mb/s | 48.2 / 43.2 / 42.3 dB | 16.5 s |
+| `high` on the Mac | 54.4 MB | 3.06 Mb/s | 50.0 / 47.3 / 46.9 dB | 11.2 s |
+| `high` on the L4 | 53.0 MB | 2.98 Mb/s | 51.2 / 45.2 / 43.3 dB | 15.7 s |
+
+- **VideoToolbox's constant quality is set to land at the L4's size**
+  (`videotoolbox::quality`: H.264 at NVENC's 24 → 0.748, HEVC at 21 →
+  0.737 and at 17 → 0.809). At equal size the Mac loses 1.2–2.1 dB of mean
+  PSNR — VideoToolbox has no lookahead, no adaptive quantisation and no
+  per-picture multipass — and holds its worst frames as well or better.
+- **A ceiling switches the quality off.** Measured: a session given
+  `DataRateLimits` beside `Quality` encodes the same bytes at every
+  quality. On the Mac a constant-quality film therefore has no per-second
+  ceiling, and the cap's second pass (a mean rate) is where a ceiling is
+  set. An encoder that misses that mean (VideoToolbox, by ~9 % on a 3 s
+  film) is asked again, lower, up to four encodes (`compress::PASSES`).
+- **With frames reordered VideoToolbox places its key frame a B-group
+  early** (frame 58 for a GOP of 60): the GOP's first frame is forced as a
+  key frame, and the encoder's own interval left at twice the GOP.
+- **A render on the Mac** (Metal, frames 1–150 of the same run, 720×1280):
+  150 frames in 15.7 s with the mezzanine encoded on its own thread; the
+  Mac's mezzanine is 3.0 Mb/s where the L4's is 4.0 on the same frames.
+  Films and their parameters: `videos/README.md`,
+  `stl-1572170-mobile-720x1280-mac-*`.
+
+What this does not measure: VMAF/CAMBI (PSNR is blind to banding), the
+mezzanine against the float render, HD and 4K on the Mac (not run there),
+ProRes (not built).
+

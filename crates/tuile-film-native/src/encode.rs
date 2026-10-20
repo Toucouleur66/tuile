@@ -371,6 +371,22 @@ pub fn i420_to_p010(i420: &[u8], (width, height): (usize, usize)) -> Vec<u8> {
     out
 }
 
+/// An I420 picture as NV12: the luma as it is, the two chromas
+/// interleaved, U first.
+pub fn i420_to_nv12(i420: &[u8], (width, height): (usize, usize)) -> Vec<u8> {
+    let (luma, chroma) = (width * height, width.div_ceil(2) * height.div_ceil(2));
+    let mut out = Vec::with_capacity(luma + 2 * chroma);
+    out.extend_from_slice(&i420[..luma]);
+    let (u, v) = (
+        &i420[luma..luma + chroma],
+        &i420[luma + chroma..luma + 2 * chroma],
+    );
+    for (&u, &v) in u.iter().zip(v) {
+        out.extend([u, v]);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
