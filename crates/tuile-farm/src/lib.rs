@@ -42,6 +42,7 @@ use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutPayload
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub mod assemble;
+pub mod compress;
 pub mod concat;
 pub mod job;
 pub mod jobs;
@@ -280,6 +281,49 @@ impl ObjectRunStore {
             _ => Self::bucket(&BucketConfig::from_env()?, tuning)?,
         };
         Ok(store.under(&std::env::var("TUILE_STORE_PREFIX").unwrap_or_default()))
+    }
+
+    /// A Google Cloud Storage bucket, signed for by the machine's own
+    /// identity (on Cloud Run, its service account through the metadata
+    /// server; elsewhere `GOOGLE_APPLICATION_CREDENTIALS`).
+    pub fn gcs(bucket: &str, tuning: Tuning) -> Result<Self> {
+        let store = object_store::gcp::GoogleCloudStorageBuilder::from_env()
+            .with_bucket_name(bucket)
+            .build()
+            .map_err(|e| StoreError::Config(e.to_string()))?;
+        Ok(ObjectRunStore {
+            store: Arc::new(store),
+            tuning,
+            label: format!("gs://{bucket}"),
+        })
+    }
+
+    /// The store that keeps a render's mezzanine — its segments, read only
+    /// by the final stage — as `TUILE_MEZZANINE_STORE` names it: `gs://<bucket>`
+    /// (kept in the region of the cards that write and read it, so that its
+    /// bytes never cross a paid network), or a directory. `None` when it is
+    /// not set: the mezzanine is then kept in the run store, as everything
+    /// else.
+    pub fn mezzanine_from_env() -> Result<Option<Self>> {
+        Self::mezzanine_at(std::env::var("TUILE_MEZZANINE_STORE").ok().as_deref())
+    }
+
+    /// [`Self::mezzanine_from_env`] for the value given.
+    pub fn mezzanine_at(at: Option<&str>) -> Result<Option<Self>> {
+        let Some(at) = at.map(str::trim).filter(|v| !v.is_empty()) else {
+            return Ok(None);
+        };
+        let tuning = Tuning::from_env();
+        let store = match at.strip_prefix("gs://") {
+            Some(bucket) => Self::gcs(bucket.trim_end_matches('/'), tuning)?,
+            None if at.contains("://") => {
+                return Err(StoreError::Config(format!(
+                    "TUILE_MEZZANINE_STORE is gs://<bucket> or a directory, not {at}"
+                )))
+            }
+            None => Self::local(Path::new(at), tuning)?,
+        };
+        Ok(Some(store))
     }
 
     /// The same store, every key under `prefix`: a trial's objects kept
@@ -736,6 +780,26 @@ pub async fn assert_run_store_contract(store: &dyn RunStore, prefix: &str, part_
 
 #[cfg(test)]
 mod tests {
+    /// The mezzanine is kept where the variable says — a GCS bucket or a
+    /// directory — or in the run store when it says nothing.
+    #[test]
+    fn the_mezzanine_store_is_a_bucket_a_directory_or_the_run_store() {
+        let dir = tempfile::tempdir().expect("dir");
+        assert!(ObjectRunStore::mezzanine_at(None).expect("none").is_none());
+        assert!(ObjectRunStore::mezzanine_at(Some("  "))
+            .expect("blank")
+            .is_none());
+        let local = ObjectRunStore::mezzanine_at(Some(dir.path().to_str().unwrap()))
+            .expect("dir")
+            .expect("a store");
+        assert!(local.label.starts_with("dir "), "{}", local.label);
+        let gcs = ObjectRunStore::mezzanine_at(Some("gs://stl-mezzanine/"))
+            .expect("bucket")
+            .expect("a store");
+        assert_eq!(gcs.label, "gs://stl-mezzanine");
+        assert!(ObjectRunStore::mezzanine_at(Some("s3://elsewhere")).is_err());
+    }
+
     use super::*;
 
     #[test]

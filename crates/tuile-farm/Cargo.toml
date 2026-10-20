@@ -26,11 +26,12 @@ path = "src/bin/tuile-migrate-packs.rs"
 # One client for every byte a job moves, and one we did not write.
 #
 # `aws` is the S3 protocol, which every bucket the farm talks to speaks; `fs`
-# is the same interface on a directory, for tests and for the workstation. The
+# is the same interface on a directory, for tests and for the workstation;
+# `gcp` is a render's mezzanine, kept in the region of the cards. The
 # `aws` feature brings rustls on aws-lc-rs, which is the provider the rest of
 # the workspace already resolves to — one crypto provider in the process, so
 # rustls never has to guess.
-object_store = { version = "0.14.2", default-features = false, features = ["aws", "fs"] }
+object_store = { version = "0.14.2", default-features = false, features = ["aws", "fs", "gcp"] }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }

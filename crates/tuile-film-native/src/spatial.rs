@@ -196,7 +196,12 @@ impl SpatialFilm {
             let key = |k: Option<&'static NSString>| k.ok_or("AVFoundation names no such key");
             properties.insert(
                 key(AVVideoAverageBitRateKey)?,
-                &NSNumber::new_u32(self.bitrate),
+                // Both eyes: what a spatial film is asked for unless told.
+                &NSNumber::new_u32(if self.bitrate == 0 {
+                    30_000_000
+                } else {
+                    self.bitrate
+                }),
             );
             properties.insert(
                 key(AVVideoExpectedSourceFrameRateKey)?,
