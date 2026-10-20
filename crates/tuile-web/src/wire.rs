@@ -24,13 +24,17 @@
 use std::sync::Arc;
 
 use glam::{DVec2, DVec3, Mat4};
-use tuile_core::content::{
-    ContentFormat, DecodedMesh, DecodedTexture, DecodedTileContent, MaterialDesc, TileContent,
+use tuile_core::budget::{
+    Bytes, Class, DrapeChoice, DrawItem, DrawSet, Generation, LayerId, PerClass, Pressure,
+    ResourceId, Role, SwapGroup, Thermal, UploadPlan, UvTransform,
 };
-use tuile_core::protocol::{Ancestry, ClientMessage, Priming, ServerMessage};
+use tuile_core::content::{
+    DecodedMesh, DecodedTexture, DecodedTileContent, DrapeContent, MaterialDesc,
+};
+use tuile_core::protocol::{Ancestry, ClientMessage, Priming, ResourceContent, ServerMessage};
 use tuile_core::raster::{ImageryCoord, ImageryLayer};
 use tuile_core::source::TileId;
-use tuile_core::traversal::{TraversalStats, ViewState, ViewStateParams};
+use tuile_core::traversal::{Fov, TraversalStats, ViewState, ViewStateParams};
 
 /// A buffer that does not read back into a message.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -60,20 +64,59 @@ pub fn encode_client(message: &ClientMessage) -> Vec<u8> {
                 w.f64(p.viewport_px.x);
                 w.f64(p.viewport_px.y);
                 w.f64(p.fovy_rad);
+                match p.fov {
+                    Some(fov) => {
+                        w.u8(1);
+                        for v in [fov.left, fov.right, fov.up, fov.down] {
+                            w.f64(v);
+                        }
+                    }
+                    None => w.u8(0),
+                }
+                w.f64(p.scale);
             }
             w.u64(*generation);
         }
-        ClientMessage::Ack { tile } => {
+        ClientMessage::Ack {
+            resource,
+            gen,
+            bytes,
+        } => {
             w.u8(1);
-            w.u64(tile.0);
+            w.resource(resource);
+            w.u64(gen.0);
+            w.u64(*bytes);
         }
-        ClientMessage::Cancel { tile } => {
+        ClientMessage::Discarded { resource, gen } => {
             w.u8(2);
-            w.u64(tile.0);
+            w.resource(resource);
+            w.u64(gen.0);
         }
-        ClientMessage::Trim { budget_bytes } => {
+        ClientMessage::Pressure(p) => {
             w.u8(3);
-            w.u64(*budget_bytes as u64);
+            w.u8(match p {
+                Pressure::Normal => 0,
+                Pressure::Warning => 1,
+                Pressure::Critical => 2,
+                Pressure::Background => 3,
+            });
+        }
+        ClientMessage::Thermal(t) => {
+            w.u8(4);
+            w.u8(match t {
+                Thermal::Nominal => 0,
+                Thermal::Fair => 1,
+                Thermal::Serious => 2,
+                Thermal::Critical => 3,
+            });
+        }
+        ClientMessage::Retarget { total_bytes } => {
+            w.u8(5);
+            w.u64(*total_bytes);
+        }
+        ClientMessage::ReleaseBeyond { bytes } => {
+            w.u8(6);
+            w.u64(*bytes);
         }
     }
     w.0
@@ -87,13 +130,30 @@ pub fn decode_client(bytes: &[u8]) -> Result<ClientMessage, WireError> {
             let n = r.len()?;
             let mut views = Vec::with_capacity(n.min(16));
             for _ in 0..n {
-                let params = ViewStateParams {
-                    position: r.dvec3()?,
-                    direction: r.dvec3()?,
-                    up: r.dvec3()?,
-                    viewport_px: DVec2::new(r.f64()?, r.f64()?),
-                    fovy_rad: r.f64()?,
+                let position = r.dvec3()?;
+                let direction = r.dvec3()?;
+                let up = r.dvec3()?;
+                let viewport_px = DVec2::new(r.f64()?, r.f64()?);
+                let fovy_rad = r.f64()?;
+                let fov = match r.u8()? {
+                    0 => None,
+                    1 => Some(Fov {
+                        left: r.f64()?,
+                        right: r.f64()?,
+                        up: r.f64()?,
+                        down: r.f64()?,
+                    }),
+                    tag => {
+                        return Err(WireError::Tag {
+                            what: "a lens",
+                            tag,
+                        })
+                    }
                 };
+                let mut params =
+                    ViewStateParams::perspective(position, direction, up, viewport_px, fovy_rad);
+                params.fov = fov;
+                params.scale = r.f64()?;
                 views.push(ViewState::from(params));
             }
             ClientMessage::ViewerState {
@@ -102,14 +162,42 @@ pub fn decode_client(bytes: &[u8]) -> Result<ClientMessage, WireError> {
             }
         }
         1 => ClientMessage::Ack {
-            tile: TileId(r.u64()?),
+            resource: r.resource()?,
+            gen: Generation(r.u64()?),
+            bytes: r.u64()?,
         },
-        2 => ClientMessage::Cancel {
-            tile: TileId(r.u64()?),
+        2 => ClientMessage::Discarded {
+            resource: r.resource()?,
+            gen: Generation(r.u64()?),
         },
-        3 => ClientMessage::Trim {
-            budget_bytes: r.u64()? as usize,
+        3 => ClientMessage::Pressure(match r.u8()? {
+            0 => Pressure::Normal,
+            1 => Pressure::Warning,
+            2 => Pressure::Critical,
+            3 => Pressure::Background,
+            tag => {
+                return Err(WireError::Tag {
+                    what: "a pressure",
+                    tag,
+                })
+            }
+        }),
+        4 => ClientMessage::Thermal(match r.u8()? {
+            0 => Thermal::Nominal,
+            1 => Thermal::Fair,
+            2 => Thermal::Serious,
+            3 => Thermal::Critical,
+            tag => {
+                return Err(WireError::Tag {
+                    what: "a thermal state",
+                    tag,
+                })
+            }
+        }),
+        5 => ClientMessage::Retarget {
+            total_bytes: r.u64()?,
         },
+        6 => ClientMessage::ReleaseBeyond { bytes: r.u64()? },
         tag => {
             return Err(WireError::Tag {
                 what: "a client message",
@@ -126,16 +214,27 @@ pub fn encode_server(message: &ServerMessage) -> Vec<u8> {
     let mut w = Writer::default();
     match message {
         ServerMessage::Select {
-            tiles,
+            draw,
+            plan,
             ancestry,
             stats,
+            hard_limit,
+            frame_ready,
+            converged,
+            lost,
+            bare,
             generation,
         } => {
             w.u8(0);
-            w.len(tiles.len());
-            for (tile, sse) in tiles {
-                w.u64(tile.0);
-                w.f64(*sse);
+            w.len(draw.items.len());
+            for item in &draw.items {
+                w.item(item);
+            }
+            w.resources(&plan.items);
+            w.u64(plan.bytes.0);
+            w.len(plan.groups.len());
+            for group in &plan.groups {
+                w.resources(&group.members);
             }
             w.len(ancestry.len());
             for (tile, a) in ancestry {
@@ -143,56 +242,68 @@ pub fn encode_server(message: &ServerMessage) -> Vec<u8> {
                 w.ancestry(a);
             }
             w.stats(stats);
+            for (_, b) in hard_limit.iter() {
+                w.u64(b.0);
+            }
+            w.u8(u8::from(*frame_ready));
+            w.u8(u8::from(*converged));
+            w.u32(*lost);
+            w.u32(*bare);
             w.u64(*generation);
         }
         ServerMessage::Content {
-            tile,
+            resource,
+            gen,
+            class,
             ancestry,
             content,
         } => {
             w.u8(1);
-            w.u64(tile.0);
+            w.resource(resource);
+            w.u64(gen.0);
+            w.u8(match class {
+                Class::TerrainMesh => 0,
+                Class::Tiles3dMesh => 1,
+                Class::Drape => 2,
+                Class::Overlay => 3,
+            });
             w.ancestry(ancestry);
             match content {
-                TileContent::Raw { format, bytes } => {
+                ResourceContent::Mesh(mesh) => {
                     w.u8(0);
-                    w.u8(match format {
-                        ContentFormat::Glb => 0,
-                        ContentFormat::B3dm => 1,
-                    });
-                    w.bytes(bytes);
+                    w.decoded(mesh);
                 }
-                TileContent::Decoded(decoded) => {
+                ResourceContent::Drape(drape) => {
                     w.u8(1);
-                    w.decoded(decoded);
+                    w.drape(drape);
                 }
             }
         }
-        ServerMessage::Fill {
-            tile,
-            ancestry,
-            content,
-        } => {
+        ServerMessage::Cancel { resources } => {
             w.u8(2);
-            w.u64(tile.0);
-            w.ancestry(ancestry);
-            w.decoded(content);
+            w.len(resources.len());
+            for (r, g) in resources {
+                w.resource(r);
+                w.u64(g.0);
+            }
         }
-        ServerMessage::Evict { tiles } => {
+        ServerMessage::Evict { resources } => {
             w.u8(3);
-            w.tiles(tiles);
+            w.resources(resources);
         }
-        ServerMessage::Retire { tiles } => {
+        ServerMessage::Error { resource, message } => {
             w.u8(4);
-            w.tiles(tiles);
-        }
-        ServerMessage::Error { tile, message } => {
-            w.u8(5);
-            w.option_u64(tile.map(|t| t.0));
+            match resource {
+                Some(r) => {
+                    w.u8(1);
+                    w.resource(r);
+                }
+                None => w.u8(0),
+            }
             w.bytes(message.as_bytes());
         }
         ServerMessage::Priming(p) => {
-            w.u8(6);
+            w.u8(5);
             w.u32(p.total);
             w.u32(p.unavailable);
             w.u32(p.outstanding);
@@ -207,68 +318,107 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerMessage, WireError> {
     let message = match r.u8()? {
         0 => {
             let n = r.len()?;
-            let mut tiles = Vec::with_capacity(n);
+            let mut items = Vec::with_capacity(n.min(1 << 16));
             for _ in 0..n {
-                tiles.push((TileId(r.u64()?), r.f64()?));
+                items.push(r.item()?);
+            }
+            let plan_items = r.resources()?;
+            let plan_bytes = Bytes(r.u64()?);
+            let n = r.len()?;
+            let mut groups = Vec::with_capacity(n.min(1 << 16));
+            for _ in 0..n {
+                groups.push(SwapGroup {
+                    members: r.resources()?,
+                });
             }
             let n = r.len()?;
-            let mut ancestry = Vec::with_capacity(n);
+            let mut ancestry = Vec::with_capacity(n.min(1 << 16));
             for _ in 0..n {
                 ancestry.push((TileId(r.u64()?), r.ancestry()?));
             }
+            let stats = r.stats()?;
+            let hard_limit = PerClass([
+                Bytes(r.u64()?),
+                Bytes(r.u64()?),
+                Bytes(r.u64()?),
+                Bytes(r.u64()?),
+            ]);
             ServerMessage::Select {
-                tiles,
+                draw: DrawSet { items },
+                plan: UploadPlan {
+                    items: plan_items,
+                    bytes: plan_bytes,
+                    groups,
+                },
                 ancestry,
-                stats: r.stats()?,
+                stats,
+                hard_limit,
+                frame_ready: r.flag()?,
+                converged: r.flag()?,
+                lost: r.u32()?,
+                bare: r.u32()?,
                 generation: r.u64()?,
             }
         }
         1 => {
-            let tile = TileId(r.u64()?);
-            let ancestry = r.ancestry()?;
-            let content = match r.u8()? {
-                0 => {
-                    let format = match r.u8()? {
-                        0 => ContentFormat::Glb,
-                        1 => ContentFormat::B3dm,
-                        tag => {
-                            return Err(WireError::Tag {
-                                what: "a content format",
-                                tag,
-                            })
-                        }
-                    };
-                    TileContent::Raw {
-                        format,
-                        bytes: bytes::Bytes::from(r.bytes()?.to_vec()),
-                    }
-                }
-                1 => TileContent::Decoded(r.decoded()?),
+            let resource = r.resource()?;
+            let gen = Generation(r.u64()?);
+            let class = match r.u8()? {
+                0 => Class::TerrainMesh,
+                1 => Class::Tiles3dMesh,
+                2 => Class::Drape,
+                3 => Class::Overlay,
                 tag => {
                     return Err(WireError::Tag {
-                        what: "a tile content",
+                        what: "a class",
+                        tag,
+                    })
+                }
+            };
+            let ancestry = r.ancestry()?;
+            let content = match r.u8()? {
+                0 => ResourceContent::Mesh(Arc::new(r.decoded()?)),
+                1 => ResourceContent::Drape(Arc::new(r.drape()?)),
+                tag => {
+                    return Err(WireError::Tag {
+                        what: "a resource content",
                         tag,
                     })
                 }
             };
             ServerMessage::Content {
-                tile,
+                resource,
+                gen,
+                class,
                 ancestry,
                 content,
             }
         }
-        2 => ServerMessage::Fill {
-            tile: TileId(r.u64()?),
-            ancestry: r.ancestry()?,
-            content: r.decoded()?,
+        2 => {
+            let n = r.len()?;
+            let mut resources = Vec::with_capacity(n.min(1 << 16));
+            for _ in 0..n {
+                resources.push((r.resource()?, Generation(r.u64()?)));
+            }
+            ServerMessage::Cancel { resources }
+        }
+        3 => ServerMessage::Evict {
+            resources: r.resources()?,
         },
-        3 => ServerMessage::Evict { tiles: r.tiles()? },
-        4 => ServerMessage::Retire { tiles: r.tiles()? },
-        5 => ServerMessage::Error {
-            tile: r.option_u64()?.map(TileId),
+        4 => ServerMessage::Error {
+            resource: match r.u8()? {
+                0 => None,
+                1 => Some(r.resource()?),
+                tag => {
+                    return Err(WireError::Tag {
+                        what: "an option",
+                        tag,
+                    })
+                }
+            },
             message: String::from_utf8(r.bytes()?.to_vec()).map_err(|_| WireError::Utf8)?,
         },
-        6 => ServerMessage::Priming(Priming {
+        5 => ServerMessage::Priming(Priming {
             total: r.u32()?,
             unavailable: r.u32()?,
             outstanding: r.u32()?,
@@ -337,6 +487,93 @@ impl Writer {
         for t in tiles {
             self.u64(t.0);
         }
+    }
+    fn resource(&mut self, r: &ResourceId) {
+        match r {
+            ResourceId::Mesh(tile) => {
+                self.u8(0);
+                self.u64(tile.0);
+            }
+            ResourceId::Drape { tile, layer, level } => {
+                self.u8(1);
+                self.u64(tile.0);
+                self.u32(u32::from(layer.0));
+                self.u32(*level);
+            }
+        }
+    }
+    fn resources(&mut self, rs: &[ResourceId]) {
+        self.len(rs.len());
+        for r in rs {
+            self.resource(r);
+        }
+    }
+    fn item(&mut self, item: &DrawItem) {
+        let DrawItem {
+            mesh,
+            role,
+            drapes,
+            serves,
+        } = item;
+        self.resource(mesh);
+        self.u8(match role {
+            Role::Exact => 0,
+            Role::Held => 1,
+            Role::Fallback => 2,
+        });
+        self.len(drapes.len());
+        for DrapeChoice {
+            resource,
+            layer,
+            level,
+            uv,
+        } in drapes
+        {
+            self.resource(resource);
+            self.u32(u32::from(layer.0));
+            self.u32(*level);
+            for v in uv.scale.iter().chain(&uv.offset) {
+                self.f64(*v);
+            }
+        }
+        self.tiles(serves);
+    }
+    fn layer(&mut self, layer: &ImageryLayer) {
+        let ImageryLayer {
+            coord,
+            source,
+            texture,
+            coverage,
+            translation,
+            scale,
+        } = layer;
+        self.u32(coord.level);
+        self.u64(coord.x);
+        self.u64(coord.y);
+        self.u32(*source);
+        self.texture(texture);
+        for f in coverage.iter().chain(translation).chain(scale) {
+            self.f32(*f);
+        }
+    }
+    fn drape(&mut self, d: &DrapeContent) {
+        let DrapeContent {
+            layer,
+            level,
+            tiles,
+            floor_tiles,
+            identity,
+            withheld,
+        } = d;
+        self.u32(u32::from(layer.0));
+        self.u32(*level);
+        self.len(tiles.len());
+        for t in tiles {
+            self.layer(t);
+        }
+        self.len(*floor_tiles);
+        self.u64(*identity);
+        self.u8(u8::from(*withheld));
     }
     fn ancestry(&mut self, a: &Ancestry) {
         self.u32(a.level);
@@ -420,22 +657,7 @@ impl Writer {
         }
         self.len(imagery.len());
         for layer in imagery {
-            let ImageryLayer {
-                coord,
-                source,
-                texture,
-                coverage,
-                translation,
-                scale,
-            } = layer;
-            self.u32(coord.level);
-            self.u64(coord.x);
-            self.u64(coord.y);
-            self.u32(*source);
-            self.texture(texture);
-            for f in coverage.iter().chain(translation).chain(scale) {
-                self.f32(*f);
-            }
+            self.layer(layer);
         }
         self.option_u64(*withheld_drape);
         self.dvec3(*local_origin_ecef);
@@ -519,6 +741,112 @@ impl<'a> Reader<'a> {
             }),
         }
     }
+    fn flag(&mut self) -> Result<bool, WireError> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            tag => Err(WireError::Tag {
+                what: "a flag",
+                tag,
+            }),
+        }
+    }
+    fn layer_id(&mut self) -> Result<LayerId, WireError> {
+        let raw = self.u32()?;
+        u16::try_from(raw).map(LayerId).map_err(|_| WireError::Tag {
+            what: "a layer",
+            tag: u8::MAX,
+        })
+    }
+    fn resource(&mut self) -> Result<ResourceId, WireError> {
+        match self.u8()? {
+            0 => Ok(ResourceId::Mesh(TileId(self.u64()?))),
+            1 => Ok(ResourceId::Drape {
+                tile: TileId(self.u64()?),
+                layer: self.layer_id()?,
+                level: self.u32()?,
+            }),
+            tag => Err(WireError::Tag {
+                what: "a resource",
+                tag,
+            }),
+        }
+    }
+    fn resources(&mut self) -> Result<Vec<ResourceId>, WireError> {
+        let n = self.len()?;
+        let mut out = Vec::with_capacity(n.min(1 << 16));
+        for _ in 0..n {
+            out.push(self.resource()?);
+        }
+        Ok(out)
+    }
+    fn item(&mut self) -> Result<DrawItem, WireError> {
+        let mesh = self.resource()?;
+        let role = match self.u8()? {
+            0 => Role::Exact,
+            1 => Role::Held,
+            2 => Role::Fallback,
+            tag => {
+                return Err(WireError::Tag {
+                    what: "a role",
+                    tag,
+                })
+            }
+        };
+        let n = self.len()?;
+        let mut drapes = Vec::with_capacity(n.min(16));
+        for _ in 0..n {
+            drapes.push(DrapeChoice {
+                resource: self.resource()?,
+                layer: self.layer_id()?,
+                level: self.u32()?,
+                uv: UvTransform {
+                    scale: [self.f64()?, self.f64()?],
+                    offset: [self.f64()?, self.f64()?],
+                },
+            });
+        }
+        Ok(DrawItem {
+            mesh,
+            role,
+            drapes,
+            serves: self.tiles()?,
+        })
+    }
+    fn layer(&mut self) -> Result<ImageryLayer, WireError> {
+        let coord = ImageryCoord {
+            level: self.u32()?,
+            x: self.u64()?,
+            y: self.u64()?,
+        };
+        let source = self.u32()?;
+        let texture = Arc::new(self.texture()?);
+        Ok(ImageryLayer {
+            coord,
+            source,
+            texture,
+            coverage: self.f32s()?,
+            translation: self.f32s()?,
+            scale: self.f32s()?,
+        })
+    }
+    fn drape(&mut self) -> Result<DrapeContent, WireError> {
+        let layer = self.layer_id()?;
+        let level = self.u32()?;
+        let n = self.len()?;
+        let mut tiles = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            tiles.push(self.layer()?);
+        }
+        Ok(DrapeContent {
+            layer,
+            level,
+            tiles,
+            floor_tiles: self.len()?,
+            identity: self.u64()?,
+            withheld: self.flag()?,
+        })
+    }
     fn tiles(&mut self) -> Result<Vec<TileId>, WireError> {
         let n = self.len()?;
         let mut tiles = Vec::with_capacity(n);
@@ -600,21 +928,7 @@ impl<'a> Reader<'a> {
         let n = self.len()?;
         let mut imagery = Vec::with_capacity(n.min(64));
         for _ in 0..n {
-            let coord = ImageryCoord {
-                level: self.u32()?,
-                x: self.u64()?,
-                y: self.u64()?,
-            };
-            let source = self.u32()?;
-            let texture = Arc::new(self.texture()?);
-            imagery.push(ImageryLayer {
-                coord,
-                source,
-                texture,
-                coverage: self.f32s()?,
-                translation: self.f32s()?,
-                scale: self.f32s()?,
-            });
+            imagery.push(self.layer()?);
         }
         Ok(DecodedTileContent {
             meshes,
@@ -712,59 +1026,106 @@ mod tests {
         decode_server(&encode_server(message)).expect("reads back")
     }
 
-    /// Content crosses whole: meshes, owned textures, draped imagery with its
-    /// placement, and the f64 origin bit for bit.
+    fn drape_content() -> DrapeContent {
+        DrapeContent {
+            layer: LayerId(2),
+            level: 11,
+            tiles: content().imagery,
+            floor_tiles: 1,
+            identity: 0xdead_beef,
+            withheld: true,
+        }
+    }
+
+    /// A mesh crosses whole: meshes, owned textures, the f64 origin bit for
+    /// bit — with its resource, generation and class.
     #[test]
-    fn content_crosses_whole() {
+    fn a_mesh_crosses_whole() {
         let ancestry = Ancestry {
             level: 7,
             parent: Some(TileId(41)),
         };
         let back = round_trip(&ServerMessage::Content {
-            tile: TileId(42),
+            resource: ResourceId::Mesh(TileId(42)),
+            gen: Generation(9),
+            class: Class::TerrainMesh,
             ancestry,
-            content: TileContent::Decoded(content()),
+            content: ResourceContent::Mesh(Arc::new(content())),
         });
         let ServerMessage::Content {
-            tile,
+            resource,
+            gen,
+            class,
             ancestry: a,
-            content: TileContent::Decoded(decoded),
+            content: ResourceContent::Mesh(decoded),
         } = back
         else {
-            panic!("not content: {back:?}");
+            panic!("not a mesh: {back:?}");
         };
-        assert_eq!((tile, a), (TileId(42), ancestry));
+        assert_eq!(
+            (resource, gen, class, a),
+            (
+                ResourceId::Mesh(TileId(42)),
+                Generation(9),
+                Class::TerrainMesh,
+                ancestry
+            )
+        );
         same_content(&content(), &decoded);
     }
 
-    /// A stand-in stays a stand-in: the consumer must be able to refuse it.
+    /// A drape crosses whole: its layer and level, its imagery tiles with
+    /// their placement, the floor, its identity and whether it was withheld.
     #[test]
-    fn a_fill_stays_a_fill() {
-        let back = round_trip(&ServerMessage::Fill {
-            tile: TileId(9),
+    fn a_drape_crosses_whole() {
+        let resource = ResourceId::drape(TileId(42), LayerId(2), 11);
+        let back = round_trip(&ServerMessage::Content {
+            resource,
+            gen: Generation(3),
+            class: Class::Drape,
             ancestry: Ancestry {
-                level: 0,
+                level: 7,
                 parent: None,
             },
-            content: content(),
+            content: ResourceContent::Drape(Arc::new(drape_content())),
         });
-        let ServerMessage::Fill {
-            tile,
-            ancestry,
-            content: c,
+        let ServerMessage::Content {
+            resource: r,
+            class,
+            content: ResourceContent::Drape(d),
+            ..
         } = back
         else {
-            panic!("not a fill: {back:?}");
+            panic!("not a drape: {back:?}");
         };
-        assert_eq!(tile, TileId(9));
-        assert_eq!(ancestry.parent, None);
-        same_content(&content(), &c);
+        assert_eq!((r, class), (resource, Class::Drape));
+        let want = drape_content();
+        assert_eq!(
+            (d.layer, d.level, d.floor_tiles, d.identity, d.withheld),
+            (
+                want.layer,
+                want.level,
+                want.floor_tiles,
+                want.identity,
+                want.withheld
+            )
+        );
+        assert_eq!(d.tiles.len(), want.tiles.len());
+        for (l, k) in d.tiles.iter().zip(&want.tiles) {
+            assert_eq!((l.coord, l.source), (k.coord, k.source));
+            assert_eq!(l.texture.rgba8, k.texture.rgba8);
+            assert_eq!(
+                (l.coverage, l.translation, l.scale),
+                (k.coverage, k.translation, k.scale)
+            );
+        }
     }
 
-    /// The selection keeps its closure of ancestors and its generation: the
-    /// fallback chain and the camera it answers.
+    /// The draw set crosses as the budget decided it — roles, worn drapes
+    /// and their uv transforms bit for bit, what each item serves — with the
+    /// upload plan, the ancestry, the hard limits and the frame's signals.
     #[test]
-    fn a_selection_keeps_its_ancestry_and_generation() {
+    fn a_selection_keeps_its_draw_set_plan_and_signals() {
         let stats = TraversalStats {
             held_but_drawn: 1,
             deferred_subtrees: 2,
@@ -775,8 +1136,48 @@ mod tests {
             max_depth: 7,
             gaps: 8,
         };
+        let drape = ResourceId::drape(TileId(1), LayerId(0), 6);
+        let draw = DrawSet {
+            items: vec![
+                DrawItem {
+                    mesh: ResourceId::Mesh(TileId(1)),
+                    role: Role::Fallback,
+                    drapes: vec![DrapeChoice {
+                        resource: drape,
+                        layer: LayerId(0),
+                        level: 6,
+                        uv: UvTransform {
+                            scale: [0.5, 0.25],
+                            offset: [0.5, 1.0 / 3.0],
+                        },
+                    }],
+                    serves: vec![TileId(5), TileId(6)],
+                },
+                DrawItem {
+                    mesh: ResourceId::Mesh(TileId(5)),
+                    role: Role::Exact,
+                    drapes: Vec::new(),
+                    serves: vec![TileId(5)],
+                },
+                DrawItem {
+                    mesh: ResourceId::Mesh(TileId(9)),
+                    role: Role::Held,
+                    drapes: Vec::new(),
+                    serves: vec![TileId(2)],
+                },
+            ],
+        };
+        let plan = UploadPlan {
+            items: vec![drape, ResourceId::Mesh(TileId(5))],
+            bytes: Bytes(1 << 20),
+            groups: vec![SwapGroup {
+                members: vec![drape, ResourceId::Mesh(TileId(5))],
+            }],
+        };
+        let hard_limit = PerClass([Bytes(1), Bytes(2), Bytes(3), Bytes::MAX]);
         let message = ServerMessage::Select {
-            tiles: vec![(TileId(5), 1.5), (TileId(6), f64::INFINITY)],
+            draw: draw.clone(),
+            plan: plan.clone(),
             ancestry: vec![(
                 TileId(5),
                 Ancestry {
@@ -785,41 +1186,73 @@ mod tests {
                 },
             )],
             stats,
+            hard_limit,
+            frame_ready: true,
+            converged: false,
+            lost: 4,
+            bare: 2,
             generation: 77,
         };
         let ServerMessage::Select {
-            tiles,
+            draw: d,
+            plan: p,
             ancestry,
             stats: s,
+            hard_limit: h,
+            frame_ready,
+            converged,
+            lost,
+            bare,
             generation,
         } = round_trip(&message)
         else {
             panic!("not a selection");
         };
-        assert_eq!(tiles, vec![(TileId(5), 1.5), (TileId(6), f64::INFINITY)]);
+        assert_eq!(d, draw);
+        assert_eq!(p, plan);
         assert_eq!(ancestry[0].1.parent, Some(TileId(1)));
-        assert_eq!((s, generation), (stats, 77));
+        assert_eq!((s, h), (stats, hard_limit));
+        assert_eq!(
+            (frame_ready, converged, lost, bare, generation),
+            (true, false, 4, 2, 77)
+        );
     }
 
-    /// Evict and Retire have different blast radii and must not be confused.
+    /// A cancel names each resource with its generation; an eviction names
+    /// resources only. Neither is taken for the other.
     #[test]
-    fn evict_and_retire_stay_apart() {
-        let tiles = vec![TileId(1), TileId(u64::MAX)];
+    fn cancel_and_evict_stay_apart() {
+        let resources = vec![
+            ResourceId::Mesh(TileId(1)),
+            ResourceId::drape(TileId(u64::MAX), LayerId(u16::MAX), u32::MAX),
+        ];
         assert!(matches!(
-            round_trip(&ServerMessage::Evict { tiles: tiles.clone() }),
-            ServerMessage::Evict { tiles: t } if t == tiles
+            round_trip(&ServerMessage::Evict { resources: resources.clone() }),
+            ServerMessage::Evict { resources: r } if r == resources
         ));
+        let cancelled: Vec<_> = resources
+            .iter()
+            .map(|r| (*r, Generation(u64::MAX)))
+            .collect();
         assert!(matches!(
-            round_trip(&ServerMessage::Retire { tiles: tiles.clone() }),
-            ServerMessage::Retire { tiles: t } if t == tiles
+            round_trip(&ServerMessage::Cancel { resources: cancelled.clone() }),
+            ServerMessage::Cancel { resources: r } if r == cancelled
         ));
     }
 
     #[test]
-    fn errors_priming_and_raw_content_cross() {
+    fn errors_and_priming_cross() {
+        let r = ResourceId::drape(TileId(3), LayerId(1), 4);
         assert!(matches!(
-            round_trip(&ServerMessage::Error { tile: Some(TileId(3)), message: "é 404".into() }),
-            ServerMessage::Error { tile: Some(TileId(3)), message } if message == "é 404"
+            round_trip(&ServerMessage::Error { resource: Some(r), message: "é 404".into() }),
+            ServerMessage::Error { resource: Some(back), message } if back == r && message == "é 404"
+        ));
+        assert!(matches!(
+            round_trip(&ServerMessage::Error {
+                resource: None,
+                message: String::new()
+            }),
+            ServerMessage::Error { resource: None, .. }
         ));
         let p = Priming {
             total: 85,
@@ -829,28 +1262,11 @@ mod tests {
         assert!(
             matches!(round_trip(&ServerMessage::Priming(p)), ServerMessage::Priming(q) if q == p)
         );
-        let raw = ServerMessage::Content {
-            tile: TileId(1),
-            ancestry: Ancestry {
-                level: 0,
-                parent: None,
-            },
-            content: TileContent::Raw {
-                format: ContentFormat::B3dm,
-                bytes: bytes::Bytes::from_static(b"b3dm"),
-            },
-        };
-        assert!(matches!(
-            round_trip(&raw),
-            ServerMessage::Content {
-                content: TileContent::Raw { format: ContentFormat::B3dm, bytes },
-                ..
-            } if &bytes[..] == b"b3dm"
-        ));
     }
 
-    /// The camera crosses exactly: the server culls against what the page
-    /// sees.
+    /// The camera crosses exactly — a symmetric one, and an eye of four
+    /// angles at a display scale — so the server culls against what the page
+    /// sees and counts its need in the page's logical pixels.
     #[test]
     fn client_messages_cross() {
         let view = ViewState::perspective(
@@ -860,8 +1276,21 @@ mod tests {
             DVec2::new(1280.0, 720.0),
             0.8,
         );
+        let eye = ViewState::from_fov(
+            DVec3::new(6_400_000.0, 1.0, -2.0),
+            DVec3::new(-1.0, 0.0, 0.0),
+            DVec3::Z,
+            DVec2::new(1440.0, 1600.0),
+            Fov {
+                left: -0.9,
+                right: 0.7,
+                up: 0.8,
+                down: -0.95,
+            },
+        )
+        .with_scale(2.0);
         let message = ClientMessage::ViewerState {
-            views: vec![view, view],
+            views: vec![view, eye],
             generation: 12,
         };
         let ClientMessage::ViewerState { views, generation } =
@@ -871,19 +1300,50 @@ mod tests {
         };
         assert_eq!(generation, 12);
         assert_eq!(views.len(), 2);
-        let (a, b) = (ViewStateParams::from(view), ViewStateParams::from(views[1]));
-        assert_eq!(
-            (a.position, a.direction, a.up),
-            (b.position, b.direction, b.up)
-        );
-        assert_eq!((a.viewport_px, a.fovy_rad), (b.viewport_px, b.fovy_rad));
-        for message in [
-            ClientMessage::Ack { tile: TileId(4) },
-            ClientMessage::Cancel { tile: TileId(5) },
-            ClientMessage::Trim {
-                budget_bytes: 1 << 30,
+        for (sent, got) in [view, eye].iter().zip(&views) {
+            let (a, b) = (ViewStateParams::from(*sent), ViewStateParams::from(*got));
+            assert_eq!(
+                (a.position, a.direction, a.up),
+                (b.position, b.direction, b.up)
+            );
+            assert_eq!((a.viewport_px, a.fovy_rad), (b.viewport_px, b.fovy_rad));
+            assert_eq!((a.fov, a.scale), (b.fov, b.scale));
+        }
+        let drape = ResourceId::drape(TileId(4), LayerId(3), 12);
+        let mut messages = vec![
+            ClientMessage::Ack {
+                resource: drape,
+                gen: Generation(7),
+                bytes: 1 << 33,
             },
-        ] {
+            ClientMessage::Discarded {
+                resource: ResourceId::Mesh(TileId(5)),
+                gen: Generation(8),
+            },
+            ClientMessage::Retarget {
+                total_bytes: 3 << 30,
+            },
+            ClientMessage::ReleaseBeyond { bytes: 1 << 30 },
+        ];
+        messages.extend(
+            [
+                Pressure::Normal,
+                Pressure::Warning,
+                Pressure::Critical,
+                Pressure::Background,
+            ]
+            .map(ClientMessage::Pressure),
+        );
+        messages.extend(
+            [
+                Thermal::Nominal,
+                Thermal::Fair,
+                Thermal::Serious,
+                Thermal::Critical,
+            ]
+            .map(ClientMessage::Thermal),
+        );
+        for message in messages {
             let back = decode_client(&encode_client(&message)).expect("reads back");
             assert_eq!(format!("{back:?}"), format!("{message:?}"));
         }
@@ -892,13 +1352,15 @@ mod tests {
     /// A damaged buffer is an error, never a panic or a wrong message.
     #[test]
     fn a_damaged_buffer_is_refused() {
-        let bytes = encode_server(&ServerMessage::Fill {
-            tile: TileId(1),
+        let bytes = encode_server(&ServerMessage::Content {
+            resource: ResourceId::drape(TileId(1), LayerId(0), 3),
+            gen: Generation(1),
+            class: Class::Drape,
             ancestry: Ancestry {
                 level: 0,
                 parent: None,
             },
-            content: content(),
+            content: ResourceContent::Drape(Arc::new(drape_content())),
         });
         for cut in 0..bytes.len() {
             assert!(decode_server(&bytes[..cut]).is_err(), "cut at {cut}");
