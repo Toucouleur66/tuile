@@ -138,6 +138,19 @@ use web as shell;
 #[cfg(target_arch = "wasm32")]
 pub use web::page::start_with_host;
 
+/// The worker entries a host's own module must re-export.
+///
+/// A host that starts the viewer with [`start_with_host`] *is* the wasm
+/// module the page loads, so the package's `worker.js` and
+/// `decode-worker.js` import **its** name, not the viewer's — and they call
+/// these. Re-exporting them is how a host's module carries them; they are
+/// `#[wasm_bindgen]` already, so naming them here is enough for the bindings
+/// to appear in the host's own JS.
+#[cfg(target_arch = "wasm32")]
+pub use web::decode::run_decode_worker;
+#[cfg(target_arch = "wasm32")]
+pub use web::worker::run_worker;
+
 pub use embed::{
     credential, renamed_by_environment, Identity, ImageryChoice, MissingCredential, Sources,
     TerrainChoice, ViewerHost,
