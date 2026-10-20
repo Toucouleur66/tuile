@@ -26,6 +26,7 @@
 
 pub mod av1;
 pub mod compress;
+pub mod encode;
 pub mod engine;
 pub mod extract;
 pub mod meter;
@@ -53,7 +54,7 @@ pub use seams::SeamLog;
 pub use sink::{Av1Film, Nothing, Pictures, Sink};
 pub use source::{Counting, Film, Reads, Sources};
 #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
-pub use videotoolbox::H264Film;
+pub use videotoolbox::{VtCodec, VtFilm};
 #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
 pub mod spatial;
 #[cfg(all(target_os = "macos", feature = "videotoolbox"))]

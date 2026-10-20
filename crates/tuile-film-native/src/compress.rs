@@ -26,6 +26,8 @@
 
 use std::path::Path;
 
+use crate::encode::{Input, Rate, Spec};
+
 /// Thresholds of the dither, 0 to 3, over a tile of 64 × 64 samples:
 /// interleaved gradient noise, which spreads neighbouring thresholds apart
 /// (no clumps, no visible grid).
@@ -74,6 +76,12 @@ pub struct Stream {
     track: tuile_mp4::film::Track,
     /// The entry's parameter sets, start codes and all.
     sets: Vec<u8>,
+    /// The same, each NAL unit apart.
+    units: Vec<Vec<u8>>,
+    /// Each sample's decoding and presentation times, in ticks.
+    times: Vec<(i64, i64)>,
+    /// The frame shown at each presentation time.
+    shown: std::collections::HashMap<i64, u64>,
     /// Bytes of a NAL unit's length in a sample.
     length: usize,
     pub hevc: bool,
@@ -83,9 +91,11 @@ pub struct Stream {
 
 impl Stream {
     pub fn of(track: tuile_mp4::film::Track) -> Result<Self, crate::Error> {
-        let start = |unit: &[u8], sets: &mut Vec<u8>| {
+        let mut units: Vec<Vec<u8>> = Vec::new();
+        let mut start = |unit: &[u8], sets: &mut Vec<u8>| {
             sets.extend([0, 0, 0, 1]);
             sets.extend_from_slice(unit);
+            units.push(unit.to_vec());
         };
         let mut sets = Vec::new();
         let (length, hevc, bit_depth) = match &track.entry {
@@ -120,13 +130,75 @@ impl Stream {
             }
             _ => return Err("only H.264 and HEVC films are decoded here".into()),
         };
+        let mut dts = 0i64;
+        let times: Vec<(i64, i64)> = track
+            .samples
+            .iter()
+            .map(|s| {
+                let t = (dts, dts + s.composition);
+                dts += i64::from(s.duration);
+                t
+            })
+            .collect();
+        let mut order: Vec<i64> = times.iter().map(|&(_, pts)| pts).collect();
+        order.sort_unstable();
+        order.dedup();
+        if order.len() != times.len() {
+            return Err("two samples shown at the same time".into());
+        }
+        let shown = order.into_iter().zip(0u64..).collect();
         Ok(Self {
             track,
             sets,
+            units,
+            times,
+            shown,
             length,
             hevc,
             bit_depth,
         })
+    }
+
+    /// The entry's parameter sets, each NAL unit as it is (no start code).
+    pub fn parameter_sets(&self) -> &[Vec<u8>] {
+        &self.units
+    }
+
+    /// Bytes of a NAL unit's length in a sample.
+    pub fn length_size(&self) -> usize {
+        self.length
+    }
+
+    /// Ticks a second of the track's times.
+    pub fn timescale(&self) -> u32 {
+        self.track.timescale
+    }
+
+    /// Sample `n`'s decoding and presentation times, in ticks, and its
+    /// duration.
+    pub fn timing(&self, n: usize) -> (i64, i64, u32) {
+        let (dts, pts) = self.times[n];
+        (dts, pts, self.track.samples[n].duration)
+    }
+
+    /// The frame of the film shown at presentation time `pts` (ticks), from
+    /// 0: frames counted in the order they are shown.
+    pub fn shown_at(&self, pts: i64) -> Option<u64> {
+        self.shown.get(&pts).copied()
+    }
+
+    /// Sample `n` (decoding order) from `file`, as the film holds it:
+    /// length-prefixed NAL units.
+    pub fn sample(
+        &self,
+        file: &mut (impl std::io::Read + std::io::Seek),
+        n: usize,
+    ) -> Result<Vec<u8>, crate::Error> {
+        let s = self.track.samples[n];
+        let mut sample = vec![0u8; s.size as usize];
+        file.seek(std::io::SeekFrom::Start(s.offset))?;
+        file.read_exact(&mut sample)?;
+        Ok(sample)
     }
 
     pub fn frames(&self) -> usize {
@@ -146,9 +218,7 @@ impl Stream {
         n: usize,
     ) -> Result<Vec<u8>, crate::Error> {
         let s = self.track.samples[n];
-        let mut sample = vec![0u8; s.size as usize];
-        file.seek(std::io::SeekFrom::Start(s.offset))?;
-        file.read_exact(&mut sample)?;
+        let sample = self.sample(file, n)?;
         let mut unit = Vec::with_capacity(sample.len() + self.sets.len() + 16);
         if s.key {
             unit.extend_from_slice(&self.sets);
@@ -246,18 +316,110 @@ pub fn compress(
         }
         tuile_farm::compress::Delivery::Encode { profile } => {
             let profile = tuned(profile.clone(), |name| std::env::var(name).ok())?;
-            #[cfg(all(target_os = "linux", feature = "nvenc"))]
-            {
-                gpu::encode_profile(joined, out, &profile, fps, device, began)
-            }
-            #[cfg(not(all(target_os = "linux", feature = "nvenc")))]
-            {
-                let _ = (profile, fps, device);
-                Err("this build decodes and encodes with no card: no compression but a copy".into())
-            }
+            let (written, passes) = by_the_machine(joined, out, &profile, fps, device)?;
+            Ok(Compressed {
+                frames: written.frames,
+                bytes: written.bytes,
+                passes,
+                seconds: began.elapsed().as_secs_f64(),
+            })
         }
     }
 }
+
+/// The film at `joined` delivered by `profile` at `out` by this build's
+/// decoder and encoder: NVDEC and NVENC on CUDA device `device`, or the
+/// Mac's VideoToolbox. Returns the film and the encodes it took.
+#[allow(unused_variables)]
+fn by_the_machine(
+    joined: &Path,
+    out: &Path,
+    profile: &tuile_farm::compress::Profile,
+    fps: u32,
+    device: usize,
+) -> Result<(tuile_mp4::film::Written, u32), crate::Error> {
+    #[cfg(all(target_os = "linux", feature = "nvenc"))]
+    {
+        gpu::encode_profile(joined, out, profile, fps, device)
+    }
+    #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
+    {
+        crate::videotoolbox::compress_profile(joined, out, profile, fps)
+    }
+    #[cfg(not(any(
+        all(target_os = "linux", feature = "nvenc"),
+        all(target_os = "macos", feature = "videotoolbox")
+    )))]
+    {
+        Err("this build decodes and encodes with no card: no compression but a copy".into())
+    }
+}
+
+/// What a profile's encoder is handed from a stream of `stream_bits` bits:
+/// ten bits as they are to a ten-bit profile; to an eight-bit one, eight,
+/// dithered ([`p016_to_nv12`]).
+pub fn input_for(stream_bits: u8, profile: &tuile_farm::compress::Profile) -> Input {
+    if stream_bits > 8 && profile.bit_depth > 8 {
+        Input::P010
+    } else {
+        Input::Nv12
+    }
+}
+
+/// A film of `frames` pictures of `size` at `fps` delivered by `profile`,
+/// whichever backend encodes it: `pass` encodes the whole film once by the
+/// spec it is given. A film over the profile's size cap is encoded again,
+/// at the mean rate that fits the cap (its ceiling half as high again,
+/// never above the profile's); an encoder that still misses it is asked
+/// again, its mean lowered by what it missed, up to [`PASSES`] encodes in
+/// all. Returns the film written and the encodes it took.
+pub fn deliver(
+    profile: &tuile_farm::compress::Profile,
+    input: Input,
+    size: (usize, usize),
+    fps: u32,
+    frames: usize,
+    mut pass: impl FnMut(&Spec) -> Result<tuile_mp4::film::Written, crate::Error>,
+) -> Result<(tuile_mp4::film::Written, u32), crate::Error> {
+    let fps = fps.max(1);
+    let seconds = frames as f64 / f64::from(fps);
+    let mut written = pass(&Spec::of(profile, input, size, fps, None))?;
+    let mut passes = 1;
+    let Some(cap) = profile.size_cap_bytes else {
+        return Ok((written, passes));
+    };
+    let (_, ceiling) = profile.bitrates(size.0 as u32, size.1 as u32, f64::from(fps));
+    let mut average = profile.capped_bitrate(seconds).ok_or("a cap of no rate")?;
+    while written.bytes > cap {
+        if passes == PASSES {
+            return Err(format!(
+                "compress {}: {} bytes after {passes} encodes, over the cap of {cap}",
+                profile.key(),
+                written.bytes
+            )
+            .into());
+        }
+        if passes > 1 {
+            // Missed by so much: asked for that much less, and a little more.
+            average = (f64::from(average) * cap as f64 / written.bytes as f64 * 0.97) as u32;
+        }
+        eprintln!(
+            "compress {}: {} bytes over the cap of {cap}: again at {average} b/s",
+            profile.key(),
+            written.bytes
+        );
+        let rate = Rate::Vbr {
+            average,
+            max: ceiling.min(average.saturating_mul(3) / 2).max(average),
+        };
+        written = pass(&Spec::of(profile, input, size, fps, Some(rate)))?;
+        passes += 1;
+    }
+    Ok((written, passes))
+}
+
+/// The most encodes a delivery takes to fit its cap.
+pub const PASSES: u32 = 4;
 
 #[cfg(all(target_os = "linux", feature = "nvenc"))]
 mod gpu {
@@ -268,68 +430,29 @@ mod gpu {
     use nvidia_video_codec_sdk::{DecodeCodec, Decoder};
     use tuile_farm::compress::Profile;
 
-    use super::{p016_to_nv12, Compressed, Stream};
-    use crate::nvenc::{encode, Frame, Input, Package, Rate, Spec};
+    use super::{deliver, input_for, p016_to_nv12, Stream};
+    use crate::nvenc::{encode, Frame, Input, Package, Spec};
 
     /// Pictures decoded ahead of the encoder.
     const AHEAD: usize = 8;
 
+    /// The film at `joined` delivered by `profile` at `out`, decoded by
+    /// NVDEC and encoded by NVENC on CUDA device `device`.
     pub(super) fn encode_profile(
         joined: &Path,
         out: &Path,
         profile: &Profile,
         fps: u32,
         device: usize,
-        began: std::time::Instant,
-    ) -> Result<Compressed, crate::Error> {
+    ) -> Result<(tuile_mp4::film::Written, u32), crate::Error> {
         let mut file = std::fs::File::open(joined)?;
         let track =
             tuile_mp4::film::read_track(&mut file)?.ok_or("no video track in the joined film")?;
         let stream = Stream::of(track)?;
         let size = stream.size().ok_or("a track of no size")?;
-        let fps = fps.max(1);
-        // Ten bits handed to a ten-bit profile as they are; to an
-        // eight-bit one, dithered to eight.
-        let input = if stream.bit_depth > 8 && profile.bit_depth > 8 {
-            Input::P010
-        } else {
-            Input::Nv12
-        };
-        let seconds = stream.frames() as f64 / f64::from(fps);
-        let mut passes = 1;
-        let mut written = pass(
-            joined,
-            &stream,
-            out,
-            &Spec::of(profile, input, size, fps, None),
-            device,
-        )?;
-        if let Some(cap) = profile.size_cap_bytes.filter(|&cap| written.bytes > cap) {
-            let average = profile.capped_bitrate(seconds).ok_or("a cap of no rate")?;
-            let (_, ceiling) = profile.bitrates(size.0 as u32, size.1 as u32, f64::from(fps));
-            eprintln!(
-                "compress {}: {} bytes over the cap of {cap}: again at {average} b/s",
-                profile.key(),
-                written.bytes
-            );
-            let rate = Rate::Vbr {
-                average,
-                max: ceiling.min(average.saturating_mul(3) / 2).max(average),
-            };
-            written = pass(
-                joined,
-                &stream,
-                out,
-                &Spec::of(profile, input, size, fps, Some(rate)),
-                device,
-            )?;
-            passes = 2;
-        }
-        Ok(Compressed {
-            frames: written.frames,
-            bytes: written.bytes,
-            passes,
-            seconds: began.elapsed().as_secs_f64(),
+        let input = input_for(stream.bit_depth, profile);
+        deliver(profile, input, size, fps, stream.frames(), |spec| {
+            pass(joined, &stream, out, spec, device)
         })
     }
 
@@ -496,6 +619,102 @@ mod tests {
             stream.access_unit(&mut file, 1).expect("second"),
             [0, 0, 0, 1, 0x41, 2]
         );
+    }
+
+    /// A film under its profile's cap is encoded once at the profile's
+    /// constant quality; over it, once more at the mean rate that fits the
+    /// cap, under a ceiling no higher than the profile's.
+    #[test]
+    fn a_film_over_its_cap_is_encoded_again_at_the_rate_that_fits() {
+        let mut web = tuile_farm::compress::Profile::h264();
+        web.size_cap_bytes = Some(1_000_000);
+        let mut specs = Vec::new();
+        let (written, passes) = deliver(&web, Input::Nv12, (720, 1280), 30, 300, |spec| {
+            specs.push(spec.clone());
+            let bytes = if specs.len() == 1 { 3_000_000 } else { 900_000 };
+            Ok(tuile_mp4::film::Written { frames: 300, bytes })
+        })
+        .expect("delivered");
+        assert_eq!((passes, written.bytes), (2, 900_000));
+        assert!(matches!(specs[0].rate, Rate::Quality { quality: 24, .. }));
+        let Rate::Vbr { average, max } = specs[1].rate else {
+            panic!("{:?}", specs[1].rate)
+        };
+        assert_eq!(Some(average), web.capped_bitrate(10.0));
+        assert!(max >= average && max <= 5_000_000, "{max}");
+        let mut asked = 0;
+        let (_, passes) = deliver(&web, Input::Nv12, (720, 1280), 30, 300, |_| {
+            asked += 1;
+            Ok(tuile_mp4::film::Written {
+                frames: 300,
+                bytes: 999_999,
+            })
+        })
+        .expect("delivered");
+        assert_eq!((passes, asked), (1, 1));
+        // An encoder that misses the mean it is asked for: asked again,
+        // lower by what it missed, until the film fits.
+        let mut specs = Vec::new();
+        let sizes = [3_000_000u64, 1_100_000, 950_000];
+        let (written, passes) = deliver(&web, Input::Nv12, (720, 1280), 30, 300, |spec| {
+            specs.push(spec.clone());
+            Ok(tuile_mp4::film::Written {
+                frames: 300,
+                bytes: sizes[specs.len() - 1],
+            })
+        })
+        .expect("delivered");
+        assert_eq!((passes, written.bytes), (3, 950_000));
+        let mean = |s: &Spec| match s.rate {
+            Rate::Vbr { average, .. } => average,
+            Rate::Quality { .. } => panic!("a capped pass at a mean"),
+        };
+        assert!(
+            f64::from(mean(&specs[2])) < f64::from(mean(&specs[1])) * 0.92,
+            "{} after {}",
+            mean(&specs[2]),
+            mean(&specs[1])
+        );
+        assert_eq!(
+            input_for(10, &tuile_farm::compress::Profile::hevc_main10()),
+            Input::P010
+        );
+        assert_eq!(input_for(10, &web), Input::Nv12);
+    }
+
+    /// A film whose frames are shown in another order than decoded: each
+    /// sample's times as the file says them, and the frame each is shown as.
+    #[test]
+    fn a_reordered_film_s_samples_say_the_frame_each_is_shown_as() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("b.mp4");
+        let entry = tuile_mp4::film::avc1(64, 48, &[0x67, 0x64, 0, 0x28], &[0x68]).expect("entry");
+        let mut w = tuile_mp4::film::FilmWriter::create(&path, entry, 30).expect("writer");
+        // Decoded I P B B: shown 0 3 1 2.
+        for (i, shown) in [0u64, 3, 1, 2].into_iter().enumerate() {
+            w.push(&[0, 0, 0, 1, i as u8], i == 0, shown).expect("push");
+        }
+        w.finish().expect("finish");
+        let mut file = std::fs::File::open(&path).expect("film");
+        let track = tuile_mp4::film::read_track(&mut file)
+            .expect("read")
+            .expect("track");
+        let stream = Stream::of(track).expect("stream");
+        let shown: Vec<u64> = (0..4)
+            .map(|n| stream.shown_at(stream.timing(n).1).expect("shown"))
+            .collect();
+        assert_eq!(shown, [0, 3, 1, 2]);
+        let (dts, _, duration) = stream.timing(2);
+        assert_eq!(dts, 2 * i64::from(duration));
+        assert_eq!(
+            stream.sample(&mut file, 1).expect("sample"),
+            [0, 0, 0, 1, 1]
+        );
+        assert_eq!(
+            stream.parameter_sets(),
+            [vec![0x67, 0x64, 0, 0x28], vec![0x68]]
+        );
+        assert_eq!(stream.length_size(), 4);
     }
 
     /// A tuning variable changes its one setting and nothing else; a value

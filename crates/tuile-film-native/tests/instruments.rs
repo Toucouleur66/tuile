@@ -209,12 +209,12 @@ fn a_film_of_pictures_is_an_mp4_with_every_one_of_them() {
 #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
 #[test]
 fn the_machines_encoder_writes_an_h264_mp4_with_every_picture() {
-    use tuile_film_native::H264Film;
+    use tuile_film_native::{VtCodec, VtFilm};
 
     let dir = tempfile::tempdir().expect("dir");
     let path = dir.path().join("film.mp4");
     let (width, height) = (320usize, 240usize);
-    let mut film = H264Film::at(&path, 2_000_000);
+    let mut film = VtFilm::at(&path, 2_000_000, VtCodec::H264);
     film.open(width as u32, height as u32, 30).expect("open");
     for n in 0..12u32 {
         let mut i420 = vec![(30 + n * 15) as u8; width * height];
