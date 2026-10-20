@@ -109,7 +109,11 @@ pub struct PreloadView {
 impl PreloadView {
     /// A view wanted as soon as possible, at `aspect`.
     pub fn now(pose: Pose, aspect: f64) -> Self {
-        Self { pose, aspect, priority: Priority::Now }
+        Self {
+            pose,
+            aspect,
+            priority: Priority::Now,
+        }
     }
 }
 
@@ -227,7 +231,12 @@ pub enum HostEvent {
     /// top-left.
     PointerMoved { x: f64, y: f64 },
     /// A button went down or came up at that position.
-    PointerButton { x: f64, y: f64, button: PointerButton, down: bool },
+    PointerButton {
+        x: f64,
+        y: f64,
+        button: PointerButton,
+        down: bool,
+    },
     /// A wheel or a trackpad scrolled. Lines where the device reports lines,
     /// device pixels where it reports pixels — `lines` says which.
     Scrolled { dx: f64, dy: f64, lines: bool },
@@ -274,8 +283,11 @@ mod tests {
 
     #[test]
     fn a_host_that_says_nothing_leaves_the_frame_alone() {
-        let mut camera = HostCamera::new(pose(1000.0));
-        assert!(camera.taken().is_none(), "nothing asked for is nothing applied");
+        let camera = HostCamera::new(pose(1000.0));
+        assert!(
+            camera.taken().is_none(),
+            "nothing asked for is nothing applied"
+        );
         assert_eq!(camera.get().position, pose(1000.0).position);
     }
 
@@ -308,8 +320,18 @@ mod tests {
         let mut host = Quiet;
         let mut camera = HostCamera::new(pose(1000.0));
         let mut preload = Vec::new();
-        let frame = HostFrame { camera: &mut camera, preload: &mut preload, viewport: (1920, 1080) };
-        let seen = host.window_event(&HostEvent::Key { key: Key::Space, down: true }, &frame);
+        let frame = HostFrame {
+            camera: &mut camera,
+            preload: &mut preload,
+            viewport: (1920, 1080),
+        };
+        let seen = host.window_event(
+            &HostEvent::Key {
+                key: Key::Space,
+                down: true,
+            },
+            &frame,
+        );
         assert_eq!(seen, Consumed::No);
     }
 
@@ -317,14 +339,22 @@ mod tests {
     fn the_frame_s_aspect_is_its_pixels_and_never_divides_by_zero() {
         let mut camera = HostCamera::new(pose(1000.0));
         let mut preload = Vec::new();
-        let frame = HostFrame { camera: &mut camera, preload: &mut preload, viewport: (1920, 1080) };
+        let frame = HostFrame {
+            camera: &mut camera,
+            preload: &mut preload,
+            viewport: (1920, 1080),
+        };
         assert!((frame.aspect() - 16.0 / 9.0).abs() < 1e-12);
 
         let mut camera = HostCamera::new(pose(1000.0));
         let mut preload = Vec::new();
         // A window collapsed to nothing still has to answer something finite:
         // a NaN aspect reaches the projection matrix and loses the frame.
-        let frame = HostFrame { camera: &mut camera, preload: &mut preload, viewport: (0, 0) };
+        let frame = HostFrame {
+            camera: &mut camera,
+            preload: &mut preload,
+            viewport: (0, 0),
+        };
         assert!(frame.aspect().is_finite());
     }
 
@@ -345,14 +375,20 @@ mod tests {
         let mut ctrl = CameraController::new(pose(50_000.0)).with_min_altitude(floor);
         ctrl.drive(under);
         ctrl.advance(1.0 / 60.0);
-        assert_eq!(ctrl.camera.position, under.position, "drive must not be clamped");
+        assert_eq!(
+            ctrl.camera.position, under.position,
+            "drive must not be clamped"
+        );
         assert!(ctrl.is_driven());
 
         // Place: the floor applies, and the host is no longer driving.
         let mut ctrl = CameraController::new(pose(50_000.0)).with_min_altitude(floor);
         ctrl.jump_to(under);
         assert!(!ctrl.is_driven(), "placing hands the camera back");
-        assert_ne!(ctrl.camera.position, under.position, "place must be clamped");
+        assert_ne!(
+            ctrl.camera.position, under.position,
+            "place must be clamped"
+        );
 
         // Release: driving stops, and the eye stays where it was driven.
         let mut ctrl = CameraController::new(pose(50_000.0)).with_min_altitude(floor);
@@ -361,7 +397,10 @@ mod tests {
         ctrl.release();
         assert!(!ctrl.is_driven());
         ctrl.advance(1.0 / 60.0);
-        assert_eq!(ctrl.camera.position, high.position, "release must not move the eye");
+        assert_eq!(
+            ctrl.camera.position, high.position,
+            "release must not move the eye"
+        );
     }
 
     #[test]

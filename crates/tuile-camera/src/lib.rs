@@ -881,7 +881,10 @@ mod tests {
 
         ctrl.drive(under);
 
-        assert_eq!(ctrl.camera.position, under.position, "the floor moved a driven eye");
+        assert_eq!(
+            ctrl.camera.position, under.position,
+            "the floor moved a driven eye"
+        );
         assert_eq!(ctrl.camera.direction, under.direction);
         assert_eq!(ctrl.camera.up, under.up);
         assert_eq!(ctrl.camera.fovy, under.fovy);
@@ -889,7 +892,10 @@ mod tests {
         // And it stays there: a frame's ease must not pull it anywhere,
         // because the target was driven too.
         ctrl.advance(1.0 / 60.0);
-        assert_eq!(ctrl.camera.position, under.position, "the ease moved a driven eye");
+        assert_eq!(
+            ctrl.camera.position, under.position,
+            "the ease moved a driven eye"
+        );
     }
 
     /// `place` is the other door, and it must keep the floor — otherwise a
