@@ -364,6 +364,11 @@ pub type SharedMeter = Arc<Mutex<BudgetMeter>>;
 /// How often the session copies its signals to the process's metrics.
 const PUBLISH_EVERY: Micros = Micros::from_millis(500);
 
+/// How often, in steps, the pass over the views ahead runs again while the
+/// camera holds still: their ring grows a level each time its tiles arrive,
+/// and a pass over many views is not to be paid at every arrival.
+const AHEAD_EVERY: u64 = 4;
+
 /// Creates a geometry server for a **3D Tiles** tileset, bound in-process to
 /// one consumer. Convenience over [`in_process_with`]: it wraps the tileset in
 /// a shared arena and builds the [`TilesetTree`]/[`TilesetLoader`] pair.
@@ -808,6 +813,16 @@ struct State {
     /// Set when the camera moved since the last step.
     view_moved: bool,
     out: TraversalOutput,
+    /// The views of the frames to come ([`ClientMessage::Ahead`]), and the
+    /// pass over them that lists the need's ring: a pass of its own, with
+    /// its own memo, reading the current pass's hysteresis memory and
+    /// writing nothing the current pass reads.
+    ahead: Vec<ViewState>,
+    ahead_out: TraversalOutput,
+    ahead_near: NearestContent,
+    /// Set when the views ahead changed, or the camera moved, since the
+    /// pass over them.
+    ahead_moved: bool,
     /// What the last step drew, for the traversal's hold logic.
     rendered_last: HashSet<TileId>,
     /// What the last pass under the previous views chose at its own level:
@@ -849,6 +864,10 @@ impl State {
             view_generation: 0,
             view_moved: false,
             out: TraversalOutput::default(),
+            ahead: Vec::new(),
+            ahead_out: TraversalOutput::default(),
+            ahead_near: NearestContent::default(),
+            ahead_moved: false,
             rendered_last: HashSet::new(),
             chosen_before: HashSet::new(),
             near: NearestContent::default(),
@@ -871,6 +890,10 @@ impl State {
                 self.views = views;
                 self.view_generation = generation;
                 self.view_moved = true;
+            }
+            ClientMessage::Ahead { views } => {
+                self.ahead = views;
+                self.ahead_moved = true;
             }
             ClientMessage::Ack {
                 resource,
@@ -1143,17 +1166,35 @@ impl State {
                 ancestors.insert(t);
             }
         }
-        let views = &self.views;
-        let list = |set: &BTreeSet<TileId>| -> Vec<(TileId, Need)> {
+        // The ring: what the views ahead select and ask for, beyond what
+        // the current ones need — loaded when they leave a slot, never drawn.
+        let ring: BTreeSet<TileId> = if self.ahead.is_empty() {
+            BTreeSet::new()
+        } else {
+            self.ahead_out
+                .selected
+                .iter()
+                .map(|(t, _)| *t)
+                .chain(self.ahead_out.requests.iter().map(|r| r.tile))
+                .filter(|t| {
+                    !drawn.contains(t)
+                        && !blockers.contains(t)
+                        && !ancestors.contains(t)
+                        && tree.properties(*t).has_content
+                })
+                .collect()
+        };
+        let list = |set: &BTreeSet<TileId>, views: &[ViewState]| -> Vec<(TileId, Need)> {
             set.iter()
                 .map(|t| (*t, Self::need_of(host, views, tau, *t)))
                 .collect()
         };
+        let views = &self.views;
         NeedSet {
-            drawn: list(&drawn),
-            blockers: list(&blockers),
-            ancestors: list(&ancestors),
-            ring: Vec::new(),
+            drawn: list(&drawn, views),
+            blockers: list(&blockers, views),
+            ancestors: list(&ancestors, views),
+            ring: list(&ring, &self.ahead),
         }
     }
 
@@ -1283,6 +1324,27 @@ impl State {
                 &self.chosen_before,
                 &mut self.near,
                 &mut self.out,
+            );
+        }
+        // The pass over the views ahead, when they or the camera moved, and
+        // again every few steps while their tiles arrive: it reads the
+        // residency and the current pass's memory, and writes only its own.
+        if !self.ahead.is_empty()
+            && (std::mem::take(&mut self.ahead_moved)
+                || camera_moved
+                || self.steps.is_multiple_of(AHEAD_EVERY))
+        {
+            let residency = self.budget.residency();
+            traverse_with(
+                tree,
+                &residency,
+                &self.ahead,
+                &config,
+                self.frame,
+                &self.rendered_last,
+                &self.chosen_before,
+                &mut self.ahead_near,
+                &mut self.ahead_out,
             );
         }
         let walked = started.elapsed();
@@ -2269,6 +2331,64 @@ mod tests {
 
     /// **A release between frames is announced** as any eviction, and takes
     /// nothing the last step drew.
+    /// A batch session told the frames ahead loads their tiles beside the
+    /// frame it converges — with the slots that frame leaves, never drawn,
+    /// never waited on — and the frame draws what it draws without them; a
+    /// release between frames keeps them for the frame that needs them.
+    #[test]
+    fn the_frames_ahead_load_beside_the_frame_and_change_nothing_it_draws() {
+        let session = |ahead: bool| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let tileset = deep_tileset(dir.path());
+            let leaves = leaves_of(&tileset);
+            let mut batch = BudgetConfig::batch();
+            batch.pinned_level = None;
+            let (mut stream, server) =
+                in_process(tileset, Arc::new(FsFetcher), Config::default(), batch).expect("budget");
+            let mut server = Box::pin(server.run());
+            let mut consumer = Consumer::default();
+            if ahead {
+                stream
+                    .send(ClientMessage::Ahead {
+                        views: vec![near_view()],
+                    })
+                    .expect("send");
+            }
+            look(&stream, far_view(), 1);
+            assert!(settle(&mut server, &mut stream, &mut consumer));
+            assert!(consumer.ready, "the far frame is ready");
+            let far = (consumer.exact(), consumer.draw.clone());
+            stream
+                .send(ClientMessage::ReleaseBeyond { bytes: 0 })
+                .expect("send");
+            assert!(settle(&mut server, &mut stream, &mut consumer));
+            let loaded_leaves: HashSet<TileId> = consumer
+                .held
+                .keys()
+                .map(|r| r.tile())
+                .filter(|t| leaves.contains(t))
+                .collect();
+            look(&stream, near_view(), 2);
+            assert!(settle(&mut server, &mut stream, &mut consumer));
+            assert!(consumer.ready, "the near frame is ready");
+            (far, loaded_leaves, consumer.exact(), dir)
+        };
+        let (without, none_ahead, near_without, _a) = session(false);
+        let (with, leaves_ahead, near_with, _b) = session(true);
+        assert_eq!(with.0, without.0, "the far frame draws other tiles");
+        assert_eq!(
+            format!("{:?}", with.1),
+            format!("{:?}", without.1),
+            "the far frame's draw set differs"
+        );
+        assert!(none_ahead.is_empty(), "the far frame alone loads no leaf");
+        assert!(
+            !leaves_ahead.is_empty(),
+            "the near frame's leaves were loaded ahead, and kept through the release"
+        );
+        assert_eq!(near_with, near_without, "the near frame draws other tiles");
+    }
+
     #[test]
     fn a_release_beyond_is_announced_and_spares_what_is_drawn() {
         let dir = tempfile::tempdir().expect("tempdir");
