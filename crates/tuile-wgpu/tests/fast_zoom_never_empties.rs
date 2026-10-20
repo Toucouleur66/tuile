@@ -29,13 +29,14 @@
 //! turns the skip into a failure, so a machine that is supposed to have a GPU
 //! cannot quietly stop running this.
 
-use std::future::Future;
-use std::pin::Pin;
+mod support;
+
 use std::sync::Arc;
-use std::task::Context;
 
 use glam::{DVec2, DVec3};
 
+use support::{gpu, poll, Server};
+use tuile_core::budget::{BudgetConfig, Bytes};
 use tuile_core::geo::{geodetic_to_ecef, Geodetic};
 use tuile_core::runtime::in_process_with;
 use tuile_core::source::{LoadError, Loaded, TileId, TileLoader, TileTree};
@@ -50,22 +51,8 @@ use tuile_wgpu::{
 /// pinned pyramid stays quick.
 const DEEPEST: u32 = 6;
 
-/// Levels held for the whole session, as the viewer holds them.
+/// The floor the budget pins for the whole session, as the viewer's does.
 const PINNED: u32 = 4;
-
-fn gpu() -> Option<GpuContext> {
-    match pollster::block_on(GpuContext::headless()) {
-        Ok(gpu) => Some(gpu),
-        Err(e) => {
-            assert!(
-                std::env::var("TUILE_REQUIRE_GPU").is_err(),
-                "TUILE_REQUIRE_GPU is set and there is no usable adapter: {e}"
-            );
-            eprintln!("skipping GPU scenario: no usable adapter ({e})");
-            None
-        }
-    }
-}
 
 /// A `layer.json` describing a globe that has every tile down to [`DEEPEST`].
 ///
@@ -141,7 +128,7 @@ fn looking_down(altitude: f64) -> (ViewState, DVec3, DVec3) {
 /// `tuile-wgpu-viewer` makes, not a copy of it.
 #[allow(clippy::too_many_arguments)]
 fn frame(
-    server: &mut Pin<Box<dyn Future<Output = ()>>>,
+    server: &mut Server,
     stream: &mut tuile_core::protocol::InProcessStream,
     pump: &mut ContentPump,
     gpu: &GpuContext,
@@ -151,27 +138,27 @@ fn frame(
     eye: DVec3,
     settle: usize,
 ) -> Frame {
-    let waker = futures_util::task::noop_waker();
-    let mut cx = Context::from_waker(&waker);
     // The camera goes out **once**, as a host sends it once per frame. Sending
     // it on every poll instead provokes a full traversal per poll, which turned
     // a fourteen-second test into a five-minute one and measured an engine
     // nobody drives.
-    let _ = server.as_mut().poll(&mut cx);
-    pump.advance(stream, gpu, view, eye);
+    poll(server);
+    let deadline = pump.deadline(60);
+    pump.advance(stream, gpu, &[view], eye, deadline);
     // Then let the server work, taking this frame's share of uploads each time —
     // which is what a real session does between camera updates, on its own
     // thread.
     for _ in 1..settle {
-        let _ = server.as_mut().poll(&mut cx);
-        pump.pump(stream, gpu, tuile_wgpu::UPLOADS_PER_FRAME);
+        poll(server);
+        let deadline = pump.deadline(60);
+        pump.pump(stream, gpu, deadline);
     }
     // Rebased once, at the end. `rebase` rewrites a uniform buffer for **every**
     // resident tile, so calling it per poll is thousands of GPU writes per frame
     // — the settle loop alone was doing tens of millions of them, and that, not
     // the engine, was the three minutes.
     pump.rebase(&gpu.queue, eye);
-    let (drawn, resolution) = pump.resolve(&gpu.queue);
+    let (drawn, resolution) = pump.resolve(gpu);
     Frame {
         lost: resolution.lost,
         drawn: drawn.exact.len() + drawn.fallback.len(),
@@ -403,20 +390,19 @@ fn a_fast_zoom_never_leaves_a_tile_empty() {
     let tree: Box<dyn TileTree> = tuile_planetary::terrain_tree(everywhere());
     let config = Config {
         maximum_screen_space_error: 2.0,
-        maximum_simultaneous_fetches: 64,
-        pinned_level: Some(PINNED),
-        // Under memory pressure, deliberately. A session that never evicts is
-        // not the session anyone runs: the viewer reclaims constantly — 19 326
-        // evictions against 26 915 uploads, measured — and an eviction that
-        // takes an ancestor leaves the climb below it with nothing to find.
-        // Without this the harness was strictly easier than reality and passed
-        // while the real globe went black.
-        resident_tile_limit: 1_500,
-        resident_budget_bytes: 96 * 1024 * 1024,
         ..Config::default()
     };
-    let (mut stream, server) = in_process_with(tree, Arc::new(Instant), config);
-    let mut server: Pin<Box<dyn Future<Output = ()>>> = Box::pin(server.run());
+    // Under memory pressure, deliberately. A session that never evicts is
+    // not the session anyone runs: the viewer reclaims constantly — 19 326
+    // evictions against 26 915 uploads, measured — and an eviction that
+    // takes an ancestor leaves the ground below it with nothing to fall back
+    // on. Without this the harness was strictly easier than reality and
+    // passed while the real globe went black.
+    let mut budget = BudgetConfig::interactive(Bytes::mib(96));
+    budget.pinned_level = Some(PINNED);
+    let (mut stream, server) =
+        in_process_with(tree, Arc::new(Instant), config, budget).expect("a valid budget");
+    let mut server: Server = Box::pin(server.run());
     let mut pump = ContentPump::new(DVec3::ZERO);
     let bench = Bench::new(&gpu);
 

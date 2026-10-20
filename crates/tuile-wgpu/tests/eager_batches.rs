@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! `ContentPump::advance_with`: several views, one residency — the consumer
-//! side of the traversal's multi-view union.
+//! `ContentPump::advance` with several views: one need, one residency — the
+//! consumer side of the traversal's multi-view union.
 //!
 //! The scenario a headless recorder runs: while one slice of a camera path is
 //! rendered from residency, the *next* slice's views are sent along with it so
@@ -16,40 +16,27 @@
 //! making, not latency. Skips without a usable GPU adapter;
 //! `TUILE_REQUIRE_GPU=1` turns the skip into a failure.
 
-use std::future::Future;
-use std::pin::Pin;
+mod support;
+
 use std::sync::Arc;
-use std::task::Context;
 
 use glam::{DVec2, DVec3};
 
+use support::{gpu, settle, Server};
+use tuile_core::budget::{BudgetConfig, Bytes, Role};
 use tuile_core::geo::{geodetic_to_ecef, Geodetic};
 use tuile_core::runtime::in_process_with;
 use tuile_core::source::{LoadError, Loaded, TileId, TileLoader, TileTree};
 use tuile_core::traversal::{Config, ViewState};
 use tuile_terrain::{fill_content, GeographicTilingScheme, LayerJson, TileCoord};
-use tuile_wgpu::{ContentPump, GpuContext};
+use tuile_wgpu::ContentPump;
 
 /// Deepest level the synthetic terrain serves.
 const DEEPEST: u32 = 5;
 
-/// Levels pinned for the session — everything above stays resident globally,
+/// The floor the budget pins — everything above stays resident globally,
 /// so the discriminating evidence must live *below* this level.
 const PINNED: u32 = 2;
-
-fn gpu() -> Option<GpuContext> {
-    match pollster::block_on(GpuContext::headless()) {
-        Ok(gpu) => Some(gpu),
-        Err(e) => {
-            assert!(
-                std::env::var("TUILE_REQUIRE_GPU").is_err(),
-                "TUILE_REQUIRE_GPU is set and there is no usable adapter: {e}"
-            );
-            eprintln!("skipping GPU scenario: no usable adapter ({e})");
-            None
-        }
-    }
-}
 
 /// A `layer.json` with every tile down to [`DEEPEST`].
 fn everywhere() -> LayerJson {
@@ -105,32 +92,6 @@ fn over(lon_deg: f64) -> ViewState {
     )
 }
 
-/// Drives the session until quiet: poll the server, take uploads, repeat.
-fn settle(
-    server: &mut Pin<Box<dyn Future<Output = ()>>>,
-    stream: &mut tuile_core::protocol::InProcessStream,
-    pump: &mut ContentPump,
-    gpu: &GpuContext,
-    views: &[ViewState],
-    origin: DVec3,
-) {
-    let waker = futures_util::task::noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    let _ = server.as_mut().poll(&mut cx);
-    pump.advance_with(stream, gpu, views, origin);
-    let mut quiet = 0;
-    for _ in 0..2_000 {
-        let _ = server.as_mut().poll(&mut cx);
-        let uploaded = pump.pump(stream, gpu, tuile_wgpu::UPLOADS_PER_FRAME);
-        let done =
-            !pump.selection.is_empty() && pump.provisional() == 0 && pump.pending_uploads() == 0;
-        quiet = if uploaded == 0 && done { quiet + 1 } else { 0 };
-        if quiet > 8 {
-            break;
-        }
-    }
-}
-
 /// Which longitudinal halves hold prepared tiles finer than the pin.
 ///
 /// Level-`z` terrain tiling has `2·2^z` columns; the western half of the world
@@ -139,8 +100,8 @@ fn settle(
 /// view" and "this ground is pinned".
 fn fine_halves(pump: &ContentPump) -> (bool, bool) {
     let (mut west, mut east) = (false, false);
-    for (tile, _) in &pump.selection {
-        let (z, x, _) = tile.terrain_coord();
+    for item in &pump.draw_set().items {
+        let (z, x, _) = item.mesh.tile().terrain_coord();
         if z <= PINNED {
             continue;
         }
@@ -158,12 +119,11 @@ fn a_second_view_loads_its_ground_too() {
     let Some(gpu) = gpu() else { return };
     let tree: Box<dyn TileTree> = tuile_planetary::terrain_tree(everywhere());
     let loader: Arc<dyn TileLoader> = Arc::new(Instant);
-    let config = Config {
-        pinned_level: Some(PINNED),
-        ..Config::default()
-    };
-    let (mut stream, server) = in_process_with(tree, loader, config);
-    let mut server: Pin<Box<dyn Future<Output = ()>>> = Box::pin(server.run());
+    let mut budget = BudgetConfig::interactive(Bytes::mib(512));
+    budget.pinned_level = Some(PINNED);
+    let (mut stream, server) =
+        in_process_with(tree, loader, Config::default(), budget).expect("a valid budget");
+    let mut server: Server = Box::pin(server.run());
 
     // One camera over lon −90 (west), one over lon +90 (east) — disjoint
     // ground by construction.
@@ -173,14 +133,14 @@ fn a_second_view_loads_its_ground_too() {
 
     // A single view first: only its own half refines below the pin — the
     // baseline that proves the union assertion below is not vacuous.
-    settle(
+    assert!(settle(
         &mut server,
         &mut stream,
         &mut pump,
         &gpu,
         &[west_view],
         origin,
-    );
+    ));
     let (west, east) = fine_halves(&pump);
     assert!(west, "the west view refined its own ground");
     assert!(
@@ -188,25 +148,25 @@ fn a_second_view_loads_its_ground_too() {
         "nothing east of the pin was asked for by a west view"
     );
 
-    // Both views together: the union loads the east eagerly as well, and the
-    // pump's own gate (`missing == 0`) now covers both.
-    settle(
+    // Both views together: the union loads the east eagerly as well, and
+    // the view converges on both.
+    assert!(settle(
         &mut server,
         &mut stream,
         &mut pump,
         &gpu,
         &[west_view, east_view],
         origin,
-    );
+    ));
     let (west, east) = fine_halves(&pump);
     assert!(
         west && east,
         "two views must refine both grounds (west={west}, east={east})"
     );
-    assert_eq!(pump.missing(), 0, "the union settled completely");
-    assert_eq!(
-        pump.provisional(),
-        0,
-        "nothing selected is a stand-in — real ground everywhere"
+    let (_, counts) = pump.resolve(&gpu);
+    assert_eq!(counts.lost, 0, "the union settled completely");
+    assert!(
+        pump.draw_set().items.iter().all(|i| i.role == Role::Exact),
+        "nothing drawn is a fallback — real ground everywhere"
     );
 }

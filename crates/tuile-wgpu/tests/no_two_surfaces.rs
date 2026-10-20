@@ -31,18 +31,18 @@
 //! A machine without a usable adapter skips, with a printed reason. Set
 //! `TUILE_REQUIRE_GPU=1` to turn that skip into a failure.
 
-use std::collections::VecDeque;
+mod support;
+
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use glam::{DVec3, Mat4, Vec3};
 
-use tuile_core::content::{DecodedTexture, DecodedTileContent, TileContent};
+use support::{exact, fallback, gpu, mesh, select, Scripted};
+use tuile_core::budget::FrameDeadline;
+use tuile_core::content::{DecodedTexture, DecodedTileContent};
 use tuile_core::geo::{geodetic_to_ecef, Geodetic};
-use tuile_core::protocol::{ClientMessage, GeometryStream, ServerMessage, StreamError};
 use tuile_core::raster::{ImageryCoord, ImageryLayer};
 use tuile_core::source::TileId;
-use tuile_core::traversal::TraversalStats;
 use tuile_terrain::{
     skirt_height, to_decoded, GeoRect, GeographicTilingScheme, Header, QuantizedMesh, TileCoord,
 };
@@ -58,34 +58,6 @@ const SIZE: u32 = 512;
 /// Large enough that a coarse tessellation and a fine one visibly disagree at
 /// this framing, small enough to be terrain rather than a wall.
 const RELIEF: f64 = 2_000.0;
-
-fn gpu() -> Option<GpuContext> {
-    match pollster::block_on(GpuContext::headless()) {
-        Ok(gpu) => Some(gpu),
-        Err(e) => {
-            assert!(
-                std::env::var("TUILE_REQUIRE_GPU").is_err(),
-                "TUILE_REQUIRE_GPU is set and there is no usable adapter: {e}"
-            );
-            eprintln!("skipping GPU test: no usable adapter ({e})");
-            None
-        }
-    }
-}
-
-struct Scripted(VecDeque<ServerMessage>);
-
-impl GeometryStream for Scripted {
-    fn send(&self, _msg: ClientMessage) -> Result<(), StreamError> {
-        Ok(())
-    }
-    fn poll_message(&mut self, _cx: &mut Context<'_>) -> Poll<Option<ServerMessage>> {
-        match self.0.pop_front() {
-            Some(msg) => Poll::Ready(Some(msg)),
-            None => Poll::Pending,
-        }
-    }
-}
 
 fn rect_of(tile: TileId) -> GeoRect {
     let (z, x, y) = tile.terrain_coord();
@@ -203,7 +175,7 @@ const CHILD_COLOUR: [u8; 3] = [30, 230, 30];
 /// frame, RGBA8.
 fn render(gpu: &GpuContext, pump: &mut ContentPump, eye: DVec3, look_at: DVec3) -> Vec<u8> {
     pump.rebase(&gpu.queue, eye);
-    let (drawn, _) = pump.resolve(&gpu.queue);
+    let (drawn, _) = pump.resolve(gpu);
     draw(gpu, eye, look_at, &drawn.exact, &drawn.fallback)
 }
 
@@ -392,28 +364,23 @@ fn an_ancestor_drawn_for_a_late_sibling_does_not_show_over_the_others() {
     let late = children[3];
     let arrived: Vec<TileId> = children.iter().copied().filter(|c| *c != late).collect();
 
-    let mut script = vec![ServerMessage::Select {
-        tiles: selected(&children),
-        ancestry: tree_shape(&children),
-        stats: TraversalStats::default(),
-        generation: 0,
-    }];
     // Coarse: two quads across the whole ancestor, which is what makes its
     // surface disagree with the children's.
-    script.push(ServerMessage::Content {
-        tile: ancestor,
-        ancestry: ancestry(ancestor),
-        content: TileContent::Decoded(content(ancestor, 2, ANCESTOR_COLOUR, 0)),
-    });
+    let mut script = vec![mesh(ancestor, 1, content(ancestor, 2, ANCESTOR_COLOUR, 0))];
     for (n, child) in arrived.iter().enumerate() {
-        script.push(ServerMessage::Content {
-            tile: *child,
-            ancestry: ancestry(*child),
-            content: TileContent::Decoded(content(*child, 16, CHILD_COLOUR, n as u64 + 1)),
-        });
+        script.push(mesh(
+            *child,
+            n as u64 + 2,
+            content(*child, 16, CHILD_COLOUR, n as u64 + 1),
+        ));
     }
+    // The budget draws the three that arrived as themselves, and the ancestor
+    // for the late one.
+    let mut items: Vec<_> = arrived.iter().map(|c| exact(*c)).collect();
+    items.push(fallback(ancestor, &[late]));
+    script.push(select(items, 1));
 
-    let mut stream = Scripted(VecDeque::from(script));
+    let mut stream = Scripted::new(script);
     // Straight down on the middle of the first arrived child, from close enough
     // that it fills the frame — so every pixel counted is over ground that child
     // covers.
@@ -426,7 +393,7 @@ fn an_ancestor_drawn_for_a_late_sibling_does_not_show_over_the_others() {
     });
     let eye = look_at + look_at.normalize() * 30_000.0;
     let mut pump = ContentPump::new(eye);
-    pump.pump(&mut stream, &gpu, 32);
+    pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
 
     let pixels = render(&gpu, &mut pump, eye, look_at);
     // The middle of the frame only: the edges are where the child runs out and
@@ -519,38 +486,4 @@ fn a_fallback_on_the_far_side_does_not_paint_through_the_planet() {
          through the Earth, and its skirt walls are what survive back-face \
          culling to do it"
     );
-}
-
-/// The selection, as the server sends it.
-fn selected(tiles: &[TileId]) -> Vec<(TileId, f64)> {
-    tiles.iter().map(|t| (*t, 0.0)).collect()
-}
-
-/// The shape of the tree around a selection: every tile named, **and every
-/// ancestor of one**, up to the root.
-///
-/// The closure, not one link per tile — a walk climbs *through* tiles it holds
-/// nothing for, so a chain that stops after one step reports the ground as lost.
-/// See `tuile_core::protocol::ServerMessage::Select`.
-fn tree_shape(tiles: &[TileId]) -> Vec<(TileId, tuile_core::protocol::Ancestry)> {
-    let mut out = Vec::new();
-    for tile in tiles {
-        let mut cur = Some(*tile);
-        while let Some(id) = cur {
-            let (z, x, y) = id.terrain_coord();
-            let parent = (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2));
-            out.push((id, tuile_core::protocol::Ancestry { level: z, parent }));
-            cur = parent;
-        }
-    }
-    out
-}
-
-/// The terrain ancestry of a tile, as the server states it on the wire.
-fn ancestry(tile: TileId) -> tuile_core::protocol::Ancestry {
-    let (z, x, y) = tile.terrain_coord();
-    tuile_core::protocol::Ancestry {
-        level: z,
-        parent: (z > 0).then(|| TileId::from_terrain(z - 1, x / 2, y / 2)),
-    }
 }
