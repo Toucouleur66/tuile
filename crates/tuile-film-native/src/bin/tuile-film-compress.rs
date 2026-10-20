@@ -13,7 +13,8 @@
 //! (`tuile_farm::compress::Delivery::named`). `<in>` and `<out>` are paths,
 //! or `store:<key>` in the run store the environment names
 //! (`TUILE_STORE_*`, as for `tuile-film-produce`). The encode runs on the
-//! NVIDIA card `TUILE_CUDA_DEVICE` (0 unless said).
+//! NVIDIA card `TUILE_CUDA_DEVICE` (0 unless said), or on a Mac by
+//! VideoToolbox (a build with `--features videotoolbox`).
 //!
 //! `--probe` says what a player finds: the order of the top boxes (the
 //! index first is a film that plays from its first bytes), the codec, its

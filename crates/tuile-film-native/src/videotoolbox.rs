@@ -18,7 +18,8 @@
 //! has no lookahead, no adaptive quantisation and no B-frame count to set
 //! (reordering is on or off, the encoder places them), and no per-picture
 //! multipass; those fields of a spec are read by NVENC only. Its constant
-//! quality is a number from 0 to 1 ([`quality`]), not NVENC's scale.
+//! quality is a number from 0 to 1 ([`quality`]), not NVENC's scale, and
+//! it holds no ceiling beside it.
 //!
 //! The system's frameworks are reached through the `objc2-*` bindings.
 
@@ -89,18 +90,21 @@ fn check(status: Status, what: &str) -> Result<(), String> {
 }
 
 /// VideoToolbox's constant quality, 0 (smallest) to 1 (best), for a
-/// profile's quality on NVENC's scale (`targetQuality`, 1 best to 51): a
-/// line through the points measured to land a Mac's films near the size
-/// of the same profile's on an L4 (`docs/explorations/compression-pipeline.md`
-/// §9.2).
-pub fn quality(nvenc: u8) -> f64 {
+/// profile's quality on NVENC's scale (`targetQuality`, 1 best to 51) and
+/// the codec it encodes: the point where the Mac's encoder lands a film at
+/// the size an L4's NVENC gives the same profile, measured on one
+/// production run (720×1280, 4266 frames, the L4's own mezzanine decoded
+/// on the Mac; `docs/explorations/compression-pipeline.md` §9.2). H.264 at
+/// `targetQuality` 24 is 0.748; HEVC at 21 is 0.737 and at 17 (the
+/// mezzanine) 0.809, which sets the slope for both.
+pub fn quality(out: Out, nvenc: u8) -> f64 {
+    let (anchor, at) = match out {
+        Out::H264 => (24.0, 0.748),
+        Out::Hevc | Out::Av1 => (21.0, 0.737),
+    };
     let q = f64::from(nvenc.clamp(1, 51));
-    (1.0 - (q - 1.0) / 50.0 * QUALITY_SLOPE).clamp(0.0, 1.0)
+    (at - (q - anchor) * 0.018).clamp(0.0, 1.0)
 }
-
-/// How fast VideoToolbox's quality falls as NVENC's number rises: 1.0 maps
-/// NVENC's 1–51 onto 1–0 evenly.
-const QUALITY_SLOPE: f64 = 1.0;
 
 /// The pixel format VideoToolbox takes for pictures handed as `input`.
 fn pixel_format(input: Input) -> u32 {
@@ -421,38 +425,42 @@ fn open(spec: &Spec) -> Result<(Session, Receiver<Result<Unit, String>>), String
     let interval = CFNumber::new_i32(spec.gop.saturating_mul(2).min(i32::MAX as u32) as i32);
     let interval_seconds = CFNumber::new_f64(f64::from(2 * spec.gop) / f64::from(fps));
     let per_second = CFNumber::new_i32(fps as i32);
+    // A constant quality, or a mean with its ceiling: so many bytes in any
+    // one second. Not both — measured on an M2, a session given a ceiling
+    // ignores the quality it is asked and holds a mean of its own — so a
+    // constant-quality film has no ceiling here, and its whole size is
+    // what the profile's cap holds (`crate::compress::deliver`).
     // SAFETY: the system's constants.
-    let (rate_key, rate_value, ceiling): (&CFString, CFRetained<CFNumber>, u32) = unsafe {
+    let (rate_key, rate_value, ceiling): (&CFString, CFRetained<CFNumber>, Option<u32>) = unsafe {
         match spec.rate {
-            Rate::Quality { quality: q, max } => (
+            Rate::Quality { quality: q, .. } => (
                 kVTCompressionPropertyKey_Quality,
-                CFNumber::new_f64(quality(q)),
-                max,
+                CFNumber::new_f64(quality(spec.out, q)),
+                None,
             ),
             Rate::Vbr { average, max } => (
                 kVTCompressionPropertyKey_AverageBitRate,
                 CFNumber::new_i32(average.min(i32::MAX as u32) as i32),
-                max.max(average),
+                Some(max.max(average)),
             ),
         }
     };
-    // The ceiling: so many bytes in any one second.
-    let limit = [
-        CFNumber::new_f64(f64::from(ceiling) / 8.0),
-        CFNumber::new_f64(1.0),
-    ];
-    let limits = CFArray::from_retained_objects(&limit);
+    let limits = ceiling.map(|ceiling| {
+        CFArray::from_retained_objects(&[
+            CFNumber::new_f64(f64::from(ceiling) / 8.0),
+            CFNumber::new_f64(1.0),
+        ])
+    });
     let reorder = if spec.b_frames > 0 { yes } else { no };
     // SAFETY: the system's constants, present on any macOS that has
     // VideoToolbox; values of the types the keys take.
     unsafe {
-        let required: [(&CFString, &CFType); 11] = [
+        let required: [(&CFString, &CFType); 10] = [
             // Not a live stream: quality before latency.
             (kVTCompressionPropertyKey_RealTime, no),
             (kVTCompressionPropertyKey_AllowFrameReordering, reorder),
             (kVTCompressionPropertyKey_ProfileLevel, profile),
             (rate_key, &rate_value),
-            (kVTCompressionPropertyKey_DataRateLimits, &limits),
             (kVTCompressionPropertyKey_MaxKeyFrameInterval, &interval),
             (
                 kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
@@ -478,6 +486,16 @@ fn open(spec: &Spec) -> Result<(Session, Receiver<Result<Unit, String>>), String
             if status != 0 {
                 return Err(format!("VideoToolbox: setting {key} failed ({status})"));
             }
+        }
+        if let Some(limits) = &limits {
+            check(
+                VTSessionSetProperty(
+                    &session.session,
+                    kVTCompressionPropertyKey_DataRateLimits,
+                    Some(limits),
+                ),
+                "the ceiling",
+            )?;
         }
         if hevc {
             // Each key frame an IDR: a closed GOP, where a join or a seek
@@ -1223,6 +1241,48 @@ mod tests {
         assert_eq!(e.hvcc.bit_depth_luma_minus8 + 8, 10);
         assert_eq!(keys(&t), [0, 30, 60]);
         assert!(faststart(&out));
+    }
+
+    /// The calibration's points: each profile lands where it was measured
+    /// to match the L4's size.
+    #[test]
+    fn nvenc_s_quality_maps_onto_the_points_measured() {
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert!(near(quality(Out::H264, Profile::h264().quality), 0.748));
+        assert!(near(
+            quality(Out::Hevc, Profile::hevc_main10().quality),
+            0.737
+        ));
+        assert!(near(
+            quality(Out::Hevc, Profile::mezzanine().quality),
+            0.809
+        ));
+        assert!(quality(Out::Hevc, 1) <= 1.0 && quality(Out::Hevc, 51) >= 0.0);
+    }
+
+    /// A profile's constant quality is what decides the size: the same
+    /// film at a finer quality is larger, at a coarser one smaller — and
+    /// the profile's own lands between.
+    #[test]
+    fn the_constant_quality_decides_the_size() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (w, h) = (320, 240);
+        let size_at = |quality: u8| {
+            let mut spec = Spec::of(&Profile::h264(), Input::Nv12, (w, h), 30, None);
+            if let Rate::Quality { max, .. } = spec.rate {
+                spec.rate = Rate::Quality { quality, max };
+            }
+            let frames = noisy(w, h, 60).into_iter().enumerate().map(|(i, i420)| {
+                Ok(Frame {
+                    data: crate::encode::i420_to_nv12(&i420, (w, h)),
+                    shown: i as u64,
+                })
+            });
+            let path = dir.path().join(format!("q{quality}.mp4"));
+            encode(&spec, frames, &path).expect("encoded").0.bytes
+        };
+        let (fine, own, coarse) = (size_at(12), size_at(Profile::h264().quality), size_at(36));
+        assert!(fine > own && own > coarse, "{fine} > {own} > {coarse}");
     }
 
     /// A film over its profile's cap is encoded again, at the rate that
