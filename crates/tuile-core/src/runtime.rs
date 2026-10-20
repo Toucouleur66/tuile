@@ -364,9 +364,9 @@ pub type SharedMeter = Arc<Mutex<BudgetMeter>>;
 /// How often the session copies its signals to the process's metrics.
 const PUBLISH_EVERY: Micros = Micros::from_millis(500);
 
-/// How often, in steps, the pass over the views ahead runs again while the
-/// camera holds still: their ring grows a level each time its tiles arrive,
-/// and a pass over many views is not to be paid at every arrival.
+/// How often, in steps, the pass over the views ahead runs again while they
+/// hold still: their ring grows a level each time its tiles arrive, and a
+/// pass over many views is not to be paid at every arrival.
 const AHEAD_EVERY: u64 = 4;
 
 /// Creates a geometry server for a **3D Tiles** tileset, bound in-process to
@@ -797,8 +797,7 @@ struct State {
     ahead: Vec<ViewState>,
     ahead_out: TraversalOutput,
     ahead_near: NearestContent,
-    /// Set when the views ahead changed, or the camera moved, since the
-    /// pass over them.
+    /// Set when the views ahead changed since the pass over them.
     ahead_moved: bool,
     /// What the last step drew, for the traversal's hold logic.
     rendered_last: HashSet<TileId>,
@@ -1302,13 +1301,11 @@ impl State {
                 &mut self.out,
             );
         }
-        // The pass over the views ahead, when they or the camera moved, and
-        // again every few steps while their tiles arrive: it reads the
-        // residency and the current pass's memory, and writes only its own.
+        // The pass over the views ahead, when they moved, and again every few
+        // steps while their tiles arrive: it reads the residency and the
+        // current pass's memory, and writes only its own.
         if !self.ahead.is_empty()
-            && (std::mem::take(&mut self.ahead_moved)
-                || camera_moved
-                || self.steps.is_multiple_of(AHEAD_EVERY))
+            && (std::mem::take(&mut self.ahead_moved) || self.steps.is_multiple_of(AHEAD_EVERY))
         {
             let residency = self.budget.residency();
             traverse_with(
