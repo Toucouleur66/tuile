@@ -22,7 +22,6 @@
 // The bindings' one way into an input buffer is an unchecked copy.
 #![allow(unsafe_code)]
 
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::thread::JoinHandle;
@@ -380,10 +379,10 @@ fn is_sync(out: Out, kind: NV_ENC_PIC_TYPE) -> bool {
 /// in the encoder's calls.
 ///
 /// A picture handed in is not always encoded at once: with lookahead or
-/// B-frames the encoder asks for more input first (`NeedMoreInput`), and
-/// once it answers, every picture handed in since is ready — read from
-/// their output buffers in the order they were handed, which is the
-/// order they are decoded in.
+/// B-frames the encoder holds pictures. Output buffers are read in the
+/// order they were handed — which is the order pictures are decoded in —
+/// each once the pool's depth of pictures has followed it, as NVIDIA's own
+/// encoder samples read them; the rest after the end of the stream.
 pub fn encode(
     device: usize,
     spec: &Spec,
@@ -452,8 +451,13 @@ pub fn encode(
     };
     step(&format!("{pool} buffers, pitch {pitch}"));
     let bytes = spec.input.bytes(spec.size);
-    let mut free: VecDeque<usize> = (0..pool).collect();
-    let mut pending: VecDeque<usize> = VecDeque::new();
+    // A picture's output is read once the encoder can no longer be holding
+    // it: `delay` pictures after it was handed in. Reading one sooner —
+    // when an encode call answers success with lookahead on, which
+    // means one picture is out, not every one handed in — dies in the
+    // driver (measured on an L4, driver 580: a segmentation fault).
+    let delay = pool - 1;
+    let (mut sent, mut got) = (0usize, 0usize);
     let mut busy = 0.0f64;
     let out = spec.out;
     for frame in frames {
@@ -466,9 +470,7 @@ pub fn encode(
             ));
         }
         let began = Instant::now();
-        let slot = free
-            .pop_front()
-            .ok_or("NVENC held more pictures than its pool of buffers")?;
+        let slot = sent % pool;
         {
             let mut lock = inputs[slot].lock().map_err(told)?;
             let planes = spec.input.pitched(&frame.data, spec.size, pitch);
@@ -487,23 +489,22 @@ pub fn encode(
                 step(&format!("picture {}: {:?}", frame.shown, result.as_ref().err().map(|e| e.kind())));
             }
             match result {
-                Ok(()) => {
-                    pending.push_back(slot);
-                    busy += began.elapsed().as_secs_f64();
-                    drain(out, &mut pending, &mut free, &mut outputs, &mut take)?;
-                    break;
-                }
-                Err(e) if e.kind() == ErrorKind::NeedMoreInput => {
-                    pending.push_back(slot);
-                    busy += began.elapsed().as_secs_f64();
-                    break;
-                }
+                // Asked for more input, or not: either way the picture is
+                // in, and outputs are read by their delay.
+                Ok(()) => break,
+                Err(e) if e.kind() == ErrorKind::NeedMoreInput => break,
                 Err(e) if e.kind() == ErrorKind::EncoderBusy => {
                     std::thread::sleep(Duration::from_millis(2));
                 }
                 Err(e) => return Err(told(e)),
             }
         }
+        sent += 1;
+        while got + delay < sent {
+            take(read(out, &mut outputs[got % pool])?)?;
+            got += 1;
+        }
+        busy += began.elapsed().as_secs_f64();
     }
     let began = Instant::now();
     loop {
@@ -515,32 +516,22 @@ pub fn encode(
             Err(e) => return Err(told(e)),
         }
     }
-    drain(out, &mut pending, &mut free, &mut outputs, &mut take)?;
+    while got < sent {
+        take(read(out, &mut outputs[got % pool])?)?;
+        got += 1;
+    }
     Ok(busy + began.elapsed().as_secs_f64())
 }
 
-/// Every picture handed in since the encoder last answered, read from
-/// their output buffers in the order they were handed — decoding order —
-/// and their buffers freed.
-fn drain(
-    out: Out,
-    pending: &mut VecDeque<usize>,
-    free: &mut VecDeque<usize>,
-    outputs: &mut [nvidia_video_codec_sdk::Bitstream<'_>],
-    take: &mut impl FnMut(Encoded) -> Result<(), String>,
-) -> Result<(), String> {
-    while let Some(slot) = pending.pop_front() {
-        let lock = outputs[slot].lock().map_err(told)?;
-        let encoded = Encoded {
-            key: is_sync(out, lock.picture_type()),
-            shown: lock.timestamp(),
-            data: lock.data().to_vec(),
-        };
-        drop(lock);
-        free.push_back(slot);
-        take(encoded)?;
-    }
-    Ok(())
+/// The picture in `output`, waited for: its bytes, whether it is a sync
+/// sample, and the frame it is shown as.
+fn read(out: Out, output: &mut nvidia_video_codec_sdk::Bitstream<'_>) -> Result<Encoded, String> {
+    let lock = output.lock().map_err(told)?;
+    Ok(Encoded {
+        key: is_sync(out, lock.picture_type()),
+        shown: lock.timestamp(),
+        data: lock.data().to_vec(),
+    })
 }
 
 /// Encoded pictures into a film laid out for a viewer: its sample entry
