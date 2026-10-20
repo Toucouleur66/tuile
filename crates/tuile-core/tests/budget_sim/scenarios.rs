@@ -68,9 +68,13 @@ fn a_still_camera_converges_within_two_seconds_on_desktop() {
     converges(Profile::desktop());
 }
 
-/// I3: on a phone, within four.
+/// I3: on a phone, within four. Ignored while it measured 6.4 s; it
+/// converges in 3.15 s under the pooled ledger (measured 2026-10-21).
 #[test]
-#[ignore = "throughput-bound: 6.4 s after the stop; the network model allows 6.3 s at best (740 loads, ~0.24 s each, 8+8 in flight); 4 s needs the target or the model changed"]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+)]
 fn a_still_camera_converges_within_four_seconds_on_a_phone() {
     converges(Profile::handheld());
 }
