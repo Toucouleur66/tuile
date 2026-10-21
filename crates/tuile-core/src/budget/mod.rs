@@ -30,6 +30,7 @@ pub mod imagery;
 pub mod need;
 pub mod observe;
 pub mod priority;
+mod sorted;
 mod state;
 pub mod stats;
 pub mod tier;
@@ -146,13 +147,14 @@ pub struct Budget {
     entries: std::collections::BTreeMap<ResourceId, state::Entry>,
     tiles: std::collections::BTreeMap<TileId, TileInfo>,
     imagery_prev: std::collections::BTreeMap<(TileId, LayerId), u32>,
-    held_last: std::collections::BTreeSet<TileId>,
-    drawn_last: std::collections::BTreeSet<ResourceId>,
-    /// The drapes each drawn mesh wore last step: on a layer switch, the
-    /// old layer stays worn until the new one is drawable.
-    worn_last: std::collections::BTreeMap<ResourceId, Vec<DrapeChoice>>,
-    swap_last: std::collections::BTreeSet<ResourceId>,
-    chain_last: std::collections::BTreeSet<ResourceId>,
+    held_last: sorted::SortedSet<TileId>,
+    drawn_last: sorted::SortedSet<ResourceId>,
+    /// The drapes each drawn mesh wore last step, by mesh, in its stacking
+    /// order: on a layer switch, the old layer stays worn until the new one
+    /// is drawable.
+    worn_last: Vec<(ResourceId, DrapeChoice)>,
+    swap_last: sorted::SortedSet<ResourceId>,
+    chain_last: sorted::SortedSet<ResourceId>,
     /// Resources loading or in transit (an index, so a step need not scan).
     active: std::collections::BTreeSet<ResourceId>,
     /// Resources of the floor (an index).
@@ -161,7 +163,7 @@ pub struct Budget {
     ranked_last: Vec<ResourceId>,
     /// Steps taken, for the amortised prune.
     steps: u64,
-    wanted_last: std::collections::BTreeSet<ResourceId>,
+    wanted_last: sorted::SortedSet<ResourceId>,
     recent: std::collections::BTreeMap<ResourceId, Micros>,
     epochs: PerClass<u64>,
     /// Per imagery layer, added to the drape class's epoch.
@@ -194,7 +196,7 @@ impl Budget {
             imagery_prev: Default::default(),
             held_last: Default::default(),
             drawn_last: Default::default(),
-            worn_last: Default::default(),
+            worn_last: Vec::new(),
             swap_last: Default::default(),
             chain_last: Default::default(),
             active: Default::default(),

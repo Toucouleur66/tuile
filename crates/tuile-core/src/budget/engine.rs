@@ -35,6 +35,7 @@ use super::error::{AuditError, SessionError};
 use super::imagery::{drape_rank, needed_level, DrapeCandidate, GeoRect, LevelClamp, UvTransform};
 use super::need::{ImageryNeed, LayerReach, Membership, Need};
 use super::priority::{score, PriorityKey, Quantised, Urgency};
+use super::sorted::union4;
 use super::state::{CpuCopy, Entry, Gpu, Load, Transit};
 use super::stats::{BudgetStats, CancelReason, EvictReason, GAP_BUCKETS, LATENCY_BUCKETS};
 use super::tier::{Presence, PresenceOracle, Source, Tier};
@@ -585,6 +586,20 @@ impl Budget {
         any && all
     }
 
+    /// Kept from eviction this step: drawn, or in a swap the view waits on.
+    fn kept(&self, r: &ResourceId) -> bool {
+        self.drawn_last.contains(r) || self.swap_last.contains(r)
+    }
+
+    /// The drapes `mesh` wore last step.
+    fn worn_last_of(&self, mesh: ResourceId) -> impl Iterator<Item = &DrapeChoice> + '_ {
+        let from = self.worn_last.partition_point(|w| w.0 < mesh);
+        self.worn_last[from..]
+            .iter()
+            .take_while(move |w| w.0 == mesh)
+            .map(|w| &w.1)
+    }
+
     fn drawable(&self, r: ResourceId) -> bool {
         self.entries.get(&r).is_some_and(|e| e.gpu.is_some())
     }
@@ -736,10 +751,7 @@ impl Budget {
         let missing = layers.iter().any(|l| !self.has_drape(tile, *l));
         !missing
             || self
-                .worn_last
-                .get(&ResourceId::Mesh(tile))
-                .into_iter()
-                .flatten()
+                .worn_last_of(ResourceId::Mesh(tile))
                 .any(|d| !layers.contains(&d.layer) && self.drawable(d.resource))
     }
 
@@ -870,7 +882,7 @@ impl Budget {
                 // A layer switch in progress: a layer the tiles now ask for
                 // is drawable nowhere yet, so the layers this mesh wore last
                 // step and no longer needs stay worn until it is.
-                for old in self.worn_last.get(&mesh).into_iter().flatten() {
+                for old in self.worn_last_of(mesh) {
                     if !needed(old.layer) && self.drawable(old.resource) {
                         chosen.push(*old);
                     }
@@ -1031,7 +1043,11 @@ impl Budget {
     }
 
     fn protection(&self, r: ResourceId) -> Option<Protection> {
-        let e = self.entries.get(&r)?;
+        self.protection_of(r, self.entries.get(&r)?)
+    }
+
+    /// What protects `r`, whose entry is `e`.
+    fn protection_of(&self, r: ResourceId, e: &Entry) -> Option<Protection> {
         if self.is_floor(e.level) && (e.gpu.is_some() || e.transit.is_some()) {
             return Some(Protection::Floor);
         }
@@ -1111,57 +1127,69 @@ impl Budget {
             }
         }
 
-        // 4. Mark: needed now, or unneeded since when.
-        let mut drawn_res: BTreeSet<ResourceId> = BTreeSet::new();
-        for i in &draw.items {
-            drawn_res.insert(i.mesh);
-            drawn_res.extend(i.drapes.iter().map(|x| x.resource));
-        }
-        self.drawn_last = drawn_res.clone();
-        self.worn_last = draw
-            .items
-            .iter()
-            .filter(|i| !i.drapes.is_empty())
-            .map(|i| (i.mesh, i.drapes.clone()))
-            .collect();
-        self.chain_last = wants
-            .iter()
-            .filter(|(r, w)| w.urgency == Urgency::Ancestor && self.drawable(**r))
-            .map(|(r, _)| *r)
-            .collect();
-        self.swap_last = wants
-            .iter()
-            .filter(|(r, w)| {
-                matches!(
-                    w.urgency,
-                    Urgency::Hole | Urgency::Blocker | Urgency::Ancestor
-                ) && self.drawable(**r)
-            })
-            .map(|(r, _)| *r)
-            .collect();
-        let mut keep = drawn_res.clone();
-        keep.extend(self.swap_last.iter().copied());
+        // 4. Mark: needed now, or unneeded since when. What is drawn, the
+        // drapes each mesh wears, and the swap and chain sets are kept for
+        // the rest of the step and the next, in buffers refilled in place.
+        self.drawn_last.refill(
+            draw.items
+                .iter()
+                .flat_map(|i| std::iter::once(i.mesh).chain(i.drapes.iter().map(|x| x.resource))),
+        );
+        // Items are sorted by mesh: so is this.
+        self.worn_last.clear();
+        self.worn_last.extend(
+            draw.items
+                .iter()
+                .flat_map(|i| i.drapes.iter().map(move |x| (i.mesh, *x))),
+        );
+        let mut chain = std::mem::take(&mut self.chain_last);
+        chain.refill(
+            wants
+                .iter()
+                .filter(|(r, w)| w.urgency == Urgency::Ancestor && self.drawable(**r))
+                .map(|(r, _)| *r),
+        );
+        self.chain_last = chain;
+        let mut swap = std::mem::take(&mut self.swap_last);
+        swap.refill(
+            wants
+                .iter()
+                .filter(|(r, w)| {
+                    matches!(
+                        w.urgency,
+                        Urgency::Hole | Urgency::Blocker | Urgency::Ancestor
+                    ) && self.drawable(**r)
+                })
+                .map(|(r, _)| *r),
+        );
+        self.swap_last = swap;
         // Only what the view touched this step or the last: everything else
         // was already marked unneeded.
-        let touched: BTreeSet<ResourceId> = wants
-            .keys()
-            .chain(drawn_res.iter())
-            .chain(self.wanted_last.iter())
-            .copied()
-            .collect();
-        for r in &touched {
-            let Some(e) = self.entries.get_mut(r) else {
+        // A merge of the three sorted sources, not a set built of them.
+        let Budget {
+            entries,
+            drawn_last,
+            wanted_last,
+            ..
+        } = self;
+        let touched = union4(
+            wants.keys().copied(),
+            drawn_last.iter().copied(),
+            wanted_last.iter().copied(),
+            std::iter::empty(),
+        );
+        for r in touched {
+            let Some(e) = entries.get_mut(&r) else {
                 continue;
             };
-            if let Some(w) = wants.get(r) {
+            if wants.contains_key(&r) {
                 e.last_needed = now;
                 e.unneeded_since = None;
                 e.first_wanted.get_or_insert(now);
                 if let Some(tn) = tiles.get(&r.tile()) {
                     e.distance = tn.q.distance;
                 }
-                let _ = w;
-            } else if drawn_res.contains(r) {
+            } else if drawn_last.contains(&r) {
                 e.last_needed = now;
                 e.unneeded_since = None;
                 e.first_wanted = None;
@@ -1283,7 +1311,6 @@ impl Budget {
             &delivers,
             &floor_groups,
             &coarsening,
-            &keep,
             &wants,
             &mut d,
             &mut st,
@@ -1296,7 +1323,7 @@ impl Budget {
 
         // 9. Eviction and release.
         if !eff.batch {
-            self.evict(now, &eff, &keep, &mut d, &mut st);
+            self.evict(now, &eff, &mut d, &mut st);
         }
 
         // 10. Relaxation.
@@ -1343,17 +1370,15 @@ impl Budget {
         };
 
         // Bookkeeping for the next step.
-        self.held_last = draw
-            .items
-            .iter()
-            .filter(|i| i.role != Role::Fallback)
-            .map(|i| i.mesh.tile())
-            .collect();
-        self.wanted_last = wants
-            .keys()
-            .copied()
-            .chain(drawn_res.iter().copied())
-            .collect();
+        self.held_last.refill(
+            draw.items
+                .iter()
+                .filter(|i| i.role != Role::Fallback)
+                .map(|i| i.mesh.tile()),
+        );
+        let mut wanted = std::mem::take(&mut self.wanted_last);
+        wanted.refill(wants.keys().chain(self.drawn_last.iter()).copied());
+        self.wanted_last = wanted;
         let pruned = self.prune(now, &tiles, &wants, &drapes);
         st.work = st.work.saturating_add(pruned);
 
@@ -1391,19 +1416,17 @@ impl Budget {
 
     fn protected_bytes(&self) -> PerClass<Bytes> {
         let mut p = PerClass::splat(Bytes::ZERO);
-        let candidates: BTreeSet<ResourceId> = self
-            .drawn_last
-            .iter()
-            .chain(&self.swap_last)
-            .chain(&self.active)
-            .chain(&self.floor_set)
-            .copied()
-            .collect();
+        let candidates = union4(
+            self.drawn_last.iter().copied(),
+            self.swap_last.iter().copied(),
+            self.active.iter().copied(),
+            self.floor_set.iter().copied(),
+        );
         for r in candidates {
             let Some(e) = self.entries.get(&r) else {
                 continue;
             };
-            if self.protection(r).is_some() {
+            if self.protection_of(r, e).is_some() {
                 let b = e
                     .gpu
                     .map(|g| g.bytes)
@@ -1639,7 +1662,6 @@ impl Budget {
         bytes: Bytes,
         limit: Bytes,
         urgency: Urgency,
-        keep: &BTreeSet<ResourceId>,
         wants: &BTreeMap<ResourceId, Want>,
         d: &mut Decisions,
         st: &mut BudgetStats,
@@ -1656,7 +1678,7 @@ impl Budget {
                 e.class == class
                     && e.gpu.is_some()
                     && e.transit.is_none()
-                    && !keep.contains(r)
+                    && !self.kept(r)
                     && !self.is_floor(e.level)
                     && wants
                         .get(r)
@@ -1704,7 +1726,6 @@ impl Budget {
         jobs: &[(PriorityKey, ResourceId, Job, Want)],
         floor_groups: &BTreeMap<ResourceId, Vec<ResourceId>>,
         coarsening: &BTreeSet<TileId>,
-        keep: &BTreeSet<ResourceId>,
         wants: &BTreeMap<ResourceId, Want>,
         d: &mut Decisions,
         st: &mut BudgetStats,
@@ -1712,7 +1733,7 @@ impl Budget {
         let mut flags = (false, false);
         for (_, r, _, w) in jobs {
             let Some(group) = floor_groups.get(r) else {
-                self.deliver_one(now, eff, *r, w, coarsening, keep, wants, d, st, &mut flags);
+                self.deliver_one(now, eff, *r, w, coarsening, wants, d, st, &mut flags);
                 continue;
             };
             // A floor mesh and its drapes are one swap group (D-A1): none
@@ -1729,9 +1750,7 @@ impl Budget {
             }
             for m in group {
                 let mw = wants.get(m).copied().unwrap_or(*w);
-                self.deliver_one(
-                    now, eff, *m, &mw, coarsening, keep, wants, d, st, &mut flags,
-                );
+                self.deliver_one(now, eff, *m, &mw, coarsening, wants, d, st, &mut flags);
             }
         }
         flags
@@ -1747,7 +1766,6 @@ impl Budget {
         r: ResourceId,
         w: &Want,
         coarsening: &BTreeSet<TileId>,
-        keep: &BTreeSet<ResourceId>,
         wants: &BTreeMap<ResourceId, Want>,
         d: &mut Decisions,
         st: &mut BudgetStats,
@@ -1813,7 +1831,6 @@ impl Budget {
                 c.cost.gpu,
                 limit,
                 w.urgency,
-                keep,
                 wants,
                 d,
                 st,
@@ -1933,17 +1950,10 @@ impl Budget {
         plan
     }
 
-    fn evict(
-        &mut self,
-        now: Micros,
-        eff: &Eff,
-        drawn: &BTreeSet<ResourceId>,
-        d: &mut Decisions,
-        st: &mut BudgetStats,
-    ) {
+    fn evict(&mut self, now: Micros, eff: &Eff, d: &mut Decisions, st: &mut BudgetStats) {
         let w = self.cfg.watermarks;
         if let Some(p) = eff.pool {
-            self.evict_pooled(now, p, drawn, d, st);
+            self.evict_pooled(now, p, d, st);
         }
         for class in Class::ALL {
             if eff.pool.is_some_and(|p| p.members[class]) {
@@ -1962,7 +1972,7 @@ impl Budget {
                 .filter(|(r, e)| {
                     e.class == class
                         && e.gpu.is_some()
-                        && !drawn.contains(r)
+                        && !self.kept(r)
                         && e.transit.is_none()
                         && !self.is_floor(e.level)
                 })
@@ -2004,7 +2014,7 @@ impl Budget {
                 // then copies already demoted (they save a re-read when the
                 // view comes back).
                 .map(|(r, e)| {
-                    let rank = match (e.gpu.is_some(), drawn.contains(r)) {
+                    let rank = match (e.gpu.is_some(), self.kept(r)) {
                         (true, true) => 0u8,
                         (true, false) => 1,
                         (false, _) => 2,
@@ -2039,14 +2049,7 @@ impl Budget {
     /// D-A3: one sweep over the pool's members, in the one eviction order,
     /// down to the low watermark of the pool's target, no member below its
     /// floor, none left above its ceiling.
-    fn evict_pooled(
-        &mut self,
-        now: Micros,
-        p: PoolEff,
-        drawn: &BTreeSet<ResourceId>,
-        d: &mut Decisions,
-        st: &mut BudgetStats,
-    ) {
+    fn evict_pooled(&mut self, now: Micros, p: PoolEff, d: &mut Decisions, st: &mut BudgetStats) {
         let w = self.cfg.watermarks;
         let used = |l: &Ledger| {
             Class::ALL
@@ -2075,7 +2078,7 @@ impl Budget {
             .filter(|(r, e)| {
                 p.members[e.class]
                     && e.gpu.is_some()
-                    && !drawn.contains(r)
+                    && !self.kept(r)
                     && e.transit.is_none()
                     && !self.is_floor(e.level)
             })
