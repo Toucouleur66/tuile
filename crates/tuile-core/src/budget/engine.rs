@@ -36,7 +36,7 @@ use super::imagery::{drape_rank, needed_level, DrapeCandidate, GeoRect, LevelCla
 use super::need::{ImageryNeed, LayerReach, Membership, Need};
 use super::priority::{score, PriorityKey, Quantised, Urgency};
 use super::sorted::{recycle, union4, SortedMap};
-use super::state::{CpuCopy, Entry, Gpu, Load, Transit};
+use super::state::{CpuCopy, Entry, Gpu, Load, Rank, Transit};
 use super::stats::{BudgetStats, CancelReason, EvictReason, GAP_BUCKETS, LATENCY_BUCKETS};
 use super::tier::{Presence, PresenceOracle, Source, Tier};
 use super::types::{
@@ -236,6 +236,16 @@ fn floor_group<'t>(
     member.then(|| std::iter::once(ResourceId::Mesh(t)).chain(drapes))
 }
 
+/// Frees one load slot of `count`. A slot freed twice would wrap a `u32`
+/// to `u32::MAX` and freeze its quota (or panic in a debug build): it
+/// saturates at 0 instead, and `underflows` records it for `audit`.
+fn release(count: &mut u32, underflows: &mut u32) {
+    match count.checked_sub(1) {
+        Some(n) => *count = n,
+        None => *underflows = underflows.saturating_add(1),
+    }
+}
+
 fn backoff(policy: FailurePolicy, failures: u32, why: Failure) -> Micros {
     match policy {
         FailurePolicy::RetryBackoff { first, max } => match why {
@@ -377,9 +387,11 @@ impl Budget {
                         } if gen == g => {
                             e.load = Load::Idle;
                             match source {
-                                Source::Network => self.in_flight[e.class] -= 1,
+                                Source::Network => {
+                                    release(&mut self.in_flight[e.class], &mut self.underflows)
+                                }
                                 Source::Local => {
-                                    self.local_reads -= 1;
+                                    release(&mut self.local_reads, &mut self.underflows);
                                     st.network_bytes_avoided =
                                         st.network_bytes_avoided.plus(cost.gpu);
                                 }
@@ -409,8 +421,12 @@ impl Budget {
                         if gen == g {
                             e.load = Load::Idle;
                             match source {
-                                Source::Network => self.in_flight[e.class] -= 1,
-                                Source::Local => self.local_reads -= 1,
+                                Source::Network => {
+                                    release(&mut self.in_flight[e.class], &mut self.underflows)
+                                }
+                                Source::Local => {
+                                    release(&mut self.local_reads, &mut self.underflows)
+                                }
                             }
                             st.failed += 1;
                             st.failures[e.class][usize::from(why == Failure::Permanent)] += 1;
@@ -435,7 +451,7 @@ impl Budget {
                     {
                         if gen == g {
                             e.load = Load::Idle;
-                            self.local_reads -= 1;
+                            release(&mut self.local_reads, &mut self.underflows);
                             e.store_missed = true;
                             e.presence = Some(Presence::Absent);
                             st.store_misses += 1;
@@ -1368,7 +1384,7 @@ impl Budget {
         for (k, r, _, w) in &jobs {
             if let Some(e) = self.entries.get_mut(r) {
                 e.urgency = Some(w.urgency);
-                e.priority = Some(*k);
+                e.priority = Some(Rank::of(k));
             }
         }
 
@@ -1559,8 +1575,10 @@ impl Budget {
                 if (unneeded && !batch) || timed_out {
                     e.load = Load::Idle;
                     match source {
-                        Source::Network => self.in_flight[e.class] -= 1,
-                        Source::Local => self.local_reads -= 1,
+                        Source::Network => {
+                            release(&mut self.in_flight[e.class], &mut self.underflows)
+                        }
+                        Source::Local => release(&mut self.local_reads, &mut self.underflows),
                     }
                     d.cancel.push((*r, gen));
                     st.cancelled += 1;
@@ -1671,7 +1689,7 @@ impl Budget {
                         if let Some(ve) = self.entries.get_mut(&vr) {
                             if let Load::Loading { gen, .. } = ve.load {
                                 ve.load = Load::Idle;
-                                self.in_flight[class] -= 1;
+                                release(&mut self.in_flight[class], &mut self.underflows);
                                 d.cancel.push((vr, gen));
                                 st.cancelled += 1;
                                 st.cancels[CancelReason::Preempted as usize] += 1;
@@ -1698,7 +1716,7 @@ impl Budget {
             e.last_needed = now;
             e.unneeded_since = None;
             e.urgency = Some(w.urgency);
-            e.priority = Some(*key);
+            e.priority = Some(Rank::of(key));
             e.load = Load::Loading {
                 gen,
                 source,
@@ -2438,11 +2456,16 @@ impl Budget {
             decoded: e.cpu.map(|c| c.cost.gpu).unwrap_or(Bytes::ZERO),
             protected: self.protection(r),
             urgency: e.urgency,
-            priority: e.priority,
+            priority: e.priority.map(|p| p.key(r)),
         })
     }
 
     pub(super) fn audit_impl(&self) -> Result<(), AuditError> {
+        if self.underflows > 0 {
+            return Err(AuditError::SlotUnderflow {
+                count: self.underflows,
+            });
+        }
         let mut l = Ledger::default();
         let mut flight = PerClass::splat(0u32);
         for e in self.entries.values() {
@@ -2487,5 +2510,31 @@ impl Budget {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::budget::BudgetConfig;
+
+    #[test]
+    fn a_slot_freed_twice_saturates_and_is_recorded() {
+        let (mut n, mut under) = (2u32, 0u32);
+        release(&mut n, &mut under);
+        assert_eq!((n, under), (1, 0));
+        release(&mut n, &mut under);
+        release(&mut n, &mut under);
+        assert_eq!((n, under), (0, 1), "saturates at 0, the underflow counted");
+    }
+
+    #[test]
+    fn the_audit_reports_a_slot_underflow() {
+        let mut b = Budget::new(BudgetConfig::interactive(Bytes::mib(64))).unwrap();
+        assert_eq!(b.audit(), Ok(()));
+        release(&mut b.local_reads, &mut b.underflows);
+        assert_eq!(b.local_reads, 0);
+        assert_eq!(b.audit(), Err(AuditError::SlotUnderflow { count: 1 }));
     }
 }

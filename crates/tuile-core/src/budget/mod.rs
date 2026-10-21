@@ -177,6 +177,9 @@ pub struct Budget {
     ledger: Ledger,
     in_flight: PerClass<u32>,
     local_reads: u32,
+    /// Load slots freed below zero (`engine::release`): never, unless an
+    /// invariant broke; `audit` reports it.
+    underflows: u32,
     fatal: Option<SessionError>,
     /// The statistics of arrivals applied ahead of their step
     /// ([`Budget::apply_arrivals`]), reported by it.
@@ -217,6 +220,7 @@ impl Budget {
             ledger: Ledger::default(),
             in_flight: PerClass::splat(0),
             local_reads: 0,
+            underflows: 0,
             fatal: None,
             pending: BudgetStats::default(),
         })

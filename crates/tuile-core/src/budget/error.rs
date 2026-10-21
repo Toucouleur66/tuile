@@ -89,4 +89,11 @@ pub enum AuditError {
         /// What the states count.
         states: u32,
     },
+    /// A load slot (in flight, or a local read) was freed with none taken:
+    /// the counter saturated at 0 instead of wrapping.
+    #[error("{count} load slots freed below zero")]
+    SlotUnderflow {
+        /// How many times.
+        count: u32,
+    },
 }
