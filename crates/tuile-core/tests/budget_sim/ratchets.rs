@@ -41,9 +41,10 @@ fn still() -> (u64, u64, u32) {
 }
 
 /// The soak's tour for a simulated minute: the p99 of the internal blocks
-/// per step past the first ten seconds, then the heap the budget frees when
-/// dropped, per tracked resource.
-fn motion() -> (u64, i64, usize) {
+/// per step past the first ten seconds, the step buffers the budget holds
+/// then (`release_scratch`), and the heap the budget frees when dropped
+/// without them, per tracked resource.
+fn motion() -> (u64, i64, i64, usize) {
     let mut sim = Sim::new(Profile::desktop(), 11);
     sim.count_output = true;
     let end = Micros::from_secs(60);
@@ -63,13 +64,15 @@ fn motion() -> (u64, i64, usize) {
         .copied()
         .unwrap_or(0);
     let tracked = sim.budget.tracked();
+    let ((), t) = super::alloc::counted(|| sim.budget.release_scratch());
+    let scratch = -t.live;
     let cfg = sim.budget.config().clone();
     let fresh = Budget::new(cfg).unwrap();
     // `Budget::new` holds nothing on the heap (empty maps and vectors), so
     // what the swap and drop give back is the old budget's whole heap.
     let ((), t) = super::alloc::counted(|| drop(std::mem::replace(&mut sim.budget, fresh)));
     let per = -t.live / (tracked.max(1) as i64);
-    (p99, per, tracked)
+    (p99, scratch, per, tracked)
 }
 
 /// A3.g: the converged still view, the tour's p99 and the bytes per tracked
@@ -84,15 +87,16 @@ fn allocation_ratchets_hold() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/budget_sim/alloc_ratchets.txt");
     let (still_worst, still_output, still_drawn) = still();
-    let (motion_p99, per_tracked, tracked) = motion();
+    let (motion_p99, scratch, per_tracked, tracked) = motion();
     eprintln!(
         "still: {still_worst} internal blocks per step at worst ({still_output} for the output, \
-         {still_drawn} drawn); tour: p99 {motion_p99} internal blocks per step; \
-         {per_tracked} B per tracked resource ({tracked} tracked)"
+         {still_drawn} drawn); tour: p99 {motion_p99} internal blocks per step, then \
+         {scratch} B of step buffers and {per_tracked} B per tracked resource ({tracked} tracked)"
     );
     let got = format!(
         "still-internal-allocs-per-step {still_worst}\n\
          motion-internal-allocs-per-step-p99 {motion_p99}\n\
+         scratch-bytes-after-tour {scratch}\n\
          bytes-per-tracked-resource {per_tracked}\n"
     );
     if std::env::var_os("TUILE_BLESS_BUDGET").is_some() {

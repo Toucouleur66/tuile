@@ -35,7 +35,7 @@ use super::error::{AuditError, SessionError};
 use super::imagery::{drape_rank, needed_level, DrapeCandidate, GeoRect, LevelClamp, UvTransform};
 use super::need::{ImageryNeed, LayerReach, Membership, Need};
 use super::priority::{score, PriorityKey, Quantised, Urgency};
-use super::sorted::union4;
+use super::sorted::{recycle, union4, SortedMap};
 use super::state::{CpuCopy, Entry, Gpu, Load, Transit};
 use super::stats::{BudgetStats, CancelReason, EvictReason, GAP_BUCKETS, LATENCY_BUCKETS};
 use super::tier::{Presence, PresenceOracle, Source, Tier};
@@ -135,6 +135,21 @@ struct TileNeed<'a> {
     membership: Membership,
     need: &'a Need,
     q: Quantised,
+    /// Its place in the need's entries: of equal entries, the first wins.
+    seq: u32,
+}
+
+/// A step's buffers, kept across steps so that a step allocates nothing
+/// once they have grown to the view.
+#[derive(Debug, Default)]
+pub(super) struct Scratch {
+    tiles: Vec<(TileId, TileNeed<'static>)>,
+    drapes: Vec<((TileId, LayerId), u32)>,
+    /// Wants before their merge: (resource, order put, want).
+    wants_raw: Vec<(ResourceId, u32, Want)>,
+    wants: Vec<(ResourceId, Want)>,
+    keys: Vec<(ResourceId, PriorityKey)>,
+    ancestry: Vec<(TileId, TileId, u32)>,
 }
 
 /// The meshes standing for the wanted tiles, before their drapes.
@@ -181,6 +196,27 @@ fn layers(img: &ImageryNeed) -> &[LayerReach] {
 /// Every layer of `tile`, as a range of a map keyed by `(tile, layer)`.
 fn tile_layers(tile: TileId) -> std::ops::RangeInclusive<(TileId, LayerId)> {
     (tile, LayerId(0))..=(tile, LayerId(u16::MAX))
+}
+
+/// The floor swap group `r` belongs to (D-A1), if any: a floor tile's mesh
+/// and its floor drape of every layer it wears, in stacking order.
+fn floor_group<'t>(
+    tiles: &'t SortedMap<TileId, TileNeed<'_>>,
+    r: ResourceId,
+    is_floor: impl Fn(u32) -> bool,
+) -> Option<impl Iterator<Item = ResourceId> + Clone + 't> {
+    let t = r.tile();
+    let tn = tiles.get(&t)?;
+    let img = tn.need.imagery.as_ref()?;
+    let level = tn.need.level;
+    if !is_floor(level) {
+        return None;
+    }
+    let drapes = layers(img)
+        .iter()
+        .map(move |x| ResourceId::drape(t, x.layer, level));
+    let member = r == ResourceId::Mesh(t) || drapes.clone().any(|m| m == r);
+    member.then(|| std::iter::once(ResourceId::Mesh(t)).chain(drapes))
 }
 
 fn backoff(policy: FailurePolicy, failures: u32, why: Failure) -> Micros {
@@ -450,29 +486,23 @@ impl Budget {
         &mut self,
         input: &FrameInput<'a>,
         st: &mut BudgetStats,
-    ) -> BTreeMap<TileId, TileNeed<'a>> {
-        let mut tiles: BTreeMap<TileId, TileNeed<'a>> = BTreeMap::new();
-        for (m, t, n) in input.need.entries() {
+    ) -> SortedMap<TileId, TileNeed<'a>> {
+        let mut tiles: Vec<(TileId, TileNeed<'a>)> =
+            recycle(std::mem::take(&mut self.scratch.tiles));
+        for (seq, (m, t, n)) in input.need.entries().enumerate() {
             let q = Quantised::of(n);
             if q.rejected {
                 st.rejected_inputs += 1;
             }
-            let cand = TileNeed {
-                membership: m,
-                need: n,
-                q,
-            };
-            // The best wins; of equals, the first.
-            match tiles.entry(t) {
-                std::collections::btree_map::Entry::Vacant(v) => {
-                    v.insert(cand);
-                }
-                std::collections::btree_map::Entry::Occupied(mut o) => {
-                    if sort_key(o.get()) < sort_key(&cand) {
-                        o.insert(cand);
-                    }
-                }
-            }
+            tiles.push((
+                t,
+                TileNeed {
+                    membership: m,
+                    need: n,
+                    q,
+                    seq: u32::try_from(seq).unwrap_or(u32::MAX),
+                },
+            ));
             self.tiles.insert(
                 t,
                 TileInfo {
@@ -482,7 +512,14 @@ impl Budget {
                 },
             );
         }
-        tiles
+        // Per tile, the best entry first; of equals, the first listed.
+        tiles.sort_unstable_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| sort_key(&b.1).cmp(&sort_key(&a.1)))
+                .then(a.1.seq.cmp(&b.1.seq))
+        });
+        tiles.dedup_by_key(|e| e.0);
+        SortedMap::from_sorted(tiles)
     }
 
     /// How cheaply a drape could be drawn: on the GPU, decoded, in a local
@@ -511,10 +548,11 @@ impl Budget {
     /// (I14, I15). Batch takes the exact level, a function of the frame.
     fn drape_needs(
         &mut self,
-        tiles: &BTreeMap<TileId, TileNeed<'_>>,
+        tiles: &SortedMap<TileId, TileNeed<'_>>,
         presence: &dyn PresenceOracle,
-    ) -> BTreeMap<(TileId, LayerId), u32> {
-        let mut out = BTreeMap::new();
+    ) -> SortedMap<(TileId, LayerId), u32> {
+        let mut out = std::mem::take(&mut self.scratch.drapes);
+        out.clear();
         let floor = self.cfg.pinned_level.unwrap_or(0);
         let batch = self.cfg.policy == Policy::Batch;
         let cap = self.cfg.imagery_cap();
@@ -533,7 +571,7 @@ impl Budget {
                     source_max: reach.max_level,
                 };
                 if batch {
-                    out.insert(key, needed_level(None, img.footprint, clamp));
+                    out.push((key, needed_level(None, img.footprint, clamp)));
                     continue;
                 }
                 let prev = self.imagery_prev.get(&key).copied();
@@ -556,18 +594,30 @@ impl Budget {
                         }
                     }
                 }
-                out.insert(key, level);
+                out.push((key, level));
             }
+            // This tile's layers in order, a layer listed twice in the order
+            // listed; the tiles come in order.
+            let from = out.partition_point(|e| e.0 .0 < *t);
+            out[from..].sort_by_key(|e| e.0);
         }
+        // A layer listed twice: the last listing's level.
+        out.dedup_by(|later, earlier| {
+            let same = later.0 == earlier.0;
+            if same {
+                earlier.1 = later.1;
+            }
+            same
+        });
         for (k, l) in &out {
             self.imagery_prev.insert(*k, *l);
         }
-        out
+        SortedMap::from_sorted(out)
     }
 
     /// Every floor tile the need lists is drawable with its floor drape
     /// of every layer it wears (P1.1), and the need lists one at least.
-    fn floor_in(&self, tiles: &BTreeMap<TileId, TileNeed<'_>>) -> bool {
+    fn floor_in(&self, tiles: &SortedMap<TileId, TileNeed<'_>>) -> bool {
         let mut any = false;
         let all = tiles
             .iter()
@@ -761,8 +811,8 @@ impl Budget {
     /// ancestor.
     fn select(
         &self,
-        tiles: &BTreeMap<TileId, TileNeed<'_>>,
-        drapes: &BTreeMap<(TileId, LayerId), u32>,
+        tiles: &SortedMap<TileId, TileNeed<'_>>,
+        drapes: &SortedMap<(TileId, LayerId), u32>,
         ancestry: &[(TileId, TileId, u32)],
         cap: Option<u32>,
     ) -> Selection {
@@ -814,20 +864,19 @@ impl Budget {
     // 3. The draw set.
     fn build_draw(
         &self,
-        tiles: &BTreeMap<TileId, TileNeed<'_>>,
-        drapes: &BTreeMap<(TileId, LayerId), u32>,
+        tiles: &SortedMap<TileId, TileNeed<'_>>,
+        drapes: &SortedMap<(TileId, LayerId), u32>,
+        ancestry: &[(TileId, TileId, u32)],
         floor_in: bool,
         st: &mut BudgetStats,
     ) -> (DrawSet, BTreeSet<TileId>) {
-        let mut ancestry = Vec::new();
-        self.held_ancestry(&mut ancestry);
-        let mut sel = self.select(tiles, drapes, &ancestry, None);
+        let mut sel = self.select(tiles, drapes, ancestry, None);
         if sel.lost > 0 && !floor_in {
             // P1.1 (b): coarse ground before any refinement. While wanted
             // ground is lost and the floor not in, nothing finer than the
             // floor is drawn.
             if let Some(p) = self.cfg.pinned_level {
-                sel = self.select(tiles, drapes, &ancestry, Some(p));
+                sel = self.select(tiles, drapes, ancestry, Some(p));
             }
         }
         st.exact += sel.exact;
@@ -930,17 +979,19 @@ impl Budget {
     /// What the step wants loaded or delivered.
     fn wants(
         &self,
-        tiles: &BTreeMap<TileId, TileNeed<'_>>,
-        drapes: &BTreeMap<(TileId, LayerId), u32>,
+        tiles: &SortedMap<TileId, TileNeed<'_>>,
+        drapes: &SortedMap<(TileId, LayerId), u32>,
         draw: &DrawSet,
-    ) -> BTreeMap<ResourceId, Want> {
-        let mut out: BTreeMap<ResourceId, Want> = BTreeMap::new();
+        raw: &mut Vec<(ResourceId, u32, Want)>,
+        mut merged: Vec<(ResourceId, Want)>,
+    ) -> SortedMap<ResourceId, Want> {
+        raw.clear();
+        merged.clear();
         let batch = self.cfg.policy == Policy::Batch;
-        let put = |out: &mut BTreeMap<ResourceId, Want>, r: ResourceId, w: Want| match out.get(&r) {
-            Some(cur) if (cur.urgency, Reverse(cur.q)) <= (w.urgency, Reverse(w.q)) => {}
-            _ => {
-                out.insert(r, w);
-            }
+        // Every want put, in order; merged below.
+        let put = |out: &mut Vec<(ResourceId, u32, Want)>, r: ResourceId, w: Want| {
+            let seq = u32::try_from(out.len()).unwrap_or(u32::MAX);
+            out.push((r, seq, w));
         };
         // Batch: a frame's drapes are those of what it draws. Batch never
         // cancels a load it started (I13), so a drape started for a tile the
@@ -975,7 +1026,7 @@ impl Budget {
                 }
             };
             put(
-                &mut out,
+                raw,
                 ResourceId::Mesh(*t),
                 Want {
                     urgency,
@@ -987,7 +1038,7 @@ impl Budget {
             if floor {
                 for reach in tn.need.imagery.as_ref().map(layers).unwrap_or(&[]) {
                     put(
-                        &mut out,
+                        raw,
                         ResourceId::drape(*t, reach.layer, tn.need.level),
                         Want {
                             urgency: Urgency::Floor,
@@ -1027,7 +1078,7 @@ impl Budget {
                 };
                 if let Some(du) = du {
                     put(
-                        &mut out,
+                        raw,
                         drape,
                         Want {
                             urgency: du,
@@ -1039,7 +1090,12 @@ impl Budget {
                 }
             }
         }
-        out
+        // Per resource the most urgent, then the best scored; of equals,
+        // the first put.
+        raw.sort_unstable_by_key(|(r, seq, w)| (*r, w.urgency, Reverse(w.q), *seq));
+        raw.dedup_by_key(|e| e.0);
+        merged.extend(raw.iter().map(|(r, _, w)| (*r, *w)));
+        SortedMap::from_sorted(merged)
     }
 
     fn protection(&self, r: ResourceId) -> Option<Protection> {
@@ -1106,26 +1162,46 @@ impl Budget {
         st.work = st.work.saturating_add(input.need.entries().count() as u32);
         let drapes = self.drape_needs(&tiles, input.presence);
         st.floor_in = self.floor_in(&tiles);
-        let (draw, coarsening) = self.build_draw(&tiles, &drapes, st.floor_in, &mut st);
-        let mut wants = self.wants(&tiles, &drapes, &draw);
+        let mut ancestry = std::mem::take(&mut self.scratch.ancestry);
+        self.held_ancestry(&mut ancestry);
+        let (draw, coarsening) = self.build_draw(&tiles, &drapes, &ancestry, st.floor_in, &mut st);
+        self.scratch.ancestry = ancestry;
+        let mut raw = std::mem::take(&mut self.scratch.wants_raw);
+        let merged = std::mem::take(&mut self.scratch.wants);
+        let wants = self.wants(&tiles, &drapes, &draw, &mut raw, merged);
         // Drawn content of an older epoch is refreshed, new before old.
+        raw.clear();
         for i in &draw.items {
             for r in std::iter::once(i.mesh).chain(i.drapes.iter().map(|x| x.resource)) {
                 if let Some(e) = self.entries.get(&r) {
                     if e.stale_gpu(self.epoch(r, e.class)) && !wants.contains_key(&r) {
-                        wants.insert(
+                        let seq = u32::try_from(raw.len()).unwrap_or(u32::MAX);
+                        raw.push((
                             r,
+                            seq,
                             Want {
                                 urgency: Urgency::Refresh,
                                 q: Quantised::default(),
                                 class: e.class,
                                 level: e.level,
                             },
-                        );
+                        ));
                     }
                 }
             }
         }
+        let wants = if raw.is_empty() {
+            wants
+        } else {
+            // The first refresh of a resource listed twice.
+            raw.sort_unstable_by_key(|(r, seq, _)| (*r, *seq));
+            raw.dedup_by_key(|e| e.0);
+            let mut all = wants.into_vec();
+            all.extend(raw.iter().map(|(r, _, w)| (*r, *w)));
+            all.sort_unstable_by_key(|e| e.0);
+            SortedMap::from_sorted(all)
+        };
+        self.scratch.wants_raw = raw;
 
         // 4. Mark: needed now, or unneeded since when. What is drawn, the
         // drapes each mesh wears, and the swap and chain sets are kept for
@@ -1203,13 +1279,9 @@ impl Budget {
         self.cancel(now, &eff, &mut d, &mut st);
 
         // 6. Rank the work.
-        let fallback_cover: BTreeMap<ResourceId, u32> = draw
-            .items
-            .iter()
-            .filter(|i| i.role == Role::Fallback)
-            .map(|i| (i.mesh, i.serves.len() as u32))
-            .collect();
-        let mut keys: BTreeMap<ResourceId, PriorityKey> = BTreeMap::new();
+        // Wants come in order: so do their keys.
+        let mut keys = std::mem::take(&mut self.scratch.keys);
+        keys.clear();
         let mut jobs: Vec<(PriorityKey, ResourceId, Job, Want)> = Vec::new();
         for (r, w) in &wants {
             let class = self.class_of(*r, w.class);
@@ -1233,7 +1305,11 @@ impl Budget {
                 .and_then(|e| e.first_wanted)
                 .map(|f| now.since(f))
                 .unwrap_or(Micros::ZERO);
-            let cover = fallback_cover.get(r).copied().unwrap_or(0);
+            // How many wanted tiles it stands in for, as a fallback.
+            let cover = draw
+                .get(*r)
+                .filter(|i| i.role == Role::Fallback)
+                .map_or(0, |i| i.serves.len() as u32);
             let mut sc = score(w.q, waited, self.cfg.age_full, cover);
             if urgency == Urgency::Hole && coarsening.contains(&r.tile()) {
                 // At the ceiling a coarser covering tile frees bytes: first.
@@ -1245,11 +1321,12 @@ impl Budget {
                 tier: self.tier(*r, e, class, input.presence),
                 resource: *r,
             };
-            keys.insert(*r, key);
+            keys.push((*r, key));
             if let Some(job) = job {
                 jobs.push((key, *r, job, Want { urgency, ..*w }));
             }
         }
+        let keys = SortedMap::from_sorted(keys);
         jobs.sort_by_key(|j| j.0);
         st.work = st
             .work
@@ -1287,29 +1364,11 @@ impl Budget {
             .filter(|j| j.2 == Job::Deliver)
             .copied()
             .collect();
-        let mut floor_groups: BTreeMap<ResourceId, Vec<ResourceId>> = BTreeMap::new();
-        for (t, tn) in &tiles {
-            let Some(img) = tn.need.imagery.as_ref() else {
-                continue;
-            };
-            if !self.is_floor(tn.need.level) {
-                continue;
-            }
-            let mut group = vec![ResourceId::Mesh(*t)];
-            group.extend(
-                layers(img)
-                    .iter()
-                    .map(|r| ResourceId::drape(*t, r.layer, tn.need.level)),
-            );
-            for m in &group {
-                floor_groups.insert(*m, group.clone());
-            }
-        }
         let (blocked, strained) = self.deliver(
             now,
             &eff,
             &delivers,
-            &floor_groups,
+            &tiles,
             &coarsening,
             &wants,
             &mut d,
@@ -1381,6 +1440,10 @@ impl Budget {
         self.wanted_last = wanted;
         let pruned = self.prune(now, &tiles, &wants, &drapes);
         st.work = st.work.saturating_add(pruned);
+        self.scratch.tiles = recycle(tiles.into_buffer());
+        self.scratch.drapes = drapes.into_buffer();
+        self.scratch.wants = wants.into_buffer();
+        self.scratch.keys = keys.into_buffer();
 
         // Statistics.
         st.gpu = self.ledger.gpu;
@@ -1506,8 +1569,8 @@ impl Budget {
         now: Micros,
         eff: &Eff,
         loads: &[(PriorityKey, ResourceId, Job, Want)],
-        keys: &BTreeMap<ResourceId, PriorityKey>,
-        wants: &BTreeMap<ResourceId, Want>,
+        keys: &SortedMap<ResourceId, PriorityKey>,
+        wants: &SortedMap<ResourceId, Want>,
         presence: &dyn PresenceOracle,
         d: &mut Decisions,
         st: &mut BudgetStats,
@@ -1662,7 +1725,7 @@ impl Budget {
         bytes: Bytes,
         limit: Bytes,
         urgency: Urgency,
-        wants: &BTreeMap<ResourceId, Want>,
+        wants: &SortedMap<ResourceId, Want>,
         d: &mut Decisions,
         st: &mut BudgetStats,
         strained: &mut bool,
@@ -1724,33 +1787,33 @@ impl Budget {
         now: Micros,
         eff: &Eff,
         jobs: &[(PriorityKey, ResourceId, Job, Want)],
-        floor_groups: &BTreeMap<ResourceId, Vec<ResourceId>>,
+        tiles: &SortedMap<TileId, TileNeed<'_>>,
         coarsening: &BTreeSet<TileId>,
-        wants: &BTreeMap<ResourceId, Want>,
+        wants: &SortedMap<ResourceId, Want>,
         d: &mut Decisions,
         st: &mut BudgetStats,
     ) -> (bool, bool) {
         let mut flags = (false, false);
         for (_, r, _, w) in jobs {
-            let Some(group) = floor_groups.get(r) else {
+            let Some(group) = floor_group(tiles, *r, |l| self.is_floor(l)) else {
                 self.deliver_one(now, eff, *r, w, coarsening, wants, d, st, &mut flags);
                 continue;
             };
             // A floor mesh and its drapes are one swap group (D-A1): none
             // goes until every one is loaded, then they go together.
-            let ready = group.iter().all(|m| {
-                self.entries.get(m).is_some_and(|e| {
+            let ready = group.clone().all(|m| {
+                self.entries.get(&m).is_some_and(|e| {
                     e.gpu.is_some()
                         || e.transit.is_some()
-                        || e.fresh_cpu(self.epoch(*m, e.class)).is_some()
+                        || e.fresh_cpu(self.epoch(m, e.class)).is_some()
                 })
             });
             if !ready {
                 continue;
             }
             for m in group {
-                let mw = wants.get(m).copied().unwrap_or(*w);
-                self.deliver_one(now, eff, *m, &mw, coarsening, wants, d, st, &mut flags);
+                let mw = wants.get(&m).copied().unwrap_or(*w);
+                self.deliver_one(now, eff, m, &mw, coarsening, wants, d, st, &mut flags);
             }
         }
         flags
@@ -1766,7 +1829,7 @@ impl Budget {
         r: ResourceId,
         w: &Want,
         coarsening: &BTreeSet<TileId>,
-        wants: &BTreeMap<ResourceId, Want>,
+        wants: &SortedMap<ResourceId, Want>,
         d: &mut Decisions,
         st: &mut BudgetStats,
         flags: &mut (bool, bool),
@@ -1869,9 +1932,9 @@ impl Budget {
     fn plan(
         &self,
         eff: &Eff,
-        keys: &BTreeMap<ResourceId, PriorityKey>,
-        tiles: &BTreeMap<TileId, TileNeed<'_>>,
-        drapes: &BTreeMap<(TileId, LayerId), u32>,
+        keys: &SortedMap<ResourceId, PriorityKey>,
+        tiles: &SortedMap<TileId, TileNeed<'_>>,
+        drapes: &SortedMap<(TileId, LayerId), u32>,
     ) -> UploadPlan {
         // Group: the blockers of one parent (meshes and drapes), else a
         // tile's mesh and its drape.
@@ -2183,9 +2246,9 @@ impl Budget {
     fn prune(
         &mut self,
         now: Micros,
-        tiles: &BTreeMap<TileId, TileNeed<'_>>,
-        wants: &BTreeMap<ResourceId, Want>,
-        drapes: &BTreeMap<(TileId, LayerId), u32>,
+        tiles: &SortedMap<TileId, TileNeed<'_>>,
+        wants: &SortedMap<ResourceId, Want>,
+        drapes: &SortedMap<(TileId, LayerId), u32>,
     ) -> u32 {
         // Amortised: emptied entries and unreferenced tiles go every eighth
         // step, so a step does not scan all it tracks. Returns the entries

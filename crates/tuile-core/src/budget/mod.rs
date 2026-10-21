@@ -164,6 +164,8 @@ pub struct Budget {
     /// Steps taken, for the amortised prune.
     steps: u64,
     wanted_last: sorted::SortedSet<ResourceId>,
+    /// A step's buffers, kept across steps.
+    scratch: engine::Scratch,
     recent: std::collections::BTreeMap<ResourceId, Micros>,
     epochs: PerClass<u64>,
     /// Per imagery layer, added to the drape class's epoch.
@@ -204,6 +206,7 @@ impl Budget {
             ranked_last: Vec::new(),
             steps: 0,
             wanted_last: Default::default(),
+            scratch: Default::default(),
             recent: Default::default(),
             epochs: PerClass::splat(0),
             layer_epochs: Default::default(),
@@ -351,6 +354,14 @@ impl Budget {
     /// How many resources the budget tracks.
     pub fn tracked(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Drops the buffers a step reuses from one step to the next, which
+    /// have grown to the size of the view: a host freeing memory (sent to
+    /// the background) can give them back; the next step grows them again.
+    /// Decides nothing.
+    pub fn release_scratch(&mut self) {
+        self.scratch = Default::default();
     }
 }
 
