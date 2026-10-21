@@ -289,7 +289,9 @@ fn slow_dive_converges(profile: Profile, seed: u64, bound: Micros) {
     let mut sim = Sim::new(quiet(profile), seed);
     sim.run(10.0, &slow_dive);
     let stop = sim.now;
-    sim.run(8.0, &|_| slow_dive(10.0));
+    // Watched for eight seconds, or for the bound when it is longer.
+    let watch = (bound.0 as f64 / 1e6).max(8.0);
+    sim.run(watch, &|_| slow_dive(10.0));
     let took = converged_within(&sim, stop);
     assert!(
         took <= bound,
@@ -311,23 +313,25 @@ fn a_slow_zoom_in_converges_at_the_deepest_level() {
     }
 }
 
-/// P2.4 on the phone (512 MiB). Red under the pooled ledger, and bound by
-/// throughput under either ledger (measured 2026-10-21, seed 88): eight
-/// meshes and eight drapes in flight on the phone's 8 MB/s fill the view at
-/// 400 m over the mountains at a steady ~60 starts a second, and the view
-/// converges only once the relaxation has raised the SSE scale enough to
-/// shrink the need. Under the fixed 40/60 split the terrain class hit its
+/// P2.4 on the phone (512 MiB), within 11 s (D-P1, Laurent, 2026-10-21).
+/// Bound by throughput under either ledger (measured 2026-10-21, seed 88):
+/// eight meshes and eight drapes in flight on the phone's 8 MB/s fill the
+/// view at 400 m over the mountains at a steady ~60 starts a second, and the
+/// view converges only once the relaxation has raised the SSE scale enough
+/// to shrink the need. Under the fixed 40/60 split the terrain class hit its
 /// 118 MiB target at 13 s and the relaxation started at 15.5 s: converged
 /// 7.3 s after the stop, at scale 2.53, 248 tiles exact. Under the pool the
 /// terrain grows into what the imagery leaves (152 MiB), the relaxation
 /// starts at 17 s: converged 10.1 s after the stop, at scale 2.08, 330 tiles
-/// exact — sharper, later. No load is lost or repeated (no thrash). Meeting
-/// 8 s means moving the bound (D-P1) or relaxing earlier than the pool is
-/// full: Laurent's decision.
+/// exact — sharper, later, no thrash. The sharper picture is worth the
+/// seconds: the bound moved from 8 s to 11 s, the measurement plus margin.
 #[test]
-#[ignore = "throughput-bound: 10.1 s after the stop under the pool (7.3 s under the old split, by relaxing earlier); the 8 s bound or the relaxation is D-P1's, open"]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-core --test budget_sim"
+)]
 fn a_slow_zoom_in_converges_at_the_deepest_level_on_a_phone() {
-    slow_dive_converges(Profile::handheld(), 88, Micros::from_secs(8));
+    slow_dive_converges(Profile::handheld(), 88, Micros::from_secs(11));
 }
 
 /// P2.2: a fast zoom-in starts nothing the view has left: every start is
