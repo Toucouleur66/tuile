@@ -1392,9 +1392,9 @@ impl Budget {
         );
 
         // 8. The upload plan.
-        d.upload_plan = self.plan(&eff, &keys, &tiles, &drapes);
-        // The plan scans every tracked entry for those in transit.
-        st.work = st.work.saturating_add(self.entries.len() as u32);
+        d.upload_plan = self.plan(&eff, &keys, &tiles);
+        // The plan scans the loads and transits for those in transit.
+        st.work = st.work.saturating_add(self.active.len() as u32);
 
         // 9. Eviction and release.
         if !eff.batch {
@@ -1629,24 +1629,15 @@ impl Budget {
                             }
                             continue;
                         }
-                        // Preempt the least urgent in-flight preload.
-                        st.work = st.work.saturating_add(self.entries.len() as u32);
+                        // Preempt the least urgent in-flight preload. Every
+                        // load is indexed in `active` (`start`).
+                        st.work = st.work.saturating_add(self.active.len() as u32);
                         let victim = self
-                            .entries
+                            .active
                             .iter()
-                            .filter(|(vr, ve)| {
-                                ve.class == class
-                                    && matches!(
-                                        ve.load,
-                                        Load::Loading {
-                                            source: Source::Network,
-                                            ..
-                                        }
-                                    )
-                                    && wants.get(vr).is_some_and(|vw| {
-                                        matches!(vw.urgency, Urgency::Ring | Urgency::Ancestor)
-                                    })
-                                    || ve.class == class
+                            .filter(|vr| {
+                                self.entries.get(vr).is_some_and(|ve| {
+                                    ve.class == class
                                         && matches!(
                                             ve.load,
                                             Load::Loading {
@@ -1654,9 +1645,12 @@ impl Budget {
                                                 ..
                                             }
                                         )
-                                        && ve.urgency == Some(Urgency::Refresh)
+                                        && (wants.get(vr).is_some_and(|vw| {
+                                            matches!(vw.urgency, Urgency::Ring | Urgency::Ancestor)
+                                        }) || ve.urgency == Some(Urgency::Refresh))
+                                })
                             })
-                            .filter_map(|(vr, _)| keys.get(vr).map(|k| (*k, *vr)))
+                            .filter_map(|vr| keys.get(vr).map(|k| (*k, *vr)))
                             .max();
                         let Some((_, vr)) = victim else { continue };
                         if let Some(ve) = self.entries.get_mut(&vr) {
@@ -1955,7 +1949,6 @@ impl Budget {
         eff: &Eff,
         keys: &SortedMap<ResourceId, PriorityKey>,
         tiles: &SortedMap<TileId, TileNeed<'_>>,
-        drapes: &SortedMap<(TileId, LayerId), u32>,
     ) -> UploadPlan {
         // Group: the blockers of one parent (meshes and drapes), else a
         // tile's mesh and its drape.
@@ -1969,10 +1962,14 @@ impl Budget {
                 _ => (1, t),
             }
         };
+        // Every copy in transit is indexed in `active` (`deliver_one`).
         let mut transit: Vec<(PriorityKey, ResourceId, Bytes)> = self
-            .entries
+            .active
             .iter()
-            .filter_map(|(r, e)| e.transit.map(|t| (*r, t.cost.gpu)))
+            .filter_map(|r| {
+                let t = self.entries.get(r)?.transit?;
+                Some((*r, t.cost.gpu))
+            })
             .map(|(r, b)| {
                 let k = keys.get(&r).copied().unwrap_or(PriorityKey {
                     urgency: Urgency::Refresh,
@@ -1984,51 +1981,38 @@ impl Budget {
             })
             .collect();
         transit.sort_unstable();
-        let _ = drapes;
-        let mut taken: BTreeSet<ResourceId> = BTreeSet::new();
         let mut plan = UploadPlan::default();
-        let mut groups: BTreeMap<(u8, TileId), Vec<ResourceId>> = BTreeMap::new();
-        for (_, r, _) in &transit {
-            groups.entry(group_of(*r)).or_default().push(*r);
+        // Each group's members with their bytes, in transit order.
+        let mut groups: BTreeMap<(u8, TileId), Vec<(ResourceId, Bytes)>> = BTreeMap::new();
+        for (_, r, b) in &transit {
+            groups.entry(group_of(*r)).or_default().push((*r, *b));
         }
         for (_, r, _) in &transit {
-            if taken.contains(r) {
+            // A group goes whole, at its first member in transit order: a
+            // later member finds it gone.
+            let Some(mut members) = groups.remove(&group_of(*r)) else {
                 continue;
-            }
-            let g = group_of(*r);
-            let members: Vec<ResourceId> = groups.get(&g).cloned().unwrap_or_else(|| vec![*r]);
-            let bytes = members.iter().fold(Bytes::ZERO, |a, m| {
-                a.plus(
-                    transit
-                        .iter()
-                        .find(|x| x.1 == *m)
-                        .map(|x| x.2)
-                        .unwrap_or(Bytes::ZERO),
-                )
-            });
+            };
+            let bytes = members.iter().fold(Bytes::ZERO, |a, m| a.plus(m.1));
             if plan.items.is_empty() && plan.bytes.plus(bytes) > eff.upload {
                 // The first item always goes, alone if its group is too big.
-                let b = transit
-                    .iter()
-                    .find(|x| x.1 == *r)
-                    .map(|x| x.2)
-                    .unwrap_or(Bytes::ZERO);
                 plan.items.push(*r);
-                plan.bytes = b;
+                plan.bytes = members
+                    .iter()
+                    .find(|m| m.0 == *r)
+                    .map_or(Bytes::ZERO, |m| m.1);
                 break;
             }
             if plan.bytes.plus(bytes) > eff.upload {
                 break;
             }
-            for m in &members {
-                taken.insert(*m);
-                plan.items.push(*m);
-            }
+            plan.items.extend(members.iter().map(|m| m.0));
             plan.bytes = plan.bytes.plus(bytes);
             if members.len() > 1 {
-                let mut sorted = members.clone();
-                sorted.sort_unstable();
-                plan.groups.push(SwapGroup { members: sorted });
+                members.sort_unstable_by_key(|m| m.0);
+                plan.groups.push(SwapGroup {
+                    members: members.into_iter().map(|m| m.0).collect(),
+                });
             }
         }
         plan
