@@ -151,6 +151,12 @@ pub(super) struct Scratch {
     keys: Vec<(ResourceId, PriorityKey)>,
     ancestry: Vec<(TileId, TileId, u32)>,
     jobs: Vec<(PriorityKey, ResourceId, Job, Want)>,
+    /// Per class, this step's eviction order of the GPU residents outside
+    /// the kept set, the floor and transit, built at its first use: their
+    /// keys do not move within a step after the mark, and the set only
+    /// shrinks, so every later use filters it instead of sorting again.
+    /// Dropped at the end of the step: only a step under pressure builds it.
+    evict_order: PerClass<Option<Vec<EvictKey>>>,
     /// The loads, then the deliveries, picked from `jobs`.
     picked: Vec<(PriorityKey, ResourceId, Job, Want)>,
 }
@@ -166,6 +172,14 @@ struct Selection {
     fallback: u32,
     lost: u32,
     depth: u32,
+}
+
+/// The eviction order: least recently needed first, then finer, then
+/// farther; the resource last, so the order is total.
+type EvictKey = (Micros, Reverse<u32>, Reverse<u32>, ResourceId);
+
+fn evict_key(r: ResourceId, e: &Entry) -> EvictKey {
+    (e.last_needed, Reverse(e.level), Reverse(e.distance), r)
 }
 
 /// Work on a wanted resource.
@@ -1157,6 +1171,7 @@ impl Budget {
         let mut st = std::mem::take(&mut self.pending);
         let mut d = Decisions::default();
         let eff = self.eff();
+        self.scratch.evict_order = PerClass::default();
         let mut ranked = std::mem::take(&mut self.ranked_last);
         for r in &ranked {
             if let Some(e) = self.entries.get_mut(r) {
@@ -1747,38 +1762,31 @@ impl Budget {
         if self.ledger.gpu[class].plus(bytes) <= limit {
             return true;
         }
-        st.work = st.work.saturating_add(self.entries.len() as u32);
-        let mut victims: Vec<_> = self
-            .entries
+        let order = self.evict_order(class, st);
+        // The victims now: still evictable, and worth less than the work.
+        let victim = |b: &Budget, r: &ResourceId| -> Option<Bytes> {
+            let e = b.entries.get(r)?;
+            let worth_less = wants
+                .get(r)
+                .is_none_or(|w| urgency < Urgency::Ring && w.urgency > urgency);
+            (e.transit.is_none() && worth_less).then_some(e.gpu?.bytes)
+        };
+        st.work = st.work.saturating_add(order.len() as u32);
+        let freeable = order
             .iter()
-            .filter(|(r, e)| {
-                e.class == class
-                    && e.gpu.is_some()
-                    && e.transit.is_none()
-                    && !self.kept(r)
-                    && !self.is_floor(e.level)
-                    && wants
-                        .get(r)
-                        .is_none_or(|w| urgency < Urgency::Ring && w.urgency > urgency)
-            })
-            .map(|(r, e)| {
-                (
-                    (e.last_needed, Reverse(e.level), Reverse(e.distance), *r),
-                    *r,
-                    e.gpu.map(|g| g.bytes).unwrap_or(Bytes::ZERO),
-                )
-            })
-            .collect();
-        // Keys end in the resource: total, so unstable is stable.
-        victims.sort_unstable();
-        let freeable = victims.iter().fold(Bytes::ZERO, |a, v| a.plus(v.2));
+            .filter_map(|k| victim(self, &k.3))
+            .fold(Bytes::ZERO, |a, b| a.plus(b));
         if self.ledger.gpu[class].minus(freeable).plus(bytes) > limit {
             *strained = true;
+            self.scratch.evict_order[class] = Some(order);
             return false;
         }
-        for (_, r, _) in victims {
+        for &(.., r) in &order {
             if self.ledger.gpu[class].plus(bytes) <= limit {
                 break;
+            }
+            if victim(self, &r).is_none() {
+                continue;
             }
             if wants.contains_key(&r) {
                 // Wanted work displaces wanted work: the view asks for more
@@ -1793,7 +1801,32 @@ impl Budget {
                 self.recent.insert(r, now);
             }
         }
+        self.scratch.evict_order[class] = Some(order);
         true
+    }
+
+    /// This step's eviction order for `class`, built at its first use
+    /// (see `Scratch::evict_order`); the caller puts it back.
+    fn evict_order(&mut self, class: Class, st: &mut BudgetStats) -> Vec<EvictKey> {
+        if let Some(order) = self.scratch.evict_order[class].take() {
+            return order;
+        }
+        st.work = st.work.saturating_add(self.entries.len() as u32);
+        let mut order: Vec<EvictKey> = self
+            .entries
+            .iter()
+            .filter(|(r, e)| {
+                e.class == class
+                    && e.gpu.is_some()
+                    && e.transit.is_none()
+                    && !self.kept(r)
+                    && !self.is_floor(e.level)
+            })
+            .map(|(r, e)| evict_key(*r, e))
+            .collect();
+        // Keys end in the resource: total, so unstable is stable.
+        order.sort_unstable();
+        order
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2033,28 +2066,18 @@ impl Budget {
                 continue;
             }
             let low = eff.target[class].scaled(u64::from(w.low_percent), 100);
-            st.work = st.work.saturating_add(self.entries.len() as u32);
-            let mut cands: Vec<_> = self
-                .entries
-                .iter()
-                .filter(|(r, e)| {
-                    e.class == class
-                        && e.gpu.is_some()
-                        && !self.kept(r)
-                        && e.transit.is_none()
-                        && !self.is_floor(e.level)
-                })
-                .map(|(r, e)| {
-                    (
-                        (e.last_needed, Reverse(e.level), Reverse(e.distance), *r),
-                        *r,
-                    )
-                })
-                .collect();
-            cands.sort_unstable();
-            for (_, r) in cands {
+            let order = self.evict_order(class, st);
+            for &(.., r) in &order {
                 if self.ledger.gpu[class] <= low {
                     break;
+                }
+                // Still on the GPU, and not on its way again.
+                let evictable = self
+                    .entries
+                    .get(&r)
+                    .is_some_and(|e| e.gpu.is_some() && e.transit.is_none());
+                if !evictable {
+                    continue;
                 }
                 if let Some(e) = self.entries.get_mut(&r) {
                     e.take_gpu(&mut self.ledger);
@@ -2070,6 +2093,8 @@ impl Budget {
                 }
             }
         }
+        // Only a step under pressure built one: nothing kept across steps.
+        self.scratch.evict_order = PerClass::default();
         if self.ledger.decoded > eff.decoded {
             st.work = st.work.saturating_add(self.entries.len() as u32);
             let mut cands: Vec<_> = self
@@ -2290,30 +2315,40 @@ impl Budget {
         self.floor_set.retain(|r| entries.contains_key(r));
         // Keep only what is wanted this step among idle, never-started entries.
         self.recent.retain(|_, t| now.since(*t) <= THRASH_WINDOW);
-        while self.recent.len() > RECENT_CAP {
-            let oldest = self
-                .recent
-                .iter()
-                .min_by_key(|(r, t)| (**t, **r))
-                .map(|(r, _)| *r);
-            if let Some(r) = oldest {
-                self.recent.remove(&r);
+        if self.recent.len() > RECENT_CAP {
+            // The oldest go, by (time, resource): one sort, not one scan
+            // per removal.
+            let mut by_age: Vec<(Micros, ResourceId)> =
+                self.recent.iter().map(|(r, t)| (*t, *r)).collect();
+            by_age.sort_unstable();
+            for (_, r) in &by_age[..by_age.len() - RECENT_CAP] {
+                self.recent.remove(r);
             }
         }
-        let mut keep: BTreeSet<TileId> = tiles.keys().copied().collect();
+        // The tiles still referenced and every ancestor of theirs, as one
+        // sorted vector rather than a set grown node by node.
+        let mut keep: Vec<TileId> = tiles.keys().copied().collect();
         keep.extend(self.entries.keys().map(|r| r.tile()));
         keep.extend(self.held_last.iter().copied());
-        let seeds: Vec<TileId> = keep.iter().copied().collect();
-        for s in seeds {
-            let mut cur = s;
+        keep.sort_unstable();
+        keep.dedup();
+        let seeds = keep.len();
+        for i in 0..seeds {
+            let mut cur = keep[i];
+            let walk = keep.len();
             while let Some(p) = self.tiles.get(&cur).and_then(|i| i.parent) {
-                if !keep.insert(p) {
+                // A seed's ancestors are walked from the seed itself; a
+                // tile met twice in one walk is a cycle.
+                if keep[..seeds].binary_search(&p).is_ok() || keep[walk..].contains(&p) {
                     break;
                 }
+                keep.push(p);
                 cur = p;
             }
         }
-        self.tiles.retain(|t, _| keep.contains(t));
+        keep.sort_unstable();
+        keep.dedup();
+        self.tiles.retain(|t, _| keep.binary_search(t).is_ok());
         let held = &self.held_last;
         self.imagery_prev
             .retain(|k, _| drapes.contains_key(k) || held.contains(&k.0));
