@@ -202,6 +202,27 @@ pub struct StepLog {
     pub idle: bool,
 }
 
+/// What the heap saw during one `decide` call.
+#[derive(Clone, Copy, Debug)]
+pub struct DecideAllocs {
+    /// The step's time.
+    pub now: Micros,
+    /// The call's own tally.
+    pub heap: super::alloc::Tally,
+    /// The blocks its output alone takes (a clone of the `Decisions`, with
+    /// exact capacities), when [`Sim::count_output`] is set; else 0.
+    pub output: u64,
+    /// Items drawn.
+    pub drawn: u32,
+}
+
+impl DecideAllocs {
+    /// The blocks `decide` asked for beyond its output: its own scratch.
+    pub fn internal(&self) -> u64 {
+        self.heap.allocs.saturating_sub(self.output)
+    }
+}
+
 struct BudgetResidency<'a>(&'a Budget);
 impl Residency for BudgetResidency<'_> {
     fn resident(&self, t: TileId) -> bool {
@@ -249,6 +270,12 @@ pub struct Sim {
     pub waits: Vec<(Micros, f64)>,
     /// Wall time of each `decide` call alone, µs, with the step's time.
     pub decide_us: Vec<(Micros, f64)>,
+    /// What the heap saw during each `decide` call, with the step's time.
+    pub decide_allocs: Vec<DecideAllocs>,
+    /// Also count the allocations of the step's output alone (a clone of
+    /// its `Decisions`), for [`DecideAllocs::output`]: off by default, it
+    /// costs a clone per step.
+    pub count_output: bool,
     /// Per tile: (mesh level drawn, drape level worn, last change time),
     /// tracked while the camera is still (I4).
     levels: BTreeMap<TileId, (u32, u32, Vec<Micros>)>,
@@ -281,6 +308,8 @@ impl Sim {
             wanted_at: BTreeMap::new(),
             waits: Vec::new(),
             decide_us: Vec::new(),
+            decide_allocs: Vec::new(),
+            count_output: false,
             levels: BTreeMap::new(),
             profile,
         }
@@ -349,9 +378,20 @@ impl Sim {
         );
         let input = FrameInput::new(self.frame, self.now, &need).with_presence(&self.net.store);
         let clock = std::time::Instant::now();
-        let d = self.budget.decide(input);
+        let (d, heap) = super::alloc::counted(|| self.budget.decide(input));
         self.decide_us
             .push((self.now, clock.elapsed().as_secs_f64() * 1e6));
+        let output = if self.count_output {
+            super::alloc::counted(|| d.clone()).1.allocs
+        } else {
+            0
+        };
+        self.decide_allocs.push(DecideAllocs {
+            now: self.now,
+            heap,
+            output,
+            drawn: d.draw.items.len() as u32,
+        });
         // The executor: in step, or `lag` steps behind. Either way it has
         // applied every decision before this one when this one is checked.
         let lagged = (self.profile.lag > 0).then(|| {

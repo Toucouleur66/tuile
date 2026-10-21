@@ -11,14 +11,24 @@
 //! every PR.
 
 #![allow(clippy::unwrap_used, clippy::panic)]
+// The counting allocator (`alloc.rs`) is the one unsafe item: a
+// `GlobalAlloc` that forwards to the system allocator. Test-only.
+#![allow(unsafe_code)]
 
+mod alloc;
 mod detmath;
 mod gpu;
 mod motion;
 mod net;
 mod patterns;
+mod ratchets;
 mod rng;
 mod scenarios;
 mod server;
 mod soak;
 mod world;
+
+/// Every allocation of this binary goes through the counter; it counts only
+/// on a thread that armed it (`alloc::counted`).
+#[global_allocator]
+static HEAP: alloc::Counting = alloc::Counting;

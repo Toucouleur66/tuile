@@ -249,22 +249,26 @@ pub fn check(s: &StepRecord<'_>, cfg: &BudgetConfig, out: &mut Violations) {
     if st.heap_len > cfg.request_heap || st.duplicates_in_flight > 0 {
         out.add(7);
     }
-    let worn: BTreeSet<ResourceId> = d
-        .draw
-        .items
-        .iter()
-        .flat_map(|i| std::iter::once(i.mesh).chain(i.drapes.iter().map(|x| x.resource)))
-        .collect();
-    let floor_levels: BTreeMap<TileId, u32> = s
-        .need
-        .entries()
-        .filter(|(_, _, n)| cfg.pinned_level.is_some_and(|p| n.level <= p))
-        .map(|(_, t, n)| (t, n.level))
-        .collect();
-    for e in &d.evict {
-        if worn.contains(e) || floor_levels.contains_key(&e.tile()) {
-            out.add(11);
-            break;
+    // What I11 compares evictions with, built only when something is
+    // evicted: a still step evicts nothing and allocates nothing here.
+    if !d.evict.is_empty() {
+        let worn: BTreeSet<ResourceId> = d
+            .draw
+            .items
+            .iter()
+            .flat_map(|i| std::iter::once(i.mesh).chain(i.drapes.iter().map(|x| x.resource)))
+            .collect();
+        let floor_tiles: BTreeSet<TileId> = s
+            .need
+            .entries()
+            .filter(|(_, _, n)| cfg.pinned_level.is_some_and(|p| n.level <= p))
+            .map(|(_, t, _)| t)
+            .collect();
+        for e in &d.evict {
+            if worn.contains(e) || floor_tiles.contains(&e.tile()) {
+                out.add(11);
+                break;
+            }
         }
     }
     if cfg.policy == Policy::Batch && d.frame_ready {
@@ -722,15 +726,49 @@ pub struct BudgetMeter {
     still_since: Option<Micros>,
     converged_counted: bool,
     shown: BTreeMap<TileId, Shown>,
-    /// The tiles each drawn mesh served last step, and its role.
-    drawn_last: BTreeMap<TileId, Role>,
-    served_last: BTreeSet<TileId>,
-    worn_layers_last: BTreeMap<TileId, BTreeSet<LayerId>>,
-    /// The tree as the last need knew it: a held child is no longer listed
-    /// once its parent is wanted.
-    parents_last: BTreeMap<TileId, TileId>,
+    /// Each drawn mesh's tile last step and its role, by tile.
+    drawn_last: Vec<(TileId, Role)>,
+    /// The tiles drawn items served last step, sorted.
+    served_last: Vec<TileId>,
+    /// The layers each drawn mesh wore last step, by tile then layer.
+    worn_layers_last: Vec<(TileId, LayerId)>,
+    /// The tree as the last need knew it, by child: a held child is no
+    /// longer listed once its parent is wanted.
+    parents_last: Vec<(TileId, TileId)>,
+    /// This step's buffers, swapped with the `_last` ones: a step allocates
+    /// nothing once they have grown to the view (the zero-cost contract).
+    scratch: MeterScratch,
     batch_steps: u64,
     violations: Violations,
+}
+
+/// The meter's per-step buffers.
+#[derive(Clone, Debug, Default)]
+struct MeterScratch {
+    /// The need's entries: (tile, order listed, level, parent).
+    listed: Vec<(TileId, u32, u32, Option<TileId>)>,
+    /// Each listed tile's level, the last listing's, by tile.
+    levels: Vec<(TileId, u32)>,
+    /// The tiles wanted drawn, sorted.
+    wanted: Vec<TileId>,
+    drawn: Vec<(TileId, Role)>,
+    served: Vec<TileId>,
+    worn_layers: Vec<(TileId, LayerId)>,
+    parents: Vec<(TileId, TileId)>,
+    /// Parents refined or coarsened this step, counted once each.
+    swapped: Vec<TileId>,
+}
+
+/// The value at `k` of a vector of pairs sorted by key.
+fn lookup<'v, K: Ord, V>(v: &'v [(K, V)], k: &K) -> Option<&'v V> {
+    v.binary_search_by(|e| e.0.cmp(k)).ok().map(|i| &v[i].1)
+}
+
+/// The run of a vector of pairs sorted by key whose key is `k`.
+fn run_of<'v, K: Ord, V>(v: &'v [(K, V)], k: &K) -> &'v [(K, V)] {
+    let from = v.partition_point(|e| e.0 < *k);
+    let to = from + v[from..].partition_point(|e| e.0 == *k);
+    &v[from..to]
 }
 
 impl BudgetMeter {
@@ -770,8 +808,27 @@ impl BudgetMeter {
         &self.violations
     }
 
-    fn levels(need: &NeedSet) -> BTreeMap<TileId, u32> {
-        need.entries().map(|(_, t, n)| (t, n.level)).collect()
+    /// The need's levels and parents, by tile: a tile listed twice keeps
+    /// its last listing's, as a map collected from the entries would.
+    fn read_need(x: &mut MeterScratch, need: &NeedSet) {
+        x.listed.clear();
+        x.listed.extend(
+            need.entries()
+                .enumerate()
+                .map(|(i, (_, t, n))| (t, u32::try_from(i).unwrap_or(u32::MAX), n.level, n.parent)),
+        );
+        // By tile, the last listing first.
+        x.listed
+            .sort_unstable_by_key(|e| (e.0, std::cmp::Reverse(e.1)));
+        x.levels.clear();
+        x.parents.clear();
+        for run in x.listed.chunk_by(|a, b| a.0 == b.0) {
+            x.levels.push((run[0].0, run[0].2));
+            // The last listing that names a parent.
+            if let Some(p) = run.iter().find_map(|e| e.3) {
+                x.parents.push((run[0].0, p));
+            }
+        }
     }
 }
 
@@ -888,12 +945,13 @@ impl BudgetObserver for BudgetMeter {
             }
         }
         // Flaps (I4): a tile's second level change within 10 s, still.
-        let levels = Self::levels(r.need);
+        let mut x = std::mem::take(&mut self.scratch);
+        Self::read_need(&mut x, r.need);
         if r.views_changed {
             self.shown.clear();
         } else {
             for i in &d.draw.items {
-                let Some(&mesh) = levels.get(&i.mesh.tile()) else {
+                let Some(&mesh) = lookup(&x.levels, &i.mesh.tile()) else {
                     continue;
                 };
                 let drape = i.drapes.first().map_or(0, |x| x.level);
@@ -922,65 +980,71 @@ impl BudgetObserver for BudgetMeter {
                     }
                 }
             }
-            let wanted: BTreeSet<TileId> = r.need.drawn.iter().map(|(t, _)| *t).collect();
-            self.shown.retain(|t, _| wanted.contains(t));
+            x.wanted.clear();
+            x.wanted.extend(r.need.drawn.iter().map(|(t, _)| *t));
+            x.wanted.sort_unstable();
+            let wanted = &x.wanted;
+            self.shown.retain(|t, _| wanted.binary_search(t).is_ok());
         }
-        // Swaps and gaps (I9).
-        let drawn: BTreeMap<TileId, Role> = d
-            .draw
-            .items
-            .iter()
-            .map(|i| (i.mesh.tile(), i.role))
-            .collect();
-        let served: BTreeSet<TileId> = d
-            .draw
-            .items
-            .iter()
-            .flat_map(|i| i.serves.iter().copied())
-            .collect();
-        let parents: BTreeMap<TileId, TileId> = r
-            .need
-            .entries()
-            .filter_map(|(_, t, n)| n.parent.map(|p| (t, p)))
-            .collect();
-        let mut refined = BTreeSet::new();
-        for (t, role) in &drawn {
+        // Swaps and gaps (I9). Items are sorted by mesh, so by tile.
+        x.drawn.clear();
+        x.drawn
+            .extend(d.draw.items.iter().map(|i| (i.mesh.tile(), i.role)));
+        x.served.clear();
+        x.served
+            .extend(d.draw.items.iter().flat_map(|i| i.serves.iter().copied()));
+        x.served.sort_unstable();
+        x.served.dedup();
+        let drawn = &x.drawn;
+        let parents = &x.parents;
+        x.swapped.clear();
+        for (t, role) in drawn {
             if *role == Role::Exact {
                 // A parent drawn last step, gone now that its child is
                 // drawn as itself: a refinement completed.
-                if let Some(p) = parents.get(t) {
-                    if self.drawn_last.contains_key(p) && !drawn.contains_key(p) {
-                        refined.insert(*p);
+                if let Some(p) = lookup(parents, t) {
+                    if lookup(&self.drawn_last, p).is_some() && lookup(drawn, p).is_none() {
+                        x.swapped.push(*p);
                     }
                 }
             }
         }
-        s.swaps_total[0] += refined.len() as u64;
-        let mut coarsened = BTreeSet::new();
+        x.swapped.sort_unstable();
+        x.swapped.dedup();
+        s.swaps_total[0] += x.swapped.len() as u64;
+        x.swapped.clear();
         for (t, role) in &self.drawn_last {
             // A finer tile drawn last step (as itself, or held), gone now
             // that its parent is drawn as itself: a coarsening completed.
-            if *role != Role::Fallback && !drawn.contains_key(t) {
-                if let Some(p) = parents.get(t).or_else(|| self.parents_last.get(t)) {
-                    let was = self.drawn_last.get(p);
-                    if drawn.get(p) == Some(&Role::Exact) && was != Some(&Role::Exact) {
-                        coarsened.insert(*p);
+            if *role != Role::Fallback && lookup(drawn, t).is_none() {
+                if let Some(p) = lookup(parents, t).or_else(|| lookup(&self.parents_last, t)) {
+                    let was = lookup(&self.drawn_last, p);
+                    if lookup(drawn, p) == Some(&Role::Exact) && was != Some(&Role::Exact) {
+                        x.swapped.push(*p);
                     }
                 }
             }
         }
-        s.swaps_total[1] += coarsened.len() as u64;
-        let worn_layers: BTreeMap<TileId, BTreeSet<LayerId>> = d
-            .draw
-            .items
-            .iter()
-            .map(|i| (i.mesh.tile(), i.drapes.iter().map(|x| x.layer).collect()))
-            .collect();
-        for (t, layers) in &worn_layers {
-            if let Some(was) = self.worn_layers_last.get(t) {
-                if !was.is_empty() && !layers.is_empty() && was != layers {
-                    s.swaps_total[3] += 1;
-                }
+        x.swapped.sort_unstable();
+        x.swapped.dedup();
+        s.swaps_total[1] += x.swapped.len() as u64;
+        // The rows of a tile, sorted and distinct, are the set of layers it
+        // wears.
+        x.worn_layers.clear();
+        x.worn_layers.extend(
+            d.draw
+                .items
+                .iter()
+                .flat_map(|i| i.drapes.iter().map(move |y| (i.mesh.tile(), y.layer))),
+        );
+        x.worn_layers.sort_unstable();
+        x.worn_layers.dedup();
+        for i in &d.draw.items {
+            let t = i.mesh.tile();
+            let layers = run_of(&x.worn_layers, &t);
+            let was = run_of(&self.worn_layers_last, &t);
+            if !was.is_empty() && !layers.is_empty() && was != layers {
+                s.swaps_total[3] += 1;
             }
         }
         if st.floor_in {
@@ -988,14 +1052,17 @@ impl BudgetObserver for BudgetMeter {
                 .need
                 .drawn
                 .iter()
-                .filter(|(t, _)| self.served_last.contains(t) && !served.contains(t))
+                .filter(|(t, _)| {
+                    self.served_last.binary_search(t).is_ok() && x.served.binary_search(t).is_err()
+                })
                 .count();
             s.swap_gaps_total += gaps as u64;
         }
-        self.drawn_last = drawn;
-        self.served_last = served;
-        self.worn_layers_last = worn_layers;
-        self.parents_last = parents;
+        std::mem::swap(&mut self.drawn_last, &mut x.drawn);
+        std::mem::swap(&mut self.served_last, &mut x.served);
+        std::mem::swap(&mut self.worn_layers_last, &mut x.worn_layers);
+        std::mem::swap(&mut self.parents_last, &mut x.parents);
+        self.scratch = x;
         // The record-local checks.
         let cfg = BudgetConfig {
             pinned_level: self.cfg_pinned,

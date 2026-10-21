@@ -23,6 +23,10 @@
 //! Every container is ordered (`BTreeMap`, `BTreeSet`, sorted `Vec`): no
 //! decision depends on a hash order.
 
+// The decisions are integer arithmetic: floats stay in `imagery` and
+// `priority`, quantised once, where bit-exactness is controlled.
+#![deny(clippy::float_arithmetic)]
+
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -32,15 +36,16 @@ use super::decisions::{
     Decisions, DrapeChoice, DrawItem, DrawSet, Role, Start, SwapGroup, UploadPlan,
 };
 use super::error::{AuditError, SessionError};
-use super::imagery::{best_drape, needed_level, DrapeCandidate, LevelClamp, UvTransform};
+use super::imagery::{drape_rank, needed_level, DrapeCandidate, GeoRect, LevelClamp, UvTransform};
 use super::need::{ImageryNeed, LayerReach, Membership, Need};
 use super::priority::{score, PriorityKey, Quantised, Urgency};
-use super::state::{CpuCopy, Entry, Gpu, Load, Transit};
+use super::sorted::{recycle, union4, SortedMap};
+use super::state::{CpuCopy, Entry, Gpu, Load, Rank, Transit};
 use super::stats::{BudgetStats, CancelReason, EvictReason, GAP_BUCKETS, LATENCY_BUCKETS};
 use super::tier::{Presence, PresenceOracle, Source, Tier};
 use super::types::{
-    Bytes, Class, Failure, Generation, LayerId, Micros, PerClass, Policy, Pressure, ResourceId,
-    Thermal, TileId,
+    sat_u32, Bytes, Class, Failure, Generation, LayerId, Micros, PerClass, Policy, Pressure,
+    ResourceId, Thermal, TileId,
 };
 use super::view::{Protection, ResourceState, ResourceView};
 use super::{Budget, Event, FrameInput, Ledger, TileInfo, RECENT_CAP, THRASH_WINDOW};
@@ -128,23 +133,57 @@ struct Want {
     level: u32,
 }
 
-/// One wanted tile's need, merged.
-#[derive(Clone, Debug)]
-struct TileNeed {
+/// One wanted tile's need, merged: borrowed from the step's input.
+#[derive(Clone, Copy, Debug)]
+struct TileNeed<'a> {
     membership: Membership,
-    need: Need,
+    need: &'a Need,
     q: Quantised,
+    /// Its place in the need's entries: of equal entries, the first wins.
+    seq: u32,
+}
+
+/// A step's buffers, kept across steps so that a step allocates nothing
+/// once they have grown to the view.
+#[derive(Debug, Default)]
+pub(super) struct Scratch {
+    tiles: Vec<(TileId, TileNeed<'static>)>,
+    drapes: Vec<((TileId, LayerId), u32)>,
+    /// Wants before their merge: (resource, order put, want).
+    wants_raw: Vec<(ResourceId, u32, Want)>,
+    wants: Vec<(ResourceId, Want)>,
+    keys: Vec<(ResourceId, PriorityKey)>,
+    ancestry: Vec<(TileId, TileId, u32)>,
+    jobs: Vec<(PriorityKey, ResourceId, Job, Want)>,
+    /// Per class, this step's eviction order of the GPU residents outside
+    /// the kept set, the floor and transit, built at its first use: their
+    /// keys do not move within a step after the mark, and the set only
+    /// shrinks, so every later use filters it instead of sorting again.
+    /// Dropped at the end of the step: only a step under pressure builds it.
+    evict_order: PerClass<Option<Vec<EvictKey>>>,
+    /// The loads, then the deliveries, picked from `jobs`.
+    picked: Vec<(PriorityKey, ResourceId, Job, Want)>,
 }
 
 /// The meshes standing for the wanted tiles, before their drapes.
 #[derive(Default)]
 struct Selection {
-    items: BTreeMap<ResourceId, (Role, BTreeSet<TileId>)>,
+    /// (mesh, a tile it serves, the role it serves it in), unsorted: a mesh
+    /// is drawn in the least of its roles, for every tile it serves.
+    items: Vec<(ResourceId, TileId, Role)>,
     coarsening: BTreeSet<TileId>,
     exact: u32,
     fallback: u32,
     lost: u32,
     depth: u32,
+}
+
+/// The eviction order: least recently needed first, then finer, then
+/// farther; the resource last, so the order is total.
+type EvictKey = (Micros, Reverse<u32>, Reverse<u32>, ResourceId);
+
+fn evict_key(r: ResourceId, e: &Entry) -> EvictKey {
+    (e.last_needed, Reverse(e.level), Reverse(e.distance), r)
 }
 
 /// Work on a wanted resource.
@@ -154,7 +193,7 @@ enum Job {
     Deliver,
 }
 
-fn sort_key(n: &TileNeed) -> impl Ord + '_ {
+fn sort_key<'n>(n: &'n TileNeed<'_>) -> impl Ord + 'n {
     let img = n
         .need
         .imagery
@@ -178,6 +217,37 @@ fn layers(img: &ImageryNeed) -> &[LayerReach] {
 /// Every layer of `tile`, as a range of a map keyed by `(tile, layer)`.
 fn tile_layers(tile: TileId) -> std::ops::RangeInclusive<(TileId, LayerId)> {
     (tile, LayerId(0))..=(tile, LayerId(u16::MAX))
+}
+
+/// The floor swap group `r` belongs to (D-A1), if any: a floor tile's mesh
+/// and its floor drape of every layer it wears, in stacking order.
+fn floor_group<'t>(
+    tiles: &'t SortedMap<TileId, TileNeed<'_>>,
+    r: ResourceId,
+    is_floor: impl Fn(u32) -> bool,
+) -> Option<impl Iterator<Item = ResourceId> + Clone + 't> {
+    let t = r.tile();
+    let tn = tiles.get(&t)?;
+    let img = tn.need.imagery.as_ref()?;
+    let level = tn.need.level;
+    if !is_floor(level) {
+        return None;
+    }
+    let drapes = layers(img)
+        .iter()
+        .map(move |x| ResourceId::drape(t, x.layer, level));
+    let member = r == ResourceId::Mesh(t) || drapes.clone().any(|m| m == r);
+    member.then(|| std::iter::once(ResourceId::Mesh(t)).chain(drapes))
+}
+
+/// Frees one load slot of `count`. A slot freed twice would wrap a `u32`
+/// to `u32::MAX` and freeze its quota (or panic in a debug build): it
+/// saturates at 0 instead, and `underflows` records it for `audit`.
+fn release(count: &mut u32, underflows: &mut u32) {
+    match count.checked_sub(1) {
+        Some(n) => *count = n,
+        None => *underflows = underflows.saturating_add(1),
+    }
 }
 
 fn backoff(policy: FailurePolicy, failures: u32, why: Failure) -> Micros {
@@ -302,8 +372,10 @@ impl Budget {
     // 1. Arrivals.
     pub(super) fn apply_events(&mut self, now: Micros, st: &mut BudgetStats) {
         let mut events = std::mem::take(&mut self.events);
-        events.sort();
-        for ev in events {
+        // Events are compared whole: equal ones are identical, and an
+        // unstable sort orders them as a stable one would.
+        events.sort_unstable();
+        for &ev in &events {
             match ev {
                 Event::Loaded(r, g, cost) => {
                     let Some(e) = self.entries.get_mut(&r) else {
@@ -319,9 +391,11 @@ impl Budget {
                         } if gen == g => {
                             e.load = Load::Idle;
                             match source {
-                                Source::Network => self.in_flight[e.class] -= 1,
+                                Source::Network => {
+                                    release(&mut self.in_flight[e.class], &mut self.underflows)
+                                }
                                 Source::Local => {
-                                    self.local_reads -= 1;
+                                    release(&mut self.local_reads, &mut self.underflows);
                                     st.network_bytes_avoided =
                                         st.network_bytes_avoided.plus(cost.gpu);
                                 }
@@ -351,8 +425,12 @@ impl Budget {
                         if gen == g {
                             e.load = Load::Idle;
                             match source {
-                                Source::Network => self.in_flight[e.class] -= 1,
-                                Source::Local => self.local_reads -= 1,
+                                Source::Network => {
+                                    release(&mut self.in_flight[e.class], &mut self.underflows)
+                                }
+                                Source::Local => {
+                                    release(&mut self.local_reads, &mut self.underflows)
+                                }
                             }
                             st.failed += 1;
                             st.failures[e.class][usize::from(why == Failure::Permanent)] += 1;
@@ -377,7 +455,7 @@ impl Budget {
                     {
                         if gen == g {
                             e.load = Load::Idle;
-                            self.local_reads -= 1;
+                            release(&mut self.local_reads, &mut self.underflows);
                             e.store_missed = true;
                             e.presence = Some(Presence::Absent);
                             st.store_misses += 1;
@@ -440,31 +518,32 @@ impl Budget {
                 }
             }
         }
+        events.clear();
+        self.events = events;
     }
 
     // 2. The need.
-    fn read_need(
+    fn read_need<'a>(
         &mut self,
-        input: &FrameInput<'_>,
+        input: &FrameInput<'a>,
         st: &mut BudgetStats,
-    ) -> BTreeMap<TileId, TileNeed> {
-        let mut tiles: BTreeMap<TileId, TileNeed> = BTreeMap::new();
-        for (m, t, n) in input.need.entries() {
+    ) -> SortedMap<TileId, TileNeed<'a>> {
+        let mut tiles: Vec<(TileId, TileNeed<'a>)> =
+            recycle(std::mem::take(&mut self.scratch.tiles));
+        for (seq, (m, t, n)) in input.need.entries().enumerate() {
             let q = Quantised::of(n);
             if q.rejected {
                 st.rejected_inputs += 1;
             }
-            let cand = TileNeed {
-                membership: m,
-                need: n.clone(),
-                q,
-            };
-            match tiles.get(&t) {
-                Some(cur) if sort_key(cur) >= sort_key(&cand) => {}
-                _ => {
-                    tiles.insert(t, cand);
-                }
-            }
+            tiles.push((
+                t,
+                TileNeed {
+                    membership: m,
+                    need: n,
+                    q,
+                    seq: u32::try_from(seq).unwrap_or(u32::MAX),
+                },
+            ));
             self.tiles.insert(
                 t,
                 TileInfo {
@@ -474,7 +553,14 @@ impl Budget {
                 },
             );
         }
-        tiles
+        // Per tile, the best entry first; of equals, the first listed.
+        tiles.sort_unstable_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| sort_key(&b.1).cmp(&sort_key(&a.1)))
+                .then(a.1.seq.cmp(&b.1.seq))
+        });
+        tiles.dedup_by_key(|e| e.0);
+        SortedMap::from_sorted(tiles)
     }
 
     /// How cheaply a drape could be drawn: on the GPU, decoded, in a local
@@ -503,10 +589,11 @@ impl Budget {
     /// (I14, I15). Batch takes the exact level, a function of the frame.
     fn drape_needs(
         &mut self,
-        tiles: &BTreeMap<TileId, TileNeed>,
+        tiles: &SortedMap<TileId, TileNeed<'_>>,
         presence: &dyn PresenceOracle,
-    ) -> BTreeMap<(TileId, LayerId), u32> {
-        let mut out = BTreeMap::new();
+    ) -> SortedMap<(TileId, LayerId), u32> {
+        let mut out = std::mem::take(&mut self.scratch.drapes);
+        out.clear();
         let floor = self.cfg.pinned_level.unwrap_or(0);
         let batch = self.cfg.policy == Policy::Batch;
         let cap = self.cfg.imagery_cap();
@@ -525,7 +612,7 @@ impl Budget {
                     source_max: reach.max_level,
                 };
                 if batch {
-                    out.insert(key, needed_level(None, img.footprint, clamp));
+                    out.push((key, needed_level(None, img.footprint, clamp)));
                     continue;
                 }
                 let prev = self.imagery_prev.get(&key).copied();
@@ -548,18 +635,30 @@ impl Budget {
                         }
                     }
                 }
-                out.insert(key, level);
+                out.push((key, level));
             }
+            // This tile's layers in order, a layer listed twice in the order
+            // listed; the tiles come in order.
+            let from = out.partition_point(|e| e.0 .0 < *t);
+            out[from..].sort_by_key(|e| e.0);
         }
+        // A layer listed twice: the last listing's level.
+        out.dedup_by(|later, earlier| {
+            let same = later.0 == earlier.0;
+            if same {
+                earlier.1 = later.1;
+            }
+            same
+        });
         for (k, l) in &out {
             self.imagery_prev.insert(*k, *l);
         }
-        out
+        SortedMap::from_sorted(out)
     }
 
     /// Every floor tile the need lists is drawable with its floor drape
     /// of every layer it wears (P1.1), and the need lists one at least.
-    fn floor_in(&self, tiles: &BTreeMap<TileId, TileNeed>) -> bool {
+    fn floor_in(&self, tiles: &SortedMap<TileId, TileNeed<'_>>) -> bool {
         let mut any = false;
         let all = tiles
             .iter()
@@ -578,42 +677,106 @@ impl Budget {
         any && all
     }
 
+    /// Kept from eviction this step: drawn, or in a swap the view waits on.
+    fn kept(&self, r: &ResourceId) -> bool {
+        self.drawn_last.contains(r) || self.swap_last.contains(r)
+    }
+
+    /// The drapes `mesh` wore last step.
+    fn worn_last_of(&self, mesh: ResourceId) -> impl Iterator<Item = &DrapeChoice> + '_ {
+        let from = self.worn_last.partition_point(|w| w.0 < mesh);
+        self.worn_last[from..]
+            .iter()
+            .take_while(move |w| w.0 == mesh)
+            .map(|w| &w.1)
+    }
+
     fn drawable(&self, r: ResourceId) -> bool {
         self.entries.get(&r).is_some_and(|e| e.gpu.is_some())
     }
 
-    fn is_descendant(&self, mut t: TileId, of: TileId) -> bool {
-        let target = self.tiles.get(&of).map(|i| i.level);
-        for _ in 0..64 {
-            let Some(info) = self.tiles.get(&t) else {
-                return false;
-            };
-            let Some(p) = info.parent else {
-                return false;
-            };
-            if p == of {
-                return true;
+    /// Every (ancestor, held tile) pair of last step's held tiles, sorted,
+    /// with the lowest level the walk from the held tile passed before
+    /// reaching that ancestor: `held` is a descendant of `of` exactly when
+    /// that level is above `of`'s own (or `of`'s is unknown). One walk per
+    /// held tile, once per step, instead of one per held tile and missing
+    /// tile.
+    fn held_ancestry(&self, out: &mut Vec<(TileId, TileId, u32)>) {
+        out.clear();
+        for &h in &self.held_last {
+            let mut t = h;
+            let mut passed = u32::MAX;
+            for _ in 0..64 {
+                let Some(info) = self.tiles.get(&t) else {
+                    break;
+                };
+                let Some(p) = info.parent else {
+                    break;
+                };
+                out.push((p, h, passed));
+                passed = passed.min(info.level);
+                t = p;
             }
-            if target.is_some_and(|l| info.level <= l) {
-                return false;
-            }
-            t = p;
         }
-        false
+        // A cycle visits an ancestor twice: its first visit, the highest
+        // level passed, is the one that counts.
+        out.sort_unstable_by_key(|a| (a.0, a.1, Reverse(a.2)));
+        out.dedup_by(|b, a| (a.0, a.1) == (b.0, b.1));
     }
 
-    /// The tile's ancestors, nearest first, as far as the budget knows them.
-    fn ancestors(&self, t: TileId) -> Vec<TileId> {
-        let mut out = Vec::new();
-        let mut cur = t;
-        while let Some(p) = self.tiles.get(&cur).and_then(|i| i.parent) {
-            if out.len() >= 64 {
-                break;
-            }
-            out.push(p);
-            cur = p;
+    /// The held tiles below `of`, in tile order.
+    fn held_below<'h>(
+        &self,
+        ancestry: &'h [(TileId, TileId, u32)],
+        of: TileId,
+    ) -> impl Iterator<Item = TileId> + 'h {
+        let target = self.tiles.get(&of).map(|i| i.level);
+        let from = ancestry.partition_point(|a| a.0 < of);
+        ancestry[from..]
+            .iter()
+            .take_while(move |a| a.0 == of)
+            .filter(move |a| target.is_none_or(|l| a.2 > l))
+            .map(|a| a.1)
+    }
+
+    /// The tile's ancestors, nearest first, as far as the budget knows them:
+    /// at most 64, lazily, so a caller that stops at the first hit walks no
+    /// further.
+    fn ancestors(&self, t: TileId) -> impl Iterator<Item = TileId> + '_ {
+        std::iter::successors(self.tiles.get(&t).and_then(|i| i.parent), move |p| {
+            self.tiles.get(p).and_then(|i| i.parent)
+        })
+        .take(64)
+    }
+
+    /// The UV mapping of `tile`'s mesh into the drapes of `x`, the tile
+    /// itself (`up == 0`) or one of its ancestors: `None` when either
+    /// footprint is unknown.
+    fn uv_into(&self, rect: Option<GeoRect>, up: usize, x: TileId) -> Option<UvTransform> {
+        if up == 0 {
+            return Some(UvTransform::IDENTITY);
         }
-        out
+        match (rect, self.tiles.get(&x).and_then(|i| i.rect)) {
+            (Some(a), Some(b)) => UvTransform::between(a, b),
+            _ => None,
+        }
+    }
+
+    /// The drawable drapes of `layer` on `x`, with their levels.
+    fn drawable_drapes(
+        &self,
+        x: TileId,
+        layer: LayerId,
+    ) -> impl Iterator<Item = (ResourceId, u32)> + '_ {
+        // Only this layer's drapes: a layer never falls back on another's.
+        let lo = ResourceId::drape(x, layer, 0);
+        let hi = ResourceId::drape(x, layer, u32::MAX);
+        self.entries
+            .range(lo..=hi)
+            .filter_map(|(r, e)| match (r, e.gpu) {
+                (ResourceId::Drape { level, .. }, Some(_)) => Some((*r, *level)),
+                _ => None,
+            })
     }
 
     fn best_drape_for(&self, tile: TileId, layer: LayerId, need: u32) -> Option<DrapeChoice> {
@@ -629,50 +792,45 @@ impl Budget {
             });
         }
         let rect = self.tiles.get(&tile).and_then(|i| i.rect);
-        let mut chain = vec![tile];
-        chain.extend(self.ancestors(tile));
-        let mut cands: Vec<(DrapeCandidate, ResourceId, UvTransform)> = Vec::new();
-        for (up, x) in chain.iter().enumerate() {
-            let uv = if up == 0 {
-                Some(UvTransform::IDENTITY)
-            } else {
-                match (rect, self.tiles.get(x).and_then(|i| i.rect)) {
-                    (Some(a), Some(b)) => UvTransform::between(a, b),
-                    _ => None,
-                }
+        // `best_drape`'s fold, walked lazily: the first of equal ranks wins.
+        let mut best: Option<(DrapeCandidate, ResourceId, UvTransform)> = None;
+        for (up, x) in std::iter::once(tile)
+            .chain(self.ancestors(tile))
+            .enumerate()
+        {
+            let Some(uv) = self.uv_into(rect, up, x) else {
+                continue;
             };
-            let Some(uv) = uv else { continue };
-            // Only this layer's drapes: a layer never falls back on another's.
-            let lo = ResourceId::drape(*x, layer, 0);
-            let hi = ResourceId::drape(*x, layer, u32::MAX);
-            for (r, e) in self.entries.range(lo..=hi) {
-                if let (ResourceId::Drape { level, .. }, Some(_)) = (r, e.gpu) {
-                    cands.push((
-                        DrapeCandidate {
-                            level: *level,
-                            up: up as u32,
-                        },
-                        *r,
-                        uv,
-                    ));
+            for (r, level) in self.drawable_drapes(x, layer) {
+                let c = DrapeCandidate {
+                    level,
+                    up: sat_u32(up),
+                };
+                if best.is_none_or(|(b, ..)| drape_rank(need, c) < drape_rank(need, b)) {
+                    best = Some((c, r, uv));
                 }
             }
         }
-        let best = best_drape(need, cands.iter().map(|c| c.0))?;
-        cands
-            .into_iter()
-            .find(|c| c.0 == best)
-            .map(|(c, resource, uv)| DrapeChoice {
-                resource,
-                layer,
-                level: c.level,
-                uv,
-            })
+        best.map(|(c, resource, uv)| DrapeChoice {
+            resource,
+            layer,
+            level: c.level,
+            uv,
+        })
     }
 
-    /// The layers a wanted tile's drape need asks for.
-    fn layers_of(drapes: &BTreeMap<(TileId, LayerId), u32>, t: TileId) -> BTreeSet<LayerId> {
-        drapes.range(tile_layers(t)).map(|((_, l), _)| *l).collect()
+    /// Whether `tile` has any drawable drape of `layer`, on itself or an
+    /// ancestor it maps into: `best_drape_for(tile, layer, _).is_some()`,
+    /// stopping at the first found.
+    fn has_drape(&self, tile: TileId, layer: LayerId) -> bool {
+        let rect = self.tiles.get(&tile).and_then(|i| i.rect);
+        std::iter::once(tile)
+            .chain(self.ancestors(tile))
+            .enumerate()
+            .any(|(up, x)| {
+                self.drawable_drapes(x, layer).next().is_some()
+                    && self.uv_into(rect, up, x).is_some()
+            })
     }
 
     /// Whether `tile`'s mesh can be drawn dressed for `layers`: each layer
@@ -680,16 +838,11 @@ impl Budget {
     /// layer switch in progress — the mesh still wears a layer it no longer
     /// needs. A mesh that cannot is not drawn: bare ground is black ground
     /// (I1, D-A1).
-    fn dressable(&self, tile: TileId, layers: &BTreeSet<LayerId>) -> bool {
-        let missing = layers
-            .iter()
-            .any(|l| self.best_drape_for(tile, *l, 0).is_none());
+    fn dressable(&self, tile: TileId, layers: &[LayerId]) -> bool {
+        let missing = layers.iter().any(|l| !self.has_drape(tile, *l));
         !missing
             || self
-                .worn_last
-                .get(&ResourceId::Mesh(tile))
-                .into_iter()
-                .flatten()
+                .worn_last_of(ResourceId::Mesh(tile))
                 .any(|d| !layers.contains(&d.layer) && self.drawable(d.resource))
     }
 
@@ -699,58 +852,50 @@ impl Budget {
     /// ancestor.
     fn select(
         &self,
-        tiles: &BTreeMap<TileId, TileNeed>,
-        drapes: &BTreeMap<(TileId, LayerId), u32>,
+        tiles: &SortedMap<TileId, TileNeed<'_>>,
+        drapes: &SortedMap<(TileId, LayerId), u32>,
+        ancestry: &[(TileId, TileId, u32)],
         cap: Option<u32>,
     ) -> Selection {
         let mut sel = Selection::default();
-        let shown = |t: TileId, layers: &BTreeSet<LayerId>| {
+        // The layers each wanted tile's drape need asks for, in layer order.
+        let mut layers: Vec<LayerId> = Vec::new();
+        let shown = |t: TileId, layers: &[LayerId]| {
             let level = self.tiles.get(&t).map_or(0, |i| i.level);
             cap.is_none_or(|c| level <= c)
                 && self.drawable(ResourceId::Mesh(t))
                 && self.dressable(t, layers)
         };
-        let add = |items: &mut BTreeMap<ResourceId, (Role, BTreeSet<TileId>)>,
-                   t: TileId,
-                   role: Role,
-                   serves: TileId| {
-            let e = items
-                .entry(ResourceId::Mesh(t))
-                .or_insert((role, BTreeSet::new()));
-            e.0 = e.0.min(role);
-            e.1.insert(serves);
-        };
         for (t, _) in tiles
             .iter()
             .filter(|(_, n)| n.membership == Membership::Drawn)
         {
-            let layers = Self::layers_of(drapes, *t);
+            layers.clear();
+            layers.extend(drapes.range(tile_layers(*t)).map(|((_, l), _)| *l));
             if shown(*t, &layers) {
-                add(&mut sel.items, *t, Role::Exact, *t);
+                sel.items.push((ResourceId::Mesh(*t), *t, Role::Exact));
                 sel.exact += 1;
                 continue;
             }
-            let held: Vec<TileId> = self
-                .held_last
-                .iter()
-                .copied()
-                .filter(|h| self.is_descendant(*h, *t) && shown(*h, &layers))
-                .collect();
-            for h in &held {
-                add(&mut sel.items, *h, Role::Held, *t);
+            let mut held = false;
+            for h in self.held_below(ancestry, *t) {
+                if shown(h, &layers) {
+                    sel.items.push((ResourceId::Mesh(h), *t, Role::Held));
+                    held = true;
+                }
             }
-            if !held.is_empty() {
+            if held {
                 sel.coarsening.insert(*t);
             }
-            let anc = self.ancestors(*t).into_iter().find(|a| shown(*a, &layers));
+            let anc = self.ancestors(*t).find(|a| shown(*a, &layers));
             if let Some(a) = anc {
-                add(&mut sel.items, a, Role::Fallback, *t);
+                sel.items.push((ResourceId::Mesh(a), *t, Role::Fallback));
                 let level = |x: TileId| self.tiles.get(&x).map_or(0, |i| i.level);
                 sel.depth = sel.depth.max(level(*t).saturating_sub(level(a)));
-                if held.is_empty() {
+                if !held {
                     sel.fallback += 1;
                 }
-            } else if held.is_empty() {
+            } else if !held {
                 sel.lost += 1;
             }
         }
@@ -760,18 +905,19 @@ impl Budget {
     // 3. The draw set.
     fn build_draw(
         &self,
-        tiles: &BTreeMap<TileId, TileNeed>,
-        drapes: &BTreeMap<(TileId, LayerId), u32>,
+        tiles: &SortedMap<TileId, TileNeed<'_>>,
+        drapes: &SortedMap<(TileId, LayerId), u32>,
+        ancestry: &[(TileId, TileId, u32)],
         floor_in: bool,
         st: &mut BudgetStats,
     ) -> (DrawSet, BTreeSet<TileId>) {
-        let mut sel = self.select(tiles, drapes, None);
+        let mut sel = self.select(tiles, drapes, ancestry, None);
         if sel.lost > 0 && !floor_in {
             // P1.1 (b): coarse ground before any refinement. While wanted
             // ground is lost and the floor not in, nothing finer than the
             // floor is drawn.
             if let Some(p) = self.cfg.pinned_level {
-                sel = self.select(tiles, drapes, Some(p));
+                sel = self.select(tiles, drapes, ancestry, Some(p));
             }
         }
         st.exact += sel.exact;
@@ -779,19 +925,33 @@ impl Budget {
         st.lost += sel.lost;
         st.fallback_depth_max = st.fallback_depth_max.max(sel.depth);
         let Selection {
-            items, coarsening, ..
+            mut items,
+            coarsening,
+            ..
         } = sel;
-        let mut out = Vec::new();
-        for (mesh, (role, serves)) in items {
+        // By mesh, then by tile served: each mesh's run is one draw item.
+        items.sort_unstable();
+        let meshes = items.chunk_by(|a, b| a.0 == b.0).count();
+        let mut out = Vec::with_capacity(meshes);
+        // The level each layer is needed at, by layer.
+        let mut needs: Vec<(LayerId, u32)> = Vec::new();
+        for run in items.chunk_by(|a, b| a.0 == b.0) {
+            let mesh = run[0].0;
+            let role = run.iter().map(|x| x.2).min().unwrap_or(Role::Exact);
+            let mut serves: Vec<TileId> = Vec::with_capacity(run.len());
+            serves.extend(run.iter().map(|x| x.1));
+            serves.dedup();
             let tile = mesh.tile();
             // The level each layer is needed at: the tile's own need when
             // exact; a held tile keeps its own last level; a fallback
             // dresses for the finest of the tiles it serves.
-            let mut needs: BTreeMap<LayerId, u32> = BTreeMap::new();
+            needs.clear();
             for s in &serves {
                 for ((_, layer), n) in drapes.range(tile_layers(*s)) {
-                    let e = needs.entry(*layer).or_insert(*n);
-                    *e = (*e).max(*n);
+                    match needs.binary_search_by_key(layer, |x| x.0) {
+                        Ok(i) => needs[i].1 = needs[i].1.max(*n),
+                        Err(i) => needs.insert(i, (*layer, *n)),
+                    }
                 }
             }
             if role == Role::Held {
@@ -801,25 +961,31 @@ impl Budget {
                     }
                 }
             }
-            let mut chosen: Vec<DrapeChoice> = needs
-                .iter()
-                .filter_map(|(layer, n)| self.best_drape_for(tile, *layer, *n))
-                .collect();
+            let needed = |l: LayerId| needs.iter().any(|x| x.0 == l);
+            let mut chosen: Vec<DrapeChoice> = Vec::with_capacity(needs.len());
+            chosen.extend(
+                needs
+                    .iter()
+                    .filter_map(|(layer, n)| self.best_drape_for(tile, *layer, *n)),
+            );
             if chosen.len() < needs.len() {
                 // A layer switch in progress: a layer the tiles now ask for
                 // is drawable nowhere yet, so the layers this mesh wore last
                 // step and no longer needs stay worn until it is.
-                for old in self.worn_last.get(&mesh).into_iter().flatten() {
-                    if !needs.contains_key(&old.layer) && self.drawable(old.resource) {
+                for old in self.worn_last_of(mesh) {
+                    if !needed(old.layer) && self.drawable(old.resource) {
                         chosen.push(*old);
                     }
                 }
-                chosen.sort_by_key(|d| d.layer);
+                // One drape per layer: an unstable sort is the stable one.
+                chosen.sort_unstable_by_key(|d| d.layer);
             }
             // Bare: a layer the tiles need is worn by no drape, and no old
             // layer stands in for it during a switch.
-            let missing = needs.keys().any(|l| !chosen.iter().any(|d| d.layer == *l));
-            let switching = chosen.iter().any(|d| !needs.contains_key(&d.layer));
+            let missing = needs
+                .iter()
+                .any(|(l, _)| !chosen.iter().any(|d| d.layer == *l));
+            let switching = chosen.iter().any(|d| !needed(d.layer));
             if missing && !switching {
                 st.bare += 1;
             }
@@ -835,7 +1001,8 @@ impl Budget {
                 for d in &chosen {
                     let gap = i64::from(d.level)
                         - i64::from(self.tiles.get(&tile).map(|i| i.level).unwrap_or(0));
-                    let i = (gap + 8).clamp(0, GAP_BUCKETS as i64 - 1) as usize;
+                    let i =
+                        usize::try_from((gap + 8).clamp(0, GAP_BUCKETS as i64 - 1)).unwrap_or(0);
                     st.imagery_over_terrain[i] += 1;
                 }
             }
@@ -846,7 +1013,7 @@ impl Budget {
                 mesh,
                 role,
                 drapes: chosen,
-                serves: serves.into_iter().collect(),
+                serves,
             });
         }
         (DrawSet { items: out }, coarsening)
@@ -855,17 +1022,19 @@ impl Budget {
     /// What the step wants loaded or delivered.
     fn wants(
         &self,
-        tiles: &BTreeMap<TileId, TileNeed>,
-        drapes: &BTreeMap<(TileId, LayerId), u32>,
+        tiles: &SortedMap<TileId, TileNeed<'_>>,
+        drapes: &SortedMap<(TileId, LayerId), u32>,
         draw: &DrawSet,
-    ) -> BTreeMap<ResourceId, Want> {
-        let mut out: BTreeMap<ResourceId, Want> = BTreeMap::new();
+        raw: &mut Vec<(ResourceId, u32, Want)>,
+        mut merged: Vec<(ResourceId, Want)>,
+    ) -> SortedMap<ResourceId, Want> {
+        raw.clear();
+        merged.clear();
         let batch = self.cfg.policy == Policy::Batch;
-        let put = |out: &mut BTreeMap<ResourceId, Want>, r: ResourceId, w: Want| match out.get(&r) {
-            Some(cur) if (cur.urgency, Reverse(cur.q)) <= (w.urgency, Reverse(w.q)) => {}
-            _ => {
-                out.insert(r, w);
-            }
+        // Every want put, in order; merged below.
+        let put = |out: &mut Vec<(ResourceId, u32, Want)>, r: ResourceId, w: Want| {
+            let seq = u32::try_from(out.len()).unwrap_or(u32::MAX);
+            out.push((r, seq, w));
         };
         // Batch: a frame's drapes are those of what it draws. Batch never
         // cancels a load it started (I13), so a drape started for a tile the
@@ -900,7 +1069,7 @@ impl Budget {
                 }
             };
             put(
-                &mut out,
+                raw,
                 ResourceId::Mesh(*t),
                 Want {
                     urgency,
@@ -912,7 +1081,7 @@ impl Budget {
             if floor {
                 for reach in tn.need.imagery.as_ref().map(layers).unwrap_or(&[]) {
                     put(
-                        &mut out,
+                        raw,
                         ResourceId::drape(*t, reach.layer, tn.need.level),
                         Want {
                             urgency: Urgency::Floor,
@@ -952,7 +1121,7 @@ impl Budget {
                 };
                 if let Some(du) = du {
                     put(
-                        &mut out,
+                        raw,
                         drape,
                         Want {
                             urgency: du,
@@ -964,11 +1133,20 @@ impl Budget {
                 }
             }
         }
-        out
+        // Per resource the most urgent, then the best scored; of equals,
+        // the first put.
+        raw.sort_unstable_by_key(|(r, seq, w)| (*r, w.urgency, Reverse(w.q), *seq));
+        raw.dedup_by_key(|e| e.0);
+        merged.extend(raw.iter().map(|(r, _, w)| (*r, *w)));
+        SortedMap::from_sorted(merged)
     }
 
     fn protection(&self, r: ResourceId) -> Option<Protection> {
-        let e = self.entries.get(&r)?;
+        self.protection_of(r, self.entries.get(&r)?)
+    }
+
+    /// What protects `r`, whose entry is `e`.
+    fn protection_of(&self, r: ResourceId, e: &Entry) -> Option<Protection> {
         if self.is_floor(e.level) && (e.gpu.is_some() || e.transit.is_some()) {
             return Some(Protection::Floor);
         }
@@ -1014,91 +1192,131 @@ impl Budget {
         let mut st = std::mem::take(&mut self.pending);
         let mut d = Decisions::default();
         let eff = self.eff();
-        for r in std::mem::take(&mut self.ranked_last) {
-            if let Some(e) = self.entries.get_mut(&r) {
+        self.scratch.evict_order = PerClass::default();
+        let mut ranked = std::mem::take(&mut self.ranked_last);
+        for r in &ranked {
+            if let Some(e) = self.entries.get_mut(r) {
                 e.urgency = None;
                 e.priority = None;
             }
         }
+        ranked.clear();
+        self.ranked_last = ranked;
         self.steps += 1;
 
         self.apply_events(now, &mut st);
         let tiles = self.read_need(&input, &mut st);
-        st.work = st.work.saturating_add(input.need.entries().count() as u32);
+        let listed = input.need.drawn.len()
+            + input.need.blockers.len()
+            + input.need.ancestors.len()
+            + input.need.ring.len();
+        st.work = st.work.saturating_add(sat_u32(listed));
         let drapes = self.drape_needs(&tiles, input.presence);
         st.floor_in = self.floor_in(&tiles);
-        let (draw, coarsening) = self.build_draw(&tiles, &drapes, st.floor_in, &mut st);
-        let mut wants = self.wants(&tiles, &drapes, &draw);
+        let mut ancestry = std::mem::take(&mut self.scratch.ancestry);
+        self.held_ancestry(&mut ancestry);
+        let (draw, coarsening) = self.build_draw(&tiles, &drapes, &ancestry, st.floor_in, &mut st);
+        self.scratch.ancestry = ancestry;
+        let mut raw = std::mem::take(&mut self.scratch.wants_raw);
+        let merged = std::mem::take(&mut self.scratch.wants);
+        let wants = self.wants(&tiles, &drapes, &draw, &mut raw, merged);
         // Drawn content of an older epoch is refreshed, new before old.
+        raw.clear();
         for i in &draw.items {
             for r in std::iter::once(i.mesh).chain(i.drapes.iter().map(|x| x.resource)) {
                 if let Some(e) = self.entries.get(&r) {
                     if e.stale_gpu(self.epoch(r, e.class)) && !wants.contains_key(&r) {
-                        wants.insert(
+                        let seq = u32::try_from(raw.len()).unwrap_or(u32::MAX);
+                        raw.push((
                             r,
+                            seq,
                             Want {
                                 urgency: Urgency::Refresh,
                                 q: Quantised::default(),
                                 class: e.class,
                                 level: e.level,
                             },
-                        );
+                        ));
                     }
                 }
             }
         }
+        let wants = if raw.is_empty() {
+            wants
+        } else {
+            // The first refresh of a resource listed twice.
+            raw.sort_unstable_by_key(|(r, seq, _)| (*r, *seq));
+            raw.dedup_by_key(|e| e.0);
+            let mut all = wants.into_vec();
+            all.extend(raw.iter().map(|(r, _, w)| (*r, *w)));
+            all.sort_unstable_by_key(|e| e.0);
+            SortedMap::from_sorted(all)
+        };
+        self.scratch.wants_raw = raw;
 
-        // 4. Mark: needed now, or unneeded since when.
-        let mut drawn_res: BTreeSet<ResourceId> = BTreeSet::new();
-        for i in &draw.items {
-            drawn_res.insert(i.mesh);
-            drawn_res.extend(i.drapes.iter().map(|x| x.resource));
-        }
-        self.drawn_last = drawn_res.clone();
-        self.worn_last = draw
-            .items
-            .iter()
-            .filter(|i| !i.drapes.is_empty())
-            .map(|i| (i.mesh, i.drapes.clone()))
-            .collect();
-        self.chain_last = wants
-            .iter()
-            .filter(|(r, w)| w.urgency == Urgency::Ancestor && self.drawable(**r))
-            .map(|(r, _)| *r)
-            .collect();
-        self.swap_last = wants
-            .iter()
-            .filter(|(r, w)| {
-                matches!(
-                    w.urgency,
-                    Urgency::Hole | Urgency::Blocker | Urgency::Ancestor
-                ) && self.drawable(**r)
-            })
-            .map(|(r, _)| *r)
-            .collect();
-        let mut keep = drawn_res.clone();
-        keep.extend(self.swap_last.iter().copied());
+        // 4. Mark: needed now, or unneeded since when. What is drawn, the
+        // drapes each mesh wears, and the swap and chain sets are kept for
+        // the rest of the step and the next, in buffers refilled in place.
+        self.drawn_last.refill(
+            draw.items
+                .iter()
+                .flat_map(|i| std::iter::once(i.mesh).chain(i.drapes.iter().map(|x| x.resource))),
+        );
+        // Items are sorted by mesh: so is this.
+        self.worn_last.clear();
+        self.worn_last.extend(
+            draw.items
+                .iter()
+                .flat_map(|i| i.drapes.iter().map(move |x| (i.mesh, *x))),
+        );
+        let mut chain = std::mem::take(&mut self.chain_last);
+        chain.refill(
+            wants
+                .iter()
+                .filter(|(r, w)| w.urgency == Urgency::Ancestor && self.drawable(**r))
+                .map(|(r, _)| *r),
+        );
+        self.chain_last = chain;
+        let mut swap = std::mem::take(&mut self.swap_last);
+        swap.refill(
+            wants
+                .iter()
+                .filter(|(r, w)| {
+                    matches!(
+                        w.urgency,
+                        Urgency::Hole | Urgency::Blocker | Urgency::Ancestor
+                    ) && self.drawable(**r)
+                })
+                .map(|(r, _)| *r),
+        );
+        self.swap_last = swap;
         // Only what the view touched this step or the last: everything else
         // was already marked unneeded.
-        let touched: BTreeSet<ResourceId> = wants
-            .keys()
-            .chain(drawn_res.iter())
-            .chain(self.wanted_last.iter())
-            .copied()
-            .collect();
-        for r in &touched {
-            let Some(e) = self.entries.get_mut(r) else {
+        // A merge of the three sorted sources, not a set built of them.
+        let Budget {
+            entries,
+            drawn_last,
+            wanted_last,
+            ..
+        } = self;
+        let touched = union4(
+            wants.keys().copied(),
+            drawn_last.iter().copied(),
+            wanted_last.iter().copied(),
+            std::iter::empty(),
+        );
+        for r in touched {
+            let Some(e) = entries.get_mut(&r) else {
                 continue;
             };
-            if let Some(w) = wants.get(r) {
+            if wants.contains_key(&r) {
                 e.last_needed = now;
                 e.unneeded_since = None;
                 e.first_wanted.get_or_insert(now);
                 if let Some(tn) = tiles.get(&r.tile()) {
                     e.distance = tn.q.distance;
                 }
-                let _ = w;
-            } else if drawn_res.contains(r) {
+            } else if drawn_last.contains(&r) {
                 e.last_needed = now;
                 e.unneeded_since = None;
                 e.first_wanted = None;
@@ -1112,14 +1330,11 @@ impl Budget {
         self.cancel(now, &eff, &mut d, &mut st);
 
         // 6. Rank the work.
-        let fallback_cover: BTreeMap<ResourceId, u32> = draw
-            .items
-            .iter()
-            .filter(|i| i.role == Role::Fallback)
-            .map(|i| (i.mesh, i.serves.len() as u32))
-            .collect();
-        let mut keys: BTreeMap<ResourceId, PriorityKey> = BTreeMap::new();
-        let mut jobs: Vec<(PriorityKey, ResourceId, Job, Want)> = Vec::new();
+        // Wants come in order: so do their keys.
+        let mut keys = std::mem::take(&mut self.scratch.keys);
+        keys.clear();
+        let mut jobs = std::mem::take(&mut self.scratch.jobs);
+        jobs.clear();
         for (r, w) in &wants {
             let class = self.class_of(*r, w.class);
             let epoch = self.epoch(*r, class);
@@ -1142,7 +1357,11 @@ impl Budget {
                 .and_then(|e| e.first_wanted)
                 .map(|f| now.since(f))
                 .unwrap_or(Micros::ZERO);
-            let cover = fallback_cover.get(r).copied().unwrap_or(0);
+            // How many wanted tiles it stands in for, as a fallback.
+            let cover = draw
+                .get(*r)
+                .filter(|i| i.role == Role::Fallback)
+                .map_or(0, |i| sat_u32(i.serves.len()));
             let mut sc = score(w.q, waited, self.cfg.age_full, cover);
             if urgency == Urgency::Hole && coarsening.contains(&r.tile()) {
                 // At the ceiling a coarser covering tile frees bytes: first.
@@ -1154,35 +1373,39 @@ impl Budget {
                 tier: self.tier(*r, e, class, input.presence),
                 resource: *r,
             };
-            keys.insert(*r, key);
+            keys.push((*r, key));
             if let Some(job) = job {
                 jobs.push((key, *r, job, Want { urgency, ..*w }));
             }
         }
-        jobs.sort_by_key(|j| j.0);
+        let keys = SortedMap::from_sorted(keys);
+        // Keys end in the resource: total, so unstable is stable.
+        jobs.sort_unstable_by_key(|j| j.0);
         st.work = st
             .work
-            .saturating_add(wants.len() as u32)
-            .saturating_add(jobs.len() as u32);
-        self.ranked_last = jobs.iter().map(|j| j.1).collect();
+            .saturating_add(sat_u32(wants.len()))
+            .saturating_add(sat_u32(jobs.len()));
+        self.ranked_last.extend(jobs.iter().map(|j| j.1));
         for (k, r, _, w) in &jobs {
             if let Some(e) = self.entries.get_mut(r) {
                 e.urgency = Some(w.urgency);
-                e.priority = Some(*k);
+                e.priority = Some(Rank::of(k));
             }
         }
 
-        let loads: Vec<_> = jobs
-            .iter()
-            .filter(|j| j.2 == Job::Load)
-            .take(self.cfg.request_heap as usize)
-            .copied()
-            .collect();
-        st.heap_len = loads.len() as u32;
+        let mut picked = std::mem::take(&mut self.scratch.picked);
+        picked.clear();
+        picked.extend(
+            jobs.iter()
+                .filter(|j| j.2 == Job::Load)
+                .take(self.cfg.request_heap as usize)
+                .copied(),
+        );
+        st.heap_len = sat_u32(picked.len());
         self.start(
             now,
             &eff,
-            &loads,
+            &picked,
             &keys,
             &wants,
             input.presence,
@@ -1191,49 +1414,27 @@ impl Budget {
         );
 
         // 7. Deliveries.
-        let delivers: Vec<_> = jobs
-            .iter()
-            .filter(|j| j.2 == Job::Deliver)
-            .copied()
-            .collect();
-        let mut floor_groups: BTreeMap<ResourceId, Vec<ResourceId>> = BTreeMap::new();
-        for (t, tn) in &tiles {
-            let Some(img) = tn.need.imagery.as_ref() else {
-                continue;
-            };
-            if !self.is_floor(tn.need.level) {
-                continue;
-            }
-            let mut group = vec![ResourceId::Mesh(*t)];
-            group.extend(
-                layers(img)
-                    .iter()
-                    .map(|r| ResourceId::drape(*t, r.layer, tn.need.level)),
-            );
-            for m in &group {
-                floor_groups.insert(*m, group.clone());
-            }
-        }
+        picked.clear();
+        picked.extend(jobs.iter().filter(|j| j.2 == Job::Deliver).copied());
         let (blocked, strained) = self.deliver(
             now,
             &eff,
-            &delivers,
-            &floor_groups,
+            &picked,
+            &tiles,
             &coarsening,
-            &keep,
             &wants,
             &mut d,
             &mut st,
         );
 
         // 8. The upload plan.
-        d.upload_plan = self.plan(&eff, &keys, &tiles, &drapes);
-        // The plan scans every tracked entry for those in transit.
-        st.work = st.work.saturating_add(self.entries.len() as u32);
+        d.upload_plan = self.plan(&eff, &keys, &tiles);
+        // The plan scans the loads and transits for those in transit.
+        st.work = st.work.saturating_add(sat_u32(self.active.len()));
 
         // 9. Eviction and release.
         if !eff.batch {
-            self.evict(now, &eff, &keep, &mut d, &mut st);
+            self.evict(now, &eff, &mut d, &mut st);
         }
 
         // 10. Relaxation.
@@ -1280,19 +1481,25 @@ impl Budget {
         };
 
         // Bookkeeping for the next step.
-        self.held_last = draw
-            .items
-            .iter()
-            .filter(|i| i.role != Role::Fallback)
-            .map(|i| i.mesh.tile())
-            .collect();
-        self.wanted_last = wants
-            .keys()
-            .copied()
-            .chain(drawn_res.iter().copied())
-            .collect();
+        self.held_last.refill(
+            draw.items
+                .iter()
+                .filter(|i| i.role != Role::Fallback)
+                .map(|i| i.mesh.tile()),
+        );
+        let mut wanted = std::mem::take(&mut self.wanted_last);
+        wanted.refill(wants.keys().chain(self.drawn_last.iter()).copied());
+        self.wanted_last = wanted;
         let pruned = self.prune(now, &tiles, &wants, &drapes);
         st.work = st.work.saturating_add(pruned);
+        self.scratch.tiles = recycle(tiles.into_buffer());
+        self.scratch.drapes = drapes.into_buffer();
+        self.scratch.wants = wants.into_buffer();
+        self.scratch.keys = keys.into_buffer();
+        jobs.clear();
+        self.scratch.jobs = jobs;
+        picked.clear();
+        self.scratch.picked = picked;
 
         // Statistics.
         st.gpu = self.ledger.gpu;
@@ -1312,7 +1519,7 @@ impl Budget {
         st.sse_scale_milli = d.sse_scale_milli;
         st.in_flight = self.in_flight;
         st.local_reads = self.local_reads;
-        st.tracked = self.entries.len() as u32;
+        st.tracked = sat_u32(self.entries.len());
         for r in &self.active {
             if let Some(e) = self.entries.get(r) {
                 if let Some(t) = e.transit {
@@ -1328,19 +1535,17 @@ impl Budget {
 
     fn protected_bytes(&self) -> PerClass<Bytes> {
         let mut p = PerClass::splat(Bytes::ZERO);
-        let candidates: BTreeSet<ResourceId> = self
-            .drawn_last
-            .iter()
-            .chain(&self.swap_last)
-            .chain(&self.active)
-            .chain(&self.floor_set)
-            .copied()
-            .collect();
+        let candidates = union4(
+            self.drawn_last.iter().copied(),
+            self.swap_last.iter().copied(),
+            self.active.iter().copied(),
+            self.floor_set.iter().copied(),
+        );
         for r in candidates {
             let Some(e) = self.entries.get(&r) else {
                 continue;
             };
-            if self.protection(r).is_some() {
+            if self.protection_of(r, e).is_some() {
                 let b = e
                     .gpu
                     .map(|g| g.bytes)
@@ -1375,8 +1580,10 @@ impl Budget {
                 if (unneeded && !batch) || timed_out {
                     e.load = Load::Idle;
                     match source {
-                        Source::Network => self.in_flight[e.class] -= 1,
-                        Source::Local => self.local_reads -= 1,
+                        Source::Network => {
+                            release(&mut self.in_flight[e.class], &mut self.underflows)
+                        }
+                        Source::Local => release(&mut self.local_reads, &mut self.underflows),
                     }
                     d.cancel.push((*r, gen));
                     st.cancelled += 1;
@@ -1420,8 +1627,8 @@ impl Budget {
         now: Micros,
         eff: &Eff,
         loads: &[(PriorityKey, ResourceId, Job, Want)],
-        keys: &BTreeMap<ResourceId, PriorityKey>,
-        wants: &BTreeMap<ResourceId, Want>,
+        keys: &SortedMap<ResourceId, PriorityKey>,
+        wants: &SortedMap<ResourceId, Want>,
         presence: &dyn PresenceOracle,
         d: &mut Decisions,
         st: &mut BudgetStats,
@@ -1460,24 +1667,15 @@ impl Budget {
                             }
                             continue;
                         }
-                        // Preempt the least urgent in-flight preload.
-                        st.work = st.work.saturating_add(self.entries.len() as u32);
+                        // Preempt the least urgent in-flight preload. Every
+                        // load is indexed in `active` (`start`).
+                        st.work = st.work.saturating_add(sat_u32(self.active.len()));
                         let victim = self
-                            .entries
+                            .active
                             .iter()
-                            .filter(|(vr, ve)| {
-                                ve.class == class
-                                    && matches!(
-                                        ve.load,
-                                        Load::Loading {
-                                            source: Source::Network,
-                                            ..
-                                        }
-                                    )
-                                    && wants.get(vr).is_some_and(|vw| {
-                                        matches!(vw.urgency, Urgency::Ring | Urgency::Ancestor)
-                                    })
-                                    || ve.class == class
+                            .filter(|vr| {
+                                self.entries.get(vr).is_some_and(|ve| {
+                                    ve.class == class
                                         && matches!(
                                             ve.load,
                                             Load::Loading {
@@ -1485,15 +1683,18 @@ impl Budget {
                                                 ..
                                             }
                                         )
-                                        && ve.urgency == Some(Urgency::Refresh)
+                                        && (wants.get(vr).is_some_and(|vw| {
+                                            matches!(vw.urgency, Urgency::Ring | Urgency::Ancestor)
+                                        }) || ve.urgency == Some(Urgency::Refresh))
+                                })
                             })
-                            .filter_map(|(vr, _)| keys.get(vr).map(|k| (*k, *vr)))
+                            .filter_map(|vr| keys.get(vr).map(|k| (*k, *vr)))
                             .max();
                         let Some((_, vr)) = victim else { continue };
                         if let Some(ve) = self.entries.get_mut(&vr) {
                             if let Load::Loading { gen, .. } = ve.load {
                                 ve.load = Load::Idle;
-                                self.in_flight[class] -= 1;
+                                release(&mut self.in_flight[class], &mut self.underflows);
                                 d.cancel.push((vr, gen));
                                 st.cancelled += 1;
                                 st.cancels[CancelReason::Preempted as usize] += 1;
@@ -1520,7 +1721,7 @@ impl Budget {
             e.last_needed = now;
             e.unneeded_since = None;
             e.urgency = Some(w.urgency);
-            e.priority = Some(*key);
+            e.priority = Some(Rank::of(key));
             e.load = Load::Loading {
                 gen,
                 source,
@@ -1576,8 +1777,7 @@ impl Budget {
         bytes: Bytes,
         limit: Bytes,
         urgency: Urgency,
-        keep: &BTreeSet<ResourceId>,
-        wants: &BTreeMap<ResourceId, Want>,
+        wants: &SortedMap<ResourceId, Want>,
         d: &mut Decisions,
         st: &mut BudgetStats,
         strained: &mut bool,
@@ -1585,37 +1785,31 @@ impl Budget {
         if self.ledger.gpu[class].plus(bytes) <= limit {
             return true;
         }
-        st.work = st.work.saturating_add(self.entries.len() as u32);
-        let mut victims: Vec<_> = self
-            .entries
+        let order = self.evict_order(class, st);
+        // The victims now: still evictable, and worth less than the work.
+        let victim = |b: &Budget, r: &ResourceId| -> Option<Bytes> {
+            let e = b.entries.get(r)?;
+            let worth_less = wants
+                .get(r)
+                .is_none_or(|w| urgency < Urgency::Ring && w.urgency > urgency);
+            (e.transit.is_none() && worth_less).then_some(e.gpu?.bytes)
+        };
+        st.work = st.work.saturating_add(sat_u32(order.len()));
+        let freeable = order
             .iter()
-            .filter(|(r, e)| {
-                e.class == class
-                    && e.gpu.is_some()
-                    && e.transit.is_none()
-                    && !keep.contains(r)
-                    && !self.is_floor(e.level)
-                    && wants
-                        .get(r)
-                        .is_none_or(|w| urgency < Urgency::Ring && w.urgency > urgency)
-            })
-            .map(|(r, e)| {
-                (
-                    (e.last_needed, Reverse(e.level), Reverse(e.distance), *r),
-                    *r,
-                    e.gpu.map(|g| g.bytes).unwrap_or(Bytes::ZERO),
-                )
-            })
-            .collect();
-        victims.sort();
-        let freeable = victims.iter().fold(Bytes::ZERO, |a, v| a.plus(v.2));
+            .filter_map(|k| victim(self, &k.3))
+            .fold(Bytes::ZERO, |a, b| a.plus(b));
         if self.ledger.gpu[class].minus(freeable).plus(bytes) > limit {
             *strained = true;
+            self.scratch.evict_order[class] = Some(order);
             return false;
         }
-        for (_, r, _) in victims {
+        for &(.., r) in &order {
             if self.ledger.gpu[class].plus(bytes) <= limit {
                 break;
+            }
+            if victim(self, &r).is_none() {
+                continue;
             }
             if wants.contains_key(&r) {
                 // Wanted work displaces wanted work: the view asks for more
@@ -1630,7 +1824,32 @@ impl Budget {
                 self.recent.insert(r, now);
             }
         }
+        self.scratch.evict_order[class] = Some(order);
         true
+    }
+
+    /// This step's eviction order for `class`, built at its first use
+    /// (see `Scratch::evict_order`); the caller puts it back.
+    fn evict_order(&mut self, class: Class, st: &mut BudgetStats) -> Vec<EvictKey> {
+        if let Some(order) = self.scratch.evict_order[class].take() {
+            return order;
+        }
+        st.work = st.work.saturating_add(sat_u32(self.entries.len()));
+        let mut order: Vec<EvictKey> = self
+            .entries
+            .iter()
+            .filter(|(r, e)| {
+                e.class == class
+                    && e.gpu.is_some()
+                    && e.transit.is_none()
+                    && !self.kept(r)
+                    && !self.is_floor(e.level)
+            })
+            .map(|(r, e)| evict_key(*r, e))
+            .collect();
+        // Keys end in the resource: total, so unstable is stable.
+        order.sort_unstable();
+        order
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1639,36 +1858,33 @@ impl Budget {
         now: Micros,
         eff: &Eff,
         jobs: &[(PriorityKey, ResourceId, Job, Want)],
-        floor_groups: &BTreeMap<ResourceId, Vec<ResourceId>>,
+        tiles: &SortedMap<TileId, TileNeed<'_>>,
         coarsening: &BTreeSet<TileId>,
-        keep: &BTreeSet<ResourceId>,
-        wants: &BTreeMap<ResourceId, Want>,
+        wants: &SortedMap<ResourceId, Want>,
         d: &mut Decisions,
         st: &mut BudgetStats,
     ) -> (bool, bool) {
         let mut flags = (false, false);
         for (_, r, _, w) in jobs {
-            let Some(group) = floor_groups.get(r) else {
-                self.deliver_one(now, eff, *r, w, coarsening, keep, wants, d, st, &mut flags);
+            let Some(group) = floor_group(tiles, *r, |l| self.is_floor(l)) else {
+                self.deliver_one(now, eff, *r, w, coarsening, wants, d, st, &mut flags);
                 continue;
             };
             // A floor mesh and its drapes are one swap group (D-A1): none
             // goes until every one is loaded, then they go together.
-            let ready = group.iter().all(|m| {
-                self.entries.get(m).is_some_and(|e| {
+            let ready = group.clone().all(|m| {
+                self.entries.get(&m).is_some_and(|e| {
                     e.gpu.is_some()
                         || e.transit.is_some()
-                        || e.fresh_cpu(self.epoch(*m, e.class)).is_some()
+                        || e.fresh_cpu(self.epoch(m, e.class)).is_some()
                 })
             });
             if !ready {
                 continue;
             }
             for m in group {
-                let mw = wants.get(m).copied().unwrap_or(*w);
-                self.deliver_one(
-                    now, eff, *m, &mw, coarsening, keep, wants, d, st, &mut flags,
-                );
+                let mw = wants.get(&m).copied().unwrap_or(*w);
+                self.deliver_one(now, eff, m, &mw, coarsening, wants, d, st, &mut flags);
             }
         }
         flags
@@ -1684,8 +1900,7 @@ impl Budget {
         r: ResourceId,
         w: &Want,
         coarsening: &BTreeSet<TileId>,
-        keep: &BTreeSet<ResourceId>,
-        wants: &BTreeMap<ResourceId, Want>,
+        wants: &SortedMap<ResourceId, Want>,
         d: &mut Decisions,
         st: &mut BudgetStats,
         flags: &mut (bool, bool),
@@ -1750,7 +1965,6 @@ impl Budget {
                 c.cost.gpu,
                 limit,
                 w.urgency,
-                keep,
                 wants,
                 d,
                 st,
@@ -1789,9 +2003,8 @@ impl Budget {
     fn plan(
         &self,
         eff: &Eff,
-        keys: &BTreeMap<ResourceId, PriorityKey>,
-        tiles: &BTreeMap<TileId, TileNeed>,
-        drapes: &BTreeMap<(TileId, LayerId), u32>,
+        keys: &SortedMap<ResourceId, PriorityKey>,
+        tiles: &SortedMap<TileId, TileNeed<'_>>,
     ) -> UploadPlan {
         // Group: the blockers of one parent (meshes and drapes), else a
         // tile's mesh and its drape.
@@ -1805,10 +2018,14 @@ impl Budget {
                 _ => (1, t),
             }
         };
+        // Every copy in transit is indexed in `active` (`deliver_one`).
         let mut transit: Vec<(PriorityKey, ResourceId, Bytes)> = self
-            .entries
+            .active
             .iter()
-            .filter_map(|(r, e)| e.transit.map(|t| (*r, t.cost.gpu)))
+            .filter_map(|r| {
+                let t = self.entries.get(r)?.transit?;
+                Some((*r, t.cost.gpu))
+            })
             .map(|(r, b)| {
                 let k = keys.get(&r).copied().unwrap_or(PriorityKey {
                     urgency: Urgency::Refresh,
@@ -1819,68 +2036,48 @@ impl Budget {
                 (k, r, b)
             })
             .collect();
-        transit.sort();
-        let _ = drapes;
-        let mut taken: BTreeSet<ResourceId> = BTreeSet::new();
+        transit.sort_unstable();
         let mut plan = UploadPlan::default();
-        let mut groups: BTreeMap<(u8, TileId), Vec<ResourceId>> = BTreeMap::new();
-        for (_, r, _) in &transit {
-            groups.entry(group_of(*r)).or_default().push(*r);
+        // Each group's members with their bytes, in transit order.
+        let mut groups: BTreeMap<(u8, TileId), Vec<(ResourceId, Bytes)>> = BTreeMap::new();
+        for (_, r, b) in &transit {
+            groups.entry(group_of(*r)).or_default().push((*r, *b));
         }
         for (_, r, _) in &transit {
-            if taken.contains(r) {
+            // A group goes whole, at its first member in transit order: a
+            // later member finds it gone.
+            let Some(mut members) = groups.remove(&group_of(*r)) else {
                 continue;
-            }
-            let g = group_of(*r);
-            let members: Vec<ResourceId> = groups.get(&g).cloned().unwrap_or_else(|| vec![*r]);
-            let bytes = members.iter().fold(Bytes::ZERO, |a, m| {
-                a.plus(
-                    transit
-                        .iter()
-                        .find(|x| x.1 == *m)
-                        .map(|x| x.2)
-                        .unwrap_or(Bytes::ZERO),
-                )
-            });
+            };
+            let bytes = members.iter().fold(Bytes::ZERO, |a, m| a.plus(m.1));
             if plan.items.is_empty() && plan.bytes.plus(bytes) > eff.upload {
                 // The first item always goes, alone if its group is too big.
-                let b = transit
-                    .iter()
-                    .find(|x| x.1 == *r)
-                    .map(|x| x.2)
-                    .unwrap_or(Bytes::ZERO);
                 plan.items.push(*r);
-                plan.bytes = b;
+                plan.bytes = members
+                    .iter()
+                    .find(|m| m.0 == *r)
+                    .map_or(Bytes::ZERO, |m| m.1);
                 break;
             }
             if plan.bytes.plus(bytes) > eff.upload {
                 break;
             }
-            for m in &members {
-                taken.insert(*m);
-                plan.items.push(*m);
-            }
+            plan.items.extend(members.iter().map(|m| m.0));
             plan.bytes = plan.bytes.plus(bytes);
             if members.len() > 1 {
-                let mut sorted = members.clone();
-                sorted.sort();
-                plan.groups.push(SwapGroup { members: sorted });
+                members.sort_unstable_by_key(|m| m.0);
+                plan.groups.push(SwapGroup {
+                    members: members.into_iter().map(|m| m.0).collect(),
+                });
             }
         }
         plan
     }
 
-    fn evict(
-        &mut self,
-        now: Micros,
-        eff: &Eff,
-        drawn: &BTreeSet<ResourceId>,
-        d: &mut Decisions,
-        st: &mut BudgetStats,
-    ) {
+    fn evict(&mut self, now: Micros, eff: &Eff, d: &mut Decisions, st: &mut BudgetStats) {
         let w = self.cfg.watermarks;
         if let Some(p) = eff.pool {
-            self.evict_pooled(now, p, drawn, d, st);
+            self.evict_pooled(now, p, d, st);
         }
         for class in Class::ALL {
             if eff.pool.is_some_and(|p| p.members[class]) {
@@ -1892,28 +2089,18 @@ impl Budget {
                 continue;
             }
             let low = eff.target[class].scaled(u64::from(w.low_percent), 100);
-            st.work = st.work.saturating_add(self.entries.len() as u32);
-            let mut cands: Vec<_> = self
-                .entries
-                .iter()
-                .filter(|(r, e)| {
-                    e.class == class
-                        && e.gpu.is_some()
-                        && !drawn.contains(r)
-                        && e.transit.is_none()
-                        && !self.is_floor(e.level)
-                })
-                .map(|(r, e)| {
-                    (
-                        (e.last_needed, Reverse(e.level), Reverse(e.distance), *r),
-                        *r,
-                    )
-                })
-                .collect();
-            cands.sort();
-            for (_, r) in cands {
+            let order = self.evict_order(class, st);
+            for &(.., r) in &order {
                 if self.ledger.gpu[class] <= low {
                     break;
+                }
+                // Still on the GPU, and not on its way again.
+                let evictable = self
+                    .entries
+                    .get(&r)
+                    .is_some_and(|e| e.gpu.is_some() && e.transit.is_none());
+                if !evictable {
+                    continue;
                 }
                 if let Some(e) = self.entries.get_mut(&r) {
                     e.take_gpu(&mut self.ledger);
@@ -1929,8 +2116,10 @@ impl Budget {
                 }
             }
         }
+        // Only a step under pressure built one: nothing kept across steps.
+        self.scratch.evict_order = PerClass::default();
         if self.ledger.decoded > eff.decoded {
-            st.work = st.work.saturating_add(self.entries.len() as u32);
+            st.work = st.work.saturating_add(sat_u32(self.entries.len()));
             let mut cands: Vec<_> = self
                 .entries
                 .iter()
@@ -1941,7 +2130,7 @@ impl Budget {
                 // then copies already demoted (they save a re-read when the
                 // view comes back).
                 .map(|(r, e)| {
-                    let rank = match (e.gpu.is_some(), drawn.contains(r)) {
+                    let rank = match (e.gpu.is_some(), self.kept(r)) {
                         (true, true) => 0u8,
                         (true, false) => 1,
                         (false, _) => 2,
@@ -1958,7 +2147,7 @@ impl Budget {
                     )
                 })
                 .collect();
-            cands.sort();
+            cands.sort_unstable();
             for (_, r) in cands {
                 if self.ledger.decoded <= eff.decoded {
                     break;
@@ -1976,14 +2165,7 @@ impl Budget {
     /// D-A3: one sweep over the pool's members, in the one eviction order,
     /// down to the low watermark of the pool's target, no member below its
     /// floor, none left above its ceiling.
-    fn evict_pooled(
-        &mut self,
-        now: Micros,
-        p: PoolEff,
-        drawn: &BTreeSet<ResourceId>,
-        d: &mut Decisions,
-        st: &mut BudgetStats,
-    ) {
+    fn evict_pooled(&mut self, now: Micros, p: PoolEff, d: &mut Decisions, st: &mut BudgetStats) {
         let w = self.cfg.watermarks;
         let used = |l: &Ledger| {
             Class::ALL
@@ -2005,14 +2187,14 @@ impl Budget {
             return;
         }
         let low = pct(p.target, w.low_percent);
-        st.work = st.work.saturating_add(self.entries.len() as u32);
+        st.work = st.work.saturating_add(sat_u32(self.entries.len()));
         let mut cands: Vec<_> = self
             .entries
             .iter()
             .filter(|(r, e)| {
                 p.members[e.class]
                     && e.gpu.is_some()
-                    && !drawn.contains(r)
+                    && !self.kept(r)
                     && e.transit.is_none()
                     && !self.is_floor(e.level)
             })
@@ -2025,7 +2207,7 @@ impl Budget {
                 )
             })
             .collect();
-        cands.sort();
+        cands.sort_unstable();
         for (_, r, class, bytes) in cands {
             for c in Class::ALL {
                 over[c] &= self.ledger.gpu[c] > ceiling_low(c);
@@ -2111,20 +2293,21 @@ impl Budget {
                 self.scale_fine = self.scale_fine.saturating_sub(down).max(one);
             }
         }
-        self.scale = (self.scale_fine / 1_000_000) as u32;
+        // At most `max_scale`, a u32: `scale_fine` is capped at it.
+        self.scale = u32::try_from(self.scale_fine / 1_000_000).unwrap_or(u32::MAX);
     }
 
     fn prune(
         &mut self,
         now: Micros,
-        tiles: &BTreeMap<TileId, TileNeed>,
-        wants: &BTreeMap<ResourceId, Want>,
-        drapes: &BTreeMap<(TileId, LayerId), u32>,
+        tiles: &SortedMap<TileId, TileNeed<'_>>,
+        wants: &SortedMap<ResourceId, Want>,
+        drapes: &SortedMap<(TileId, LayerId), u32>,
     ) -> u32 {
         // Amortised: emptied entries and unreferenced tiles go every eighth
         // step, so a step does not scan all it tracks. Returns the entries
         // visited.
-        let visited = self.imagery_prev.len() as u32;
+        let visited = sat_u32(self.imagery_prev.len());
         if !self.steps.is_multiple_of(8) {
             let held = &self.held_last;
             self.imagery_prev
@@ -2132,8 +2315,8 @@ impl Budget {
             return visited;
         }
         let visited = visited
-            .saturating_add(self.entries.len() as u32)
-            .saturating_add(self.tiles.len() as u32);
+            .saturating_add(sat_u32(self.entries.len()))
+            .saturating_add(sat_u32(self.tiles.len()));
         let entries = &self.entries;
         self.active.retain(|r| {
             entries
@@ -2156,30 +2339,40 @@ impl Budget {
         self.floor_set.retain(|r| entries.contains_key(r));
         // Keep only what is wanted this step among idle, never-started entries.
         self.recent.retain(|_, t| now.since(*t) <= THRASH_WINDOW);
-        while self.recent.len() > RECENT_CAP {
-            let oldest = self
-                .recent
-                .iter()
-                .min_by_key(|(r, t)| (**t, **r))
-                .map(|(r, _)| *r);
-            if let Some(r) = oldest {
-                self.recent.remove(&r);
+        if self.recent.len() > RECENT_CAP {
+            // The oldest go, by (time, resource): one sort, not one scan
+            // per removal.
+            let mut by_age: Vec<(Micros, ResourceId)> =
+                self.recent.iter().map(|(r, t)| (*t, *r)).collect();
+            by_age.sort_unstable();
+            for (_, r) in &by_age[..by_age.len() - RECENT_CAP] {
+                self.recent.remove(r);
             }
         }
-        let mut keep: BTreeSet<TileId> = tiles.keys().copied().collect();
+        // The tiles still referenced and every ancestor of theirs, as one
+        // sorted vector rather than a set grown node by node.
+        let mut keep: Vec<TileId> = tiles.keys().copied().collect();
         keep.extend(self.entries.keys().map(|r| r.tile()));
         keep.extend(self.held_last.iter().copied());
-        let seeds: Vec<TileId> = keep.iter().copied().collect();
-        for s in seeds {
-            let mut cur = s;
+        keep.sort_unstable();
+        keep.dedup();
+        let seeds = keep.len();
+        for i in 0..seeds {
+            let mut cur = keep[i];
+            let walk = keep.len();
             while let Some(p) = self.tiles.get(&cur).and_then(|i| i.parent) {
-                if !keep.insert(p) {
+                // A seed's ancestors are walked from the seed itself; a
+                // tile met twice in one walk is a cycle.
+                if keep[..seeds].binary_search(&p).is_ok() || keep[walk..].contains(&p) {
                     break;
                 }
+                keep.push(p);
                 cur = p;
             }
         }
-        self.tiles.retain(|t, _| keep.contains(t));
+        keep.sort_unstable();
+        keep.dedup();
+        self.tiles.retain(|t, _| keep.binary_search(t).is_ok());
         let held = &self.held_last;
         self.imagery_prev
             .retain(|k, _| drapes.contains_key(k) || held.contains(&k.0));
@@ -2210,7 +2403,7 @@ impl Budget {
                 )
             })
             .collect();
-        cands.sort();
+        cands.sort_unstable();
         let mut out = super::Released::default();
         for (_, r) in cands {
             if total(&self.ledger) <= target && self.ledger.decoded <= target {
@@ -2269,11 +2462,16 @@ impl Budget {
             decoded: e.cpu.map(|c| c.cost.gpu).unwrap_or(Bytes::ZERO),
             protected: self.protection(r),
             urgency: e.urgency,
-            priority: e.priority,
+            priority: e.priority.map(|p| p.key(r)),
         })
     }
 
     pub(super) fn audit_impl(&self) -> Result<(), AuditError> {
+        if self.underflows > 0 {
+            return Err(AuditError::SlotUnderflow {
+                count: self.underflows,
+            });
+        }
         let mut l = Ledger::default();
         let mut flight = PerClass::splat(0u32);
         for e in self.entries.values() {
@@ -2318,5 +2516,31 @@ impl Budget {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::budget::BudgetConfig;
+
+    #[test]
+    fn a_slot_freed_twice_saturates_and_is_recorded() {
+        let (mut n, mut under) = (2u32, 0u32);
+        release(&mut n, &mut under);
+        assert_eq!((n, under), (1, 0));
+        release(&mut n, &mut under);
+        release(&mut n, &mut under);
+        assert_eq!((n, under), (0, 1), "saturates at 0, the underflow counted");
+    }
+
+    #[test]
+    fn the_audit_reports_a_slot_underflow() {
+        let mut b = Budget::new(BudgetConfig::interactive(Bytes::mib(64))).unwrap();
+        assert_eq!(b.audit(), Ok(()));
+        release(&mut b.local_reads, &mut b.underflows);
+        assert_eq!(b.local_reads, 0);
+        assert_eq!(b.audit(), Err(AuditError::SlotUnderflow { count: 1 }));
     }
 }

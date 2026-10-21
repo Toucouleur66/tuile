@@ -109,6 +109,8 @@ tempfile = "3"
 # Property tests (dev only): the de facto standard for Rust, shrinking
 # included. No default features: no fork, no timeout, no regex strategies.
 proptest = { version = "1.7", default-features = false, features = ["std"] }
+# The budget's `decide` bench: no plots, no rayon, the cargo-bench runner only.
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

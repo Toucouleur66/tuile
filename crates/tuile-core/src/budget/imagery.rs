@@ -221,24 +221,20 @@ pub fn best_drape(
     let mut best: Option<DrapeCandidate> = None;
     for c in candidates {
         best = Some(match best {
-            None => c,
-            Some(b) => {
-                let key = |x: DrapeCandidate| {
-                    // At or above the need: coarsest first; below: sharpest.
-                    let rank = if x.level >= need {
-                        (0, x.level - need)
-                    } else {
-                        (1, need - x.level)
-                    };
-                    (rank, x.up)
-                };
-                if key(c) < key(b) {
-                    c
-                } else {
-                    b
-                }
-            }
+            Some(b) if drape_rank(need, c) >= drape_rank(need, b) => b,
+            _ => c,
         });
     }
     best
+}
+
+/// The order of [`best_drape`], smaller first: at or above the need,
+/// coarsest first; below it, sharpest; at equal level, the closest owner.
+pub(crate) fn drape_rank(need: u32, x: DrapeCandidate) -> ((u8, u32), u32) {
+    let rank = if x.level >= need {
+        (0, x.level - need)
+    } else {
+        (1, need - x.level)
+    };
+    (rank, x.up)
 }

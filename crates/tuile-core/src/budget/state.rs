@@ -10,9 +10,15 @@
 //! update the [`Ledger`](super::Ledger) in the same breath; `audit` checks
 //! the two never drift.
 
+// The decisions are integer arithmetic: floats stay in `imagery` and
+// `priority`, quantised once, where bit-exactness is controlled.
+#![deny(clippy::float_arithmetic)]
+
 use super::cost::Cost;
 use super::priority::{PriorityKey, Urgency};
+use super::tier::Tier;
 use super::tier::{Presence, Source};
+use super::types::ResourceId;
 use super::types::{Bytes, Class, Generation, Micros};
 use super::Ledger;
 
@@ -77,8 +83,43 @@ pub(super) struct Entry {
     pub deliver_after: Micros,
     /// This step's urgency and priority, if it has work.
     pub urgency: Option<Urgency>,
-    pub priority: Option<PriorityKey>,
+    pub priority: Option<Rank>,
 }
+
+/// A priority key without its resource, which the entry's map key already
+/// is: 16 bytes instead of 32 in every tracked entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Rank {
+    urgency: Urgency,
+    score: std::cmp::Reverse<i64>,
+    tier: Tier,
+}
+
+impl Rank {
+    pub fn of(k: &PriorityKey) -> Self {
+        Rank {
+            urgency: k.urgency,
+            score: k.score,
+            tier: k.tier,
+        }
+    }
+
+    /// The full key, for `resource`.
+    pub fn key(self, resource: ResourceId) -> PriorityKey {
+        PriorityKey {
+            urgency: self.urgency,
+            score: self.score,
+            tier: self.tier,
+            resource,
+        }
+    }
+}
+
+// A tracked resource's state, kept small: every full scan walks it, and
+// it is the bulk of the bytes per tracked resource. It holds no `usize`,
+// so the bound holds on wasm32 too.
+const _: () = assert!(std::mem::size_of::<Entry>() <= ENTRY_BYTES);
+const ENTRY_BYTES: usize = 240;
 
 impl Entry {
     pub fn new(class: Class, level: u32, now: Micros) -> Self {

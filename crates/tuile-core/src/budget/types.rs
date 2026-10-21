@@ -53,6 +53,12 @@ impl Class {
     }
 }
 
+/// A length as a `u32`, saturating: `as` would wrap above `u32::MAX` on a
+/// 64-bit target and not on wasm32, where a `usize` is 32 bits.
+pub(crate) fn sat_u32(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
 /// One value per [`Class`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct PerClass<T>(pub [T; 4]);
@@ -126,6 +132,8 @@ impl Bytes {
         if v > u64::MAX as u128 {
             Bytes::MAX
         } else {
+            // In range: checked just above (`try_from` is not `const`).
+            #[allow(clippy::cast_possible_truncation)]
             Bytes(v as u64)
         }
     }

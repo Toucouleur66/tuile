@@ -20,6 +20,13 @@
 //! next `decide` applies them in a canonical order, whatever order they came
 //! in, then decides.
 
+// Determinism guards (A3.f): a hash container's order is seeded per process
+// and differs between targets, so nothing here may iterate one; and a
+// `usize` is 32 bits on wasm32, so no length is narrowed by `as` (see
+// `types::sat_u32`).
+#![deny(clippy::iter_over_hash_type)]
+#![deny(clippy::cast_possible_truncation)]
+
 pub mod config;
 pub mod cost;
 pub mod deadline;
@@ -30,6 +37,7 @@ pub mod imagery;
 pub mod need;
 pub mod observe;
 pub mod priority;
+mod sorted;
 mod state;
 pub mod stats;
 pub mod tier;
@@ -146,13 +154,14 @@ pub struct Budget {
     entries: std::collections::BTreeMap<ResourceId, state::Entry>,
     tiles: std::collections::BTreeMap<TileId, TileInfo>,
     imagery_prev: std::collections::BTreeMap<(TileId, LayerId), u32>,
-    held_last: std::collections::BTreeSet<TileId>,
-    drawn_last: std::collections::BTreeSet<ResourceId>,
-    /// The drapes each drawn mesh wore last step: on a layer switch, the
-    /// old layer stays worn until the new one is drawable.
-    worn_last: std::collections::BTreeMap<ResourceId, Vec<DrapeChoice>>,
-    swap_last: std::collections::BTreeSet<ResourceId>,
-    chain_last: std::collections::BTreeSet<ResourceId>,
+    held_last: sorted::SortedSet<TileId>,
+    drawn_last: sorted::SortedSet<ResourceId>,
+    /// The drapes each drawn mesh wore last step, by mesh, in its stacking
+    /// order: on a layer switch, the old layer stays worn until the new one
+    /// is drawable.
+    worn_last: Vec<(ResourceId, DrapeChoice)>,
+    swap_last: sorted::SortedSet<ResourceId>,
+    chain_last: sorted::SortedSet<ResourceId>,
     /// Resources loading or in transit (an index, so a step need not scan).
     active: std::collections::BTreeSet<ResourceId>,
     /// Resources of the floor (an index).
@@ -161,7 +170,9 @@ pub struct Budget {
     ranked_last: Vec<ResourceId>,
     /// Steps taken, for the amortised prune.
     steps: u64,
-    wanted_last: std::collections::BTreeSet<ResourceId>,
+    wanted_last: sorted::SortedSet<ResourceId>,
+    /// A step's buffers, kept across steps.
+    scratch: engine::Scratch,
     recent: std::collections::BTreeMap<ResourceId, Micros>,
     epochs: PerClass<u64>,
     /// Per imagery layer, added to the drape class's epoch.
@@ -173,6 +184,9 @@ pub struct Budget {
     ledger: Ledger,
     in_flight: PerClass<u32>,
     local_reads: u32,
+    /// Load slots freed below zero (`engine::release`): never, unless an
+    /// invariant broke; `audit` reports it.
+    underflows: u32,
     fatal: Option<SessionError>,
     /// The statistics of arrivals applied ahead of their step
     /// ([`Budget::apply_arrivals`]), reported by it.
@@ -194,7 +208,7 @@ impl Budget {
             imagery_prev: Default::default(),
             held_last: Default::default(),
             drawn_last: Default::default(),
-            worn_last: Default::default(),
+            worn_last: Vec::new(),
             swap_last: Default::default(),
             chain_last: Default::default(),
             active: Default::default(),
@@ -202,6 +216,7 @@ impl Budget {
             ranked_last: Vec::new(),
             steps: 0,
             wanted_last: Default::default(),
+            scratch: Default::default(),
             recent: Default::default(),
             epochs: PerClass::splat(0),
             layer_epochs: Default::default(),
@@ -212,6 +227,7 @@ impl Budget {
             ledger: Ledger::default(),
             in_flight: PerClass::splat(0),
             local_reads: 0,
+            underflows: 0,
             fatal: None,
             pending: BudgetStats::default(),
         })
@@ -349,6 +365,14 @@ impl Budget {
     /// How many resources the budget tracks.
     pub fn tracked(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Drops the buffers a step reuses from one step to the next, which
+    /// have grown to the size of the view: a host freeing memory (sent to
+    /// the background) can give them back; the next step grows them again.
+    /// Decides nothing.
+    pub fn release_scratch(&mut self) {
+        self.scratch = Default::default();
     }
 }
 
