@@ -20,6 +20,13 @@
 //! next `decide` applies them in a canonical order, whatever order they came
 //! in, then decides.
 
+// Determinism guards (A3.f): a hash container's order is seeded per process
+// and differs between targets, so nothing here may iterate one; and a
+// `usize` is 32 bits on wasm32, so no length is narrowed by `as` (see
+// `types::sat_u32`).
+#![deny(clippy::iter_over_hash_type)]
+#![deny(clippy::cast_possible_truncation)]
+
 pub mod config;
 pub mod cost;
 pub mod deadline;

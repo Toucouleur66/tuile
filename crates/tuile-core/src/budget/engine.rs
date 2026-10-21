@@ -23,6 +23,10 @@
 //! Every container is ordered (`BTreeMap`, `BTreeSet`, sorted `Vec`): no
 //! decision depends on a hash order.
 
+// The decisions are integer arithmetic: floats stay in `imagery` and
+// `priority`, quantised once, where bit-exactness is controlled.
+#![deny(clippy::float_arithmetic)]
+
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -40,8 +44,8 @@ use super::state::{CpuCopy, Entry, Gpu, Load, Rank, Transit};
 use super::stats::{BudgetStats, CancelReason, EvictReason, GAP_BUCKETS, LATENCY_BUCKETS};
 use super::tier::{Presence, PresenceOracle, Source, Tier};
 use super::types::{
-    Bytes, Class, Failure, Generation, LayerId, Micros, PerClass, Policy, Pressure, ResourceId,
-    Thermal, TileId,
+    sat_u32, Bytes, Class, Failure, Generation, LayerId, Micros, PerClass, Policy, Pressure,
+    ResourceId, Thermal, TileId,
 };
 use super::view::{Protection, ResourceState, ResourceView};
 use super::{Budget, Event, FrameInput, Ledger, TileInfo, RECENT_CAP, THRASH_WINDOW};
@@ -800,7 +804,7 @@ impl Budget {
             for (r, level) in self.drawable_drapes(x, layer) {
                 let c = DrapeCandidate {
                     level,
-                    up: up as u32,
+                    up: sat_u32(up),
                 };
                 if best.is_none_or(|(b, ..)| drape_rank(need, c) < drape_rank(need, b)) {
                     best = Some((c, r, uv));
@@ -997,7 +1001,8 @@ impl Budget {
                 for d in &chosen {
                     let gap = i64::from(d.level)
                         - i64::from(self.tiles.get(&tile).map(|i| i.level).unwrap_or(0));
-                    let i = (gap + 8).clamp(0, GAP_BUCKETS as i64 - 1) as usize;
+                    let i =
+                        usize::try_from((gap + 8).clamp(0, GAP_BUCKETS as i64 - 1)).unwrap_or(0);
                     st.imagery_over_terrain[i] += 1;
                 }
             }
@@ -1205,7 +1210,7 @@ impl Budget {
             + input.need.blockers.len()
             + input.need.ancestors.len()
             + input.need.ring.len();
-        st.work = st.work.saturating_add(listed as u32);
+        st.work = st.work.saturating_add(sat_u32(listed));
         let drapes = self.drape_needs(&tiles, input.presence);
         st.floor_in = self.floor_in(&tiles);
         let mut ancestry = std::mem::take(&mut self.scratch.ancestry);
@@ -1356,7 +1361,7 @@ impl Budget {
             let cover = draw
                 .get(*r)
                 .filter(|i| i.role == Role::Fallback)
-                .map_or(0, |i| i.serves.len() as u32);
+                .map_or(0, |i| sat_u32(i.serves.len()));
             let mut sc = score(w.q, waited, self.cfg.age_full, cover);
             if urgency == Urgency::Hole && coarsening.contains(&r.tile()) {
                 // At the ceiling a coarser covering tile frees bytes: first.
@@ -1378,8 +1383,8 @@ impl Budget {
         jobs.sort_unstable_by_key(|j| j.0);
         st.work = st
             .work
-            .saturating_add(wants.len() as u32)
-            .saturating_add(jobs.len() as u32);
+            .saturating_add(sat_u32(wants.len()))
+            .saturating_add(sat_u32(jobs.len()));
         self.ranked_last.extend(jobs.iter().map(|j| j.1));
         for (k, r, _, w) in &jobs {
             if let Some(e) = self.entries.get_mut(r) {
@@ -1396,7 +1401,7 @@ impl Budget {
                 .take(self.cfg.request_heap as usize)
                 .copied(),
         );
-        st.heap_len = picked.len() as u32;
+        st.heap_len = sat_u32(picked.len());
         self.start(
             now,
             &eff,
@@ -1425,7 +1430,7 @@ impl Budget {
         // 8. The upload plan.
         d.upload_plan = self.plan(&eff, &keys, &tiles);
         // The plan scans the loads and transits for those in transit.
-        st.work = st.work.saturating_add(self.active.len() as u32);
+        st.work = st.work.saturating_add(sat_u32(self.active.len()));
 
         // 9. Eviction and release.
         if !eff.batch {
@@ -1514,7 +1519,7 @@ impl Budget {
         st.sse_scale_milli = d.sse_scale_milli;
         st.in_flight = self.in_flight;
         st.local_reads = self.local_reads;
-        st.tracked = self.entries.len() as u32;
+        st.tracked = sat_u32(self.entries.len());
         for r in &self.active {
             if let Some(e) = self.entries.get(r) {
                 if let Some(t) = e.transit {
@@ -1664,7 +1669,7 @@ impl Budget {
                         }
                         // Preempt the least urgent in-flight preload. Every
                         // load is indexed in `active` (`start`).
-                        st.work = st.work.saturating_add(self.active.len() as u32);
+                        st.work = st.work.saturating_add(sat_u32(self.active.len()));
                         let victim = self
                             .active
                             .iter()
@@ -1789,7 +1794,7 @@ impl Budget {
                 .is_none_or(|w| urgency < Urgency::Ring && w.urgency > urgency);
             (e.transit.is_none() && worth_less).then_some(e.gpu?.bytes)
         };
-        st.work = st.work.saturating_add(order.len() as u32);
+        st.work = st.work.saturating_add(sat_u32(order.len()));
         let freeable = order
             .iter()
             .filter_map(|k| victim(self, &k.3))
@@ -1829,7 +1834,7 @@ impl Budget {
         if let Some(order) = self.scratch.evict_order[class].take() {
             return order;
         }
-        st.work = st.work.saturating_add(self.entries.len() as u32);
+        st.work = st.work.saturating_add(sat_u32(self.entries.len()));
         let mut order: Vec<EvictKey> = self
             .entries
             .iter()
@@ -2114,7 +2119,7 @@ impl Budget {
         // Only a step under pressure built one: nothing kept across steps.
         self.scratch.evict_order = PerClass::default();
         if self.ledger.decoded > eff.decoded {
-            st.work = st.work.saturating_add(self.entries.len() as u32);
+            st.work = st.work.saturating_add(sat_u32(self.entries.len()));
             let mut cands: Vec<_> = self
                 .entries
                 .iter()
@@ -2182,7 +2187,7 @@ impl Budget {
             return;
         }
         let low = pct(p.target, w.low_percent);
-        st.work = st.work.saturating_add(self.entries.len() as u32);
+        st.work = st.work.saturating_add(sat_u32(self.entries.len()));
         let mut cands: Vec<_> = self
             .entries
             .iter()
@@ -2288,7 +2293,8 @@ impl Budget {
                 self.scale_fine = self.scale_fine.saturating_sub(down).max(one);
             }
         }
-        self.scale = (self.scale_fine / 1_000_000) as u32;
+        // At most `max_scale`, a u32: `scale_fine` is capped at it.
+        self.scale = u32::try_from(self.scale_fine / 1_000_000).unwrap_or(u32::MAX);
     }
 
     fn prune(
@@ -2301,7 +2307,7 @@ impl Budget {
         // Amortised: emptied entries and unreferenced tiles go every eighth
         // step, so a step does not scan all it tracks. Returns the entries
         // visited.
-        let visited = self.imagery_prev.len() as u32;
+        let visited = sat_u32(self.imagery_prev.len());
         if !self.steps.is_multiple_of(8) {
             let held = &self.held_last;
             self.imagery_prev
@@ -2309,8 +2315,8 @@ impl Budget {
             return visited;
         }
         let visited = visited
-            .saturating_add(self.entries.len() as u32)
-            .saturating_add(self.tiles.len() as u32);
+            .saturating_add(sat_u32(self.entries.len()))
+            .saturating_add(sat_u32(self.tiles.len()));
         let entries = &self.entries;
         self.active.retain(|r| {
             entries

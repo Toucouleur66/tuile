@@ -55,6 +55,9 @@ pub struct Quantised {
 
 impl Quantised {
     /// Quantises a need's floats.
+    // The float to integer casts are the quantisation itself, each clamped
+    // into its integer's range first.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn of(need: &Need) -> Self {
         let mut rejected = false;
         let mut finite = |v: f32| {
@@ -87,7 +90,9 @@ pub fn score(q: Quantised, waited: Micros, age_full: Micros, waiting_descendants
     let age = if age_full.0 == 0 {
         1000
     } else {
-        (waited.0.min(age_full.0) as u128 * 1000 / age_full.0 as u128) as i64
+        // At most 1000: `waited` is capped at `age_full`.
+        i64::try_from(u128::from(waited.0.min(age_full.0)) * 1000 / u128::from(age_full.0))
+            .unwrap_or(1000)
     };
     let cover = (i64::from(waiting_descendants) * 250).min(4000);
     sse + age + cover

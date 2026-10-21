@@ -10,6 +10,10 @@
 //! update the [`Ledger`](super::Ledger) in the same breath; `audit` checks
 //! the two never drift.
 
+// The decisions are integer arithmetic: floats stay in `imagery` and
+// `priority`, quantised once, where bit-exactness is controlled.
+#![deny(clippy::float_arithmetic)]
+
 use super::cost::Cost;
 use super::priority::{PriorityKey, Urgency};
 use super::tier::Tier;
