@@ -12,14 +12,18 @@
 //! depend on the allocator underneath, so they hold on the Linux CI as on
 //! the Mac that recorded them.
 
-use tuile_core::budget::{Budget, Micros};
+use tuile_core::budget::{
+    Budget, BudgetMeter, BudgetObserver, Micros, Pressure, StepRecord, Thermal,
+};
 
 use super::scenarios::{approach, home};
 use super::server::{DecideAllocs, Profile, Sim};
 
 /// The still view: the approach, then still until nothing churns, then 120
-/// steps measured. The worst step's internal blocks (beyond its output).
-fn still() -> (u64, u64, u32) {
+/// steps measured. The worst step's internal blocks (beyond its output),
+/// its output's, what it drew, and the worst step of a `BudgetMeter`
+/// watching it (past its first two, which fill its maps).
+fn still() -> (u64, u64, u32, u64) {
     let mut sim = Sim::new(Profile::desktop(), 7);
     sim.run(5.0, &approach);
     let stop = sim.now;
@@ -30,14 +34,34 @@ fn still() -> (u64, u64, u32) {
     );
     sim.count_output = true;
     let from = sim.decide_allocs.len();
-    for _ in 0..120 {
-        sim.step(home());
+    let mut meter = BudgetMeter::new(sim.budget.config());
+    let mut metered = Vec::new();
+    for step in 0..120u64 {
+        let (need, d) = sim.step(home());
+        let rec = StepRecord {
+            step,
+            frame: sim.frame,
+            now: sim.now,
+            views_changed: false,
+            eyes: 1,
+            need: &need,
+            events: &[],
+            presence: &[],
+            decisions: &d,
+            ledger: sim.budget.ledger(),
+            pressure: Pressure::Normal,
+            thermal: Thermal::Nominal,
+            decide_wall: None,
+        };
+        let ((), t) = super::alloc::counted(|| meter.step(&rec));
+        metered.push(t.allocs);
     }
+    let meter_worst = metered.iter().skip(2).copied().max().unwrap_or(0);
     let w = &sim.decide_allocs[from..];
     let worst = w.iter().map(DecideAllocs::internal).max().unwrap_or(0);
     let output = w.iter().map(|a| a.output).max().unwrap_or(0);
     let drawn = w.iter().map(|a| a.drawn).max().unwrap_or(0);
-    (worst, output, drawn)
+    (worst, output, drawn, meter_worst)
 }
 
 /// The soak's tour for a simulated minute: the p99 of the internal blocks
@@ -86,15 +110,16 @@ fn motion() -> (u64, i64, i64, usize) {
 fn allocation_ratchets_hold() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/budget_sim/alloc_ratchets.txt");
-    let (still_worst, still_output, still_drawn) = still();
+    let (still_worst, still_output, still_drawn, meter_worst) = still();
     let (motion_p99, scratch, per_tracked, tracked) = motion();
     eprintln!(
         "still: {still_worst} internal blocks per step at worst ({still_output} for the output, \
-         {still_drawn} drawn); tour: p99 {motion_p99} internal blocks per step, then \
+         {still_drawn} drawn), a meter watching it {meter_worst}; tour: p99 {motion_p99} internal blocks per step, then \
          {scratch} B of step buffers and {per_tracked} B per tracked resource ({tracked} tracked)"
     );
     let got = format!(
         "still-internal-allocs-per-step {still_worst}\n\
+         meter-allocs-per-still-step {meter_worst}\n\
          motion-internal-allocs-per-step-p99 {motion_p99}\n\
          scratch-bytes-after-tour {scratch}\n\
          bytes-per-tracked-resource {per_tracked}\n"
