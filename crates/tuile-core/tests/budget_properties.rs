@@ -610,13 +610,11 @@ fn a_completing_script_brings_the_floor_in() {
 /// effective target is its floor, 40 % of the pool, 622 570. The drapes hold
 /// two unprotected drapes of 349 524, 699 048 bytes: evicting one would leave
 /// 349 524, under the floor, so the sweep keeps both (`evict_pooled`: for the
-/// pool's sake, only down to its floor) and I2 breaks by less than one drape.
-/// The specification asks both — I2's unprotected bytes within the target,
-/// and §15.1's sweep with no member below its floor — and at one resource's
-/// granularity they cannot both hold here: which yields is a specification
-/// decision.
+/// pool's sake, only down to its floor) and I2 broke by less than one drape.
+/// The floor now yields to I2 (Laurent, 2026-10-21; spec §15.1): a member
+/// goes below its floor when, and only as far as, its unprotected bytes
+/// would otherwise stay over its target.
 #[test]
-#[ignore = "red: I2 against the pool floor at one resource's granularity (spec §15.1 vs I2), Laurent's decision"]
 fn only_the_protected_set_overflows_under_critical_pressure() {
     use Op::*;
     let ops = [
