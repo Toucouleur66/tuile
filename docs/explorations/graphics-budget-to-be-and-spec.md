@@ -579,6 +579,7 @@ with the invariant or obligation it proves — is `graphics-budget-test-plan.md`
 | **D5** | Open | iOS budget fractions, credit size, imagery-over-terrain cap (3 proposed). Profile values found in Phase 3, accepted 2026-10-20 for the cut-over: the desktop reads its local store 32 at a time (`max_local_reads`; at 8 a warm start converged later than a cold one, P1.3); the ground pool's floors and ceilings (D-A3) |
 | **Skirts** | Deferred | Skirts are deferred (see the header) |
 | **D-A3** | Decided 2026-10-20 | The ledger is pooled: terrain and imagery share one pool, terrain between 25 % and 60 % of it, imagery between 40 % and 75 %, one eviction sweep over both (architecture §7). The fixed per-class split goes; the pooled policy is the only one |
+| **D-A3 floor** | Decided 2026-10-21 (Laurent) | The pool's floor yields to I2: at one resource's granularity a member just above its floor, all of it unprotected, can sit over its effective target (found by `only_the_protected_set_overflows`, kept as `…_under_critical_pressure`); the sweep then takes it below its floor, only as far as I2 needs (§15.1) |
 | **D-A0…D-A8** | Decided 2026-10-19 | `graphics-budget-architecture.md` §6: one arbiter; I1 extended; imagery its own content; a pooled ledger simulated in Phase 3; per-layer drapes; the budget with `GeometryServer`, which runs where its budget's inputs are (locally on interactive devices, in a `tuile-server` session for a declared budget); side channels folded into the stream; `ViewState::from_fov` and the incremental decide for P6; the executor's `FrameDeadline` |
 | **Cut-over** | Decided 2026-10-19 | One PR, reviewed in pieces, with no bridge: no flag, no shadow, no adapter between the old protocol and the new |
 | **Deadband** | Decided 2026-10-19 | The refine deadband of #86 (`1ba0d77`, what the last pass *chose*) stays in the traversal; the budget does not re-decide the cut |
@@ -928,8 +929,9 @@ impl FrameDeadline {
   `hard_limit`: terrain 60 %, imagery 75 % of the pool's). A member's effective target is
   what the pool leaves once the other members' bytes are counted, between its floor and its
   ceiling; one eviction sweep runs over the members in the one eviction order, no member
-  below its floor, none left above its ceiling; the relaxation reads the pool's protected
-  bytes. 3D Tiles and overlays keep their own targets.
+  below its floor except to keep I2 (a member whose unprotected bytes are still over its
+  target once the pool is trimmed goes below its floor, in the same order, only until they
+  fit), none left above its ceiling; the relaxation reads the pool's protected bytes. 3D Tiles and overlays keep their own targets.
 - `BudgetStats` gains the fields the observability contract needs (§16): `bare`, the
   per-class split of drawable and in-transit bytes, the work counter.
 - `FrameDeadline` is in the core so that every executor — the wgpu pump, the web page, the
