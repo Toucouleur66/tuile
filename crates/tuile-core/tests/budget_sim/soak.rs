@@ -154,9 +154,11 @@ fn five_simulated_minutes_keep_flat_latency_and_bounded_state() {
     soak(5);
 }
 
-/// I6, I7: one simulated hour, flat slopes (nightly, in release).
+/// I6, I7: one simulated hour, flat slopes, in release. Kept out of CI's
+/// release job for its time: 12.6 min on an M-series Mac (passed
+/// 2026-10-21). No scheduled workflow runs it yet; it is run by hand.
 #[test]
-#[ignore = "nightly: one simulated hour, run with --release"]
+#[ignore = "13 min in release: by hand, cargo test --release -p tuile-core --test budget_sim -- --ignored one_simulated_hour (no nightly job yet)"]
 fn one_simulated_hour_keeps_flat_latency_and_bounded_state() {
     soak(60);
 }

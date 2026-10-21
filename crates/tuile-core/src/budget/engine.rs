@@ -2164,7 +2164,7 @@ impl Budget {
 
     /// D-A3: one sweep over the pool's members, in the one eviction order,
     /// down to the low watermark of the pool's target, no member below its
-    /// floor, none left above its ceiling.
+    /// floor except to keep I2, none left above its ceiling.
     fn evict_pooled(&mut self, now: Micros, p: PoolEff, d: &mut Decisions, st: &mut BudgetStats) {
         let w = self.cfg.watermarks;
         let used = |l: &Ledger| {
@@ -2187,6 +2187,14 @@ impl Budget {
             return;
         }
         let low = pct(p.target, w.low_percent);
+        // I2 (Laurent, 2026-10-21): what is not protected fits in the
+        // member's target. The sweep evicts only unprotected residents, so
+        // the protected bytes do not move while it runs; the target does, as
+        // the other members shrink.
+        let protected = self.protected_bytes();
+        let short = |l: &Ledger, c: Class| {
+            p.members[c] && l.gpu[c].minus(protected[c]) > p.target(c, &l.gpu)
+        };
         st.work = st.work.saturating_add(sat_u32(self.entries.len()));
         let mut cands: Vec<_> = self
             .entries
@@ -2208,7 +2216,7 @@ impl Budget {
             })
             .collect();
         cands.sort_unstable();
-        for (_, r, class, bytes) in cands {
+        for &(_, r, class, bytes) in &cands {
             for c in Class::ALL {
                 over[c] &= self.ledger.gpu[c] > ceiling_low(c);
             }
@@ -2220,21 +2228,45 @@ impl Budget {
             // its floor.
             let goes =
                 over[class] || (pool_trim && self.ledger.gpu[class].minus(bytes) >= floor(class));
-            if !goes {
-                continue;
+            if goes {
+                self.evict_one(now, r, class, d, st);
             }
-            if let Some(e) = self.entries.get_mut(&r) {
-                e.take_gpu(&mut self.ledger);
-                d.evict.push(r);
-                st.evicted += 1;
-                let why = if self.pressure == Pressure::Normal {
-                    EvictReason::Sweep
-                } else {
-                    EvictReason::Pressure
-                };
-                st.evictions[class][why as usize] += 1;
-                self.recent.insert(r, now);
+        }
+        // The floor yields to I2 (Laurent, 2026-10-21), and only as far as
+        // I2 needs: a member whose unprotected bytes are still over its
+        // target once the pool is trimmed goes below its floor, in the same
+        // order, until they fit.
+        for &(_, r, class, _) in &cands {
+            if Class::ALL.iter().all(|c| !short(&self.ledger, *c)) {
+                break;
             }
+            let resident = self.entries.get(&r).is_some_and(|e| e.gpu.is_some());
+            if resident && short(&self.ledger, class) {
+                self.evict_one(now, r, class, d, st);
+            }
+        }
+    }
+
+    /// Evicts `r`, of `class`, from the GPU, and counts it.
+    fn evict_one(
+        &mut self,
+        now: Micros,
+        r: ResourceId,
+        class: Class,
+        d: &mut Decisions,
+        st: &mut BudgetStats,
+    ) {
+        if let Some(e) = self.entries.get_mut(&r) {
+            e.take_gpu(&mut self.ledger);
+            d.evict.push(r);
+            st.evicted += 1;
+            let why = if self.pressure == Pressure::Normal {
+                EvictReason::Sweep
+            } else {
+                EvictReason::Pressure
+            };
+            st.evictions[class][why as usize] += 1;
+            self.recent.insert(r, now);
         }
     }
 
