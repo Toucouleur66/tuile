@@ -150,6 +150,9 @@ pub(super) struct Scratch {
     wants: Vec<(ResourceId, Want)>,
     keys: Vec<(ResourceId, PriorityKey)>,
     ancestry: Vec<(TileId, TileId, u32)>,
+    jobs: Vec<(PriorityKey, ResourceId, Job, Want)>,
+    /// The loads, then the deliveries, picked from `jobs`.
+    picked: Vec<(PriorityKey, ResourceId, Job, Want)>,
 }
 
 /// The meshes standing for the wanted tiles, before their drapes.
@@ -341,8 +344,10 @@ impl Budget {
     // 1. Arrivals.
     pub(super) fn apply_events(&mut self, now: Micros, st: &mut BudgetStats) {
         let mut events = std::mem::take(&mut self.events);
-        events.sort();
-        for ev in events {
+        // Events are compared whole: equal ones are identical, and an
+        // unstable sort orders them as a stable one would.
+        events.sort_unstable();
+        for &ev in &events {
             match ev {
                 Event::Loaded(r, g, cost) => {
                     let Some(e) = self.entries.get_mut(&r) else {
@@ -479,6 +484,8 @@ impl Budget {
                 }
             }
         }
+        events.clear();
+        self.events = events;
     }
 
     // 2. The need.
@@ -936,7 +943,8 @@ impl Budget {
                         chosen.push(*old);
                     }
                 }
-                chosen.sort_by_key(|d| d.layer);
+                // One drape per layer: an unstable sort is the stable one.
+                chosen.sort_unstable_by_key(|d| d.layer);
             }
             // Bare: a layer the tiles need is worn by no drape, and no old
             // layer stands in for it during a switch.
@@ -1149,17 +1157,24 @@ impl Budget {
         let mut st = std::mem::take(&mut self.pending);
         let mut d = Decisions::default();
         let eff = self.eff();
-        for r in std::mem::take(&mut self.ranked_last) {
-            if let Some(e) = self.entries.get_mut(&r) {
+        let mut ranked = std::mem::take(&mut self.ranked_last);
+        for r in &ranked {
+            if let Some(e) = self.entries.get_mut(r) {
                 e.urgency = None;
                 e.priority = None;
             }
         }
+        ranked.clear();
+        self.ranked_last = ranked;
         self.steps += 1;
 
         self.apply_events(now, &mut st);
         let tiles = self.read_need(&input, &mut st);
-        st.work = st.work.saturating_add(input.need.entries().count() as u32);
+        let listed = input.need.drawn.len()
+            + input.need.blockers.len()
+            + input.need.ancestors.len()
+            + input.need.ring.len();
+        st.work = st.work.saturating_add(listed as u32);
         let drapes = self.drape_needs(&tiles, input.presence);
         st.floor_in = self.floor_in(&tiles);
         let mut ancestry = std::mem::take(&mut self.scratch.ancestry);
@@ -1282,7 +1297,8 @@ impl Budget {
         // Wants come in order: so do their keys.
         let mut keys = std::mem::take(&mut self.scratch.keys);
         keys.clear();
-        let mut jobs: Vec<(PriorityKey, ResourceId, Job, Want)> = Vec::new();
+        let mut jobs = std::mem::take(&mut self.scratch.jobs);
+        jobs.clear();
         for (r, w) in &wants {
             let class = self.class_of(*r, w.class);
             let epoch = self.epoch(*r, class);
@@ -1327,12 +1343,13 @@ impl Budget {
             }
         }
         let keys = SortedMap::from_sorted(keys);
-        jobs.sort_by_key(|j| j.0);
+        // Keys end in the resource: total, so unstable is stable.
+        jobs.sort_unstable_by_key(|j| j.0);
         st.work = st
             .work
             .saturating_add(wants.len() as u32)
             .saturating_add(jobs.len() as u32);
-        self.ranked_last = jobs.iter().map(|j| j.1).collect();
+        self.ranked_last.extend(jobs.iter().map(|j| j.1));
         for (k, r, _, w) in &jobs {
             if let Some(e) = self.entries.get_mut(r) {
                 e.urgency = Some(w.urgency);
@@ -1340,17 +1357,19 @@ impl Budget {
             }
         }
 
-        let loads: Vec<_> = jobs
-            .iter()
-            .filter(|j| j.2 == Job::Load)
-            .take(self.cfg.request_heap as usize)
-            .copied()
-            .collect();
-        st.heap_len = loads.len() as u32;
+        let mut picked = std::mem::take(&mut self.scratch.picked);
+        picked.clear();
+        picked.extend(
+            jobs.iter()
+                .filter(|j| j.2 == Job::Load)
+                .take(self.cfg.request_heap as usize)
+                .copied(),
+        );
+        st.heap_len = picked.len() as u32;
         self.start(
             now,
             &eff,
-            &loads,
+            &picked,
             &keys,
             &wants,
             input.presence,
@@ -1359,15 +1378,12 @@ impl Budget {
         );
 
         // 7. Deliveries.
-        let delivers: Vec<_> = jobs
-            .iter()
-            .filter(|j| j.2 == Job::Deliver)
-            .copied()
-            .collect();
+        picked.clear();
+        picked.extend(jobs.iter().filter(|j| j.2 == Job::Deliver).copied());
         let (blocked, strained) = self.deliver(
             now,
             &eff,
-            &delivers,
+            &picked,
             &tiles,
             &coarsening,
             &wants,
@@ -1444,6 +1460,10 @@ impl Budget {
         self.scratch.drapes = drapes.into_buffer();
         self.scratch.wants = wants.into_buffer();
         self.scratch.keys = keys.into_buffer();
+        jobs.clear();
+        self.scratch.jobs = jobs;
+        picked.clear();
+        self.scratch.picked = picked;
 
         // Statistics.
         st.gpu = self.ledger.gpu;
@@ -1755,7 +1775,8 @@ impl Budget {
                 )
             })
             .collect();
-        victims.sort();
+        // Keys end in the resource: total, so unstable is stable.
+        victims.sort_unstable();
         let freeable = victims.iter().fold(Bytes::ZERO, |a, v| a.plus(v.2));
         if self.ledger.gpu[class].minus(freeable).plus(bytes) > limit {
             *strained = true;
@@ -1962,7 +1983,7 @@ impl Budget {
                 (k, r, b)
             })
             .collect();
-        transit.sort();
+        transit.sort_unstable();
         let _ = drapes;
         let mut taken: BTreeSet<ResourceId> = BTreeSet::new();
         let mut plan = UploadPlan::default();
@@ -2006,7 +2027,7 @@ impl Budget {
             plan.bytes = plan.bytes.plus(bytes);
             if members.len() > 1 {
                 let mut sorted = members.clone();
-                sorted.sort();
+                sorted.sort_unstable();
                 plan.groups.push(SwapGroup { members: sorted });
             }
         }
@@ -2046,7 +2067,7 @@ impl Budget {
                     )
                 })
                 .collect();
-            cands.sort();
+            cands.sort_unstable();
             for (_, r) in cands {
                 if self.ledger.gpu[class] <= low {
                     break;
@@ -2094,7 +2115,7 @@ impl Budget {
                     )
                 })
                 .collect();
-            cands.sort();
+            cands.sort_unstable();
             for (_, r) in cands {
                 if self.ledger.decoded <= eff.decoded {
                     break;
@@ -2154,7 +2175,7 @@ impl Budget {
                 )
             })
             .collect();
-        cands.sort();
+        cands.sort_unstable();
         for (_, r, class, bytes) in cands {
             for c in Class::ALL {
                 over[c] &= self.ledger.gpu[c] > ceiling_low(c);
@@ -2339,7 +2360,7 @@ impl Budget {
                 )
             })
             .collect();
-        cands.sort();
+        cands.sort_unstable();
         let mut out = super::Released::default();
         for (_, r) in cands {
             if total(&self.ledger) <= target && self.ledger.decoded <= target {

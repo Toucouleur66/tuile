@@ -1,4 +1,4 @@
 still-internal-allocs-per-step 172
-motion-internal-allocs-per-step-p99 332
-scratch-bytes-after-tour 319616
-bytes-per-tracked-resource 554
+motion-internal-allocs-per-step-p99 327
+scratch-bytes-after-tour 381056
+bytes-per-tracked-resource 559
