@@ -3,7 +3,9 @@
 
 # GPU-compressed imagery stored in PMTiles — an impact study
 
-Status: study, 24 Oct. 2026. Nothing here is decided and no code changed.
+Status: study, 24 Oct. 2026. Amended the same day with Laurent's decisions
+on who chooses compression and on licences (see *Decided, 24 Oct.* below);
+the rest is still a study.
 The question: *the tile store must be able to serve GPU-compressed textures
 from its PMTiles archives. What does that change in the bake and the file
 preparation, and in rendering, if the downstream film product moves onto it?*
@@ -42,10 +44,32 @@ not measurements.
     to BC7 on the L4. That is independent of how tiles are stored.
 - **Recommendation:**
   - build the capability generically in tuile: a *prepared imagery* layer
-    (KTX2, UASTC, full mips, geographic spacing) made by a bake step, and a
-    fourth way to fill a tile on the client, transcode only;
+    (KTX2, UASTC, full mips, geographic spacing) made by a preparation step
+    outside tuile-bake, and a fourth way to fill a tile on the client,
+    transcode only, used only when the client opts in;
   - give it first to open or generated imagery served to the viewer;
   - leave the film product on JPEG until the licence decision.
+
+## Decided, 24 Oct. 2026 (Laurent)
+
+These replace the licence rule this study first recommended (§4, §6 item 4,
+B1):
+
+- **The compression mode is chosen by tuile's client, never by tuile.** A
+  client passes its choice (off, automatic, or a named format); tuile turns
+  that choice and the device's capabilities into a plan, and never picks
+  compression on its own.
+- **Off by default.** A client that says nothing gets RGBA8, and every
+  existing output (bake digests, film goldens, budget goldens) is unchanged.
+- **No licence rule anywhere in tuile.** tuile guarantees nothing about what
+  a client may store or serve compressed; that is the client's call and the
+  client's responsibility. No catalog field is read for it, no step refuses
+  on it.
+- **No compression in tuile-bake.** The bake neither encodes nor prepares
+  compressed layers. Preparing a KTX2/UASTC layer, if anyone does it, is a
+  client's tool outside tuile-bake.
+- **Compression is exercised in the interactive viewers** (tuile-viewer on
+  macOS, iOS, Android and the web), where the client opts in.
 
 ## 1. What to store
 
@@ -423,9 +447,12 @@ The memos are explicit:
   commercial use.
 - PR #63 §4 reaches the same verdict for any pixel re-encoding.
 
-**In code.** The preparation step derives a layer only from a source layer
-whose catalog `licence` allows derivatives. It reads that from the data and
-refuses otherwise. This is a data rule, not a flag.
+**In code — superseded on 24 Oct. 2026.** This study first recommended
+that the preparation read a catalog `licence` field and refuse a derivative
+of a source that does not allow one. Laurent decided otherwise: tuile has no
+licence rule and guarantees nothing. Whether a layer may be stored or served
+compressed is the decision of the client that chooses compression, and the
+table above is that client's homework, not tuile's.
 
 ## 5. One path
 
@@ -462,8 +489,9 @@ So the honest answer:
    on the client.
 3. The film product stays on JPEG. The film's VRAM lever is a BC7 encode of
    composed drapes on the L4, a separate item.
-4. No commercial imagery is prepared until its terms are reopened. The
-   preparation enforces that from the catalog.
+4. The client chooses compression; tuile does not. Off by default, no
+   licence rule in tuile, nothing compressed in tuile-bake. What a client
+   prepares and serves, and under which terms, is its own decision.
 5. Raw UASTC first. Zstd comes after the readers honour `tile_compression`;
    RDO only if a consumer's wire budget demands it.
 
@@ -475,7 +503,7 @@ So the honest answer:
 | K1 | texcomp | KTX2 read/write for UASTC with mips: header, level index, data format descriptor. Pure Rust, wasm-clean, tests against files written by the upstream tool | S | |
 | R1 | tuile | readers honour each archive's `tile_compression`: `tuile-repository` and `TileStore::get` (PR #63 §5, "readers first") | S–M | |
 | T1 | tuile | **Stored fill**: `ImageryDecode` takes KTX2 by `content_type` and returns `Texels::Blocks` (transcode) or `Rgba8` (unpack); tests for never-black, corrupt tiles and the budget | M | S1, C1's wire, K1 |
-| B1 | tuile | **Preparation step** in tuile-bake: source layer → prepared layer, in the order of §2.1. Licence rule from the catalog, cross-arch byte-identical test, CPU time per tile measured and recorded in this note | M–L | 3c, K1 |
+| B1 | client | **Preparation step**, a client's tool and **not** tuile-bake: source layer → prepared layer, in the order of §2.1. No licence rule in tuile (decided 24 Oct.). Cross-arch byte-identical test, CPU time per tile measured and recorded in this note | M–L | 3c, K1 |
 | V1 | tuile | viewer: an imagery template or store layer that serves `.ktx2`, the P1a test server included. Measured on the reference phone: wire bytes, ms per tile, memory, against P0's encode-at-load | M | T1, B1 |
 | F1 | tuile | film: `imagery_texture` dispatches on `content_type` (unpack, option A), with new goldens from a prepared NASA fixture | S–M | K1, B1 |
 | F2 | tuile | film: BC7 encode of composed drapes on the L4, VRAM and goldens measured. Independent of everything above | M | P0's texcomp tag |
@@ -505,8 +533,9 @@ So the honest answer:
 
 1. **What is it for?** Client CPU and WebGL2, on the viewer, or film VRAM?
    The answer picks V1 or F2 first.
-2. **Commercial imagery.** Reopen its terms now, or keep it out of any
-   prepared layer, so that the film product stays on JPEG?
+2. ~~**Commercial imagery.**~~ Decided 24 Oct.: the client chooses
+   compression, off by default; tuile has no licence rule and guarantees
+   nothing.
 3. **Container.** KTX2 (recommended) or a minimal header of our own?
 4. **RDO and Zstd.** Leave them out of texcomp's scope until V1 measures the
    wire (recommended), or plan them now?
