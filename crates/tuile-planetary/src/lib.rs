@@ -102,6 +102,24 @@ type MeshFuture<'a> = std::pin::Pin<
 /// does when a tile's own imagery has not arrived — it walks up to the closest
 /// ready ancestor rather than to a level chosen in advance.
 impl GlobeOptions {
+    /// These options with the consumer's imagery compression: one choice,
+    /// resolved against its own device into both
+    /// [`imagery_plan`](Self::imagery_plan) (JPEG/PNG tiles, encoded at load)
+    /// and [`stored_imagery`](Self::stored_imagery) (tiles stored already
+    /// compressed, transcoded only), so the two cannot disagree.
+    ///
+    /// Not calling it is [`ImageryCompression::Off`](tuile_core::texels::ImageryCompression::Off):
+    /// RGBA8 everywhere.
+    pub fn with_imagery_compression(
+        mut self,
+        choice: tuile_core::texels::ImageryCompression,
+        caps: tuile_core::texels::GpuTextureCaps,
+    ) -> Self {
+        self.imagery_plan = choice.plan(caps);
+        self.stored_imagery = choice.stored(caps);
+        self
+    }
+
     /// Which coarse tile goes under a drape.
     ///
     /// The choice lives here, on the options, rather than inline at the one
@@ -1749,6 +1767,30 @@ mod tests {
             GlobeOptions::default().stored_imagery,
             tuile_core::texels::StoredPlan::OFF
         );
+    }
+
+    /// One client choice sets both plans, from the same device; Off leaves
+    /// the defaults.
+    #[test]
+    fn one_choice_sets_both_imagery_plans() {
+        use tuile_core::texels::{GpuTextureCaps, ImageryCompression};
+        let caps = GpuTextureCaps {
+            bc: true,
+            astc: false,
+            compute: false,
+        };
+        for choice in [
+            ImageryCompression::Off,
+            ImageryCompression::Auto,
+            ImageryCompression::Format(tuile_core::texels::BlockFormat::Bc7),
+        ] {
+            let o = GlobeOptions::default().with_imagery_compression(choice, caps);
+            assert_eq!(o.imagery_plan, choice.plan(caps), "{choice:?}");
+            assert_eq!(o.stored_imagery, choice.stored(caps), "{choice:?}");
+        }
+        let off = GlobeOptions::default().with_imagery_compression(ImageryCompression::Off, caps);
+        assert_eq!(off.imagery_plan, GlobeOptions::default().imagery_plan);
+        assert_eq!(off.stored_imagery, GlobeOptions::default().stored_imagery);
     }
 
     /// An imagery provider that refuses everything and counts being asked.
