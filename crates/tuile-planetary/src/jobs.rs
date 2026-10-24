@@ -30,7 +30,9 @@ use bytes::Bytes;
 use tuile_core::content::DecodedTexture;
 use tuile_core::offload::{self, Portable};
 use tuile_core::raster::{self, ImageryCoord, Projection, TilingScheme};
-use tuile_core::texels::{BlockFormat, ImageryFormat, StoredPlan, Texels};
+use tuile_core::texels::{
+    BlockFormat, ImageryEncode, ImageryFormat, ImageryPlan, StoredPlan, Texels,
+};
 use tuile_terrain::{AvailabilityRange, Header, QuantizedMesh};
 
 /// Runs the job of this kind from its bytes: the whole registry a decode
@@ -57,6 +59,13 @@ pub struct ImageryDecode {
     /// choice, [`StoredPlan::OFF`] unless it opted in. A JPEG or PNG ignores
     /// it.
     pub stored: StoredPlan,
+    /// How the consumer holds a JPEG or PNG tile: its own choice,
+    /// [`ImageryPlan::RGBA8`] unless it opted in. Under
+    /// [`ImageryEncode::Cpu`] the job encodes the tile into the plan's block
+    /// format here, mip chain included, and the blocks cross instead of the
+    /// RGBA8 ([`tuile_core::texels::encode_on_cpu`]); a tile it cannot encode
+    /// crosses as RGBA8. Every other plan leaves the RGBA8 as it is.
+    pub plan: ImageryPlan,
 }
 
 /// The texture, and whether it is entirely opaque black — a provider's way
@@ -64,9 +73,9 @@ pub struct ImageryDecode {
 /// in its words.
 pub type ImageryDecoded = Result<(DecodedTexture, bool), String>;
 
-/// The scheme, the coord and the stored plan, after the image: 29 + 20 + 3
-/// bytes.
-const IMAGERY_TRAILER: usize = 1 + 8 + 8 + 4 + 4 + 4 + 4 + 8 + 8 + 3;
+/// The scheme, the coord, the stored plan and the plan, after the image:
+/// 29 + 20 + 3 + 2 bytes.
+const IMAGERY_TRAILER: usize = 1 + 8 + 8 + 4 + 4 + 4 + 4 + 8 + 8 + 3 + 2;
 
 /// The form of an imagery answer's texels, before its outcome byte.
 const FORM_RGBA8: u8 = 0;
@@ -82,6 +91,25 @@ fn format_tag(f: ImageryFormat) -> u8 {
         ImageryFormat::Rgba8 => FORM_RGBA8,
         ImageryFormat::Bc7 => FORM_BC7,
         ImageryFormat::Astc4x4 => FORM_ASTC,
+    }
+}
+
+fn encode_tag(e: ImageryEncode) -> u8 {
+    match e {
+        ImageryEncode::None => 0,
+        ImageryEncode::Gpu => 1,
+        ImageryEncode::Cpu => 2,
+        ImageryEncode::Transcode => 3,
+    }
+}
+
+fn tag_encode(tag: u8) -> Result<ImageryEncode, String> {
+    match tag {
+        0 => Ok(ImageryEncode::None),
+        1 => Ok(ImageryEncode::Gpu),
+        2 => Ok(ImageryEncode::Cpu),
+        3 => Ok(ImageryEncode::Transcode),
+        other => Err(format!("no encoder is numbered {other}")),
     }
 }
 
@@ -101,8 +129,9 @@ impl Portable for ImageryDecode {
     fn run(self) -> ImageryDecoded {
         let tex = raster::decode_imagery(&self.bytes, &self.scheme, self.coord, self.stored)
             .map_err(|e| e.to_string())?;
+        // Black is named on the decoded texels, before any encode.
         let black = crate::is_opaque_black(&tex);
-        Ok((tex, black))
+        Ok((encoded_on_cpu(tex, self.plan), black))
     }
 
     /// The image first and the numbers after, so the far side reads them off
@@ -126,6 +155,8 @@ impl Portable for ImageryDecode {
         out.push(format_tag(self.stored.uastc));
         out.push(u8::from(self.stored.keep_bc7));
         out.push(u8::from(self.stored.keep_astc));
+        out.push(format_tag(self.plan.target));
+        out.push(encode_tag(self.plan.encode));
         out
     }
 
@@ -158,12 +189,17 @@ impl Portable for ImageryDecode {
             keep_bc7: r.u8()? != 0,
             keep_astc: r.u8()? != 0,
         };
+        let plan = ImageryPlan {
+            target: tag_format(r.u8()?)?,
+            encode: tag_encode(r.u8()?)?,
+        };
         bytes.truncate(start);
         Ok(Self {
             bytes: Bytes::from(bytes),
             scheme,
             coord,
             stored,
+            plan,
         })
     }
 
@@ -253,6 +289,34 @@ impl Portable for ImageryDecode {
             },
             black,
         )))
+    }
+}
+
+/// `tex` as `plan` sends it: encoded into the plan's block format when the
+/// plan encodes on the CPU and the texture is RGBA8, as it is otherwise. An
+/// encode that cannot be done sends the RGBA8 — the ground is never left
+/// without its texture.
+fn encoded_on_cpu(tex: DecodedTexture, plan: ImageryPlan) -> DecodedTexture {
+    let (ImageryEncode::Cpu, Some(format)) = (plan.encode, plan.target.block()) else {
+        return tex;
+    };
+    if tex.rgba8().is_none() {
+        return tex;
+    }
+    match tuile_core::texels::encode_on_cpu(&tex, format) {
+        Ok(texels) => DecodedTexture {
+            width: tex.width,
+            height: tex.height,
+            texels,
+        },
+        Err(why) => {
+            tracing::debug!(
+                width = tex.width,
+                height = tex.height,
+                "imagery sent as RGBA8, not encoded on the CPU: {why}"
+            );
+            tex
+        }
     }
 }
 
@@ -539,6 +603,7 @@ mod tests {
                 y: 2,
             },
             stored: StoredPlan::OFF,
+            plan: ImageryPlan::RGBA8,
         }
     }
 
@@ -562,7 +627,12 @@ mod tests {
             keep_bc7: false,
             keep_astc: true,
         };
+        job.plan = ImageryPlan {
+            target: ImageryFormat::Bc7,
+            encode: ImageryEncode::Cpu,
+        };
         let back = ImageryDecode::decode(job.encode()).expect("decode");
+        assert_eq!(back.plan, job.plan);
         assert_eq!(back.bytes, job.bytes);
         assert_eq!(back.scheme, job.scheme);
         assert_eq!(back.coord, job.coord);
@@ -699,6 +769,81 @@ mod tests {
         assert_eq!(there.0.resident_format(), ImageryFormat::Rgba8);
         assert_eq!(there.0.rgba8().map(<[u8]>::len), Some(64 * 64 * 4));
         assert_eq!(there.0.texels, here.0.texels);
+    }
+
+    /// A client whose plan encodes on the CPU (WebGL2): the decode worker
+    /// sends the tile as blocks of the plan's format, its whole chain built
+    /// there, and they cross the wire byte for byte. Black is still named on
+    /// the decoded pixels. Any other plan leaves the RGBA8 as it was.
+    #[test]
+    fn a_cpu_planned_tile_crosses_as_its_blocks() {
+        for format in [BlockFormat::Astc4x4, BlockFormat::Bc7] {
+            let job = ImageryDecode {
+                plan: ImageryPlan {
+                    target: format.into(),
+                    encode: ImageryEncode::Cpu,
+                },
+                ..geographic_job()
+            };
+            let rgba = geographic_job().run().expect("decodes").0;
+            let here = job.clone().run().expect("encodes");
+            let there = ImageryDecode::decode_output(
+                serve(ImageryDecode::KIND, job.encode()).expect("served"),
+            )
+            .expect("readable")
+            .expect("encodes");
+            assert_eq!(there.0.texels, here.0.texels, "{format:?}");
+            assert_eq!(
+                there.0.texels,
+                tuile_core::texels::encode_on_cpu(&rgba, format).expect("blocks"),
+                "{format:?}"
+            );
+            let Texels::Blocks { levels, .. } = &there.0.texels else {
+                panic!("{format:?}: blocks expected");
+            };
+            assert_eq!(levels.len(), 4, "8×4 down to 1×1");
+            assert_eq!(there.0.resident_format(), format.into());
+            assert!(there.0.cost().gpu < rgba.cost().gpu);
+        }
+        for plan in [
+            ImageryPlan::RGBA8,
+            ImageryPlan {
+                target: ImageryFormat::Bc7,
+                encode: ImageryEncode::Gpu,
+            },
+        ] {
+            let tex = ImageryDecode {
+                plan,
+                ..geographic_job()
+            }
+            .run()
+            .expect("decodes")
+            .0;
+            assert!(tex.rgba8().is_some(), "{plan:?}: RGBA8 crosses");
+        }
+    }
+
+    /// A tile the CPU path cannot encode — not whole blocks — crosses as
+    /// RGBA8: never a hole.
+    #[test]
+    fn a_tile_the_cpu_cannot_encode_crosses_as_rgba8() {
+        let img = image::RgbaImage::from_pixel(6, 3, image::Rgba([40, 80, 120, 255]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut png, image::ImageFormat::Png)
+            .expect("encode");
+        let job = ImageryDecode {
+            bytes: Bytes::from(png.into_inner()),
+            plan: ImageryPlan {
+                target: ImageryFormat::Astc4x4,
+                encode: ImageryEncode::Cpu,
+            },
+            ..geographic_job()
+        };
+        let there =
+            ImageryDecode::decode_output(serve(ImageryDecode::KIND, job.encode()).expect("served"))
+                .expect("readable")
+                .expect("decodes");
+        assert_eq!(there.0.rgba8().map(<[u8]>::len), Some(6 * 3 * 4));
     }
 
     /// A corrupt KTX 2.0 tile is the decoder's error on both sides — a failed

@@ -865,6 +865,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                     scheme,
                     coord: c,
                     stored: self.opts.stored_imagery,
+                    plan: self.opts.imagery_plan.get(),
                 };
                 let (tex, black) = offload::run_portable(off.as_ref(), job)
                     .await

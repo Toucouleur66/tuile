@@ -10,12 +10,16 @@
 // named by address, with no catalog at all (see examples/heightfield-serve):
 //   ?terrain=…/layer.json&imagery=…/{z}/{x}/{y}.png&scheme=geographic&maxLevel=15
 //   &lon=…&lat=…&altitude=…[&heading=…&pitch=…]
+//
+// `?compression=auto` (or `bc7`, `astc`; `off` by default) holds the imagery
+// block-compressed: see the package's `imageryCompression`.
 
 import { createViewer, UnsupportedError } from "../../packages/tuile-viewer/index.js";
 
 const PHOTOGRAPHY = "© Microsoft and its data suppliers";
 const params = new URLSearchParams(location.search);
 const backend = params.get("backend") ?? "auto";
+const imageryCompression = params.get("compression") ?? "off";
 
 /** The sources by address the query names, or none. */
 function addressed() {
@@ -53,6 +57,7 @@ try {
   globalThis.viewer = await createViewer(document.querySelector("#globe"), {
     name: "Tuile",
     backend,
+    imageryCompression,
     view: view(),
     sources: addressed() ?? {
       catalog: { url: "/catalog/" },

@@ -83,6 +83,7 @@ is a canvas. It resolves once the viewer draws.
 | `showUnsupportedMessage` | Whether a viewer that cannot draw says so in the container (`true` by default). |
 | `rememberView` | Whether a viewer created without `view` opens where the last one was left, kept in the site's local storage (`true` by default). |
 | `decodeWorkers` | The most Web Workers that decode imagery and terrain beside the geometry server's: one per core less one, up to this (`4` by default). `0` decodes on the geometry server's own worker. They exchange transferred buffers: no `SharedArrayBuffer`, so no cross-origin isolation headers are needed. |
+| `imageryCompression` | How imagery is held on the GPU: `"off"` (the default: RGBA8), `"auto"`, `"bc7"` or `"astc"`. Compressed imagery takes a quarter of the memory. `"auto"` picks the best format the page's device samples: under WebGPU, BC7 or ASTC 4×4 encoded on the GPU; under WebGL2, which has no compute, ASTC 4×4 (phones) or BC7 (desktops) encoded in the decode workers. A device that holds neither stays RGBA8, and a tile that cannot be encoded is held as RGBA8, never left out. The caption says what is held: `imagery ASTC 4x4 23 MiB (276 × 85 KiB)`. |
 
 ## The viewer
 

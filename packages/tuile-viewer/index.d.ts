@@ -91,6 +91,16 @@ export interface ViewerOptions {
    * decodes on the geometry server's own worker. `4` unless said.
    */
   decodeWorkers?: number;
+  /**
+   * How imagery is held on the GPU. `"off"` unless said: RGBA8, as always.
+   * `"auto"` holds it block-compressed — a quarter of the memory — in the
+   * best format the page's own device samples: BC7 or ASTC 4×4 encoded on the
+   * GPU under WebGPU, ASTC 4×4 (phones) or BC7 (desktops) encoded in the
+   * decode workers under WebGL2, which has no compute. `"bc7"` and `"astc"`
+   * name the format. A device that can hold none of them stays RGBA8; a tile
+   * that cannot be encoded is held as RGBA8, never left out.
+   */
+  imageryCompression?: "off" | "auto" | "bc7" | "astc";
 }
 
 export interface ViewerEvents {

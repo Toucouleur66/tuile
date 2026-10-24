@@ -106,6 +106,7 @@ export async function createViewer(container, options) {
     showUnsupportedMessage: o.showUnsupportedMessage ?? true,
     rememberView: o.rememberView ?? true,
     decodeWorkers: o.decodeWorkers,
+    imageryCompression: o.imageryCompression ?? "off",
   };
 
   const listeners = new Map(EVENTS.map((kind) => [kind, new Set()]));

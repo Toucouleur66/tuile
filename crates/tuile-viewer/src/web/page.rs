@@ -157,7 +157,10 @@ fn start_viewer_with(
         profile: options.profile,
         device_memory: options.device_memory,
         decode_workers: options.decode_workers,
+        compression: options.imagery_compression,
     });
+    // A new viewer, whose device has not yet said how it holds imagery.
+    super::imagery::begin();
     let launch = session::start(&plan);
     let retries = Retries::new(move || session::start(&plan));
     let config = ViewerConfig {
@@ -183,9 +186,9 @@ fn start_viewer_with(
             .with_prevent_default(true),
         controls: options.ui,
         backends: Some(options.backend.backends()),
-        // The page's loader runs in its worker, which does not take a plan
-        // yet: its imagery is RGBA8.
-        imagery_compression: tuile_wgpu::ImageryCompression::Off,
+        // The host's choice: resolved against the page's adapter when its
+        // device comes up, and passed to the worker in its start message.
+        imagery_compression: options.imagery_compression,
     };
     let app = App::new(config, launch);
     let id = CURRENT.with(|c| c.get()) + 1;

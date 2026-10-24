@@ -182,10 +182,14 @@ impl ImageryCompression {
         let (target, encode) = match self {
             ImageryCompression::Off => return ImageryPlan::RGBA8,
             ImageryCompression::Auto => return select(caps),
-            // BC7 has a GPU encoder only.
-            ImageryCompression::Format(BlockFormat::Bc7) if caps.bc && caps.compute => {
-                (ImageryFormat::Bc7, ImageryEncode::Gpu)
-            }
+            ImageryCompression::Format(BlockFormat::Bc7) if caps.bc => (
+                ImageryFormat::Bc7,
+                if caps.compute {
+                    ImageryEncode::Gpu
+                } else {
+                    ImageryEncode::Cpu
+                },
+            ),
             ImageryCompression::Format(BlockFormat::Astc4x4) if caps.astc => (
                 ImageryFormat::Astc4x4,
                 if caps.compute {
@@ -312,9 +316,12 @@ impl StoredPlan {
 /// 2. compute and ASTC: ASTC 4×4, encoded on the GPU;
 /// 3. ASTC without compute (WebGL2 on a phone): ASTC 4×4, encoded on the CPU
 ///    in the decode worker;
-/// 4. anything else: RGBA8. BC without compute (WebGL2 on a desktop) lands
-///    here too: the CPU encoder writes ASTC only for now, and a BC7 one is
-///    deferred until a desktop WebGL2 consumer needs it.
+/// 4. BC without ASTC or compute (WebGL2 on a desktop): BC7, encoded on the
+///    CPU in the decode worker — UASTC, transcoded;
+/// 5. anything else: RGBA8.
+///
+/// Without compute, ASTC comes before BC7: the CPU path encodes UASTC, which
+/// transcodes to ASTC 4×4 losslessly and to BC7 within a small loss.
 ///
 /// BC7 comes before ASTC where an adapter has both — Apple silicon on macOS,
 /// and desktop WebGPU on Apple. Both hold 8 bits per texel, so memory does not
@@ -327,6 +334,7 @@ pub const fn select(caps: GpuTextureCaps) -> ImageryPlan {
         (true, true, _) => (ImageryFormat::Bc7, ImageryEncode::Gpu),
         (true, false, true) => (ImageryFormat::Astc4x4, ImageryEncode::Gpu),
         (false, _, true) => (ImageryFormat::Astc4x4, ImageryEncode::Cpu),
+        (false, true, false) => (ImageryFormat::Bc7, ImageryEncode::Cpu),
         _ => (ImageryFormat::Rgba8, ImageryEncode::None),
     };
     ImageryPlan { target, encode }
@@ -404,6 +412,55 @@ impl Texels {
     }
 }
 
+/// The UASTC effort level the CPU path encodes at: upstream's level 0, the
+/// fastest — tens of milliseconds a 256² tile in a browser's worker.
+const CPU_LEVEL: texcomp::uastc::Level = texcomp::uastc::Level::Fastest;
+
+/// RGBA8 encoded into `format` on the CPU, its whole mip chain built and
+/// encoded: the blocks a decode worker sends when its consumer's plan says
+/// [`ImageryEncode::Cpu`] — a GPU that samples the format and cannot run the
+/// GPU encoder (WebGL2).
+///
+/// Each level is box-filtered by [`raster::mip_chain`](crate::raster::mip_chain)
+/// as the RGBA8 path's are, encoded to UASTC and transcoded: to ASTC 4×4
+/// losslessly, to BC7 within a small loss.
+///
+/// Refused — for the caller to send RGBA8 instead, never a hole — when the
+/// texture is not RGBA8 or level 0 is not whole blocks, which the upload
+/// needs.
+pub fn encode_on_cpu(
+    texture: &crate::content::DecodedTexture,
+    format: BlockFormat,
+) -> Result<Texels, String> {
+    let (width, height) = (texture.width, texture.height);
+    let side = BlockFormat::BLOCK_SIDE;
+    if width == 0 || height == 0 || width % side != 0 || height % side != 0 {
+        return Err(format!("{width}×{height} is not whole 4×4 blocks"));
+    }
+    let Some(base) = texture.rgba8() else {
+        return Err("already blocks".to_owned());
+    };
+    let mips = crate::raster::mip_chain(texture);
+    let images = std::iter::once((width, height, base)).chain(
+        mips.iter()
+            .filter_map(|m| m.rgba8().map(|px| (m.width, m.height, px))),
+    );
+    let mut levels = Vec::with_capacity(1 + mips.len());
+    for (w, h, pixels) in images {
+        let mut uastc = vec![0; BlockFormat::level_bytes(w, h)];
+        texcomp::uastc::encode_image(pixels, w, h, CPU_LEVEL, &mut uastc)
+            .map_err(|e| e.to_string())?;
+        let mut blocks = vec![0; uastc.len()];
+        match format {
+            BlockFormat::Astc4x4 => texcomp::uastc::transcode_to_astc_4x4(&uastc, &mut blocks),
+            BlockFormat::Bc7 => texcomp::uastc::transcode_to_bc7(&uastc, &mut blocks),
+        }
+        .map_err(|e| e.to_string())?;
+        levels.push(blocks);
+    }
+    Ok(Texels::Blocks { format, levels })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,7 +528,7 @@ mod tests {
             (
                 "WebGL2 desktop, the four BC extensions",
                 caps(true, false, false),
-                ImageryPlan::RGBA8,
+                plan(Bc7, Cpu),
             ),
             (
                 "WebGL2 with BC and ASTC, no compute",
@@ -558,7 +615,13 @@ mod tests {
                 "BC7 on WebGL2 desktop",
                 bc7,
                 caps(true, false, false),
-                ImageryPlan::RGBA8,
+                plan(Bc7, Cpu),
+            ),
+            (
+                "BC7 on WebGL2 with BC and ASTC",
+                bc7,
+                caps(true, true, false),
+                plan(Bc7, Cpu),
             ),
             (
                 "BC7 on nothing",
@@ -709,5 +772,100 @@ mod tests {
         assert_eq!(blocks.byte_len(), 96);
         assert_eq!(blocks.as_rgba8(), None);
         assert_eq!(blocks.resident(), ImageryFormat::Astc4x4);
+    }
+
+    fn gradient(width: u32, height: u32) -> crate::content::DecodedTexture {
+        let pixels = (0..height)
+            .flat_map(|y| {
+                (0..width)
+                    .flat_map(move |x| [(x * 255 / width) as u8, (y * 255 / height) as u8, 90, 255])
+            })
+            .collect();
+        crate::content::DecodedTexture::from_rgba8(width, height, pixels)
+    }
+
+    /// The CPU path: a 256² tile comes back as blocks of the asked format,
+    /// its whole chain down to 1×1, each level its whole blocks — a quarter
+    /// of the RGBA8 chain, charged as such.
+    #[test]
+    fn the_cpu_encoder_writes_the_whole_chain_as_blocks() {
+        let tile = gradient(256, 256);
+        for format in [BlockFormat::Astc4x4, BlockFormat::Bc7] {
+            let texels = encode_on_cpu(&tile, format).expect("encodes");
+            let Texels::Blocks {
+                format: got,
+                levels,
+            } = &texels
+            else {
+                panic!("{format:?}: blocks expected");
+            };
+            assert_eq!(*got, format);
+            assert_eq!(levels.len(), 9, "{format:?}: 256 down to 1");
+            for (l, level) in levels.iter().enumerate() {
+                assert_eq!(
+                    level.len(),
+                    BlockFormat::level_bytes(256 >> l, 256 >> l),
+                    "{format:?} level {l}"
+                );
+            }
+            assert_eq!(texels.byte_len(), 87_408, "{format:?}");
+            assert_eq!(texels.cost(256, 256).gpu, Bytes(87_408), "{format:?}");
+        }
+    }
+
+    /// Level 0 is the UASTC encoder's blocks, transcoded: ASTC is exactly
+    /// what the UASTC blocks stand for, and decodes close to the source.
+    #[test]
+    fn the_cpu_encoder_is_uastc_transcoded() {
+        let tile = gradient(64, 32);
+        let Texels::Blocks { levels, .. } =
+            encode_on_cpu(&tile, BlockFormat::Astc4x4).expect("encodes")
+        else {
+            panic!("blocks expected");
+        };
+        let rgba = tile.rgba8().expect("rgba8");
+        let mut uastc = vec![0; BlockFormat::level_bytes(64, 32)];
+        texcomp::uastc::encode_image(rgba, 64, 32, CPU_LEVEL, &mut uastc).expect("uastc");
+        let mut astc = vec![0; uastc.len()];
+        texcomp::uastc::transcode_to_astc_4x4(&uastc, &mut astc).expect("astc");
+        assert_eq!(levels[0], astc);
+        // Within a few codes of the source, block by block.
+        let (blocks, _) = uastc.as_chunks::<16>();
+        let worst = blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(i, b)| {
+                let texels = texcomp::uastc::UastcBlock::from_bytes(*b)
+                    .decode_rgba8(true)
+                    .expect("valid");
+                let (bx, by) = (i % 16, i / 16);
+                (0..16).map(move |t| {
+                    let (x, y) = (bx * 4 + t % 4, by * 4 + t / 4);
+                    let at = (y * 64 + x) * 4;
+                    (0..3)
+                        .map(|c| texels[t][c].abs_diff(rgba[at + c]))
+                        .max()
+                        .unwrap_or(0)
+                })
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(worst <= 12, "worst channel error {worst}");
+    }
+
+    /// What the upload cannot take is refused, for the caller to send RGBA8.
+    #[test]
+    fn the_cpu_encoder_refuses_what_is_not_whole_blocks() {
+        assert!(encode_on_cpu(&gradient(255, 256), BlockFormat::Astc4x4).is_err());
+        assert!(encode_on_cpu(&gradient(256, 2), BlockFormat::Bc7).is_err());
+        let blocks = crate::content::DecodedTexture {
+            width: 4,
+            height: 4,
+            texels: Texels::Blocks {
+                format: BlockFormat::Bc7,
+                levels: vec![vec![0; 16]],
+            },
+        };
+        assert!(encode_on_cpu(&blocks, BlockFormat::Bc7).is_err());
     }
 }

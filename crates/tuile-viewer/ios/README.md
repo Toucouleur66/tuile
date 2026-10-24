@@ -71,7 +71,7 @@ uploaded. A launch argument wins over the page:
 simulator, `xcrun devicectl device process launch --device <id>
 dev.lapoule.tuile.viewer --imagery-compression auto` on a phone, or the
 scheme's *Arguments Passed On Launch* in Xcode. The caption at the bottom
-says what is held: `imagery ASTC 4x4 23 MiB`.
+says what is held: `imagery ASTC 4x4 23 MiB (276 × 85 KiB)`.
 
 ## What it does differently on a phone
 

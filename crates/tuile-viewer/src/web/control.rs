@@ -31,6 +31,11 @@ pub(crate) enum ToWorker {
         /// The most decode workers to start: see `schedule::pool_size`.
         #[serde(default)]
         decode_workers: Option<u32>,
+        /// How the page's device holds imagery: the plans the loader decodes
+        /// by. RGBA8 unless the host asked for compression and the device
+        /// can hold it: see [`super::imagery`].
+        #[serde(default)]
+        imagery: super::imagery::Held,
     },
     /// The sampled textures per stage the device reported: how many imagery
     /// tiles one drape may stack (`tuile_planetary::LayerBudget`). A count of
