@@ -303,12 +303,16 @@ fn encoded_on_cpu(tex: DecodedTexture, plan: ImageryPlan) -> DecodedTexture {
     if tex.rgba8().is_none() {
         return tex;
     }
+    let started = web_time::Instant::now();
     match tuile_core::texels::encode_on_cpu(&tex, format) {
-        Ok(texels) => DecodedTexture {
-            width: tex.width,
-            height: tex.height,
-            texels,
-        },
+        Ok(texels) => {
+            encode_took(format, started.elapsed());
+            DecodedTexture {
+                width: tex.width,
+                height: tex.height,
+                texels,
+            }
+        }
         Err(why) => {
             tracing::debug!(
                 width = tex.width,
@@ -318,6 +322,35 @@ fn encoded_on_cpu(tex: DecodedTexture, plan: ImageryPlan) -> DecodedTexture {
             tex
         }
     }
+}
+
+/// Tiles the CPU encoder's console line sums over.
+const ENCODES_PER_LINE: u32 = 32;
+
+std::thread_local! {
+    /// This thread's encodes since its last line: count, total, slowest.
+    static ENCODES: std::cell::Cell<(u32, std::time::Duration, std::time::Duration)> =
+        const { std::cell::Cell::new((0, std::time::Duration::ZERO, std::time::Duration::ZERO)) };
+}
+
+/// One console line every [`ENCODES_PER_LINE`] tiles a thread encodes: the
+/// CPU path's cost per tile, mip chain included, where it is paid — a
+/// browser's decode worker.
+fn encode_took(format: BlockFormat, took: std::time::Duration) {
+    let (count, total, peak) = ENCODES.get();
+    let (count, total, peak) = (count + 1, total + took, peak.max(took));
+    if count < ENCODES_PER_LINE {
+        ENCODES.set((count, total, peak));
+        return;
+    }
+    ENCODES.set((0, std::time::Duration::ZERO, std::time::Duration::ZERO));
+    tracing::info!(
+        ?format,
+        tiles = count,
+        mean_ms = format!("{:.1}", total.as_secs_f64() * 1000.0 / f64::from(count)),
+        peak_ms = format!("{:.1}", peak.as_secs_f64() * 1000.0),
+        "imagery encoded on the CPU"
+    );
 }
 
 /// One terrain tile's quantized-mesh bytes, to the mesh.

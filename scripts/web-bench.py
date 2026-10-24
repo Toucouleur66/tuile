@@ -19,6 +19,10 @@ controls (resize, reload), plays the patterns below and checks, per pattern:
                while another for it is still pending
   budget       held bytes within the page's hard limit; timeouts and failures
                counted
+  imagery      no black patch in the lower ground band of the normal view, and
+               — with `--compression` — the caption's held line: the format
+               the imagery is held in and its bytes per texture (a 256² tile
+               with its chain: 341 KiB as RGBA8, 85 KiB as blocks)
 
 Writes `summary.json`, the console of the page and its workers, and a
 screenshot of every pattern's last frame (and of every failing check) into
@@ -27,6 +31,7 @@ screenshot of every pattern's last frame (and of every failing check) into
     scripts/try-viewer.sh web            # in one terminal (port 8091)
     scripts/web-bench.py --out /tmp/wb   # in another
     scripts/web-bench.py --backend webgl2 --dpr 1 --size 390x844 --patterns still,yaw
+    scripts/web-bench.py --backend webgl2 --compression auto --patterns cold
 
 Needs `pip install websockets pillow` and Google Chrome.
 """
@@ -126,9 +131,17 @@ class Page:
             if method == "Target.attachedToTarget":
                 s = p["sessionId"]
                 self.sessions.append(s)
-                for meth in ("Runtime.enable", "Network.enable", "Runtime.runIfWaitingForDebugger"):
+                self.log.write(f"{now:.1f} attached {p['targetInfo'].get('type')} {p['targetInfo'].get('url', '')[-40:]} under {sid}\n")
+                # The session worker's own decode workers too: their console
+                # carries the CPU encoder's cost per tile.
+                for meth, params in (("Runtime.enable", {}), ("Network.enable", {}),
+                                     ("Target.setAutoAttach", {"autoAttach": True,
+                                                               "waitForDebuggerOnStart": False,
+                                                               "flatten": True}),
+                                     ("Runtime.runIfWaitingForDebugger", {})):
                     self.n += 1
-                    await self.ws.send(json.dumps({"id": self.n, "sessionId": s, "method": meth}))
+                    await self.ws.send(json.dumps({"id": self.n, "sessionId": s, "method": meth,
+                                                   "params": params}))
             elif method == "Runtime.consoleAPICalled":
                 text = " ".join(str(a.get("value", a.get("description", ""))) for a in p["args"])
                 self.log.write(f"{now:.1f} {'W' if sid else 'P'} {p['type']}: {text}\n")
@@ -166,8 +179,11 @@ class Page:
         return base64.b64decode(r["data"])
 
 
-def holes(png, step=4):
-    """Black pixels in the lower ground band of a geometry-view frame."""
+def holes(png, step=4, patch=0, below=12):
+    """Black pixels (every channel under `below`) in the lower ground band of
+    a frame. With `patch`, a pixel counts only when the pixels `patch` away on
+    every side are black too: a black region, not one dark texel of a
+    photograph."""
     im = Image.open(io.BytesIO(png)).convert("RGB")
     w, h = im.size
     px = im.load()
@@ -176,7 +192,9 @@ def holes(png, step=4):
     for y in band:
         for x in range(int(w * 0.05), int(w * 0.85), step):
             total += 1
-            if max(px[x, y]) < 12:
+            if max(px[x, y]) < below and all(
+                    max(px[min(max(x + dx, 0), w - 1), min(max(y + dy, 0), h - 1)]) < below
+                    for dx in (-patch, 0, patch) for dy in (-patch, 0, patch)):
                 black += 1
     return black, total
 
@@ -211,7 +229,12 @@ async def pattern(args, ws_url, name):
     desc, steps, bound = PATTERNS[name]
     out = os.path.join(args.out, name)
     os.makedirs(out, exist_ok=True)
-    url = args.url + (f"?backend={args.backend}" if args.backend != "webgpu" else "")
+    query = []
+    if args.backend != "webgpu":
+        query.append(f"backend={args.backend}")
+    if args.compression:
+        query.append(f"compression={args.compression}")
+    url = args.url + ("?" + "&".join(query) if query else "")
     log = open(os.path.join(out, "console.log"), "w")
     async with websockets.connect(ws_url, max_size=None) as ws:
         page = Page(ws, log)
@@ -365,6 +388,15 @@ async def pattern(args, ws_url, name):
         still_pending = page.oldest_pending(time.time(), older_than=5.0)
         normal = await page.shot()
         open(os.path.join(out, "normal.png"), "wb").write(normal)
+        # Under 4: a photograph's shadowed valley reaches 8–12 (the Alps
+        # after the yaw, in RGBA8 as compressed); a black quad is 0.
+        dark, dark_total = holes(normal, patch=4, below=4)
+        # The caption's held line: how the imagery is held, and what each
+        # texture holds.
+        r = await page.ev("""[...document.querySelectorAll('div')].map(d => d.textContent)
+            .map(t => (t.match(/imagery (?:(?:RGBA8|BC7|ASTC 4x4) \\d+ MiB \\(\\d+ × \\d+ KiB\\)(?: \\+ )?)+/) || [])[0])
+            .find(Boolean) || ''""")
+        held_line = r.get("result", {}).get("value", "")
         # The geometry view: black is ground no mesh covers.
         for _ in range(0 if geometry_on else 3):
             await page.call("Input.dispatchKeyEvent", type="keyDown", key="d", text="d")
@@ -390,6 +422,9 @@ async def pattern(args, ws_url, name):
                      and not page.dupes,
                      f"oldest pending {worst_pending[1]:.0f} s, {still_pending[0]} pending over 5 s at the end, "
                      f"{len(page.dupes)} duplicate concurrent requests, {len(page.finished)} finished"),
+        "imagery": (dark == 0 and (not args.compression or bool(held_line)),
+                    f"{dark} of {dark_total} sampled ground pixels in black patches in the normal view; "
+                    f"{held_line or 'no held line in the caption'}"),
         "budget": (held <= hard, f"held {held} MiB of hard {hard}, {last.get('timeouts', '?')} timed out, "
                    f"{last.get('failed', '?')} failed, {last.get('evicted', '?')} evicted, scale {last.get('scale', '?')}"),
     }
@@ -401,7 +436,7 @@ async def pattern(args, ws_url, name):
     pending = sorted(((round(now - t, 1), u) for (u, t) in page.requests.values()), reverse=True)
     json.dump({"samples": samples, "dupes": page.dupes[:200], "pending": pending},
               open(os.path.join(out, "trace.json"), "w"), indent=1)
-    return {"pattern": name, "backend": backend, "kept": kept,
+    return {"pattern": name, "backend": backend, "compression": args.compression, "held": held_line, "kept": kept,
             "checks": {k: {"kept": ok, "what": w} for k, (ok, w) in checks.items()}}
 
 
@@ -409,6 +444,8 @@ def main():
     a = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     a.add_argument("--url", default="http://127.0.0.1:8091/examples/web-viewer/")
     a.add_argument("--backend", choices=["webgpu", "webgl2"], default="webgpu")
+    a.add_argument("--compression", choices=["off", "auto", "bc7", "astc"], default=None,
+                   help="the page's imageryCompression (?compression=); unset, the page's default")
     a.add_argument("--dpr", type=float, default=2.0)
     a.add_argument("--size", type=lambda s: tuple(int(v) for v in s.split("x")), default=(1280, 800))
     a.add_argument("--patterns", type=lambda s: s.split(","), default=list(PATTERNS))

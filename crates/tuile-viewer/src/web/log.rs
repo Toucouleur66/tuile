@@ -33,6 +33,7 @@ pub(crate) fn install() {
             .with_target("tuile_viewer", Level::INFO)
             .with_target("tuile_web", Level::INFO)
             .with_target("tuile_core", Level::INFO)
+            .with_target("tuile_planetary", Level::INFO)
             .with_target("tuile_wgpu", Level::INFO);
         let layer = tracing_subscriber::fmt::layer()
             .with_ansi(false)
