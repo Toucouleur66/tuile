@@ -68,6 +68,9 @@ pub struct Report {
     pub over_budget_frames: usize,
     /// The most GPU bytes held, meshes and imagery.
     pub worst_gpu_bytes: u64,
+    /// The most imagery bytes held on the GPU, in the formats it was held
+    /// in: what holding it block-compressed divides by four.
+    pub worst_imagery_bytes: u64,
     /// Lookups the store could not answer, which went to the network; and
     /// those it could.
     pub store_misses: u64,
@@ -101,6 +104,7 @@ impl Report {
             let m = &s.metrics;
             r.worst_resident_bytes = r.worst_resident_bytes.max(m.resident_bytes);
             r.worst_gpu_bytes = r.worst_gpu_bytes.max(m.mesh_bytes + m.texture_bytes);
+            r.worst_imagery_bytes = r.worst_imagery_bytes.max(m.texture_bytes);
             if m.resident_bytes > budget {
                 r.over_budget_frames += 1;
             }
@@ -207,11 +211,13 @@ impl Verdict {
                 self.obligations.bound
             ),
             format!(
-                "{} budget: resident {:.0} MB at most against {:.0} MB, over on {} frames",
+                "{} budget: resident {:.0} MB at most against {:.0} MB, over on {} frames \
+                 (imagery on the GPU {:.1} MB at most)",
                 mark(self.budget),
                 r.worst_resident_bytes as f64 / 1e6,
                 self.obligations.resident_budget as f64 / 1e6,
-                r.over_budget_frames
+                r.over_budget_frames,
+                r.worst_imagery_bytes as f64 / 1e6
             ),
         ];
         if let Some(check) = self.warm_fetches {
@@ -265,6 +271,7 @@ impl Verdict {
                 "budget_bytes": self.obligations.resident_budget,
                 "frames_over": r.over_budget_frames,
                 "worst_gpu_bytes": r.worst_gpu_bytes,
+                "worst_imagery_bytes": r.worst_imagery_bytes,
             },
             "warm_fetches": self.warm_fetches.map(|c| serde_json::json!({
                 "kept": c.kept,

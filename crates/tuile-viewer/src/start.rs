@@ -32,6 +32,12 @@ FLAGS (each takes one number; `--flag value` or `--flag=value`):
                        when the answer arrives, and stays put if none does)
     --imagery <name>   the imagery layer to open on, by key or by name
 IMAGERY_LAYERS
+    --imagery-compression <off|auto|bc7|astc>
+                       how imagery is held on the GPU: off (RGBA8, the
+                       default), auto (the best block format the GPU samples:
+                       BC7 on a desktop, ASTC 4x4 on a phone), or that format.
+                       Blocks hold a quarter of the bytes, encoded on the GPU
+                       at upload; a tile that cannot be encoded stays RGBA8
 
 SOURCES BY ADDRESS (no catalog, no token; each replaces the host's own):
     --terrain-url <url>          quantized-mesh terrain: the URL of its layer.json.
@@ -206,11 +212,13 @@ pub(crate) enum Invocation {
     ///
     /// `imagery` is the layer `--imagery` named, as typed: which layer that
     /// is depends on the host's list, which this parser does not have.
+    /// `compression` is what `--imagery-compression` said, if it was given.
     Run {
         view: StartView,
         here: bool,
         imagery: Option<String>,
         addresses: Addresses,
+        compression: Option<tuile_wgpu::ImageryCompression>,
     },
     /// Print [`usage`] and leave.
     Help,
@@ -403,6 +411,7 @@ where
         ("--imagery-scheme", None),
         ("--imagery-max-level", None),
     ];
+    let mut compression: Option<tuile_wgpu::ImageryCompression> = None;
     let mut seen = [false; FLAGS.len()];
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -418,6 +427,19 @@ where
             Some((name, value)) => (name, Some(value.to_owned())),
             None => (arg, None),
         };
+        if name == "--imagery-compression" {
+            if compression.is_some() {
+                return Err("--imagery-compression given twice".to_owned());
+            }
+            let text = match inline {
+                Some(text) => text,
+                None => args.next().map(|s| s.as_ref().to_owned()).ok_or_else(|| {
+                    "--imagery-compression needs off, auto, bc7 or astc".to_owned()
+                })?,
+            };
+            compression = Some(tuile_wgpu::compression_named(&text)?);
+            continue;
+        }
         if name == "--imagery" {
             if imagery.is_some() {
                 return Err("--imagery given twice".to_owned());
@@ -490,6 +512,7 @@ where
         here,
         imagery,
         addresses,
+        compression,
     })
 }
 
@@ -556,6 +579,7 @@ mod tests {
             here: false,
             imagery: None,
             addresses,
+            compression: None,
         }) = parsed
         else {
             unreachable!("{args:?} should start a session, got {parsed:?}");
@@ -810,6 +834,45 @@ mod tests {
         }
     }
 
+    /// `--imagery-compression` takes one of four names, once; without it
+    /// nothing is said and the session holds RGBA8.
+    #[test]
+    fn imagery_compression_is_named_once() {
+        use tuile_wgpu::ImageryCompression;
+        let said = |args: &[&str]| match parse(args) {
+            Ok(Invocation::Run { compression, .. }) => compression,
+            other => unreachable!("{args:?} should start a session, got {other:?}"),
+        };
+        assert_eq!(said(&[]), None);
+        assert_eq!(
+            said(&["--imagery-compression", "auto"]),
+            Some(ImageryCompression::Auto)
+        );
+        assert_eq!(
+            said(&["--imagery-compression=off", "--lat", "3"]),
+            Some(ImageryCompression::Off)
+        );
+        assert_eq!(
+            said(&["--imagery", "x", "--imagery-compression", "astc"]),
+            Some(ImageryCompression::Format(
+                tuile_core::texels::BlockFormat::Astc4x4
+            ))
+        );
+        for bad in [
+            &["--imagery-compression"][..],
+            &["--imagery-compression", "etc2"],
+            &[
+                "--imagery-compression",
+                "bc7",
+                "--imagery-compression",
+                "off",
+            ],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+        assert!(FLAGS_TEXT.contains("--imagery-compression <off|auto|bc7|astc>"));
+    }
+
     #[test]
     fn here_replaces_the_position_and_refuses_to_share_it() {
         assert_eq!(
@@ -823,6 +886,7 @@ mod tests {
                 here: true,
                 imagery: None,
                 addresses: Addresses::default(),
+                compression: None,
             })
         );
         // Either order, either coordinate.

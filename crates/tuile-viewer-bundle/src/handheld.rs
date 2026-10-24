@@ -221,8 +221,13 @@ pub(crate) fn bundled_key(variable: &str) -> String {
 /// Shared with the viewer, which reads the key: one file, two readers.
 const BUNDLED_PREFIX: &str = include_str!("../../tuile-viewer/ios/bundled-credential-prefix.txt");
 
+/// The key the viewer reads the imagery compression under: the same string
+/// as `tuile_viewer`'s `IMAGERY_COMPRESSION_KEY`.
+pub(crate) const IMAGERY_COMPRESSION_KEY: &str = "imagery_compression";
+
 /// The settings page: one secure text field for the credential, under the
-/// key the application reads first.
+/// key the application reads first, and the choice of how imagery is held on
+/// the GPU — off unless the person picks otherwise, read at launch.
 fn settings_bundle(credential: &Credential, out: &Path) -> anyhow::Result<()> {
     use plist::Value::{Array, Boolean, Dictionary, String as Text};
     let settings = out.join("Settings.bundle");
@@ -254,10 +259,46 @@ fn settings_bundle(credential: &Credential, out: &Path) -> anyhow::Result<()> {
     ] {
         field.insert(key.into(), value);
     }
+    let mut rendering = plist::Dictionary::new();
+    rendering.insert("Type".into(), text("PSGroupSpecifier"));
+    rendering.insert("Title".into(), text("Rendering"));
+    rendering.insert(
+        "FooterText".into(),
+        text(
+            "Imagery held block-compressed on the GPU: a quarter of the memory, \
+             encoded at upload. Auto picks ASTC 4x4 on a phone. Applies at the \
+             next launch.",
+        ),
+    );
+    let mut compression = plist::Dictionary::new();
+    let names = ["off", "auto", "bc7", "astc"];
+    for (key, value) in [
+        ("Type", text("PSMultiValueSpecifier")),
+        ("Title", text("Imagery compression")),
+        ("Key", text(IMAGERY_COMPRESSION_KEY)),
+        ("DefaultValue", text("off")),
+        (
+            "Titles",
+            Array(
+                ["Off (RGBA8)", "Auto", "BC7", "ASTC 4x4"]
+                    .iter()
+                    .map(|t| text(t))
+                    .collect(),
+            ),
+        ),
+        ("Values", Array(names.iter().map(|v| text(v)).collect())),
+    ] {
+        compression.insert(key.into(), value);
+    }
     let mut root = plist::Dictionary::new();
     root.insert(
         "PreferenceSpecifiers".into(),
-        Array(vec![Dictionary(group), Dictionary(field)]),
+        Array(vec![
+            Dictionary(group),
+            Dictionary(field),
+            Dictionary(rendering),
+            Dictionary(compression),
+        ]),
     );
     Dictionary(root).to_file_xml(settings.join("Root.plist"))?;
     Ok(())
@@ -443,6 +484,30 @@ mod tests {
             field.get("IsSecure").and_then(plist::Value::as_boolean),
             Some(true)
         );
+        // The imagery compression: a choice of four, off by default.
+        let choice = fields
+            .iter()
+            .filter_map(plist::Value::as_dictionary)
+            .find(|f| {
+                f.get("Type").and_then(plist::Value::as_string) == Some("PSMultiValueSpecifier")
+            })
+            .expect("a choice of imagery compression");
+        assert_eq!(
+            choice.get("Key").and_then(plist::Value::as_string),
+            Some(IMAGERY_COMPRESSION_KEY)
+        );
+        assert_eq!(
+            choice.get("DefaultValue").and_then(plist::Value::as_string),
+            Some("off")
+        );
+        let values: Vec<&str> = choice
+            .get("Values")
+            .and_then(plist::Value::as_array)
+            .expect("values")
+            .iter()
+            .filter_map(plist::Value::as_string)
+            .collect();
+        assert_eq!(values, ["off", "auto", "bc7", "astc"]);
         let info = plist::Value::from_file(dir.path().join("Info.plist")).expect("a plist");
         let key = bundled_key("SOME_TOKEN");
         assert!(info.as_dictionary().is_some_and(|d| !d.contains_key(&key)));

@@ -111,6 +111,9 @@ pub struct ViewerConfig {
     /// The graphics backends to choose from; `None` is the platform's own
     /// choice. A page may force WebGL2, say, to test it.
     pub(crate) backends: Option<wgpu::Backends>,
+    /// How the imagery is held on the GPU: the person's choice, off unless
+    /// they asked (`--imagery-compression`, or the phone's settings page).
+    pub(crate) imagery_compression: tuile_wgpu::ImageryCompression,
 }
 
 /// Where the on-screen controls live: the part of the frame not under a
@@ -265,6 +268,10 @@ pub struct App {
     gpu_on_its_way: Option<setup::GpuOnItsWay>,
     /// See [`ViewerConfig::backends`].
     backends: Option<wgpu::Backends>,
+    /// See [`ViewerConfig::imagery_compression`].
+    imagery_compression: tuile_wgpu::ImageryCompression,
+    /// The loader's imagery plan, once a session is up: told the device's.
+    imagery_plan: Option<tuile_planetary::ImageryPlanHandle>,
     lifecycle: lifecycle::Lifecycle,
     loading: loading::Loading,
     demand: demand::Demand,
@@ -475,6 +482,8 @@ impl App {
             window_attributes: config.window,
             gpu_on_its_way: None,
             backends: config.backends,
+            imagery_compression: config.imagery_compression,
+            imagery_plan: None,
             rig: Rig::MONO,
             speaker: crate::desktop::try_alert,
             #[cfg(feature = "control")]
@@ -560,6 +569,7 @@ impl App {
             active.pump.observe(meter);
         }
         self.layer_budget = started.layer_budget.clone();
+        self.imagery_plan = started.imagery_plan().cloned();
         self.fit_the_layer_budget();
         // Away already: the loads wait until the application is back.
         if self.lifecycle.phase() != lifecycle::Phase::Active {
@@ -580,6 +590,9 @@ impl App {
 
     /// Tells the loader how many imagery layers the device binds, once both
     /// exist.
+    ///
+    /// The imagery plan too: the device's, which is the person's choice where
+    /// the device was created for it and RGBA8 where it could not be.
     fn fit_the_layer_budget(&mut self) {
         let Some(active) = self.active.as_ref() else {
             return;
@@ -591,6 +604,9 @@ impl App {
                 .limits()
                 .max_sampled_textures_per_shader_stage,
         );
+        if let Some(plan) = &self.imagery_plan {
+            plan.set(active.gpu.imagery_plan());
+        }
     }
 
     /// Closes the session down: the stream, the store, the server. A phone, on

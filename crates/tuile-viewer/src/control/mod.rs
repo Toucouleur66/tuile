@@ -82,6 +82,7 @@ use web_time::Instant;
 pub use log::{BudgetTopics, Observer, Pictures};
 pub use series::{Action, Finger, Pressure, Series};
 pub use tuile_core::metrics::Snapshot;
+pub use tuile_wgpu::{compression_named, ImageryCompression};
 pub use verdict::{Obligations, Report, Verdict};
 
 use crate::app::{App, Rig, Turn, ViewerConfig};
@@ -281,6 +282,9 @@ pub struct Start {
     pub log: Option<PathBuf>,
     /// Which pictures go into the log.
     pub pictures: Pictures,
+    /// How imagery is held on the GPU: off, as a window's session holds it
+    /// unless the person asks.
+    pub imagery_compression: tuile_wgpu::ImageryCompression,
 }
 
 /// Midsummer noon over Greenwich, 2026: the sun high over Europe.
@@ -301,6 +305,7 @@ impl Start {
             lit_at: MIDSUMMER_NOON,
             log: None,
             pictures: Pictures::WhenWrong,
+            imagery_compression: tuile_wgpu::ImageryCompression::Off,
         }
     }
 }
@@ -316,6 +321,7 @@ impl std::fmt::Debug for Start {
             .field("device", &self.device)
             .field("refresh_hz", &self.refresh_hz)
             .field("log", &self.log)
+            .field("imagery_compression", &self.imagery_compression)
             .finish_non_exhaustive()
     }
 }
@@ -492,8 +498,10 @@ impl Headless {
 
     fn bring_up(start: Start, claim: Claim) -> Result<Self, Refused> {
         let launching = Instant::now();
-        let gpu = pollster::block_on(tuile_wgpu::GpuContext::headless())
-            .map_err(|e| Refused::NoGpu(e.to_string()))?;
+        let gpu = pollster::block_on(tuile_wgpu::GpuContext::headless_with(
+            start.imagery_compression,
+        ))
+        .map_err(|e| Refused::NoGpu(e.to_string()))?;
         // The process's identity and layers, as `main` adopts the host's: the
         // first host wins, and a test process has one.
         crate::embed::adopt(start.host.identity(), start.host.imagery());
@@ -523,6 +531,7 @@ impl Headless {
             budget,
             profile: profile.clone(),
             timeout: crate::launch::START_TIMEOUT,
+            imagery_plan: gpu.imagery_plan(),
         };
         let launch = crate::native::launch::start(&handle, plan.clone());
         let launch = if profile.hold_window_until_warm {
@@ -557,6 +566,7 @@ impl Headless {
             window: winit::window::Window::default_attributes(),
             controls: true,
             backends: None,
+            imagery_compression: start.imagery_compression,
         };
         let mut app = App::new(config, launch);
         app.speak_through(said);

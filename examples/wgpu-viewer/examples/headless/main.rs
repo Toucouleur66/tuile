@@ -38,6 +38,7 @@
 //! | `--watch S` | seconds the settling is watched for at most, instead of the pattern's |
 //! | `--logs DIR` | where the session logs and `summary.json` go: `target/headless` unless said |
 //! | `--json PATH` | where the summary goes, instead |
+//! | `--imagery-compression C` | `off` (the default), `auto`, `bc7` or `astc`: how imagery is held on the GPU |
 //!
 //! A run's log flies again in the application: `TUILE_REPLAY=<log>.mcap`.
 
@@ -47,10 +48,13 @@ use std::path::{Path, PathBuf};
 
 use serde_json::json;
 use tuile_viewer::control::patterns::{self, Pattern};
-use tuile_viewer::control::{Device, Headless, Obligations, Start, State, Verdict};
+use tuile_viewer::control::{
+    compression_named, Device, Headless, ImageryCompression, Obligations, Start, State, Verdict,
+};
 
 const USAGE: &str = "headless list
 headless run <pattern|all> [--device D] [--hz N] [--memory-gib N] [--watch S] [--logs DIR] [--json PATH]
+             [--imagery-compression off|auto|bc7|astc]
 
 The patterns ask the real catalog: TUILE_ION_TOKEN must be set. See the source's documentation.";
 
@@ -59,6 +63,7 @@ struct Asked {
     patterns: Vec<Pattern>,
     logs: PathBuf,
     json: Option<PathBuf>,
+    compression: ImageryCompression,
 }
 
 fn device(name: &str, memory_gib: Option<f64>) -> Result<Device, String> {
@@ -138,6 +143,7 @@ fn read(args: &[String]) -> Result<Option<Asked>, String> {
             "--watch",
             "--logs",
             "--json",
+            "--imagery-compression",
         ]
         .contains(key)
         {
@@ -150,6 +156,9 @@ fn read(args: &[String]) -> Result<Option<Asked>, String> {
             .get("--logs")
             .map_or_else(|| PathBuf::from("target/headless"), PathBuf::from),
         json: flags.get("--json").map(PathBuf::from),
+        compression: flags
+            .get("--imagery-compression")
+            .map_or(Ok(ImageryCompression::Off), |name| compression_named(name))?,
     }))
 }
 
@@ -170,27 +179,40 @@ fn place() -> Result<tempfile::TempDir, String> {
         .map_err(|e| e.to_string())
 }
 
-fn start(pattern: &Pattern, proxy: &catalog::Proxy, place: &Path, log: Option<PathBuf>) -> Start {
+fn start(
+    pattern: &Pattern,
+    proxy: &catalog::Proxy,
+    place: &Path,
+    log: Option<PathBuf>,
+    compression: ImageryCompression,
+) -> Start {
     Start {
         log,
+        imagery_compression: compression,
         ..pattern.start(proxy.host(place.join("http")), place.join("tiles"))
     }
 }
 
 /// Plays `pattern`: up, the motion, the watch — or, for a relaunch, a first
 /// run that fills the store and the relaunch over it.
-fn play(pattern: &Pattern, proxy: &catalog::Proxy, logs: &Path) -> Result<Outcome, String> {
+fn play(
+    pattern: &Pattern,
+    proxy: &catalog::Proxy,
+    logs: &Path,
+    compression: ImageryCompression,
+) -> Result<Outcome, String> {
     let dir = place()?;
     let log = logs.join(format!("{}.mcap", pattern.key));
     let mut run = if pattern.relaunch {
-        let mut first =
-            Headless::start(start(pattern, proxy, dir.path(), None)).map_err(|e| e.to_string())?;
+        let mut first = Headless::start(start(pattern, proxy, dir.path(), None, compression))
+            .map_err(|e| e.to_string())?;
         first.settle(pattern.watch);
         // What it was still fetching lands before it is put away.
         let _ = first.wait_until(5.0, State::idle);
         first.relaunch(Some(log)).map_err(|e| e.to_string())?
     } else {
-        Headless::start(start(pattern, proxy, dir.path(), Some(log))).map_err(|e| e.to_string())?
+        Headless::start(start(pattern, proxy, dir.path(), Some(log), compression))
+            .map_err(|e| e.to_string())?
     };
     let launch = run.launched();
     let came_up = pattern.warm == 0.0 || run.settle(pattern.warm).settled;
@@ -280,7 +302,7 @@ fn main() {
                 ""
             },
         );
-        let outcome = match play(pattern, &proxy, &asked.logs) {
+        let outcome = match play(pattern, &proxy, &asked.logs, asked.compression) {
             Ok(outcome) => outcome,
             Err(why) => {
                 eprintln!("{header}\n  could not run: {why}");

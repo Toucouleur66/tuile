@@ -36,6 +36,30 @@ pub(crate) fn init_tracing(quiet: bool) {
     subscriber.init();
 }
 
+/// The key the phone's settings page keeps the imagery compression under:
+/// `off`, `auto`, `bc7` or `astc`.
+pub(crate) const IMAGERY_COMPRESSION_KEY: &str = "imagery_compression";
+
+/// How the imagery is held on the GPU: what `--imagery-compression` said,
+/// else what the person chose in the system's settings page for the
+/// application (a phone's *Settings › Tuile*, kept between launches), else
+/// off. A value nobody can read is an error naming the four there are.
+pub(crate) fn imagery_compression(
+    flag: Option<tuile_wgpu::ImageryCompression>,
+    host: &dyn crate::host::Host,
+) -> Result<tuile_wgpu::ImageryCompression, String> {
+    if let Some(choice) = flag {
+        return Ok(choice);
+    }
+    match host
+        .setting(IMAGERY_COMPRESSION_KEY)
+        .filter(|v| !v.trim().is_empty())
+    {
+        Some(value) => tuile_wgpu::compression_named(&value),
+        None => Ok(tuile_wgpu::ImageryCompression::Off),
+    }
+}
+
 /// The instant the scene is lit for, UTC seconds since the Unix epoch.
 ///
 /// `TUILE_LIT_AT` overrides it, so a session can be pinned to a stated moment —
@@ -96,5 +120,59 @@ pub fn pinned_level(default: u32) -> Option<u32> {
             tracing::warn!("TUILE_PIN_LEVEL={setting:?} is not a level; keeping the default");
             Some(default)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tuile_wgpu::ImageryCompression;
+
+    /// A machine whose settings page holds `page`, if anything.
+    struct Page(Option<&'static str>);
+
+    impl crate::host::Host for Page {
+        fn var(&self, _name: &str) -> Option<String> {
+            None
+        }
+        fn read(&self, path: &std::path::Path) -> std::io::Result<String> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                path.display().to_string(),
+            ))
+        }
+        fn is_macos(&self) -> bool {
+            true
+        }
+        fn setting(&self, key: &str) -> Option<String> {
+            (key == IMAGERY_COMPRESSION_KEY)
+                .then_some(self.0)
+                .flatten()
+                .map(str::to_owned)
+        }
+    }
+
+    /// **Off unless the person chose**: the flag first, then the settings
+    /// page, and a value nobody can read is said, not guessed at.
+    #[test]
+    fn compression_is_the_flag_then_the_settings_page_then_off() {
+        assert_eq!(
+            imagery_compression(None, &Page(None)),
+            Ok(ImageryCompression::Off)
+        );
+        assert_eq!(
+            imagery_compression(None, &Page(Some(""))),
+            Ok(ImageryCompression::Off)
+        );
+        assert_eq!(
+            imagery_compression(None, &Page(Some("auto"))),
+            Ok(ImageryCompression::Auto)
+        );
+        assert_eq!(
+            imagery_compression(Some(ImageryCompression::Off), &Page(Some("astc"))),
+            Ok(ImageryCompression::Off),
+            "the command line wins"
+        );
+        assert!(imagery_compression(None, &Page(Some("etc2"))).is_err());
     }
 }

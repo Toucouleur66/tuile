@@ -86,6 +86,12 @@ pub(crate) struct Started {
 }
 
 impl Started {
+    /// A page's loader is in its worker and holds imagery as RGBA8: the plan
+    /// does not cross to it yet.
+    pub(crate) fn imagery_plan(&self) -> Option<&tuile_planetary::ImageryPlanHandle> {
+        None
+    }
+
     /// Closes the session down. A page has no store to flush and no thread to
     /// join: the worker is terminated, and that is all of it.
     pub(crate) fn close(self, _patience: std::time::Duration, _join_the_server: bool) {

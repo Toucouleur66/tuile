@@ -42,6 +42,8 @@ pub(crate) struct Started {
     pub meter: tuile_core::runtime::SharedMeter,
     pub heights: Arc<TerrainHeights>,
     pub layer_budget: Budget,
+    /// How the loader holds imagery: told the device's plan once it exists.
+    pub imagery_plan: tuile_planetary::ImageryPlanHandle,
     pub switcher: Switcher,
     /// Kept so it can be flushed on the way out: a store that is merely
     /// dropped leaves the disk as cold as it found it.
@@ -52,6 +54,12 @@ pub(crate) struct Started {
 }
 
 impl Started {
+    /// How the loader holds imagery, for the window to tell it the device's
+    /// plan.
+    pub(crate) fn imagery_plan(&self) -> Option<&tuile_planetary::ImageryPlanHandle> {
+        Some(&self.imagery_plan)
+    }
+
     /// The budget's signals, shared with the session.
     pub(crate) fn meter(&self) -> Option<tuile_core::runtime::SharedMeter> {
         Some(std::sync::Arc::clone(&self.meter))
@@ -160,6 +168,11 @@ pub(crate) struct Plan {
     pub profile: crate::profile::Profile,
     /// See [`crate::launch::START_TIMEOUT`].
     pub timeout: std::time::Duration,
+    /// How imagery is held, as far as it is known before the window's
+    /// device exists: the person's choice resolved against the adapter
+    /// (`App::imagery_plan_before_the_window`). The device confirms it, or
+    /// corrects it, once it is up.
+    pub imagery_plan: tuile_core::texels::ImageryPlan,
 }
 
 /// Starts the launch on `runtime` and returns at once.
@@ -213,6 +226,9 @@ async fn bring_up_now(plan: Plan, runtime: tokio::runtime::Handle) -> Outcome {
     )
     .await
     .map_err(|e| format!("{e:#}"))?;
+    // Before the server runs, so the first tile decoded is already held as
+    // the person chose.
+    globe.plan.set(plan.imagery_plan);
     let gate = Gate::default();
     let loader: Arc<dyn TileLoader> = Arc::new(Gated {
         inner: globe.loader,
@@ -238,6 +254,7 @@ async fn bring_up_now(plan: Plan, runtime: tokio::runtime::Handle) -> Outcome {
         meter,
         heights: globe.heights,
         layer_budget: globe.budget,
+        imagery_plan: globe.plan,
         switcher: Switcher {
             layers: globe.layers,
             runtime: runtime.clone(),
@@ -309,6 +326,7 @@ mod tests {
             budget: crate::profile::Profile::desktop().budget(),
             profile: crate::profile::Profile::desktop(),
             timeout: crate::launch::START_TIMEOUT,
+            imagery_plan: tuile_core::texels::ImageryPlan::RGBA8,
         }
     }
 

@@ -137,13 +137,14 @@ fn session(
 ) -> anyhow::Result<()> {
     // The command line, read by `main`. Exit code 2 is the usual one for a
     // command that was not understood.
-    let (view, here, imagery) = match invocation {
+    let (view, here, imagery, compression) = match invocation {
         Ok(start::Invocation::Run {
             view,
             here,
             imagery,
+            compression,
             ..
-        }) => (view, here, imagery),
+        }) => (view, here, imagery, compression),
         Ok(start::Invocation::Help) => {
             println!("{}", start::usage());
             return Ok(());
@@ -186,6 +187,27 @@ fn session(
     };
     settings::init_tracing(bundled);
     lift_the_open_file_limit();
+    // How the imagery is held on the GPU: the person's choice — the flag,
+    // else the phone's settings page — and off when they made none.
+    let compression = match settings::imagery_compression(compression, &host::Machine) {
+        Ok(choice) => choice,
+        Err(why) => {
+            eprintln!("{}: {why}", embed::identity().executable);
+            std::process::exit(2);
+        }
+    };
+    // `TUILE_BACKEND=gl` forces one — a launch setting on Android.
+    let backends = crate::app::backend_named(std::env::var("TUILE_BACKEND").ok().as_deref())
+        .map_err(anyhow::Error::msg)?;
+    // What that comes to on this machine's GPU, asked before there is a
+    // window, so the first tiles decoded are already held as chosen; the
+    // device confirms it when the window brings it up.
+    let imagery_plan = pollster::block_on(tuile_wgpu::adapter_plan(compression, backends));
+    tracing::info!(
+        ?compression,
+        held = tuile_wgpu::format_name(imagery_plan.target),
+        "imagery compression"
+    );
     // How hard this machine may be pushed: the desktop's numbers, or a
     // phone's, sized from its memory. See `profile`.
     let profile = profile::Profile::current();
@@ -243,6 +265,7 @@ fn session(
         budget: budget.clone(),
         profile: profile.clone(),
         timeout: crate::launch::START_TIMEOUT,
+        imagery_plan,
     };
     let launch = launch::start(&handle, plan.clone());
     // A phone tries again by itself; a desktop says why and stops, as it
@@ -316,9 +339,8 @@ fn session(
         retries,
         window: winit::window::Window::default_attributes(),
         controls: true,
-        // `TUILE_BACKEND=gl` forces one — a launch setting on Android.
-        backends: crate::app::backend_named(std::env::var("TUILE_BACKEND").ok().as_deref())
-            .map_err(anyhow::Error::msg)?,
+        backends,
+        imagery_compression: compression,
     };
 
     // Everything the engine counts, scrapeable, so the log can stop being a
