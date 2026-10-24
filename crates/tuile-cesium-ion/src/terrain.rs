@@ -13,7 +13,7 @@ use crate::{Attribution, IonClient, IonError, IonHttp};
 use bytes::Bytes;
 use futures_util::lock::Mutex;
 use tuile_core::fetch::Fetched;
-use tuile_terrain::{LayerJson, TileCoord};
+use tuile_terrain::{LayerJson, TileCoord, TileUrlError};
 
 /// A terrain asset served by ion (e.g. Cesium World Terrain = asset 1).
 pub struct IonTerrainSource<H: IonHttp> {
@@ -92,17 +92,15 @@ impl<H: IonHttp> IonTerrainSource<H> {
     }
 
     /// Builds the tile URL: `base + layer template`, with the extensions
-    /// query the layer advertises appended.
+    /// query the layer advertises appended — the address every HTTP terrain
+    /// source builds ([`LayerJson::tile_request_url`]).
     fn tile_url(&self, s: &State, coord: TileCoord) -> Result<url::Url, IonError> {
-        let rel = s
-            .layer
-            .tile_url(coord)
-            .ok_or_else(|| IonError::Transport("layer.json has no tile template".into()))?;
-        let mut url = s.base_url.join(&rel)?;
-        if let Some(ext) = s.layer.extensions_query() {
-            url.query_pairs_mut().append_pair("extensions", &ext);
-        }
-        Ok(url)
+        s.layer
+            .tile_request_url(&s.base_url, coord)
+            .map_err(|e| match e {
+                TileUrlError::NoTemplate => IonError::Transport(e.to_string()),
+                TileUrlError::Url(e) => IonError::from(e),
+            })
     }
 
     /// Resolves the endpoint and fetches+parses `layer.json` once.
