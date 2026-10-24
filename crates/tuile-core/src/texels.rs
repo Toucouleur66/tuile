@@ -1,17 +1,22 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! The imagery format seam: which format a consumer holds its drape textures
-//! in, decided once from what its GPU can do, and the texels a
-//! [`DecodedTexture`](crate::content::DecodedTexture) carries.
+//! The imagery format seam: the format a consumer holds its drape textures
+//! in, and the texels a [`DecodedTexture`](crate::content::DecodedTexture)
+//! carries.
+//!
+//! **Compression is the consumer's choice, and it is off by default.** A
+//! consumer that wants it says so with an [`ImageryCompression`], and
+//! resolves it against its own device into an [`ImageryPlan`]: the format
+//! textures are held in once resident, and who encodes them into it. Without
+//! that, every texture is RGBA8, exactly as before.
 //!
 //! Nothing here names a graphics API. A consumer describes its adapter with a
 //! [`GpuTextureCaps`] — filled from wgpu, from another engine's adapter, or by
-//! hand in a test — and [`select`] answers with an [`ImageryPlan`]: the format
-//! textures are held in once resident, and who encodes them into it. The plan
-//! is a pure function of the capabilities, so the capability matrix is a unit
-//! test and every frontend that fills the struct the same way gets the same
-//! answer.
+//! hand in a test. [`select`] is the helper behind
+//! [`ImageryCompression::Auto`]: the best format that adapter supports. It is
+//! a pure function of the capabilities, so the capability matrix is a unit
+//! test, and nothing in tuile calls it on a consumer's behalf.
 //!
 //! The format a texture is held in is recorded on the texture itself
 //! ([`Texels::resident`]), so its cost needs no argument and the runtime that
@@ -121,9 +126,9 @@ pub enum ImageryEncode {
 /// How a consumer holds its drape textures: the format, and who encodes it.
 ///
 /// `encode` is [`ImageryEncode::None`] exactly when `target` is
-/// [`ImageryFormat::Rgba8`]. [`select`] is what makes one; the default is the
-/// uncompressed plan, which is what bake, film and every consumer that does
-/// not ask get.
+/// [`ImageryFormat::Rgba8`]. [`ImageryCompression::plan`] is what makes one;
+/// the default is the uncompressed plan, which is what every consumer that
+/// does not ask gets.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ImageryPlan {
     /// The format textures are held in once resident.
@@ -140,7 +145,46 @@ impl ImageryPlan {
     };
 }
 
-/// The plan for an adapter that can do `caps`.
+/// What a consumer asks of its drape textures. Off unless it says otherwise.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ImageryCompression {
+    /// RGBA8 everywhere: what every consumer gets unless it asks.
+    #[default]
+    Off,
+    /// The best block format the device supports: [`select`].
+    Auto,
+    /// This format, where the device can sample it and something can encode
+    /// it; RGBA8 otherwise, never a missing texture.
+    Format(BlockFormat),
+}
+
+impl ImageryCompression {
+    /// The plan this choice comes to on a device that can do `caps`.
+    pub const fn plan(self, caps: GpuTextureCaps) -> ImageryPlan {
+        let (target, encode) = match self {
+            ImageryCompression::Off => return ImageryPlan::RGBA8,
+            ImageryCompression::Auto => return select(caps),
+            // BC7 has a GPU encoder only.
+            ImageryCompression::Format(BlockFormat::Bc7) if caps.bc && caps.compute => {
+                (ImageryFormat::Bc7, ImageryEncode::Gpu)
+            }
+            ImageryCompression::Format(BlockFormat::Astc4x4) if caps.astc => (
+                ImageryFormat::Astc4x4,
+                if caps.compute {
+                    ImageryEncode::Gpu
+                } else {
+                    ImageryEncode::Cpu
+                },
+            ),
+            ImageryCompression::Format(_) => return ImageryPlan::RGBA8,
+        };
+        ImageryPlan { target, encode }
+    }
+}
+
+/// The best plan for an adapter that can do `caps`: what
+/// [`ImageryCompression::Auto`] resolves to. Only a consumer that opted in
+/// calls it.
 ///
 /// In order of preference:
 /// 1. compute and BC: BC7, encoded on the GPU;
@@ -337,6 +381,74 @@ mod tests {
             );
         }
         assert_eq!(ImageryPlan::default(), ImageryPlan::RGBA8);
+    }
+
+    /// Off by default, and off means RGBA8 whatever the device can do.
+    #[test]
+    fn compression_is_off_unless_asked() {
+        assert_eq!(ImageryCompression::default(), ImageryCompression::Off);
+        for bits in 0..8u8 {
+            let c = caps(bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
+            assert_eq!(ImageryCompression::Off.plan(c), ImageryPlan::RGBA8, "{c:?}");
+            assert_eq!(ImageryCompression::Auto.plan(c), select(c), "{c:?}");
+        }
+    }
+
+    /// A format asked for by name is honoured where the device samples it and
+    /// something encodes it, and is RGBA8 elsewhere — never a hole.
+    #[test]
+    fn a_named_format_falls_back_to_rgba8() {
+        use ImageryEncode::{Cpu, Gpu};
+        use ImageryFormat::{Astc4x4, Bc7};
+        let bc7 = ImageryCompression::Format(BlockFormat::Bc7);
+        let astc = ImageryCompression::Format(BlockFormat::Astc4x4);
+        let cases = [
+            (
+                "BC7 on Apple silicon",
+                bc7,
+                caps(true, true, true),
+                plan(Bc7, Gpu),
+            ),
+            (
+                "ASTC on Apple silicon",
+                astc,
+                caps(true, true, true),
+                plan(Astc4x4, Gpu),
+            ),
+            (
+                "BC7 on an iPhone",
+                bc7,
+                caps(false, true, true),
+                ImageryPlan::RGBA8,
+            ),
+            (
+                "ASTC on desktop NVIDIA",
+                astc,
+                caps(true, false, true),
+                ImageryPlan::RGBA8,
+            ),
+            (
+                "ASTC on WebGL2 mobile",
+                astc,
+                caps(false, true, false),
+                plan(Astc4x4, Cpu),
+            ),
+            (
+                "BC7 on WebGL2 desktop",
+                bc7,
+                caps(true, false, false),
+                ImageryPlan::RGBA8,
+            ),
+            (
+                "BC7 on nothing",
+                bc7,
+                GpuTextureCaps::default(),
+                ImageryPlan::RGBA8,
+            ),
+        ];
+        for (case, choice, caps, wanted) in cases {
+            assert_eq!(choice.plan(caps), wanted, "{case}");
+        }
     }
 
     #[test]

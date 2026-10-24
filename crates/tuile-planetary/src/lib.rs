@@ -488,6 +488,14 @@ pub struct GlobeOptions {
     /// the same layers, placements, digests and composed size as from the
     /// bytes; a tile the provider cannot describe is fetched as always.
     pub imagery_by_stamp: bool,
+    /// How the consumer holds the imagery it is handed: its own
+    /// [`tuile_core::texels::ImageryCompression`] resolved against its own
+    /// device. The default is RGBA8, and nothing here chooses otherwise.
+    ///
+    /// Every texture still comes out RGBA8 held as RGBA8 whatever this says:
+    /// the encoders that honour it land in the consumer's upload (GPU) and in
+    /// the decode job (CPU).
+    pub imagery_plan: tuile_core::texels::ImageryPlan,
 }
 
 /// The consumer's answer to "do you already hold this drape?".
@@ -1720,6 +1728,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The loader compresses nothing unless its consumer asks.
+    #[test]
+    fn imagery_is_held_as_rgba8_by_default() {
+        assert_eq!(
+            GlobeOptions::default().imagery_plan,
+            tuile_core::texels::ImageryPlan::RGBA8
+        );
+    }
 
     /// An imagery provider that refuses everything and counts being asked.
     ///
