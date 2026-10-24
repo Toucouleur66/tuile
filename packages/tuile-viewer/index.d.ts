@@ -25,7 +25,11 @@ export interface ImageryLayer {
   attribution: string;
   /** The catalog's asset number. Give this or `template`. */
   asset?: number;
-  /** `https://…/{z}/{x}/{y}.png`. Give this or `asset`. */
+  /**
+   * `https://…/{z}/{x}/{y}.png`, addressed XYZ: row 0 in the north. Give this
+   * or `asset`. Absolute; the server must answer with
+   * `Access-Control-Allow-Origin`.
+   */
   template?: string;
   /** The grid a template's tiles are cut on. `webmercator` unless said. */
   scheme?: "webmercator" | "geographic";
@@ -39,11 +43,16 @@ export interface Sources {
    * The catalog that resolves asset numbers to tile endpoints: `url` is the
    * address of the catalog proxy, which holds the catalog's token on the server
    * (`tuile-catalog-proxy`). Relative to the page unless absolute. The page
-   * never holds a token.
+   * never holds a token. Required only when a source is named by `asset`.
    */
-  catalog: { url: string };
-  /** The terrain: an asset of the catalog. */
-  terrain: { asset: number };
+  catalog?: { url: string };
+  /**
+   * The terrain: an asset of the catalog, or quantized-mesh terrain served at
+   * the URL of its `layer.json` (relative to the page unless absolute; no
+   * token, and the server must answer with `Access-Control-Allow-Origin`).
+   * Its tiles are addressed as the `layer.json` says — TMS, row 0 in the south.
+   */
+  terrain: { asset: number } | { url: string };
   /** The layers, in the order a person should meet them; the first is shown first. */
   imagery: ImageryLayer[];
 }

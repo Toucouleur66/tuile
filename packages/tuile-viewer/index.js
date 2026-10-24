@@ -83,11 +83,17 @@ export async function createViewer(container, options) {
     ownCanvas = true;
   }
 
-  // The catalog proxy's address, resolved against the page: the worker that
-  // asks it has a base URL of its own.
-  const sources = o.sources?.catalog?.url
-    ? { ...o.sources, catalog: { ...o.sources.catalog, url: new URL(o.sources.catalog.url, location.href).href } }
-    : o.sources;
+  // The catalog proxy's and the terrain's addresses, resolved against the
+  // page: the worker that asks them has a base URL of its own. (Imagery
+  // templates are left as given: resolving one would escape its braces.)
+  const resolve = (url) => new URL(url, location.href).href;
+  let sources = o.sources;
+  if (sources?.catalog?.url) {
+    sources = { ...sources, catalog: { ...sources.catalog, url: resolve(sources.catalog.url) } };
+  }
+  if (typeof sources?.terrain?.url === "string") {
+    sources = { ...sources, terrain: { ...sources.terrain, url: resolve(sources.terrain.url) } };
+  }
   const normalized = {
     name: o.name ?? "Globe",
     sources,

@@ -30,6 +30,8 @@ tuile-tape = { version = "0.12.0", path = "../tuile-tape" }
 tuile-terrain = { version = "0.12.0", path = "../tuile-terrain" }
 tuile-ui = { version = "0.12.0", path = "../tuile-ui" }
 tuile-wgpu = { version = "0.12.0", path = "../tuile-wgpu" }
+# Sources named by address (`open`): a terrain's layer.json, an imagery template.
+url = { workspace = true }
 wgpu = { workspace = true }
 web-time = { workspace = true }
 winit = { workspace = true }
@@ -71,7 +73,6 @@ serde = { workspace = true }
 serde-wasm-bindgen = "0.6.5"
 tuile-cesium-ion = { version = "0.12.0", path = "../tuile-cesium-ion" }
 tuile-web = { version = "0.12.0", path = "../tuile-web" }
-url = { workspace = true }
 wasm-bindgen = "0.2.99"
 wasm-bindgen-futures = "0.4.49"
 wgpu = { workspace = true, features = ["webgpu", "webgl"] }
@@ -119,7 +120,6 @@ futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
-url = { workspace = true }
 
 # Android: winit's backend over the platform's native activity (no Java of
 # the application's own beyond the small `TuileActivity`, so no Gradle);
