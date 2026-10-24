@@ -132,10 +132,11 @@ impl ViewSpec {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct SourcesSpec {
     /// The catalog that resolves asset numbers to endpoints: the address of
-    /// the proxy that holds its token. A page never holds one.
+    /// the proxy that holds its token. A page never holds one. Required only
+    /// when some source is named by an asset number.
     #[serde(default)]
     pub catalog: Option<CatalogSpec>,
-    pub terrain: AssetSpec,
+    pub terrain: TerrainSpec,
     pub imagery: Vec<LayerSpec>,
 }
 
@@ -146,11 +147,56 @@ pub(crate) struct CatalogSpec {
     pub url: String,
 }
 
-/// An asset of the catalog, by number.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// The terrain: an asset of the catalog, by number, or quantized-mesh terrain
+/// at the URL of its `layer.json` — `{ "asset": 1 }` or
+/// `{ "url": "https://…/layer.json" }`, one or the other.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "TerrainFields", into = "TerrainFields")]
+pub(crate) enum TerrainSpec {
+    Asset(i64),
+    Url(String),
+}
+
+/// The terrain's object as the page writes it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AssetSpec {
-    pub asset: i64,
+struct TerrainFields {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    asset: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+}
+
+impl TryFrom<TerrainFields> for TerrainSpec {
+    type Error = String;
+
+    fn try_from(fields: TerrainFields) -> Result<Self, String> {
+        match (fields.asset, fields.url) {
+            (Some(asset), None) => Ok(Self::Asset(asset)),
+            (None, Some(url)) => Ok(Self::Url(url)),
+            (Some(_), Some(_)) => {
+                Err("`sources.terrain` gives both an `asset` and a `url`: give one".to_owned())
+            }
+            (None, None) => Err(
+                "`sources.terrain` needs a catalog `asset` or the `url` of a layer.json".to_owned(),
+            ),
+        }
+    }
+}
+
+impl From<TerrainSpec> for TerrainFields {
+    fn from(spec: TerrainSpec) -> Self {
+        match spec {
+            TerrainSpec::Asset(asset) => Self {
+                asset: Some(asset),
+                url: None,
+            },
+            TerrainSpec::Url(url) => Self {
+                asset: None,
+                url: Some(url),
+            },
+        }
+    }
 }
 
 /// One imagery layer: from the catalog by asset number, or from a URL
@@ -187,8 +233,13 @@ impl SourcesSpec {
     /// A template layer has no catalog number, so it is given one the catalog
     /// never uses — negative, by its place in the list — which is what the
     /// worker's sources answer it by.
+    ///
+    /// The catalog is asked for only when some source is named by its number:
+    /// a terrain at a URL under template layers needs none.
     pub(crate) fn choices(&self) -> Result<(TerrainChoice, Vec<ImageryChoice>), String> {
-        self.catalog_base()?;
+        if self.needs_catalog() {
+            self.catalog_base()?;
+        }
         if self.imagery.is_empty() {
             return Err("`sources.imagery` lists no layer".to_owned());
         }
@@ -196,12 +247,9 @@ impl SourcesSpec {
         for (index, layer) in self.imagery.iter().enumerate() {
             let asset = match (&layer.asset, &layer.template) {
                 (Some(asset), None) if *asset >= 0 => *asset,
-                (None, Some(template)) if template.contains("{z}") => template_asset(index),
-                (None, Some(_)) => {
-                    return Err(format!(
-                        "imagery {:?}: a template names {{z}}, {{x}} and {{y}}",
-                        layer.key
-                    ))
+                (None, Some(template)) => {
+                    crate::open::check_template(&format!("imagery {:?}:", layer.key), template)?;
+                    template_asset(index)
                 }
                 _ => {
                     return Err(format!(
@@ -220,11 +268,31 @@ impl SourcesSpec {
                 &layer.attribution,
             ));
         }
-        let terrain = TerrainChoice {
-            asset: self.terrain.asset,
-            cache: format!("terrain-{}", self.terrain.asset),
+        let terrain = match &self.terrain {
+            TerrainSpec::Asset(asset) => TerrainChoice {
+                asset: *asset,
+                cache: format!("terrain-{asset}"),
+            },
+            TerrainSpec::Url(url) => {
+                crate::open::absolute_url("`sources.terrain.url`", url)?;
+                TerrainChoice::at_url(url)
+            }
         };
         Ok((terrain, layers))
+    }
+
+    /// Whether some source is named by a catalog's asset number.
+    pub(crate) fn needs_catalog(&self) -> bool {
+        matches!(self.terrain, TerrainSpec::Asset(_))
+            || self.imagery.iter().any(|l| l.asset.is_some())
+    }
+
+    /// The terrain's `layer.json`, when it is named by its address.
+    pub(crate) fn terrain_url(&self) -> Option<&str> {
+        match &self.terrain {
+            TerrainSpec::Url(url) => Some(url),
+            TerrainSpec::Asset(_) => None,
+        }
     }
 
     /// The template layer an asset number stands for, if it is one.
@@ -237,9 +305,10 @@ impl SourcesSpec {
     /// paths are read under it.
     pub(crate) fn catalog_base(&self) -> Result<url::Url, String> {
         let Some(url) = self.catalog.as_ref().map(|c| c.url.as_str()) else {
-            return Err(
-                "terrain comes from a catalog: `sources.catalog.url` is required".to_owned(),
-            );
+            return Err("a source is named by a catalog asset number: \
+                 `sources.catalog.url` is required (or name the terrain by `url` \
+                 and the imagery by `template`)"
+                .to_owned());
         };
         let mut base = url::Url::parse(url).map_err(|e| format!("catalog url {url:?}: {e}"))?;
         if !base.path().ends_with('/') {
@@ -253,14 +322,7 @@ impl LayerSpec {
     /// The grid a template layer's tiles are cut on, as deep as the page
     /// says they go.
     pub(crate) fn tiling(&self) -> tuile_core::raster::TilingScheme {
-        let mut scheme = match self.scheme.unwrap_or(Grid::Webmercator) {
-            Grid::Webmercator => tuile_core::raster::TilingScheme::web_mercator(),
-            Grid::Geographic => tuile_core::raster::TilingScheme::geographic(),
-        };
-        if let Some(deepest) = self.max_level {
-            scheme.maximum_level = deepest;
-        }
-        scheme
+        crate::open::template_tiling(self.scheme == Some(Grid::Geographic), self.max_level)
     }
 }
 
@@ -388,6 +450,87 @@ mod tests {
         )
         .unwrap_err()
         .contains("tokn"));
+    }
+
+    /// A terrain named by its `layer.json` under template layers needs no
+    /// catalog; the worker is handed the same spec it was given.
+    #[test]
+    fn a_terrain_at_a_url_needs_no_catalog() {
+        let o = options(
+            r#"{"profile":"desktop","sources":{
+                "terrain": { "url": "http://127.0.0.1:8092/terrain/layer.json" },
+                "imagery": [{ "key": "relief", "name": "Relief", "attribution": "synthetic",
+                    "template": "http://127.0.0.1:8092/imagery/{z}/{x}/{y}.png",
+                    "scheme": "geographic", "maxLevel": 15 }]
+            }}"#,
+        )
+        .expect("valid");
+        assert!(!o.sources.needs_catalog());
+        let (terrain, layers) = o.sources.choices().expect("no catalog is needed");
+        assert_eq!(
+            terrain,
+            TerrainChoice::at_url("http://127.0.0.1:8092/terrain/layer.json")
+        );
+        assert_eq!(
+            o.sources.terrain_url(),
+            Some("http://127.0.0.1:8092/terrain/layer.json")
+        );
+        assert!(layers[0].asset < 0);
+        assert_eq!(o.sources.imagery[0].tiling().maximum_level, 15);
+        // What the page posts to the worker reads back as the same spec.
+        let posted = serde_json::to_string(&o.sources).expect("serialisable");
+        assert!(posted.contains(r#""terrain":{"url":"#), "{posted}");
+        let read: SourcesSpec = serde_json::from_str(&posted).expect("readable");
+        assert_eq!(read, o.sources);
+    }
+
+    /// An asset number without a catalog, a terrain with both or neither of
+    /// its two names, and an address that is not one: each refused in a
+    /// sentence that says what to give.
+    #[test]
+    fn a_wrong_terrain_is_named() {
+        let asset_without_catalog = options(
+            r#"{"profile":"desktop","sources":{"terrain":{"asset":1},
+                "imagery":[{"key":"a","name":"A","attribution":"©",
+                "template":"https://t.test/{z}/{x}/{y}.png"}]}}"#,
+        )
+        .expect("readable");
+        let why = asset_without_catalog.sources.choices().unwrap_err();
+        assert!(why.contains("`sources.catalog.url` is required"), "{why}");
+        let imagery_asset_without_catalog = options(
+            r#"{"profile":"desktop","sources":{"terrain":{"url":"https://t.test/layer.json"},
+                "imagery":[{"key":"a","name":"A","attribution":"©","asset":2}]}}"#,
+        )
+        .expect("readable");
+        assert!(imagery_asset_without_catalog
+            .sources
+            .choices()
+            .unwrap_err()
+            .contains("catalog"));
+        let both = options(
+            r#"{"profile":"desktop","sources":{"terrain":{"asset":1,"url":"https://t.test/layer.json"},"imagery":[]}}"#,
+        )
+        .unwrap_err();
+        assert!(both.contains("give one"), "{both}");
+        let neither =
+            options(r#"{"profile":"desktop","sources":{"terrain":{},"imagery":[]}}"#).unwrap_err();
+        assert!(neither.contains("layer.json"), "{neither}");
+        let unknown = options(
+            r#"{"profile":"desktop","sources":{"terrain":{"href":"https://t.test/layer.json"},"imagery":[]}}"#,
+        )
+        .unwrap_err();
+        assert!(unknown.contains("href"), "{unknown}");
+        let relative = options(
+            r#"{"profile":"desktop","sources":{"terrain":{"url":"terrain/layer.json"},
+                "imagery":[{"key":"a","name":"A","attribution":"©",
+                "template":"https://t.test/{z}/{x}/{y}.png"}]}}"#,
+        )
+        .expect("readable");
+        assert!(relative
+            .sources
+            .choices()
+            .unwrap_err()
+            .contains("not a URL"));
     }
 
     /// A view is held to the flags' bounds; the backend choice maps to the

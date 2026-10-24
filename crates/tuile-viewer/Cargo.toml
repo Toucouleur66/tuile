@@ -30,6 +30,8 @@ tuile-tape = { version = "0.12.0", path = "../tuile-tape" }
 tuile-terrain = { version = "0.12.0", path = "../tuile-terrain" }
 tuile-ui = { version = "0.12.0", path = "../tuile-ui" }
 tuile-wgpu = { version = "0.12.0", path = "../tuile-wgpu" }
+# Sources named by address (`open`): a terrain's layer.json, an imagery template.
+url = { workspace = true }
 wgpu = { workspace = true }
 web-time = { workspace = true }
 winit = { workspace = true }
@@ -44,6 +46,9 @@ pollster = { workspace = true }
 # `time` for the bounded flush of the tile store on the way out.
 tokio = { workspace = true, features = ["sync", "time"] }
 tuile-storage-foyer = { version = "0.12.0", path = "../tuile-storage-foyer" }
+# The sources the command line names by address (`--terrain-url`,
+# `--imagery-template`), fetched with no token over the native HTTP stack.
+tuile-native-fetchers = { version = "0.12.0", path = "../tuile-native-fetchers" }
 # Ctrl-C, SIGTERM and SIGHUP have to end the *session*, not the process: a
 # recording is most valuable in exactly the run that ends badly. A safe wrapper
 # rather than raw `libc::signal`, because the workspace denies `unsafe_code`.
@@ -71,7 +76,6 @@ serde = { workspace = true }
 serde-wasm-bindgen = "0.6.5"
 tuile-cesium-ion = { version = "0.12.0", path = "../tuile-cesium-ion" }
 tuile-web = { version = "0.12.0", path = "../tuile-web" }
-url = { workspace = true }
 wasm-bindgen = "0.2.99"
 wasm-bindgen-futures = "0.4.49"
 wgpu = { workspace = true, features = ["webgpu", "webgl"] }
@@ -119,7 +123,6 @@ futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
-url = { workspace = true }
 
 # Android: winit's backend over the platform's native activity (no Java of
 # the application's own beyond the small `TuileActivity`, so no Gradle);

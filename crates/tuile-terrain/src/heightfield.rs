@@ -12,8 +12,9 @@
 //! - [`HeightfieldSource`]: the [`TerrainSource`] that cuts a relief into
 //!   the tiles of the geographic quadtree, each a regular grid of vertices
 //!   with its full header ([`Header::for_vertices`]), its four edges and its
-//!   oct-encoded normals. Around the footprint it answers the
-//!   [`Ellipsoid`]'s tiles, so that a client always has ground to draw.
+//!   oct-encoded normals. Around the footprint it answers flat tiles on the
+//!   ellipsoid, down to the [`Ellipsoid`]'s levels, so that a client always
+//!   has ground to draw.
 //!
 //! **Shared edges are shared samples.** A vertex's longitude and latitude
 //! are a function of its level and its index in that level's global vertex
@@ -191,9 +192,16 @@ impl Heights for Grid {
     }
 
     /// Bilinear where the box is no wider than a sample spacing; otherwise
-    /// the mean of the samples inside it, those off the grid counting as
-    /// zero — so a coarse vertex carries its ground's mean height, not
-    /// whichever sample it happens to land on.
+    /// the mean over the box, each sample standing for the cell around it
+    /// and weighted by how much of that cell the box covers — those off the
+    /// grid counting as zero — so a coarse vertex carries its ground's mean
+    /// height, not whichever sample it happens to land on.
+    ///
+    /// Weighted by area rather than by counting the samples inside: a count
+    /// jumps by a whole row as the box slides, which moves the mean by half a
+    /// sample from one vertex to the next and stripes a slope with false
+    /// normals. The weights slide with the box, and at one sample wide they
+    /// are exactly the bilinear weights.
     fn mean_height(&self, lon_deg: f64, lat_deg: f64, span_lon_deg: f64, span_lat_deg: f64) -> f64 {
         let across = span_lon_deg / self.step_lon;
         let down = span_lat_deg / self.step_lat;
@@ -201,36 +209,41 @@ impl Heights for Grid {
             return self.height(lon_deg, lat_deg);
         }
         let (c, r) = self.position(lon_deg, lat_deg);
-        // The lattice points inside the box, the grid extended past its
-        // edges with zeros: their count is the box's whatever lies under it.
-        let span = |centre: f64, width: f64| {
+        // The samples on the grid whose cells the box overlaps, and by how
+        // much: those off it are zeros, which weigh nothing in the sum, so
+        // they are not visited — a coarse tile's box spans far more ground
+        // than the grid.
+        let weights = |centre: f64, width: f64, count: usize| {
             let half = width.max(1.0) / 2.0;
-            (
-                (centre - half).ceil() as i64,
-                (centre + half).floor() as i64,
-            )
+            let (lo, hi) = (centre - half, centre + half);
+            let first = ((lo + 0.5).floor() as i64).max(0);
+            let last = ((hi - 0.5).ceil() as i64).min(count as i64 - 1);
+            (first..=last)
+                .map(move |i| {
+                    let cell = (i as f64 - 0.5, i as f64 + 0.5);
+                    (i, (hi.min(cell.1) - lo.max(cell.0)).max(0.0))
+                })
+                .filter(|(_, w)| *w > 0.0)
         };
-        let (c_first, c_last) = span(c, across);
-        let (r_first, r_last) = span(r, down);
-        let count = (c_last - c_first + 1).max(0) * (r_last - r_first + 1).max(0);
-        if count == 0 {
-            return self.height(lon_deg, lat_deg);
-        }
+        let area = across.max(1.0) * down.max(1.0);
         let mut sum = 0.0;
-        for row in r_first.max(0)..=r_last.min(self.rows as i64 - 1) {
-            for column in c_first.max(0)..=c_last.min(self.columns as i64 - 1) {
-                sum += self.at(column, row);
+        for (row, wr) in weights(r, down, self.rows) {
+            for (column, wc) in weights(c, across, self.columns) {
+                sum += wr * wc * self.at(column, row);
             }
         }
-        sum / count as f64
+        sum / area
     }
 }
 
 /// What a [`HeightfieldSource`] answers for a tile outside its footprint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Outside {
-    /// The [`Ellipsoid`]'s tile, down to [`ELLIPSOID_LEVELS`], and no tile
-    /// below: ground everywhere around the relief.
+    /// The ellipsoid at 0 m, down to [`ELLIPSOID_LEVELS`], and no tile
+    /// below: ground everywhere around the relief. Made as the relief's own
+    /// tiles are — the same vertices, and normals — not as [`Ellipsoid`]'s:
+    /// a tile without the normals the `layer.json` promises is lit
+    /// otherwise than its neighbour, and every edge between them shows.
     #[default]
     Ellipsoid,
     /// No tile at all.
@@ -296,7 +309,9 @@ impl<H: Heights> HeightfieldSource<H> {
             return Ok(self.relief_tile(coord));
         }
         match self.outside {
-            Outside::Ellipsoid if coord.level <= ELLIPSOID_LEVELS => Ok(Ellipsoid::tile(coord)),
+            // Every height outside the footprint is zero (`Heights`): the
+            // relief's own tile there is the ellipsoid, normals included.
+            Outside::Ellipsoid if coord.level <= ELLIPSOID_LEVELS => Ok(self.relief_tile(coord)),
             _ => Err(absent()),
         }
     }
@@ -838,6 +853,38 @@ mod tests {
         assert_eq!(grid.mean_height(-10.0, 0.0, 1.0, 1.0), 0.0);
     }
 
+    /// On a plane, the box mean follows the plane as the box slides: no
+    /// jump of half a sample when a row of samples enters or leaves it,
+    /// whatever its width — the stripes a count of the samples inside put
+    /// on every slope.
+    #[test]
+    fn the_box_mean_slides_smoothly_over_a_slope() {
+        let side = 129;
+        // 10 m per sample eastward, 3 m per sample southward.
+        let heights: Vec<f32> = (0..side * side)
+            .map(|k| (10 * (k % side) + 3 * (k / side)) as f32)
+            .collect();
+        let grid = Grid::new(side, side, heights, footprint()).expect("grid");
+        let plane = |c: f64, r: f64| 10.0 * c + 3.0 * r;
+        for width in [1.3, 2.0, 2.5, 3.7, 6.0] {
+            let (span_lon, span_lat) = (width * grid.step_lon, width * grid.step_lat);
+            for k in 0..200 {
+                let (c, r) = (40.0 + k as f64 * 0.137, 50.0 + k as f64 * 0.071);
+                let lon = grid.west + c * grid.step_lon;
+                let lat = grid.north - r * grid.step_lat;
+                let mean = grid.mean_height(lon, lat, span_lon, span_lat);
+                // A sample stands for its cell: at most an eighth of a
+                // sample off the plane in each direction.
+                let error = (mean - plane(c, r)).abs();
+                assert!(
+                    error <= 13.0 / 8.0 + 1e-6,
+                    "width {width}, at ({c:.3}, {r:.3}): {mean} against {}",
+                    plane(c, r)
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_grid_is_refused_when_its_heights_do_not_fit() {
         assert_eq!(
@@ -858,20 +905,39 @@ mod tests {
         .is_err());
     }
 
-    /// Around the footprint, the ellipsoid's own tiles down to its levels,
-    /// then nothing; past `max_level`, nothing even inside; and with
+    /// Around the footprint, flat tiles on the ellipsoid with the relief's
+    /// normals down to the ellipsoid's levels, then nothing; past `max_level`, nothing even inside; and with
     /// [`Outside::NoSuchTile`], nothing anywhere outside.
     #[test]
     fn outside_the_footprint_is_the_ellipsoid_then_nothing() {
         let source = source();
         let far = TileCoord::new(5, 3, 7);
         assert!(!source.covers(far));
-        assert_eq!(source.tile(far).expect("ellipsoid"), Ellipsoid::tile(far));
         let far_deep = TileCoord::new(ELLIPSOID_LEVELS, 100, 200);
-        assert_eq!(
-            source.tile(far_deep).expect("ellipsoid"),
-            Ellipsoid::tile(far_deep)
-        );
+        for c in [far, far_deep] {
+            let mesh = decode(&source.tile(c).expect("ellipsoid")).expect("a mesh");
+            assert_eq!((mesh.header.min_height, mesh.header.max_height), (0.0, 0.0));
+            let normals = mesh
+                .normals
+                .as_ref()
+                .expect("the normals the layer promises");
+            assert_eq!(mesh.vertex_count(), DEFAULT_VERTICES_PER_SIDE.pow(2));
+            // Flat: every normal is the ellipsoid's up, to the oct encoding's
+            // two bytes.
+            let rect = GeographicTilingScheme::default().tile_rect(c);
+            for (k, n) in normals.iter().enumerate() {
+                let lon = rect.west + mesh.u[k] * rect.width();
+                let lat = rect.south + mesh.v[k] * rect.height();
+                let up = enu_frame(Geodetic {
+                    lon,
+                    lat,
+                    height: 0.0,
+                })
+                .col(2);
+                let n = DVec3::new(f64::from(n[0]), f64::from(n[1]), f64::from(n[2]));
+                assert!(n.dot(up) > 0.999, "{c:?} vertex {k}: {n:?}");
+            }
+        }
         let beyond = TileCoord::new(ELLIPSOID_LEVELS + 1, 100, 200);
         assert!(source.tile(beyond).expect_err("none").is_absence());
         let deeper = inside(16);

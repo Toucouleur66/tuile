@@ -6740,6 +6740,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "tuile-heightfield-serve"
+version = "0.12.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "image",
+ "rustls-pki-types",
+ "tokio",
+ "tokio-rustls",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "tuile-terrain",
+]
+
+[[package]]
 name = "tuile-hydra"
 version = "0.12.0"
 dependencies = [
@@ -7050,6 +7067,7 @@ dependencies = [
  "tuile-cesium-ion",
  "tuile-core",
  "tuile-metrics",
+ "tuile-native-fetchers",
  "tuile-overlay",
  "tuile-planetary",
  "tuile-storage-foyer",

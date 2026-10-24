@@ -79,6 +79,7 @@ mod journal;
 mod launch;
 mod location;
 mod menu;
+mod open;
 mod profile;
 mod recording;
 mod session;

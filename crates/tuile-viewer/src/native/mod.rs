@@ -12,6 +12,7 @@ pub mod android;
 #[cfg(any(target_os = "android", test))]
 pub(crate) mod android_signals;
 pub(crate) mod launch;
+mod open;
 pub(crate) mod settings;
 pub(crate) mod store;
 
@@ -58,9 +59,27 @@ fn in_a_bundle() -> bool {
 /// requires. Exit code 0 for a session that ended, 1 for one that failed, 2
 /// for a command line that was not understood.
 pub fn main(embedder: impl ViewerHost) -> ! {
+    // The command line first, before the logger, the token, the network and
+    // the window: a mistyped flag must cost nothing but the message that says
+    // so. An Android application has no command line: its process is forked
+    // from the system's, whose arguments are not the viewer's. Its knobs
+    // arrive as launch settings instead (see `android`).
+    let arguments: Vec<String> = if cfg!(target_os = "android") {
+        Vec::new()
+    } else {
+        std::env::args().skip(1).collect()
+    };
+    let invocation = start::parse(arguments);
+    // Sources the command line named by address take the host's place —
+    // before the layers are adopted, since a template is then the only one.
+    let addresses = match &invocation {
+        Ok(start::Invocation::Run { addresses, .. }) => addresses.clone(),
+        _ => start::Addresses::default(),
+    };
+    let embedder = open::Addressed::wrap(Arc::new(embedder), addresses);
     embed::adopt(embedder.identity(), embedder.imagery());
     journal::open();
-    if let Err(error) = session(Arc::new(embedder)) {
+    if let Err(error) = session(embedder, invocation) {
         journal::note(&format!("session failed: {error:#}"));
         // From an icon, stderr is the system log and nobody is reading it: an
         // application that fails must say so in a window, or it has simply
@@ -112,23 +131,18 @@ fn lift_the_open_file_limit() {
     }
 }
 
-fn session(embedder: Arc<dyn ViewerHost>) -> anyhow::Result<()> {
-    // The command line first, before the logger, the token, the network and
-    // the window: a mistyped flag must cost nothing but the message that says
-    // so. Exit code 2 is the usual one for a command that was not understood.
-    // An Android application has no command line: its process is forked from
-    // the system's, whose arguments are not the viewer's. Its knobs arrive
-    // as launch settings instead (see `android`).
-    let arguments: Vec<String> = if cfg!(target_os = "android") {
-        Vec::new()
-    } else {
-        std::env::args().skip(1).collect()
-    };
-    let (view, here, imagery) = match start::parse(arguments) {
+fn session(
+    embedder: Arc<dyn ViewerHost>,
+    invocation: Result<start::Invocation, String>,
+) -> anyhow::Result<()> {
+    // The command line, read by `main`. Exit code 2 is the usual one for a
+    // command that was not understood.
+    let (view, here, imagery) = match invocation {
         Ok(start::Invocation::Run {
             view,
             here,
             imagery,
+            ..
         }) => (view, here, imagery),
         Ok(start::Invocation::Help) => {
             println!("{}", start::usage());

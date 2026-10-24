@@ -1,0 +1,31 @@
+[package]
+name = "tuile-heightfield-serve"
+description = "A synthetic relief served as quantized-mesh terrain and XYZ imagery over plain HTTP: the reference for a server that makes its own maps"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+axum = "0.8"
+image = { workspace = true }
+tokio = { workspace = true, features = ["net", "signal"] }
+# CORS: the viewer's page is served from another origin than the tiles.
+tower-http = { version = "0.6", features = ["cors"] }
+# HTTPS for a phone on the local network, whose page is HTTPS (WebGPU needs a
+# secure page) and may not fetch plain HTTP: the TLS stack reqwest already
+# brings, as the catalog proxy uses it.
+tokio-rustls = { version = "0.26", default-features = false }
+rustls-pki-types = { version = "1", features = ["std"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tuile-terrain = { version = "0.12.0", path = "../../crates/tuile-terrain" }
+
+[dev-dependencies]
+tower = "0.5"
