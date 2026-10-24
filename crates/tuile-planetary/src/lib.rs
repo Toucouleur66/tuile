@@ -86,21 +86,6 @@ type MeshFuture<'a> = std::pin::Pin<
     >,
 >;
 
-/// The tile to lay underneath the sharp mosaic: the closest ancestor already
-/// decoded, or the guaranteed floor if none is.
-///
-/// A fixed level would be the simple answer and it wastes what is already in
-/// hand. Descending to level 18 leaves every level on the way down in the cache;
-/// pulling back and covering the ground with level 5 — 4.9 km per texel — when
-/// level 12 is sitting right there is gratuitous blur, and blur that lasts for
-/// as long as the network takes.
-///
-/// So the walk starts at the deepest tile that covers the rectangle whole and
-/// climbs until it finds one that is decoded, stopping at [`FLOOR_LEVEL`],
-/// which is pinned and therefore always there. As sharp as what is available,
-/// never sharper, and never nothing. This is what the reference implementation
-/// does when a tile's own imagery has not arrived — it walks up to the closest
-/// ready ancestor rather than to a level chosen in advance.
 impl GlobeOptions {
     /// These options with the consumer's imagery compression: one choice,
     /// resolved against its own device into both
@@ -156,6 +141,21 @@ fn fixed_floor(scheme: &raster::TilingScheme, rect: &GeoRect) -> ImageryCoord {
     }
 }
 
+/// The tile to lay underneath the sharp mosaic: the closest ancestor already
+/// decoded, or the guaranteed floor if none is.
+///
+/// A fixed level would be the simple answer and it wastes what is already in
+/// hand. Descending to level 18 leaves every level on the way down in the cache;
+/// pulling back and covering the ground with level 5 — 4.9 km per texel — when
+/// level 12 is sitting right there is gratuitous blur, and blur that lasts for
+/// as long as the network takes.
+///
+/// So the walk starts at the deepest tile that covers the rectangle whole and
+/// climbs until it finds one that is decoded, stopping at [`FLOOR_LEVEL`],
+/// which is pinned and therefore always there. As sharp as what is available,
+/// never sharper, and never nothing. This is what the reference implementation
+/// does when a tile's own imagery has not arrived — it walks up to the closest
+/// ready ancestor rather than to a level chosen in advance.
 fn coarse_floor(
     scheme: &raster::TilingScheme,
     rect: &GeoRect,
