@@ -28,6 +28,7 @@
 //! The crate never creates a window or a surface; the host owns the event
 //! loop and the render pass.
 
+mod compress;
 mod context;
 mod encode;
 mod overlay;
@@ -41,7 +42,13 @@ mod targets;
 mod webgl2;
 mod world_overlay;
 
-pub use context::{ContextError, GpuContext, DEPTH_FORMAT, SAMPLES, TEXTURE_FORMAT};
+pub use compress::{
+    adapter_plan, caps_of, compression_named, format_name, plan_features, plan_for,
+    stored_features, texture_caps, EncodePace, EncodeStats, ImageryCompression,
+};
+pub use context::{
+    ContextError, GpuContext, ImageryTextures, DEPTH_FORMAT, SAMPLES, TEXTURE_FORMAT,
+};
 pub use overlay::{OverlayRenderer, OverlayVertex};
 pub use prepare::{
     prepare, prepare_drape, PreparedDrape, PreparedMesh, PreparedTile, Vertex, STITCH_ROWS,

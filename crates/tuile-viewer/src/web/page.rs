@@ -183,6 +183,9 @@ fn start_viewer_with(
             .with_prevent_default(true),
         controls: options.ui,
         backends: Some(options.backend.backends()),
+        // The page's loader runs in its worker, which does not take a plan
+        // yet: its imagery is RGBA8.
+        imagery_compression: tuile_wgpu::ImageryCompression::Off,
     };
     let app = App::new(config, launch);
     let id = CURRENT.with(|c| c.get()) + 1;

@@ -89,6 +89,8 @@ async fn start(spec: SourcesSpec, opening: usize, profile: Profile) -> Result<()
         &layers,
         opening,
         Arc::new(super::decode::WebDecode),
+        // The worker takes no plan yet: tiles stored compressed are unpacked.
+        tuile_core::texels::StoredPlan::OFF,
     )
     .await
     .map_err(|e| format!("{e:#}"))?;

@@ -224,14 +224,27 @@ impl DrapeContent {
     /// still charge the overlap twice: an over-estimate, never an under-one.
     /// Its staging bytes — what an upload moves — are every tile's whole.
     pub fn cost(&self) -> crate::budget::cost::Cost {
+        // In the format each texture is held in, recorded on it.
+        self.cost_with(|_, t| t.texture.cost())
+    }
+
+    /// [`Self::cost`], with each imagery tile's whole cost said by `whole` —
+    /// given its index in [`Self::tiles`] and the tile — rather than read off
+    /// its texture: what a consumer acknowledges once it
+    /// knows the format each tile really went resident in — a texture headed
+    /// for a block format that had to stay RGBA8 costs RGBA8.
+    pub fn cost_with(
+        &self,
+        mut whole: impl FnMut(usize, &crate::raster::ImageryLayer) -> crate::budget::cost::Cost,
+    ) -> crate::budget::cost::Cost {
         use crate::budget::cost::Cost;
         use crate::budget::Bytes;
         self.tiles
             .iter()
+            .enumerate()
             .skip(self.floor_tiles)
-            .map(|t| {
-                // In the format the texture is held in, recorded on it.
-                let whole = t.texture.cost();
+            .map(|(i, t)| {
+                let whole = whole(i, t);
                 // The tile spans 1 / scale of the drape's uv square on each
                 // axis; the part of it inside the square is its coverage.
                 let c = t.coverage;
@@ -308,6 +321,17 @@ impl DecodedTexture {
         }
     }
 
+    /// The same texture, held as `plan` says: RGBA8 the consumer's GPU
+    /// encodes at upload is marked with the format it will be held in, so its
+    /// cost follows. Blocks, and any plan that does not encode on the GPU,
+    /// are left as they are.
+    pub fn planned(mut self, plan: crate::texels::ImageryPlan) -> Self {
+        if let crate::texels::Texels::Rgba8 { resident, .. } = &mut self.texels {
+            *resident = plan.rgba8_resident();
+        }
+        self
+    }
+
     /// The RGBA8 pixels, if that is what this texture carries.
     pub fn rgba8(&self) -> Option<&[u8]> {
         self.texels.as_rgba8()
@@ -338,6 +362,18 @@ impl DecodedTexture {
     /// is held in: see [`Texels::cost`](crate::texels::Texels::cost).
     pub fn cost(&self) -> crate::budget::cost::Cost {
         self.texels.cost(self.width, self.height)
+    }
+
+    /// What it costs held in `format` instead of the format it records: the
+    /// chain in that format, and the same bytes moved. A consumer that could
+    /// not hold it as planned — an encode that failed, a device without the
+    /// format — charges this.
+    pub fn cost_as(&self, format: crate::texels::ImageryFormat) -> crate::budget::cost::Cost {
+        let moved = self.cost().staging;
+        crate::budget::cost::Cost {
+            gpu: crate::budget::cost::drape_cost(self.width, self.height, format.cost_format()).gpu,
+            staging: moved,
+        }
     }
 
     /// A stand-in for a texture a consumer cannot read: one texel of the
@@ -884,6 +920,84 @@ pub(crate) mod tests {
             assert_eq!(gpu.gpu, Bytes(87_408), "{format:?}");
             assert_eq!(gpu.staging, rgba.staging, "{format:?}");
         }
+    }
+
+    /// **A drape is acknowledged in the format each tile really went
+    /// resident in.** Planned as blocks and held as blocks, it is charged
+    /// what [`DrapeContent::cost`] says; a tile that had to stay RGBA8 (an
+    /// encode refused) is charged RGBA8, and the bytes moved do not change.
+    #[test]
+    fn a_drape_is_acknowledged_in_the_format_it_went_resident_in() {
+        use crate::budget::Bytes;
+        use crate::texels::{ImageryFormat, Texels};
+        let planned = DecodedTexture {
+            width: 256,
+            height: 256,
+            texels: Texels::Rgba8 {
+                pixels: Vec::new(),
+                resident: ImageryFormat::Bc7,
+            },
+        };
+        let d = drape(vec![whole(planned)]);
+        assert_eq!(d.cost_with(|_, t| t.texture.cost()), d.cost());
+        assert_eq!(d.cost().gpu, Bytes(87_408));
+        let fell_back = d.cost_with(|_, t| t.texture.cost_as(ImageryFormat::Rgba8));
+        assert_eq!(fell_back.gpu, Bytes(349_524));
+        assert_eq!(fell_back.staging, d.cost().staging, "the same bytes moved");
+        // RGBA8 charged as RGBA8 is exactly what it always was.
+        let rgba = DecodedTexture::from_rgba8(256, 256, Vec::new());
+        assert_eq!(rgba.cost_as(ImageryFormat::Rgba8), rgba.cost());
+    }
+
+    /// **A plan that encodes on the GPU marks RGBA8 with its target**, and
+    /// the charge follows; RGBA8, the CPU path and blocks are left alone.
+    #[test]
+    fn a_texture_is_held_as_its_plan_says() {
+        use crate::texels::{
+            BlockFormat, GpuTextureCaps, ImageryCompression, ImageryFormat, ImageryPlan,
+        };
+        let apple = GpuTextureCaps {
+            bc: true,
+            astc: true,
+            compute: true,
+        };
+        let rgba = || DecodedTexture::from_rgba8(256, 256, vec![7; 256 * 256 * 4]);
+        assert_eq!(
+            rgba().planned(ImageryPlan::RGBA8).resident_format(),
+            ImageryFormat::Rgba8
+        );
+        assert_eq!(
+            rgba().planned(ImageryCompression::Off.plan(apple)).cost(),
+            rgba().cost(),
+            "off is RGBA8, byte for byte"
+        );
+        let bc7 = rgba().planned(ImageryCompression::Auto.plan(apple));
+        assert_eq!(bc7.resident_format(), ImageryFormat::Bc7);
+        assert_eq!(bc7.cost().gpu.0, 87_408);
+        assert_eq!(
+            bc7.rgba8().map(<[u8]>::len),
+            Some(256 * 256 * 4),
+            "pixels kept"
+        );
+        let astc = rgba().planned(ImageryCompression::Format(BlockFormat::Astc4x4).plan(apple));
+        assert_eq!(astc.resident_format(), ImageryFormat::Astc4x4);
+        // No compute: the CPU encoder's plan hands over blocks, not RGBA8.
+        let webgl2 = GpuTextureCaps {
+            compute: false,
+            ..apple
+        };
+        assert_eq!(
+            rgba()
+                .planned(ImageryCompression::Auto.plan(webgl2))
+                .resident_format(),
+            ImageryFormat::Rgba8
+        );
+        assert_eq!(
+            blocks_256(BlockFormat::Astc4x4)
+                .planned(ImageryCompression::Auto.plan(apple))
+                .resident_format(),
+            ImageryFormat::Astc4x4
+        );
     }
 
     /// The textures a tile owns are charged in the format they are held in.

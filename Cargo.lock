@@ -5994,7 +5994,9 @@ name = "texcomp"
 version = "0.2.0"
 source = "git+https://github.com/lapoule-dev/texcomp?tag=v0.2.0#b3e1d4d0bc2ca71dd1ac617b2d5eda842e2868b0"
 dependencies = [
+ "bytemuck",
  "thiserror 2.0.18",
+ "wgpu",
 ]
 
 [[package]]
@@ -7138,6 +7140,7 @@ dependencies = [
  "image",
  "naga",
  "pollster",
+ "texcomp",
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
@@ -7158,6 +7161,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "image",
  "serde_json",
  "tempfile",
  "tokio",

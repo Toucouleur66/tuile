@@ -10,6 +10,9 @@
 
 use std::sync::{Arc, Mutex};
 use tuile_core::raster::{ImageryCoord, ImageryPool};
+use tuile_core::texels::{ImageryCompression, ImageryEncode, ImageryFormat, ImageryPlan};
+
+use crate::compress::{Compressor, EncodeStats};
 use wgpu::util::DeviceExt;
 
 #[derive(Debug, thiserror::Error)]
@@ -65,14 +68,23 @@ pub struct GpuImagery {
     _texture: wgpu::Texture,
     /// What this cost to upload, mip chain included.
     pub(crate) bytes: usize,
+    /// The format it went resident in: the one its texels asked for, or
+    /// RGBA8 where that could not be done.
+    pub(crate) format: ImageryFormat,
 }
 
 impl GpuImagery {
-    pub(crate) fn new(texture: wgpu::Texture, view: wgpu::TextureView, bytes: usize) -> Self {
+    pub(crate) fn new(
+        texture: wgpu::Texture,
+        view: wgpu::TextureView,
+        bytes: usize,
+        format: ImageryFormat,
+    ) -> Self {
         Self {
             view,
             _texture: texture,
             bytes,
+            format,
         }
     }
 }
@@ -110,6 +122,23 @@ impl ImageryTextures {
         let live = self.0.live();
         (live.len(), live.iter().map(|e| e.bytes).sum())
     }
+
+    /// Live imagery bytes by the format each texture went resident in.
+    pub fn live_by_format(&self) -> Vec<(ImageryFormat, usize)> {
+        let mut out: Vec<(ImageryFormat, usize)> = Vec::new();
+        for held in self.0.live() {
+            match out.iter_mut().find(|(f, _)| *f == held.format) {
+                Some((_, bytes)) => *bytes += held.bytes,
+                None => out.push((held.format, held.bytes)),
+            }
+        }
+        out
+    }
+
+    /// Whether tile `coord` of imagery `source` is on the GPU now.
+    pub(crate) fn holds(&self, source: u32, coord: ImageryCoord) -> bool {
+        self.0.holds(source, coord)
+    }
 }
 
 pub struct GpuContext {
@@ -134,6 +163,11 @@ pub struct GpuContext {
     /// loader is allowed to ask for — reads it from here rather than agreeing
     /// with a constant.
     pub imagery_slots: u32,
+    /// How this context holds imagery: the consumer's plan, RGBA8 unless it
+    /// chose otherwise. See [`Self::with_imagery_plan`].
+    imagery_plan: ImageryPlan,
+    /// The GPU encoder, when the plan encodes on the GPU.
+    pub(crate) compressor: Option<Mutex<Compressor>>,
 }
 
 impl GpuContext {
@@ -252,13 +286,60 @@ impl GpuContext {
             white_view,
             imagery: Mutex::new(ImageryTextures::default()),
             imagery_slots,
+            imagery_plan: ImageryPlan::RGBA8,
+            compressor: None,
         }
+    }
+
+    /// Holds imagery as `plan` says: the consumer's
+    /// [`ImageryCompression`] resolved against its adapter
+    /// ([`crate::plan_for`]), on a device created with the features it named.
+    ///
+    /// A plan whose format this device was not created to sample falls back
+    /// to RGBA8 — the plan is what [`Self::imagery_plan`] then reports, and
+    /// what the consumer hands its loader. Off, the default, changes nothing.
+    pub fn with_imagery_plan(mut self, plan: ImageryPlan) -> Self {
+        let sampled = crate::compress::plan_features(plan);
+        let plan = if self.device.features().contains(sampled) {
+            plan
+        } else {
+            ImageryPlan::RGBA8
+        };
+        self.compressor = match (plan.encode, plan.target.block()) {
+            (ImageryEncode::Gpu, Some(format)) => Some(Mutex::new(Compressor::new(
+                &self.device,
+                &self.queue,
+                format,
+            ))),
+            _ => None,
+        };
+        self.imagery_plan = plan;
+        self
+    }
+
+    /// How this context holds imagery: what the consumer's loader is told.
+    pub fn imagery_plan(&self) -> ImageryPlan {
+        self.imagery_plan
+    }
+
+    /// What the GPU encoder has done, when there is one.
+    pub fn imagery_encode_stats(&self) -> Option<EncodeStats> {
+        self.compressor
+            .as_ref()
+            .and_then(|c| c.lock().ok().map(|c| c.stats()))
     }
 
     /// Creates a context without any surface (tests, offscreen render).
     /// Returns a typed error when the machine has no usable adapter, so
     /// CI without a GPU can skip cleanly.
     pub async fn headless() -> Result<Self, ContextError> {
+        Self::headless_with(ImageryCompression::Off).await
+    }
+
+    /// [`Self::headless`], holding imagery as `compression` comes to on the
+    /// adapter found: the device is created with the features the plan
+    /// needs, and only those. Off is exactly [`Self::headless`].
+    pub async fn headless_with(compression: ImageryCompression) -> Result<Self, ContextError> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -269,6 +350,7 @@ impl GpuContext {
             })
             .await
             .map_err(|e| ContextError::NoAdapter(e.to_string()))?;
+        let (plan, required_features) = crate::compress::plan_for(compression, &adapter);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("tuile headless"),
@@ -276,11 +358,12 @@ impl GpuContext {
                 // targets (8K readback buffers, large textures) aren't capped
                 // at the conservative defaults (256 MiB / 8192 px).
                 required_limits: adapter.limits(),
+                required_features,
                 ..Default::default()
             })
             .await
             .map_err(|e| ContextError::NoDevice(e.to_string()))?;
-        Ok(Self::new(device, queue))
+        Ok(Self::new(device, queue).with_imagery_plan(plan))
     }
 }
 

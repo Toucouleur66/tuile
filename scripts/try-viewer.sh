@@ -13,7 +13,8 @@
 #                                             #     clipboard there (see below)
 #   scripts/try-viewer.sh mac [flags]         # the Mac application; flags as
 #                                             #     `tuile-wgpu-viewer --help`
-#   scripts/try-viewer.sh ios                 # the iOS simulator
+#   scripts/try-viewer.sh ios [flags]         # the iOS simulator; flags as the
+#                                             #     Mac application's
 #   scripts/try-viewer.sh android             # the Android emulator, or the
 #                                             #     phone on the cable
 #   scripts/try-viewer.sh android --gl        # … forcing OpenGL ES
@@ -169,7 +170,8 @@ ios() {
   xcrun simctl install booted "$app"
   local token
   token="$(with_token printenv CESIUM_ION_TOKEN)"
-  SIMCTL_CHILD_CESIUM_ION_TOKEN="$token" xcrun simctl launch booted dev.lapoule.tuile.viewer
+  # Any further arguments are the viewer's own: `ios --imagery-compression auto`.
+  SIMCTL_CHILD_CESIUM_ION_TOKEN="$token" xcrun simctl launch booted dev.lapoule.tuile.viewer "$@"
 }
 
 # The Android emulator (the AVD `TUILE_AVD`, by default `tuile-arm64`, booted

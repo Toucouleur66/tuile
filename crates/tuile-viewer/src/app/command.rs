@@ -184,6 +184,14 @@ impl App {
         self.keep_the_title(&snapshot);
     }
 
+    /// The imagery on the GPU, by the format it is held in: `imagery BC7
+    /// 31 MiB`, and the RGBA8 beside it where some had to stay RGBA8.
+    fn imagery_held(&self) -> Option<String> {
+        let active = self.active.as_ref()?;
+        let mut held = active.gpu.imagery.lock().ok()?.live_by_format();
+        Some(held_line(active.gpu.imagery_plan().target, &mut held))
+    }
+
     /// The title bar: the application, where the eye is, and — for a few
     /// seconds — the last thing that was said.
     ///
@@ -214,6 +222,12 @@ impl App {
         if let Some(layer) = snapshot.imagery {
             title = format!("{title} — {} · {}", layer.name, layer.attribution);
         }
+        // How the imagery is held, and what it holds: the one line that
+        // tells a compressed session from an uncompressed one.
+        let held = self.imagery_held();
+        if let Some(held) = &held {
+            title = format!("{title} — {held}");
+        }
         if let Some((notice, _)) = &self.notice {
             title = format!("{title} — {notice}");
         }
@@ -231,6 +245,9 @@ impl App {
                 .imagery
                 .map(|layer| format!("{} · {}", layer.name, layer.attribution))
                 .unwrap_or_default();
+            if let Some(held) = &held {
+                caption = format!("{caption} — {held}");
+            }
             if let Some((notice, _)) = &self.notice {
                 caption = format!("{caption} — {notice}");
             }
@@ -241,5 +258,56 @@ impl App {
             crate::desktop::view(snapshot);
             self.title_shown = title;
         }
+    }
+}
+
+/// `imagery BC7 31 MiB`: the plan's format first, then any other the
+/// imagery is held in.
+fn held_line(
+    plan: tuile_core::texels::ImageryFormat,
+    held: &mut [(tuile_core::texels::ImageryFormat, usize)],
+) -> String {
+    held.sort_by_key(|(format, _)| *format != plan);
+    let mib = |bytes: usize| bytes as f64 / f64::from(1u32 << 20);
+    let mut parts: Vec<String> = held
+        .iter()
+        .map(|(format, bytes)| {
+            format!(
+                "{} {:.0} MiB",
+                tuile_wgpu::format_name(*format),
+                mib(*bytes)
+            )
+        })
+        .collect();
+    if parts.is_empty() {
+        parts.push(format!("{} 0 MiB", tuile_wgpu::format_name(plan)));
+    }
+    format!("imagery {}", parts.join(" + "))
+}
+
+#[cfg(test)]
+mod held_tests {
+    use super::held_line;
+    use tuile_core::texels::ImageryFormat;
+
+    /// The plan's format leads, the others follow, sizes in whole MiB.
+    #[test]
+    fn the_held_line_names_each_format() {
+        assert_eq!(held_line(ImageryFormat::Bc7, &mut []), "imagery BC7 0 MiB");
+        let mut held = [
+            (ImageryFormat::Rgba8, 3 << 20),
+            (ImageryFormat::Bc7, 31 << 20),
+        ];
+        assert_eq!(
+            held_line(ImageryFormat::Bc7, &mut held),
+            "imagery BC7 31 MiB + RGBA8 3 MiB"
+        );
+        assert_eq!(
+            held_line(
+                ImageryFormat::Rgba8,
+                &mut [(ImageryFormat::Rgba8, 120 << 20)]
+            ),
+            "imagery RGBA8 120 MiB"
+        );
     }
 }

@@ -21,7 +21,7 @@ use tuile_cesium_ion::{tms::TmsImagery, AssetEndpoint, IonClient, IonTerrainSour
 use tuile_core::offload;
 use tuile_core::texels::{ImageryPlan, StoredPlan};
 use tuile_native_fetchers::{NativeHttp, RetryConfig, TransportConfig};
-use tuile_planetary::{globe_with_provenance, GlobeOptions, Held, LayerBudget};
+use tuile_planetary::{globe_with_provenance, GlobeOptions, Held, ImageryPlanHandle, LayerBudget};
 
 /// Where a globe's tiles come from, when the host brings its own sources:
 /// defined beside the crossing it feeds, and re-exported here because this is
@@ -421,7 +421,7 @@ async fn resolve(
             imagery_by_stamp: names_only(config),
             // A bake never compresses: its textures are written out as PNG, and
             // a tile stored compressed is unpacked to RGBA8.
-            imagery_plan: ImageryPlan::RGBA8,
+            imagery_plan: ImageryPlanHandle::new(ImageryPlan::RGBA8),
             stored_imagery: StoredPlan::OFF,
         };
         return Ok(match config.imagery_asset_id {
@@ -488,7 +488,7 @@ async fn resolve(
                 imagery_by_stamp: names_only(config),
                 // A bake never compresses: its textures are written out as PNG, and
                 // a tile stored compressed is unpacked to RGBA8.
-                imagery_plan: ImageryPlan::RGBA8,
+                imagery_plan: ImageryPlanHandle::new(ImageryPlan::RGBA8),
                 stored_imagery: StoredPlan::OFF,
             },
             decode_pool(),
@@ -519,7 +519,7 @@ async fn resolve(
             imagery_by_stamp: names_only(config),
             // A bake never compresses: its textures are written out as PNG, and
             // a tile stored compressed is unpacked to RGBA8.
-            imagery_plan: ImageryPlan::RGBA8,
+            imagery_plan: ImageryPlanHandle::new(ImageryPlan::RGBA8),
             stored_imagery: StoredPlan::OFF,
         };
         return Ok(globe_with_provenance(
@@ -558,7 +558,7 @@ async fn resolve(
         imagery_by_stamp: names_only(config),
         // A bake never compresses: its textures are written out as PNG, and
         // a tile stored compressed is unpacked to RGBA8.
-        imagery_plan: ImageryPlan::RGBA8,
+        imagery_plan: ImageryPlanHandle::new(ImageryPlan::RGBA8),
         stored_imagery: StoredPlan::OFF,
     };
 

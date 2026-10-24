@@ -45,13 +45,17 @@ impl GpuOnItsWay {
     /// Vulkan and then OpenGL ES, for a device or an emulator whose Vulkan
     /// driver will not give a surface, an adapter or a device.
     #[cfg(not(target_arch = "wasm32"))]
-    fn start(window: Arc<Window>, backends: Option<wgpu::Backends>) -> Self {
+    fn start(
+        window: Arc<Window>,
+        backends: Option<wgpu::Backends>,
+        compression: tuile_wgpu::ImageryCompression,
+    ) -> Self {
         let mut refusals = Vec::new();
         let mut answer = Err(String::from("no backend to try"));
         for attempt in attempts(backends, cfg!(target_os = "android")) {
             // Each attempt's surface is dropped before the next is made: a
             // window takes one producer at a time.
-            answer = pollster::block_on(bring_up(Arc::clone(&window), attempt));
+            answer = pollster::block_on(bring_up(Arc::clone(&window), attempt, compression));
             match &answer {
                 Ok(_) => break,
                 Err(why) => {
@@ -67,11 +71,15 @@ impl GpuOnItsWay {
     /// Asks for a GPU that can draw into `window`, and returns at once: a
     /// browser answers on a later turn of its event loop.
     #[cfg(target_arch = "wasm32")]
-    fn start(window: Arc<Window>, backends: Option<wgpu::Backends>) -> Self {
+    fn start(
+        window: Arc<Window>,
+        backends: Option<wgpu::Backends>,
+        compression: tuile_wgpu::ImageryCompression,
+    ) -> Self {
         let slot = Rc::new(RefCell::new(None));
         let answer = Rc::clone(&slot);
         wasm_bindgen_futures::spawn_local(async move {
-            let up = bring_up(Arc::clone(&window), backends).await;
+            let up = bring_up(Arc::clone(&window), backends, compression).await;
             *answer.borrow_mut() = Some(up);
             // The loop may be asleep, with nothing else to wake it: a frame
             // asked for is a turn of the loop, which collects the answer.
@@ -130,7 +138,15 @@ pub(crate) fn backend_named(name: Option<&str>) -> Result<Option<wgpu::Backends>
 /// `backends` narrows the instance — a page forcing WebGL2, say; `None` is
 /// the platform's default. A browser without WebGPU falls back to WebGL2 by
 /// itself: the instance is made with WebGPU detected rather than assumed.
-async fn bring_up(window: Arc<Window>, backends: Option<wgpu::Backends>) -> Result<Gpu, String> {
+///
+/// `compression` is the person's choice of how imagery is held: resolved
+/// against this adapter, it asks the device for its format's feature, and
+/// for nothing when it is off.
+async fn bring_up(
+    window: Arc<Window>,
+    backends: Option<wgpu::Backends>,
+    compression: tuile_wgpu::ImageryCompression,
+) -> Result<Gpu, String> {
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     if let Some(backends) = backends {
         descriptor.backends = backends;
@@ -183,6 +199,17 @@ async fn bring_up(window: Arc<Window>, backends: Option<wgpu::Backends>) -> Resu
     } else {
         tracing::info!(?features, ?missing, "gpu timing partly unavailable");
     }
+    // How the imagery is held: the person's choice, on this adapter. Off asks
+    // for nothing; a block format asks for its own feature, which the
+    // adapter was checked to have.
+    let (imagery_plan, imagery_features) = tuile_wgpu::plan_for(compression, &adapter);
+    tracing::info!(
+        ?compression,
+        held = tuile_wgpu::format_name(imagery_plan.target),
+        encode = ?imagery_plan.encode,
+        caps = ?tuile_wgpu::texture_caps(&adapter),
+        "imagery"
+    );
     // Everything the adapter has, which is by definition what it supports: on
     // WebGL2 that is the downlevel set raised to what the context reports, and
     // the renderer fits its imagery slots to it.
@@ -190,7 +217,7 @@ async fn bring_up(window: Arc<Window>, backends: Option<wgpu::Backends>) -> Resu
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("viewer"),
             required_limits: adapter.limits(),
-            required_features: features,
+            required_features: features | imagery_features,
             ..Default::default()
         })
         .await
@@ -211,7 +238,7 @@ async fn bring_up(window: Arc<Window>, backends: Option<wgpu::Backends>) -> Resu
         instance,
         surface,
         format,
-        gpu: GpuContext::new(device, queue),
+        gpu: GpuContext::new(device, queue).with_imagery_plan(imagery_plan),
         backend: info.backend,
     })
 }
@@ -246,7 +273,11 @@ impl App {
             .with_title(self.title.clone())
             .with_visible(!self.profile.hold_window_until_warm);
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
-        self.gpu_on_its_way = Some(GpuOnItsWay::start(window, self.backends));
+        self.gpu_on_its_way = Some(GpuOnItsWay::start(
+            window,
+            self.backends,
+            self.imagery_compression,
+        ));
         self.take_the_gpu();
     }
 

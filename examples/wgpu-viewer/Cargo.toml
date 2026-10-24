@@ -32,6 +32,8 @@ url = { workspace = true }
 # `cargo run --release -p tuile-wgpu-viewer --example headless -- run all`.
 [dev-dependencies]
 axum = "0.8"
+# The runner's `--pictures`: a settled frame written as PNG.
+image = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["net"] }

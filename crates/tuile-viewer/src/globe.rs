@@ -17,7 +17,9 @@ use tuile_core::offload::Offload;
 use tuile_core::raster::{CachedImagery, ImageryProvider};
 use tuile_core::source::{TileLoader, TileTree};
 use tuile_core::storage::ContentStore;
-use tuile_planetary::{globe_on, GlobeOptions, Held, LayerBudget, Sources, SwitchableImagery};
+use tuile_planetary::{
+    globe_on, GlobeOptions, Held, ImageryPlanHandle, LayerBudget, Sources, SwitchableImagery,
+};
 use tuile_terrain::{CachedTerrain, TerrainSource};
 
 use crate::embed::{ImageryChoice, TerrainChoice};
@@ -31,6 +33,10 @@ pub(crate) struct Globe {
     #[cfg(not(target_arch = "wasm32"))]
     pub heights: Arc<tuile_terrain::TerrainHeights>,
     pub budget: LayerBudget,
+    /// How the window's device holds imagery, told to the loader: a handle
+    /// for the same reason as [`Self::budget`]. RGBA8 until it is set.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub plan: ImageryPlanHandle,
     /// What a change of imagery is resolved against.
     pub layers: Layers,
 }
@@ -140,6 +146,7 @@ pub(crate) async fn assemble(
     layers: &[ImageryChoice],
     opening: usize,
     decode: Arc<dyn Offload>,
+    stored_imagery: tuile_core::texels::StoredPlan,
 ) -> anyhow::Result<Globe> {
     let opening_layer = layers
         .get(opening)
@@ -171,8 +178,13 @@ pub(crate) async fn assemble(
     // handle is passed now and filled in by `start_window`; until then it reads
     // the correctness floor.
     let budget = LayerBudget::default();
+    let plan = ImageryPlanHandle::default();
     let opts = GlobeOptions {
         imagery_slots: budget.clone(),
+        imagery_plan: plan.clone(),
+        // What the person's choice does with tiles stored already compressed;
+        // off, they are unpacked to RGBA8.
+        stored_imagery,
         max_level: Some(if layers.len() > 1 {
             deepest.max(DEPTH_FOR_ANY_LAYER)
         } else {
@@ -190,6 +202,7 @@ pub(crate) async fn assemble(
         #[cfg(not(target_arch = "wasm32"))]
         heights,
         budget,
+        plan,
         layers: Layers {
             sources: sources_kept,
             store,
@@ -247,6 +260,7 @@ mod tests {
             &layers,
             0,
             Arc::new(tuile_core::offload::Inline),
+            tuile_core::texels::StoredPlan::OFF,
         ))
         .err()
         .expect("there is no terrain");

@@ -28,33 +28,26 @@
 //! Both are asserted below against read-back pixels, on a fixture built to have
 //! exactly one layer more than the device will bind.
 //!
+//! Each runs under every imagery plan a consumer can choose — RGBA8, and each
+//! block format the GPU encodes into — on 256² layers, whole blocks; the
+//! colours are held to a tolerance block compression of a flat colour meets.
+//!
 //! A machine without a usable adapter skips, with a printed reason. Set
 //! `TUILE_REQUIRE_GPU=1` to turn that skip into a failure.
 
+mod support;
+
+use support::{gpu_with, painted, PLANS};
+
 use glam::{DVec3, Mat4, Vec3};
 use std::sync::Arc;
-use tuile_core::content::{DecodedMesh, DecodedTexture, DecodedTileContent, MaterialDesc};
+use tuile_core::content::{DecodedMesh, DecodedTileContent, MaterialDesc};
 use tuile_core::raster::{ImageryCoord, ImageryLayer};
 use tuile_wgpu::{
     prepare, GpuContext, TileRenderer, ViewUniform, DEPTH_FORMAT, SAMPLES, TEXTURE_FORMAT,
 };
 
 const SIZE: u32 = 256;
-
-/// A GPU, or a stated reason there is none.
-fn gpu() -> Option<GpuContext> {
-    match pollster::block_on(GpuContext::headless()) {
-        Ok(gpu) => Some(gpu),
-        Err(e) => {
-            assert!(
-                std::env::var("TUILE_REQUIRE_GPU").is_err(),
-                "TUILE_REQUIRE_GPU is set and there is no usable adapter: {e}"
-            );
-            eprintln!("skipping GPU test: no usable adapter ({e})");
-            None
-        }
-    }
-}
 
 /// A unit quad in the z = 0 plane, facing the camera, with uv over `[0, 1]²`.
 ///
@@ -86,8 +79,9 @@ fn quad() -> DecodedTileContent {
     }
 }
 
-/// A layer of one flat colour over `coverage`, in the tile's own uv space.
-fn layer(index: u32, colour: [u8; 3], coverage: [f32; 4]) -> ImageryLayer {
+/// A layer of one flat colour over `coverage`, in the tile's own uv space:
+/// 256², whole blocks, held as `gpu`'s plan says.
+fn layer(gpu: &GpuContext, index: u32, colour: [u8; 3], coverage: [f32; 4]) -> ImageryLayer {
     ImageryLayer {
         source: 0,
         // Distinct per layer: the shared-imagery pool is keyed by coord, so two
@@ -98,11 +92,9 @@ fn layer(index: u32, colour: [u8; 3], coverage: [f32; 4]) -> ImageryLayer {
             x: u64::from(index),
             y: 0,
         },
-        texture: Arc::new(DecodedTexture::from_rgba8(
-            2,
-            2,
-            [[colour[0], colour[1], colour[2], 255u8]; 4].concat(),
-        )),
+        texture: Arc::new(painted(gpu, 256, 256, |_, _| {
+            [colour[0], colour[1], colour[2], 255]
+        })),
         coverage,
         // Maps the covered part of the tile onto the whole texture. Immaterial
         // for a flat colour, and written correctly anyway so the fixture does
@@ -276,13 +268,26 @@ const GREEN: [u8; 3] = [20, 220, 20];
 /// were merged, and the test would pass for the wrong reason.
 #[test]
 fn a_layer_past_the_first_batch_is_drawn_where_it_covers() {
-    let Some(gpu) = gpu() else { return };
+    for (plan, compression) in PLANS {
+        let Some(gpu) = gpu_with(compression) else {
+            continue;
+        };
+        a_layer_past_the_first_batch_under(plan, &gpu);
+    }
+}
+
+fn a_layer_past_the_first_batch_under(plan: &str, gpu: &GpuContext) {
     let slots = gpu.imagery_slots;
 
     let mut content = quad();
     content.imagery = (0..slots)
-        .map(|i| layer(i, RED, [0.0, 0.0, 1.0, 1.0]))
-        .chain(std::iter::once(layer(slots, GREEN, [0.0, 0.0, 0.5, 1.0])))
+        .map(|i| layer(gpu, i, RED, [0.0, 0.0, 1.0, 1.0]))
+        .chain(std::iter::once(layer(
+            gpu,
+            slots,
+            GREEN,
+            [0.0, 0.0, 0.5, 1.0],
+        )))
         .collect();
     assert_eq!(
         content.imagery.len(),
@@ -290,19 +295,20 @@ fn a_layer_past_the_first_batch_is_drawn_where_it_covers() {
         "the fixture must be exactly one layer wider than one draw can bind"
     );
 
-    let pixels = render(&gpu, &content);
+    let pixels = render(gpu, &content);
+    support::encoded_as_planned(plan, gpu, u64::from(slots) + 1);
     let left = sample(&pixels, 0.25);
     let right = sample(&pixels, 0.75);
 
     assert!(
         close(left, GREEN),
-        "the layer past the first batch of {slots} did not reach the screen: \
-         the left half is {left:?}, expected green {GREEN:?}"
+        "{plan}: the layer past the first batch of {slots} did not reach the \
+         screen: the left half is {left:?}, expected green {GREEN:?}"
     );
     assert!(
         close(right, RED),
-        "the second pass painted over ground its own layer does not cover: \
-         the right half is {right:?}, expected the first pass's red {RED:?}"
+        "{plan}: the second pass painted over ground its own layer does not \
+         cover: the right half is {right:?}, expected the first pass's red {RED:?}"
     );
 }
 
@@ -315,24 +321,28 @@ fn a_layer_past_the_first_batch_is_drawn_where_it_covers() {
 /// above would still pass.
 #[test]
 fn a_drape_that_fits_in_one_draw_is_drawn_exactly_once() {
-    let Some(gpu) = gpu() else { return };
+    for (plan, compression) in PLANS {
+        let Some(gpu) = gpu_with(compression) else {
+            continue;
+        };
+        let mut content = quad();
+        content.imagery = vec![
+            layer(&gpu, 0, RED, [0.0, 0.0, 1.0, 1.0]),
+            layer(&gpu, 1, GREEN, [0.0, 0.0, 0.5, 1.0]),
+        ];
 
-    let mut content = quad();
-    content.imagery = vec![
-        layer(0, RED, [0.0, 0.0, 1.0, 1.0]),
-        layer(1, GREEN, [0.0, 0.0, 0.5, 1.0]),
-    ];
-
-    let pixels = render(&gpu, &content);
-    assert!(
-        close(sample(&pixels, 0.25), GREEN),
-        "two layers in one pass: the later one must win where it covers"
-    );
-    assert!(
-        close(sample(&pixels, 0.75), RED),
-        "two layers in one pass: the earlier one must survive where the later \
-         does not cover"
-    );
+        let pixels = render(&gpu, &content);
+        support::encoded_as_planned(plan, &gpu, 2);
+        assert!(
+            close(sample(&pixels, 0.25), GREEN),
+            "{plan}: two layers in one pass: the later one must win where it covers"
+        );
+        assert!(
+            close(sample(&pixels, 0.75), RED),
+            "{plan}: two layers in one pass: the earlier one must survive where \
+             the later does not cover"
+        );
+    }
 }
 
 /// **Content with no imagery at all still draws its base colour.**
@@ -344,7 +354,9 @@ fn a_drape_that_fits_in_one_draw_is_drawn_exactly_once() {
 /// forbidden output.
 #[test]
 fn content_with_no_imagery_still_draws() {
-    let Some(gpu) = gpu() else { return };
+    let Some(gpu) = gpu_with(tuile_wgpu::ImageryCompression::Off) else {
+        return;
+    };
 
     let mut content = quad();
     content.meshes[0].material.base_color_factor = [0.0, 1.0, 0.0, 1.0];

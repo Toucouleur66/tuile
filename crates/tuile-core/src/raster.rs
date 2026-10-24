@@ -1203,6 +1203,15 @@ impl<T> ImageryPool<T> {
         entry
     }
 
+    /// Whether tile `coord` of imagery `source` is held by some tile now: a
+    /// [`ImageryPool::get_or_insert_from`] for it would build nothing. What a
+    /// consumer asks before it schedules work that only a miss costs.
+    pub fn holds(&self, source: u32, coord: ImageryCoord) -> bool {
+        self.entries
+            .get(&(source, coord))
+            .is_some_and(|w| w.strong_count() > 0)
+    }
+
     fn live_count(&self) -> usize {
         self.entries
             .values()
@@ -2945,6 +2954,14 @@ mod tests {
             &pool.get_or_insert(coord, || unreachable!("already live"))
         ));
         assert_eq!(pool.live().len(), 2);
+        // Held while some tile holds it, by the whole identity, and not after.
+        assert!(pool.holds(0, coord) && pool.holds(1, coord));
+        assert!(!pool.holds(2, coord));
+        let elsewhere = ImageryCoord { x: 4, ..coord };
+        let gone = pool.get_or_insert_from(0, elsewhere, || "gone");
+        assert!(pool.holds(0, elsewhere));
+        drop(gone);
+        assert!(!pool.holds(0, elsewhere), "dropped by its last holder");
         assert_eq!(
             pool.live_with_coords()
                 .iter()

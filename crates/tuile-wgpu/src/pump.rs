@@ -18,6 +18,7 @@
 //! evictions, so between two frames the ground goes from one complete
 //! picture to the next, and never through a frame with a hole.
 
+use crate::compress::EncodePace;
 use crate::context::GpuContext;
 use crate::prepare::{prepare, prepare_drape, PreparedDrape, PreparedTile};
 use glam::DVec3;
@@ -124,6 +125,9 @@ pub struct ContentPump {
     /// Drapes evicted since the last resolve: their wearers let go of them
     /// there, where the device is.
     undress_wearers: Vec<ResourceId>,
+    /// The GPU time a frame's imagery encodes may take: see
+    /// [`Self::set_encode_pace`].
+    encode_pace: EncodePace,
 }
 
 /// Frames a tile takes to slide to its new edge when what is drawn beside it
@@ -168,7 +172,15 @@ impl ContentPump {
             throughput: ASSUMED_BYTES_PER_MS,
             meter: None,
             undress_wearers: Vec::new(),
+            encode_pace: EncodePace::DEFAULT,
         }
+    }
+
+    /// How much GPU time a frame's imagery encodes may take, when the
+    /// context's plan encodes on the GPU ([`crate::plan_for`], [`crate::GpuContext::with_imagery_plan`]); without an
+    /// encoder it changes nothing. [`EncodePace::DEFAULT`] unless set.
+    pub fn set_encode_pace(&mut self, pace: EncodePace) {
+        self.encode_pace = pace;
     }
 
     /// Records every frame into `meter`, the session's: what the budget's
@@ -447,11 +459,32 @@ impl ContentPump {
         let taken: Vec<ResourceId> = deadline
             .take(&order, &self.plan.groups, Bytes::ZERO, estimate)
             .to_vec();
-        let deferred = (order.len() - taken.len()) as u32;
+        let mut deferred = (order.len() - taken.len()) as u32;
         let began = web_time::Instant::now();
         let mut uploaded: Vec<(ResourceId, Bytes)> = Vec::with_capacity(taken.len());
         let mut moved = 0u64;
+        // The GPU encodes have a share of their own: the blocks this frame
+        // may still write, when the plan encodes on the GPU at all.
+        let mut encodes_left = gpu.compressor.as_ref().and_then(|c| {
+            let ns = c.lock().ok()?.ns_per_block();
+            Some(self.encode_pace.blocks_per_frame(ns))
+        });
+        let mut encoded_any = false;
         for r in taken {
+            if let (Some(left), Some(q)) = (encodes_left.as_mut(), self.queue.get(&r)) {
+                let blocks = blocks_to_encode(gpu, &q.content);
+                if blocks > 0 {
+                    // The first encode of a frame always goes, however large:
+                    // nothing waits for ever. The rest wait for a frame with
+                    // room, in the plan's order, as a deadline's do.
+                    if encoded_any && blocks > *left {
+                        deferred += 1;
+                        continue;
+                    }
+                    *left = left.saturating_sub(blocks);
+                    encoded_any = true;
+                }
+            }
             let Some(q) = self.queue.remove(&r) else {
                 continue;
             };
@@ -973,6 +1006,47 @@ impl ContentPump {
 /// What one mesh holds once uploaded, by the measure its estimate uses:
 /// its buffers and uniform, the textures it owns, and the CPU copy kept for
 /// stitching (which unified memory pays for).
+/// The blocks uploading `content` would have the GPU encode: its textures
+/// marked for the encoder's format, and of its imagery those not already on
+/// the GPU. Zero without an encoder, so a context that did not choose
+/// compression paces nothing.
+fn blocks_to_encode(gpu: &GpuContext, content: &ResourceContent) -> u64 {
+    let Some(format) = gpu
+        .compressor
+        .as_ref()
+        .and_then(|c| c.lock().ok().map(|c| c.format()))
+    else {
+        return 0;
+    };
+    let encodes = |t: &tuile_core::content::DecodedTexture| {
+        t.resident_format().block() == Some(format) && t.rgba8().is_some()
+    };
+    let blocks = |t: &tuile_core::content::DecodedTexture| {
+        crate::compress::tile_blocks(format, t.width, t.height)
+    };
+    let Ok(pool) = gpu.imagery.lock() else {
+        return 0;
+    };
+    let imagery = |layers: &[tuile_core::raster::ImageryLayer]| -> u64 {
+        layers
+            .iter()
+            .filter(|l| l.is_visible() && encodes(&l.texture) && !pool.holds(l.source, l.coord))
+            .map(|l| blocks(&l.texture))
+            .sum()
+    };
+    match content {
+        ResourceContent::Mesh(m) => {
+            m.textures
+                .iter()
+                .filter(|t| encodes(t))
+                .map(blocks)
+                .sum::<u64>()
+                + imagery(&m.imagery)
+        }
+        ResourceContent::Drape(d) => imagery(&d.tiles),
+    }
+}
+
 fn mesh_bytes(prepared: &PreparedTile, content: &tuile_core::DecodedTileContent) -> u64 {
     let copy: u64 = content
         .meshes
