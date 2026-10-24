@@ -34,6 +34,7 @@ members = [
     "crates/tuile-wgpu",
     "examples/catalog-proxy",
     "examples/globe-bulk",
+    "examples/heightfield-serve",
     "examples/orbit-probe",
     "examples/warm-cache",
     "examples/wgpu-viewer",
