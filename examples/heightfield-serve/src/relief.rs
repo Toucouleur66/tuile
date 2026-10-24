@@ -202,10 +202,9 @@ pub fn imagery_png(heights: &Grid, z: u32, x: u64, y: u64) -> Vec<u8> {
         }
     } else {
         let c = ramp(0.0);
-        for p in pixels.chunks_exact_mut(3) {
-            for k in 0..3 {
-                p[k] = c[k] as u8;
-            }
+        let c = c.map(|v| v as u8);
+        for p in pixels.as_chunks_mut::<3>().0 {
+            *p = c;
         }
     }
     let mut png = Vec::new();

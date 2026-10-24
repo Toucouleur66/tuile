@@ -22,7 +22,9 @@
 
 use tuile_core::raster::TilingScheme;
 
-use crate::embed::{ImageryChoice, TerrainChoice};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::embed::ImageryChoice;
+use crate::embed::TerrainChoice;
 
 /// The number a terrain named by its `layer.json` URL is asked for by.
 pub(crate) const URL_TERRAIN: i64 = -1;
