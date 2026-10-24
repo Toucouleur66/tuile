@@ -7161,6 +7161,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "image",
  "serde_json",
  "tempfile",
  "tokio",

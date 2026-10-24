@@ -82,7 +82,7 @@ fn everywhere() -> LayerJson {
 }
 
 /// Answers every tile instantly with a flat surface over its own rectangle,
-/// wearing a 256² imagery tile of its own, held as the test's plan says.
+/// wearing an imagery tile of its own, held as the test's plan says.
 ///
 /// No network, no decode, no failure: the engine is given every excuse removed.
 /// Whatever this test catches is therefore the engine's own decision-making, not
@@ -407,16 +407,22 @@ fn a_fast_zoom_never_leaves_a_tile_empty() {
         let Some(gpu) = gpu_with(compression) else {
             continue;
         };
+        let began = std::time::Instant::now();
         a_fast_zoom_under(plan, &gpu);
+        eprintln!("{plan}: {:.1} s", began.elapsed().as_secs_f64());
     }
 }
 
 /// The zoom, with every tile's imagery held as `gpu`'s plan says — encoded
 /// at upload, under the pump's encode pace, for a block plan.
 fn a_fast_zoom_under(plan: &str, gpu: &GpuContext) {
-    // Bright, never near the clear colour.
-    let imagery = Arc::new(painted(gpu, 256, 256, |x, y| {
-        [90 + (x % 128) as u8, 140, 90 + (y % 128) as u8, 255]
+    // Bright, never near the clear colour. 32², not a real tile's 256²: the
+    // pinned pyramid alone is 682 tiles, each with its chain built on the CPU
+    // in an unoptimised test build, and at 256² that took the three plans
+    // fourteen minutes. 32² is still whole blocks with a chain that goes
+    // below one (2², 1²), which is the case an encoder gets wrong.
+    let imagery = Arc::new(painted(gpu, 32, 32, |x, y| {
+        [90 + (x % 128) as u8 * 4, 140, 90 + (y % 128) as u8 * 4, 255]
     }));
     let tree: Box<dyn TileTree> = tuile_planetary::terrain_tree(everywhere());
     let config = Config {

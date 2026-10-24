@@ -61,6 +61,18 @@ environment, which xcodebuild writes into its log.
 > not embed a token: build it with `TUILE_TILES_TOKEN=none` and let the person
 > type theirs in Settings.
 
+## Imagery compression
+
+Off by default. **Settings › Tuile › Imagery compression** — Off, Auto, BC7,
+ASTC 4x4 — is read at launch: Auto holds the imagery as ASTC 4×4 on an
+iPhone, a quarter of the memory, encoded on the GPU as each tile is
+uploaded. A launch argument wins over the page:
+`../../../scripts/try-viewer.sh ios --imagery-compression auto` on the
+simulator, `xcrun devicectl device process launch --device <id>
+dev.lapoule.tuile.viewer --imagery-compression auto` on a phone, or the
+scheme's *Arguments Passed On Launch* in Xcode. The caption at the bottom
+says what is held: `imagery ASTC 4x4 23 MiB`.
+
 ## What it does differently on a phone
 
 - **Launch**: the window opens at once on the globe's shell — the launch

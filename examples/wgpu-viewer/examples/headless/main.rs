@@ -39,6 +39,8 @@
 //! | `--logs DIR` | where the session logs and `summary.json` go: `target/headless` unless said |
 //! | `--json PATH` | where the summary goes, instead |
 //! | `--imagery-compression C` | `off` (the default), `auto`, `bc7` or `astc`: how imagery is held on the GPU |
+//! | `--pictures DIR` | where each run's last picture goes, once settled: `<pattern>.png`, eye 0 |
+//! | `--idle S` | after settling, wait up to `S` seconds for every load and upload to land (drapes included, which the settling does not see), and say how long it took |
 //!
 //! A run's log flies again in the application: `TUILE_REPLAY=<log>.mcap`.
 
@@ -54,7 +56,7 @@ use tuile_viewer::control::{
 
 const USAGE: &str = "headless list
 headless run <pattern|all> [--device D] [--hz N] [--memory-gib N] [--watch S] [--logs DIR] [--json PATH]
-             [--imagery-compression off|auto|bc7|astc]
+             [--imagery-compression off|auto|bc7|astc] [--pictures DIR] [--idle S]
 
 The patterns ask the real catalog: TUILE_ION_TOKEN must be set. See the source's documentation.";
 
@@ -64,6 +66,8 @@ struct Asked {
     logs: PathBuf,
     json: Option<PathBuf>,
     compression: ImageryCompression,
+    pictures: Option<PathBuf>,
+    idle: Option<f64>,
 }
 
 fn device(name: &str, memory_gib: Option<f64>) -> Result<Device, String> {
@@ -144,6 +148,8 @@ fn read(args: &[String]) -> Result<Option<Asked>, String> {
             "--logs",
             "--json",
             "--imagery-compression",
+            "--pictures",
+            "--idle",
         ]
         .contains(key)
         {
@@ -159,6 +165,8 @@ fn read(args: &[String]) -> Result<Option<Asked>, String> {
         compression: flags
             .get("--imagery-compression")
             .map_or(Ok(ImageryCompression::Off), |name| compression_named(name))?,
+        pictures: flags.get("--pictures").map(PathBuf::from),
+        idle: number("--idle")?,
     }))
 }
 
@@ -200,6 +208,8 @@ fn play(
     proxy: &catalog::Proxy,
     logs: &Path,
     compression: ImageryCompression,
+    pictures: Option<&Path>,
+    idle: Option<f64>,
 ) -> Result<Outcome, String> {
     let dir = place()?;
     let log = logs.join(format!("{}.mcap", pattern.key));
@@ -236,6 +246,32 @@ fn play(
             warm: pattern.relaunch,
         },
     );
+    // Until every upload has landed: the drapes refine after the meshes
+    // have settled, and a paced encoder lands them over more frames.
+    if let Some(bound) = idle {
+        match run.wait_until(bound, State::idle) {
+            Ok(seconds) => println!("  idle {seconds:.1} s after settling"),
+            Err(seconds) => println!("  NOT idle {seconds:.1} s after settling"),
+        }
+    }
+    // The settled picture, as the run's own offscreen eye drew it.
+    if let Some(dir) = pictures {
+        let path = dir.join(format!("{}.png", pattern.key));
+        match run.picture(0) {
+            Some((pixels, (width, height))) => {
+                image::save_buffer(
+                    &path,
+                    pixels,
+                    width,
+                    height,
+                    image::ExtendedColorType::Rgba8,
+                )
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+                println!("  picture: {}", path.display());
+            }
+            None => eprintln!("  no picture: the eye drew nothing"),
+        }
+    }
     let log = run.finish()?;
     Ok(Outcome {
         verdict,
@@ -280,9 +316,11 @@ fn main() {
             std::process::exit(2);
         }
     };
-    if let Err(e) = std::fs::create_dir_all(&asked.logs) {
-        eprintln!("{}: {e}", asked.logs.display());
-        std::process::exit(2);
+    for dir in std::iter::once(&asked.logs).chain(asked.pictures.as_ref()) {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("{}: {e}", dir.display());
+            std::process::exit(2);
+        }
     }
     let began = std::time::Instant::now();
     let (mut kept, mut summaries) = (true, Vec::new());
@@ -302,7 +340,14 @@ fn main() {
                 ""
             },
         );
-        let outcome = match play(pattern, &proxy, &asked.logs, asked.compression) {
+        let outcome = match play(
+            pattern,
+            &proxy,
+            &asked.logs,
+            asked.compression,
+            asked.pictures.as_deref(),
+            asked.idle,
+        ) {
             Ok(outcome) => outcome,
             Err(why) => {
                 eprintln!("{header}\n  could not run: {why}");
