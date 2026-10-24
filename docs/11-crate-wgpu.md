@@ -13,6 +13,8 @@ Reference rendering backend. Goal: correct and readable before fast. It is the s
 3. `TileRenderer::render(&mut self, pass: &mut RenderPass, selected: &[&PreparedTile])` — the host owns the surface, the event loop and the pass; the crate creates NEITHER window NOR surface.
 4. async→frame bridge: a `ContentPump` that drains the `ServerMessage`s of a `GeometryStream` (the `Content`s are already decoded there, whatever the binding), performs the GPU uploads (spread out: a budget of N uploads/frame to avoid hitches), returns the `Ack`s. The crate does not know whether the stream is in-process, WebSocket or HTTP pull — the host injects it.
 
+5. A frame the host owns (`HostPass`, `TargetLayout`, `TileRenderer::for_layout`): an engine that embeds tuile in its own render graph hands over its device (`GpuContext::new`), its colour target, its depth buffer and the frame's encoder. Any sample count, forward or reverse-Z depth, any colour format; nothing cleared unless asked, nothing submitted or presented. The ground's ownership mark is a stencil: a host whose depth carries one lends it; one whose depth has none (`Depth32Float`) gets a companion depth-stencil, its depth copied in before the ground is drawn and the ground's depth copied back where it is nearer — the path follows from the depth format, not from a setting. Such a depth must be created with `TEXTURE_BINDING`; on WebGL2 it must be single-sampled. Our own frame (`draw_to_surface`, `draw_to_texture`) goes through the same pass.
+
 ### Features
 - `native`: reqwest/tokio for the re-exported HttpFetcher.
 - `web`: wasm-bindgen, fetch via web-sys; same public APIs.
