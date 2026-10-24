@@ -626,9 +626,10 @@ pub fn stitch_mosaic(
         let Some(pixels) = tex.rgba8() else {
             for row in 0..ts {
                 let dst = ((cj + row) * w + ci) * 4;
-                for texel in rgba8[dst..dst + ts * 4].chunks_exact_mut(4) {
-                    texel.copy_from_slice(&crate::content::STAND_IN_RGBA);
-                }
+                rgba8[dst..dst + ts * 4]
+                    .as_chunks_mut::<4>()
+                    .0
+                    .fill(crate::content::STAND_IN_RGBA);
             }
             continue;
         };
