@@ -20,6 +20,9 @@ glam = { workspace = true }
 gltf = { workspace = true }
 image = { workspace = true }
 serde = { workspace = true }
+# Imagery stored already compressed (KTX 2.0, UASTC): read, transcoded or
+# unpacked on the CPU. Pure Rust, wasm-clean, no GPU dependency.
+texcomp = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 # A facade, not a backend: with no subscriber installed the macros compile

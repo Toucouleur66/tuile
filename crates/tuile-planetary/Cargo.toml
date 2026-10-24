@@ -22,5 +22,7 @@ tuile-terrain = { version = "0.12.0", path = "../tuile-terrain" }
 
 [dev-dependencies]
 image = { workspace = true }
+# KTX 2.0 tiles for the stored-imagery jobs' tests.
+texcomp = { workspace = true }
 futures-executor = { workspace = true }
 glam = { workspace = true }

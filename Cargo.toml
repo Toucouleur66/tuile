@@ -82,6 +82,10 @@ futures-core = "0.3.32"
 futures-util = { version = "0.3.32", default-features = false, features = ["std", "alloc", "async-await"] }
 futures-executor = "0.3.32"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+# KTX 2.0 and the UASTC transcoders, on the CPU: no default features, so no
+# wgpu. Pinned to the KTX 2.0 branch (texcomp PR "K1") while it is unmerged;
+# switched to a tag before this merges.
+texcomp = { git = "https://github.com/lapoule-dev/texcomp", rev = "19c08d97da438bf1e9eee974d612a0d74e5958e9", default-features = false }
 wgpu = "29.0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1.0.102"

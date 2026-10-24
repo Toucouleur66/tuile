@@ -11,7 +11,9 @@
 //! - [`ImageryDecode`]: a JPEG or PNG to RGBA8, resampled onto geographic
 //!   spacing when the provider's grid is not, and the opaque-black check. By
 //!   far the largest: a drape binds up to a dozen imagery tiles, each a full
-//!   image decode and a per-texel resample.
+//!   image decode and a per-texel resample. A tile stored already compressed
+//!   (KTX 2.0) is transcoded or unpacked instead, by the consumer's
+//!   [`StoredPlan`].
 //! - [`TerrainDecode`]: a quantized-mesh tile to its vertices, indices,
 //!   normals, edges and the availability it reveals.
 //!
@@ -28,6 +30,7 @@ use bytes::Bytes;
 use tuile_core::content::DecodedTexture;
 use tuile_core::offload::{self, Portable};
 use tuile_core::raster::{self, ImageryCoord, Projection, TilingScheme};
+use tuile_core::texels::{BlockFormat, ImageryFormat, StoredPlan, Texels};
 use tuile_terrain::{AvailabilityRange, Header, QuantizedMesh};
 
 /// Runs the job of this kind from its bytes: the whole registry a decode
@@ -50,6 +53,10 @@ pub struct ImageryDecode {
     pub scheme: TilingScheme,
     /// The tile, which places the resampling.
     pub coord: ImageryCoord,
+    /// What the consumer does with a tile stored already compressed: its own
+    /// choice, [`StoredPlan::OFF`] unless it opted in. A JPEG or PNG ignores
+    /// it.
+    pub stored: StoredPlan,
 }
 
 /// The texture, and whether it is entirely opaque black — a provider's way
@@ -57,15 +64,42 @@ pub struct ImageryDecode {
 /// in its words.
 pub type ImageryDecoded = Result<(DecodedTexture, bool), String>;
 
-/// The scheme and the coord, after the image: 29 + 20 bytes.
-const IMAGERY_TRAILER: usize = 1 + 8 + 8 + 4 + 4 + 4 + 4 + 8 + 8;
+/// The scheme, the coord and the stored plan, after the image: 29 + 20 + 3
+/// bytes.
+const IMAGERY_TRAILER: usize = 1 + 8 + 8 + 4 + 4 + 4 + 4 + 8 + 8 + 3;
+
+/// The form of an imagery answer's texels, before its outcome byte.
+const FORM_RGBA8: u8 = 0;
+const FORM_BC7: u8 = 1;
+const FORM_ASTC: u8 = 2;
+
+/// An imagery answer's numbers, after its texels: width, height, the black
+/// flag, the form and the level count.
+const ANSWER_TRAILER: usize = 4 + 4 + 1 + 1 + 1;
+
+fn format_tag(f: ImageryFormat) -> u8 {
+    match f {
+        ImageryFormat::Rgba8 => FORM_RGBA8,
+        ImageryFormat::Bc7 => FORM_BC7,
+        ImageryFormat::Astc4x4 => FORM_ASTC,
+    }
+}
+
+fn tag_format(tag: u8) -> Result<ImageryFormat, String> {
+    match tag {
+        FORM_RGBA8 => Ok(ImageryFormat::Rgba8),
+        FORM_BC7 => Ok(ImageryFormat::Bc7),
+        FORM_ASTC => Ok(ImageryFormat::Astc4x4),
+        other => Err(format!("no texel form is numbered {other}")),
+    }
+}
 
 impl Portable for ImageryDecode {
     const KIND: &'static str = "imagery";
     type Output = ImageryDecoded;
 
     fn run(self) -> ImageryDecoded {
-        let tex = raster::decode_and_reproject(&self.bytes, &self.scheme, self.coord)
+        let tex = raster::decode_imagery(&self.bytes, &self.scheme, self.coord, self.stored)
             .map_err(|e| e.to_string())?;
         let black = crate::is_opaque_black(&tex);
         Ok((tex, black))
@@ -89,6 +123,9 @@ impl Portable for ImageryDecode {
         out.extend_from_slice(&self.coord.level.to_le_bytes());
         out.extend_from_slice(&self.coord.x.to_le_bytes());
         out.extend_from_slice(&self.coord.y.to_le_bytes());
+        out.push(format_tag(self.stored.uastc));
+        out.push(u8::from(self.stored.keep_bc7));
+        out.push(u8::from(self.stored.keep_astc));
         out
     }
 
@@ -116,29 +153,43 @@ impl Portable for ImageryDecode {
             x: r.u64()?,
             y: r.u64()?,
         };
+        let stored = StoredPlan {
+            uastc: tag_format(r.u8()?)?,
+            keep_bc7: r.u8()? != 0,
+            keep_astc: r.u8()? != 0,
+        };
         bytes.truncate(start);
         Ok(Self {
             bytes: Bytes::from(bytes),
             scheme,
             coord,
+            stored,
         })
     }
 
-    /// The pixels first and the numbers after, for the same reason as the
+    /// The texels first and the numbers after, for the same reason as the
     /// job's: the answer is a quarter of a megabyte, its header a few bytes.
     ///
-    /// RGBA8 only: the job makes nothing else, and block-compressed texels
-    /// have no form on this wire yet.
+    /// RGBA8 crosses as its pixels; blocks as their levels end to end, each
+    /// level's length following from the size and the format.
     fn encode_output(output: ImageryDecoded) -> Vec<u8> {
         match output {
             Ok((tex, black)) => {
                 let (width, height) = (tex.width, tex.height);
-                let Some(mut out) = tex.into_rgba8() else {
-                    return failed("block-compressed texels have no form on this wire".into());
+                let (mut out, form, levels) = match tex.texels {
+                    Texels::Rgba8 { pixels, .. } => (pixels, FORM_RGBA8, 1),
+                    Texels::Blocks { format, levels } => {
+                        let Ok(count) = u8::try_from(levels.len()) else {
+                            return failed(format!("{} levels of blocks", levels.len()));
+                        };
+                        (levels.concat(), format_tag(format.into()), count)
+                    }
                 };
                 out.extend_from_slice(&width.to_le_bytes());
                 out.extend_from_slice(&height.to_le_bytes());
                 out.push(u8::from(black));
+                out.push(form);
+                out.push(levels);
                 out.push(OK);
                 out
             }
@@ -154,19 +205,52 @@ impl Portable for ImageryDecode {
         }
         let start = bytes
             .len()
-            .checked_sub(9)
+            .checked_sub(ANSWER_TRAILER)
             .ok_or("an imagery answer shorter than its own numbers")?;
         let mut r = Reader::new(&bytes[start..]);
         let (width, height, black) = (r.u32()?, r.u32()?, r.u8()? != 0);
+        let (form, count) = (tag_format(r.u8()?)?, r.u8()?);
         bytes.truncate(start);
-        if bytes.len() != width as usize * height as usize * 4 {
+        let Some(format) = form.block() else {
+            if bytes.len() != width as usize * height as usize * 4 {
+                return Err(format!(
+                    "{} bytes of pixels for a {width}×{height} texture",
+                    bytes.len()
+                ));
+            }
+            return Ok(Ok((
+                DecodedTexture::from_rgba8(width, height, bytes),
+                black,
+            )));
+        };
+        let mut levels = Vec::with_capacity(usize::from(count));
+        let mut rest = bytes.as_slice();
+        for level in 0..u32::from(count) {
+            let len = BlockFormat::level_bytes(
+                width.checked_shr(level).unwrap_or(0).max(1),
+                height.checked_shr(level).unwrap_or(0).max(1),
+            );
+            if rest.len() < len {
+                return Err(format!(
+                    "level {level} of a {width}×{height} texture cut short"
+                ));
+            }
+            let (head, tail) = rest.split_at(len);
+            levels.push(head.to_vec());
+            rest = tail;
+        }
+        if !rest.is_empty() || levels.is_empty() {
             return Err(format!(
-                "{} bytes of pixels for a {width}×{height} texture",
+                "{} bytes of blocks that are not {count} levels of a {width}×{height} texture",
                 bytes.len()
             ));
         }
         Ok(Ok((
-            DecodedTexture::from_rgba8(width, height, bytes),
+            DecodedTexture {
+                width,
+                height,
+                texels: Texels::Blocks { format, levels },
+            },
             black,
         )))
     }
@@ -454,6 +538,7 @@ mod tests {
                 x: 5,
                 y: 2,
             },
+            stored: StoredPlan::OFF,
         }
     }
 
@@ -472,10 +557,16 @@ mod tests {
             x: u64::from(u32::MAX) + 3,
             y: 99,
         };
+        job.stored = StoredPlan {
+            uastc: ImageryFormat::Astc4x4,
+            keep_bc7: false,
+            keep_astc: true,
+        };
         let back = ImageryDecode::decode(job.encode()).expect("decode");
         assert_eq!(back.bytes, job.bytes);
         assert_eq!(back.scheme, job.scheme);
         assert_eq!(back.coord, job.coord);
+        assert_eq!(back.stored, job.stored);
         assert!(ImageryDecode::decode(vec![0; 10]).is_err());
     }
 
@@ -536,6 +627,128 @@ mod tests {
                 .expect("readable")
                 .expect("decodes");
         assert!(is_black);
+    }
+
+    const UASTC: &[u8] = include_bytes!("../../tuile-core/tests/fixtures/uastc/alps-0-crop.uastc");
+    const ASTC: &[u8] = include_bytes!("../../tuile-core/tests/fixtures/uastc/alps-0-crop.astc");
+
+    /// A KTX 2.0 tile of texcomp's reference UASTC blocks, 64² with its full
+    /// chain (each level the first blocks of level 0).
+    fn ktx2_tile() -> Vec<u8> {
+        use texcomp::ktx2::{Format, Texture, UastcChannels};
+        let levels = (0..7)
+            .map(|l| UASTC[..BlockFormat::level_bytes(64 >> l, 64 >> l)].to_vec())
+            .collect();
+        texcomp::ktx2::write(&Texture {
+            format: Format::Uastc(UastcChannels::Rgb),
+            srgb: true,
+            width: 64,
+            height: 64,
+            levels,
+        })
+        .expect("a valid texture")
+    }
+
+    fn ktx2_job(stored: StoredPlan) -> ImageryDecode {
+        ImageryDecode {
+            bytes: Bytes::from(ktx2_tile()),
+            stored,
+            ..geographic_job()
+        }
+    }
+
+    /// A stored tile, for a client that chose ASTC: transcoded in the worker,
+    /// and every level crosses back as upstream's blocks, byte for byte.
+    #[test]
+    fn a_transcoded_tile_crosses_as_its_blocks() {
+        let stored = StoredPlan {
+            uastc: ImageryFormat::Astc4x4,
+            keep_bc7: false,
+            keep_astc: true,
+        };
+        let job = ktx2_job(stored);
+        let here = job.clone().run().expect("transcodes");
+        let there =
+            ImageryDecode::decode_output(serve(ImageryDecode::KIND, job.encode()).expect("served"))
+                .expect("readable")
+                .expect("transcodes");
+        assert_eq!((there.0.width, there.0.height), (64, 64));
+        assert_eq!(there.0.texels, here.0.texels);
+        let Texels::Blocks { format, levels } = &there.0.texels else {
+            panic!("blocks expected");
+        };
+        assert_eq!(*format, BlockFormat::Astc4x4);
+        assert_eq!(levels.len(), 7);
+        for (l, level) in levels.iter().enumerate() {
+            assert!(level[..] == ASTC[..level.len()], "level {l}");
+        }
+        assert!(!there.1, "blocks are never called black");
+        assert_eq!(there.0.cost().gpu, here.0.cost().gpu);
+    }
+
+    /// Not opted in: the same tile comes back as RGBA8, unpacked, the same
+    /// on both sides of the wire.
+    #[test]
+    fn a_stored_tile_unpacks_when_not_opted_in() {
+        let job = ktx2_job(StoredPlan::OFF);
+        let here = job.clone().run().expect("unpacks");
+        let there =
+            ImageryDecode::decode_output(serve(ImageryDecode::KIND, job.encode()).expect("served"))
+                .expect("readable")
+                .expect("unpacks");
+        assert_eq!(there.0.resident_format(), ImageryFormat::Rgba8);
+        assert_eq!(there.0.rgba8().map(<[u8]>::len), Some(64 * 64 * 4));
+        assert_eq!(there.0.texels, here.0.texels);
+    }
+
+    /// A corrupt KTX 2.0 tile is the decoder's error on both sides — a failed
+    /// tile the ancestor covers — never a panic and never a texture.
+    #[test]
+    fn a_corrupt_ktx2_tile_comes_back_as_the_decoders_error() {
+        let mut bytes = ktx2_tile();
+        bytes.truncate(bytes.len() - 5);
+        for stored in [
+            StoredPlan::OFF,
+            StoredPlan {
+                uastc: ImageryFormat::Bc7,
+                keep_bc7: true,
+                keep_astc: false,
+            },
+        ] {
+            let job = ImageryDecode {
+                bytes: Bytes::from(bytes.clone()),
+                ..ktx2_job(stored)
+            };
+            let here = job.clone().run().expect_err("corrupt");
+            assert!(here.contains("KTX2"), "{here}");
+            let there = ImageryDecode::decode_output(
+                serve(ImageryDecode::KIND, job.encode()).expect("an answer"),
+            )
+            .expect("readable")
+            .expect_err("corrupt");
+            assert_eq!(there, here);
+        }
+    }
+
+    /// Blocks whose levels do not add up to their size are refused.
+    #[test]
+    fn short_blocks_are_refused() {
+        let blocks = DecodedTexture {
+            width: 8,
+            height: 8,
+            texels: Texels::Blocks {
+                format: BlockFormat::Bc7,
+                levels: vec![vec![1; 64], vec![2; 16], vec![3; 16], vec![4; 16]],
+            },
+        };
+        let answer = ImageryDecode::encode_output(Ok((blocks.clone(), false)));
+        let back = ImageryDecode::decode_output(answer.clone())
+            .expect("readable")
+            .expect("blocks");
+        assert_eq!(back.0.texels, blocks.texels);
+        let mut short = answer;
+        short.remove(0);
+        assert!(ImageryDecode::decode_output(short).is_err());
     }
 
     /// A pixel count that does not match the size is refused, not drawn.

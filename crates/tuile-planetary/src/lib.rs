@@ -496,6 +496,14 @@ pub struct GlobeOptions {
     /// the encoders that honour it land in the consumer's upload (GPU) and in
     /// the decode job (CPU).
     pub imagery_plan: tuile_core::texels::ImageryPlan,
+    /// What the consumer does with imagery tiles stored already compressed
+    /// (KTX 2.0 holding UASTC, BC7 or ASTC 4×4): its own
+    /// [`tuile_core::texels::ImageryCompression::stored`] on its own device.
+    ///
+    /// The default, [`StoredPlan::OFF`](tuile_core::texels::StoredPlan::OFF),
+    /// unpacks UASTC to RGBA8 and holds nothing as blocks. A JPEG or PNG
+    /// tile ignores it.
+    pub stored_imagery: tuile_core::texels::StoredPlan,
 }
 
 /// The consumer's answer to "do you already hold this drape?".
@@ -799,6 +807,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                     bytes: fetched.value,
                     scheme,
                     coord: c,
+                    stored: self.opts.stored_imagery,
                 };
                 let (tex, black) = offload::run_portable(off.as_ref(), job)
                     .await
@@ -1735,6 +1744,10 @@ mod tests {
         assert_eq!(
             GlobeOptions::default().imagery_plan,
             tuile_core::texels::ImageryPlan::RGBA8
+        );
+        assert_eq!(
+            GlobeOptions::default().stored_imagery,
+            tuile_core::texels::StoredPlan::OFF
         );
     }
 

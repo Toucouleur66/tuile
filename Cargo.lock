@@ -5999,6 +5999,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "texcomp"
+version = "0.1.0"
+source = "git+https://github.com/lapoule-dev/texcomp?rev=19c08d97da438bf1e9eee974d612a0d74e5958e9#19c08d97da438bf1e9eee974d612a0d74e5958e9"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6595,6 +6603,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "texcomp",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -6870,6 +6879,7 @@ dependencies = [
  "glam 0.33.1",
  "image",
  "serde",
+ "texcomp",
  "tracing",
  "tuile-core",
  "tuile-terrain",
