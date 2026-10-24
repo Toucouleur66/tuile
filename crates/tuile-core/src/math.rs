@@ -570,8 +570,14 @@ mod tests {
     #[test]
     fn frustum_sphere_culling() {
         // Camera at origin looking down -Z (right-handed), 90° fov, square.
-        let proj = DMat4::perspective_rh(std::f64::consts::FRAC_PI_2, 1.0, 0.1, 1e9);
-        let view = DMat4::look_at_rh(DVec3::ZERO, dvec3(0.0, 0.0, -1.0), DVec3::Y);
+        let proj = glam::dcamera::rh::proj::directx::perspective(
+            std::f64::consts::FRAC_PI_2,
+            1.0,
+            0.1,
+            1e9,
+        );
+        let view =
+            glam::dcamera::rh::view::look_at_mat4(DVec3::ZERO, dvec3(0.0, 0.0, -1.0), DVec3::Y);
         let f = Frustum::from_view_proj(&(proj * view));
 
         let visible = Sphere {
@@ -598,8 +604,14 @@ mod tests {
 
     #[test]
     fn frustum_obb_culling() {
-        let proj = DMat4::perspective_rh(std::f64::consts::FRAC_PI_2, 1.0, 0.1, 1e9);
-        let view = DMat4::look_at_rh(DVec3::ZERO, dvec3(0.0, 0.0, -1.0), DVec3::Y);
+        let proj = glam::dcamera::rh::proj::directx::perspective(
+            std::f64::consts::FRAC_PI_2,
+            1.0,
+            0.1,
+            1e9,
+        );
+        let view =
+            glam::dcamera::rh::view::look_at_mat4(DVec3::ZERO, dvec3(0.0, 0.0, -1.0), DVec3::Y);
         let f = Frustum::from_view_proj(&(proj * view));
 
         let visible = Obb {

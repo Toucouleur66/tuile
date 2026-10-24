@@ -583,7 +583,7 @@ fn render_to_rgba(
     gpu.device
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("poll");
-    let data = slice.get_mapped_range();
+    let data = slice.get_mapped_range().expect("map range");
     let mut pixels = vec![0u8; (size * size * 4) as usize];
     for row in 0..size as usize {
         let src = row * bytes_per_row as usize;

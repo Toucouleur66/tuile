@@ -95,7 +95,9 @@ impl Readback {
         let slice = buffer.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         gpu.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
-        let data = slice.get_mapped_range();
+        // A mapping that failed reads as no pixels, as a poll that failed
+        // does: the caller already lives without a capture.
+        let data = slice.get_mapped_range().ok()?;
         let mut out = Vec::with_capacity(tight * height as usize);
         for row in 0..height as usize {
             let start = row * padded;

@@ -155,8 +155,9 @@ fn render(gpu: &GpuContext, content: &DecodedTileContent) -> Vec<u8> {
     let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
 
     let renderer = TileRenderer::new(gpu, TEXTURE_FORMAT);
-    let view_m = Mat4::look_at_rh(Vec3::new(0.0, 0.0, 2.0), Vec3::ZERO, Vec3::Y);
-    let proj = Mat4::perspective_rh(60f32.to_radians(), 1.0, 0.1, 10.0);
+    let view_m =
+        glam::camera::rh::view::look_at_mat4(Vec3::new(0.0, 0.0, 2.0), Vec3::ZERO, Vec3::Y);
+    let proj = glam::camera::rh::proj::directx::perspective(60f32.to_radians(), 1.0, 0.1, 10.0);
     renderer.set_view(
         &gpu.queue,
         &ViewUniform {
@@ -238,7 +239,7 @@ fn render(gpu: &GpuContext, content: &DecodedTileContent) -> Vec<u8> {
     gpu.device
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("poll");
-    let pixels = slice.get_mapped_range().to_vec();
+    let pixels = slice.get_mapped_range().expect("map range").to_vec();
     readback.unmap();
     pixels
 }

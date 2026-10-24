@@ -15,7 +15,7 @@
 //! present) and never stored.
 
 use anyhow::{bail, Context, Result};
-use glam::{DVec2, DVec3, Mat4};
+use glam::{DVec2, DVec3};
 use std::sync::Arc;
 use tuile_bing::{BingImageryProvider, BingMetadata};
 use tuile_cesium_ion::{AssetEndpoint, IonClient, IonTerrainSource};
@@ -129,12 +129,17 @@ impl Preset {
 
     /// The rebased f32 uniforms the renderer draws with.
     fn uniform(&self) -> ViewUniform {
-        let v = Mat4::look_at_rh(
+        let v = glam::camera::rh::view::look_at_mat4(
             (self.eye - self.render_origin).as_vec3(),
             (self.target - self.render_origin).as_vec3(),
             self.up.as_vec3(),
         );
-        let p = Mat4::perspective_rh(self.fovy_deg.to_radians(), 1.0, self.near, self.far);
+        let p = glam::camera::rh::proj::directx::perspective(
+            self.fovy_deg.to_radians(),
+            1.0,
+            self.near,
+            self.far,
+        );
         // Headlight: the light travels along the camera's view direction, so
         // it sits behind the camera and lights exactly what we look at.
         let headlight = (self.target - self.eye).normalize().as_vec3();
@@ -433,5 +438,5 @@ fn render_to_png(
     gpu.device
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("poll");
-    slice.get_mapped_range().to_vec()
+    slice.get_mapped_range().expect("map range").to_vec()
 }

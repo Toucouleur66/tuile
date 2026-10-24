@@ -133,7 +133,7 @@ fn render(gpu: &GpuContext, vertices: &[OverlayVertex]) -> Vec<u8> {
     gpu.device
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("poll");
-    let data = slice.get_mapped_range();
+    let data = slice.get_mapped_range().expect("map range");
 
     let mut pixels = vec![0u8; (SIZE * SIZE * 4) as usize];
     for row in 0..SIZE as usize {

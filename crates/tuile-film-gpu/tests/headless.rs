@@ -71,7 +71,7 @@ fn read(
     film.device()
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("poll");
-    slice.get_mapped_range().to_vec()
+    slice.get_mapped_range().expect("map range").to_vec()
 }
 
 fn oetf(c: f32) -> f32 {

@@ -84,7 +84,7 @@ fn picture(film: &FilmGpu) -> Vec<u8> {
     film.device()
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("poll");
-    let rows = slice.get_mapped_range().to_vec();
+    let rows = slice.get_mapped_range().expect("map range").to_vec();
     rows.chunks(padded as usize)
         .flat_map(|row| row[..(WIDTH * 4) as usize].to_vec())
         .collect()
@@ -562,7 +562,7 @@ fn floats(film: &FilmGpu, buffer: &wgpu::Buffer) -> Vec<f32> {
     film.device()
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("poll");
-    let bytes = slice.get_mapped_range().to_vec();
+    let bytes = slice.get_mapped_range().expect("map range").to_vec();
     bytemuck::pod_collect_to_vec(&bytes)
 }
 

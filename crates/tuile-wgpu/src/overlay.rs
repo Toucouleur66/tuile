@@ -95,7 +95,7 @@ impl OverlayRenderer {
                     module: &shader,
                     entry_point: Some("vs_main"),
                     compilation_options: Default::default(),
-                    buffers: &[OverlayVertex::LAYOUT],
+                    buffers: &[Some(OverlayVertex::LAYOUT)],
                 },
                 primitive: wgpu::PrimitiveState {
                     topology: wgpu::PrimitiveTopology::TriangleList,
