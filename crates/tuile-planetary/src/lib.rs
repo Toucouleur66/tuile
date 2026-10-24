@@ -100,7 +100,7 @@ impl GlobeOptions {
         choice: tuile_core::texels::ImageryCompression,
         caps: tuile_core::texels::GpuTextureCaps,
     ) -> Self {
-        self.imagery_plan = choice.plan(caps);
+        self.imagery_plan = ImageryPlanHandle::new(choice.plan(caps));
         self.stored_imagery = choice.stored(caps);
         self
     }
@@ -510,10 +510,15 @@ pub struct GlobeOptions {
     /// [`tuile_core::texels::ImageryCompression`] resolved against its own
     /// device. The default is RGBA8, and nothing here chooses otherwise.
     ///
-    /// Every texture still comes out RGBA8 held as RGBA8 whatever this says:
-    /// the encoders that honour it land in the consumer's upload (GPU) and in
-    /// the decode job (CPU).
-    pub imagery_plan: tuile_core::texels::ImageryPlan,
+    /// Read at each decode: a texture decoded under a plan that encodes on the
+    /// consumer's GPU comes out RGBA8 marked with the plan's target
+    /// ([`tuile_core::DecodedTexture::planned`]), so the budget charges it in
+    /// that format. A plan that encodes on the CPU leaves it RGBA8 for now:
+    /// that encoder runs in the decode job, which does not exist yet.
+    ///
+    /// A handle, like [`Self::imagery_slots`], because the plan needs the
+    /// device and the device comes after the loader — see [`ImageryPlanHandle`].
+    pub imagery_plan: ImageryPlanHandle,
     /// What the consumer does with imagery tiles stored already compressed
     /// (KTX 2.0 holding UASTC, BC7 or ASTC 4×4): its own
     /// [`tuile_core::texels::ImageryCompression::stored`] on its own device.
@@ -522,6 +527,40 @@ pub struct GlobeOptions {
     /// unpacks UASTC to RGBA8 and holds nothing as blocks. A JPEG or PNG
     /// tile ignores it.
     pub stored_imagery: tuile_core::texels::StoredPlan,
+}
+
+/// The consumer's imagery plan, shared with the loader and set once the
+/// consumer's device exists: the same ordering as [`LayerBudget`]. Until it
+/// is set — and for every consumer that never sets it — it reads
+/// [`tuile_core::texels::ImageryPlan::RGBA8`].
+///
+/// A texture is marked when it is decoded and keeps that mark in the decoded
+/// cache, so a plan set later applies to what is decoded from then on.
+#[derive(Clone, Default)]
+pub struct ImageryPlanHandle(Arc<std::sync::Mutex<tuile_core::texels::ImageryPlan>>);
+
+impl ImageryPlanHandle {
+    /// A handle that already reads `plan`.
+    pub fn new(plan: tuile_core::texels::ImageryPlan) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(plan)))
+    }
+
+    /// Declares the plan, as soon as the consumer's device says what it is.
+    pub fn set(&self, plan: tuile_core::texels::ImageryPlan) {
+        if let Ok(mut held) = self.0.lock() {
+            *held = plan;
+        }
+    }
+
+    pub fn get(&self) -> tuile_core::texels::ImageryPlan {
+        self.0.lock().map(|p| *p).unwrap_or_default()
+    }
+}
+
+impl std::fmt::Debug for ImageryPlanHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ImageryPlanHandle({:?})", self.get())
+    }
 }
 
 /// The consumer's answer to "do you already hold this drape?".
@@ -830,7 +869,8 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                 let (tex, black) = offload::run_portable(off.as_ref(), job)
                     .await
                     .map_err(|e| LoadError::Failed(format!("imagery {c:?}: {e}")))?;
-                let tex = Arc::new(tex);
+                // Held as the consumer's plan says: what the budget charges.
+                let tex = Arc::new(tex.planned(self.opts.imagery_plan.get()));
                 // A provider's way of saying "no data here" is often an opaque
                 // black image. Draped on good geometry that is a clean black
                 // quad with sharp edges — visually identical to a rendering
@@ -1760,7 +1800,7 @@ mod tests {
     #[test]
     fn imagery_is_held_as_rgba8_by_default() {
         assert_eq!(
-            GlobeOptions::default().imagery_plan,
+            GlobeOptions::default().imagery_plan.get(),
             tuile_core::texels::ImageryPlan::RGBA8
         );
         assert_eq!(
@@ -1785,11 +1825,11 @@ mod tests {
             ImageryCompression::Format(tuile_core::texels::BlockFormat::Bc7),
         ] {
             let o = GlobeOptions::default().with_imagery_compression(choice, caps);
-            assert_eq!(o.imagery_plan, choice.plan(caps), "{choice:?}");
+            assert_eq!(o.imagery_plan.get(), choice.plan(caps), "{choice:?}");
             assert_eq!(o.stored_imagery, choice.stored(caps), "{choice:?}");
         }
         let off = GlobeOptions::default().with_imagery_compression(ImageryCompression::Off, caps);
-        assert_eq!(off.imagery_plan, GlobeOptions::default().imagery_plan);
+        assert_eq!(off.imagery_plan.get(), GlobeOptions::default().imagery_plan.get());
         assert_eq!(off.stored_imagery, GlobeOptions::default().stored_imagery);
     }
 
@@ -2062,6 +2102,35 @@ mod tests {
             .collect();
         assert!(textures.iter().all(|t| Arc::ptr_eq(t, &textures[0])));
         assert_eq!(loader.fetching.len(), 0, "nothing left in flight");
+    }
+
+    /// **The loader holds what it decodes as its consumer's plan says**, read
+    /// at each decode: RGBA8 until a plan is set, then marked with the target
+    /// the consumer's GPU encodes it into.
+    #[test]
+    fn decoded_imagery_follows_the_consumers_plan() {
+        use tuile_core::texels::{ImageryEncode, ImageryFormat, ImageryPlan};
+        let gate = Arc::new(futures_util::lock::Mutex::new(()));
+        let loader = gated_loader(gate);
+        let fetch = |c| {
+            futures_executor::block_on(loader.fetch_imagery(c))
+                .expect("a texture")
+                .1
+        };
+        assert_eq!(fetch(SHARED).resident_format(), ImageryFormat::Rgba8);
+        loader.opts.imagery_plan.set(ImageryPlan {
+            target: ImageryFormat::Astc4x4,
+            encode: ImageryEncode::Gpu,
+        });
+        let next = ImageryCoord { x: 41, ..SHARED };
+        let planned = fetch(next);
+        assert_eq!(planned.resident_format(), ImageryFormat::Astc4x4);
+        assert!(planned.rgba8().is_some(), "still RGBA8: the GPU encodes it");
+        assert_eq!(
+            fetch(SHARED).resident_format(),
+            ImageryFormat::Rgba8,
+            "what was decoded before keeps its mark"
+        );
     }
 
     /// **The asker that fetches may be cancelled; the others are not left
