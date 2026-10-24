@@ -350,11 +350,11 @@ mod tests {
         };
         crate::raster::ImageryLayer::placed(
             crate::raster::ImageryCoord { level: 3, x, y: 0 },
-            Arc::new(crate::content::DecodedTexture {
-                width: 1,
-                height: 1,
-                rgba8: vec![0, 0, 0, 255],
-            }),
+            Arc::new(crate::content::DecodedTexture::from_rgba8(
+                1,
+                1,
+                vec![0, 0, 0, 255],
+            )),
             &rect,
             &rect,
         )

@@ -26,6 +26,7 @@
 //! - [`drive`] — render-agnostic consumer driving (progressive + bulk)
 //! - [`fetch`] — abstract byte source ([`fetch::FsFetcher`], `HttpFetcher`)
 //! - [`budget`] — the graphics budget: pure, deterministic GPU residency decisions
+//! - [`texels`] — the imagery format seam: GPU capabilities → plan, texels
 
 pub mod budget;
 pub mod content;
@@ -46,6 +47,7 @@ pub mod seam;
 pub mod source;
 pub mod stitch;
 pub mod storage;
+pub mod texels;
 pub mod tiles3d;
 pub mod tileset;
 pub mod traversal;

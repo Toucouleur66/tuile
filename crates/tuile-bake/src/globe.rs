@@ -19,6 +19,7 @@ use std::time::Duration;
 use tuile_bing::{BingImageryProvider, BingMetadata};
 use tuile_cesium_ion::{tms::TmsImagery, AssetEndpoint, IonClient, IonTerrainSource};
 use tuile_core::offload;
+use tuile_core::texels::ImageryPlan;
 use tuile_native_fetchers::{NativeHttp, RetryConfig, TransportConfig};
 use tuile_planetary::{globe_with_provenance, GlobeOptions, Held, LayerBudget};
 
@@ -418,6 +419,8 @@ async fn resolve(
             held_drape: config.held_drape.clone(),
             composed_at: config.session.bake_max_size,
             imagery_by_stamp: names_only(config),
+            // A bake never compresses: its textures are written out as PNG.
+            imagery_plan: ImageryPlan::RGBA8,
         };
         return Ok(match config.imagery_asset_id {
             None => globe_with_provenance(terrain, NoImagery, layer, options(true), decode_pool()),
@@ -481,6 +484,8 @@ async fn resolve(
                 held_drape: config.held_drape.clone(),
                 composed_at: config.session.bake_max_size,
                 imagery_by_stamp: names_only(config),
+                // A bake never compresses: its textures are written out as PNG.
+                imagery_plan: ImageryPlan::RGBA8,
             },
             decode_pool(),
         );
@@ -508,6 +513,8 @@ async fn resolve(
             held_drape: config.held_drape.clone(),
             composed_at: config.session.bake_max_size,
             imagery_by_stamp: names_only(config),
+            // A bake never compresses: its textures are written out as PNG.
+            imagery_plan: ImageryPlan::RGBA8,
         };
         return Ok(globe_with_provenance(
             terrain,
@@ -543,6 +550,8 @@ async fn resolve(
         held_drape: config.held_drape.clone(),
         composed_at: config.session.bake_max_size,
         imagery_by_stamp: names_only(config),
+        // A bake never compresses: its textures are written out as PNG.
+        imagery_plan: ImageryPlan::RGBA8,
     };
 
     // Ce que l'endpoint est, et non ce qu'on espère qu'il soit.

@@ -561,7 +561,20 @@ fn passes(
 /// pass per level per texture: at eight uploads a frame that is ~80 passes a
 /// frame, enough to exhaust the driver in minutes and take the machine down
 /// with it. Filtering on the CPU costs zero render passes.
+///
+/// RGBA8 only. Block-compressed texels have no upload here yet and no path
+/// hands them one; if one ever did, the stand-in slate is drawn instead —
+/// ground shown flat, never a hole and never black. A debug build stops on
+/// it, so a real occurrence fails the tests rather than hide under the slate.
 fn upload_texture(gpu: &GpuContext, t: &DecodedTexture) -> GpuImagery {
+    let stand_in;
+    let t = if t.rgba8().is_some() {
+        t
+    } else {
+        debug_assert!(false, "block-compressed texels reached the RGBA8 upload");
+        stand_in = DecodedTexture::stand_in();
+        &stand_in
+    };
     let mips = raster::mip_chain(t);
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("tuile base color"),
@@ -588,7 +601,7 @@ fn upload_texture(gpu: &GpuContext, t: &DecodedTexture) -> GpuImagery {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &image.rgba8,
+            image.rgba8().unwrap_or_default(),
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(image.width * BYTES_PER_TEXEL),
@@ -600,7 +613,7 @@ fn upload_texture(gpu: &GpuContext, t: &DecodedTexture) -> GpuImagery {
                 depth_or_array_layers: 1,
             },
         );
-        bytes += image.rgba8.len();
+        bytes += image.texels.byte_len();
     }
 
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -757,4 +770,44 @@ fn compute_normals(positions: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
     acc.into_iter()
         .map(|n| n.normalize_or_zero().to_array())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tuile_core::texels::{BlockFormat, Texels};
+
+    /// Block-compressed texels have no upload here yet. One that arrived
+    /// anyway stops a debug build, and a release build draws the stand-in —
+    /// a real texture with its chain, never an empty one.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "block-compressed texels reached the RGBA8 upload")
+    )]
+    fn blocks_upload_the_stand_in() {
+        let gpu = match pollster::block_on(GpuContext::headless()) {
+            Ok(gpu) => gpu,
+            Err(e) => {
+                assert!(
+                    std::env::var("TUILE_REQUIRE_GPU").is_err(),
+                    "TUILE_REQUIRE_GPU is set and there is no usable adapter: {e}"
+                );
+                eprintln!("SKIP: {e}");
+                return;
+            }
+        };
+        let blocks = DecodedTexture {
+            width: 4,
+            height: 4,
+            texels: Texels::Blocks {
+                format: BlockFormat::Bc7,
+                levels: vec![vec![0; 16]; 3],
+            },
+        };
+        let uploaded = upload_texture(&gpu, &blocks);
+        assert_eq!(uploaded.bytes, 4, "one stand-in texel");
+        let rgba = upload_texture(&gpu, &DecodedTexture::from_rgba8(2, 2, vec![9; 16]));
+        assert_eq!(rgba.bytes, 16 + 4, "RGBA8 uploads its chain as before");
+    }
 }

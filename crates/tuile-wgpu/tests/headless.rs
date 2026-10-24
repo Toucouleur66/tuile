@@ -47,16 +47,16 @@ fn quad_content(origin: DVec3) -> DecodedTileContent {
                 base_color_texture: Some(0),
             },
         }],
-        textures: vec![DecodedTexture {
-            width: 2,
-            height: 2,
-            rgba8: vec![
+        textures: vec![DecodedTexture::from_rgba8(
+            2,
+            2,
+            vec![
                 255, 0, 0, 255, // (0,0) red
                 0, 255, 0, 255, // (1,0) green
                 0, 0, 255, 255, // (0,1) blue
                 255, 255, 255, 255, // (1,1) white
             ],
-        }],
+        )],
         imagery: Vec::new(),
         local_origin_ecef: origin,
         transform_local: Mat4::IDENTITY,
@@ -311,16 +311,16 @@ fn depth_test_orders_overlapping_quads() {
 /// A 4×1 strip: red on its west half, green on its east. Sampling it tells you
 /// *where* in the texture a fragment landed, which a flat colour cannot.
 fn ramp_texture() -> std::sync::Arc<DecodedTexture> {
-    std::sync::Arc::new(DecodedTexture {
-        width: 4,
-        height: 1,
-        rgba8: vec![
+    std::sync::Arc::new(DecodedTexture::from_rgba8(
+        4,
+        1,
+        vec![
             255, 0, 0, 255, // texel 0 red
             255, 0, 0, 255, // texel 1 red
             0, 255, 0, 255, // texel 2 green
             0, 255, 0, 255, // texel 3 green
         ],
-    })
+    ))
 }
 
 /// Screen x of a point at tile-uv `u`, for the quad under `looking_down_z(2.5)`.

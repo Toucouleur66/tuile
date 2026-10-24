@@ -514,10 +514,13 @@ impl Frame {
         // Encoded outside the lock: this is milliseconds of CPU per texture,
         // and holding the map while it runs would serialise every other tile's
         // encode behind it for no reason.
+        let rgba8 = texture.rgba8().ok_or_else(|| {
+            FrameError::TextureEncode("block-compressed texels cannot be written as PNG".into())
+        })?;
         let mut png = Vec::new();
         image::write_buffer_with_format(
             &mut std::io::Cursor::new(&mut png),
-            &texture.rgba8,
+            rgba8,
             texture.width,
             texture.height,
             image::ColorType::Rgba8,
@@ -2004,10 +2007,11 @@ fn encode_baked(
 ) -> Option<Arc<EncodedTexture>> {
     let baked = baked?;
     let texture = decoded.textures.first()?;
+    let rgba8 = texture.rgba8()?;
     let mut png = Vec::new();
     image::write_buffer_with_format(
         &mut std::io::Cursor::new(&mut png),
-        &texture.rgba8,
+        rgba8,
         texture.width,
         texture.height,
         image::ColorType::Rgba8,
@@ -2085,11 +2089,7 @@ pub(crate) mod tests {
                 content: DecodedTileContent {
                     withheld_drape: None,
                     meshes: Vec::new(),
-                    textures: vec![DecodedTexture {
-                        width: 2,
-                        height: 2,
-                        rgba8: vec![255u8; 2 * 2 * 4],
-                    }],
+                    textures: vec![DecodedTexture::from_rgba8(2, 2, vec![255u8; 2 * 2 * 4])],
                     imagery: Vec::new(),
                     local_origin_ecef: DVec3::ZERO,
                     transform_local: glam::Mat4::IDENTITY,
@@ -2410,11 +2410,7 @@ pub(crate) mod tests {
                     x: 0,
                     y: 0,
                 },
-                texture: Arc::new(DecodedTexture {
-                    width: 2,
-                    height: 2,
-                    rgba8: vec![128u8; 2 * 2 * 4],
-                }),
+                texture: Arc::new(DecodedTexture::from_rgba8(2, 2, vec![128u8; 2 * 2 * 4])),
                 coverage: [-0.1, -0.1, 1.1, 1.1],
                 translation: [0.0, 0.0],
                 scale: [1.0, 1.0],
@@ -2463,11 +2459,7 @@ pub(crate) mod tests {
                     x: 0,
                     y: 0,
                 },
-                texture: Arc::new(DecodedTexture {
-                    width: 2,
-                    height: 2,
-                    rgba8: vec![128u8; 2 * 2 * 4],
-                }),
+                texture: Arc::new(DecodedTexture::from_rgba8(2, 2, vec![128u8; 2 * 2 * 4])),
                 coverage: [-0.1, -0.1, 1.1, 1.1],
                 translation: [0.0, 0.0],
                 scale: [1.0, 1.0],
@@ -2566,7 +2558,12 @@ pub(crate) mod tests {
     fn a_baked_tile_holds_no_raw_mosaic() {
         let memo = TextureMemo::default();
         let tile = finish_tile(&memo, "test", TileId(7), draped_content(), 256);
-        let raw: usize = tile.content.textures.iter().map(|t| t.rgba8.len()).sum();
+        let raw: usize = tile
+            .content
+            .textures
+            .iter()
+            .map(|t| t.texels.byte_len())
+            .sum();
         assert_eq!(raw, 0, "{raw} bytes of raw mosaic stayed resident");
         let png = tile
             .memoized
@@ -2981,17 +2978,17 @@ pub(crate) mod tests {
             content.meshes[0].positions[1] = [id.0 as f32, 1.0, 0.0];
             let layer = &mut content.imagery[0];
             layer.coord = tuile_core::raster::ImageryCoord { level, x, y };
-            layer.texture = Arc::new(DecodedTexture {
-                width: 2,
-                height: 2,
-                rgba8: [
+            layer.texture = Arc::new(DecodedTexture::from_rgba8(
+                2,
+                2,
+                [
                     (id.0 % 251) as u8,
                     (id.0 / 251) as u8,
                     level as u8 * 40,
                     255,
                 ]
                 .repeat(4),
-            });
+            ));
             Ok(tuile_core::source::Loaded::Content(content))
         }
     }

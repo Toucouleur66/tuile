@@ -857,16 +857,15 @@ pub async fn render(
                                     timings.observe += ms(t);
                                     let t = Instant::now();
                                     let decoded = imagery_texture(&placed.tile, scheme, found)?;
-                                    let opaque = decoded
-                                        .rgba8
-                                        .as_chunks::<4>()
-                                        .0
-                                        .iter()
-                                        .all(|p| p[3] == 255);
+                                    let rgba8 = decoded
+                                        .rgba8()
+                                        .ok_or("film reads imagery as RGBA8 only")?;
+                                    let opaque =
+                                        rgba8.as_chunks::<4>().0.iter().all(|p| p[3] == 255);
                                     timings.decode += ms(t);
                                     let t = Instant::now();
                                     let texture = gpu.create_imagery(decoded.width, decoded.height);
-                                    gpu.write_rgba(&texture, &decoded.rgba8);
+                                    gpu.write_rgba(&texture, rgba8);
                                     timings.upload += ms(t);
                                     e.insert((texture, opaque));
                                 }
@@ -899,14 +898,20 @@ pub async fn render(
                                     let mut texels =
                                         imagery_texture(&placed.tile, scheme, &found.bytes)?;
                                     let (w, h) = (texels.width, texels.height);
-                                    fielded(at, &mut texels.rgba8, w, h);
+                                    let rgba8 = texels
+                                        .rgba8_mut()
+                                        .ok_or("film reads imagery as RGBA8 only")?;
+                                    fielded(at, rgba8, w, h);
                                     decoded.insert(at, std::sync::Arc::new(texels));
                                 }
                                 compose(&refs, factor, |t| decoded[&(t.level, t.x, t.y)].clone())
                                     .map(|texels| {
                                         let texture =
                                             gpu.create_albedo(texels.width, texels.height);
-                                        gpu.write_rgba(&texture, &texels.rgba8);
+                                        // Composition writes RGBA8 and nothing else.
+                                        let rgba8 =
+                                            texels.rgba8().expect("a composed drape is RGBA8");
+                                        gpu.write_rgba(&texture, rgba8);
                                         texture
                                     })
                             } else {

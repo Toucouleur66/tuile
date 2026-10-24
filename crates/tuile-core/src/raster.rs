@@ -606,7 +606,8 @@ impl ImageryMosaic {
 
 /// Stitches mosaic tiles (row-major NW→SE, each ≤ `tile_size`²) into one RGBA8
 /// texture laid out as a `cols × rows` grid. Tiles smaller than `tile_size`
-/// are copied into the top-left of their cell.
+/// are copied into the top-left of their cell. A tile that does not carry
+/// RGBA8 leaves its cell the stand-in slate, never black.
 pub fn stitch_mosaic(
     tiles: &[DecodedTexture],
     cols: u32,
@@ -622,17 +623,23 @@ pub fn stitch_mosaic(
         let cj = (idx / cols as usize) * ts;
         let tw = (tex.width as usize).min(ts);
         let th = (tex.height as usize).min(ts);
+        let Some(pixels) = tex.rgba8() else {
+            for row in 0..ts {
+                let dst = ((cj + row) * w + ci) * 4;
+                rgba8[dst..dst + ts * 4]
+                    .as_chunks_mut::<4>()
+                    .0
+                    .fill(crate::content::STAND_IN_RGBA);
+            }
+            continue;
+        };
         for row in 0..th {
             let src = row * tex.width as usize * 4;
             let dst = ((cj + row) * w + ci) * 4;
-            rgba8[dst..dst + tw * 4].copy_from_slice(&tex.rgba8[src..src + tw * 4]);
+            rgba8[dst..dst + tw * 4].copy_from_slice(&pixels[src..src + tw * 4]);
         }
     }
-    DecodedTexture {
-        width: w as u32,
-        height: h as u32,
-        rgba8,
-    }
+    DecodedTexture::from_rgba8(w as u32, h as u32, rgba8)
 }
 
 /// Resamples an imagery texture from its source projection (covering
@@ -642,12 +649,18 @@ pub fn stitch_mosaic(
 /// correct on geographic terrain: no Web-Mercator twist, and latitudes past
 /// the projection's limit clamp to its edge row (a smooth polar cap, no
 /// pinwheel of stretched meridian wedges).
+///
+/// Only RGBA8 resamples: block-compressed texels are encoded after
+/// reprojection, never before, and are returned as they are.
 pub fn reproject_to_geographic(
     src: &DecodedTexture,
     src_extent: (f64, f64, f64, f64),
     rect: &GeoRect,
     projection: Projection,
 ) -> DecodedTexture {
+    let Some(pixels) = src.rgba8() else {
+        return src.clone();
+    };
     let (w, h) = (src.width.max(1), src.height.max(1));
     let (x0, y0, x1, y1) = src_extent;
     let sw = (x1 - x0).max(1e-15);
@@ -666,30 +679,27 @@ pub fn reproject_to_geographic(
             });
             let su = ((mx - x0) / sw).clamp(0.0, 1.0);
             let sv = ((my - y0) / sh).clamp(0.0, 1.0);
-            let px = bilinear(src, su, sv);
+            let px = bilinear((src.width, src.height, pixels), su, sv);
             let di = ((row * w + col) * 4) as usize;
             rgba8[di..di + 4].copy_from_slice(&px);
         }
     }
-    DecodedTexture {
-        width: w,
-        height: h,
-        rgba8,
-    }
+    DecodedTexture::from_rgba8(w, h, rgba8)
 }
 
-fn bilinear(t: &DecodedTexture, u: f64, v: f64) -> [u8; 4] {
-    let fx = u * (t.width.saturating_sub(1)) as f64;
-    let fy = v * (t.height.saturating_sub(1)) as f64;
+/// Samples RGBA8 pixels `(width, height, pixels)` at `(u, v)`.
+fn bilinear((width, height, pixels): (u32, u32, &[u8]), u: f64, v: f64) -> [u8; 4] {
+    let fx = u * (width.saturating_sub(1)) as f64;
+    let fy = v * (height.saturating_sub(1)) as f64;
     let x0 = fx.floor() as u32;
     let y0 = fy.floor() as u32;
-    let x1 = (x0 + 1).min(t.width - 1);
-    let y1 = (y0 + 1).min(t.height - 1);
+    let x1 = (x0 + 1).min(width - 1);
+    let y1 = (y0 + 1).min(height - 1);
     let tx = (fx - x0 as f64) as f32;
     let ty = (fy - y0 as f64) as f32;
     let texel = |x: u32, y: u32| {
-        let i = ((y * t.width + x) * 4) as usize;
-        [t.rgba8[i], t.rgba8[i + 1], t.rgba8[i + 2], t.rgba8[i + 3]]
+        let i = ((y * width + x) * 4) as usize;
+        [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
     };
     let lerp = |a: u8, b: u8, f: f32| (a as f32 + (b as f32 - a as f32) * f) as u8;
     let mix = |a: [u8; 4], b: [u8; 4], f: f32| {
@@ -1335,7 +1345,13 @@ pub fn bake_layers(layers: &[ImageryLayer], base: [f32; 4], size: (u32, u32)) ->
                 }
                 let tu = (u * layer.scale[0] + layer.translation[0]).clamp(0.0, 1.0);
                 let tv = (v * layer.scale[1] + layer.translation[1]).clamp(0.0, 1.0);
-                let texel = bilinear(&layer.texture, f64::from(tu), f64::from(tv));
+                // Composition reads RGBA8; a layer carrying blocks leaves
+                // what is under it showing, never a hole.
+                let Some(pixels) = layer.texture.rgba8() else {
+                    continue;
+                };
+                let t = &layer.texture;
+                let texel = bilinear((t.width, t.height, pixels), f64::from(tu), f64::from(tv));
                 let a = f32::from(texel[3]) / 255.0;
                 for (dst, src) in rgb.iter_mut().zip(texel) {
                     *dst += (f32::from(src) - *dst) * a;
@@ -1348,11 +1364,7 @@ pub fn bake_layers(layers: &[ImageryLayer], base: [f32; 4], size: (u32, u32)) ->
             rgba8[i + 3] = 255;
         }
     }
-    DecodedTexture {
-        width: w,
-        height: h,
-        rgba8,
-    }
+    DecodedTexture::from_rgba8(w, h, rgba8)
 }
 
 /// The side of the texture a stack of layers composes into: as many texels
@@ -1610,11 +1622,11 @@ impl<P: ImageryProvider> ImageryProvider for CachedImagery<P> {
 pub fn decode_image(bytes: &[u8]) -> Result<DecodedTexture, RasterError> {
     let img = image::load_from_memory(bytes).map_err(|e| RasterError::Image(e.to_string()))?;
     let rgba = img.to_rgba8();
-    Ok(DecodedTexture {
-        width: rgba.width(),
-        height: rgba.height(),
-        rgba8: rgba.into_raw(),
-    })
+    Ok(DecodedTexture::from_rgba8(
+        rgba.width(),
+        rgba.height(),
+        rgba.into_raw(),
+    ))
 }
 
 /// Everything that turns fetched imagery bytes into a drapeable texture, as one
@@ -1650,7 +1662,10 @@ pub fn decode_and_reproject(
 /// than blocky.
 pub fn upsample_quadrant(src: &DecodedTexture, qx: u32, qy: u32) -> DecodedTexture {
     use image::{imageops, RgbaImage};
-    let Some(img) = RgbaImage::from_raw(src.width, src.height, src.rgba8.clone()) else {
+    let Some(pixels) = src.rgba8() else {
+        return src.clone();
+    };
+    let Some(img) = RgbaImage::from_raw(src.width, src.height, pixels.to_vec()) else {
         return src.clone();
     };
     let (hw, hh) = (src.width / 2, src.height / 2);
@@ -1661,11 +1676,7 @@ pub fn upsample_quadrant(src: &DecodedTexture, qx: u32, qy: u32) -> DecodedTextu
         src.height,
         imageops::FilterType::CatmullRom,
     );
-    DecodedTexture {
-        width: src.width,
-        height: src.height,
-        rgba8: full.into_raw(),
-    }
+    DecodedTexture::from_rgba8(src.width, src.height, full.into_raw())
 }
 
 /// The mip chain of a texture: levels 1.., each half the size of the previous
@@ -1681,6 +1692,8 @@ pub fn upsample_quadrant(src: &DecodedTexture, qx: u32, qy: u32) -> DecodedTextu
 /// Like `upsample_quadrant`, this averages in the encoded domain rather than in
 /// linear light, so the chain darkens very slightly against a filtering GPU
 /// sampler's own result. Consistent with the rest of the module.
+///
+/// Block-compressed texels carry their chain already: they get no levels here.
 pub fn mip_chain(src: &DecodedTexture) -> Vec<DecodedTexture> {
     use image::{imageops, ImageBuffer, Rgba};
     let mut levels: Vec<DecodedTexture> = Vec::new();
@@ -1689,19 +1702,16 @@ pub fn mip_chain(src: &DecodedTexture) -> Vec<DecodedTexture> {
         if prev.width <= 1 && prev.height <= 1 {
             return levels;
         }
-        let Some(view) =
-            ImageBuffer::<Rgba<u8>, _>::from_raw(prev.width, prev.height, &prev.rgba8[..])
+        let Some(view) = prev
+            .rgba8()
+            .and_then(|px| ImageBuffer::<Rgba<u8>, _>::from_raw(prev.width, prev.height, px))
         else {
             return levels;
         };
         let width = (prev.width / 2).max(1);
         let height = (prev.height / 2).max(1);
         let next = imageops::resize(&view, width, height, imageops::FilterType::Triangle);
-        levels.push(DecodedTexture {
-            width,
-            height,
-            rgba8: next.into_raw(),
-        });
+        levels.push(DecodedTexture::from_rgba8(width, height, next.into_raw()));
     }
 }
 
@@ -1711,11 +1721,11 @@ mod seam_tests {
     use std::sync::Arc;
 
     fn texture(size: u32) -> Arc<DecodedTexture> {
-        Arc::new(DecodedTexture {
-            width: size,
-            height: size,
-            rgba8: vec![255; (size * size * 4) as usize],
-        })
+        Arc::new(DecodedTexture::from_rgba8(
+            size,
+            size,
+            vec![255; (size * size * 4) as usize],
+        ))
     }
 
     /// A geometry tile somewhere awkward: not aligned to the imagery grid, and
@@ -2121,11 +2131,7 @@ mod tests {
             assert!((0.0..=1.0).contains(&uv[0]) && (0.0..=1.0).contains(&uv[1]));
         }
 
-        let tex = DecodedTexture {
-            width: 1,
-            height: 1,
-            rgba8: vec![1, 2, 3, 255],
-        };
+        let tex = DecodedTexture::from_rgba8(1, 1, vec![1, 2, 3, 255]);
         drape_single(&mut content, &attachment, tex);
         assert_eq!(content.textures.len(), 1);
         assert_eq!(content.meshes[0].material.base_color_texture, Some(0));
@@ -2195,11 +2201,7 @@ mod tests {
     }
 
     fn tex1x1() -> Arc<DecodedTexture> {
-        Arc::new(DecodedTexture {
-            width: 1,
-            height: 1,
-            rgba8: vec![0, 0, 0, 255],
-        })
+        Arc::new(DecodedTexture::from_rgba8(1, 1, vec![0, 0, 0, 255]))
     }
 
     /// The invariant the whole layered model rests on: a point on the ground
@@ -2235,11 +2237,11 @@ mod tests {
         // half-texel inset and a 1×1 texture makes that inset a quarter of the
         // image — true to the rule, useless as a fixture.
         const SIZE: u32 = 256;
-        let texture = Arc::new(DecodedTexture {
-            width: SIZE,
-            height: SIZE,
-            rgba8: vec![255; (SIZE * SIZE * 4) as usize],
-        });
+        let texture = Arc::new(DecodedTexture::from_rgba8(
+            SIZE,
+            SIZE,
+            vec![255; (SIZE * SIZE * 4) as usize],
+        ));
         for imagery in [finer, coarser] {
             let layer = ImageryLayer::placed(coord(5, 1, 1), Arc::clone(&texture), &tile, &imagery);
             for (lon, lat) in [(0.115, 0.23), (0.125, 0.245), (0.12, 0.225)] {
@@ -2428,11 +2430,7 @@ mod tests {
     /// tile distorts by less than one texel across its own height.
     #[test]
     fn reprojection_is_skipped_where_it_would_change_nothing() {
-        let src = DecodedTexture {
-            width: 256,
-            height: 256,
-            rgba8: vec![128; 256 * 256 * 4],
-        };
+        let src = DecodedTexture::from_rgba8(256, 256, vec![128; 256 * 256 * 4]);
         let geo = TilingScheme::geographic();
         assert!(
             reproject_tile_to_geographic(&src, &geo, coord(4, 3, 2)).is_none(),
@@ -2465,16 +2463,12 @@ mod tests {
                 rgba8.extend_from_slice(&[v, v, v, 255]);
             }
         }
-        let src = DecodedTexture {
-            width: w,
-            height: h,
-            rgba8,
-        };
+        let src = DecodedTexture::from_rgba8(w, h, rgba8);
         let wm = TilingScheme::web_mercator();
         let out = reproject_tile_to_geographic(&src, &wm, coord(2, 1, 1)).expect("reprojected");
         assert_eq!((out.width, out.height), (w, h));
-        let first = out.rgba8[0];
-        let last = out.rgba8[((h - 1) * w * 4) as usize];
+        let first = out.rgba8().unwrap()[0];
+        let last = out.rgba8().unwrap()[((h - 1) * w * 4) as usize];
         assert!(first < 8, "north edge drifted to {first}");
         assert!(last > 247, "south edge drifted to {last}");
     }
@@ -2689,11 +2683,7 @@ mod tests {
 
     #[test]
     fn mip_chain_halves_down_to_one_texel() {
-        let src = DecodedTexture {
-            width: 8,
-            height: 4,
-            rgba8: vec![128; 8 * 4 * 4],
-        };
+        let src = DecodedTexture::from_rgba8(8, 4, vec![128; 8 * 4 * 4]);
         let chain = mip_chain(&src);
         // 8×4 → 4×2 → 2×1 → 1×1: the WebGPU `max(1, size >> level)` rule, so
         // the chain runs past the shorter side rather than stopping at it.
@@ -2701,7 +2691,7 @@ mod tests {
         assert_eq!(sizes, vec![(4, 2), (2, 1), (1, 1)]);
         for level in &chain {
             assert_eq!(
-                level.rgba8.len(),
+                level.texels.byte_len(),
                 (level.width * level.height * 4) as usize,
                 "each level is tightly packed RGBA8"
             );
@@ -2712,13 +2702,9 @@ mod tests {
     fn mip_chain_of_a_flat_image_keeps_its_colour() {
         // A box filter over a constant image is that constant: this catches a
         // downsample that misreads the row stride or drops the alpha channel.
-        let src = DecodedTexture {
-            width: 4,
-            height: 4,
-            rgba8: [40u8, 90, 200, 255].repeat(4 * 4),
-        };
+        let src = DecodedTexture::from_rgba8(4, 4, [40u8, 90, 200, 255].repeat(4 * 4));
         for level in mip_chain(&src) {
-            for texel in level.rgba8.as_chunks::<4>().0 {
+            for texel in level.rgba8().unwrap().as_chunks::<4>().0 {
                 assert_eq!(texel, &[40, 90, 200, 255]);
             }
         }
@@ -2726,11 +2712,7 @@ mod tests {
 
     #[test]
     fn mip_chain_of_a_single_texel_is_empty() {
-        let src = DecodedTexture {
-            width: 1,
-            height: 1,
-            rgba8: vec![255; 4],
-        };
+        let src = DecodedTexture::from_rgba8(1, 1, vec![255; 4]);
         assert!(mip_chain(&src).is_empty(), "nothing left to halve");
     }
 
@@ -2885,7 +2867,7 @@ mod tests {
         }))
         .expect("fetch");
         assert_eq!((tex.value.width, tex.value.height), (2, 2));
-        assert_eq!(&tex.value.rgba8[0..4], &[255, 0, 0, 255]);
+        assert_eq!(&tex.value.rgba8().unwrap()[0..4], &[255, 0, 0, 255]);
 
         // A miss is a typed error.
         let err = futures_executor::block_on(provider.fetch_tile(ImageryCoord {
@@ -2901,11 +2883,7 @@ mod tests {
 
     /// A 1×1 solid texture as a shareable layer source.
     fn solid(rgba: [u8; 4]) -> Arc<DecodedTexture> {
-        Arc::new(DecodedTexture {
-            width: 1,
-            height: 1,
-            rgba8: rgba.to_vec(),
-        })
+        Arc::new(DecodedTexture::from_rgba8(1, 1, rgba.to_vec()))
     }
 
     /// Two imagery sets address the same ground by the same coord, and while
@@ -2974,7 +2952,7 @@ mod tests {
         let baked = bake_layers(&layers, [0.2, 0.4, 0.6, 1.0], (4, 4));
         assert_eq!((baked.width, baked.height), (4, 4));
         // Left half: red only (the green layer's mask is zero there).
-        assert_eq!(&baked.rgba8[0..4], &[255, 0, 0, 255]);
+        assert_eq!(&baked.rgba8().unwrap()[0..4], &[255, 0, 0, 255]);
         // Right half: mix(red, green, 128/255) — 255·(1−a) then 255·a.
         let a = 128.0 / 255.0;
         let expected = [
@@ -2983,10 +2961,10 @@ mod tests {
             0,
             255,
         ];
-        assert_eq!(&baked.rgba8[3 * 4..3 * 4 + 4], &expected);
+        assert_eq!(&baked.rgba8().unwrap()[3 * 4..3 * 4 + 4], &expected);
         // A texel no layer reaches keeps the base colour.
         let bare = bake_layers(&[], [0.2, 0.4, 0.6, 1.0], (1, 1));
-        assert_eq!(&bare.rgba8[0..4], &[51, 102, 153, 255]);
+        assert_eq!(&bare.rgba8().unwrap()[0..4], &[51, 102, 153, 255]);
     }
 
     #[test]
@@ -3028,16 +3006,19 @@ mod tests {
         assert_eq!(content.meshes[0].material.base_color_texture, Some(0));
         // A 1×1 source floors at 64; solid colour everywhere.
         assert_eq!(content.textures[0].width, 64);
-        assert_eq!(&content.textures[0].rgba8[0..4], &[10, 20, 30, 255]);
+        assert_eq!(
+            &content.textures[0].rgba8().unwrap()[0..4],
+            &[10, 20, 30, 255]
+        );
 
         // The cap binds: a sharp source is clamped, never exceeded.
         let mut sharp = content.clone();
         sharp.imagery = vec![layer(
-            Arc::new(DecodedTexture {
-                width: 512,
-                height: 512,
-                rgba8: vec![255; 512 * 512 * 4],
-            }),
+            Arc::new(DecodedTexture::from_rgba8(
+                512,
+                512,
+                vec![255; 512 * 512 * 4],
+            )),
             [-0.1, -0.1, 1.1, 1.1],
         )];
         bake_imagery(&mut sharp, 128);

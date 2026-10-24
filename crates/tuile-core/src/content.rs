@@ -132,7 +132,7 @@ impl DecodedTileContent {
                     + m.indices.len() * 4
             })
             .sum();
-        let textures: usize = self.textures.iter().map(|t| t.rgba8.len()).sum();
+        let textures: usize = self.textures.iter().map(|t| t.texels.byte_len()).sum();
         meshes + textures
     }
 
@@ -144,7 +144,10 @@ impl DecodedTileContent {
     /// is the whole argument for referencing rather than resampling. Never feed
     /// it to a budget; see [`DecodedTileContent::byte_size`].
     pub fn imagery_byte_size_unshared(&self) -> usize {
-        self.imagery.iter().map(|l| l.texture.rgba8.len()).sum()
+        self.imagery
+            .iter()
+            .map(|l| l.texture.texels.byte_len())
+            .sum()
     }
 }
 
@@ -159,12 +162,12 @@ impl DecodedTileContent {
     /// with their mip chains. Draped imagery is a resource of its own
     /// ([`DrapeContent`]) and is not counted here.
     pub fn cost(&self) -> crate::budget::cost::Cost {
-        use crate::budget::cost::{drape_cost, mesh_cost, TextureFormat};
+        use crate::budget::cost::mesh_cost;
         let vertices: u64 = self.meshes.iter().map(|m| m.positions.len() as u64).sum();
         let indices: u64 = self.meshes.iter().map(|m| m.indices.len() as u64).sum();
         let mut cost = mesh_cost(vertices, VERTEX_STRIDE, indices, true);
         for t in &self.textures {
-            let c = drape_cost(t.width, t.height, TextureFormat::Rgba8);
+            let c = t.cost();
             cost.gpu = cost.gpu.plus(c.gpu);
             cost.staging = cost.staging.plus(c.staging);
         }
@@ -221,13 +224,14 @@ impl DrapeContent {
     /// still charge the overlap twice: an over-estimate, never an under-one.
     /// Its staging bytes — what an upload moves — are every tile's whole.
     pub fn cost(&self) -> crate::budget::cost::Cost {
-        use crate::budget::cost::{drape_cost, Cost, TextureFormat};
+        use crate::budget::cost::Cost;
         use crate::budget::Bytes;
         self.tiles
             .iter()
             .skip(self.floor_tiles)
             .map(|t| {
-                let whole = drape_cost(t.texture.width, t.texture.height, TextureFormat::Rgba8);
+                // In the format the texture is held in, recorded on it.
+                let whole = t.texture.cost();
                 // The tile spans 1 / scale of the drape's uv square on each
                 // axis; the part of it inside the square is its coverage.
                 let c = t.coverage;
@@ -265,8 +269,8 @@ pub struct DecodedMesh {
 pub struct DecodedTexture {
     pub width: u32,
     pub height: u32,
-    /// Tightly packed RGBA8.
-    pub rgba8: Vec<u8>,
+    /// The texels, and the format they are held in once resident.
+    pub texels: crate::texels::Texels,
 }
 
 impl DecodedTexture {
@@ -280,10 +284,75 @@ impl DecodedTexture {
     /// under a 3072 MiB budget without a single eviction: the cache measured
     /// 2540 MiB, the GPU held the other third, and the two never disagreed
     /// loudly enough to notice.
+    ///
+    /// Blocks carry their chain already, so what they hold is what they carry.
+    /// RGBA8 headed for a block format is held at that format's chain.
     pub fn resident_bytes(&self) -> usize {
-        self.rgba8.len() * 4 / 3
+        use crate::texels::{ImageryFormat, Texels};
+        match &self.texels {
+            Texels::Rgba8 {
+                pixels,
+                resident: ImageryFormat::Rgba8,
+            } => pixels.len() * 4 / 3,
+            Texels::Rgba8 { .. } => self.cost().gpu.0 as usize,
+            Texels::Blocks { .. } => self.texels.byte_len(),
+        }
+    }
+
+    /// RGBA8 pixels held as RGBA8: what every producer makes today.
+    pub fn from_rgba8(width: u32, height: u32, pixels: Vec<u8>) -> Self {
+        DecodedTexture {
+            width,
+            height,
+            texels: crate::texels::Texels::rgba8(pixels),
+        }
+    }
+
+    /// The RGBA8 pixels, if that is what this texture carries.
+    pub fn rgba8(&self) -> Option<&[u8]> {
+        self.texels.as_rgba8()
+    }
+
+    /// The RGBA8 pixels, mutably, if that is what this texture carries.
+    pub fn rgba8_mut(&mut self) -> Option<&mut Vec<u8>> {
+        match &mut self.texels {
+            crate::texels::Texels::Rgba8 { pixels, .. } => Some(pixels),
+            crate::texels::Texels::Blocks { .. } => None,
+        }
+    }
+
+    /// The RGBA8 pixels, taken, if that is what this texture carries.
+    pub fn into_rgba8(self) -> Option<Vec<u8>> {
+        match self.texels {
+            crate::texels::Texels::Rgba8 { pixels, .. } => Some(pixels),
+            crate::texels::Texels::Blocks { .. } => None,
+        }
+    }
+
+    /// The format it is held in once resident.
+    pub fn resident_format(&self) -> crate::texels::ImageryFormat {
+        self.texels.resident()
+    }
+
+    /// What it costs a consumer whole, mip chain included, in the format it
+    /// is held in: see [`Texels::cost`](crate::texels::Texels::cost).
+    pub fn cost(&self) -> crate::budget::cost::Cost {
+        self.texels.cost(self.width, self.height)
+    }
+
+    /// A stand-in for a texture a consumer cannot read: one texel of the
+    /// slate the ground shows where no imagery reaches.
+    ///
+    /// For the paths that only take RGBA8 and are handed blocks — never by
+    /// design, and if ever, ground shown flat beats ground not shown.
+    pub fn stand_in() -> Self {
+        DecodedTexture::from_rgba8(1, 1, STAND_IN_RGBA.to_vec())
     }
 }
+
+/// The colour of [`DecodedTexture::stand_in`]: a muted slate, close to deep
+/// water and to ground in shadow, never black.
+pub const STAND_IN_RGBA: [u8; 4] = [41, 51, 61, 255];
 
 #[derive(Debug, Clone, Copy)]
 pub struct MaterialDesc {
@@ -479,11 +548,7 @@ fn to_rgba8(img: &gltf::image::Data) -> Result<DecodedTexture, ContentError> {
         }
         other => return Err(ContentError::Texture(format!("{other:?}"))),
     }
-    Ok(DecodedTexture {
-        width: img.width,
-        height: img.height,
-        rgba8,
-    })
+    Ok(DecodedTexture::from_rgba8(img.width, img.height, rgba8))
 }
 
 #[cfg(test)]
@@ -496,11 +561,7 @@ pub(crate) mod tests {
     fn placed(tile: &GeoRect, imagery: &GeoRect, x: u64) -> ImageryLayer {
         ImageryLayer::placed(
             ImageryCoord { level: 9, x, y: 0 },
-            std::sync::Arc::new(DecodedTexture {
-                width: 256,
-                height: 256,
-                rgba8: Vec::new(),
-            }),
+            std::sync::Arc::new(DecodedTexture::from_rgba8(256, 256, Vec::new())),
             tile,
             imagery,
         )
@@ -740,5 +801,131 @@ pub(crate) mod tests {
     fn byte_size_accounts_geometry() {
         let d = decode(&test_glb(), &hints(DVec3::ZERO)).expect("decode");
         assert_eq!(d.byte_size(), 3 * 12 + 3 * 4);
+    }
+
+    /// A 256² texture with its whole chain encoded: 87,408 bytes of blocks.
+    fn blocks_256(format: crate::texels::BlockFormat) -> DecodedTexture {
+        use crate::texels::{BlockFormat, Texels};
+        DecodedTexture {
+            width: 256,
+            height: 256,
+            texels: Texels::Blocks {
+                format,
+                levels: (0..9)
+                    .map(|l| vec![0; BlockFormat::level_bytes(256 >> l, 256 >> l)])
+                    .collect(),
+            },
+        }
+    }
+
+    fn whole(texture: DecodedTexture) -> ImageryLayer {
+        let rect = GeoRect {
+            west: 0.0,
+            south: 0.0,
+            east: 1.0,
+            north: 1.0,
+        };
+        ImageryLayer::placed(
+            ImageryCoord {
+                level: 9,
+                x: 0,
+                y: 0,
+            },
+            std::sync::Arc::new(texture),
+            &rect,
+            &rect,
+        )
+    }
+
+    fn owning(textures: Vec<DecodedTexture>) -> DecodedTileContent {
+        DecodedTileContent {
+            meshes: Vec::new(),
+            textures,
+            imagery: Vec::new(),
+            withheld_drape: None,
+            local_origin_ecef: DVec3::ZERO,
+            transform_local: Mat4::IDENTITY,
+        }
+    }
+
+    /// **A drape held as blocks is charged a quarter**: 87,408 bytes for a
+    /// 256² tile with its chain against RGBA8's 349,524, whether the worker
+    /// encoded the blocks or the GPU encodes them at upload. What it moves
+    /// follows what crosses: blocks from the worker, RGBA8 to the GPU.
+    #[test]
+    fn a_drape_held_as_blocks_is_charged_a_quarter() {
+        use crate::budget::Bytes;
+        use crate::texels::{BlockFormat, ImageryFormat, Texels};
+        let rgba = drape(vec![whole(DecodedTexture::from_rgba8(
+            256,
+            256,
+            Vec::new(),
+        ))])
+        .cost();
+        assert_eq!(rgba, drape_cost(256, 256, TextureFormat::Rgba8));
+        assert_eq!(rgba.gpu, Bytes(349_524));
+        for format in [BlockFormat::Bc7, BlockFormat::Astc4x4] {
+            let worker = drape(vec![whole(blocks_256(format))]).cost();
+            assert_eq!(
+                worker,
+                drape_cost(256, 256, TextureFormat::Block16),
+                "{format:?}"
+            );
+            assert_eq!(worker.gpu, Bytes(87_408), "{format:?}");
+            let on_gpu = DecodedTexture {
+                width: 256,
+                height: 256,
+                texels: Texels::Rgba8 {
+                    pixels: Vec::new(),
+                    resident: ImageryFormat::from(format),
+                },
+            };
+            let gpu = drape(vec![whole(on_gpu)]).cost();
+            assert_eq!(gpu.gpu, Bytes(87_408), "{format:?}");
+            assert_eq!(gpu.staging, rgba.staging, "{format:?}");
+        }
+    }
+
+    /// The textures a tile owns are charged in the format they are held in.
+    #[test]
+    fn owned_blocks_are_charged_a_quarter() {
+        use crate::texels::BlockFormat;
+        let none = owning(Vec::new()).cost().gpu.0;
+        let rgba = owning(vec![DecodedTexture::from_rgba8(256, 256, Vec::new())])
+            .cost()
+            .gpu
+            .0;
+        let blocks = owning(vec![blocks_256(BlockFormat::Bc7)]).cost().gpu.0;
+        assert_eq!(rgba - none, 349_524);
+        assert_eq!(blocks - none, 87_408);
+    }
+
+    /// Byte sizes count what each form holds: RGBA8 pixels and a third more
+    /// for the chain a consumer builds; blocks, their levels as carried.
+    #[test]
+    fn byte_sizes_per_format() {
+        use crate::texels::{BlockFormat, ImageryFormat, Texels};
+        let rgba = DecodedTexture::from_rgba8(256, 256, vec![0; 256 * 256 * 4]);
+        assert_eq!(rgba.resident_bytes(), 349_525);
+        assert_eq!(rgba.resident_format(), ImageryFormat::Rgba8);
+        let blocks = blocks_256(BlockFormat::Astc4x4);
+        assert_eq!(blocks.resident_bytes(), 87_408);
+        assert_eq!(blocks.resident_format(), ImageryFormat::Astc4x4);
+        let on_gpu = DecodedTexture {
+            width: 256,
+            height: 256,
+            texels: Texels::Rgba8 {
+                pixels: vec![0; 256 * 256 * 4],
+                resident: ImageryFormat::Bc7,
+            },
+        };
+        assert_eq!(on_gpu.resident_bytes(), 87_408);
+
+        let mut tile = owning(vec![rgba.clone()]);
+        assert_eq!(tile.byte_size(), 256 * 256 * 4);
+        tile.textures = vec![blocks_256(BlockFormat::Bc7)];
+        assert_eq!(tile.byte_size(), 87_408);
+        tile.imagery = vec![whole(rgba), whole(blocks_256(BlockFormat::Bc7))];
+        assert_eq!(tile.imagery_byte_size_unshared(), 256 * 256 * 4 + 87_408);
     }
 }

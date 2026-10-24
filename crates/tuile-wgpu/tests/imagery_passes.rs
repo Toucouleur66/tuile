@@ -98,11 +98,11 @@ fn layer(index: u32, colour: [u8; 3], coverage: [f32; 4]) -> ImageryLayer {
             x: u64::from(index),
             y: 0,
         },
-        texture: Arc::new(DecodedTexture {
-            width: 2,
-            height: 2,
-            rgba8: [[colour[0], colour[1], colour[2], 255u8]; 4].concat(),
-        }),
+        texture: Arc::new(DecodedTexture::from_rgba8(
+            2,
+            2,
+            [[colour[0], colour[1], colour[2], 255u8]; 4].concat(),
+        )),
         coverage,
         // Maps the covered part of the tile onto the whole texture. Immaterial
         // for a flat colour, and written correctly anyway so the fixture does

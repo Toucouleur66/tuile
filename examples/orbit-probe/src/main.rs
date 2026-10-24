@@ -393,7 +393,7 @@ fn report_imagery(contents: &HashMap<TileId, tuile_core::DecodedTileContent>) {
     for content in contents.values() {
         unshared += content.imagery_byte_size_unshared();
         for layer in &content.imagery {
-            distinct.insert(layer.coord, layer.texture.rgba8.len());
+            distinct.insert(layer.coord, layer.texture.texels.byte_len());
             drapes += 1;
         }
     }
