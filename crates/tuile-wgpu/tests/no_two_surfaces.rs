@@ -147,11 +147,11 @@ fn painted(colour: [u8; 3], key: u64) -> ImageryLayer {
             x: key,
             y: 0,
         },
-        texture: Arc::new(DecodedTexture {
-            width: 2,
-            height: 2,
-            rgba8: [[colour[0], colour[1], colour[2], 255u8]; 4].concat(),
-        }),
+        texture: Arc::new(DecodedTexture::from_rgba8(
+            2,
+            2,
+            [[colour[0], colour[1], colour[2], 255u8]; 4].concat(),
+        )),
         coverage: [0.0, 0.0, 1.0, 1.0],
         translation: [0.0, 0.0],
         scale: [1.0, 1.0],

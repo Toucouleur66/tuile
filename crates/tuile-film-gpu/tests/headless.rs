@@ -430,11 +430,7 @@ fn a_drape_composed_on_the_gpu_is_the_bakes() {
                 x: 0,
                 y: 0,
             },
-            texture: Arc::new(DecodedTexture {
-                width: texels,
-                height: texels,
-                rgba8,
-            }),
+            texture: Arc::new(DecodedTexture::from_rgba8(texels, texels, rgba8)),
             coverage,
             translation,
             scale,
@@ -476,7 +472,7 @@ fn a_drape_composed_on_the_gpu_is_the_bakes() {
         for x in 0..side as usize * 4 {
             let (g, c) = (
                 got[y * row as usize + x],
-                wanted.rgba8[y * side as usize * 4 + x],
+                wanted.rgba8().unwrap()[y * side as usize * 4 + x],
             );
             let d = g.abs_diff(c);
             apart += usize::from(d > 0);
@@ -491,7 +487,8 @@ fn a_drape_composed_on_the_gpu_is_the_bakes() {
     );
     // And it is not the base colour everywhere: the layers were written.
     let base_only = wanted
-        .rgba8
+        .rgba8()
+        .unwrap()
         .chunks(4)
         .filter(|p| p[..3] == [51, 102, 153])
         .count();

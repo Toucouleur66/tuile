@@ -159,13 +159,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let same_size =
                         (carried.width(), carried.height()) == (composed.width, composed.height);
                     let (apart, worst) = if same_size {
-                        carried.as_raw().iter().zip(&composed.rgba8).fold(
-                            (0u64, 0u8),
-                            |(apart, worst), (a, b)| {
+                        carried
+                            .as_raw()
+                            .iter()
+                            .zip(composed.rgba8().ok_or("a composed drape is RGBA8")?)
+                            .fold((0u64, 0u8), |(apart, worst), (a, b)| {
                                 let d = a.abs_diff(*b);
                                 (apart + u64::from(d > 0), worst.max(d))
-                            },
-                        )
+                            })
                     } else {
                         (u64::MAX, u8::MAX)
                     };

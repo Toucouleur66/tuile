@@ -480,11 +480,11 @@ fn whole_tile_layer() -> tuile_core::raster::ImageryLayer {
             x: 0,
             y: 0,
         },
-        texture: std::sync::Arc::new(tuile_core::content::DecodedTexture {
-            width: 2,
-            height: 2,
-            rgba8: [[200u8, 200, 200, 255]; 4].concat(),
-        }),
+        texture: std::sync::Arc::new(tuile_core::content::DecodedTexture::from_rgba8(
+            2,
+            2,
+            [[200u8, 200, 200, 255]; 4].concat(),
+        )),
         coverage: [0.0, 0.0, 1.0, 1.0],
         translation: [0.0, 0.0],
         scale: [1.0, 1.0],

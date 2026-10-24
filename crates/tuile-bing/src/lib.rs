@@ -505,6 +505,6 @@ mod tests {
 
         let tex = futures_executor::block_on(provider.fetch_tile(coord)).expect("fetch");
         assert_eq!((tex.value.width, tex.value.height), (2, 2));
-        assert_eq!(&tex.value.rgba8[0..4], &[10, 20, 30, 255]);
+        assert_eq!(&tex.value.rgba8().unwrap()[0..4], &[10, 20, 30, 255]);
     }
 }

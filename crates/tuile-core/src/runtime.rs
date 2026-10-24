@@ -2471,11 +2471,11 @@ mod tests {
                 .lock()
                 .expect("drapes")
                 .push(ResourceId::drape(id, layer, level));
-            let texture = Arc::new(crate::content::DecodedTexture {
-                width: 4,
-                height: 4,
-                rgba8: vec![self.epoch.load(Ordering::SeqCst) as u8; 64],
-            });
+            let texture = Arc::new(crate::content::DecodedTexture::from_rgba8(
+                4,
+                4,
+                vec![self.epoch.load(Ordering::SeqCst) as u8; 64],
+            ));
             let tile = crate::raster::GeoRect {
                 west: 0.0,
                 south: 0.0,

@@ -126,12 +126,18 @@ impl Portable for ImageryDecode {
 
     /// The pixels first and the numbers after, for the same reason as the
     /// job's: the answer is a quarter of a megabyte, its header a few bytes.
+    ///
+    /// RGBA8 only: the job makes nothing else, and block-compressed texels
+    /// have no form on this wire yet.
     fn encode_output(output: ImageryDecoded) -> Vec<u8> {
         match output {
             Ok((tex, black)) => {
-                let mut out = tex.rgba8;
-                out.extend_from_slice(&tex.width.to_le_bytes());
-                out.extend_from_slice(&tex.height.to_le_bytes());
+                let (width, height) = (tex.width, tex.height);
+                let Some(mut out) = tex.into_rgba8() else {
+                    return failed("block-compressed texels have no form on this wire".into());
+                };
+                out.extend_from_slice(&width.to_le_bytes());
+                out.extend_from_slice(&height.to_le_bytes());
                 out.push(u8::from(black));
                 out.push(OK);
                 out
@@ -160,11 +166,7 @@ impl Portable for ImageryDecode {
             ));
         }
         Ok(Ok((
-            DecodedTexture {
-                width,
-                height,
-                rgba8: bytes,
-            },
+            DecodedTexture::from_rgba8(width, height, bytes),
             black,
         )))
     }
@@ -496,7 +498,7 @@ mod tests {
                 (there.0.width, there.0.height),
                 (here.0.width, here.0.height)
             );
-            assert_eq!(there.0.rgba8, here.0.rgba8);
+            assert_eq!(there.0.rgba8().unwrap(), here.0.rgba8().unwrap());
             assert_eq!(there.1, here.1);
         }
     }
@@ -540,11 +542,7 @@ mod tests {
     #[test]
     fn a_short_texture_is_refused() {
         let mut answer = ImageryDecode::encode_output(Ok((
-            DecodedTexture {
-                width: 2,
-                height: 2,
-                rgba8: vec![9; 16],
-            },
+            DecodedTexture::from_rgba8(2, 2, vec![9; 16]),
             false,
         )));
         answer.remove(0);

@@ -173,16 +173,22 @@ fn coarse_floor(
 /// every arrival, but a tile that is black at a hundred spread-out points and
 /// not elsewhere does not exist in aerial photography. One false negative in
 /// exchange for a check that costs nothing.
+///
+/// Read on RGBA8 only: block-compressed texels are encoded after this check
+/// ran on their pixels, and are never called black here.
 pub(crate) fn is_opaque_black(tex: &DecodedTexture) -> bool {
     const SAMPLES: usize = 100;
-    let texels = tex.rgba8.len() / 4;
+    let Some(rgba8) = tex.rgba8() else {
+        return false;
+    };
+    let texels = rgba8.len() / 4;
     if texels == 0 {
         return false;
     }
     let step = (texels / SAMPLES).max(1);
     (0..texels)
         .step_by(step)
-        .all(|i| tex.rgba8[i * 4] == 0 && tex.rgba8[i * 4 + 1] == 0 && tex.rgba8[i * 4 + 2] == 0)
+        .all(|i| rgba8[i * 4] == 0 && rgba8[i * 4 + 1] == 0 && rgba8[i * 4 + 2] == 0)
 }
 
 /// What shows under a mosaic wherever no layer reaches.
@@ -734,11 +740,11 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                     self.provenance.stamped_imagery(c, stamp.digest);
                     // The size the bytes would have decoded to — reprojection
                     // keeps it — and no pixels: nothing composes this drape.
-                    let tex = Arc::new(DecodedTexture {
-                        width: stamp.width,
-                        height: stamp.height,
-                        rgba8: Vec::new(),
-                    });
+                    let tex = Arc::new(DecodedTexture::from_rgba8(
+                        stamp.width,
+                        stamp.height,
+                        Vec::new(),
+                    ));
                     let mut cache = self.decoded();
                     if cache.generation == generation {
                         cache.put(c, Arc::clone(&tex));
@@ -2053,7 +2059,7 @@ mod tests {
             content
                 .tiles
                 .iter()
-                .map(|layer| (layer.source, layer.coord, layer.texture.rgba8[0]))
+                .map(|layer| (layer.source, layer.coord, layer.texture.rgba8().unwrap()[0]))
                 .collect::<Vec<_>>()
         };
 
@@ -2193,11 +2199,7 @@ mod tests {
         };
         cache.lock().expect("cache").put(
             deeper,
-            Arc::new(DecodedTexture {
-                width: 1,
-                height: 1,
-                rgba8: vec![255, 255, 255, 255],
-            }),
+            Arc::new(DecodedTexture::from_rgba8(1, 1, vec![255, 255, 255, 255])),
         );
         assert_eq!(
             coarse_floor(&scheme, &rect, &cache),
