@@ -208,12 +208,15 @@ impl Heights for Grid {
             return self.height(lon_deg, lat_deg);
         }
         let (c, r) = self.position(lon_deg, lat_deg);
-        // The samples whose cells the box overlaps, and by how much.
-        let weights = |centre: f64, width: f64| {
+        // The samples on the grid whose cells the box overlaps, and by how
+        // much: those off it are zeros, which weigh nothing in the sum, so
+        // they are not visited — a coarse tile's box spans far more ground
+        // than the grid.
+        let weights = |centre: f64, width: f64, count: usize| {
             let half = width.max(1.0) / 2.0;
             let (lo, hi) = (centre - half, centre + half);
-            let first = (lo + 0.5).floor() as i64;
-            let last = (hi - 0.5).ceil() as i64;
+            let first = ((lo + 0.5).floor() as i64).max(0);
+            let last = ((hi - 0.5).ceil() as i64).min(count as i64 - 1);
             (first..=last)
                 .map(move |i| {
                     let cell = (i as f64 - 0.5, i as f64 + 0.5);
@@ -223,11 +226,8 @@ impl Heights for Grid {
         };
         let area = across.max(1.0) * down.max(1.0);
         let mut sum = 0.0;
-        for (row, wr) in weights(r, down) {
-            if row < 0 || row >= self.rows as i64 {
-                continue;
-            }
-            for (column, wc) in weights(c, across) {
+        for (row, wr) in weights(r, down, self.rows) {
+            for (column, wc) in weights(c, across, self.columns) {
                 sum += wr * wc * self.at(column, row);
             }
         }
