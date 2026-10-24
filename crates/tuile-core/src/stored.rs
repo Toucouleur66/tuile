@@ -8,7 +8,7 @@
 //! block by block, into the block format the consumer chose and its device
 //! samples, or unpacked to RGBA8, bit-exact, when it did not opt in or its
 //! device samples neither. What happens is the consumer's
-//! [`StoredPlan`](crate::texels::StoredPlan), made from its own
+//! [`StoredPlan`], made from its own
 //! [`ImageryCompression`](crate::texels::ImageryCompression); the table of
 //! cases is there.
 //!
