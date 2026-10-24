@@ -25,7 +25,14 @@ const nav = [
 ];
 
 // `/architecture` and `/architecture/` are the same page; `/` matches only itself.
-const here = Astro.url.pathname.replace(/\/+$/, '') || '/';
+// With `build.format: 'file'` the build may name a page by its file
+// (`/index.html`, `/architecture.html`), so the extension and a trailing
+// `index` are dropped too.
+const here =
+  Astro.url.pathname
+    .replace(/\.html$/, '')
+    .replace(/(^|\/)index$/, '')
+    .replace(/\/+$/, '') || '/';
 const current = (href: string) => (here === href ? 'page' : undefined);
 ---
 
