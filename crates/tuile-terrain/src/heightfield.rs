@@ -12,8 +12,9 @@
 //! - [`HeightfieldSource`]: the [`TerrainSource`] that cuts a relief into
 //!   the tiles of the geographic quadtree, each a regular grid of vertices
 //!   with its full header ([`Header::for_vertices`]), its four edges and its
-//!   oct-encoded normals. Around the footprint it answers the
-//!   [`Ellipsoid`]'s tiles, so that a client always has ground to draw.
+//!   oct-encoded normals. Around the footprint it answers flat tiles on the
+//!   ellipsoid, down to the [`Ellipsoid`]'s levels, so that a client always
+//!   has ground to draw.
 //!
 //! **Shared edges are shared samples.** A vertex's longitude and latitude
 //! are a function of its level and its index in that level's global vertex
@@ -238,8 +239,11 @@ impl Heights for Grid {
 /// What a [`HeightfieldSource`] answers for a tile outside its footprint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Outside {
-    /// The [`Ellipsoid`]'s tile, down to [`ELLIPSOID_LEVELS`], and no tile
-    /// below: ground everywhere around the relief.
+    /// The ellipsoid at 0 m, down to [`ELLIPSOID_LEVELS`], and no tile
+    /// below: ground everywhere around the relief. Made as the relief's own
+    /// tiles are — the same vertices, and normals — not as [`Ellipsoid`]'s:
+    /// a tile without the normals the `layer.json` promises is lit
+    /// otherwise than its neighbour, and every edge between them shows.
     #[default]
     Ellipsoid,
     /// No tile at all.
@@ -305,7 +309,9 @@ impl<H: Heights> HeightfieldSource<H> {
             return Ok(self.relief_tile(coord));
         }
         match self.outside {
-            Outside::Ellipsoid if coord.level <= ELLIPSOID_LEVELS => Ok(Ellipsoid::tile(coord)),
+            // Every height outside the footprint is zero (`Heights`): the
+            // relief's own tile there is the ellipsoid, normals included.
+            Outside::Ellipsoid if coord.level <= ELLIPSOID_LEVELS => Ok(self.relief_tile(coord)),
             _ => Err(absent()),
         }
     }
@@ -899,20 +905,39 @@ mod tests {
         .is_err());
     }
 
-    /// Around the footprint, the ellipsoid's own tiles down to its levels,
-    /// then nothing; past `max_level`, nothing even inside; and with
+    /// Around the footprint, flat tiles on the ellipsoid with the relief's
+    /// normals down to the ellipsoid's levels, then nothing; past `max_level`, nothing even inside; and with
     /// [`Outside::NoSuchTile`], nothing anywhere outside.
     #[test]
     fn outside_the_footprint_is_the_ellipsoid_then_nothing() {
         let source = source();
         let far = TileCoord::new(5, 3, 7);
         assert!(!source.covers(far));
-        assert_eq!(source.tile(far).expect("ellipsoid"), Ellipsoid::tile(far));
         let far_deep = TileCoord::new(ELLIPSOID_LEVELS, 100, 200);
-        assert_eq!(
-            source.tile(far_deep).expect("ellipsoid"),
-            Ellipsoid::tile(far_deep)
-        );
+        for c in [far, far_deep] {
+            let mesh = decode(&source.tile(c).expect("ellipsoid")).expect("a mesh");
+            assert_eq!((mesh.header.min_height, mesh.header.max_height), (0.0, 0.0));
+            let normals = mesh
+                .normals
+                .as_ref()
+                .expect("the normals the layer promises");
+            assert_eq!(mesh.vertex_count(), DEFAULT_VERTICES_PER_SIDE.pow(2));
+            // Flat: every normal is the ellipsoid's up, to the oct encoding's
+            // two bytes.
+            let rect = GeographicTilingScheme::default().tile_rect(c);
+            for (k, n) in normals.iter().enumerate() {
+                let lon = rect.west + mesh.u[k] * rect.width();
+                let lat = rect.south + mesh.v[k] * rect.height();
+                let up = enu_frame(Geodetic {
+                    lon,
+                    lat,
+                    height: 0.0,
+                })
+                .col(2);
+                let n = DVec3::new(f64::from(n[0]), f64::from(n[1]), f64::from(n[2]));
+                assert!(n.dot(up) > 0.999, "{c:?} vertex {k}: {n:?}");
+            }
+        }
         let beyond = TileCoord::new(ELLIPSOID_LEVELS + 1, 100, 200);
         assert!(source.tile(beyond).expect_err("none").is_absence());
         let deeper = inside(16);
