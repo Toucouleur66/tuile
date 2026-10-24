@@ -6000,8 +6000,8 @@ dependencies = [
 
 [[package]]
 name = "texcomp"
-version = "0.1.0"
-source = "git+https://github.com/lapoule-dev/texcomp?rev=19c08d97da438bf1e9eee974d612a0d74e5958e9#19c08d97da438bf1e9eee974d612a0d74e5958e9"
+version = "0.2.0"
+source = "git+https://github.com/lapoule-dev/texcomp?tag=v0.2.0#b3e1d4d0bc2ca71dd1ac617b2d5eda842e2868b0"
 dependencies = [
  "thiserror 2.0.18",
 ]
