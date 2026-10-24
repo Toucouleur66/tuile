@@ -17,16 +17,18 @@ use std::task::{Context, Poll};
 use glam::DVec3;
 
 use tuile_core::budget::{
-    Bytes, Class, DrapeChoice, DrawItem, DrawSet, FrameDeadline, Generation, PerClass, ResourceId,
-    Role, UploadPlan, UvTransform,
+    Bytes, Class, DrapeChoice, DrawItem, DrawSet, FrameDeadline, Generation, LayerId, PerClass,
+    ResourceId, Role, UploadPlan, UvTransform,
 };
-use tuile_core::content::{DecodedTileContent, DrapeContent};
+use tuile_core::content::{DecodedTexture, DecodedTileContent, DrapeContent};
 use tuile_core::protocol::{
     Ancestry, ClientMessage, GeometryStream, ResourceContent, ServerMessage, StreamError,
 };
+use tuile_core::raster::{ImageryCoord, ImageryLayer};
 use tuile_core::source::TileId;
+use tuile_core::texels::{BlockFormat, ImageryFormat};
 use tuile_core::traversal::{TraversalStats, ViewState};
-use tuile_wgpu::{ContentPump, GpuContext};
+use tuile_wgpu::{ContentPump, GpuContext, ImageryCompression};
 
 /// A GPU, or a stated reason there is none.
 ///
@@ -44,6 +46,98 @@ pub fn gpu() -> Option<GpuContext> {
             eprintln!("skipping GPU test: no usable adapter ({e})");
             None
         }
+    }
+}
+
+/// The imagery plans every scenario that drapes runs under: what a consumer
+/// gets without asking, and each block format the GPU encodes.
+pub const PLANS: [(&str, ImageryCompression); 3] = [
+    ("off", ImageryCompression::Off),
+    ("bc7", ImageryCompression::Format(BlockFormat::Bc7)),
+    ("astc", ImageryCompression::Format(BlockFormat::Astc4x4)),
+];
+
+/// A GPU holding imagery as `compression` asks, or a stated reason there is
+/// none: no adapter (a failure under `TUILE_REQUIRE_GPU=1`), or an adapter
+/// that cannot sample the format asked for — a fact about the device, said
+/// and skipped.
+pub fn gpu_with(compression: ImageryCompression) -> Option<GpuContext> {
+    let gpu = match pollster::block_on(GpuContext::headless_with(compression)) {
+        Ok(gpu) => gpu,
+        Err(e) => {
+            assert!(
+                std::env::var("TUILE_REQUIRE_GPU").is_err(),
+                "TUILE_REQUIRE_GPU is set and there is no usable adapter: {e}"
+            );
+            eprintln!("skipping GPU test: no usable adapter ({e})");
+            return None;
+        }
+    };
+    if let ImageryCompression::Format(format) = compression {
+        if gpu.imagery_plan().target != ImageryFormat::from(format) {
+            eprintln!("skipping {format:?}: this adapter does not sample it");
+            return None;
+        }
+    }
+    Some(gpu)
+}
+
+/// Holds a scenario to the plan it ran under: under a block plan, imagery
+/// really was encoded — `at_least` tiles, none fallen back to RGBA8 — so a
+/// scenario cannot pass "under BC7" on RGBA8 textures.
+pub fn encoded_as_planned(plan: &str, gpu: &GpuContext, at_least: u64) {
+    match gpu.imagery_encode_stats() {
+        None => assert_eq!(
+            gpu.imagery_plan().target,
+            ImageryFormat::Rgba8,
+            "{plan}: a block plan with no encoder"
+        ),
+        Some(stats) => {
+            assert!(
+                stats.encoded >= at_least,
+                "{plan}: {} tiles encoded, {at_least} at least expected",
+                stats.encoded
+            );
+            assert_eq!(stats.fell_back, 0, "{plan}: a 256² tile fell back to RGBA8");
+        }
+    }
+}
+
+/// A `width × height` imagery texture painted by `paint(x, y)`, held as
+/// `gpu`'s plan says — the mark a loader under that plan puts on it.
+pub fn painted(
+    gpu: &GpuContext,
+    width: u32,
+    height: u32,
+    paint: impl Fn(u32, u32) -> [u8; 4],
+) -> DecodedTexture {
+    let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            pixels.extend_from_slice(&paint(x, y));
+        }
+    }
+    DecodedTexture::from_rgba8(width, height, pixels).planned(gpu.imagery_plan())
+}
+
+/// A drape of `tile` at `level`: one imagery tile, `texture`, over the whole
+/// of it, keyed by the tile's own coord so drapes never share it.
+pub fn whole_drape(tile: TileId, level: u32, texture: DecodedTexture) -> DrapeContent {
+    let (z, x, y) = tile.terrain_coord();
+    DrapeContent {
+        layer: LayerId(0),
+        level,
+        tiles: vec![ImageryLayer {
+            coord: ImageryCoord { level: z, x, y },
+            source: 0,
+            texture: Arc::new(texture),
+            coverage: [0.0, 0.0, 1.0, 1.0],
+            translation: [0.0, 0.0],
+            scale: [1.0, 1.0],
+        }],
+        floor_tiles: 0,
+        identity: tile.0,
+        withheld: false,
     }
 }
 

@@ -35,9 +35,11 @@ use std::sync::Arc;
 
 use glam::{DVec2, DVec3};
 
-use support::{gpu, poll, Server};
+use support::{encoded_as_planned, gpu_with, painted, poll, Server, PLANS};
 use tuile_core::budget::{BudgetConfig, Bytes};
+use tuile_core::content::DecodedTexture;
 use tuile_core::geo::{geodetic_to_ecef, Geodetic};
+use tuile_core::raster::{ImageryCoord, ImageryLayer};
 use tuile_core::runtime::in_process_with;
 use tuile_core::source::{LoadError, Loaded, TileId, TileLoader, TileTree};
 use tuile_core::traversal::{Config, ViewState};
@@ -79,12 +81,13 @@ fn everywhere() -> LayerJson {
     LayerJson::from_slice(doc.as_bytes()).expect("layer.json")
 }
 
-/// Answers every tile instantly with a flat surface over its own rectangle.
+/// Answers every tile instantly with a flat surface over its own rectangle,
+/// wearing a 256² imagery tile of its own, held as the test's plan says.
 ///
 /// No network, no decode, no failure: the engine is given every excuse removed.
 /// Whatever this test catches is therefore the engine's own decision-making, not
 /// latency.
-struct Instant;
+struct Instant(Arc<DecodedTexture>);
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
@@ -92,7 +95,18 @@ impl TileLoader for Instant {
     async fn load(&self, id: TileId) -> Result<Loaded, LoadError> {
         let (z, x, y) = id.terrain_coord();
         let rect = GeographicTilingScheme::default().tile_rect(TileCoord::new(z, x, y));
-        Ok(Loaded::Content(fill_content(&rect, [Some(0.0); 4], 0.0)))
+        let mut content = fill_content(&rect, [Some(0.0); 4], 0.0);
+        // Its own imagery, keyed by its own coord: one upload — one encode
+        // under a block plan — per tile.
+        content.imagery.push(ImageryLayer {
+            coord: ImageryCoord { level: z, x, y },
+            source: 0,
+            texture: Arc::clone(&self.0),
+            coverage: [0.0, 0.0, 1.0, 1.0],
+            translation: [0.0, 0.0],
+            scale: [1.0, 1.0],
+        });
+        Ok(Loaded::Content(content))
     }
 }
 
@@ -389,8 +403,21 @@ impl Bench {
 /// it must be zero on every frame, not on average.
 #[test]
 fn a_fast_zoom_never_leaves_a_tile_empty() {
-    let Some(gpu) = gpu() else { return };
+    for (plan, compression) in PLANS {
+        let Some(gpu) = gpu_with(compression) else {
+            continue;
+        };
+        a_fast_zoom_under(plan, &gpu);
+    }
+}
 
+/// The zoom, with every tile's imagery held as `gpu`'s plan says — encoded
+/// at upload, under the pump's encode pace, for a block plan.
+fn a_fast_zoom_under(plan: &str, gpu: &GpuContext) {
+    // Bright, never near the clear colour.
+    let imagery = Arc::new(painted(gpu, 256, 256, |x, y| {
+        [90 + (x % 128) as u8, 140, 90 + (y % 128) as u8, 255]
+    }));
     let tree: Box<dyn TileTree> = tuile_planetary::terrain_tree(everywhere());
     let config = Config {
         maximum_screen_space_error: 2.0,
@@ -405,10 +432,10 @@ fn a_fast_zoom_never_leaves_a_tile_empty() {
     let mut budget = BudgetConfig::interactive(Bytes::mib(96));
     budget.pinned_level = Some(PINNED);
     let (mut stream, server) =
-        in_process_with(tree, Arc::new(Instant), config, budget).expect("a valid budget");
+        in_process_with(tree, Arc::new(Instant(imagery)), config, budget).expect("a valid budget");
     let mut server: Server = Box::pin(server.run());
     let mut pump = ContentPump::new(DVec3::ZERO);
-    let bench = Bench::new(&gpu);
+    let bench = Bench::new(gpu);
 
     // Settle at altitude first: the coarse pyramid is what every fallback lands
     // on, and a session that has not got it yet is a cold start, not a zoom.
@@ -417,7 +444,7 @@ fn a_fast_zoom_never_leaves_a_tile_empty() {
         &mut server,
         &mut stream,
         &mut pump,
-        &gpu,
+        gpu,
         &bench,
         view,
         up,
@@ -445,7 +472,7 @@ fn a_fast_zoom_never_leaves_a_tile_empty() {
         &mut server,
         &mut stream,
         &mut pump,
-        &gpu,
+        gpu,
         &bench,
         view,
         up,
@@ -464,7 +491,7 @@ fn a_fast_zoom_never_leaves_a_tile_empty() {
             &mut server,
             &mut stream,
             &mut pump,
-            &gpu,
+            gpu,
             &bench,
             view,
             up,
@@ -477,7 +504,7 @@ fn a_fast_zoom_never_leaves_a_tile_empty() {
     }
     assert!(
         worst.0 < 0.01,
-        "during a continuous zoom out, {:.1}% of a frame went bare at {:.0} km \
+        "{plan}: during a continuous zoom out, {:.1}% of a frame went bare at {:.0} km \
          (lost={}) — a black shape for a few hundredths of a second is exactly \
          the bug, and counters do not see it",
         worst.0 * 100.0,
@@ -494,7 +521,7 @@ fn a_fast_zoom_never_leaves_a_tile_empty() {
             &mut server,
             &mut stream,
             &mut pump,
-            &gpu,
+            gpu,
             &bench,
             view,
             up,
@@ -507,8 +534,9 @@ fn a_fast_zoom_never_leaves_a_tile_empty() {
     }
     assert!(
         worst_in.0 < 0.01,
-        "during a continuous zoom in, {:.1}% of a frame went bare at {:.0} km",
+        "{plan}: during a continuous zoom in, {:.1}% of a frame went bare at {:.0} km",
         worst_in.0 * 100.0,
         worst_in.1 / 1000.0
     );
+    encoded_as_planned(plan, gpu, 1);
 }

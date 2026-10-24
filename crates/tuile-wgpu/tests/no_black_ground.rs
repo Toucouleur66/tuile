@@ -27,8 +27,11 @@ mod support;
 
 use glam::{DVec3, Vec3};
 
-use support::{exact, fallback, gpu, mesh, select, Scripted};
-use tuile_core::budget::FrameDeadline;
+use support::{
+    drape, encoded_as_planned, exact, fallback, gpu, gpu_with, mesh, painted, select, wearing,
+    whole_drape, Scripted, PLANS,
+};
+use tuile_core::budget::{FrameDeadline, LayerId, ResourceId, UvTransform};
 use tuile_core::content::DecodedTileContent;
 use tuile_core::geo::{geodetic_to_ecef, Geodetic};
 use tuile_core::source::TileId;
@@ -311,4 +314,70 @@ fn without_the_fallback_the_neighbour_is_black() {
          frame does not see what it is meant to",
         black * 100.0
     );
+}
+
+/// **Draped ground under the camera is never black, under every imagery
+/// plan** — RGBA8, and each block format the GPU encodes into.
+///
+/// The scenario above, dressed: the tile that arrived and the grandparent
+/// standing in for its neighbour each wear a 256² drape, encoded at upload
+/// under a block plan. A texture the encoder left empty, a swap that bound
+/// it before it was written, or a format the sampler reads as zeros is black
+/// here; the drape's own colours never are.
+#[test]
+fn draped_ground_under_the_camera_is_never_black_under_every_plan() {
+    for (plan, compression) in PLANS {
+        let Some(gpu) = gpu_with(compression) else {
+            continue;
+        };
+        let here = TileId::from_terrain(3, 4, 4);
+        let neighbour = TileId::from_terrain(3, 5, 4);
+        let grandparent = TileId::from_terrain(1, 1, 1);
+        // A gradient, never dark: whatever is drawn is far from the clear colour.
+        let ground = |x: u32, y: u32| [80 + (x % 160) as u8, 120, 80 + (y % 160) as u8, 255];
+        let here_drape = whole_drape(here, 3, painted(&gpu, 256, 256, ground));
+        let grand_drape = whole_drape(grandparent, 1, painted(&gpu, 256, 256, ground));
+        let worn = |tile, level| {
+            (
+                ResourceId::drape(tile, LayerId(0), level),
+                level,
+                UvTransform::IDENTITY,
+            )
+        };
+        let (here_r, here_l, here_uv) = worn(here, 3);
+        let (grand_r, grand_l, grand_uv) = worn(grandparent, 1);
+        let mut stream = Scripted::new([
+            mesh(here, 1, content_for(here)),
+            mesh(grandparent, 2, content_for(grandparent)),
+            drape(here, 3, here_drape),
+            drape(grandparent, 4, grand_drape),
+            select(
+                vec![
+                    wearing(exact(here), here_r, here_l, here_uv),
+                    wearing(
+                        fallback(grandparent, &[neighbour]),
+                        grand_r,
+                        grand_l,
+                        grand_uv,
+                    ),
+                ],
+                1,
+            ),
+        ]);
+        let eye = centre_of(grandparent) * 1.25;
+        let mut pump = ContentPump::new(eye);
+        // Two frames: under a block plan the second encode may wait for one.
+        pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
+        pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
+        assert_eq!(pump.pending_uploads(), 0, "{plan}: every upload landed");
+        encoded_as_planned(plan, &gpu, 2);
+
+        let black = black_fraction_in_the_middle(&gpu, &mut pump, eye);
+        assert!(
+            black < 0.01,
+            "{plan}: {:.1}% of the middle of the frame is black — draped ground \
+             the camera is looking at was not drawn",
+            black * 100.0
+        );
+    }
 }

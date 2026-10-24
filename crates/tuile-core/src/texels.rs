@@ -151,11 +151,14 @@ impl ImageryPlan {
 
     /// The format RGBA8 a loader decoded is held in under this plan: the
     /// target when the consumer's GPU encodes it at upload, RGBA8 otherwise —
-    /// no encoder, or the CPU one, whose texels cross as blocks instead.
+    /// no encoder, or the CPU one or a transcode, whose texels cross as blocks
+    /// instead.
     pub const fn rgba8_resident(self) -> ImageryFormat {
         match self.encode {
             ImageryEncode::Gpu => self.target,
-            ImageryEncode::None | ImageryEncode::Cpu => ImageryFormat::Rgba8,
+            ImageryEncode::None | ImageryEncode::Cpu | ImageryEncode::Transcode => {
+                ImageryFormat::Rgba8
+            }
         }
     }
 }
