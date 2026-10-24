@@ -23,6 +23,7 @@
 //!   removed half of that trap; this removes the other half.
 
 use crate::context::GpuContext;
+use crate::host::{HostFrame, HostPass, TargetLayout};
 use crate::readback::Readback;
 use crate::targets::FrameTargets;
 
@@ -221,39 +222,24 @@ fn encode_frame(
         }
     };
     let mut encoder = gpu.device.create_command_encoder(&Default::default());
-    {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("tuile frame"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                // Draw into the multisampled target and resolve into the
-                // drawable: the samples are averaged on the way out, which is
-                // where the staircase on the limb disappears.
-                view: &targets.colour,
-                resolve_target: Some(resolve),
-                depth_slice: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(clear),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &targets.depth,
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
-                    store: wgpu::StoreOp::Store,
-                }),
-                stencil_ops: Some(wgpu::Operations {
-                    // Cleared to 0, and never read back: the mark says "a
-                    // surface that owns this ground drew here", which is only
-                    // true within one frame.
-                    load: wgpu::LoadOp::Clear(0),
-                    store: wgpu::StoreOp::Discard,
-                }),
-            }),
-            ..Default::default()
-        });
-        paint(&mut pass);
-    }
+    // Our own frame is a host like any other: the pass a host's frame gets is
+    // this one. It lends its depth's stencil, so the pass is drawn straight
+    // into it, and it asks for a fresh frame.
+    HostPass::new(gpu, TargetLayout::own(targets.format())).encode(
+        gpu,
+        &mut encoder,
+        HostFrame {
+            // Draw into the multisampled target and resolve into the
+            // drawable: the samples are averaged on the way out, which is
+            // where the staircase on the limb disappears.
+            colour: &targets.colour,
+            resolve: Some(resolve),
+            depth: &targets.depth,
+            size: targets.size(),
+            clear: Some(clear),
+        },
+        paint,
+    );
     // A pass of its own, on the same encoder and before the frame is
     // encoded: what needs a depth attachment the frame's own pass cannot
     // offer. See [`FramePass`].

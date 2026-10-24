@@ -24,6 +24,10 @@
 //!   four ways acquiring a drawable can fail already handled
 //! - [`draw_to_texture`] — the same frame into a texture of the host's, for a
 //!   headless run
+//! - [`HostPass`] — tuile's pass inside a frame the host owns: its device,
+//!   its colour and depth (any sample count, forward or reverse-Z, with or
+//!   without a stencil), its encoder; nothing cleared unless asked, nothing
+//!   submitted ([`TargetLayout`], [`TileRenderer::for_layout`])
 //!
 //! The crate never creates a window or a surface; the host owns the event
 //! loop and the render pass.
@@ -31,6 +35,7 @@
 mod compress;
 mod context;
 mod encode;
+mod host;
 mod overlay;
 mod prepare;
 mod pump;
@@ -49,6 +54,7 @@ pub use compress::{
 pub use context::{
     ContextError, GpuContext, ImageryTextures, DEPTH_FORMAT, SAMPLES, TEXTURE_FORMAT,
 };
+pub use host::{view_proj_from_world, DepthDirection, HostFrame, HostPass, TargetLayout};
 pub use overlay::{OverlayRenderer, OverlayVertex};
 pub use prepare::{
     prepare, prepare_drape, PreparedDrape, PreparedMesh, PreparedTile, Vertex, STITCH_ROWS,

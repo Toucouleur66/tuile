@@ -86,6 +86,9 @@ fn every_viewer_shader_runs_on_webgl2() {
         );
     }
     webgl2("overlay", include_str!("overlay.wgsl"));
+    // A stencil-less host's depth, into tuile's companion and back: one
+    // sample a pixel there, `frag_depth` written from a depth texture.
+    webgl2("depth crossing", &crate::host::crossing_wgsl(false));
     webgl2("lines", include_str!("lines.wgsl"));
     // A host's shapes in the world, with the light it shares with the film:
     // the same text the film compiles, so a WebGL2 browser draws the HUD.

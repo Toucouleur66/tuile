@@ -4,7 +4,8 @@
 //! The tile render pipeline. The host owns the surface, the event loop and
 //! the render pass; this type owns the pipelines and the view uniform.
 
-use crate::context::{GpuContext, DEPTH_FORMAT};
+use crate::context::GpuContext;
+use crate::host::TargetLayout;
 use crate::prepare::{PreparedTile, Vertex};
 use glam::Mat4;
 use tuile_atmosphere::AerialPerspective;
@@ -73,9 +74,21 @@ pub struct TileRenderer {
 
 impl TileRenderer {
     /// `target_format` is the color format of the host's surface or
-    /// offscreen target. Wireframe is created only when the device has
+    /// offscreen target, drawn with our own frame's depth and samples
+    /// ([`TargetLayout::own`]). Wireframe is created only when the device has
     /// `POLYGON_MODE_LINE`.
     pub fn new(gpu: &GpuContext, target_format: wgpu::TextureFormat) -> Self {
+        Self::for_layout(gpu, TargetLayout::own(target_format))
+    }
+
+    /// The pipelines for targets of `layout`: a host's colour format, sample
+    /// count and depth convention, drawn through a [`crate::HostPass`] of the
+    /// same layout.
+    pub fn for_layout(gpu: &GpuContext, layout: TargetLayout) -> Self {
+        let target_format = layout.colour;
+        let depth_format = layout.drawn_depth(&gpu.device);
+        let direction = layout.direction;
+        let samples = layout.samples;
         // Assembled, not one file: the two halves that are not about wgpu live
         // with the code they mirror — the air in `tuile-atmosphere`, the mosaic
         // rule beside the table it consumes in `tuile-core::raster`. What is
@@ -176,7 +189,7 @@ impl TileRenderer {
                         ..Default::default()
                     },
                     depth_stencil: Some(wgpu::DepthStencilState {
-                        format: DEPTH_FORMAT,
+                        format: depth_format,
                         // A background neither writes depth nor tests against
                         // it. It is not geometry competing for a place in the
                         // scene — it is what is behind everything, and saying
@@ -192,8 +205,8 @@ impl TileRenderer {
                         depth_write_enabled: Some(matches!(kind, Pass::Solid | Pass::Layers)),
                         depth_compare: Some(match kind {
                             Pass::Backdrop => wgpu::CompareFunction::Always,
-                            Pass::Solid | Pass::Fallback => wgpu::CompareFunction::Less,
-                            Pass::Layers => wgpu::CompareFunction::LessEqual,
+                            Pass::Solid | Pass::Fallback => direction.nearer(),
+                            Pass::Layers => direction.nearer_or_level(),
                         }),
                         // **The mark that says who owns this ground.**
                         //
@@ -236,7 +249,7 @@ impl TileRenderer {
                         bias: Default::default(),
                     }),
                     multisample: wgpu::MultisampleState {
-                        count: crate::context::SAMPLES,
+                        count: samples,
                         ..Default::default()
                     },
                     fragment: Some(wgpu::FragmentState {
@@ -294,14 +307,14 @@ impl TileRenderer {
                     ..Default::default()
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
+                    format: depth_format,
                     depth_write_enabled: Some(false),
-                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    depth_compare: Some(direction.nearer()),
                     stencil: Default::default(),
                     bias: Default::default(),
                 }),
                 multisample: wgpu::MultisampleState {
-                    count: crate::context::SAMPLES,
+                    count: samples,
                     ..Default::default()
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -368,8 +381,7 @@ impl TileRenderer {
         self.line_buf = Some((buf, vertices.len() as u32));
     }
 
-    /// Draws tiles into the host's pass (color target = `target_format`,
-    /// depth = [`DEPTH_FORMAT`]). Falls back to fill when wireframe is
+    /// Draws tiles into the host's pass (the layout's colour and depth). Falls back to fill when wireframe is
     /// requested but unsupported.
     /// Draws a surface **behind** everything, taking no part in depth.
     ///
