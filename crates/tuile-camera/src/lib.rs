@@ -24,7 +24,7 @@
 
 pub mod path;
 
-use glam::{DQuat, DVec3, Mat4};
+use glam::{DQuat, DVec3};
 use std::sync::Arc;
 use tuile_core::geo::{ecef_to_geodetic, enu_frame, geodetic_to_ecef, Geodetic, WGS84_A, WGS84_B};
 use tuile_core::ground::{lift_above_ground, FlatGround, GroundHeight};
@@ -360,11 +360,16 @@ impl GlobeCamera {
     fn projection(&self, render_origin: DVec3, aspect: f32, clearance: f64) -> [f32; 16] {
         let eye = (self.position - render_origin).as_vec3();
         let target = (self.position + self.direction - render_origin).as_vec3();
-        let view = Mat4::look_at_rh(eye, target, self.up.as_vec3());
+        let view = glam::camera::rh::view::look_at_mat4(eye, target, self.up.as_vec3());
         // Far still comes from the ellipsoid: it is the horizon, which is set
         // by how high the eye is over the globe, not by what is underfoot.
         let (near, far) = self.clip_planes(clearance);
-        let proj = Mat4::perspective_rh(self.fovy as f32, aspect.max(1e-3), near, far);
+        let proj = glam::camera::rh::proj::directx::perspective(
+            self.fovy as f32,
+            aspect.max(1e-3),
+            near,
+            far,
+        );
         (proj * view).to_cols_array()
     }
 }

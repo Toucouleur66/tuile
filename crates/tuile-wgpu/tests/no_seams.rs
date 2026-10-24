@@ -34,7 +34,7 @@
 
 mod support;
 
-use glam::{DVec3, Mat4, Vec3};
+use glam::{DVec3, Vec3};
 
 use support::{exacts, gpu, mesh, Scripted};
 use tuile_core::budget::FrameDeadline;
@@ -258,8 +258,9 @@ fn render_and_count(
     } else {
         DVec3::Z.cross(forward).normalize_or(DVec3::X)
     };
-    let view_m = Mat4::look_to_rh(Vec3::ZERO, forward.as_vec3(), up.as_vec3());
-    let proj = Mat4::perspective_rh(60f32.to_radians(), 1.0, 100.0, 40_000_000.0);
+    let view_m = glam::camera::rh::view::look_to_mat4(Vec3::ZERO, forward.as_vec3(), up.as_vec3());
+    let proj =
+        glam::camera::rh::proj::directx::perspective(60f32.to_radians(), 1.0, 100.0, 40_000_000.0);
     renderer.set_view(
         &gpu.queue,
         &ViewUniform {
@@ -354,7 +355,7 @@ fn render_and_count(
     gpu.device
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("poll");
-    let data = slice.get_mapped_range();
+    let data = slice.get_mapped_range().expect("map range");
 
     // The middle of the frame only, where the seam is aimed. The edges are
     // where the two tiles run out and the true void begins; counting those

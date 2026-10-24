@@ -296,7 +296,7 @@ fn read_texture(film: &FilmGpu, texture: &wgpu::Texture) -> Vec<u8> {
     film.device()
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("poll");
-    let bytes = slice.get_mapped_range().to_vec();
+    let bytes = slice.get_mapped_range().expect("map range").to_vec();
     bytes
         .chunks(padded as usize)
         .flat_map(|r| r[..row as usize].to_vec())

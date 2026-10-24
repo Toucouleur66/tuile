@@ -35,7 +35,7 @@ mod support;
 
 use std::sync::Arc;
 
-use glam::{DVec3, Mat4, Vec3};
+use glam::{DVec3, Vec3};
 
 use support::{exact, fallback, gpu, mesh, select, Scripted};
 use tuile_core::budget::FrameDeadline;
@@ -230,8 +230,9 @@ fn draw(
 
     let forward = (look_at - eye).normalize();
     let up = DVec3::Z.cross(forward).normalize_or(DVec3::X);
-    let view_m = Mat4::look_to_rh(Vec3::ZERO, forward.as_vec3(), up.as_vec3());
-    let proj = Mat4::perspective_rh(40f32.to_radians(), 1.0, 100.0, 40_000_000.0);
+    let view_m = glam::camera::rh::view::look_to_mat4(Vec3::ZERO, forward.as_vec3(), up.as_vec3());
+    let proj =
+        glam::camera::rh::proj::directx::perspective(40f32.to_radians(), 1.0, 100.0, 40_000_000.0);
     renderer.set_view(
         &gpu.queue,
         &ViewUniform {
@@ -316,7 +317,7 @@ fn draw(
     gpu.device
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("poll");
-    let pixels = slice.get_mapped_range().to_vec();
+    let pixels = slice.get_mapped_range().expect("map range").to_vec();
     readback.unmap();
     pixels
 }

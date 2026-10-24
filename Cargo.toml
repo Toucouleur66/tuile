@@ -42,7 +42,7 @@ members = [
 [workspace.package]
 version = "0.12.0"
 edition = "2021"
-rust-version = "1.91"
+rust-version = "1.97"
 license = "MIT OR Apache-2.0"
 authors = ["lapoule.dev"]
 
@@ -51,7 +51,7 @@ authors = ["lapoule.dev"]
 # builds one copy of each (one DVec3, one error type, one async runtime).
 # Features are additive and unified across the graph: a feature listed here is
 # enabled wherever the dep is used — harmless for crates that don't need it.
-glam = { version = "0.33.1", features = ["serde"] }
+glam = { version = "0.33.2", features = ["serde"] }
 half = "2.7"
 # NREL's Solar Position Algorithm (Reda & Andreas 2003). Pre-1.0, in the
 # wasm path through tuile-atmosphere: see that crate's `sun` module for why
@@ -85,7 +85,7 @@ image = { version = "0.25.10", default-features = false, features = ["jpeg", "pn
 # KTX 2.0 and the UASTC transcoders, on the CPU: no default features, so no
 # wgpu.
 texcomp = { git = "https://github.com/lapoule-dev/texcomp", tag = "v0.2.0", default-features = false }
-wgpu = "29.0.3"
+wgpu = "30.0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1.0.102"
 pollster = "0.4"

@@ -268,10 +268,14 @@ impl Bench {
     ) -> f64 {
         // The same projection the traversal culled with, so this looks at
         // exactly the volume the engine was asked about.
-        let view_m =
-            glam::Mat4::look_to_rh(glam::Vec3::ZERO, view.direction().as_vec3(), up.as_vec3());
+        let view_m = glam::camera::rh::view::look_to_mat4(
+            glam::Vec3::ZERO,
+            view.direction().as_vec3(),
+            up.as_vec3(),
+        );
         let far = (eye.length() * 2.0) as f32;
-        let proj = glam::Mat4::perspective_rh(45f32.to_radians(), 1.0, 100.0, far);
+        let proj =
+            glam::camera::rh::proj::directx::perspective(45f32.to_radians(), 1.0, 100.0, far);
         self.renderer.set_view(
             &gpu.queue,
             &ViewUniform {
@@ -355,7 +359,7 @@ impl Bench {
         gpu.device
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("poll");
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().expect("map range");
         let (lo, hi) = (SIZE / 4, SIZE * 3 / 4);
         let (mut black, mut total) = (0u64, 0u64);
         for row in lo..hi {

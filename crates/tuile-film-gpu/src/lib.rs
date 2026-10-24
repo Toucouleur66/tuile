@@ -907,11 +907,11 @@ impl FilmGpu {
         });
         let overlay_attributes =
             wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32x3, 3 => Uint32];
-        let overlay_buffers = [wgpu::VertexBufferLayout {
+        let overlay_buffers = [Some(wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<OverlayVertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &overlay_attributes,
-        }];
+        })];
         let overlay = |label, depth_compare, write: bool| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
@@ -953,11 +953,11 @@ impl FilmGpu {
             })
         };
         let cast_attributes = wgpu::vertex_attr_array![0 => Float32x3];
-        let cast_buffers = [wgpu::VertexBufferLayout {
+        let cast_buffers = [Some(wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<OverlayVertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &cast_attributes,
-        }];
+        })];
         let edge_attributes = [
             cast_attributes[0],
             wgpu::VertexAttribute {
@@ -966,40 +966,41 @@ impl FilmGpu {
                 shader_location: 4,
             },
         ];
-        let edge_buffers = [wgpu::VertexBufferLayout {
+        let edge_buffers = [Some(wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<OverlayVertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &edge_attributes,
-        }];
-        let cast = |label, topology, entry_point, buffers: &[wgpu::VertexBufferLayout], bias| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&overlay_cast_layout),
-                vertex: wgpu::VertexState {
-                    module: &overlay_module,
-                    entry_point: Some(entry_point),
-                    compilation_options: Default::default(),
-                    buffers,
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology,
-                    cull_mode: None,
-                    ..Default::default()
-                },
-                // As the ground is drawn into the map.
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                    stencil: Default::default(),
-                    bias,
-                }),
-                multisample: Default::default(),
-                fragment: None,
-                multiview_mask: None,
-                cache: None,
-            })
-        };
+        })];
+        let cast =
+            |label, topology, entry_point, buffers: &[Option<wgpu::VertexBufferLayout>], bias| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&overlay_cast_layout),
+                    vertex: wgpu::VertexState {
+                        module: &overlay_module,
+                        entry_point: Some(entry_point),
+                        compilation_options: Default::default(),
+                        buffers,
+                    },
+                    primitive: wgpu::PrimitiveState {
+                        topology,
+                        cull_mode: None,
+                        ..Default::default()
+                    },
+                    // As the ground is drawn into the map.
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: DEPTH_FORMAT,
+                        depth_write_enabled: Some(true),
+                        depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                        stencil: Default::default(),
+                        bias,
+                    }),
+                    multisample: Default::default(),
+                    fragment: None,
+                    multiview_mask: None,
+                    cache: None,
+                })
+            };
         // Reverse-Z: an overlay shows where it is nearer than the overlays
         // before it, and nearer is greater.
         let tested = wgpu::CompareFunction::Greater;

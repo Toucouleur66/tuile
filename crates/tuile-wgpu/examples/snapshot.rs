@@ -13,7 +13,7 @@
 
 use futures_executor::LocalPool;
 use futures_util::task::LocalSpawnExt;
-use glam::{DVec2, Mat4, Vec3};
+use glam::{DVec2, Vec3};
 use std::sync::Arc;
 use tuile_core::budget::FrameDeadline;
 use tuile_core::fetch::FsFetcher;
@@ -128,8 +128,9 @@ fn main() {
     let view = ViewUniform {
         view_proj: {
             let eye_f = (eye - render_origin).as_vec3();
-            let v = Mat4::look_at_rh(eye_f, Vec3::ZERO, up.as_vec3());
-            let p = Mat4::perspective_rh(45f32.to_radians(), 1.0, 0.05, 1.0e9);
+            let v = glam::camera::rh::view::look_at_mat4(eye_f, Vec3::ZERO, up.as_vec3());
+            let p =
+                glam::camera::rh::proj::directx::perspective(45f32.to_radians(), 1.0, 0.05, 1.0e9);
             (p * v).to_cols_array()
         },
         sun_dir: {
@@ -259,5 +260,5 @@ fn render_to_png(
     gpu.device
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("poll");
-    slice.get_mapped_range().to_vec()
+    slice.get_mapped_range().expect("map range").to_vec()
 }

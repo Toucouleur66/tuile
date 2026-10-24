@@ -72,7 +72,7 @@ fn picture(film: &FilmGpu) -> Vec<u8> {
     film.device()
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("poll");
-    let rows = slice.get_mapped_range().to_vec();
+    let rows = slice.get_mapped_range().expect("map range").to_vec();
     rows.chunks(padded as usize)
         .flat_map(|row| row[..(WIDTH * 4) as usize].to_vec())
         .collect()

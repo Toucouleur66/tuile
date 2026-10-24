@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-use glam::{DMat4, DVec3, Mat4, Vec3};
+use glam::{DVec3, Mat4, Vec3};
 use tuile_film::{FrameCamera, Look};
 
 /// `Frame` in `common.wgsl`, byte for byte.
@@ -84,7 +84,11 @@ impl SunView {
     ) -> Option<Self> {
         let to_sun = to_sun.as_dvec3().try_normalize()?;
         // A rotation only: the eye stays the origin, as for the camera.
-        let view = DMat4::look_to_rh(DVec3::ZERO, -to_sun, to_sun.any_orthonormal_vector());
+        let view = glam::dcamera::rh::view::look_to_mat4(
+            DVec3::ZERO,
+            -to_sun,
+            to_sun.any_orthonormal_vector(),
+        );
         let (mut low, mut high) = (DVec3::INFINITY, DVec3::NEG_INFINITY);
         for (centre, radius) in spheres {
             let centre = view.transform_vector3(centre);
@@ -112,7 +116,14 @@ impl SunView {
         let snapped = |from_eye: f64, eye: f64| ((from_eye + eye) / texel).floor() * texel - eye;
         let (x, y) = (snapped(low.x, eye.x), snapped(low.y, eye.y));
         // The view looks down −z: what is nearest the sun has the greatest z.
-        let projection = DMat4::orthographic_rh(x, x + width, y, y + width, -high.z, -low.z);
+        let projection = glam::dcamera::rh::proj::directx::orthographic(
+            x,
+            x + width,
+            y,
+            y + width,
+            -high.z,
+            -low.z,
+        );
         Some(Self {
             view_proj: (projection * view).as_mat4(),
             texel: texel as f32,

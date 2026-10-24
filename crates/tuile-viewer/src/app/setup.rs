@@ -144,6 +144,7 @@ async fn bring_up(window: Arc<Window>, backends: Option<wgpu::Backends>) -> Resu
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
             compatible_surface: Some(&surface),
+            apply_limit_buckets: false,
         })
         .await
         .map_err(|e| format!("adapter: {e}"))?;
@@ -519,6 +520,10 @@ pub(super) fn configure(
             present_mode: wgpu::PresentMode::AutoVsync,
             desired_maximum_frame_latency: 2,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            // What every frame has been shown in so far: sRGB for the 8-bit
+            // formats chosen here, on every backend. Wide gamut and HDR change
+            // how a frame must be encoded, and are a choice of their own.
+            color_space: wgpu::SurfaceColorSpace::Auto,
             // The sRGB view a browser's linear canvas is drawn through; empty
             // everywhere the surface is sRGB itself.
             view_formats: format.view_formats(),

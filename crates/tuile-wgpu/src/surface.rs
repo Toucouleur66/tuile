@@ -150,7 +150,7 @@ pub fn draw_to_surface(
     }
     gpu.queue.submit([encoder.finish()]);
     before_present();
-    frame.present();
+    gpu.queue.present(frame);
     Presented::Yes
 }
 

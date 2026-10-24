@@ -25,7 +25,7 @@
 
 mod support;
 
-use glam::{DVec3, Mat4, Vec3};
+use glam::{DVec3, Vec3};
 
 use support::{exact, fallback, gpu, mesh, select, Scripted};
 use tuile_core::budget::FrameDeadline;
@@ -124,8 +124,13 @@ fn black_fraction_in_the_middle(gpu: &GpuContext, pump: &mut ContentPump, eye: D
 
     let down = -eye.normalize();
     let up = DVec3::Z.cross(down).cross(down).normalize_or(DVec3::Y);
-    let view_m = Mat4::look_to_rh(Vec3::ZERO, down.as_vec3(), up.as_vec3());
-    let proj = Mat4::perspective_rh(60f32.to_radians(), 1.0, 1_000.0, 40_000_000.0);
+    let view_m = glam::camera::rh::view::look_to_mat4(Vec3::ZERO, down.as_vec3(), up.as_vec3());
+    let proj = glam::camera::rh::proj::directx::perspective(
+        60f32.to_radians(),
+        1.0,
+        1_000.0,
+        40_000_000.0,
+    );
     renderer.set_view(
         &gpu.queue,
         &ViewUniform {
@@ -220,7 +225,7 @@ fn black_fraction_in_the_middle(gpu: &GpuContext, pump: &mut ContentPump, eye: D
     gpu.device
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("poll");
-    let data = slice.get_mapped_range();
+    let data = slice.get_mapped_range().expect("map range");
 
     let (lo, hi) = (SIZE / 4, SIZE * 3 / 4);
     let (mut black, mut total) = (0u64, 0u64);

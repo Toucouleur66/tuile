@@ -191,7 +191,7 @@ impl ViewState {
         let direction = direction.normalize();
         let up = up.normalize();
         let aspect = (viewport_px.x / viewport_px.y).max(1e-6);
-        let view = DMat4::look_to_rh(position, direction, up);
+        let view = glam::dcamera::rh::view::look_to_mat4(position, direction, up);
         // Near/far only bound the culling frustum, not the LOD logic; keep
         // them generous (geospatial scenes span centimeters to planets).
         //
@@ -200,7 +200,7 @@ impl ViewState {
         // the margin must change what is selected, never how finely it is
         // divided — an inflated fov in the screen-space error would silently
         // coarsen the whole globe.
-        let proj = DMat4::perspective_rh(
+        let proj = glam::dcamera::rh::proj::directx::perspective(
             (fovy_rad * (1.0 + CULL_MARGIN)).min(std::f64::consts::PI * 0.98),
             aspect,
             0.05,
@@ -231,7 +231,7 @@ impl ViewState {
     ) -> Self {
         let direction = direction.normalize();
         let up = up.normalize();
-        let view = DMat4::look_to_rh(position, direction, up);
+        let view = glam::dcamera::rh::view::look_to_mat4(position, direction, up);
         // Each angle is widened by the culling margin, as `perspective`
         // widens its field of view; the focal below is not.
         let limit = std::f64::consts::FRAC_PI_2 * 0.98;

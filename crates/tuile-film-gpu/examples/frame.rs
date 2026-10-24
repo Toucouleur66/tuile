@@ -164,7 +164,7 @@ fn main() {
     film.device()
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("poll");
-    let data = buffer.slice(..).get_mapped_range();
+    let data = buffer.slice(..).get_mapped_range().expect("map range");
     let mut rgba = Vec::with_capacity((width * height * 4) as usize);
     for row in data.chunks(padded as usize) {
         rgba.extend_from_slice(&row[..(width * 4) as usize]);

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-use glam::{DMat4, DVec3, Mat4, Vec3};
+use glam::{DVec3, Mat4, Vec3};
 use tuile_pack::BakedView;
 
 /// Near plane as a fraction of the camera's height over the ellipsoid — the
@@ -37,7 +37,7 @@ impl FrameCamera {
         // `look_to_rh` takes the direction as given and builds the basis
         // from it: an unnormalised one scales the view matrix, and every ray
         // the resolve builds from its rows then misses its pixel.
-        let rotation = DMat4::look_to_rh(
+        let rotation = glam::dcamera::rh::view::look_to_mat4(
             DVec3::ZERO,
             DVec3::from_array(view.direction).normalize(),
             DVec3::from_array(view.up),
@@ -47,7 +47,11 @@ impl FrameCamera {
         Self {
             eye,
             view: rotation.as_mat4(),
-            projection: Mat4::perspective_infinite_reverse_rh(view.fovy_rad as f32, aspect, near),
+            projection: glam::camera::rh::proj::directx::perspective_infinite_reverse(
+                view.fovy_rad as f32,
+                aspect,
+                near,
+            ),
             near,
         }
     }

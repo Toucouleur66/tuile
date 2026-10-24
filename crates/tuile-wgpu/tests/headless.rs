@@ -225,13 +225,14 @@ fn render_frame(
     gpu.device
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("poll");
-    let pixels = slice.get_mapped_range().to_vec();
+    let pixels = slice.get_mapped_range().expect("map range").to_vec();
     Frame { pixels }
 }
 
 fn looking_down_z(distance: f32) -> ViewUniform {
-    let proj = Mat4::perspective_rh(60f32.to_radians(), 1.0, 0.1, 100.0);
-    let view = Mat4::look_at_rh(Vec3::new(0.0, 0.0, distance), Vec3::ZERO, Vec3::Y);
+    let proj = glam::camera::rh::proj::directx::perspective(60f32.to_radians(), 1.0, 0.1, 100.0);
+    let view =
+        glam::camera::rh::view::look_at_mat4(Vec3::new(0.0, 0.0, distance), Vec3::ZERO, Vec3::Y);
     ViewUniform {
         view_proj: (proj * view).to_cols_array(),
         sun_dir: [0.0, 0.0, -1.0, 0.0],
@@ -508,8 +509,14 @@ fn dark_quad_at(metres: f32) -> (DecodedTileContent, ViewUniform) {
         * Mat4::from_rotation_y(std::f32::consts::FRAC_PI_2)
         * Mat4::from_scale(Vec3::splat(metres));
 
-    let proj = Mat4::perspective_rh(60f32.to_radians(), 1.0, metres * 0.01, metres * 10.0);
-    let view = Mat4::look_at_rh(Vec3::ZERO, Vec3::new(-metres, 0.0, 0.0), Vec3::Z);
+    let proj = glam::camera::rh::proj::directx::perspective(
+        60f32.to_radians(),
+        1.0,
+        metres * 0.01,
+        metres * 10.0,
+    );
+    let view =
+        glam::camera::rh::view::look_at_mat4(Vec3::ZERO, Vec3::new(-metres, 0.0, 0.0), Vec3::Z);
     let uniform = ViewUniform {
         view_proj: (proj * view).to_cols_array(),
         // A headlight, and full ambient besides: lighting then contributes
@@ -698,8 +705,9 @@ fn a_coarse_tableland_seen_from_orbit_through_the_air_shows_none_of_its_facets()
         local_origin_ecef: origin,
         transform_local: Mat4::IDENTITY,
     };
-    let proj = Mat4::perspective_rh(60f32.to_radians(), 1.0, 10_000.0, 1.0e7);
-    let view = Mat4::look_at_rh(Vec3::ZERO, Vec3::NEG_Z, Vec3::Y);
+    let proj =
+        glam::camera::rh::proj::directx::perspective(60f32.to_radians(), 1.0, 10_000.0, 1.0e7);
+    let view = glam::camera::rh::view::look_at_mat4(Vec3::ZERO, Vec3::NEG_Z, Vec3::Y);
     let uniform = ViewUniform {
         view_proj: (proj * view).to_cols_array(),
         // The sun straight down, as `air_at`'s: the air over the tableland
