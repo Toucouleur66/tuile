@@ -32,6 +32,17 @@ FLAGS (each takes one number; `--flag value` or `--flag=value`):
                        when the answer arrives, and stays put if none does)
     --imagery <name>   the imagery layer to open on, by key or by name
 IMAGERY_LAYERS
+
+SOURCES BY ADDRESS (no catalog, no token; each replaces the host's own):
+    --terrain-url <url>          quantized-mesh terrain: the URL of its layer.json.
+                                 Its tiles are addressed as the layer.json says
+                                 (TMS: row 0 in the south)
+    --imagery-template <url>     imagery from a URL template naming {z}, {x}, {y},
+                                 addressed XYZ (row 0 in the north); the only layer
+    --imagery-scheme <grid>      the template's grid: webmercator (1 tile at level 0,
+                                 the default) or geographic (2 tiles at level 0)
+    --imagery-max-level <n>      the deepest level the template serves; deeper,
+                                 its tiles are stretched
     -h, --help         print this and exit
 ";
 
@@ -190,15 +201,55 @@ pub(crate) enum Invocation {
     /// current location once the system says where that is. The view's own
     /// longitude and latitude are then only where the eye waits meanwhile.
     ///
+    /// `addresses` are the sources the command line named by URL, which take
+    /// the place of the host's.
+    ///
     /// `imagery` is the layer `--imagery` named, as typed: which layer that
     /// is depends on the host's list, which this parser does not have.
     Run {
         view: StartView,
         here: bool,
         imagery: Option<String>,
+        addresses: Addresses,
     },
     /// Print [`usage`] and leave.
     Help,
+}
+
+/// Sources the command line names by their address: see [`crate::open`].
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct Addresses {
+    /// `--terrain-url`: a `layer.json`.
+    pub terrain: Option<url::Url>,
+    /// `--imagery-template` and the two flags that describe its grid.
+    pub imagery: Option<Template>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Addresses {
+    /// Whether the host has nothing left to answer: no catalog to ask, no
+    /// token to find.
+    pub(crate) fn are_everything(&self) -> bool {
+        self.terrain.is_some() && self.imagery.is_some()
+    }
+
+    pub(crate) fn are_nothing(&self) -> bool {
+        self.terrain.is_none() && self.imagery.is_none()
+    }
+}
+
+/// An imagery template, as the command line gave it.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Template {
+    /// `https://…/{z}/{x}/{y}.png`, addressed XYZ.
+    pub template: String,
+    /// On the geographic grid (two tiles at level 0) rather than the
+    /// web-mercator one.
+    pub geographic: bool,
+    /// The deepest level served, when said.
+    pub max_level: Option<u32>,
 }
 
 /// One flag: its name, the range it accepts (inclusive at both ends) and the
@@ -345,6 +396,13 @@ where
     let mut view = StartView::default();
     let mut here = false;
     let mut imagery: Option<String> = None;
+    // The flags that take text: each at most once.
+    let mut texts: [(&str, Option<String>); 4] = [
+        ("--terrain-url", None),
+        ("--imagery-template", None),
+        ("--imagery-scheme", None),
+        ("--imagery-max-level", None),
+    ];
     let mut seen = [false; FLAGS.len()];
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -377,6 +435,23 @@ where
             imagery = Some(text);
             continue;
         }
+        if let Some((flag, slot)) = texts.iter_mut().find(|(flag, _)| *flag == name) {
+            if slot.is_some() {
+                return Err(format!("{flag} given twice"));
+            }
+            let text = match inline {
+                Some(text) => text,
+                None => args
+                    .next()
+                    .map(|s| s.as_ref().to_owned())
+                    .ok_or_else(|| format!("{flag} needs a value"))?,
+            };
+            if text.trim().is_empty() {
+                return Err(format!("{flag} needs a value"));
+            }
+            *slot = Some(text.trim().to_owned());
+            continue;
+        }
         let Some(index) = FLAGS.iter().position(|f| f.name == name) else {
             return Err(format!("unknown argument {arg:?}"));
         };
@@ -399,11 +474,74 @@ where
     if here && (seen[0] || seen[1]) {
         return Err("--here and --lon/--lat both say where to start; give one".to_owned());
     }
+    let [(_, terrain), (_, template), (_, scheme), (_, max_level)] = texts;
+    let addresses = addresses(terrain, template, scheme, max_level)?;
+    // The template is the only layer: there is no other for `--imagery` to
+    // name.
+    if addresses.imagery.is_some() && imagery.is_some() {
+        return Err(
+            "--imagery names one of the host's layers, and --imagery-template replaces \
+             them; give one"
+                .to_owned(),
+        );
+    }
     Ok(Invocation::Run {
         view,
         here,
         imagery,
+        addresses,
     })
+}
+
+/// The sources by address, from the text of their four flags.
+#[cfg(not(target_arch = "wasm32"))]
+fn addresses(
+    terrain: Option<String>,
+    template: Option<String>,
+    scheme: Option<String>,
+    max_level: Option<String>,
+) -> Result<Addresses, String> {
+    let terrain = terrain
+        .map(|url| crate::open::absolute_url("--terrain-url", &url))
+        .transpose()?;
+    let geographic = match scheme.as_deref() {
+        None | Some("webmercator") => false,
+        Some("geographic") => true,
+        Some(other) => {
+            return Err(format!(
+                "--imagery-scheme is geographic or webmercator, got {other:?}"
+            ))
+        }
+    };
+    let max_level = max_level
+        .map(|text| {
+            text.parse::<u32>()
+                .ok()
+                .filter(|level| *level <= 30)
+                .ok_or_else(|| {
+                    format!("--imagery-max-level wants a level from 0 to 30, got {text:?}")
+                })
+        })
+        .transpose()?;
+    let imagery = match template {
+        Some(template) => {
+            crate::open::check_template("--imagery-template", &template)?;
+            Some(Template {
+                template,
+                geographic,
+                max_level,
+            })
+        }
+        None if scheme.is_some() || max_level.is_some() => {
+            return Err(
+                "--imagery-scheme and --imagery-max-level describe an --imagery-template, \
+                 and there is none"
+                    .to_owned(),
+            )
+        }
+        None => None,
+    };
+    Ok(Addresses { terrain, imagery })
 }
 
 #[cfg(test)]
@@ -417,10 +555,12 @@ mod tests {
             view,
             here: false,
             imagery: None,
+            addresses,
         }) = parsed
         else {
             unreachable!("{args:?} should start a session, got {parsed:?}");
         };
+        assert!(addresses.are_nothing());
         view
     }
 
@@ -578,6 +718,98 @@ mod tests {
         assert!(FLAGS_TEXT.contains("--imagery"));
     }
 
+    /// The sources by address: read in either spelling, checked, and
+    /// refused when they contradict each other or describe nothing.
+    #[test]
+    fn sources_by_address() {
+        let addresses = |args: &[&str]| match parse(args) {
+            Ok(Invocation::Run { addresses, .. }) => Ok(addresses),
+            Ok(other) => unreachable!("{other:?}"),
+            Err(e) => Err(e),
+        };
+        let both = addresses(&[
+            "--terrain-url",
+            "http://127.0.0.1:8092/terrain/layer.json",
+            "--imagery-template=http://127.0.0.1:8092/imagery/{z}/{x}/{y}.png",
+            "--imagery-scheme",
+            "geographic",
+            "--imagery-max-level=15",
+            "--altitude",
+            "50",
+        ])
+        .expect("valid");
+        assert!(both.are_everything());
+        assert_eq!(
+            both.terrain.as_ref().map(url::Url::as_str),
+            Some("http://127.0.0.1:8092/terrain/layer.json")
+        );
+        assert_eq!(
+            both.imagery,
+            Some(Template {
+                template: "http://127.0.0.1:8092/imagery/{z}/{x}/{y}.png".into(),
+                geographic: true,
+                max_level: Some(15),
+            })
+        );
+        // Either alone; web-mercator unless said.
+        let terrain = addresses(&["--terrain-url", "https://t.test/layer.json"]).expect("valid");
+        assert!(terrain.terrain.is_some() && terrain.imagery.is_none());
+        let imagery =
+            addresses(&["--imagery-template", "https://t.test/{z}/{x}/{y}.jpg"]).expect("valid");
+        assert!(!imagery.imagery.expect("a template").geographic);
+        // Without any, nothing — the host's sources stand.
+        assert!(addresses(&[]).expect("valid").are_nothing());
+        for (args, says) in [
+            (&["--terrain-url", "layer.json"][..], "not a URL"),
+            (&["--terrain-url"][..], "needs a value"),
+            (&["--terrain-url=a:b", "--terrain-url=a:c"][..], "twice"),
+            (
+                &["--imagery-template", "https://t.test/{z}/{x}.png"][..],
+                "{y}",
+            ),
+            (&["--imagery-scheme", "geographic"][..], "there is none"),
+            (&["--imagery-max-level", "12"][..], "there is none"),
+            (
+                &[
+                    "--imagery-template",
+                    "https://t/{z}/{x}/{y}",
+                    "--imagery-scheme",
+                    "mercator",
+                ][..],
+                "geographic or webmercator",
+            ),
+            (
+                &[
+                    "--imagery-template",
+                    "https://t/{z}/{x}/{y}",
+                    "--imagery-max-level",
+                    "-1",
+                ][..],
+                "0 to 30",
+            ),
+            (
+                &[
+                    "--imagery-template",
+                    "https://t/{z}/{x}/{y}",
+                    "--imagery",
+                    "aerial",
+                ][..],
+                "give one",
+            ),
+        ] {
+            let error = addresses(args).expect_err("refused");
+            assert!(error.contains(says), "{args:?}: {error:?}");
+        }
+        for flag in [
+            "--terrain-url",
+            "--imagery-template",
+            "--imagery-scheme",
+            "--imagery-max-level",
+        ] {
+            assert!(FLAGS_TEXT.contains(flag), "{flag} is in --help");
+        }
+    }
+
     #[test]
     fn here_replaces_the_position_and_refuses_to_share_it() {
         assert_eq!(
@@ -590,6 +822,7 @@ mod tests {
                 },
                 here: true,
                 imagery: None,
+                addresses: Addresses::default(),
             })
         );
         // Either order, either coordinate.

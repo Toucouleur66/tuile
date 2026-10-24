@@ -174,9 +174,9 @@ impl TryFrom<TerrainFields> for TerrainSpec {
         match (fields.asset, fields.url) {
             (Some(asset), None) => Ok(Self::Asset(asset)),
             (None, Some(url)) => Ok(Self::Url(url)),
-            (Some(_), Some(_)) => Err(
-                "`sources.terrain` gives both an `asset` and a `url`: give one".to_owned(),
-            ),
+            (Some(_), Some(_)) => {
+                Err("`sources.terrain` gives both an `asset` and a `url`: give one".to_owned())
+            }
             (None, None) => Err(
                 "`sources.terrain` needs a catalog `asset` or the `url` of a layer.json".to_owned(),
             ),
@@ -467,7 +467,10 @@ mod tests {
         .expect("valid");
         assert!(!o.sources.needs_catalog());
         let (terrain, layers) = o.sources.choices().expect("no catalog is needed");
-        assert_eq!(terrain, TerrainChoice::at_url("http://127.0.0.1:8092/terrain/layer.json"));
+        assert_eq!(
+            terrain,
+            TerrainChoice::at_url("http://127.0.0.1:8092/terrain/layer.json")
+        );
         assert_eq!(
             o.sources.terrain_url(),
             Some("http://127.0.0.1:8092/terrain/layer.json")
@@ -523,7 +526,11 @@ mod tests {
                 "template":"https://t.test/{z}/{x}/{y}.png"}]}}"#,
         )
         .expect("readable");
-        assert!(relative.sources.choices().unwrap_err().contains("not a URL"));
+        assert!(relative
+            .sources
+            .choices()
+            .unwrap_err()
+            .contains("not a URL"));
     }
 
     /// A view is held to the flags' bounds; the backend choice maps to the

@@ -46,6 +46,9 @@ pollster = { workspace = true }
 # `time` for the bounded flush of the tile store on the way out.
 tokio = { workspace = true, features = ["sync", "time"] }
 tuile-storage-foyer = { version = "0.12.0", path = "../tuile-storage-foyer" }
+# The sources the command line names by address (`--terrain-url`,
+# `--imagery-template`), fetched with no token over the native HTTP stack.
+tuile-native-fetchers = { version = "0.12.0", path = "../tuile-native-fetchers" }
 # Ctrl-C, SIGTERM and SIGHUP have to end the *session*, not the process: a
 # recording is most valuable in exactly the run that ends badly. A safe wrapper
 # rather than raw `libc::signal`, because the workspace denies `unsafe_code`.
