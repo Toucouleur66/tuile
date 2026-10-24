@@ -146,6 +146,7 @@ pub(crate) async fn assemble(
     layers: &[ImageryChoice],
     opening: usize,
     decode: Arc<dyn Offload>,
+    stored_imagery: tuile_core::texels::StoredPlan,
 ) -> anyhow::Result<Globe> {
     let opening_layer = layers
         .get(opening)
@@ -181,6 +182,9 @@ pub(crate) async fn assemble(
     let opts = GlobeOptions {
         imagery_slots: budget.clone(),
         imagery_plan: plan.clone(),
+        // What the person's choice does with tiles stored already compressed;
+        // off, they are unpacked to RGBA8.
+        stored_imagery,
         max_level: Some(if layers.len() > 1 {
             deepest.max(DEPTH_FOR_ANY_LAYER)
         } else {
@@ -256,6 +260,7 @@ mod tests {
             &layers,
             0,
             Arc::new(tuile_core::offload::Inline),
+            tuile_core::texels::StoredPlan::OFF,
         ))
         .err()
         .expect("there is no terrain");

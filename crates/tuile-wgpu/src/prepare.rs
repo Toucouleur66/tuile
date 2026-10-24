@@ -630,9 +630,9 @@ fn encode(
     Some(GpuImagery::new(texture, view, bytes, format.into()))
 }
 
-/// Blocks with their chain, uploaded as they are: `None` where the device
-/// was not created to sample `format`, or the levels are not a whole chain
-/// of whole blocks.
+/// Blocks, uploaded as they are, level by level: `None` where the device was
+/// not created to sample `format`, level 0 is not whole blocks, or the levels
+/// are not the start of its chain.
 fn upload_blocks(
     gpu: &GpuContext,
     t: &DecodedTexture,
@@ -652,9 +652,12 @@ fn upload_blocks(
     {
         return None;
     }
+    // The levels carried, level 0 first: the whole chain, or the first few of
+    // it — a stored tile may carry its base alone.
     let chain = 1 + t.width.max(t.height).ilog2();
     let size = |level: u32| ((t.width >> level).max(1), (t.height >> level).max(1));
-    if levels.len() != chain as usize
+    if levels.is_empty()
+        || levels.len() > chain as usize
         || levels.iter().enumerate().any(|(l, bytes)| {
             let (w, h) = size(l as u32);
             bytes.len() != BlockFormat::level_bytes(w, h)
@@ -669,7 +672,7 @@ fn upload_blocks(
             height: t.height,
             depth_or_array_layers: 1,
         },
-        mip_level_count: chain,
+        mip_level_count: levels.len() as u32,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: texcomp::gpu::texture_format(crate::compress::to_texcomp(format), true),
@@ -1007,7 +1010,12 @@ mod tests {
             let uploaded = upload_texture(&gpu, &blocks(3));
             assert_eq!((uploaded.bytes, uploaded.format), (48, ImageryFormat::Bc7));
         }
-        let broken = upload_texture(&gpu, &blocks(2));
+        if gpu.imagery_plan().target == ImageryFormat::Bc7 {
+            // The base alone, as a stored tile may carry it.
+            let base = upload_texture(&gpu, &blocks(1));
+            assert_eq!((base.bytes, base.format), (16, ImageryFormat::Bc7));
+        }
+        let broken = upload_texture(&gpu, &blocks(4));
         assert_eq!((broken.bytes, broken.format), (4, ImageryFormat::Rgba8));
         let Some(off) = gpu_with(ImageryCompression::Off) else {
             return;

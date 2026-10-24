@@ -1829,7 +1829,10 @@ mod tests {
             assert_eq!(o.stored_imagery, choice.stored(caps), "{choice:?}");
         }
         let off = GlobeOptions::default().with_imagery_compression(ImageryCompression::Off, caps);
-        assert_eq!(off.imagery_plan.get(), GlobeOptions::default().imagery_plan.get());
+        assert_eq!(
+            off.imagery_plan.get(),
+            GlobeOptions::default().imagery_plan.get()
+        );
         assert_eq!(off.stored_imagery, GlobeOptions::default().stored_imagery);
     }
 

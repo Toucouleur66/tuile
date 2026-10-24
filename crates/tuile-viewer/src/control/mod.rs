@@ -532,6 +532,12 @@ impl Headless {
             profile: profile.clone(),
             timeout: crate::launch::START_TIMEOUT,
             imagery_plan: gpu.imagery_plan(),
+            // The same choice on the same adapter, for tiles stored compressed.
+            stored_imagery: pollster::block_on(tuile_wgpu::adapter_plan(
+                start.imagery_compression,
+                None,
+            ))
+            .1,
         };
         let launch = crate::native::launch::start(&handle, plan.clone());
         let launch = if profile.hold_window_until_warm {

@@ -43,8 +43,8 @@ mod webgl2;
 mod world_overlay;
 
 pub use compress::{
-    adapter_plan, caps_of, compression_named, format_name, plan_features, plan_for, texture_caps,
-    EncodePace, EncodeStats, ImageryCompression,
+    adapter_plan, caps_of, compression_named, format_name, plan_features, plan_for,
+    stored_features, texture_caps, EncodePace, EncodeStats, ImageryCompression,
 };
 pub use context::{
     ContextError, GpuContext, ImageryTextures, DEPTH_FORMAT, SAMPLES, TEXTURE_FORMAT,

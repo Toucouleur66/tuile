@@ -28,7 +28,9 @@ use std::sync::Arc;
 
 use texcomp::gpu::{EncodeError, EncoderScratch, GpuEncoder, Level};
 use tuile_core::content::DecodedTexture;
-use tuile_core::texels::{BlockFormat, GpuTextureCaps, ImageryEncode, ImageryFormat, ImageryPlan};
+use tuile_core::texels::{
+    BlockFormat, GpuTextureCaps, ImageryEncode, ImageryFormat, ImageryPlan, StoredPlan,
+};
 
 pub use tuile_core::texels::ImageryCompression;
 
@@ -64,16 +66,34 @@ pub fn plan_features(plan: ImageryPlan) -> wgpu::Features {
     }
 }
 
+/// The device features a stored plan needs: each block format it holds
+/// tiles in, to sample them.
+pub fn stored_features(stored: StoredPlan) -> wgpu::Features {
+    let mut features = match stored.uastc.block() {
+        Some(format) => texcomp::gpu::feature(to_texcomp(format)),
+        None => wgpu::Features::empty(),
+    };
+    if stored.keep_bc7 {
+        features |= texcomp::gpu::feature(texcomp::BlockFormat::Bc7);
+    }
+    if stored.keep_astc {
+        features |= texcomp::gpu::feature(texcomp::BlockFormat::Astc4x4);
+    }
+    features
+}
+
 /// The plan `choice` comes to on `adapter`, and the features to create the
-/// device with for it: the format's, and timestamps where the adapter has
-/// them and the GPU encodes — what [`EncodePace`] measures with. Off is
-/// RGBA8 and no feature at all.
+/// device with for it: the format's, the formats tiles stored compressed are
+/// held in under the same choice ([`ImageryCompression::stored`]), and
+/// timestamps where the adapter has them and the GPU encodes — what
+/// [`EncodePace`] measures with. Off is RGBA8 and no feature at all.
 pub fn plan_for(
     choice: ImageryCompression,
     adapter: &wgpu::Adapter,
 ) -> (ImageryPlan, wgpu::Features) {
-    let plan = choice.plan(texture_caps(adapter));
-    let mut features = plan_features(plan);
+    let caps = texture_caps(adapter);
+    let plan = choice.plan(caps);
+    let mut features = plan_features(plan) | stored_features(choice.stored(caps));
     if plan.encode == ImageryEncode::Gpu {
         features |= adapter.features() & wgpu::Features::TIMESTAMP_QUERY;
     }
@@ -84,12 +104,14 @@ pub fn plan_for(
 /// before it has a window to create its device against: what a loader that
 /// starts before the device marks its first tiles with. The device confirms
 /// it ([`plan_for`]) once it exists. Off asks nothing of the system.
+///
+/// With it, what the same choice does with tiles stored already compressed.
 pub async fn adapter_plan(
     choice: ImageryCompression,
     backends: Option<wgpu::Backends>,
-) -> ImageryPlan {
+) -> (ImageryPlan, StoredPlan) {
     if choice == ImageryCompression::Off {
-        return ImageryPlan::RGBA8;
+        return (ImageryPlan::RGBA8, StoredPlan::OFF);
     }
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     if let Some(backends) = backends {
@@ -105,8 +127,11 @@ pub async fn adapter_plan(
         })
         .await
     {
-        Ok(adapter) => choice.plan(texture_caps(&adapter)),
-        Err(_) => ImageryPlan::RGBA8,
+        Ok(adapter) => {
+            let caps = texture_caps(&adapter);
+            (choice.plan(caps), choice.stored(caps))
+        }
+        Err(_) => (ImageryPlan::RGBA8, StoredPlan::OFF),
     }
 }
 
@@ -449,6 +474,15 @@ mod tests {
         assert_eq!(
             plan_features(ImageryCompression::Format(BlockFormat::Astc4x4).plan(caps)),
             wgpu::Features::TEXTURE_COMPRESSION_ASTC
+        );
+        // Stored tiles: nothing off, every format Auto keeps.
+        assert_eq!(
+            stored_features(ImageryCompression::Off.stored(caps)),
+            wgpu::Features::empty()
+        );
+        assert_eq!(
+            stored_features(ImageryCompression::Auto.stored(caps)),
+            wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::TEXTURE_COMPRESSION_ASTC
         );
     }
 

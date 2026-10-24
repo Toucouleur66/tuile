@@ -202,7 +202,8 @@ fn session(
     // What that comes to on this machine's GPU, asked before there is a
     // window, so the first tiles decoded are already held as chosen; the
     // device confirms it when the window brings it up.
-    let imagery_plan = pollster::block_on(tuile_wgpu::adapter_plan(compression, backends));
+    let (imagery_plan, stored_imagery) =
+        pollster::block_on(tuile_wgpu::adapter_plan(compression, backends));
     tracing::info!(
         ?compression,
         held = tuile_wgpu::format_name(imagery_plan.target),
@@ -266,6 +267,7 @@ fn session(
         profile: profile.clone(),
         timeout: crate::launch::START_TIMEOUT,
         imagery_plan,
+        stored_imagery,
     };
     let launch = launch::start(&handle, plan.clone());
     // A phone tries again by itself; a desktop says why and stops, as it

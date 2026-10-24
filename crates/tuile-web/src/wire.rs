@@ -647,25 +647,27 @@ impl Writer {
             self.u32(v);
         }
     }
-    /// RGBA8 only. Block-compressed texels have no form on this wire yet and
-    /// never reach it; if one did, the page would get the stand-in slate —
-    /// ground drawn flat rather than not drawn. A debug build stops on it, so
-    /// a real occurrence fails the tests rather than hide under the slate.
+    /// A texture as it is: RGBA8 with the format it is to be held in, or
+    /// blocks with every level they carry. A tag says which.
     fn texture(&mut self, t: &DecodedTexture) {
-        let stand_in;
-        let t = if t.rgba8().is_some() {
-            t
-        } else {
-            debug_assert!(false, "block-compressed texels reached the RGBA8 wire");
-            tracing::warn!(
-                "a block-compressed texture reached the wire; the stand-in goes instead"
-            );
-            stand_in = DecodedTexture::stand_in();
-            &stand_in
-        };
+        use tuile_core::texels::Texels;
         self.u32(t.width);
         self.u32(t.height);
-        self.bytes(t.rgba8().unwrap_or_default());
+        match &t.texels {
+            Texels::Rgba8 { pixels, resident } => {
+                self.u8(TEXELS_RGBA8);
+                self.u8(format_tag(*resident));
+                self.bytes(pixels);
+            }
+            Texels::Blocks { format, levels } => {
+                self.u8(TEXELS_BLOCKS);
+                self.u8(format_tag((*format).into()));
+                self.len(levels.len());
+                for level in levels {
+                    self.bytes(level);
+                }
+            }
+        }
     }
     fn decoded(&mut self, c: &DecodedTileContent) {
         let DecodedTileContent {
@@ -723,6 +725,32 @@ impl Writer {
         for f in transform_local.to_cols_array() {
             self.f32(f);
         }
+    }
+}
+
+/// A texture's texels on the wire: RGBA8, or blocks.
+const TEXELS_RGBA8: u8 = 0;
+const TEXELS_BLOCKS: u8 = 1;
+
+fn format_tag(format: tuile_core::texels::ImageryFormat) -> u8 {
+    use tuile_core::texels::ImageryFormat;
+    match format {
+        ImageryFormat::Rgba8 => 0,
+        ImageryFormat::Bc7 => 1,
+        ImageryFormat::Astc4x4 => 2,
+    }
+}
+
+fn format_of(tag: u8) -> Result<tuile_core::texels::ImageryFormat, WireError> {
+    use tuile_core::texels::ImageryFormat;
+    match tag {
+        0 => Ok(ImageryFormat::Rgba8),
+        1 => Ok(ImageryFormat::Bc7),
+        2 => Ok(ImageryFormat::Astc4x4),
+        tag => Err(WireError::Tag {
+            what: "an imagery format",
+            tag,
+        }),
     }
 }
 
@@ -933,11 +961,39 @@ impl<'a> Reader<'a> {
         })
     }
     fn texture(&mut self) -> Result<DecodedTexture, WireError> {
-        Ok(DecodedTexture::from_rgba8(
-            self.u32()?,
-            self.u32()?,
-            self.bytes()?.to_vec(),
-        ))
+        use tuile_core::texels::Texels;
+        let (width, height) = (self.u32()?, self.u32()?);
+        let kind = self.u8()?;
+        let format = format_of(self.u8()?)?;
+        let texels = match kind {
+            TEXELS_RGBA8 => Texels::Rgba8 {
+                pixels: self.bytes()?.to_vec(),
+                resident: format,
+            },
+            TEXELS_BLOCKS => {
+                let format = format.block().ok_or(WireError::Tag {
+                    what: "a block format",
+                    tag: format_tag(format),
+                })?;
+                let n = self.len()?;
+                let mut levels = Vec::with_capacity(n.min(16));
+                for _ in 0..n {
+                    levels.push(self.bytes()?.to_vec());
+                }
+                Texels::Blocks { format, levels }
+            }
+            tag => {
+                return Err(WireError::Tag {
+                    what: "texels",
+                    tag,
+                })
+            }
+        };
+        Ok(DecodedTexture {
+            width,
+            height,
+            texels,
+        })
     }
     fn f32s<const N: usize>(&mut self) -> Result<[f32; N], WireError> {
         let mut out = [0.0; N];
@@ -1091,27 +1147,30 @@ mod tests {
         }
     }
 
-    /// Block-compressed texels have no wire form yet. One that reached the
-    /// wire anyway stops a debug build; a release build sends the stand-in
-    /// slate — ground drawn flat, never an empty texture the page would upload
-    /// as a hole.
+    /// **Every texture crosses as it is**: blocks with their levels and
+    /// format, and RGBA8 with the format it is to be held in — never the
+    /// stand-in slate.
     #[test]
-    #[cfg_attr(
-        debug_assertions,
-        should_panic(expected = "block-compressed texels reached the RGBA8 wire")
-    )]
-    fn blocks_cross_as_the_stand_in() {
-        use tuile_core::content::STAND_IN_RGBA;
-        use tuile_core::texels::{BlockFormat, Texels};
+    fn blocks_and_planned_rgba8_cross_whole() {
+        use tuile_core::texels::{BlockFormat, ImageryFormat, Texels};
         let mut sent = content();
-        sent.textures[0] = DecodedTexture {
+        let blocks = DecodedTexture {
             width: 4,
             height: 4,
             texels: Texels::Blocks {
                 format: BlockFormat::Astc4x4,
-                levels: vec![vec![7; 16]; 3],
+                levels: vec![vec![7; 16], vec![8; 16], vec![9; 16]],
             },
         };
+        let planned = DecodedTexture {
+            width: 2,
+            height: 2,
+            texels: Texels::Rgba8 {
+                pixels: vec![5; 16],
+                resident: ImageryFormat::Bc7,
+            },
+        };
+        sent.textures = vec![blocks.clone(), planned.clone()];
         let back = round_trip(&ServerMessage::Content {
             resource: ResourceId::Mesh(TileId(42)),
             gen: Generation(9),
@@ -1129,9 +1188,10 @@ mod tests {
         else {
             panic!("a mesh came back as something else");
         };
-        let t = &got.textures[0];
-        assert_eq!((t.width, t.height), (1, 1));
-        assert_eq!(t.rgba8(), Some(&STAND_IN_RGBA[..]));
+        for (got, sent) in got.textures.iter().zip([&blocks, &planned]) {
+            assert_eq!((got.width, got.height), (sent.width, sent.height));
+            assert_eq!(got.texels, sent.texels);
+        }
     }
 
     /// A mesh crosses whole: meshes, owned textures, the f64 origin bit for

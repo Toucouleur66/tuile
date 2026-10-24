@@ -173,6 +173,9 @@ pub(crate) struct Plan {
     /// (`App::imagery_plan_before_the_window`). The device confirms it, or
     /// corrects it, once it is up.
     pub imagery_plan: tuile_core::texels::ImageryPlan,
+    /// What the same choice does with imagery stored already compressed:
+    /// fixed for the session, as the globe is built with it.
+    pub stored_imagery: tuile_core::texels::StoredPlan,
 }
 
 /// Starts the launch on `runtime` and returns at once.
@@ -223,6 +226,7 @@ async fn bring_up_now(plan: Plan, runtime: tokio::runtime::Handle) -> Outcome {
         plan.layers,
         plan.opening,
         decode,
+        plan.stored_imagery,
     )
     .await
     .map_err(|e| format!("{e:#}"))?;
@@ -327,6 +331,7 @@ mod tests {
             profile: crate::profile::Profile::desktop(),
             timeout: crate::launch::START_TIMEOUT,
             imagery_plan: tuile_core::texels::ImageryPlan::RGBA8,
+            stored_imagery: tuile_core::texels::StoredPlan::OFF,
         }
     }
 
