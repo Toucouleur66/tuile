@@ -936,9 +936,23 @@ impl Drop for App {
     }
 }
 
+/// How far the eye may travel from the point a host's overlays were packed
+/// against before they are packed again against the eye. An f32 offset of
+/// this length is good to a few micrometres; a set left alone over a long
+/// flight would otherwise be drawn from offsets of hundreds of kilometres.
+const OVERLAY_REBASE_METRES: f64 = 256.0;
+
+/// Whether an eye at `eye` is far enough from the packing `origin` for a
+/// host's overlays to be packed again.
+fn overlays_need_rebase(eye: glam::DVec3, origin: glam::DVec3) -> bool {
+    eye.distance(origin) > OVERLAY_REBASE_METRES
+}
+
 /// The view a host's world overlays are drawn through: the camera's own, at
-/// the picture's aspect, against the render origin every tile was prepared
-/// with — the eye.
+/// the picture's aspect, relative to `origin` — the point the overlays were
+/// packed against, which is the eye only in the frame they were packed. A
+/// view relative to the eye instead would carry a set left alone along with
+/// the camera.
 ///
 /// `clearance` is the height above the **ground**, as the tiles' own view
 /// uniform is given it: the near plane comes from it, and a near plane of
@@ -950,10 +964,10 @@ impl Drop for App {
 /// text in both, so a shape's relief comes out the same way.
 fn world_overlay_view(
     camera: tuile_camera::GlobeCamera,
+    origin: glam::DVec3,
     aspect: f64,
     clearance: f64,
 ) -> tuile_wgpu::WorldOverlayView {
-    let origin = camera.position;
     let view_proj = glam::Mat4::from_cols_array(&camera.view_proj_with_clearance(
         origin,
         aspect as f32,
@@ -963,5 +977,60 @@ fn world_overlay_view(
     // film takes the same three from its own frame.
     let fwd = camera.direction.as_vec3().normalize_or_zero();
     let right = fwd.cross(camera.up.as_vec3()).normalize_or_zero();
+    // The eye from that origin, in f64 and then narrowed: what the light's
+    // direction to the eye is measured from.
     tuile_wgpu::WorldOverlayView::new(view_proj, right, right.cross(fwd))
+        .with_eye((camera.position - origin).as_vec3())
+}
+
+#[cfg(test)]
+mod world_overlay_tests {
+    use super::*;
+    use glam::DVec3;
+
+    /// Where a world point lands on screen, through a view built against
+    /// `origin`, with the point packed against that same origin.
+    fn on_screen(view: &tuile_wgpu::WorldOverlayView, point: DVec3, origin: DVec3) -> (f32, f32) {
+        let clip =
+            glam::Mat4::from_cols_array(&view.view_proj) * (point - origin).as_vec3().extend(1.0);
+        (clip.x / clip.w, clip.y / clip.w)
+    }
+
+    /// A set the host left alone while the eye moved stays where it was put
+    /// in the world: drawn through the origin it was packed at, it lands
+    /// where a set packed at the new eye would.
+    #[test]
+    fn a_set_left_alone_stays_put_while_the_eye_moves() {
+        let earth = 6_378_137.0;
+        let packed_at = DVec3::new(earth + 1_000.0, 0.0, 0.0);
+        // The eye has since moved 150 m sideways, short of a rebase.
+        let eye = packed_at + DVec3::new(0.0, 150.0, 0.0);
+        assert!(!overlays_need_rebase(eye, packed_at));
+        let camera =
+            tuile_camera::GlobeCamera::look_at(eye, DVec3::new(earth, 150.0, 0.0), DVec3::Z, 0.8);
+        let marker = DVec3::new(earth + 300.0, 40.0, 25.0);
+        let kept = world_overlay_view(camera, packed_at, 1.0, 700.0);
+        let fresh = world_overlay_view(camera, eye, 1.0, 700.0);
+        let (a, b) = (
+            on_screen(&kept, marker, packed_at),
+            on_screen(&fresh, marker, eye),
+        );
+        assert!(
+            (a.0 - b.0).abs() < 1e-4 && (a.1 - b.1).abs() < 1e-4,
+            "the marker moved with the eye: {a:?} against {b:?}"
+        );
+        // And the light is told where the eye is from the packing origin.
+        assert_eq!(kept.eye[1], 150.0);
+        assert_eq!(fresh.eye, [0.0; 4]);
+    }
+
+    #[test]
+    fn a_set_is_packed_again_once_the_eye_is_far_from_its_origin() {
+        let origin = DVec3::new(6_378_137.0, 0.0, 0.0);
+        assert!(!overlays_need_rebase(origin, origin));
+        assert!(overlays_need_rebase(
+            origin + DVec3::new(0.0, OVERLAY_REBASE_METRES + 1.0, 0.0),
+            origin
+        ));
+    }
 }

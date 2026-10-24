@@ -43,6 +43,9 @@ impl App {
         }
         self.take_this_frames_share_of_the_stream();
         self.upload_the_view();
+        // After the eye has moved for this frame — the host's drive, the
+        // ease, a glide, a tape — so the packing origin is where it is drawn.
+        self.upload_the_world_overlays();
         let indicator = self.the_loading_indicator();
         self.upload_the_control(indicator);
         let drew = self.draw_and_present();
@@ -138,33 +141,36 @@ impl App {
         self.preload = preload;
         self.overlays = overlays;
         self.frame_host = Some(host);
-        self.upload_the_world_overlays();
     }
 
-    /// Hands this frame's overlay layers to the renderer, rebased onto the
-    /// render origin — the camera, as every tile is.
+    /// Hands this frame's overlay layers to the renderer, packed against the
+    /// eye.
     ///
     /// Only when a host changed something: a layer set once and left alone is
     /// drawn every frame from the buffers it is already in, which is the
-    /// whole point of layers.
+    /// whole point of layers. The view is built against the origin the set
+    /// was packed at, so it stays where it was put while the eye moves; once
+    /// the eye is [`super::OVERLAY_REBASE_METRES`] from that origin, the set
+    /// is packed again against the eye, to keep its f32 offsets short.
     ///
     /// A faulty mesh is reported and the **previous** set stays on screen.
     /// The alternative is a frame with no overlays in it, which for a host
     /// whose HUD is an overlay is a frame with no HUD.
     fn upload_the_world_overlays(&mut self) {
-        if !self.overlays.changed() {
-            return;
-        }
-        let origin = self.controller.camera.position;
-        let meshes = self.overlays.taken();
+        let eye = self.controller.camera.position;
+        // Before the layers are taken: a change made before the session is up
+        // waits for it rather than being marked done and lost.
         let Some(active) = self.active.as_mut() else {
             return;
         };
-        if let Err(e) = active
-            .world_overlay
-            .set_meshes(&active.gpu, &meshes, origin, None)
-        {
-            tracing::warn!("the host's overlays were refused, keeping the last set: {e}");
+        let world = &mut active.world_overlay;
+        if self.overlays.changed() {
+            let meshes = self.overlays.taken();
+            if let Err(e) = world.set_meshes(&active.gpu, &meshes, eye, None) {
+                tracing::warn!("the host's overlays were refused, keeping the last set: {e}");
+            }
+        } else if !world.is_empty() && super::overlays_need_rebase(eye, world.origin()) {
+            world.rebase(&active.gpu, eye);
         }
     }
 
@@ -382,7 +388,12 @@ impl App {
         // see through two closures.
         active.world_overlay.set_view(
             &active.gpu.queue,
-            &super::world_overlay_view(self.controller.camera, picture.aspect(), clearance),
+            &super::world_overlay_view(
+                self.controller.camera,
+                active.world_overlay.origin(),
+                picture.aspect(),
+                clearance,
+            ),
         );
         let world = std::cell::RefCell::new(&mut active.world_overlay);
         let world_gpu = &active.gpu;

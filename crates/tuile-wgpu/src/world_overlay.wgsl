@@ -4,8 +4,8 @@
 // A host's shapes in the viewer: coloured triangles through the frame's own
 // camera, into the frame it is already drawing.
 //
-// Their vertices come in eye-relative already — each mesh's origin met the
-// render origin in f64 before anything was narrowed — and their colours
+// Their vertices come relative to a packing origin near the eye — each
+// mesh's origin met it in f64 before anything was narrowed — and their colours
 // display-linear and premultiplied, which is how they are blended here.
 //
 // The flags a vertex carries and `overlay_lit` come from
@@ -19,12 +19,14 @@
 // is tested against is the pipeline's, not the shader's.
 
 struct WorldOverlayView {
-    // Eye-relative world to clip, against the same render origin the tiles
-    // were prepared with.
+    // World to clip, relative to the origin the meshes were packed against.
     view_proj: mat4x4f,
     // The camera's own axes, for the light that goes with it. w unused.
     right: vec4f,
     up: vec4f,
+    // The eye, relative to that same origin: zero when the meshes were
+    // packed where the eye now stands. w unused.
+    eye: vec4f,
 }
 @group(0) @binding(0) var<uniform> view: WorldOverlayView;
 
@@ -47,7 +49,8 @@ fn vs(
     out.clip = view.view_proj * vec4f(position, 1.0);
     out.color = color;
     out.normal = normal;
-    out.at = position;
+    // Eye-relative for the light, whatever origin the vertex was packed at.
+    out.at = position - view.eye.xyz;
     out.flags = flags;
     return out;
 }

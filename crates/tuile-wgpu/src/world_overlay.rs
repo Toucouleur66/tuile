@@ -43,6 +43,12 @@
 //! Earth's centre has lost its centimetres before it ever arrives, which is
 //! the host's to avoid and is said so in `OverlayMesh`.
 //!
+//! The origin a set was packed against is kept ([`WorldOverlayRenderer::origin`])
+//! and the view is built relative to it, so a set left alone while the eye
+//! moves stays where it was put in the world. The caller packs it again
+//! ([`WorldOverlayRenderer::rebase`]) once the eye has gone far enough for
+//! the f32 offsets to matter.
+//!
 //! # Shadows
 //!
 //! None. `OverlayShadow` is read and ignored: the viewer draws no map of the
@@ -55,18 +61,23 @@ use tuile_overlay::gpu::OverlayVertex;
 use tuile_overlay::{OverlayBlend, OverlayDepth, OverlayMesh};
 use wgpu::util::DeviceExt;
 
-/// What the shader is told about the frame: the view, and the camera's own
-/// axes for the light that goes with it.
+/// What the shader is told about the frame: the view, where the eye is, and
+/// the camera's own axes for the light that goes with it.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct WorldOverlayView {
-    /// Eye-relative world to clip, against the same render origin the tiles
-    /// were prepared with.
+    /// World to clip, relative to the origin the meshes were packed against:
+    /// [`WorldOverlayRenderer::origin`], which is not the eye once the eye
+    /// has moved since the last upload.
     pub view_proj: [f32; 16],
     /// The camera's right, w unused.
     pub right: [f32; 4],
     /// The camera's up, w unused.
     pub up: [f32; 4],
+    /// The eye, relative to that same origin, w unused: the light needs the
+    /// direction to the eye, and a vertex is only eye-relative when the two
+    /// origins coincide.
+    pub eye: [f32; 4],
 }
 
 impl Default for WorldOverlayView {
@@ -75,18 +86,28 @@ impl Default for WorldOverlayView {
             view_proj: Mat4::IDENTITY.to_cols_array(),
             right: [1.0, 0.0, 0.0, 0.0],
             up: [0.0, 1.0, 0.0, 0.0],
+            eye: [0.0; 4],
         }
     }
 }
 
 impl WorldOverlayView {
-    /// The view a camera gives, with the axes its light is built on.
+    /// The view a camera gives, with the axes its light is built on, for an
+    /// eye standing at the packing origin.
     pub fn new(view_proj: Mat4, right: Vec3, up: Vec3) -> Self {
         Self {
             view_proj: view_proj.to_cols_array(),
             right: [right.x, right.y, right.z, 0.0],
             up: [up.x, up.y, up.z, 0.0],
+            eye: [0.0; 4],
         }
+    }
+
+    /// The same view for an eye at `eye` from the packing origin — the
+    /// difference taken in f64 by the caller and only then narrowed.
+    pub fn with_eye(mut self, eye: Vec3) -> Self {
+        self.eye = [eye.x, eye.y, eye.z, 0.0];
+        self
     }
 }
 
@@ -102,10 +123,10 @@ pub enum WorldOverlayError {
 struct Batch {
     pass: Pass,
     blend: OverlayBlend,
-    /// Indices into the frame's one index buffer.
+    /// Indices into the frame's one index buffer. They are absolute — each
+    /// mesh's first vertex is added in when it is packed — because a base
+    /// vertex on an indexed draw is something WebGL2 cannot do.
     indices: std::ops::Range<u32>,
-    /// The first vertex of the mesh these indices are relative to.
-    base: i32,
 }
 
 /// Which depth a batch is tested against: the frame's, or the overlays' own.
@@ -155,9 +176,11 @@ impl Packed {
             // f64 all the way to here: the origin meets the render origin,
             // and only their difference is narrowed.
             let from_origin = DVec3::from_array(mesh.origin_ecef) - origin;
-            let base = i32::try_from(packed.vertices.len()).map_err(|_| {
-                WorldOverlayError::Mesh("a frame's overlays have too many vertices")
-            })?;
+            let too_many = || WorldOverlayError::Mesh("a frame's overlays have too many vertices");
+            let base = u32::try_from(packed.vertices.len()).map_err(|_| too_many())?;
+            // Every index of the mesh is below its vertex count (`fault` saw
+            // to it), so this one bound covers every index offset below.
+            u32::try_from(packed.vertices.len() + mesh.positions.len()).map_err(|_| too_many())?;
             let flags = tuile_overlay::gpu::flags(mesh);
             let lit = !mesh.normals.is_empty();
             packed
@@ -180,7 +203,9 @@ impl Packed {
                         }),
                 );
             let first = packed.indices.len() as u32;
-            packed.indices.extend_from_slice(&mesh.indices);
+            packed
+                .indices
+                .extend(mesh.indices.iter().map(|&i| base + i));
             packed.batches.push(Batch {
                 pass: match mesh.depth {
                     OverlayDepth::Terrain => Pass::InFrame(InFrame::Terrain),
@@ -189,7 +214,6 @@ impl Packed {
                 },
                 blend: mesh.blend,
                 indices: first..packed.indices.len() as u32,
-                base,
             });
         }
         // Opaque first — it writes the depth a translucent mesh is tested
@@ -273,6 +297,13 @@ pub struct WorldOverlayRenderer {
     indices: Growing,
     /// This frame's batches, and how much of each buffer holds them.
     packed: Packed,
+    /// The meshes last accepted, kept so they can be packed again against a
+    /// new origin without the host handing them over again.
+    accepted: Vec<OverlayMesh>,
+    /// The f64 point `packed` is relative to.
+    origin: DVec3,
+    /// Which eye `packed` was built for.
+    eye: Option<tuile_overlay::Eye>,
     /// The overlays' own depth, for [`OverlayDepth::OverlaysOnly`]. Made when
     /// first needed, and remade when the frame changes size.
     own_depth: Option<(wgpu::TextureView, (u32, u32))>,
@@ -421,12 +452,16 @@ impl WorldOverlayRenderer {
             vertices: Growing::default(),
             indices: Growing::default(),
             packed: Packed::default(),
+            accepted: Vec::new(),
+            origin: DVec3::ZERO,
+            eye: None,
             own_depth: None,
         }
     }
 
     /// The view this frame's overlays are drawn through. Its `view_proj` must
-    /// be relative to the same render origin the meshes are rebased onto.
+    /// be relative to [`Self::origin`], the point the meshes were packed
+    /// against, and its `eye` the eye's offset from it.
     pub fn set_view(&self, queue: &wgpu::Queue, view: &WorldOverlayView) {
         queue.write_buffer(&self.view_buf, 0, bytemuck::bytes_of(view));
     }
@@ -446,6 +481,36 @@ impl WorldOverlayRenderer {
         eye: Option<tuile_overlay::Eye>,
     ) -> Result<(), WorldOverlayError> {
         let packed = Packed::of(meshes, origin, eye)?;
+        self.upload(gpu, packed);
+        self.accepted = meshes.to_vec();
+        self.origin = origin;
+        self.eye = eye;
+        Ok(())
+    }
+
+    /// The f64 point the meshes on the GPU were packed against. A view drawn
+    /// through them is relative to it, wherever the eye has gone since.
+    pub fn origin(&self) -> DVec3 {
+        self.origin
+    }
+
+    /// Packs the meshes last accepted again, against `origin`.
+    ///
+    /// For an eye that has travelled away from [`Self::origin`]: the meshes
+    /// are still drawn right through a view relative to the old origin, but
+    /// their f32 offsets grow with the distance and so does their error. The
+    /// meshes were sound when accepted, so this cannot refuse them; the set on
+    /// screen is replaced in place, never cleared first.
+    pub fn rebase(&mut self, gpu: &GpuContext, origin: DVec3) {
+        if let Ok(packed) = Packed::of(&self.accepted, origin, self.eye) {
+            self.upload(gpu, packed);
+            self.origin = origin;
+        }
+    }
+
+    /// The new set written over the buffers the old one is in, and only then
+    /// made the one drawn: there is no frame with neither.
+    fn upload(&mut self, gpu: &GpuContext, packed: Packed) {
         if !packed.batches.is_empty() {
             self.vertices.holding(
                 gpu,
@@ -461,7 +526,6 @@ impl WorldOverlayRenderer {
             );
         }
         self.packed = packed;
-        Ok(())
     }
 
     /// Whether this frame has anything to draw at all.
@@ -613,7 +677,7 @@ impl WorldOverlayRenderer {
                 );
                 set = Some(which);
             }
-            pass.draw_indexed(batch.indices.clone(), batch.base, 0..1);
+            pass.draw_indexed(batch.indices.clone(), 0, 0..1);
         }
     }
 }
@@ -663,6 +727,18 @@ mod tests {
     }
 
     #[test]
+    fn indices_are_absolute_so_no_draw_needs_a_base_vertex() {
+        // WebGL2 has no base vertex on an indexed draw: the second mesh's
+        // indices have to point past the first mesh's vertices themselves.
+        let meshes = [
+            triangle([0.0; 3], OverlayDepth::Always, OverlayBlend::Opaque),
+            triangle([0.0; 3], OverlayDepth::Always, OverlayBlend::Opaque),
+        ];
+        let packed = Packed::of(&meshes, DVec3::ZERO, None).expect("sound meshes");
+        assert_eq!(packed.indices, [0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
     fn opaque_is_drawn_before_translucent_whatever_order_it_arrives_in() {
         let meshes = [
             triangle([0.0; 3], OverlayDepth::Terrain, OverlayBlend::Translucent),
@@ -682,14 +758,10 @@ mod tests {
         let mut second = triangle([0.0; 3], OverlayDepth::Always, OverlayBlend::Translucent);
         second.colors = vec![[0.0, 1.0, 0.0, 1.0]; 3];
         let packed = Packed::of(&[first, second], DVec3::ZERO, None).expect("sound meshes");
-        assert_eq!(
-            packed.vertices[packed.batches[0].base as usize].color[0],
-            1.0
-        );
-        assert_eq!(
-            packed.vertices[packed.batches[1].base as usize].color[1],
-            1.0
-        );
+        let first_vertex =
+            |b: &Batch| &packed.vertices[packed.indices[b.indices.start as usize] as usize];
+        assert_eq!(first_vertex(&packed.batches[0]).color[0], 1.0);
+        assert_eq!(first_vertex(&packed.batches[1]).color[1], 1.0);
     }
 
     #[test]
