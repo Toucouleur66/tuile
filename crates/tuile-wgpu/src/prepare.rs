@@ -647,8 +647,8 @@ fn upload_blocks(
     if !gpu.device.features().contains(wanted)
         || t.width == 0
         || t.height == 0
-        || t.width % side != 0
-        || t.height % side != 0
+        || !t.width.is_multiple_of(side)
+        || !t.height.is_multiple_of(side)
     {
         return None;
     }
