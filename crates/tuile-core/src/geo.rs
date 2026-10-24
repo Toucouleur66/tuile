@@ -59,6 +59,17 @@ pub fn ecef_to_geodetic(p: DVec3) -> Geodetic {
     let lon = p.y.atan2(p.x);
     let rho = (p.x * p.x + p.y * p.y).sqrt();
 
+    // On the axis itself the iteration below divides zero by zero — `z / ρ`
+    // and `n + h` are both infinite or zero — and lands at ±135° of latitude,
+    // millions of metres up. A pole of a tile's mesh is exactly there.
+    if rho == 0.0 {
+        return Geodetic {
+            lon,
+            lat: FRAC_PI_2.copysign(p.z),
+            height: p.z.abs() - WGS84_B,
+        };
+    }
+
     // Bowring's initial guess.
     let beta = (p.z * WGS84_A).atan2(rho * WGS84_B);
     let (sin_b, cos_b) = beta.sin_cos();
@@ -285,6 +296,19 @@ fn from_plane_extents(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A point on the axis is over a pole, at its distance from the centre
+    /// less the polar radius — not three-quarters of a turn away.
+    #[test]
+    fn a_point_on_the_axis_is_over_a_pole() {
+        for (z, lat) in [(-1.0, -FRAC_PI_2), (1.0, FRAC_PI_2)] {
+            for height in [0.0, 120.0, -50.0] {
+                let g = ecef_to_geodetic(DVec3::new(0.0, 0.0, z * (WGS84_B + height)));
+                assert_eq!(g.lat, lat);
+                assert!((g.height - height).abs() < 1e-6, "{g:?}");
+            }
+        }
+    }
 
     fn round_trip(g: Geodetic) {
         let p = geodetic_to_ecef(g);
