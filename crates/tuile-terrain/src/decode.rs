@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! quantized-mesh-1.0 decoding (and a minimal encoder for tests).
+//! quantized-mesh-1.0 decoding, and its encoder ([`encode`], with
+//! [`Header::for_vertices`] for a tile's bounds).
 //!
 //! Binary layout (little-endian), modelled on cesium-native's
 //! `QuantizedMeshLoader`:
@@ -42,6 +43,90 @@ pub struct Header {
     pub bounding_sphere_center: [f64; 3],
     pub bounding_sphere_radius: f64,
     pub horizon_occlusion: [f64; 3],
+}
+
+impl Header {
+    /// The header of a tile whose vertices are `ecef` (metres, ECEF, f64),
+    /// its heights spanning `min_height..=max_height` metres above the
+    /// ellipsoid.
+    ///
+    /// - **Bounding sphere**: centred on the vertices' bounding box, its
+    ///   radius the farthest vertex — every vertex lies inside it.
+    /// - **Centre**: the sphere's, the origin the vertices are rebased on.
+    /// - **Horizon occlusion point**: in the ellipsoid-scaled frame (ECEF
+    ///   divided by the WGS84 radii), along the sphere centre's direction,
+    ///   the nearest point such that any viewer for which it is below the
+    ///   horizon has every vertex below the horizon too. Computed per vertex
+    ///   as the height along that direction at which the vertex's horizon
+    ///   cone meets it, the farthest of them kept.
+    ///
+    /// No vertex: a sphere of no radius at the origin.
+    pub fn for_vertices(ecef: &[glam::DVec3], min_height: f32, max_height: f32) -> Self {
+        use glam::DVec3;
+        use tuile_core::geo::{WGS84_A, WGS84_B};
+        let Some(first) = ecef.first() else {
+            return Self {
+                center: [0.0; 3],
+                min_height,
+                max_height,
+                bounding_sphere_center: [0.0; 3],
+                bounding_sphere_radius: 0.0,
+                horizon_occlusion: [0.0; 3],
+            };
+        };
+        let (lo, hi) = ecef
+            .iter()
+            .fold((*first, *first), |(lo, hi), p| (lo.min(*p), hi.max(*p)));
+        let centre = (lo + hi) * 0.5;
+        let radius = ecef
+            .iter()
+            .map(|p| p.distance(centre))
+            .fold(0.0f64, f64::max);
+
+        let radii = DVec3::new(WGS84_A, WGS84_A, WGS84_B);
+        let direction = (centre / radii).normalize_or_zero();
+        let magnitude = ecef
+            .iter()
+            .map(|p| horizon_magnitude(*p / radii, direction))
+            .fold(0.0f64, f64::max)
+            .min(HORIZON_FARTHEST);
+        Self {
+            center: centre.to_array(),
+            min_height,
+            max_height,
+            bounding_sphere_center: centre.to_array(),
+            bounding_sphere_radius: radius,
+            horizon_occlusion: (direction * magnitude).to_array(),
+        }
+    }
+}
+
+/// The farthest a horizon point is put, in ellipsoid radii. A tile that
+/// reaches a quarter-turn from its centre — a level-0 hemisphere — has no
+/// point along its direction that hides it exactly; one this far is hidden
+/// only from the far side of the globe, as the tile then is.
+const HORIZON_FARTHEST: f64 = 1.0e6;
+
+/// How far along `direction` (unit, scaled frame) the horizon point must
+/// be for the scaled-frame point `p` to be hidden whenever it is: where
+/// the cone of tangents to the unit sphere through `p` crosses the line.
+/// A point inside the unit sphere is treated as lying on it.
+fn horizon_magnitude(p: glam::DVec3, direction: glam::DVec3) -> f64 {
+    let length = p.length().max(1.0);
+    let towards = p.normalize_or_zero();
+    // The angle between the point and the line, and the half-angle of the
+    // horizon cone seen from the point's height.
+    let cos_alpha = towards.dot(direction);
+    let sin_alpha = towards.cross(direction).length();
+    let cos_beta = 1.0 / length;
+    let sin_beta = (length * length - 1.0).max(0.0).sqrt() * cos_beta;
+    let denominator = cos_alpha * cos_beta - sin_alpha * sin_beta;
+    if denominator > 0.0 {
+        1.0 / denominator
+    } else {
+        // A quarter-turn or more from the line: no point along it hides it.
+        HORIZON_FARTHEST
+    }
 }
 
 /// A decoded quantized-mesh tile: normalized vertex coordinates, triangle

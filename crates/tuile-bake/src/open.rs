@@ -25,13 +25,18 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use tuile_core::fetch::{Fetched, TileFetcher};
-use tuile_core::geo::{geodetic_to_ecef, Geodetic, WGS84_A};
+use tuile_core::geo::WGS84_A;
+#[cfg(test)]
+use tuile_core::geo::{geodetic_to_ecef, Geodetic};
 use tuile_core::raster::{ImageryCoord, ImageryProvider, RasterError, TilingScheme};
-use tuile_terrain::decode::{encode, Header};
-use tuile_terrain::{
-    AvailabilityRange, GeographicTilingScheme, LayerJson, TerrainSource, TerrainSourceError,
-    TileCoord,
-};
+// The ellipsoid and the empty ground are terrain made of no data, the
+// terrain crate's own; a bake names them by asset number here.
+pub use tuile_terrain::ellipsoid::{Ellipsoid, Nothing};
+#[cfg(test)]
+use tuile_terrain::ellipsoid::{ELLIPSOID_LEVELS, ELLIPSOID_STEPS};
+#[cfg(test)]
+use tuile_terrain::TileCoord;
+use tuile_terrain::{LayerJson, TerrainSource};
 
 use crate::globe::Sources;
 use image::ImageEncoder as _;
@@ -82,188 +87,6 @@ pub const BLUE_MARBLE: i64 = 1_000_000_101;
 /// NASA Black Marble, its 2016 composite, through GIBS: the night lights, a
 /// layer of the store a render reads whole ([`BlackMarble`]).
 pub const BLACK_MARBLE: i64 = 1_000_000_201;
-
-/// The deepest level of the ellipsoid's tiles: past it a tile would be
-/// flatter than any camera that wants it can tell.
-const ELLIPSOID_LEVELS: u32 = 14;
-/// Spacings a side of an ellipsoid tile: enough that its curve is smooth
-/// from orbit at level 0.
-const ELLIPSOID_STEPS: usize = 32;
-
-/// The ellipsoid as terrain.
-pub struct Ellipsoid;
-
-impl Ellipsoid {
-    /// Its `layer.json`: quantized mesh, TMS, geographic, every tile there.
-    pub fn layer() -> LayerJson {
-        let available = (0..=ELLIPSOID_LEVELS)
-            .map(|level| {
-                vec![AvailabilityRange {
-                    start_x: 0,
-                    start_y: 0,
-                    end_x: (2u64 << level) - 1,
-                    end_y: (1u64 << level) - 1,
-                }]
-            })
-            .collect();
-        LayerJson {
-            format: "quantized-mesh-1.0".into(),
-            scheme: Some("tms".into()),
-            projection: Some("EPSG:4326".into()),
-            tiles: vec!["{z}/{x}/{y}".into()],
-            version: Some("1".into()),
-            minzoom: 0,
-            maxzoom: ELLIPSOID_LEVELS,
-            metadata_availability: None,
-            extensions: Vec::new(),
-            available,
-            attribution: None,
-        }
-    }
-
-    /// Tile `coord`'s quantized mesh: a grid on the ellipsoid at height 0.
-    pub fn tile(coord: TileCoord) -> Vec<u8> {
-        let rect = GeographicTilingScheme::default().tile_rect(coord);
-        let n = ELLIPSOID_STEPS + 1;
-        let (mut u, mut v) = (Vec::with_capacity(n * n), Vec::with_capacity(n * n));
-        for j in 0..n {
-            for i in 0..n {
-                u.push(i as f64 / ELLIPSOID_STEPS as f64);
-                v.push(j as f64 / ELLIPSOID_STEPS as f64);
-            }
-        }
-        let mut indices = Vec::with_capacity(ELLIPSOID_STEPS * ELLIPSOID_STEPS * 6);
-        for j in 0..ELLIPSOID_STEPS {
-            for i in 0..ELLIPSOID_STEPS {
-                let a = (j * n + i) as u32;
-                let (b, c, d) = (a + 1, a + n as u32, a + n as u32 + 1);
-                indices.extend_from_slice(&[a, b, c, c, b, d]);
-            }
-        }
-        let (lon, lat) = rect.center();
-        let centre = geodetic_to_ecef(Geodetic {
-            lon,
-            lat,
-            height: 0.0,
-        });
-        // A sphere that holds the tile: its corners and edges' middles.
-        let mut radius = 0.0f64;
-        for (fu, fv) in [
-            (0.0, 0.0),
-            (1.0, 0.0),
-            (0.0, 1.0),
-            (1.0, 1.0),
-            (0.5, 0.0),
-            (0.5, 1.0),
-            (0.0, 0.5),
-            (1.0, 0.5),
-        ] {
-            let p = geodetic_to_ecef(Geodetic {
-                lon: rect.west + fu * rect.width(),
-                lat: rect.south + fv * rect.height(),
-                height: 0.0,
-            });
-            radius = radius.max(p.distance(centre));
-        }
-        let line = |f: &dyn Fn(usize) -> usize| (0..n).map(|k| f(k) as u32).collect::<Vec<u32>>();
-        let header = Header {
-            center: centre.to_array(),
-            min_height: 0.0,
-            max_height: 0.0,
-            bounding_sphere_center: centre.to_array(),
-            bounding_sphere_radius: radius.max(1.0),
-            horizon_occlusion: (centre / WGS84_A).to_array(),
-        };
-        let edges = [
-            line(&|k| k * n),
-            line(&|k| k),
-            line(&|k| k * n + ELLIPSOID_STEPS),
-            line(&|k| (n - 1) * n + k),
-        ];
-        // Vertices renumbered in the order the triangles first name them:
-        // the high-water-mark coding of the indices requires it.
-        let mut order = vec![u32::MAX; n * n];
-        let mut next = 0u32;
-        for i in &mut indices {
-            let slot = &mut order[*i as usize];
-            if *slot == u32::MAX {
-                *slot = next;
-                next += 1;
-            }
-            *i = *slot;
-        }
-        let mut uu = vec![0.0; n * n];
-        let mut vv = vec![0.0; n * n];
-        for (old, &new) in order.iter().enumerate() {
-            uu[new as usize] = u[old];
-            vv[new as usize] = v[old];
-        }
-        let edges = edges.map(|e| e.into_iter().map(|i| order[i as usize]).collect());
-        let heights = vec![0.0; n * n];
-        encode(&header, &uu, &vv, &heights, &indices, None, &edges)
-    }
-}
-
-/// Terrain of no ground: the two root tiles, each a mesh of no triangle,
-/// and nothing under them.
-pub struct Nothing;
-
-impl Nothing {
-    pub fn layer() -> LayerJson {
-        LayerJson {
-            available: vec![vec![AvailabilityRange {
-                start_x: 0,
-                start_y: 0,
-                end_x: 1,
-                end_y: 0,
-            }]],
-            maxzoom: 0,
-            ..Ellipsoid::layer()
-        }
-    }
-
-    /// A root tile's mesh: its header, and no vertex.
-    pub fn tile(coord: TileCoord) -> Vec<u8> {
-        let rect = GeographicTilingScheme::default().tile_rect(coord);
-        let (lon, lat) = rect.center();
-        let centre = geodetic_to_ecef(Geodetic {
-            lon,
-            lat,
-            height: 0.0,
-        });
-        let header = Header {
-            center: centre.to_array(),
-            min_height: 0.0,
-            max_height: 0.0,
-            bounding_sphere_center: centre.to_array(),
-            bounding_sphere_radius: WGS84_A,
-            horizon_occlusion: (centre / WGS84_A).to_array(),
-        };
-        encode(
-            &header,
-            &[],
-            &[],
-            &[],
-            &[],
-            None,
-            &[Vec::new(), Vec::new(), Vec::new(), Vec::new()],
-        )
-    }
-}
-
-#[async_trait::async_trait]
-impl TerrainSource for Nothing {
-    async fn fetch_tile(&self, coord: TileCoord) -> Result<Fetched<Vec<u8>>, TerrainSourceError> {
-        Ok(Fetched::undated(Self::tile(coord)))
-    }
-}
-
-#[async_trait::async_trait]
-impl TerrainSource for Ellipsoid {
-    async fn fetch_tile(&self, coord: TileCoord) -> Result<Fetched<Vec<u8>>, TerrainSourceError> {
-        Ok(Fetched::undated(Self::tile(coord)))
-    }
-}
 
 /// A layer of NASA's Global Imagery Browse Services, in Web Mercator.
 pub struct Gibs<F> {

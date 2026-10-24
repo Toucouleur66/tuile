@@ -47,6 +47,16 @@ pub struct GeoRect {
 }
 
 impl GeoRect {
+    /// A rectangle given in degrees, held in radians.
+    pub fn from_degrees(west: f64, south: f64, east: f64, north: f64) -> Self {
+        Self {
+            west: west.to_radians(),
+            south: south.to_radians(),
+            east: east.to_radians(),
+            north: north.to_radians(),
+        }
+    }
+
     pub fn width(&self) -> f64 {
         self.east - self.west
     }
