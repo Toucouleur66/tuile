@@ -99,6 +99,26 @@ its parameters compares to nothing, and comparing renders is most of the work.
 - In case of spec ambiguity, the reference is the OGC 3D Tiles 1.1 spec (https://docs.ogc.org/cs/22-025r4/22-025r4.html), and the behavior of the reference implementations (local clones in `references/`) is authoritative for the gray areas.
 - When you need the documentation of a dependency (wgpu, axum, workers-rs, gltf), check the version in `Cargo.toml` and consult the documentation of THAT version — these APIs move fast.
 
+## Dependent PRs are a stack
+
+When a PR builds on another one that is not merged yet, the PRs form a
+**stack** (GitHub's native stacked pull requests, the `gh stack` extension of
+the GitHub CLI) — never a branch silently based on another branch.
+
+- The bottom PR targets `main`; each PR above targets the branch of the one
+  below. Create and extend a stack with `gh stack`, which works inside git
+  worktrees.
+- Every PR of a stack is reviewed on its own, like any PR. Merging a PR merges
+  every PR below it, so a PR is merged only once all the PRs under it are
+  approved.
+- Merge bottom-up, with the **merge commit** method only: GitHub makes one merge
+  commit per PR. Never squash, never rebase-merge.
+- When `main` moves, rebase the whole stack (`Rebase stack` on the PR, or
+  `gh stack` locally) — never merge `main` into a branch of the stack. A stack
+  whose rebase leaves a layer empty drops that layer.
+- Stacks live in one repository: a contributor's PR from a fork cannot join a
+  stack. It is rebased onto `main` and merged on its own.
+
 ## Useful commands
 
 ```bash
