@@ -15,7 +15,7 @@
 //! drifts is a failure here rather than a HUD half a pixel off in the
 //! simulator.
 
-use glam::{DVec3, Mat4, Vec3};
+use glam::{DVec3, Vec3};
 use tuile_overlay::{OverlayBlend, OverlayDepth, OverlayEyes, OverlayMesh, OverlayShadow};
 use tuile_wgpu::{
     GpuContext, WorldOverlayRenderer, WorldOverlayView, DEPTH_FORMAT, SAMPLES, TEXTURE_FORMAT,
@@ -41,8 +41,8 @@ fn view(eye: DVec3, at: DVec3, up: Vec3) -> (WorldOverlayView, DVec3) {
     let right = fwd.cross(up).normalize();
     let real_up = right.cross(fwd);
     // Eye-relative: the eye is the origin, so the view matrix looks from zero.
-    let look = Mat4::look_to_rh(Vec3::ZERO, fwd, real_up);
-    let proj = Mat4::perspective_rh(0.8, 1.0, 1.0, 100_000.0);
+    let look = glam::camera::rh::view::look_to_mat4(Vec3::ZERO, fwd, real_up);
+    let proj = glam::camera::rh::proj::directx::perspective(0.8, 1.0, 1.0, 100_000.0);
     (WorldOverlayView::new(proj * look, right, real_up), eye)
 }
 
@@ -318,7 +318,7 @@ fn render_in(
     gpu.device
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("the device");
-    let data = slice.get_mapped_range();
+    let data = slice.get_mapped_range().expect("map range");
     let mut pixels = Vec::with_capacity((SIZE * SIZE * 4) as usize);
     for row in 0..SIZE {
         let start = (row * bytes_per_row) as usize;

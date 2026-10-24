@@ -354,11 +354,11 @@ impl WorldOverlayRenderer {
             });
         let attributes =
             wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4, 2 => Float32x3, 3 => Uint32];
-        let buffers = [wgpu::VertexBufferLayout {
+        let buffers = [Some(wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<OverlayVertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &attributes,
-        }];
+        })];
         let pipeline = |label: &str, compare, write: bool, blend: OverlayBlend| {
             gpu.device
                 .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
