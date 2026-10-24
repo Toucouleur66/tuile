@@ -195,38 +195,147 @@ impl TerrainSource for Ellipsoid {
 mod tests {
     use super::*;
 
-    /// FNV-1a, 64 bits: a digest of a tile's bytes small enough to write
-    /// down here.
-    fn fnv1a(bytes: &[u8]) -> u64 {
-        bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
-            (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
-        })
+    // The implementations as they stood in `tuile-bake` before the move,
+    // verbatim: what bakes digested. Compared on the platform that runs the
+    // test, since the trigonometry under both is the platform's own.
+    fn legacy_ellipsoid_tile(coord: TileCoord) -> Vec<u8> {
+        let rect = GeographicTilingScheme::default().tile_rect(coord);
+        let n = ELLIPSOID_STEPS + 1;
+        let (mut u, mut v) = (Vec::with_capacity(n * n), Vec::with_capacity(n * n));
+        for j in 0..n {
+            for i in 0..n {
+                u.push(i as f64 / ELLIPSOID_STEPS as f64);
+                v.push(j as f64 / ELLIPSOID_STEPS as f64);
+            }
+        }
+        let mut indices = Vec::with_capacity(ELLIPSOID_STEPS * ELLIPSOID_STEPS * 6);
+        for j in 0..ELLIPSOID_STEPS {
+            for i in 0..ELLIPSOID_STEPS {
+                let a = (j * n + i) as u32;
+                let (b, c, d) = (a + 1, a + n as u32, a + n as u32 + 1);
+                indices.extend_from_slice(&[a, b, c, c, b, d]);
+            }
+        }
+        let (lon, lat) = rect.center();
+        let centre = geodetic_to_ecef(Geodetic {
+            lon,
+            lat,
+            height: 0.0,
+        });
+        // A sphere that holds the tile: its corners and edges' middles.
+        let mut radius = 0.0f64;
+        for (fu, fv) in [
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (0.0, 1.0),
+            (1.0, 1.0),
+            (0.5, 0.0),
+            (0.5, 1.0),
+            (0.0, 0.5),
+            (1.0, 0.5),
+        ] {
+            let p = geodetic_to_ecef(Geodetic {
+                lon: rect.west + fu * rect.width(),
+                lat: rect.south + fv * rect.height(),
+                height: 0.0,
+            });
+            radius = radius.max(p.distance(centre));
+        }
+        let line = |f: &dyn Fn(usize) -> usize| (0..n).map(|k| f(k) as u32).collect::<Vec<u32>>();
+        let header = Header {
+            center: centre.to_array(),
+            min_height: 0.0,
+            max_height: 0.0,
+            bounding_sphere_center: centre.to_array(),
+            bounding_sphere_radius: radius.max(1.0),
+            horizon_occlusion: (centre / WGS84_A).to_array(),
+        };
+        let edges = [
+            line(&|k| k * n),
+            line(&|k| k),
+            line(&|k| k * n + ELLIPSOID_STEPS),
+            line(&|k| (n - 1) * n + k),
+        ];
+        // Vertices renumbered in the order the triangles first name them:
+        // the high-water-mark coding of the indices requires it.
+        let mut order = vec![u32::MAX; n * n];
+        let mut next = 0u32;
+        for i in &mut indices {
+            let slot = &mut order[*i as usize];
+            if *slot == u32::MAX {
+                *slot = next;
+                next += 1;
+            }
+            *i = *slot;
+        }
+        let mut uu = vec![0.0; n * n];
+        let mut vv = vec![0.0; n * n];
+        for (old, &new) in order.iter().enumerate() {
+            uu[new as usize] = u[old];
+            vv[new as usize] = v[old];
+        }
+        let edges = edges.map(|e| e.into_iter().map(|i| order[i as usize]).collect());
+        let heights = vec![0.0; n * n];
+        encode(&header, &uu, &vv, &heights, &indices, None, &edges)
+    }
+
+    fn legacy_nothing_tile(coord: TileCoord) -> Vec<u8> {
+        let rect = GeographicTilingScheme::default().tile_rect(coord);
+        let (lon, lat) = rect.center();
+        let centre = geodetic_to_ecef(Geodetic {
+            lon,
+            lat,
+            height: 0.0,
+        });
+        let header = Header {
+            center: centre.to_array(),
+            min_height: 0.0,
+            max_height: 0.0,
+            bounding_sphere_center: centre.to_array(),
+            bounding_sphere_radius: WGS84_A,
+            horizon_occlusion: (centre / WGS84_A).to_array(),
+        };
+        encode(
+            &header,
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+        )
     }
 
     /// The ellipsoid's and the empty ground's tiles are the very bytes the
     /// bake produced before they moved here: a bake's digests are taken over
-    /// them, and a byte moved is every open-earth digest moved. The digests
-    /// were taken from the implementation as it stood in `tuile-bake`.
+    /// them, and a byte moved is every open-earth digest moved.
     #[test]
     fn tiles_are_the_bytes_they_were_before_the_move() {
-        for (coord, digest) in [
-            (TileCoord::new(0, 0, 0), 0x9689_118c_6441_c61f),
-            (TileCoord::new(0, 1, 0), 0xea34_bf59_cdca_db9f),
-            (TileCoord::new(3, 0, 7), 0xfb85_ffd8_8fea_6ff2),
-            (TileCoord::new(6, 64, 50), 0x4266_b1e2_293f_8b4d),
-            (TileCoord::new(14, 16_390, 12_000), 0xc9bc_c2b1_f619_7a69),
-        ] {
+        let mut coords = vec![
+            TileCoord::new(0, 0, 0),
+            TileCoord::new(0, 1, 0),
+            TileCoord::new(3, 0, 7),
+            TileCoord::new(6, 64, 50),
+            TileCoord::new(14, 16_390, 12_000),
+        ];
+        for level in 1..=ELLIPSOID_LEVELS {
+            let (nx, ny) = (2u64 << level, 1u64 << level);
+            coords.push(TileCoord::new(
+                level,
+                (level as u64 * 7919) % nx,
+                (level as u64 * 104_729) % ny,
+            ));
+        }
+        for coord in coords {
             let tile = Ellipsoid::tile(coord);
             assert_eq!(tile.len(), 19_198, "{coord:?}");
-            assert_eq!(fnv1a(&tile), digest, "ellipsoid {coord:?}");
+            assert!(tile == legacy_ellipsoid_tile(coord), "ellipsoid {coord:?}");
         }
-        for (coord, digest) in [
-            (TileCoord::new(0, 0, 0), 0x1e75_494c_49e4_29fe),
-            (TileCoord::new(0, 1, 0), 0x5252_8b26_8167_e37e),
-        ] {
-            let tile = Nothing::tile(coord);
-            assert_eq!(tile.len(), 112, "{coord:?}");
-            assert_eq!(fnv1a(&tile), digest, "nothing {coord:?}");
+        for coord in [TileCoord::new(0, 0, 0), TileCoord::new(0, 1, 0)] {
+            assert!(
+                Nothing::tile(coord) == legacy_nothing_tile(coord),
+                "nothing {coord:?}"
+            );
         }
     }
 

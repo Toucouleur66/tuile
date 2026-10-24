@@ -25,9 +25,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use tuile_core::fetch::{Fetched, TileFetcher};
+use tuile_core::geo::WGS84_A;
 #[cfg(test)]
 use tuile_core::geo::{geodetic_to_ecef, Geodetic};
-use tuile_core::geo::WGS84_A;
 use tuile_core::raster::{ImageryCoord, ImageryProvider, RasterError, TilingScheme};
 // The ellipsoid and the empty ground are terrain made of no data, the
 // terrain crate's own; a bake names them by asset number here.
