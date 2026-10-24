@@ -177,7 +177,7 @@ impl ContentPump {
     }
 
     /// How much GPU time a frame's imagery encodes may take, when the
-    /// context's plan encodes on the GPU ([`crate::compress`]); without an
+    /// context's plan encodes on the GPU ([`crate::plan_for`], [`crate::GpuContext::with_imagery_plan`]); without an
     /// encoder it changes nothing. [`EncodePace::DEFAULT`] unless set.
     pub fn set_encode_pace(&mut self, pace: EncodePace) {
         self.encode_pace = pace;

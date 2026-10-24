@@ -572,7 +572,7 @@ fn passes(
 ///   always was.
 /// - **RGBA8 headed for a block format** the context's GPU encoder writes:
 ///   the chain is built on the CPU, encoded on the GPU and copied into a
-///   texture of that format ([`crate::compress`]). An encode that cannot be
+///   texture of that format ([`crate::plan_for`], [`crate::GpuContext::with_imagery_plan`]). An encode that cannot be
 ///   done — a size that is not whole blocks, a tile too large for the device,
 ///   a context without that encoder — uploads RGBA8 instead.
 /// - **Blocks**, already encoded with their chain: uploaded block row by

@@ -512,7 +512,7 @@ pub struct GlobeOptions {
     ///
     /// Read at each decode: a texture decoded under a plan that encodes on the
     /// consumer's GPU comes out RGBA8 marked with the plan's target
-    /// ([`tuile_core::DecodedTexture::planned`]), so the budget charges it in
+    /// ([`tuile_core::content::DecodedTexture::planned`]), so the budget charges it in
     /// that format. A plan that encodes on the CPU leaves it RGBA8 for now:
     /// that encoder runs in the decode job, which does not exist yet.
     ///
