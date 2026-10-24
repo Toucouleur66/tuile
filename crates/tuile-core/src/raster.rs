@@ -1655,6 +1655,35 @@ pub fn decode_and_reproject(
     Ok(reproject_tile_to_geographic(&decoded, scheme, coord).unwrap_or(decoded))
 }
 
+/// [`decode_and_reproject`], for a consumer that may be served tiles stored
+/// already compressed (KTX 2.0): what the decode job runs.
+///
+/// A JPEG or PNG goes to [`decode_and_reproject`] untouched, whatever
+/// `stored` says, so a consumer that never meets a KTX 2.0 tile gets exactly
+/// the texels it got before. A KTX 2.0 tile is recognised by its content and
+/// filled by [`crate::stored::decode`]:
+///
+/// - held as blocks only when `scheme` is geographic already, since blocks
+///   cannot be resampled;
+/// - otherwise unpacked to RGBA8 and resampled exactly as a decoded JPEG
+///   would be.
+pub fn decode_imagery(
+    bytes: &[u8],
+    scheme: &TilingScheme,
+    coord: ImageryCoord,
+    stored: crate::texels::StoredPlan,
+) -> Result<DecodedTexture, RasterError> {
+    if !crate::stored::is_ktx2(bytes) {
+        return decode_and_reproject(bytes, scheme, coord);
+    }
+    let on_grid = scheme.projection == Projection::Geographic;
+    let decoded = crate::stored::decode(bytes, on_grid, stored)?;
+    if decoded.rgba8().is_none() {
+        return Ok(decoded);
+    }
+    Ok(reproject_tile_to_geographic(&decoded, scheme, coord).unwrap_or(decoded))
+}
+
 /// Upsamples one quadrant of a parent imagery texture back to a full tile —
 /// the quality fallback for imagery a provider lacks at a given zoom. `qx`/`qy`
 /// select the quadrant (0/1); `qy = 0` is the north (top) half. Uses `image`'s

@@ -86,22 +86,25 @@ type MeshFuture<'a> = std::pin::Pin<
     >,
 >;
 
-/// The tile to lay underneath the sharp mosaic: the closest ancestor already
-/// decoded, or the guaranteed floor if none is.
-///
-/// A fixed level would be the simple answer and it wastes what is already in
-/// hand. Descending to level 18 leaves every level on the way down in the cache;
-/// pulling back and covering the ground with level 5 — 4.9 km per texel — when
-/// level 12 is sitting right there is gratuitous blur, and blur that lasts for
-/// as long as the network takes.
-///
-/// So the walk starts at the deepest tile that covers the rectangle whole and
-/// climbs until it finds one that is decoded, stopping at [`FLOOR_LEVEL`],
-/// which is pinned and therefore always there. As sharp as what is available,
-/// never sharper, and never nothing. This is what the reference implementation
-/// does when a tile's own imagery has not arrived — it walks up to the closest
-/// ready ancestor rather than to a level chosen in advance.
 impl GlobeOptions {
+    /// These options with the consumer's imagery compression: one choice,
+    /// resolved against its own device into both
+    /// [`imagery_plan`](Self::imagery_plan) (JPEG/PNG tiles, encoded at load)
+    /// and [`stored_imagery`](Self::stored_imagery) (tiles stored already
+    /// compressed, transcoded only), so the two cannot disagree.
+    ///
+    /// Not calling it is [`ImageryCompression::Off`](tuile_core::texels::ImageryCompression::Off):
+    /// RGBA8 everywhere.
+    pub fn with_imagery_compression(
+        mut self,
+        choice: tuile_core::texels::ImageryCompression,
+        caps: tuile_core::texels::GpuTextureCaps,
+    ) -> Self {
+        self.imagery_plan = choice.plan(caps);
+        self.stored_imagery = choice.stored(caps);
+        self
+    }
+
     /// Which coarse tile goes under a drape.
     ///
     /// The choice lives here, on the options, rather than inline at the one
@@ -138,6 +141,21 @@ fn fixed_floor(scheme: &raster::TilingScheme, rect: &GeoRect) -> ImageryCoord {
     }
 }
 
+/// The tile to lay underneath the sharp mosaic: the closest ancestor already
+/// decoded, or the guaranteed floor if none is.
+///
+/// A fixed level would be the simple answer and it wastes what is already in
+/// hand. Descending to level 18 leaves every level on the way down in the cache;
+/// pulling back and covering the ground with level 5 — 4.9 km per texel — when
+/// level 12 is sitting right there is gratuitous blur, and blur that lasts for
+/// as long as the network takes.
+///
+/// So the walk starts at the deepest tile that covers the rectangle whole and
+/// climbs until it finds one that is decoded, stopping at [`FLOOR_LEVEL`],
+/// which is pinned and therefore always there. As sharp as what is available,
+/// never sharper, and never nothing. This is what the reference implementation
+/// does when a tile's own imagery has not arrived — it walks up to the closest
+/// ready ancestor rather than to a level chosen in advance.
 fn coarse_floor(
     scheme: &raster::TilingScheme,
     rect: &GeoRect,
@@ -496,6 +514,14 @@ pub struct GlobeOptions {
     /// the encoders that honour it land in the consumer's upload (GPU) and in
     /// the decode job (CPU).
     pub imagery_plan: tuile_core::texels::ImageryPlan,
+    /// What the consumer does with imagery tiles stored already compressed
+    /// (KTX 2.0 holding UASTC, BC7 or ASTC 4×4): its own
+    /// [`tuile_core::texels::ImageryCompression::stored`] on its own device.
+    ///
+    /// The default, [`StoredPlan::OFF`](tuile_core::texels::StoredPlan::OFF),
+    /// unpacks UASTC to RGBA8 and holds nothing as blocks. A JPEG or PNG
+    /// tile ignores it.
+    pub stored_imagery: tuile_core::texels::StoredPlan,
 }
 
 /// The consumer's answer to "do you already hold this drape?".
@@ -799,6 +825,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                     bytes: fetched.value,
                     scheme,
                     coord: c,
+                    stored: self.opts.stored_imagery,
                 };
                 let (tex, black) = offload::run_portable(off.as_ref(), job)
                     .await
@@ -1736,6 +1763,34 @@ mod tests {
             GlobeOptions::default().imagery_plan,
             tuile_core::texels::ImageryPlan::RGBA8
         );
+        assert_eq!(
+            GlobeOptions::default().stored_imagery,
+            tuile_core::texels::StoredPlan::OFF
+        );
+    }
+
+    /// One client choice sets both plans, from the same device; Off leaves
+    /// the defaults.
+    #[test]
+    fn one_choice_sets_both_imagery_plans() {
+        use tuile_core::texels::{GpuTextureCaps, ImageryCompression};
+        let caps = GpuTextureCaps {
+            bc: true,
+            astc: false,
+            compute: false,
+        };
+        for choice in [
+            ImageryCompression::Off,
+            ImageryCompression::Auto,
+            ImageryCompression::Format(tuile_core::texels::BlockFormat::Bc7),
+        ] {
+            let o = GlobeOptions::default().with_imagery_compression(choice, caps);
+            assert_eq!(o.imagery_plan, choice.plan(caps), "{choice:?}");
+            assert_eq!(o.stored_imagery, choice.stored(caps), "{choice:?}");
+        }
+        let off = GlobeOptions::default().with_imagery_compression(ImageryCompression::Off, caps);
+        assert_eq!(off.imagery_plan, GlobeOptions::default().imagery_plan);
+        assert_eq!(off.stored_imagery, GlobeOptions::default().stored_imagery);
     }
 
     /// An imagery provider that refuses everything and counts being asked.

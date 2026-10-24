@@ -121,6 +121,11 @@ pub enum ImageryEncode {
     Gpu,
     /// The decode worker, on the CPU: the texels cross as blocks.
     Cpu,
+    /// Nobody encodes: the tile was stored already compressed (a KTX 2.0
+    /// file holding UASTC), and the decode worker transcodes its blocks,
+    /// level by level, into the target — losslessly to ASTC 4×4, within a
+    /// small loss to BC7. The texels cross as blocks. See [`StoredPlan`].
+    Transcode,
 }
 
 /// How a consumer holds its drape textures: the format, and who encodes it.
@@ -179,6 +184,109 @@ impl ImageryCompression {
             ImageryCompression::Format(_) => return ImageryPlan::RGBA8,
         };
         ImageryPlan { target, encode }
+    }
+
+    /// What this choice does with imagery **stored** already compressed, on a
+    /// device that can do `caps`: see [`StoredPlan`].
+    ///
+    /// No encoder runs for such a tile, so compute does not matter, only what
+    /// the device samples: BC7 is a transcode target on WebGL2 too, where
+    /// [`plan`](Self::plan) cannot encode it.
+    ///
+    /// - [`Off`](Self::Off): nothing is kept as blocks; UASTC is unpacked to
+    ///   RGBA8, bit-exact.
+    /// - [`Auto`](Self::Auto): UASTC to BC7 where it is sampled, else to
+    ///   ASTC 4×4 where it is, else unpacked; stored BC7 or ASTC kept
+    ///   wherever the device samples it.
+    /// - [`Format`](Self::Format): that format only, where the device samples
+    ///   it; [`StoredPlan::OFF`] where it does not.
+    pub const fn stored(self, caps: GpuTextureCaps) -> StoredPlan {
+        match self {
+            ImageryCompression::Off => StoredPlan::OFF,
+            ImageryCompression::Auto => StoredPlan {
+                uastc: if caps.bc {
+                    ImageryFormat::Bc7
+                } else if caps.astc {
+                    ImageryFormat::Astc4x4
+                } else {
+                    ImageryFormat::Rgba8
+                },
+                keep_bc7: caps.bc,
+                keep_astc: caps.astc,
+            },
+            ImageryCompression::Format(BlockFormat::Bc7) if caps.bc => StoredPlan {
+                uastc: ImageryFormat::Bc7,
+                keep_bc7: true,
+                keep_astc: false,
+            },
+            ImageryCompression::Format(BlockFormat::Astc4x4) if caps.astc => StoredPlan {
+                uastc: ImageryFormat::Astc4x4,
+                keep_bc7: false,
+                keep_astc: true,
+            },
+            ImageryCompression::Format(_) => StoredPlan::OFF,
+        }
+    }
+}
+
+/// What a consumer does with an imagery tile **stored** already compressed —
+/// a KTX 2.0 file holding UASTC, BC7 or ASTC 4×4 blocks with their mips — as
+/// opposed to a JPEG or PNG it decodes. Made by
+/// [`ImageryCompression::stored`]; the default, [`StoredPlan::OFF`], is what
+/// a consumer that did not opt in gets.
+///
+/// Such a tile is recognised by its content (the KTX 2.0 identifier), never
+/// by a setting, and is filled one of three ways by
+/// [`stored::decode`](crate::stored::decode):
+///
+/// | Stored | Plan | Texels |
+/// |---|---|---|
+/// | UASTC | `uastc` a block format | [`Texels::Blocks`], every level of the file transcoded |
+/// | UASTC | `uastc` RGBA8 | [`Texels::Rgba8`], level 0 unpacked bit-exact; the consumer builds the chain as for a JPEG |
+/// | BC7 / ASTC 4×4 | kept | [`Texels::Blocks`], the file's levels as they are |
+/// | BC7 / ASTC 4×4 | not kept | an error: nothing here decodes them on the CPU. The tile is not resident, and the consumer's climb to the nearest resident ancestor covers it, as for a failed fetch |
+///
+/// Blocks are never resampled: a tile is kept as blocks only when its layer
+/// is on geographic spacing already. A tile on another grid is unpacked to
+/// RGBA8 and reprojected like a JPEG, and stored BC7 or ASTC on another grid
+/// is the error above.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct StoredPlan {
+    /// What UASTC is transcoded to: a block format the device samples, or
+    /// [`ImageryFormat::Rgba8`] for unpacked.
+    pub uastc: ImageryFormat,
+    /// Stored BC7 is held as it is: the device samples it.
+    pub keep_bc7: bool,
+    /// Stored ASTC 4×4 is held as it is: the device samples it.
+    pub keep_astc: bool,
+}
+
+impl StoredPlan {
+    /// Not opted in: UASTC unpacked to RGBA8, nothing held as blocks.
+    pub const OFF: StoredPlan = StoredPlan {
+        uastc: ImageryFormat::Rgba8,
+        keep_bc7: false,
+        keep_astc: false,
+    };
+
+    /// The plan a UASTC tile is filled by: a transcode into `uastc`, or RGBA8
+    /// with no encoder.
+    pub const fn for_uastc(self) -> ImageryPlan {
+        match self.uastc {
+            ImageryFormat::Rgba8 => ImageryPlan::RGBA8,
+            target => ImageryPlan {
+                target,
+                encode: ImageryEncode::Transcode,
+            },
+        }
+    }
+
+    /// Whether stored blocks of `format` are held as they are.
+    pub const fn keeps(self, format: BlockFormat) -> bool {
+        match format {
+            BlockFormat::Bc7 => self.keep_bc7,
+            BlockFormat::Astc4x4 => self.keep_astc,
+        }
     }
 }
 
@@ -449,6 +557,91 @@ mod tests {
         for (case, choice, caps, wanted) in cases {
             assert_eq!(choice.plan(caps), wanted, "{case}");
         }
+    }
+
+    /// Stored tiles: off unpacks and keeps nothing; a choice keeps and
+    /// transcodes to what the device samples, compute or not.
+    #[test]
+    fn a_stored_tile_follows_the_choice_and_what_the_device_samples() {
+        use ImageryFormat::{Astc4x4, Bc7, Rgba8};
+        let bc7 = ImageryCompression::Format(BlockFormat::Bc7);
+        let astc = ImageryCompression::Format(BlockFormat::Astc4x4);
+        let sp = |uastc, keep_bc7, keep_astc| StoredPlan {
+            uastc,
+            keep_bc7,
+            keep_astc,
+        };
+        assert_eq!(StoredPlan::default(), StoredPlan::OFF);
+        for bits in 0..8u8 {
+            let c = caps(bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
+            assert_eq!(ImageryCompression::Off.stored(c), StoredPlan::OFF, "{c:?}");
+        }
+        let cases = [
+            (
+                "Auto, Apple silicon",
+                ImageryCompression::Auto,
+                caps(true, true, true),
+                sp(Bc7, true, true),
+            ),
+            (
+                "Auto, iPhone",
+                ImageryCompression::Auto,
+                caps(false, true, true),
+                sp(Astc4x4, false, true),
+            ),
+            (
+                "Auto, WebGL2 desktop",
+                ImageryCompression::Auto,
+                caps(true, false, false),
+                sp(Bc7, true, false),
+            ),
+            (
+                "Auto, WebGL2 mobile",
+                ImageryCompression::Auto,
+                caps(false, true, false),
+                sp(Astc4x4, false, true),
+            ),
+            (
+                "Auto, nothing",
+                ImageryCompression::Auto,
+                GpuTextureCaps::default(),
+                StoredPlan::OFF,
+            ),
+            (
+                "BC7, WebGL2 desktop",
+                bc7,
+                caps(true, false, false),
+                sp(Bc7, true, false),
+            ),
+            ("BC7, iPhone", bc7, caps(false, true, true), StoredPlan::OFF),
+            (
+                "ASTC, Apple silicon",
+                astc,
+                caps(true, true, true),
+                sp(Astc4x4, false, true),
+            ),
+            (
+                "ASTC, desktop NVIDIA",
+                astc,
+                caps(true, false, true),
+                StoredPlan::OFF,
+            ),
+        ];
+        for (case, choice, caps, wanted) in cases {
+            assert_eq!(choice.stored(caps), wanted, "{case}");
+        }
+        assert_eq!(StoredPlan::OFF.for_uastc(), ImageryPlan::RGBA8);
+        assert_eq!(
+            sp(Rgba8, true, true).for_uastc(),
+            ImageryPlan::RGBA8,
+            "nothing to transcode to: unpacked"
+        );
+        assert_eq!(
+            sp(Bc7, true, false).for_uastc(),
+            plan(Bc7, ImageryEncode::Transcode)
+        );
+        assert!(sp(Bc7, true, false).keeps(BlockFormat::Bc7));
+        assert!(!sp(Bc7, true, false).keeps(BlockFormat::Astc4x4));
     }
 
     #[test]

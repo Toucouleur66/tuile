@@ -47,6 +47,7 @@ pub mod seam;
 pub mod source;
 pub mod stitch;
 pub mod storage;
+pub mod stored;
 pub mod texels;
 pub mod tiles3d;
 pub mod tileset;
