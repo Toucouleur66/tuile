@@ -11,7 +11,7 @@ from its PMTiles archives. What does that change in the bake and the file
 preparation, and in rendering, if the downstream film product moves onto it?*
 
 It revisits one line of the A6 design note (PR #107, §1): "nothing is stored
-compressed". It builds on the PMTiles compression study (PR #63), which
+compressed". It builds on the [PMTiles compression study](pmtiles-compression.md) (PR #63), which
 measured KTX2/UASTC against the production JPEGs, and on P0 as approved:
 `select(caps) -> ImageryPlan { target, encode: Gpu | Cpu | None }`, the texcomp
 GPU encoders (BC7, ASTC 4×4), and the texcomp CPU port. In the port, UASTC
