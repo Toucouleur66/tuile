@@ -5,105 +5,122 @@
 import Base from '../layouts/Base.astro';
 
 const traits = `/// Abstract I/O: the core does not know where the bytes come from.
-#[async_trait]
 pub trait TileFetcher: Send + Sync {
     async fn fetch(&self, url: &Url) -> Result<Bytes, FetchError>;
 }
 
-/// Bridge to the renderer: the core decodes, the backend materialises.
-pub trait PrepareRenderResources: Send + Sync {
-    type Prepared: Send + Sync;
-    fn prepare(&self, tile: &DecodedTileContent) -> Result<Self::Prepared, PrepareError>;
-    fn free(&self, prepared: Self::Prepared);
+/// A byte cache a loader consults before fetching. A cache, not a
+/// database: any get may miss, every value can be recomputed.
+pub trait ContentStore: Send + Sync {
+    async fn get(&self, key: &str) -> Option<Bytes>;
+    async fn put(&self, key: &str, value: Bytes, ttl: Option<Duration>);
 }
 
-/// Pluggable cache, removable depending on the runtime environment.
-#[async_trait]
-pub trait TileCache: Send + Sync {
-    async fn get(&self, key: &CacheKey) -> Option<Bytes>;
-    async fn put(&self, key: &CacheKey, value: Bytes);
+/// The tile hierarchy the traversal walks — 3D Tiles, terrain, or both.
+pub trait TileTree: Send + Sync { /* roots, children, properties … */ }
+
+/// Loads and decodes a tile, and composes the imagery that drapes it.
+pub trait TileLoader: Send + Sync {
+    async fn load(&self, id: TileId) -> Result<Loaded, LoadError>;
+    async fn load_drape(&self, id: TileId, layer: LayerId, level: u32)
+        -> Result<DrapeContent, LoadError>;
 }`;
 
 const stream = `/// The project's master seam: the streaming protocol,
 /// independent of any transport.
-pub trait GeometryStream {
+pub trait GeometryStream: Send {
     fn send(&self, msg: ClientMessage) -> Result<(), StreamError>;
-    fn messages(&mut self) -> impl Stream<Item = ServerMessage>;
+    fn poll_message(&mut self, cx: &mut Context<'_>) -> Poll<Option<ServerMessage>>;
 }
 
-// ClientMessage : Hello | ViewerState | Ack | Cancel
-// ServerMessage : Select | Content | Evict | Error
+// ClientMessage : ViewerState | Ack { bytes } | Discarded | Retarget
+//                 | Pressure | Thermal | ReleaseBeyond | Ahead
+// ServerMessage : Select { draw, plan, … } | Content | Cancel | Evict
+//                 | Error | Priming`;
 
-/// A tile's content, in its two forms. The decoded form IS a TileContent:
-/// the same Content message everywhere, only the shape varies.
-pub enum TileContent {
-    Raw { format: ContentFormat, bytes: Bytes }, // glb / b3dm — crosses wires
-    Decoded(DecodedTileContent),                 // what a renderer consumes
-}`;
-
-const flow = `Camera (pose, projection, viewport)
+const flow = `ViewerState (one view per eye or viewport)
    │
    ▼
-Traversal (tuile-core) ── screen-space error per tile, frustum culling,
-   │                      REPLACE / ADD decision, emits a TileSelection
-   ├──► tiles to draw (already resident)
-   └──► prioritised ContentRequests (descending error)
-            │
-            ▼
-        TileFetcher::fetch ──► decode (glTF / b3dm / quantized-mesh)
-            │
-            ▼
-        PrepareRenderResources::prepare ──► GPU or scene handle
-            │
-            ▼
-        Resident cache (LRU, byte budget, never evicts a selected tile)`;
+Traversal (tuile-core) ── screen-space error, frustum and horizon culling,
+   │                      REPLACE / ADD, hold until the children are ready
+   ▼
+Budget::decide ── pure and deterministic: what to load, deliver, draw and
+   │              evict, per memory class, under hard limits
+   ├──► TileLoader ──► TileFetcher (+ ContentStore) ──► decode off the frame
+   ├──► Content ──► the consumer uploads in plan order ──► Ack { bytes }
+   ├──► Select  ──► the consumer draws: new before old, never a gap
+   └──► Evict   ──► released after the draw that stops using it`;
 
-const rules = `tuile-b3dm   → serde_json, thiserror                   (pure codec, zero I/O)
-tuile-core   → tuile-b3dm, serde, glam (f64), gltf, bytes, thiserror,
-               async traits — and NO runtime
-tuile-wgpu   → tuile-core, wgpu, bytemuck; HTTP + runtime behind features
-tuile-usd    → tuile-core, gltf, zip (stored), image
-tuile-hydra  → tuile-core, tuile-bake — a C ABI and nothing else
+const rules = `tuile-b3dm      → serde_json, thiserror           (pure codec, zero I/O)
+tuile-core      → tuile-b3dm, serde, glam (f64), gltf, image, texcomp,
+                  async traits — and NO runtime (tokio only behind the
+                  optional native feature "rt-tokio")
+tuile-terrain, tuile-planetary, tuile-camera, tuile-atmosphere
+                → tuile-core                      (render-agnostic, wasm-clean)
+tuile-wgpu      → tuile-core, wgpu, texcomp
+tuile-viewer    → tuile-wgpu, tuile-planetary, winit; native fetchers or
+                  the browser transport, per target
+tuile-hydra     → tuile-core, tuile-bake — a C ABI and nothing else
 
-forbidden in tuile-core: any renderer, any async runtime, any HTTP
-framework, std::fs on production paths (tests excepted)`;
+forbidden in tuile-core: any renderer, any HTTP framework, an unconditional
+async runtime, std::fs on production paths (tests excepted)`;
 
-const crates = [
+type Item = [string, string] | [string, string, 'review'];
+
+const crates: { group: string; items: Item[] }[] = [
   {
-    group: 'The standard',
+    group: 'The standard and the globe',
     items: [
-      ['tuile-core', 'Tileset parsing, screen-space-error traversal, content decoding, the geometry-server runtime and the streaming protocol. Render-agnostic, wasm-clean.'],
+      ['tuile-core', 'Tileset parsing, screen-space-error traversal, content decoding, the graphics budget, the geometry server and the streaming protocol. Render-agnostic, wasm-clean.'],
       ['tuile-b3dm', 'The legacy 3D Tiles 1.0 batched-model container: parse and encode, zero I/O.'],
-      ['tuile-terrain', 'Quantized-mesh decoding and geographic tiling — a terrain tile becomes the same decoded content type as a glTF one.'],
+      ['tuile-terrain', 'Quantized-mesh decoding and encoding, geographic tiling, a heightfield source, terrain from any layer.json URL.'],
       ['tuile-planetary', 'Terrain × imagery assembled into one tile tree and one loader, backend-agnostic.'],
       ['tuile-camera', 'Globe camera and input controller producing the core view states. Knows no renderer.'],
-    ],
-  },
-  {
-    group: 'Rendering',
-    items: [
-      ['tuile-wgpu', 'The reference render backend, native and in the browser.'],
-      ['tuile-atmosphere', 'Sun position, aerial perspective and sky for a rendered globe — also renderer-agnostic.'],
+      ['tuile-atmosphere', 'Sun position, aerial perspective and sky for a rendered globe — renderer-agnostic.'],
       ['tuile-ui', 'On-screen navigation controls (compass, tilt, zoom) with no renderer dependency.'],
+      ['tuile-overlay', 'Geometry an application hands a renderer to draw in the world, and how it meets the ground.'],
     ],
   },
   {
-    group: 'Transport and runtime',
+    group: 'Rendering and applications',
+    items: [
+      ['tuile-wgpu', 'The reference render backend: native, WebGPU and WebGL2; the budget’s executor; draws into a frame a host owns.'],
+      ['tuile-viewer', 'The interactive viewer as a library — window, camera, controls, steering — over any terrain and imagery source; desktop, iOS, Android and web shells.'],
+      ['tuile-viewer-bundle', 'Packages the viewer as a macOS application and writes the phone builds’ resources.'],
+      ['tuile-bevy', 'The globe inside a Rust game engine, drawn by tuile-wgpu on the engine’s own device and targets.', 'review'],
+    ],
+  },
+  {
+    group: 'Transport and storage',
     items: [
       ['tuile-native-fetchers', 'Pooled HTTP client plus browser-style disk and memory caching, implementing the core fetch seams.'],
       ['tuile-web', 'Browser transport: fetch, and the streaming protocol over postMessage between a page and its worker.'],
       ['tuile-storage-foyer', 'Hybrid memory-and-disk content store, native only.'],
+      ['tuile-tile-server', 'The source-tile store: tiles kept once in PMTiles archives per zone and per layer on object storage.'],
+      ['tuile-repository', 'Repositories over the buckets that hold packs, camera paths and tiles, and their read API as a function from request to reply.'],
+      ['tuile-pack-api', 'A native, read-only HTTP host of that API.'],
       ['tuile-metrics', 'Publishes the core counters on a metrics endpoint.'],
     ],
   },
   {
-    group: 'Offline: bake, replay, USD',
+    group: 'Films',
     items: [
-      ['tuile-pack', 'The pre-baked scene container — a flat binary structure with compressed payloads.'],
-      ['tuile-bake', 'Resolves a camera path into tiles once, on a machine with time, and freezes the result into a pack.'],
       ['tuile-tape', 'Records a camera path and flies it again, exactly.'],
-      ['tuile-usd', 'USD text and USDZ packaging, written in pure Rust with no C++ dependency.'],
-      ['tuile-hydra', 'A C ABI over the geometry server, consumed by the scene-index plugin under integrations/.'],
+      ['tuile-bake', 'Resolves a frame range into tiles once, on a machine with time, and freezes the result into a pack.'],
+      ['tuile-pack', 'The pre-baked scene container — a flat binary structure with compressed payloads.'],
+      ['tuile-film', 'A baked film read frame by frame — no GPU, no I/O.'],
+      ['tuile-film-gpu', 'A film on wgpu: one visibility raster, everything else in compute.'],
+      ['tuile-film-native', 'Renders a film natively to an mp4.'],
+      ['tuile-radiometry', 'Brings imagery tiles to one another’s light.'],
+      ['tuile-mp4', 'H.264 samples into an mp4, in memory.'],
+      ['tuile-farm', 'A render farm’s object storage: ranged reads, multipart writes, film assembly.'],
+    ],
+  },
+  {
+    group: 'OpenUSD',
+    items: [
+      ['tuile-usd', 'A recorded camera path and a globe prim, as a USD stage written in pure Rust.'],
+      ['tuile-hydra', 'A C ABI over the geometry server, consumed by the Hydra plugin under integrations/.'],
     ],
   },
 ];
@@ -111,7 +128,7 @@ const crates = [
 
 <Base
   title="Architecture — Tuile"
-  description="The Tuile workspace: a render-agnostic core, strict dependency rules, and the GeometryStream trait with three transport bindings."
+  description="The Tuile workspace: a render-agnostic core, strict dependency rules, the graphics budget, and the GeometryStream trait every viewer, film and renderer consumes."
   kicker="Architecture"
   heading="One core, strict seams, replaceable everything else."
   lede="The whole design is an argument about where the dependencies are allowed to point. The core holds the standard and depends on nothing; every renderer, transport, cache and host integration hangs off a named trait."
@@ -120,15 +137,21 @@ const crates = [
 
   <p>
     A Cargo workspace of small crates with one shared dependency table, so the graph builds
-    exactly one copy of the maths type, one error type, one runtime.
+    exactly one copy of the maths type, one error type, one runtime. Thirty-one crates are
+    on <code>main</code> at v0.14.0; one more is <span class="tag review">in review</span>.
   </p>
 
   {crates.map((g) => (
     <>
       <h3>{g.group}</h3>
       <ul class="crate-list">
-        {g.items.map(([name, what]) => (
-          <li><span class="name">{name}</span><span class="what">{what}</span></li>
+        {g.items.map(([name, what, state]) => (
+          <li>
+            <span class="name">{name}</span>
+            <span class="what">
+              {what} {state === 'review' && <span class="tag review">in review</span>}
+            </span>
+          </li>
         ))}
       </ul>
     </>
@@ -138,18 +161,22 @@ const crates = [
   <p>
     Two further crates connect to specific commercial terrain and imagery services. They are
     named after the service they talk to, which is the single deliberate exception to the
-    naming rule below; they are ordinary <code>TileFetcher</code> implementations, and the
-    core has no idea they exist. That is the purity test for the seam: adding a whole data
-    provider changes nothing inside <code>tuile-core</code>.
+    naming rule; they are ordinary <code>TileFetcher</code> and source implementations, and
+    the core has no idea they exist. That is the purity test for the seam: adding a whole
+    data provider changes nothing inside <code>tuile-core</code>. A token-free path exists
+    beside them: any quantized-mesh <code>layer.json</code>, any XYZ imagery template, and
+    a heightfield of your own served over plain HTTP.
   </p>
 
-  <h3>Examples</h3>
+  <h3>Outside the crates</h3>
   <p>
-    <code>wgpu-viewer</code> (native window, orbit camera),
-    <code>web-viewer</code> and <code>web-viewer-vite</code> (the same viewer in a browser, from the
-    <code>packages/tuile-viewer</code> module),
-    <code>globe-bulk</code>, <code>warm-cache</code> and <code>orbit-probe</code>
-    (headless harnesses for pre-fetching and for probing what a traversal selects).
+    <code>packages/tuile-viewer</code> is the ES module a web page imports: the viewer in
+    WebAssembly, its geometry server in a Web Worker. <code>examples/</code> holds the
+    desktop viewer binary, the heightfield server, a catalog proxy that keeps a connector's
+    token off the client, and headless harnesses for bulk frames, cache warming and probing
+    what a traversal selects. <code>integrations/</code> holds the C++ Hydra plugin and the
+    images and job scripts around it. GPU texture compression lives in a sibling repository,
+    <a href="https://github.com/lapoule-dev/texcomp" rel="noopener">texcomp</a>.
   </p>
 
   <h2>Dependency rules</h2>
@@ -164,7 +191,8 @@ const crates = [
   <p>
     The core is runtime-agnostic on purpose: it exposes async traits and pure data, and the
     caller supplies the execution. That is what lets the same traversal run inside a native
-    window, inside a browser worker, and inside a batch renderer.
+    window, inside a browser worker, inside a film bake and inside an offline renderer's
+    plugin.
   </p>
 
   <h2>The foundational traits</h2>
@@ -172,50 +200,59 @@ const crates = [
   <pre><code>{traits}</code></pre>
 
   <p class="note">
-    On single-threaded WebAssembly the <code>Send + Sync</code> bounds are a nuisance, so
-    they are feature-gated off for that target rather than being wished away.
+    On single-threaded WebAssembly the <code>Send</code> bound of the async traits is
+    dropped for that target rather than being wished away. Preparing GPU resources is the
+    backend's own business: it reports what it holds through the protocol instead.
   </p>
 
   <h2>The geometry server is a trait, not a server</h2>
 
   <p>
     The executable heart of the project is a <strong>logical</strong> geometry server:
-    traversal, scheduling, fetching, decoding. It is not a network server. Streaming is
-    defined at the protocol level, in the core, and transports are merely implementations
-    of it.
+    traversal, the graphics budget, fetching, decoding. It is not a network server.
+    Streaming is defined at the protocol level, in the core, and transports are merely
+    implementations of it. The server decides; the consumer executes — it uploads what was
+    planned, in order, within its frame's deadline, and acknowledges each upload with the
+    bytes it really holds.
   </p>
 
   <pre><code>{stream}</code></pre>
 
-  <h3>Three bindings, one protocol</h3>
+  <h3>Bindings, one protocol</h3>
 
   <table>
     <thead>
-      <tr><th>Binding</th><th>What it is</th><th>Form on the seam</th></tr>
+      <tr><th>Binding</th><th>What it is</th><th>Status</th></tr>
     </thead>
     <tbody>
       <tr>
         <td><code>InProcessStream</code></td>
-        <td>The geometry server runs inside the consumer's own process; messages pass over channels with zero serialisation.</td>
-        <td>Decoded</td>
+        <td>The geometry server runs inside the consumer's own process; messages pass over channels with zero serialisation. Desktop and phone viewers, the film bake, the Hydra plugin.</td>
+        <td><span class="tag shipping">shipped</span></td>
+      </tr>
+      <tr>
+        <td>Worker binding</td>
+        <td>In a browser, the geometry server runs in a Web Worker; each message crosses <code>postMessage</code> as one transferred buffer and is read back into the same types.</td>
+        <td><span class="tag shipping">shipped</span></td>
+      </tr>
+      <tr>
+        <td>Static HTTP pull</td>
+        <td>No remote geometry server: the traversal runs on the consumer side and pulls static files over HTTP. This is how every Tuile viewer reads its sources today.</td>
+        <td><span class="tag shipping">shipped</span></td>
       </tr>
       <tr>
         <td><code>WsStream</code></td>
-        <td>A remote process runs the traversal per session and pushes geometry over a socket. The client binding decodes with the core's own decoder.</td>
-        <td>Raw glb on the wire</td>
-      </tr>
-      <tr>
-        <td><code>HttpPullStream</code></td>
-        <td>No remote geometry server at all: the traversal runs on the consumer side and pulls static files over HTTP. This is what makes Tuile interoperable with every existing static tileset.</td>
-        <td>Raw glb over GET</td>
+        <td>A remote process runs the geometry server per session for a consumer that declares its budget, and pushes geometry as glb.</td>
+        <td><span class="tag planned">planned</span></td>
       </tr>
     </tbody>
   </table>
 
   <p>
-    A renderer written against <code>GeometryStream</code> works in all three cases without
-    a line changed. The invariant that makes it hold: what travels over a network is
-    standard 3D Tiles; the decoded form exists only in memory, on the consumer's side.
+    A renderer written against <code>GeometryStream</code> works over each of them without
+    a line changed. Where the geometry server runs is decided by its budget's inputs: on an
+    interactive device it runs locally, because memory pressure must act at once and a head
+    rotation cannot wait a round trip.
   </p>
 
   <h2>Data flow</h2>
@@ -223,9 +260,35 @@ const crates = [
   <pre><code>{flow}</code></pre>
 
   <p>
-    Traversal is a pure function of (tree, camera, residency) → (selection, requests), with
-    no I/O inside it. That is the property that makes it testable, portable, and safe to run
-    in three different places.
+    Traversal and budget are pure functions of their inputs — tree, views, residency,
+    arrivals, platform signals — with no I/O and no clock inside. That is the property that
+    makes them testable, portable and replayable: the same inputs give the same decisions,
+    bit for bit, and CI simulates the budget on every change.
+  </p>
+
+  <h2>Compression is the client's choice</h2>
+
+  <p>
+    Imagery can be held on the GPU as BC7 or ASTC 4×4 blocks — a quarter of the memory of
+    RGBA8. Whether it is, is decided by the application that uses Tuile, never by Tuile: it
+    is off by default, and off is byte-identical to the path without compression. A client
+    that opts in describes its GPU with plain capability flags — no graphics-API type
+    reaches the core — and gets a plan: encode on the GPU at upload, encode on the CPU in a
+    browser's decode workers, or transcode imagery stored as KTX2. Anything that cannot be
+    encoded is uploaded as RGBA8, so the ground is never left without a texture. Films stay
+    RGBA8.
+  </p>
+
+  <h2>Embedding: a frame the host owns</h2>
+
+  <p>
+    A game engine owns its device, its colour target and its depth buffer, and has usually
+    drawn into them already. <code>tuile-wgpu</code>'s <code>HostPass</code> takes those
+    three and the frame's encoder, records its pass, and submits, presents and clears
+    nothing it was not asked to — any sample count, forward or reverse-Z, with or without
+    a stencil. The viewer's own frames go through the same pass. At the application level,
+    <code>tuile-viewer</code> is generic over where terrain and imagery come from, and lets
+    a host place the camera each frame and read the ground beneath it.
   </p>
 
   <h2>Geospatial precision</h2>
@@ -246,17 +309,19 @@ const crates = [
   <h2>The network middleware</h2>
 
   <p class="note">
-    <strong>Status, plainly.</strong> The socket binding and the static HTTP server are
-    specified in the repository's design documents and the protocol they implement already
-    lives in <code>tuile-core</code>, but no server crate is present in the workspace today.
-    Current work runs through the in-process and HTTP-pull bindings and through the offline
-    bake pipeline. The <a href="/roadmap">roadmap</a> says where it sits.
+    <strong>Status, plainly.</strong> The network server — a socket binding of the
+    protocol, and a static server for tilesets — is specified in the repository's design
+    documents, and the protocol it would carry lives in <code>tuile-core</code>, but
+    <strong>no such server is in the workspace</strong>. What serves today is narrower: the
+    source-tile store and its read API, used by the film pipeline; a heightfield served as
+    terrain and imagery; and a proxy that keeps a connector's token off the client. The
+    <a href="/roadmap">roadmap</a> says where it sits.
   </p>
 
   <p>
     When it lands, the shape is already decided: one service written once against the
-    storage and cache traits, with the HTTP framework and the edge-worker runtime as thin
-    adapters over it, rather than two forks of the same routes. Static responses carry a
+    storage and cache traits, with the HTTP framework and the edge runtime as thin adapters
+    over it, rather than two forks of the same routes. Static responses carry a
     content-hash entity tag and immutable cache headers, because a tile is immutable by
     construction. The design rule for that mode is short — the server does nothing a content
     delivery network could do, except when there is no content delivery network.

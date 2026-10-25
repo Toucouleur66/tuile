@@ -16,11 +16,13 @@ scripts.
 
 ## Commands
 
-All of these run from this directory.
+All of these run from this directory, with Node 22.23 or newer (Astro 7's
+floor; `engines` in `package.json` says so).
 
 | Command | What it does |
 |---|---|
-| `npm install` | Install dependencies. |
+| `npm ci` | Install the locked dependencies. |
+| `npm run check` | `astro check`: types and templates. |
 | `npm run dev` | Development server on <http://localhost:4321>. |
 | `npm run docs:api` | `cargo doc --no-deps` for the published crates, then stage the result under `public/docs/api/`. |
 | `npm run build` | Static build into `dist/`. |
@@ -31,7 +33,7 @@ All of these run from this directory.
 The usual first run:
 
 ```bash
-npm install
+npm ci
 npm run docs:api          # a couple of minutes cold, seconds afterwards
 npm run build
 npm run preview           # http://localhost:4321
@@ -42,13 +44,13 @@ npm run preview           # http://localhost:4321
 ## How the Rust API documentation is wired
 
 Not every crate of the workspace is documented here: `scripts/rustdoc.mjs`
-holds the list — twenty-seven libraries and three programs — and
+holds the list — twenty-eight libraries and two programs — and
 `src/pages/docs/index.astro` groups the same names under headings. The crates
 that record and replay camera paths, the ones that drive a render farm, their
 tools and most examples are held back for a later publication. Adding a crate
 means adding it to both files.
 
-The script clears `target/doc`, because rustdoc's search index and crate
+The script clears `target/doc` (under `$CARGO_TARGET_DIR` when that is set), because rustdoc's search index and crate
 switcher remember every crate ever documented there, runs `cargo doc --no-deps`
 for the selection, checks that what came out is exactly the selection, and then
 copies the tree into
@@ -98,6 +100,10 @@ an unknown path with `dist/404.html` and a 404 status.
 The platform caps a deployment's file count and each file's size (25 MiB). The
 rustdoc tree is nearly all of the count; `wrangler deploy` prints it, and
 refuses outright past the cap rather than publishing part of a tree.
+
+Nothing publishes the site automatically: no CI workflow deploys it, and a
+merge to `main` changes nothing online. Publishing is the `wrangler deploy`
+above, run by hand by someone logged in to the account that owns the zone.
 
 ## Layout
 

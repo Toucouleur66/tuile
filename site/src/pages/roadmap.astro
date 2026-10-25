@@ -3,158 +3,173 @@
 // Copyright (c) lapoule.dev
 
 import Base from '../layouts/Base.astro';
+
+const status = [
+  ['MG — the globe', 'shipping', 'delivered', 'Terrain and imagery, interactive on four platforms, token-free sources included.'],
+  ['M1 — core and reference renderer', 'shipping', 'core delivered', 'Parsing, decoding and traversal are in the core and drawn offscreen; the interactive viewers draw the globe, not tilesets.'],
+  ['M2 — network middleware', 'planned', 'not started', 'Only its storage-and-cache side exists, as the source-tile store.'],
+  ['M2.5 — raster imagery', 'shipping', 'delivered', 'For terrain: several layers, attributions, budgeted, compressed on demand. Draping a 3D Tiles tileset is not done.'],
+  ['M3 — USD', 'shipping', 'redirected', 'A USD stage and a Hydra plugin shipped instead of a packaged-archive exporter, which is not started.'],
+];
 ---
 
 <Base
   title="Roadmap — Tuile"
-  description="Tuile's milestones, in implementation order, with the acceptance criteria each one has to pass before the next begins."
+  description="Tuile's milestones, what each one delivered as of v0.14.0, what was built outside them, and what is in review or planned."
   kicker="Roadmap"
-  heading="Milestones, in order, with the bar each one has to clear."
-  lede="A milestone is finished when every one of its criteria passes — not when the code exists. The order is deliberate: later milestones must never require breaking a seam an earlier one established."
+  heading="Milestones, and where each one actually stands."
+  lede="A milestone is finished when every one of its criteria passes — not when the code exists. This page says what was delivered as of v0.14.0, what changed course, and what has not started; the per-criterion state is in the repository's docs/03-roadmap.md."
 >
   <p class="note">
-    <strong>The north star</strong> is a rendered globe: streamed terrain draped with raster
-    imagery, produced end to end in Rust. The 3D Tiles engine is the foundation that gets
-    there; the globe is the load that proves it at planetary scale.
+    <strong>The north star</strong> is one foundation that serves every mode — interactive
+    on desktop, phone, headset and browser, films, offline renderers. The structuring target
+    so far has been a rendered globe: streamed terrain draped with raster imagery, end to end
+    in Rust, on top of the 3D Tiles engine.
   </p>
+
+  <h2>Where things stand</h2>
+
+  <table>
+    <thead><tr><th>Milestone</th><th>Status</th><th>In short</th></tr></thead>
+    <tbody>
+      {status.map(([m, kind, label, what]) => (
+        <tr><td>{m}</td><td><span class={`tag ${kind}`}>{label}</span></td><td>{what}</td></tr>
+      ))}
+    </tbody>
+  </table>
 
   <h2>MG — the globe</h2>
 
   <div class="milestone">
-    <h3>Quantized-mesh terrain and draped imagery <span class="tag">structuring target</span></h3>
+    <h3>Quantized-mesh terrain and draped imagery <span class="tag shipping">delivered</span></h3>
     <p>
-      Terrain decoding — header, delta-encoded vertex arrays, high-water-mark indices, edge
-      skirts, octahedral normals — producing the same decoded content type a glTF tile
-      produces, so the renderer needs no change. A geographic quadtree with per-level
-      availability and per-level geometric error. A tile-source abstraction that makes the
-      traversal, the cache and the geometry server generic over where tiles come from.
-      Raster imagery providers, projections, per-tile texture coordinates, and the single
-      point where geometry and imagery meet.
+      Terrain decoding and encoding — header, delta-encoded vertices, high-water-mark
+      indices, skirts, octahedral normals — producing the same decoded content type a glTF
+      tile produces. A geographic quadtree with per-level availability. A source abstraction
+      that makes the traversal, the budget and the geometry server generic over where tiles
+      come from. Imagery providers, projections, drapes as resources of their own, several
+      layers each falling back on its own. Sources from connectors, from any terrain
+      <code>layer.json</code> and imagery template, or from a heightfield served over plain
+      HTTP with no token at all.
     </p>
     <p class="crit">
-      <strong>Done means:</strong> a real terrain tile decodes into a coherent mesh; a globe
-      patch renders without jitter at any scale, which is the proof that the f64 rebasing is
-      real; the same patch draped with imagery displays textured, with provider attributions
-      shown; the traversal refines terrain by screen-space error with no terrain-specific
-      selection code; and a build with no provider credentials at all still works against a
-      free source.
+      <strong>Done means:</strong> the traversal refines terrain by screen-space error with no
+      terrain-specific selection code, and a build with no provider credentials works
+      against a free source — both checked. Decoding a real terrain tile, a jitter-free globe
+      at every scale and attributions on screen are met in the viewers, and checked by eye
+      rather than by a test.
     </p>
   </div>
 
   <h2>M1 — core and reference renderer</h2>
 
   <div class="milestone">
-    <h3>The MVP that proves everything else is possible</h3>
+    <h3>The MVP that proves everything else is possible <span class="tag shipping">core delivered</span></h3>
     <p>
       Full parsing of the tile tree in both versions of the standard, external tilesets
       included. Content decoding for both container generations. A pure, tested traversal:
       frustum culling, replace-with-hold-until-ready, additive refinement, request
       prioritisation. The protocol module — the message types, the two content forms, the
-      <code>GeometryStream</code> trait, and its in-process and HTTP-pull bindings. Fetcher
-      implementations for the filesystem and for HTTP. The wgpu backend with a minimal
-      physically-based pipeline and relative-to-centre rendering. A windowed viewer with an
-      orbit camera and live statistics.
+      <code>GeometryStream</code> trait and its in-process binding. Fetchers for the
+      filesystem and for HTTP. The wgpu backend with relative-to-centre rendering.
     </p>
     <p class="crit">
-      <strong>Done means:</strong> a green workspace test run with traversal coverage on a
-      hand-written mini-tileset; a green WebAssembly check on the core; both content
-      generations displayed correctly with no jitter at maximum zoom; no frame over 33 ms
-      attributable to decoding, which forces decode off the render thread; and zero
-      <code>unwrap</code> or <code>panic</code> on the core's production paths.
-    </p>
-    <p class="crit">
-      The viewer consumes the geometry server <em>exclusively</em> through the trait. That
-      constraint is the whole point of the milestone: it is what guarantees that switching
-      to a remote transport later touches no renderer code.
+      <strong>Met:</strong> a green test run on Linux and macOS with traversal coverage on a
+      hand-written mini-tileset; a green WebAssembly check; no <code>unwrap</code> or
+      <code>panic</code> on the core's production paths, denied by lint in CI.
+      <strong>Not met:</strong> an interactive viewer that opens a tileset — tilesets are
+      drawn by an offscreen snapshot — and the committed sample tilesets it would be checked
+      against.
     </p>
   </div>
 
   <h2>M2 — network middleware</h2>
 
   <div class="milestone">
-    <h3>Socket streaming, static mode, and a cache you can remove <span class="tag planned">not yet in the workspace</span></h3>
+    <h3>Streaming over a network, static mode, a removable cache <span class="tag planned">not started</span></h3>
     <p>
-      The network binding of the streaming protocol: one socket session per viewer, one
-      geometry server per session, a message envelope versioned from its first byte, and
-      geometry serialised as glb. A native serving binary pointed at a directory or at
-      object storage. The cache trait with a no-op, a memory-bounded and a disk
-      implementation, selected by configuration — a cache that can be switched off entirely
-      when something upstream already caches. Correct HTTP semantics for the static mode:
-      entity tags, immutable cache control on content, range requests, configurable
-      cross-origin policy. An edge-worker build of the same service, sharing the routes
-      rather than forking them.
+      The network binding of the streaming protocol: one session per consumer that declares
+      its memory, one geometry server and budget per session, a message envelope versioned
+      from its first byte, geometry serialised as glb; its transport is still an open
+      decision. A native serving binary pointed at a directory or at object storage. A cache
+      that can be switched off entirely when something upstream already caches. Correct HTTP
+      semantics for the static mode: entity tags, immutable cache control on content, range
+      requests, configurable cross-origin policy. An edge build of the same service, sharing
+      the routes rather than forking them.
     </p>
     <p class="crit">
-      <strong>Done means:</strong> the remote viewer matches the local one not just visually
-      but in its <em>selection sequence</em> for a replayed camera path — a programmatic
-      test, not an eyeball; independent third-party 3D Tiles web viewers consume a served
-      tileset without error; end-to-end session tests cover cancellation, timeouts and
-      malformed messages; the bounded cache respects its budget and the no-op cache is a
-      true passthrough.
+      <strong>Done will mean:</strong> a remote viewer that matches the local one in its
+      <em>selection sequence</em> for a replayed camera path — a programmatic test, not an
+      eyeball; independent open-source 3D Tiles web viewers consuming a served tileset
+      without error; a session's budget held within the memory its consumer declared.
     </p>
   </div>
 
   <h2>M2.5 — raster imagery in the core</h2>
 
   <div class="milestone">
-    <h3>Because untextured geometry needs something draped over it</h3>
+    <h3>Because geometry needs something draped over it <span class="tag shipping">delivered for terrain</span></h3>
     <p>
-      An imagery-provider trait and its implementations, web-mercator and geographic
-      projections, the quadtree mapping that picks imagery tiles at a density matching the
-      geometry's screen-space error, the extra texture coordinates on decoded content, and
-      the multiply in the render backend.
+      An imagery-provider trait and its implementations, web-mercator and geographic grids,
+      imagery tiles picked at a density matching the geometry's screen-space error and
+      reprojected once, drapes delivered and budgeted on their own. Since v0.13, imagery can
+      also be stored as KTX2 and held block-compressed on the GPU — the client's choice, off
+      by default.
     </p>
     <p class="crit">
-      <strong>Done means:</strong> an untextured tileset plus an imagery layer displays
-      draped, attributions are shown, and the imagery memory budget is respected.
+      <strong>Met</strong> for terrain: draped, attributed, its memory budgeted.
+      <strong>Not done:</strong> draping an untextured 3D Tiles tileset.
     </p>
   </div>
 
-  <h2>M3 — USD and USDZ export</h2>
+  <h2>M3 — USD</h2>
 
   <div class="milestone">
-    <h3>A geographic area as a portable scene</h3>
+    <h3>From exporting geometry to rendering inside OpenUSD <span class="tag shipping">redirected</span></h3>
     <p>
-      A bounding box and a target error in, a USDZ out: decoded content converted to USD
-      text and packaged into a conformant archive — every entry stored uncompressed, every
-      payload aligned to 64 bytes, root layer first. Time-sampled animation from a
-      timestamped polyline, so a recorded trajectory replays inside the scene. Pure Rust, no
-      C++ dependency, and <strong>no change whatsoever to the server</strong>: the exporter
-      is an ordinary tileset consumer.
-    </p>
-    <p class="crit">
-      <strong>Done means:</strong> exported archives open in the standard USD viewer and in
-      mobile augmented-reality viewers without a blocking warning; an animated export plays
-      on its own; the export is deterministic, same inputs to same bytes; and it is bounded,
-      with a clear error rather than an unbounded download.
+      The plan was a packaged-archive exporter: a bounding box and a target error in, a
+      portable scene out. What shipped follows where the need went — rendering a recorded
+      flight inside an offline renderer. A USD stage of a few kilobytes, written as text in
+      pure Rust, carries the camera path and one globe prim; a Hydra plugin over a C ABI
+      resolves the stage's camera and streams terrain and imagery into whichever Hydra
+      renderer draws. The exporter is not started; its bar — opening cleanly in standard USD
+      and mobile viewers, deterministic, bounded — stands if it is picked up. The server
+      never knows USD.
     </p>
   </div>
 
   <h2>M4 and beyond</h2>
 
-  <p>Kept possible, deliberately not implemented early:</p>
-
   <ol>
     <li>
-      <strong>The scene-index integration.</strong> A generative procedural inside an
-      offline renderer's scene graph, consuming the streaming protocol — the designated
-      second consumer, and the target that justifies how clean the trait had to be. A
-      C ABI crate on the Rust side, a plugin on the C++ side, and nothing leaking between
-      them.
+      <strong>The scene-index integration</strong> <span class="tag shipping">shipped</span>
+      — linked in-process through a C ABI, one frame at a time, rather than over a socket.
     </li>
     <li>
-      <strong>A facade for platform-native rendering</strong> on phones, tablets and
-      headsets — which is what forces multi-view traversal, because a stereo pair has to
-      share one selection or the eyes disagree at refinement boundaries.
+      <strong>Game engines</strong> — <code>tuile-bevy</code>
+      <span class="tag review">in review</span>, the globe inside a Rust game engine on
+      <code>tuile-wgpu</code>'s host pass; further increments planned.
     </li>
-    <li><strong>JavaScript bindings</strong> of the core, for web renderers.</li>
-    <li><strong>A facade for a real-time game engine.</strong></li>
+    <li>
+      <strong>A platform-native façade for phones, tablets and headsets</strong>
+      <span class="tag planned">not started</span> — phones and tablets run the wgpu viewer
+      today; a headset is what would force it.
+    </li>
+    <li>
+      <strong>JavaScript bindings of the core</strong>
+      <span class="tag planned">not started</span> — the browser runs the whole viewer as
+      an ES module today.
+    </li>
     <li>
       <strong>A control plane</strong> for authentication, indexing and streamed
-      invalidations — never a replacement for the HTTP data plane.
+      invalidations <span class="tag planned">not started</span> — never a replacement for
+      the HTTP data plane.
     </li>
-    <li><strong>Tile generation on the fly</strong> from columnar geospatial sources.</li>
-    <li><strong>Point clouds and gaussian splats.</strong></li>
+    <li>
+      <strong>Tile generation on the fly</strong> — begun for terrain (any heightfield
+      served as quantized-mesh tiles); columnar geospatial sources not started.
+    </li>
+    <li><strong>Point clouds and gaussian splats</strong> <span class="tag planned">not started</span>.</li>
   </ol>
 
   <p>
@@ -163,16 +178,28 @@ import Base from '../layouts/Base.astro';
     would be worse for every one of them.
   </p>
 
-  <h2>Where things actually stand</h2>
+  <h2>Built outside the milestones</h2>
 
-  <p class="note">
-    This page describes the plan, not a claim of completion. What the workspace contains
-    today is the honest signal: the core, the terrain and planetary crates, the wgpu backend
-    and its viewers, the native and browser transports, the offline bake-and-replay pipeline
-    and the USD side are all present; <strong>no server crate is</strong>. Read
-    <code>docs/03-roadmap.md</code> in the repository for the per-criterion state, and the
-    <a href="/docs">API reference</a> for what each crate currently exposes.
-  </p>
+  <ul>
+    <li><strong>The graphics budget</strong> — one pure, deterministic decision per step for viewers and films alike, simulated in CI.</li>
+    <li><strong>Four viewer shells of one application</strong> — desktop, iOS, Android and the web.</li>
+    <li><strong>Embedding</strong> — a viewer generic over its sources, a host that places the camera, a renderer that draws into a frame it does not own.</li>
+    <li><strong>Films</strong> — record, bake once, render often, on a farm; imagery harmonised to one light; a physical sky with sun and moon.</li>
+    <li><strong>A source-tile store</strong> and its read API.</li>
+    <li><strong>GPU-compressed imagery</strong> — the client's choice, off by default.</li>
+  </ul>
+
+  <h2>Next</h2>
+
+  <p>None of this is on <code>main</code>; it is listed so the direction is visible, not promised.</p>
+
+  <ul>
+    <li><span class="tag review">in review</span> <code>tuile-bevy</code>, first increment.</li>
+    <li><span class="tag planned">draft</span> The viewer's physical atmosphere of the current time, shared with the film.</li>
+    <li><span class="tag planned">planned</span> The compression budget: the GPU time and transient memory of encoding accounted inside the core budget.</li>
+    <li><span class="tag planned">planned</span> Compact vertex encoding (meshopt) read by the core's glTF decoder, always on, in pure Rust.</li>
+    <li><span class="tag planned">exploring</span> Procedural terrain with unbounded detail.</li>
+  </ul>
 
   <p class="next">Next → <a href="/getting-started">Getting started</a></p>
 </Base>

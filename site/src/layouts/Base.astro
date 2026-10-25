@@ -60,7 +60,7 @@ const current = (href: string) => (here === href ? 'page' : undefined);
           {nav.map((i) => <a href={i.href} aria-current={current(i.href)}>{i.label}</a>)}
         </nav>
         <span class="masthead-spacer"></span>
-        <span class="repo-link">MIT OR Apache-2.0</span>
+        <a class="repo-link" href="https://github.com/lapoule-dev/tuile" rel="noopener">github</a>
       </div>
     </header>
 
@@ -80,7 +80,10 @@ const current = (href: string) => (here === href ? 'page' : undefined);
           <a href="https://www.ogc.org/standard/3dtiles/" rel="noopener">OGC 3D Tiles</a>
           Community Standard. Unaffiliated with any vendor.
         </p>
-        <p>Copyright (c) lapoule.dev — dual licensed MIT OR Apache-2.0.</p>
+        <p>
+          Copyright (c) lapoule.dev — dual licensed MIT OR Apache-2.0. Source on
+          <a href="https://github.com/lapoule-dev/tuile" rel="noopener">GitHub</a>.
+        </p>
       </div>
     </footer>
   </body>

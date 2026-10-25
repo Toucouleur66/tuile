@@ -4,20 +4,46 @@
 
 import Base from '../layouts/Base.astro';
 
+const clone = `git clone https://github.com/lapoule-dev/tuile.git
+cd tuile
+rustup target add wasm32-unknown-unknown   # once, for the guardrail below`;
+
 const build = `cargo check --workspace                                     # quick build
 cargo check --target wasm32-unknown-unknown -p tuile-core   # the wasm guardrail
 cargo test --workspace
-cargo clippy --workspace -- -D warnings`;
+cargo clippy --workspace --all-targets -- -D warnings`;
 
 const tests = `cargo test --workspace > /tmp/tests.log 2>&1
 grep -E "(test result|FAILED|panicked)" /tmp/tests.log`;
 
-const viewer = `cargo run -p wgpu-viewer -- fixtures/tileset-simple/tileset.json`;
+const relief = `# Terminal 1: a synthetic relief, served as terrain and imagery
+cargo run --release -p tuile-heightfield-serve        # http://127.0.0.1:8092
+
+# Terminal 2: the viewer, on that relief — no catalog, no token
+cargo run --release -p tuile-wgpu-viewer -- \\
+  --terrain-url http://127.0.0.1:8092/terrain/layer.json \\
+  --imagery-template 'http://127.0.0.1:8092/imagery/{z}/{x}/{y}.png' \\
+  --imagery-scheme geographic --imagery-max-level 15 \\
+  --lon 10.0 --lat 0.0 --altitude 3000 --pitch 35`;
+
+const globe = `CESIUM_ION_TOKEN=... cargo run --release -p tuile-wgpu-viewer
+CESIUM_ION_TOKEN=... cargo run --release -p tuile-wgpu-viewer -- \\
+    --lon 6.86 --lat 45.83 --altitude 6000 --heading 120 --pitch 25`;
+
+const compression = `cargo run --release -p tuile-wgpu-viewer -- --imagery-compression auto   # or bc7, astc; off is the default`;
+
+const elsewhere = `scripts/try-viewer.sh web       # the page, http://localhost:8091/ (WebGPU, or WebGL2)
+scripts/try-viewer.sh mac       # the macOS application
+scripts/try-viewer.sh ios       # the iOS simulator
+scripts/try-viewer.sh android   # an Android emulator, or the phone on the cable`;
+
+const snapshot = `cargo run -p tuile-wgpu --example snapshot -- <tileset.json> <out.png> [size]`;
 
 const doc = `cargo doc --workspace --no-deps`;
 
 const site = `cd site
-npm install
+npm ci
+npm run check        # astro check: types and templates
 npm run docs:api     # cargo doc --no-deps for the published crates, staged under /docs/api
 npm run build        # static build → dist/
 npm run preview      # serve dist/ locally`;
@@ -25,11 +51,15 @@ npm run preview      # serve dist/ locally`;
 
 <Base
   title="Getting started — Tuile"
-  description="Build, test and run the Tuile workspace: the real cargo commands, the WebAssembly guardrail, and how to build and serve this site."
+  description="Build, test and run the Tuile workspace: the cargo commands, the WebAssembly guardrail, a globe with no token, the viewers on every platform, and how to build this site."
   kicker="Getting started"
-  heading="Build it, check it, run it."
-  lede="Tuile is a plain Cargo workspace. Rust 1.91 or newer, edition 2021, no build system on top, no code generation step to remember."
+  heading="Build it, check it, fly it."
+  lede="Tuile is a plain Cargo workspace. Rust 1.97 or newer, edition 2021, no build system on top, no code generation step to remember. The crates are used from the Git repository."
 >
+  <h2>Get the code</h2>
+
+  <pre><code>{clone}</code></pre>
+
   <h2>Build and check</h2>
 
   <pre><code>{build}</code></pre>
@@ -37,13 +67,15 @@ npm run preview      # serve dist/ locally`;
   <p>
     The second line is the one that matters most. <code>tuile-core</code> compiling to
     <code>wasm32-unknown-unknown</code> is the cheapest available proof that no renderer, no
-    async runtime and no HTTP framework has crept into the core. Add the target once with
-    <code>rustup target add wasm32-unknown-unknown</code>.
+    async runtime and no HTTP framework has crept into the core. CI runs it, with every
+    other crate that claims WebAssembly, on every change.
   </p>
 
   <p>
-    The workspace denies <code>unsafe</code> outright and warns on <code>unwrap</code> and
-    <code>panic</code>, so a clean clippy run means something here.
+    The workspace denies <code>unsafe</code> outright and lints <code>unwrap</code> and
+    <code>panic</code>, denied in CI, so a clean clippy run means something here. The
+    GPU tests run headless; on Linux they need a Vulkan driver (a software rasteriser
+    such as lavapipe is enough).
   </p>
 
   <h2>Reading test output</h2>
@@ -65,26 +97,71 @@ npm run preview      # serve dist/ locally`;
     <em>not</em> cover, rather than letting a passing run imply coverage it does not have.
   </p>
 
-  <h2>Running a viewer</h2>
-
-  <pre><code>{viewer}</code></pre>
-
-  <p class="note">
-    <strong>Two honest caveats.</strong> That is the command the repository's contributor
-    guide documents, and it is the shape the viewer is meant to settle on. Today the
-    <code>wgpu-viewer</code> example in the workspace is the streaming <em>globe</em>
-    viewer: it takes no path argument and instead reads a data-provider credential from the
-    environment, so it will refuse to start without one. And the <code>fixtures/</code>
-    directory named above is not committed yet. The viewer's own module documentation, in
-    the <a href="/docs">API reference</a>, carries the current controls and environment
-    variables — including the ones that record a camera path and fly it again exactly.
-  </p>
+  <h2>Fly a globe, no token needed</h2>
 
   <p>
-    Drag to orbit, right-drag to pan, wheel to zoom. The same viewer in a browser is the
-    <code>packages/tuile-viewer</code> module, which <code>examples/web-viewer</code> imports; the
-    headless harnesses — bulk pre-fetching, cache warming, and a probe that reports what a
-    traversal actually selected — live beside them.
+    The viewer takes its terrain from any quantized-mesh <code>layer.json</code> and its
+    imagery from any XYZ template. The workspace ships a server of its own that makes both
+    from a synthetic relief, so the first run needs no account anywhere:
+  </p>
+
+  <pre><code>{relief}</code></pre>
+
+  <p>
+    Drag to move the globe, right-drag to tilt and turn, wheel to zoom. <code>N</code> turns
+    the view north-up, <code>W</code> shows the wireframe, <code>F</code> freezes the
+    traversal so the camera moves and the selection does not. <code>--help</code> lists every
+    flag and key.
+  </p>
+
+  <h2>The whole planet</h2>
+
+  <p>
+    The <code>tuile-wgpu-viewer</code> binary uses the public connectors for terrain and
+    imagery, with an access token you supply at run time and never commit:
+  </p>
+
+  <pre><code>{globe}</code></pre>
+
+  <p>
+    It opens straight down on France from 2,000 km; the second line opens somewhere else,
+    in degrees and metres. <code>TUILE_RECORD=path.jsonl</code> writes the camera path and
+    <code>TUILE_REPLAY=path.jsonl</code> flies it again exactly. Imagery can be held
+    block-compressed on the GPU — your choice, off unless you ask:
+  </p>
+
+  <pre><code>{compression}</code></pre>
+
+  <h2>The same viewer elsewhere</h2>
+
+  <p>
+    One application, four shells. From the repository root, one command each — they read
+    the token from a <code>.env</code> file, and the page and the Android build never see
+    it: they ask a local proxy that holds it.
+  </p>
+
+  <pre><code>{elsewhere}</code></pre>
+
+  <p>
+    The page is the ES module in <code>packages/tuile-viewer</code>, which
+    <code>examples/web-viewer</code> imports. A program with its own tile service reuses
+    the whole application — window, controls, scripting, packaging — by implementing one
+    trait; the guide is <code>docs/16-embedding-the-viewer.md</code> in the repository.
+  </p>
+
+  <h2>A 3D Tiles tileset</h2>
+
+  <p>
+    Tilesets are parsed, traversed and decoded by the core and drawn today by an offscreen
+    snapshot, which runs the geometry server until the tiles settle and writes one frame:
+  </p>
+
+  <pre><code>{snapshot}</code></pre>
+
+  <p class="note">
+    <strong>Plainly:</strong> the interactive viewers draw the terrain-and-imagery globe;
+    opening a <code>tileset.json</code> in a window is not wired up yet, and no sample
+    tileset is committed — bring your own.
   </p>
 
   <h2>Generating the API documentation</h2>
@@ -93,24 +170,25 @@ npm run preview      # serve dist/ locally`;
 
   <p>
     That writes rustdoc for every crate in the workspace into <code>target/doc</code>. The
-    <a href="/docs">API reference</a> page explains how this site serves it.
+    <a href="/docs">API reference</a> page explains which crates this site publishes and
+    how it serves them.
   </p>
 
   <h2>Building this site</h2>
 
   <p>
     The site is an Astro application built statically: the build produces a folder of
-    files, the generated rustdoc among them, and no server of its own.
+    files, the generated rustdoc among them, and no server of its own. It needs Node 22.23
+    or newer.
   </p>
 
   <pre><code>{site}</code></pre>
 
   <p>
-    <code>npm run docs:api</code> runs the rustdoc build above and stages the output where
-    the site can serve it; it is not part of <code>npm run build</code>, because a
-    documentation build of the whole workspace takes minutes and a copy edit should not pay
-    for it. <code>npm run build:all</code> runs both in order. Nothing generated is
-    committed.
+    <code>npm run docs:api</code> runs a rustdoc build of the published crates and stages
+    the output where the site can serve it; it is not part of <code>npm run build</code>,
+    because a documentation build takes minutes and a copy edit should not pay for it.
+    <code>npm run build:all</code> runs both in order. Nothing generated is committed.
   </p>
 
   <h2>Licence</h2>

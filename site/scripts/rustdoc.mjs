@@ -34,7 +34,12 @@ import { fileURLToPath } from 'node:url';
 
 const siteDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const repoRoot = resolve(siteDir, '..');
-const docDir = join(repoRoot, 'target', 'doc');
+// cargo writes into $CARGO_TARGET_DIR when it is set (relative to the
+// workspace root, as cargo reads it), else into the workspace's `target/`.
+const targetDir = process.env.CARGO_TARGET_DIR
+  ? resolve(repoRoot, process.env.CARGO_TARGET_DIR)
+  : join(repoRoot, 'target');
+const docDir = join(targetDir, 'doc');
 const stageDir = join(siteDir, 'public', 'docs', 'api');
 
 // The published documentation: these packages' libraries…
@@ -57,8 +62,12 @@ const libraries = [
   'tuile-camera',
   'tuile-ui',
   'tuile-atmosphere',
+  'tuile-overlay',
   'tuile-radiometry',
   'tuile-wgpu',
+  // viewers
+  'tuile-viewer',
+  'tuile-wgpu-viewer',
   // film
   'tuile-bake',
   'tuile-film',
@@ -75,11 +84,12 @@ const libraries = [
 const programs = [
   ['tuile-film-native', 'tuile-film-render'],
   ['tuile-pack-api', 'tuile-pack-api'],
-  ['wgpu-viewer', 'wgpu-viewer'],
 ];
 
 // Held back for a later publication: tuile-tape and tuile-farm with all their
-// tools, the tool of tuile-usd, and the examples other than the viewer.
+// tools, the tool of tuile-usd, and the examples other than the viewer (whose
+// library, `tuile-wgpu-viewer`, is documented above: its binary is a few
+// lines over it and shares its crate name).
 
 const crateName = (n) => n.replaceAll('-', '_');
 const expected = [...libraries, ...programs.map(([, bin]) => bin)].map(crateName).sort();
