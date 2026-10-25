@@ -1,20 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! PNG tiles decoded two ways, timed: the `png` crate through `image` (what
-//! `tuile_core::raster::decode_image` runs today) and `zune-png`.
-//!
-//! Both produce tightly packed RGBA8, which is what the decode job hands on,
-//! and the two outputs are checked equal before any number is printed: a
-//! faster decoder that decodes differently is not a candidate.
-//!
-//! ```text
-//! cargo run --release -p tuile-decode-bench -- <png files or directories>
-//! cargo build --release -p tuile-decode-bench --target wasm32-wasip1
-//! node examples/decode-bench/wasi-run.mjs target/wasm32-wasip1/release/tuile-decode-bench.wasm <dir>
-//! ```
-//!
-//! JPEG is not compared: `image` 0.25 already decodes it with `zune-jpeg`.
+#![doc = include_str!("../README.md")]
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
