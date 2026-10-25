@@ -14,9 +14,11 @@ tuile/
 │   ├── tuile-core/          # M1 — 3D Tiles logic, zero backend
 │   ├── tuile-cesium-ion/    # ion source connector (endpoint, bearer, refresh ; 3D Tiles + imagery)
 │   ├── tuile-wgpu/          # M1 — wgpu rendering backend (native + wasm)
+│   ├── tuile-bevy/          # the globe in a Bevy application: tuile-wgpu's renderer and budget on Bevy's device, in its colour and depth
 │   ├── tuile-server/        # M2, not built yet — HTTP server (native axum / workers-rs); its storage and cache side is tuile-tile-server
 │   └── tuile-usd/           # M3 — USD/USDZ export (lib + standalone CLI, outside the server)
 ├── examples/
+│   ├── bevy-viewer/           # a Bevy application over tuile-bevy: a host-driven orbit camera, meshes sharing the ground's depth
 │   └── wgpu-viewer/           # M1 — the viewer binary: `tuile-viewer` (crates/) over the public connectors — see 16-embedding-the-viewer.md
 ├── integrations/              # future, non-Rust (hydra/, swift/) — empty in v1
 └── references/                # local clones of the reference implementations — GITIGNORED, never committed
@@ -35,6 +37,8 @@ tuile-cesium-ion → tuile-core (TileFetcher), reqwest behind a feature ;
                 the core does not know that ion exists
 tuile-wgpu  → tuile-core, wgpu, bytemuck ; reqwest+tokio behind the "native" feature,
                 wasm-bindgen/web-sys behind the "web" feature
+tuile-bevy  → tuile-wgpu, tuile-planetary, bevy (render + core pipeline only) ; no shader
+                or executor of its own: tuile-wgpu's HostPass draws into the camera's targets
 tuile-server→ tuile-core (parsing/validation), tuile-tile-server (storage and cache), axum+tokio ("native" feature),
                 worker ("cloudflare" feature), object_store (S3/GCS).
                 FORBIDDEN : tuile-usd. The tile server does not know USD.
