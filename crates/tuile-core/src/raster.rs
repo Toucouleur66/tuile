@@ -869,6 +869,10 @@ pub fn imagery_passes(layers: usize, slots: u32) -> u32 {
 ///
 /// A tenth of a pixel on a thousand-pixel tile, and four orders of magnitude
 /// above the interpolation error it absorbs.
+///
+/// It does not absorb multisampling's: a pixel an edge crosses interpolates at
+/// its centre, outside the triangle, up to half a pixel's footprint past the
+/// edge — far more than this. `blend_layer` clamps the uv to the tile for that.
 const EDGE_REACH: f32 = 1.0e-4;
 
 /// mask with, and an affine map into the texture.

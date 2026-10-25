@@ -201,6 +201,34 @@ fn render_and_count(
     counts: &mut dyn FnMut([u8; 4]) -> bool,
     backdrop: Option<&tuile_wgpu::PreparedTile>,
 ) -> u64 {
+    let data = render(gpu, pump, eye, look_at, mode, backdrop);
+    // The middle of the frame only, where the seam is aimed. The edges are
+    // where the two tiles run out and the true void begins; counting those
+    // would measure the framing rather than the join.
+    let (lo, hi) = (SIZE * 3 / 8, SIZE * 5 / 8);
+    let mut holes = 0u64;
+    for row in lo..hi {
+        for col in lo..hi {
+            let i = ((row * SIZE + col) * 4) as usize;
+            if counts([data[i], data[i + 1], data[i + 2], data[i + 3]]) {
+                holes += 1;
+            }
+        }
+    }
+    holes
+}
+
+/// One frame of what `pump` draws, seen from `eye` towards `look_at` in the
+/// diagnostic view `mode`, with `backdrop` behind it: `SIZE × SIZE` RGBA8,
+/// row by row.
+fn render(
+    gpu: &GpuContext,
+    pump: &mut ContentPump,
+    eye: DVec3,
+    look_at: DVec3,
+    mode: f32,
+    backdrop: Option<&tuile_wgpu::PreparedTile>,
+) -> Vec<u8> {
     let make = |label, format, usage, samples| {
         gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
@@ -355,24 +383,9 @@ fn render_and_count(
     gpu.device
         .poll(wgpu::PollType::wait_indefinitely())
         .expect("poll");
-    let data = slice.get_mapped_range().expect("map range");
-
-    // The middle of the frame only, where the seam is aimed. The edges are
-    // where the two tiles run out and the true void begins; counting those
-    // would measure the framing rather than the join.
-    let (lo, hi) = (SIZE * 3 / 8, SIZE * 5 / 8);
-    let mut holes = 0u64;
-    for row in lo..hi {
-        for col in lo..hi {
-            let i = ((row * SIZE + col) * 4) as usize;
-            if counts([data[i], data[i + 1], data[i + 2], data[i + 3]]) {
-                holes += 1;
-            }
-        }
-    }
-    drop(data);
+    let data = slice.get_mapped_range().expect("map range").to_vec();
     readback.unmap();
-    holes
+    data
 }
 
 /// The same pair of different-detail tiles, but asked the question the coverage
@@ -535,8 +548,11 @@ fn uncovered_fragments_along_a_shared_edge(gpu: &GpuContext) -> u64 {
 /// shader inputs are interpolated at the pixel *centre* — which lies outside the
 /// triangle. The uv is extrapolated past the tile, every `step` mask answers
 /// zero together, and the ground falls through to its base colour: a bright
-/// dashed hairline along every boundary. `@interpolate(centroid)` on the uv
-/// moves the sample inside the covered area and the extrapolation cannot happen.
+/// dashed hairline along every boundary. `blend_layer` clamps the uv to the
+/// tile's own square before it masks, so the extrapolation lands on the edge.
+/// Straight down at a level-4 pair the overshoot is small enough for the
+/// coverage's own reach to hide it; `flat_ground_shows_no_hairline_between_neighbours`
+/// is the oblique, close view where it is not.
 #[test]
 fn no_fragment_of_the_ground_is_left_without_imagery() {
     let Some(gpu) = gpu() else { return };
@@ -776,4 +792,128 @@ fn an_edge_slides_to_its_new_neighbour_and_never_gaps() {
         skirted.iter().all(|n| *n == 0),
         "a frame shows the void: {skirted:?}"
     );
+}
+
+/// A block of `n × n` same-level neighbours, flat at sea level, each drawn as
+/// the engine draws ground (`to_ground`: its skirts as deep as it needs) and
+/// carrying one flat imagery layer over the whole of itself; and the pixels of
+/// one frame of it, looked at obliquely from a kilometre up — the view a
+/// person flies at, where the hairlines were seen.
+///
+/// Every pixel of ground is the same colour by construction: the ground is
+/// flat, its imagery is one grey, and the light is all ambient. So anything
+/// else inside the block is the join between two tiles showing.
+fn flat_block(gpu: &GpuContext, stitched: bool) -> (Vec<u8>, [u8; 4]) {
+    const LEVEL: u32 = 15;
+    const N: u64 = 5;
+    // 10°E on the equator, where the heightfield example lays its relief.
+    let (x0, y0) = (34_586u64, 16_382u64);
+    let tiles: Vec<TileId> = (0..N * N)
+        .map(|k| TileId::from_terrain(LEVEL, x0 + k % N, y0 + k / N))
+        .collect();
+    let mut messages = Vec::from([support::select(exacts(&tiles), 1)]);
+    for &tile in &tiles {
+        let rect = rect_of(tile);
+        let mut c = to_ground(&grid_mesh(&rect, 16), &rect);
+        for mesh in &mut c.meshes {
+            mesh.material.base_color_texture = None;
+        }
+        // Placed as the engine places a layer over a tile it covers whole:
+        // its coverage reaching past the tile's edges by `EDGE_REACH`.
+        let flat = whole_tile_layer();
+        let r = tuile_core::raster::GeoRect {
+            west: rect.west,
+            south: rect.south,
+            east: rect.east,
+            north: rect.north,
+        };
+        c.imagery = vec![tuile_core::raster::ImageryLayer::placed(
+            flat.coord,
+            flat.texture,
+            &r,
+            &r,
+        )];
+        messages.push(mesh(tile, 1, c));
+    }
+    let mut stream = Scripted::new(messages);
+
+    // The middle of the block, seen from a kilometre over a point south of it
+    // at sixty degrees under the horizon.
+    let centre = rect_of(TileId::from_terrain(LEVEL, x0 + N / 2, y0 + N / 2));
+    let target = on_the_ground(&centre, 0.5, 0.5);
+    let up = target.normalize();
+    let north = up.cross(DVec3::Z.cross(up)).normalize();
+    const HEIGHT: f64 = 1_000.0;
+    let eye = target - north * (HEIGHT / 60f64.to_radians().tan()) + up * HEIGHT;
+
+    let shell = prepare(
+        gpu,
+        &tuile_terrain::globe_shell([0.09, 0.15, 0.24, 1.0]),
+        DVec3::ZERO,
+    );
+    shell.rebase(&gpu.queue, eye);
+    let mut pump = ContentPump::new(eye);
+    pump.set_stitching(stitched.then_some(0));
+    pump.pump(&mut stream, gpu, FrameDeadline::UNBOUNDED);
+    let pixels = render(gpu, &mut pump, eye, target, DIAGNOSTIC_OFF, Some(&shell));
+    // The ground's colour: what the middle of the frame is.
+    let i = ((SIZE / 2 * SIZE + SIZE / 2) * 4) as usize;
+    let ground = [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]];
+    (pixels, ground)
+}
+
+/// Pixels in the middle half of the frame that are not the ground's colour.
+fn off_colour(pixels: &[u8], ground: [u8; 4]) -> Vec<(u32, u32, [u8; 4])> {
+    let (lo, hi) = (SIZE / 4, SIZE * 3 / 4);
+    let mut off = Vec::new();
+    for row in lo..hi {
+        for col in lo..hi {
+            let i = ((row * SIZE + col) * 4) as usize;
+            let px = [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]];
+            if px.iter().zip(ground).any(|(a, b)| a.abs_diff(b) > 2) {
+                off.push((col, row, px));
+            }
+        }
+    }
+    off
+}
+
+/// **Flat ground shows no line where two tiles of one level meet.**
+///
+/// The dotted grey-blue hairlines along tile edges, on flat ground, on every
+/// backend: a block of same-level tiles, one colour all over, must come out
+/// one colour all over — the joins included. Asked stitched, as a window
+/// draws, and with the skirts alone.
+#[test]
+fn flat_ground_shows_no_hairline_between_neighbours() {
+    let Some(gpu) = gpu() else { return };
+    let mut seen = Vec::new();
+    for stitched in [true, false] {
+        let (pixels, ground) = flat_block(&gpu, stitched);
+        assert!(
+            ground[0] > 100 && ground[0].abs_diff(ground[2]) < 4,
+            "the middle of the frame is not the block's grey ({ground:?}): the \
+             fixture is not looking at its ground"
+        );
+        // `TUILE_SEAM_PICTURES=<dir>` keeps the frame, to be looked at.
+        if let Ok(dir) = std::env::var("TUILE_SEAM_PICTURES") {
+            image::RgbaImage::from_raw(SIZE, SIZE, pixels.clone())
+                .expect("a whole frame")
+                .save(
+                    std::path::Path::new(&dir).join(format!("flat-block-stitched-{stitched}.png")),
+                )
+                .expect("the picture is written");
+        }
+        let off = off_colour(&pixels, ground);
+        seen.push(format!(
+            "stitched {stitched}: {} pixels of flat ground are not its colour \
+             {ground:?}, e.g. {:?}",
+            off.len(),
+            &off[..off.len().min(6)]
+        ));
+        if off.is_empty() {
+            seen.pop();
+        }
+    }
+    assert!(seen.is_empty(), "{seen:#?}");
 }
