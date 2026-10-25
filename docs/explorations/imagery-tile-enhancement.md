@@ -86,13 +86,14 @@ capteur (FTM, bruit) → orthorectification (rééchantillonnage) → mosaïquag
 (lignes de raccord, dates, sources) → reprojection Web Mercator → réduction
 de pyramide → JPEG 4:2:0 q≈75–85 (parfois ré-encodé)            [fournisseur]
 ──────────────────────────────────────────────────────────────────────────────
-décodage (image::load_from_memory, raster.rs:1520)
-→ reprojection géographique, bilinéaire        (raster.rs:645 / :681)
-→ mipmaps moyennés en sRGB                       (raster.rs:1593)
-→ échantillonnage trilinéaire, sans anisotropie  (tuile-wgpu context.rs:216)  [Tuile]
+décodage (image::load_from_memory, raster.rs:1636)
+→ reprojection géographique, bilinéaire        (raster.rs:655 / :682)
+→ mipmaps moyennés en sRGB                       (raster.rs:1739)
+→ compression BC7/ASTC, si le client l'a choisie (texcomp, Off par défaut)
+→ échantillonnage trilinéaire, sans anisotropie  (tuile-wgpu context.rs:266)  [Tuile]
 ```
 
-Aucune publication ne modélise la chaîne complète du fournisseur (§6). Les trois
+Aucune publication ne modélise la chaîne complète du fournisseur (§6). Les
 dernières étapes, en revanche, sont dans notre code.
 
 ### 1.2 Déjà en place
@@ -108,9 +109,9 @@ le code.
 
 | # | Action | Où | Ce que ça corrige | Références |
 |---|---|---|---|---|
-| 1 | **Filtrage anisotrope** dans le viewer (`anisotropy_clamp`, déjà à 16 dans `tuile-film-gpu`) | `tuile-wgpu/src/context.rs:216` | le flou du sol vu en oblique, le plus visible du viewer | Manson & Schaefer ; Heckbert (EWA) §3.1 |
-| 2 | **Mipmaps en lumière linéaire** (LUT déterministes de la radiométrie) | `tuile-core/src/raster.rs:1593` | le ternissement du détail contrasté au loin, que le commentaire du code reconnaît | §3.1 |
-| 3 | **Noyau de reprojection** plus fin (bicubique ou Lanczos-2), ou reprojection à partir de z+1 | `raster.rs:681` | l'adoucissement à chaque rééchantillonnage | Nehab & Hoppe ; Mitchell–Netravali §3.1 |
+| 1 | **Filtrage anisotrope** dans le viewer (`anisotropy_clamp`, déjà à 16 dans `tuile-film-gpu`) | `tuile-wgpu/src/context.rs:266` | le flou du sol vu en oblique, le plus visible du viewer | Manson & Schaefer ; Heckbert (EWA) §3.1 |
+| 2 | **Mipmaps en lumière linéaire** (LUT déterministes de la radiométrie) | `tuile-core/src/raster.rs:1739` | le ternissement du détail contrasté au loin, que le commentaire du code reconnaît. Quand le client compresse, l'encodeur reçoit cette même chaîne : la corriger corrige aussi les blocs | §3.1 |
+| 3 | **Noyau de reprojection** plus fin (bicubique ou Lanczos-2), ou reprojection à partir de z+1 | `raster.rs:682` | l'adoucissement à chaque rééchantillonnage | Nehab & Hoppe ; Mitchell–Netravali §3.1 |
 | 4 | **Netteté dans le look** : filtre guidé ou laplacien local, uniforme, optionnel | shader du look (doc 18 §4) | le manque de « piqué » | He 2010 ; Paris 2011 ; Aubry 2014 §3.1 |
 
 Les numéros 1 et 4 interagissent : l'accentuation de netteté crée du

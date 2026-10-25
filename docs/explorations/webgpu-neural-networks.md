@@ -29,6 +29,12 @@ performance viennent des résumés, des pages projet et de blogs ; *(non vérifi
 marque ce qui n'a pas été recoupé. **Aucun essai n'a été lancé ici** : la section
 « essais » rapporte ceux des autres, et le §8 propose les nôtres.
 
+**Mise à jour du 2026-10-25.** Tuile est passé en **wgpu 30.0.1** (v0.13).
+wgpu 30 expose le `GPUDevice` JS de son device (`Device::as_webgpu()`), ce qui
+lève l'obstacle décrit ici pour wgpu 29 ; Burn 0.22 / CubeCL 0.11 est la
+version alignée. Les passages concernés sont corrigés ; les essais publiés,
+eux, sont rapportés tels quels.
+
 ---
 
 ## 0. En une page
@@ -59,7 +65,7 @@ marque ce qui n'a pas été recoupé. **Aucun essai n'a été lancé ici** : la 
   - produit scalaire int8 (`dot4I8Packed`).
 
   Les **matrices coopératives n'existent pas sur le web** : l'extension
-  expérimentale de Chromium est disponible sur 0 % des machines. Dans wgpu 29,
+  expérimentale de Chromium est disponible sur 0 % des machines. Dans wgpu 29 et 30,
   elles sont **natives seulement** (Metal, Vulkan).
 - **Les frameworks JavaScript :**
   - **ONNX Runtime Web** (1.30) est le plus complet, en migration vers son
@@ -71,14 +77,15 @@ marque ce qui n'a pas été recoupé. **Aucun essai n'a été lancé ici** : la 
   - **WebNN** est en essai d'origine (Chrome 147–149) : à surveiller, pas encore
     à utiliser.
 - **Pour un moteur Rust/wgpu, un fait décisif :** l'API publique de wgpu 29
-  **n'expose ni n'adopte de `GPUDevice` JS** (vérifié dans la source). Aucun
-  runtime JS (ORT-Web, LiteRT.js, TF.js) ne peut partager le device de Tuile
-  sans copies. **Le seul chemin même-device est natif à wgpu** : Burn/CubeCL, ou
-  du WGSL écrit à la main.
+  n'exposait ni n'adoptait de `GPUDevice` JS. **wgpu 30, la version de Tuile
+  depuis v0.13, l'expose** (`Device::as_webgpu()`), sans toujours en adopter
+  un (vérifié dans la source 30.0.1). Un runtime JS (ORT-Web, LiteRT.js, TF.js)
+  peut donc travailler sur le device que Tuile lui prête. Le chemin entièrement
+  en Rust reste Burn/CubeCL, ou du WGSL écrit à la main.
 - **Burn/CubeCL** accepte un device wgpu existant (`init_device(WgpuSetup)`,
-  `WgpuDevice::Existing`). Les tenseurs sont de simples `wgpu::Buffer`. **Burn
-  0.21 / CubeCL 0.10 sont en wgpu 29, comme Tuile** ; Burn 0.22 / CubeCL 0.11
-  (6 octobre 2026) sont passés en wgpu 30. Les deux sont **0.x** : la règle 8
+  `WgpuDevice::Existing`). Les tenseurs sont de simples `wgpu::Buffer`. Burn
+  0.21 / CubeCL 0.10 sont en wgpu 29 ; **Burn 0.22 / CubeCL 0.11 (6 octobre
+  2026) sont en wgpu 30, comme Tuile depuis v0.13**. Les deux sont **0.x** : la règle 8
   exige une justification écrite pour le chemin wasm.
 - **Ce qui est réaliste côté client en 2026, par taille de réseau :**
 
@@ -232,11 +239,16 @@ Sources :
     (`src/backend/webgpu.rs:1202`) ;
   - seul `backend::custom` est public.
 
-  **Pas d'extraction ni d'adoption d'un device JS par l'API publique**, donc pas
-  de zéro copie avec un runtime JS sans patcher wgpu.
-- **Textures externes** (vidéo) : wgpu 29 a un type de texture externe dans son
-  backend WebGPU, mais aucun runtime ML ne l'accepte. Il faut toujours une passe
-  d'échantillonnage vers un buffer, qui reste sur le GPU et coûte peu.
+  **Pas d'extraction ni d'adoption d'un device JS par l'API publique** en
+  wgpu 29. **wgpu 30.0.1** ajoute l'extraction : `Device::as_webgpu()`,
+  `Buffer::as_webgpu()`, `Texture::as_webgpu()`, et
+  `Device::create_texture_from_webgpu_handle` pour envelopper une `GPUTexture`
+  JS. L'adoption d'un device créé ailleurs manque toujours : Tuile doit créer
+  le device et le prêter.
+- **Textures externes** (vidéo) : wgpu 29 et 30 ont un type de texture
+  externe dans leur backend WebGPU, mais aucun runtime ML ne l'accepte. Il
+  faut toujours une passe d'échantillonnage vers un buffer, qui reste sur le
+  GPU et coûte peu.
 - **Relecture** : `mapAsync` ajoute au moins une frame de latence. Entre deux
   modules wasm (ort-web), il faut aussi copier entre mémoires. Le partage WebNN ↔
   WebGPU n'est sans copie que sur le même GPU. —
@@ -509,12 +521,13 @@ Sources :
 
 ## 5. Ce qu'il faut en retenir pour un moteur Rust/wgpu
 
-1. **Rester sur un seul device.** Le seul chemin zéro copie est **natif à
+1. **Rester sur un seul device.** Le chemin zéro copie le plus direct est **natif à
    wgpu** : Burn/CubeCL sur le `wgpu::Device` de Tuile (`init_device(WgpuSetup)`),
    ou du WGSL écrit à la main.
-   - Les runtimes JS imposent un device séparé et des copies, car wgpu 29
-     n'expose ni n'adopte de `GPUDevice` JS.
-   - Garder **Burn 0.21 tant que Tuile est en wgpu 29**, puis avancer au même
+   - Un runtime JS peut travailler sur le device que Tuile lui prête
+     (`Device::as_webgpu()`, wgpu 30), avec des entrées en buffers ; wgpu
+     n'adopte pas un device créé par le runtime.
+   - **Burn 0.22**, aligné sur le wgpu 30 de Tuile, puis avancer au même
      rythme.
 2. **Compter les dispatchs avant les FLOPs.**
    - Fusionner biais, activation et normalisation dans l'épilogue de la matmul.
@@ -600,7 +613,7 @@ banc de dispatch sert ensuite à tous les autres.
    soumission sur nos cibles : Vulkan (L4 de la ferme), Metal, D3D12, puis
    Chrome, Safari et Firefox. On le compare aux 24–71 µs publiés, pour fixer
    notre budget ML par frame.
-2. **Burn 0.21 sur le device du viewer** (2 à 3 jours). Un MLP ou un CNN de
+2. **Burn 0.22 sur le device du viewer** (2 à 3 jours). Un MLP ou un CNN de
    moins de 1 M de paramètres (super-résolution ×2 d'une tuile) via
    `init_device(WgpuSetup)` :
    - natif et wasm, même code ;

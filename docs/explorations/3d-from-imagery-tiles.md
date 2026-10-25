@@ -1028,7 +1028,7 @@ tuile imagerie (z17–19) + tuile terrain             [déjà dans Tuile]
   de tuiles, pas `tuile-core` (règle 1). Deux emplacements possibles, à décider
   plus tard :
   - **précalcul** : un outil de « bake », cousin de `tuile-bake` ;
-  - **génération à la volée** derrière `tuile-server`, avec son cache
+  - **génération à la volée** derrière le serveur de tuiles (`tuile-tile-server`), avec son cache
     enfichable. C'est la piste post-v1 déjà nommée dans la vision.
 - **Précision** : ancrage en f64, géométrie locale en f32 après recentrage
   (règle 7).

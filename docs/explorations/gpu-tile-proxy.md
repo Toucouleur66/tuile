@@ -122,7 +122,7 @@ client ──► tile-server [couche « bdortho.sr2x-v3 »] ──(absente)─�
   sur wgpu/CUDA.
 - **Il ne connaît que** « (couche dérivée, z, x, y) → octets ». Il lit ses
   entrées par HTTP sur le tile-server et ne stocke rien lui-même.
-- **Le règles du dépôt sont respectées** : rien n'entre dans `tuile-core` (règle
+- **Les règles du dépôt sont respectées** : rien n'entre dans `tuile-core` (règle
   1), le serveur de tuiles ne dépend d'aucun framework ML, et aucun nom de marque
   n'apparaît dans les types publics (règle 3).
 

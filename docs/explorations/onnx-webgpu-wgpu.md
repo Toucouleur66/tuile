@@ -21,6 +21,17 @@ onnxruntime.ai et docs.rs ne résolvaient pas. Plusieurs dates de version d'ONNX
 Runtime viennent de miroirs (newreleases.io) aux dates relatives : elles sont
 marquées *(non vérifié)*, comme tout ce qui n'a pas été recoupé.
 
+**Mise à jour du 2026-10-25.** Tuile est passé en **wgpu 30.0.1** (v0.13).
+Deux conclusions de la version du 14 octobre changent, et le texte ci-dessous
+est corrigé en conséquence :
+- wgpu 30 **expose** le `GPUDevice` JS de son device (`Device::as_webgpu()`,
+  vérifié dans la source 30.0.1) : un runtime JS peut donc travailler sur le
+  device de Tuile. wgpu n'**adopte** toujours pas un device créé ailleurs ;
+- c'est désormais **Burn 0.22 / CubeCL 0.11** qui partage le device de Tuile ;
+  Burn 0.21 (wgpu 29) ne le peut plus.
+
+Rien n'est implémenté pour autant : la note reste une exploration.
+
 ---
 
 ## 0. En une page
@@ -36,9 +47,11 @@ marquées *(non vérifié)*, comme tout ce qui n'a pas été recoupé.
   navigateur**, mais il est **en pleine migration** : l'ancienne couche
   JavaScript (JSEP) a été déclarée obsolète dans 1.29, au profit du fournisseur
   WebGPU C++ compilé en wasm. Les sorties peuvent rester sur le GPU
-  (`gpu-buffer`). La capture de graphe exige des formes statiques. **Mais il ne
-  peut pas partager le device de Tuile** : l'API publique de wgpu 29 n'expose ni
-  n'adopte de `GPUDevice` JS (vérifié dans la source, §2.1).
+  (`gpu-buffer`). La capture de graphe exige des formes statiques. **Il peut
+  travailler sur le device de Tuile** : depuis wgpu 30, `Device::as_webgpu()`
+  rend le `GPUDevice` JS, à passer à `env.webgpu.device` (vérifié dans la
+  source, §2.1). Les entrées restent des buffers : une texture passe par une
+  copie sur le GPU.
 - **ONNX Runtime natif « WebGPU » tourne sur Dawn, pas sur wgpu.** Il ne pourra
   **jamais partager le device wgpu** de Tuile.
 - **burn-onnx est le seul chemin vraiment zéro copie en Rust.** Il **génère du
@@ -49,10 +62,10 @@ marquées *(non vérifié)*, comme tout ce qui n'a pas été recoupé.
 
   | Version de Burn | CubeCL | wgpu |
   |---|---|---|
-  | 0.21 | 0.10 | **29** (celle de Tuile) |
-  | 0.22 | 0.11 | **30** |
+  | 0.21 | 0.10 | **29** |
+  | 0.22 | 0.11 | **30** (celle de Tuile depuis v0.13) |
 
-  Le partage marche aujourd'hui avec Burn 0.21. Ensuite, Tuile et Burn doivent
+  Le partage marche aujourd'hui avec Burn 0.22. Ensuite, Tuile et Burn doivent
   avancer au même rythme.
 - **`ort` (pyke) reste en 2.0-rc** depuis environ 2,5 ans (rc.14, 12 octobre
   2026). Le support wasm a été sorti dans un crate séparé, `ort-web`, qui lie
@@ -144,21 +157,27 @@ marquées *(non vérifié)*, comme tout ce qui n'a pas été recoupé.
 - **Capture de graphe** (`enableGraphCapture`). Exige des formes statiques et
   tous les nœuds sur WebGPU. C'est **le principal levier contre le coût par
   dispatch** (voir l'étude générale).
-- **Partage du GPUDevice : impossible avec wgpu 29.** ORT-Web accepte un
+- **Partage du GPUDevice : possible depuis wgpu 30.** ORT-Web accepte un
   `GPUDevice` fourni (`env.webgpu.device`, avant la première session) et des
   entrées `Tensor.fromGpuBuffer` (f32, **f16**, entiers). Mais
   `Tensor.fromTexture` n'accepte qu'une `WebGLTexture`, et **aucune GPUTexture
   en entrée**.
 
-  Côté Tuile, j'ai lu la source de wgpu 29.0.3 :
-  - `mod backend;` est privé (`src/lib.rs:114`) ;
-  - le `GPUDevice` du navigateur est dans `WebDevice.inner`, en `pub(crate)`
-    (`src/backend/webgpu.rs:1202`) ;
-  - seul `backend::custom` est public.
+  Côté Tuile, la source a été lue deux fois :
+  - **wgpu 29.0.3** (version de Tuile au 14 octobre) : `mod backend;` privé,
+    le `GPUDevice` dans `WebDevice.inner` en `pub(crate)`. Ni extraction ni
+    adoption par l'API publique ;
+  - **wgpu 30.0.1** (version de Tuile depuis v0.13) : `Device::as_webgpu()`,
+    `Queue::as_webgpu()`, `Buffer::as_webgpu()` et `Texture::as_webgpu()`
+    rendent les objets JS (`src/api/device.rs:426`), et
+    `Device::create_texture_from_webgpu_handle` enveloppe une `GPUTexture`
+    créée en JS. **L'adoption d'un `GPUDevice` créé ailleurs n'existe
+    toujours pas.**
 
-  **Avec l'API publique, wgpu ne peut ni exposer son `GPUDevice` JS ni en
-  adopter un.** Pas de zéro copie entre le device de Tuile et ORT-Web, TF.js ou
-  LiteRT.js, à moins de patcher wgpu ou d'écrire un backend `custom` complet. —
+  **Conséquence :** Tuile garde la main sur le device et le prête à ORT-Web,
+  TF.js ou LiteRT.js. Les buffers passent sans copie ; une texture de Tuile
+  passe par une copie texture → buffer sur le GPU. Cela reste à vérifier par
+  un essai (§7). —
   https://onnxruntime.ai/docs/tutorials/web/ep-webgpu.html ·
   https://vgpu.labs.vercel.dev/docs/ml/browser
 - **fp16.** Noyaux fp16, avec `shader-f16`. Le typage strict de WGSL a causé des
@@ -176,7 +195,7 @@ marquées *(non vérifié)*, comme tout ce qui n'a pas été recoupé.
   https://onnxruntime.ai/docs/execution-providers/WebGPU-ExecutionProvider.html
   · https://newreleases.io/project/github/microsoft/onnxruntime/release/v1.30.0 ·
   https://newreleases.io/project/github/microsoft/onnxruntime/release/v1.31.0
-- **Dawn n'est pas wgpu.** Impossible de lui passer le `Device` wgpu 29 de Tuile.
+- **Dawn n'est pas wgpu.** Impossible de lui passer le `Device` wgpu de Tuile.
   Les données traversent le CPU, ou une interopérabilité de mémoire externe
   propre à chaque plateforme.
 - **onnxruntime-genai + WebGPU.** Vise les LLM, peu pertinent pour Tuile. —
@@ -214,8 +233,8 @@ Liens :
 - `cubecl-wgpu` 0.11.0 dépend de `wgpu ^30` ;
 - `burn-wgpu` 0.22.0 (6 octobre 2026) dépend de `cubecl ^0.11`.
 
-Burn 0.21 partage donc un device avec Tuile aujourd'hui. Burn 0.22 demande de
-passer Tuile en wgpu 30.
+Tuile est passé en wgpu 30 avec v0.13 : c'est désormais Burn 0.22 qui partage
+un device avec lui ; Burn 0.21 ne le peut plus.
 
 **Règles du dépôt.** L'inférence vit dans son propre crate, derrière un trait,
 jamais dans `tuile-core` (règle 1). Dans le chemin wasm, burn et ort-web sont en
@@ -293,8 +312,8 @@ burn-onnx atteint presque le même résultat, en Rust et de façon moins fragile
 
 | Cible | Choix | Repli |
 |---|---|---|
-| **Natif, sur le device wgpu de Tuile** | **burn-onnx** → code Rust sur burn-wgpu, initialisé sur *le* device de Tuile. Seul chemin zéro copie. Burn 0.21 tant que Tuile est en wgpu 29. | `ort` (CUDA, ou WebGPU sur Dawn) sur un device séparé, avec relecture CPU : acceptable hors boucle de rendu. tract pour le CPU. |
-| **Navigateur** | **burn-wgpu sur WebGPU** : le même code qu'en natif, dans le chemin Rust/wasm, et **le seul à partager le device de Tuile** (cf. §2.1). Si un opérateur manque : onnxruntime-web via `ort-web`, **sur un device séparé avec copies**, hors chemin par frame. Runtime auto-hébergé et télémétrie coupée : par défaut, `ort-web` télécharge le runtime sur cdn.pyke.io et envoie de la télémétrie. | tract ou RTen en wasm sur CPU pour de petits modèles. |
+| **Natif, sur le device wgpu de Tuile** | **burn-onnx** → code Rust sur burn-wgpu, initialisé sur *le* device de Tuile. Chemin zéro copie, entièrement en Rust. Burn 0.22, comme Tuile en wgpu 30. | `ort` (CUDA, ou WebGPU sur Dawn) sur un device séparé, avec relecture CPU : acceptable hors boucle de rendu. tract pour le CPU. |
+| **Navigateur** | **burn-wgpu sur WebGPU** : le même code qu'en natif, dans le chemin Rust/wasm, et entièrement en Rust. Si un opérateur manque : onnxruntime-web, **sur le device de Tuile** prêté par `Device::as_webgpu()` (§2.1), avec une copie texture → buffer sur le GPU, hors chemin par frame. Runtime auto-hébergé et télémétrie coupée : par défaut, `ort-web` télécharge le runtime sur cdn.pyke.io et envoie de la télémétrie. | tract ou RTen en wasm sur CPU pour de petits modèles. |
 | **Lot hors ligne (ferme, serveurs L4)** | **`ort` + CUDA ou TensorRT** (ou Python ORT). WebGPU n'apporte rien sur ces machines. | plugin WebGPU natif d'ORT pour du matériel non NVIDIA. |
 
 **Hygiène d'export, pour tous les cas :**
@@ -319,16 +338,16 @@ burn-onnx atteint presque le même résultat, en Rust et de façon moins fragile
 
 ## 7. Premiers essais proposés
 
-1. **Burn 0.21 sur le device de Tuile** (1 à 2 jours). Un petit modèle ONNX
+1. **Burn 0.22 sur le device de Tuile** (1 à 2 jours). Un petit modèle ONNX
    (super-résolution ×2 ou segmentation légère), via burn-onnx, sur le
    `wgpu::Device` du viewer. La sortie, une texture, est consommée par une passe
    de rendu sans relecture. Mesures : temps par tuile, parité natif/wasm, écart
    fp16/fp32.
-2. **Coût du chemin ORT-Web séparé en wasm** (2 à 3 jours). Le partage de device
-   étant impossible avec l'API publique de wgpu 29 (§2.1), on mesure
-   l'aller-retour par tuile : lecture de la texture wgpu, copie vers ORT-Web,
-   inférence, retour en texture. On en tire le seuil au-delà duquel ce chemin
-   reste acceptable hors de la boucle de rendu.
+2. **ORT-Web sur le device de Tuile en wasm** (2 à 3 jours). Le device est
+   prêté par `Device::as_webgpu()` (wgpu 30, §2.1). On mesure l'aller-retour
+   par tuile : copie de la texture wgpu vers un buffer sur le GPU, inférence,
+   retour en texture. On vérifie aussi que deux runtimes sur un même device ne
+   se gênent pas (pertes de device, portées d'erreur).
 3. **ONNX → WGSL à l'avance** (1 semaine). Export tinygrad d'un modèle à forme
    fixe, rejoué par un répartiteur Rust. Mesures : validation par naga, parité
    avec burn-onnx, nombre de dispatchs.

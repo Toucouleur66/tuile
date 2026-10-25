@@ -85,21 +85,28 @@ vérifier.
 
 ## 1. Pourquoi c'est intéressant pour Tuile, et d'où l'on part
 
-**Ce que Tuile fait aujourd'hui :**
+**Ce que Tuile fait aujourd'hui** (mis à jour le 2026-10-25, v0.14) :
 
-- les tuiles d'imagerie arrivent en JPEG ou PNG ;
-- elles sont décodées sur le CPU (`image`, `crates/tuile-core/src/raster.rs:1520`)
-  en RGBA8 ;
-- la chaîne de mipmaps est calculée sur le CPU (`raster.rs:1593`), puis envoyée
-  au GPU non compressée (`crates/tuile-wgpu/src/prepare.rs:423`) ;
-- pas de KTX2, pas de format compressé GPU.
+- les tuiles d'imagerie arrivent en JPEG ou PNG, plus rarement en KTX2 ;
+- JPEG et PNG sont décodés sur le CPU (`image`,
+  `crates/tuile-core/src/raster.rs:1636`) en RGBA8 ;
+- la chaîne de mipmaps est calculée sur le CPU (`raster.rs:1739`), puis envoyée
+  au GPU (`crates/tuile-wgpu/src/prepare.rs:595`) ;
+- **la compression GPU est livrée, et c'est le choix du client** :
+  `ImageryCompression` vaut `Off` par défaut (RGBA8, comme avant), `Auto` ou
+  un `Format` (BC7 ou ASTC 4×4). L'encodage se fait sur le GPU (texcomp) en
+  natif et en WebGPU, sur le CPU dans les workers de décodage en WebGL2 ;
+- une tuile déjà stockée en **KTX2/UASTC** est seulement transcodée
+  (`crates/tuile-core/src/stored.rs`), jamais encodée par Tuile.
 
-Une tuile 256² coûte donc 256 Ko de VRAM, plus environ un tiers pour les
-mipmaps.
+Une tuile 256² avec ses mipmaps coûte donc 349 524 octets de VRAM en RGBA8, et
+87 408 octets en blocs (÷4) quand le client a choisi de compresser. C'est le
+seuil que toute piste neuronale doit battre : une texture ordinaire compressée
+existe déjà dans le moteur.
 
 **Ce que la pile GPU permet :**
 
-- **wgpu 29** (version du dépôt) expose `Features::EXPERIMENTAL_COOPERATIVE_MATRIX`,
+- **wgpu 29**, et **wgpu 30** (version du dépôt depuis v0.13), exposent `Features::EXPERIMENTAL_COOPERATIVE_MATRIX`,
   activée en WGSL par `enable wgpu_cooperative_matrix;`. Disponible sur **Metal**
   (Apple7/Mac2, MSL 2.3+) et sur **Vulkan** (`VK_KHR_cooperative_matrix`, selon
   le fabricant), en natif seulement ; ailleurs, la liste des configurations est
@@ -334,7 +341,7 @@ pertinent ici. Chiffres. Code et licence. — lien.
     https://web3dsurvey.com/webgpu/features/chromium-experimental-subgroup-matrix
   - implémentation Dawn :
     https://dawn.googlesource.com/dawn/+/1a95a0a500099a285bfdfd9ea0682afcc89c7c31
-- **wgpu, matrices coopératives** — gfx-rs, wgpu 29. Natif seulement, instable ;
+- **wgpu, matrices coopératives** — gfx-rs, wgpu 29 et 30. Natif seulement, instable ;
   tailles interrogées à l'exécution (typiquement 8×8 sur Metal, 16×16 f16 sur
   AMD Vulkan). — https://wgpu.rs/doc/wgpu/documentation/extensions/cooperative_matrices/index.html
   · exemple : https://wgpu.rs/doc/wgpu_examples/cooperative_matrix/index.html
@@ -596,8 +603,11 @@ pertinent ici. Chiffres. Code et licence. — lien.
 
 Les coûts de calcul sont des estimations, pas des mesures.
 
-**Piste 0, préalable et sans réseau de neurones : la référence.** Mesurer
-KTX2/UASTC (VRAM ÷ 4 à 8 avec le filtrage matériel) et JPEG XL (recompression
+**Piste 0, préalable et sans réseau de neurones : la référence.** La
+compression GPU ordinaire est désormais dans le moteur (BC7/ASTC au choix du
+client, KTX2/UASTC transcodé ; ÷4 mesuré sur la VRAM d'imagerie). Reste à
+mesurer KTX2/UASTC en stockage (voir
+[`compressed-imagery-in-pmtiles.md`](compressed-imagery-in-pmtiles.md)) et JPEG XL (recompression
 sans perte de l'archive JPEG, décodeur Rust `jxl-rs`) sur de vraies tuiles.
 C'est le seuil que toute piste neuronale doit battre. Il s'implémente sans GPU
 d'entraînement.
@@ -660,7 +670,7 @@ d'entraînement.
   échantillonnés par le matériel (filtré, anisotrope), puis un MLP minuscule en
   f16 tourne dans le fragment shader.
 - **Gain** : la VRAM.
-- **Accélération** : wgpu 29 expose les matrices coopératives en natif (Metal,
+- **Accélération** : wgpu (29 et 30) expose les matrices coopératives en natif (Metal,
   Vulkan) ; en WebGPU, ALU ordinaire seulement pour l'instant.
 - **Calcul** : entraînement par région, de quelques heures à quelques jours.
 

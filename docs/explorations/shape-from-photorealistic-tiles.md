@@ -270,7 +270,8 @@ Notes d'architecture, si l'exploration devenait un jour un crate :
 - **Hors du cœur.** Tout ceci est lourd (lancer de rayons, apprentissage,
   binaires externes). C'est un *consommateur* comme `tuile-usd` : il lit un
   tileset via les traits existants et écrit des fichiers. `tuile-core` n'en
-  sait rien (règle 1), et `tuile-server` non plus.
+  sait rien (règle 1), et le serveur de tuiles (`tuile-tile-server`) non
+  plus.
 - L'étape ② ressemble beaucoup à ce que `tuile-bake` et `tuile-radiometry`
   manipulent déjà (texture cuite, exposition par lot de prise de vue). Le
   champ « soleil estimé par région » est cousin du champ de correction
