@@ -572,6 +572,8 @@ plan; each is reviewed before merge.
 | 7 | **Opaque regime**: two-stream term for τ ≫ 5 (Venus below the deck), only if wanted; curved rays in the tables (§7.1) | Venus render vs Venera panorama colours |
 | 8 | *Conditional*: runtime N-bin spectral engine (§7.5), only if the measured RGB error exceeds the agreed threshold | N = 3 instance identical to today; ΔE per preset vs the CPU spectral reference |
 
+Disc rendering and refraction (PR 3b, limb darkening and colour across the disc, glare, Moon photometry, eclipses) are studied in detail in `docs/explorations/sun-and-moon.md` (branch `docs/sun-and-moon`), which fits this model; PR 3b and §7.1 defer to it so the two do not diverge.
+
 A GPU table builder (compute + WebGL2 fragment fallback), held to the f64
 builder, can slot in between 3 and 4 if hosts need live air changes; baked
 presets cover the plan without it.
