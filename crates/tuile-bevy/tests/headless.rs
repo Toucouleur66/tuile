@@ -29,6 +29,11 @@ use tuile_bevy::{local_frame, GeoAnchor, SessionState, TuileCamera};
 const ALTITUDE: f64 = 3_000.0;
 const FOVY_DEG: f64 = 35.0;
 
+/// How long a frame may take to settle, wall seconds: a bound, not a wait.
+/// A software rasterizer in CI draws a debug build at a frame or two a
+/// second, and a tile's stitch slides over twelve frames.
+const SETTLE_S: f64 = 240.0;
+
 /// Straight down over the map, north up the frame.
 fn camera() -> TuileCamera {
     TuileCamera::looking(LON, LAT, ALTITUDE, 0.0, 90.0, FOVY_DEG)
@@ -154,7 +159,7 @@ fn the_host_shares_the_grounds_depth_and_no_ground_is_black() {
             300.0,
             Color::srgb(0.0, 0.0, 1.0),
         );
-        let status = app.settle(60.0);
+        let status = app.settle(SETTLE_S);
         assert_eq!(status.session, SessionState::Running, "{status:?}");
         assert!(status.is_settled(), "{target:?}: never settled: {status:?}");
         let picture = app.picture();
@@ -219,7 +224,7 @@ fn the_host_reads_the_ground_it_sees() {
         size: 256,
     };
     let mut app = Headless::new(support::plugin(), camera(), target);
-    let status = app.settle(60.0);
+    let status = app.settle(SETTLE_S);
     assert!(status.is_settled(), "never settled: {status:?}");
     // A frame more, so the snapshot is the settled draw's.
     app.update();
