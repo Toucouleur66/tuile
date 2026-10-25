@@ -161,7 +161,7 @@ objc2-foundation = { version = "0.3.2", optional = true, default-features = fals
 objc2-app-kit = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSAlert", "NSApplication", "NSPasteboard", "NSResponder", "NSRunningApplication"] }
 # The menu bar. The menu crate this workspace already locks, through the
 # status-bar readout of `tuile-ui`; nothing is added to the dependency graph.
-muda = { version = "0.19", optional = true }
+muda = { version = "0.21", optional = true, default-features = false }
 objc2-core-location = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CLLocation", "CLLocationManager", "CLLocationManagerDelegate"] }
 
 # The phone: the same location service, plus what a handset asks of the

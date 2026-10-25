@@ -19,7 +19,16 @@ statusbar = ["dep:tray-icon", "dep:muda"]
 [dependencies]
 tuile-camera = { version = "0.14.0", path = "../tuile-camera" }
 tuile-core = { version = "0.14.0", path = "../tuile-core" }
-# macOS-only in practice; the crates are a no-op elsewhere, so a host that asks
-# for the feature still builds on other platforms.
-tray-icon = { version = "0.24", optional = true }
-muda = { version = "0.18", optional = true }
+# The menu bar's item on macOS, the notification area on Windows. No default
+# features: those are the GTK 3 backends on Linux (AppIndicator for the item,
+# GTK 3 for the menu), and GTK 3's bindings are unmaintained.
+tray-icon = { version = "0.26", optional = true, default-features = false }
+muda = { version = "0.21", optional = true, default-features = false }
+
+# On Linux and the BSDs the item is a StatusNotifierItem spoken over D-Bus,
+# with the menu sent as a snapshot: no GTK at all, no system library to
+# install, and a worker thread of its own rather than a GTK main loop the
+# viewer's event loop never runs. Target-scoped so the menu's thread-safe
+# snapshot state stays off the platforms that do not use it.
+[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
+tray-icon = { version = "0.26", optional = true, default-features = false, features = ["ksni"] }
