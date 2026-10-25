@@ -42,7 +42,10 @@ pub const CLEAR_TURBIDITY: f64 = 2.0;
 /// One atmosphere: its molecules, its aerosols, its ozone and the ground
 /// under it. Canonical and plain: two equal values give the same light to
 /// the bit, which is what a render's digest wants.
+/// Open to more of the medium (layers of their own, other absorbers): built
+/// from [`Self::default`] or a preset and changed field by field.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct AtmosphereParams {
     /// Rayleigh scattering at sea level, per metre, RGB.
     pub rayleigh_scattering: [f64; 3],
@@ -86,6 +89,23 @@ impl Default for AtmosphereParams {
 }
 
 impl AtmosphereParams {
+    /// The Earth's air on a clear day: [`Self::default`].
+    pub fn earth() -> Self {
+        Self::default()
+    }
+
+    /// The Earth's air after rain, all but free of aerosols: turbidity 1.3,
+    /// a deep blue sky and far ridges sharp.
+    pub fn clear() -> Self {
+        Self::default().with_turbidity(1.3)
+    }
+
+    /// A hazy summer's day: turbidity 4, a whitish sky and distance lost in
+    /// the veil.
+    pub fn hazy() -> Self {
+        Self::default().with_turbidity(4.0)
+    }
+
     /// The optical depth of the molecules alone, straight up, in the green.
     pub fn rayleigh_depth(&self) -> f64 {
         self.rayleigh_scattering[1] * self.rayleigh_scale_height

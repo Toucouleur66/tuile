@@ -25,6 +25,8 @@ parameters; a backend draws with them.
 
 ## The pieces
 
+- [`clock`] — the scene's instant from the wall's: a start, an offset
+  and a rate ([`SceneClock`]).
 - [`sun`] — where the sun is at a stated instant. Everything else is
   downstream of it, which is why a globe lit "at 18:00 UTC" needs this rather
   than a direction someone picked by eye.
@@ -39,6 +41,11 @@ parameters; a backend draws with them.
   which sphere it is laid on.
 - [`tuning`] — every setting of the air as a tuning value: read from the
   environment by a native host, today's constant by default.
+- [`look`] — how a renderer draws the physical atmosphere: its
+  calibration, exposure, grade, discs and march ([`SkyLook`]).
+- `gpu` (feature `wgpu`) — the tables, the sky-view and the uniform on
+  a GPU, and the WGSL that draws the sky and the lit ground with them:
+  the one implementation a film's renderer and the viewer's share.
 - [`sky`] — the air with nothing behind it but space. A colour of its own,
   drawn as a shell, turning over from blue through orange to dark with the
   hour.

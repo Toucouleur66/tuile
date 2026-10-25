@@ -67,6 +67,17 @@ pub struct TileRenderer {
     fallback: wgpu::RenderPipeline,
     wireframe: Option<wgpu::RenderPipeline>,
     lines: wgpu::RenderPipeline,
+    /// The physical atmosphere: its tables, uniform and sky-view, and when
+    /// they are worked out again. See [`TileRenderer::set_sky`].
+    sky: crate::sky::Sky,
+    /// The atmosphere as the ground reads it (group 3): its tables without
+    /// the sky-view.
+    ground_air_bg: wgpu::BindGroup,
+    /// The air past everything: see [`TileRenderer::render_sky`].
+    sky_pipeline: wgpu::RenderPipeline,
+    sky_buf: wgpu::Buffer,
+    sky_bg: wgpu::BindGroup,
+    sky_air_bg: wgpu::BindGroup,
     view_buf: wgpu::Buffer,
     view_bg: wgpu::BindGroup,
     line_buf: Option<(wgpu::Buffer, u32)>,
@@ -103,6 +114,24 @@ impl TileRenderer {
                 label: Some("tuile ground"),
                 source: wgpu::ShaderSource::Wgsl(ground_wgsl(gpu.imagery_slots).into()),
             });
+        // The physical atmosphere: the ground reads its tables (group 3),
+        // the sky its sky-view besides.
+        let ground_air_bgl =
+            tuile_atmosphere::gpu::layout(&gpu.device, wgpu::ShaderStages::VERTEX_FRAGMENT, false);
+        let sky_air_bgl =
+            tuile_atmosphere::gpu::layout(&gpu.device, wgpu::ShaderStages::FRAGMENT, true);
+        let sky_state = crate::sky::Sky::new(&gpu.device, &sky_air_bgl);
+        let ground_air_bg = sky_state
+            .atmosphere
+            .bind_group(&gpu.device, &ground_air_bgl, false);
+        let sky_air_bg = sky_state
+            .atmosphere
+            .bind_group(&gpu.device, &sky_air_bgl, true);
+        gpu.queue.write_buffer(
+            &sky_state.atmosphere.uniform,
+            0,
+            bytemuck::bytes_of(&tuile_atmosphere::gpu::AtmosphereUniform::zeroed_off()),
+        );
         let layout = gpu
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -111,6 +140,7 @@ impl TileRenderer {
                     Some(&gpu.view_bgl),
                     Some(&gpu.tile_bgl),
                     Some(&gpu.material_bgl),
+                    Some(&ground_air_bgl),
                 ],
                 immediate_size: 0,
             });
@@ -327,6 +357,95 @@ impl TileRenderer {
                 cache: None,
             });
 
+        // The sky: one triangle over the picture, before everything, on the
+        // far plane, writing neither depth nor the ownership mark — what is
+        // behind the backdrop, as the backdrop is behind the ground.
+        let sky_bgl = gpu
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("tuile sky"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+        let sky_shader = gpu
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("tuile sky"),
+                source: wgpu::ShaderSource::Wgsl(sky_wgsl(direction.far()).into()),
+            });
+        let sky_layout = gpu
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("tuile sky"),
+                bind_group_layouts: &[Some(&sky_bgl), Some(&sky_air_bgl)],
+                immediate_size: 0,
+            });
+        let sky_pipeline = gpu
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("tuile sky"),
+                layout: Some(&sky_layout),
+                vertex: wgpu::VertexState {
+                    module: &sky_shader,
+                    entry_point: Some("vs_sky"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: depth_format,
+                    depth_write_enabled: Some(false),
+                    // On the far plane, so level with a cleared depth and
+                    // behind anything a host drew first.
+                    depth_compare: Some(direction.nearer_or_level()),
+                    stencil: wgpu::StencilState {
+                        front: wgpu::StencilFaceState::IGNORE,
+                        back: wgpu::StencilFaceState::IGNORE,
+                        read_mask: 0xff,
+                        write_mask: 0,
+                    },
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState {
+                    count: samples,
+                    ..Default::default()
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &sky_shader,
+                    entry_point: Some("fs_sky"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(target_format.into())],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+        let sky_buf = gpu
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("tuile sky uniform"),
+                contents: bytemuck::bytes_of(&SkyUniform::default()),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+        let sky_bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("tuile sky"),
+            layout: &sky_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: sky_buf.as_entire_binding(),
+            }],
+        });
+
         let view_buf = gpu
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -350,6 +469,12 @@ impl TileRenderer {
             fallback,
             wireframe,
             lines,
+            sky: sky_state,
+            ground_air_bg,
+            sky_pipeline,
+            sky_buf,
+            sky_bg,
+            sky_air_bg,
             view_buf,
             view_bg,
             line_buf: None,
@@ -360,9 +485,102 @@ impl TileRenderer {
         self.wireframe.is_some()
     }
 
-    /// Uploads the per-frame view uniform.
+    /// Uploads the per-frame view uniform — and, for the sky, its inverse
+    /// projection, worked out here so that no host has to.
     pub fn set_view(&self, queue: &wgpu::Queue, view: &ViewUniform) {
         queue.write_buffer(&self.view_buf, 0, bytemuck::bytes_of(view));
+        let inverse = crate::sky::inverse_view_proj(&view.view_proj);
+        queue.write_buffer(
+            &self.sky_buf,
+            0,
+            bytemuck::bytes_of(&inverse.to_cols_array()),
+        );
+    }
+
+    /// The physical atmosphere for this frame, lit at `sky`'s instant — or
+    /// none, the default: a scene that is not a planet has no air, and its
+    /// ground keeps [`ViewUniform::atmosphere`]'s closed-form haze.
+    ///
+    /// With one, the sky is drawn past the ground ([`Self::render_sky`]),
+    /// and every ground fragment is lit by the sun and the Moon of the
+    /// instant where it is, through the air between it and the eye — the
+    /// film's own model and code (`tuile_atmosphere::gpu`). Call it every
+    /// frame, after [`Self::set_view`]: what it costs is a uniform write,
+    /// and the light and the sky-view are worked out again only as the sun,
+    /// the Moon or the eye move (see `sky.rs`).
+    pub fn set_sky(&mut self, gpu: &GpuContext, sky: Option<&crate::sky::SkyFrame>) {
+        match sky {
+            None => self.sky.off(&gpu.queue),
+            Some(frame) => {
+                self.sky.update(&gpu.device, &gpu.queue, frame);
+                gpu.queue.write_buffer(
+                    &self.sky_buf,
+                    64,
+                    bytemuck::bytes_of(&[crate::sky::star_sigma(&frame.view), 0.0, 0.0, 0.0]),
+                );
+            }
+        }
+    }
+
+    /// The host's atmosphere for this frame: drawn, from its clock at
+    /// `wall` (Unix seconds) and `view`, when it is enabled; when it is
+    /// not, the path without one — closed-form haze, the clear colour past
+    /// the ground. The same as [`Self::set_air`] and [`Self::set_sky`]
+    /// together.
+    pub fn draw_atmosphere(
+        &mut self,
+        gpu: &GpuContext,
+        atmosphere: &crate::sky::Atmosphere,
+        view: &crate::sky::SkyView,
+        wall: f64,
+    ) {
+        if !atmosphere.enabled {
+            self.set_sky(gpu, None);
+            return;
+        }
+        self.set_air(atmosphere.params, atmosphere.look);
+        self.set_sky(gpu, Some(&atmosphere.frame(*view, wall)));
+    }
+
+    /// What the air is made of and how it is drawn: a clear day's and a
+    /// film's default look unless a host says otherwise
+    /// ([`tuile_atmosphere::AirTuning`], [`tuile_atmosphere::SkyLook::tuned`]).
+    pub fn set_air(
+        &mut self,
+        params: tuile_atmosphere::AtmosphereParams,
+        look: tuile_atmosphere::SkyLook,
+    ) {
+        self.sky.set_air(params, look);
+    }
+
+    /// The uniform the physical atmosphere was last drawn with: where the
+    /// sun and the Moon stood, the exposure, the grade. For a test or a
+    /// host that wants to know what the frame was lit by.
+    pub fn sky_uniform(&self) -> Option<tuile_atmosphere::gpu::AtmosphereUniform> {
+        self.sky
+            .is_on()
+            .then_some(self.sky.atmosphere.frame_uniform)
+    }
+
+    /// How many times the frame's light was worked out and its sky-view
+    /// made since this renderer was built: the budget, counted.
+    pub fn sky_updates(&self) -> (u64, u64) {
+        (self.sky.lights, self.sky.views)
+    }
+
+    /// Draws the sky: the air on every line of sight, over the whole picture,
+    /// on the far plane and writing no depth — so everything drawn after it
+    /// covers it, and nothing a host drew before it is covered. Nothing
+    /// without a physical atmosphere ([`Self::set_sky`]): the clear colour
+    /// stays.
+    pub fn render_sky(&self, pass: &mut wgpu::RenderPass<'_>) {
+        if !self.sky.is_on() {
+            return;
+        }
+        pass.set_pipeline(&self.sky_pipeline);
+        pass.set_bind_group(0, &self.sky_bg, &[]);
+        pass.set_bind_group(1, &self.sky_air_bg, &[]);
+        pass.draw(0..3, 0..1);
     }
 
     /// Replaces the debug line set (e.g. bounding volume edges).
@@ -418,6 +636,7 @@ impl TileRenderer {
         pass.set_stencil_reference(OWNED);
         pass.set_pipeline(&self.fallback);
         pass.set_bind_group(0, &self.view_bg, &[]);
+        pass.set_bind_group(3, &self.ground_air_bg, &[]);
         for tile in tiles {
             pass.set_bind_group(1, &tile.tile_bg, &[]);
             for mesh in &tile.meshes {
@@ -440,6 +659,7 @@ impl TileRenderer {
         pass.set_stencil_reference(OWNED);
         pass.set_pipeline(&self.background);
         pass.set_bind_group(0, &self.view_bg, &[]);
+        pass.set_bind_group(3, &self.ground_air_bg, &[]);
         for tile in tiles {
             pass.set_bind_group(1, &tile.tile_bg, &[]);
             for mesh in &tile.meshes {
@@ -476,6 +696,7 @@ impl TileRenderer {
         pass.set_stencil_reference(OWNED);
         pass.set_pipeline(solid);
         pass.set_bind_group(0, &self.view_bg, &[]);
+        pass.set_bind_group(3, &self.ground_air_bg, &[]);
         let tiles: Vec<&PreparedTile> = tiles.collect();
         for tile in &tiles {
             pass.set_bind_group(1, &tile.tile_bg, &[]);
@@ -540,6 +761,7 @@ impl TileRenderer {
         overlay: Option<&crate::overlay::OverlayRenderer>,
         wireframe: bool,
     ) {
+        self.render_sky(pass);
         self.render_background(pass, backdrop);
         self.render(pass, tiles, wireframe);
         // After the tiles that own their ground, so it is occluded by them —
@@ -567,6 +789,12 @@ impl TileRenderer {
 /// ask for exactly what the backend compiles, rather than reassembling it and
 /// hoping the order matches.
 pub fn ground_wgsl(slots: u32) -> String {
+    let air = format!(
+        "{}{}\n{}",
+        tuile_atmosphere::hillaire::wgsl_bindings(3),
+        tuile_atmosphere::hillaire::WGSL,
+        tuile_atmosphere::gpu::SEEN_WGSL
+    );
     let mut bindings = String::from("struct ImageryUniform {\n");
     // Two vec4 per slot: coverage, then placement. One array rather than an
     // array of structs, because that is the layout with no padding to reason
@@ -584,7 +812,7 @@ pub fn ground_wgsl(slots: u32) -> String {
         ));
     }
     format!(
-        "{}\n{}\n{}",
+        "{}\n{}\n{air}\n{}",
         tuile_core::raster::WGSL,
         tuile_atmosphere::WGSL,
         include_str!("shader.wgsl")
@@ -599,5 +827,38 @@ pub fn ground_wgsl(slots: u32) -> String {
             )
             .replace("//#IMAGERY_BINDINGS", &bindings)
             .replace("//#IMAGERY_SAMPLES", samples.trim_start()),
+    )
+}
+
+/// The sky's own uniform: its inverse projection and a star's size.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SkyUniform {
+    inverse_view_proj: [f32; 16],
+    stars: [f32; 4],
+}
+
+impl Default for SkyUniform {
+    fn default() -> Self {
+        Self {
+            inverse_view_proj: Mat4::IDENTITY.to_cols_array(),
+            stars: [0.0; 4],
+        }
+    }
+}
+
+/// The sky shader: the atmosphere's bindings (group 1), its WGSL, then the
+/// sky's own pass, drawn at `far_depth` — the far plane of the target's
+/// depth convention.
+///
+/// Public for the same reason as the ground's shader: a test, or a translator,
+/// asks for exactly what the backend compiles.
+pub fn sky_wgsl(far_depth: f32) -> String {
+    format!(
+        "{}{}\n{}\n{}",
+        tuile_atmosphere::hillaire::wgsl_bindings(1),
+        tuile_atmosphere::hillaire::WGSL,
+        tuile_atmosphere::gpu::SEEN_WGSL,
+        include_str!("sky.wgsl").replace("/*SKY_DEPTH*/", &format!("{far_depth:?}")),
     )
 }

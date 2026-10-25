@@ -65,6 +65,8 @@ pub(crate) struct Snapshot {
     pub layer: usize,
     /// Which diagnostic view is drawn; 0 is the real picture.
     pub diagnostic: usize,
+    /// The scene's clock: the instant drawn, and how it runs.
+    pub clock: crate::menu::Clock,
 }
 
 impl Snapshot {
@@ -102,6 +104,7 @@ impl Snapshot {
             imagery: None,
             layer: 0,
             diagnostic: 0,
+            clock: crate::menu::Clock::default(),
         }
     }
 }

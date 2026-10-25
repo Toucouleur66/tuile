@@ -40,3 +40,6 @@ tokio = { workspace = true, features = ["net"] }
 tracing-subscriber = { workspace = true }
 tuile-cesium-ion = { version = "0.14.0", path = "../../crates/tuile-cesium-ion", features = ["proxy"] }
 tuile-viewer = { version = "0.14.0", path = "../../crates/tuile-viewer", features = ["control"] }
+# The sunset sequence (`examples/sunset`): its instants, from the ephemeris.
+tuile-atmosphere = { version = "0.14.0", path = "../../crates/tuile-atmosphere" }
+tuile-core = { version = "0.14.0", path = "../../crates/tuile-core" }

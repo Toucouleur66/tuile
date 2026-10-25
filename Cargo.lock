@@ -7787,8 +7787,10 @@ dependencies = [
  "astro",
  "bytemuck",
  "glam 0.33.2",
+ "pollster",
  "solar-positioning",
  "tuile-core",
+ "wgpu",
 ]
 
 [[package]]
@@ -8531,8 +8533,10 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "tuile-atmosphere",
  "tuile-bing",
  "tuile-cesium-ion",
+ "tuile-core",
  "tuile-native-fetchers",
  "tuile-viewer",
  "url",

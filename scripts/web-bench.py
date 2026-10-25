@@ -234,6 +234,9 @@ async def pattern(args, ws_url, name):
         query.append(f"backend={args.backend}")
     if args.compression:
         query.append(f"compression={args.compression}")
+    if args.time:
+        # The scene's clock, held: every pattern lit for one instant.
+        query.append(f"time={args.time}&timeRate=0")
     url = args.url + ("?" + "&".join(query) if query else "")
     log = open(os.path.join(out, "console.log"), "w")
     async with websockets.connect(ws_url, max_size=None) as ws:
@@ -446,6 +449,8 @@ def main():
     a.add_argument("--backend", choices=["webgpu", "webgl2"], default="webgpu")
     a.add_argument("--compression", choices=["off", "auto", "bc7", "astc"], default=None,
                    help="the page's imageryCompression (?compression=); unset, the page's default")
+    a.add_argument("--time", default=None,
+                   help="the instant the scene is lit for (now, sunset, an RFC 3339 instant), held")
     a.add_argument("--dpr", type=float, default=2.0)
     a.add_argument("--size", type=lambda s: tuple(int(v) for v in s.split("x")), default=(1280, 800))
     a.add_argument("--patterns", type=lambda s: s.split(","), default=list(PATTERNS))

@@ -88,6 +88,16 @@ struct Atmosphere {
     // the ground, under 10 km and from over it; w: nothing. Tuning values
     // a host reads (`tuning.rs`), never the shader.
     tuning: vec4f,
+    // xyz: the eye from the origin the renderer's positions are relative
+    // to — nothing where they are the eye's already, as a film's are; w:
+    // nothing.
+    eye: vec4f,
+    // xyz: the sky's light averaged over every facing, pre-exposed — the
+    // constant `sh_x`, `sh_y` and `sh_z` are added to; w: nothing.
+    ambient: vec4f,
+    // xyz: the camera's white balance; w: where the roll-off of highlights
+    // begins. For a renderer that draws straight to the display (`graded`).
+    grade: vec4f,
 }
 
 const ATMOSPHERE_PI: f32 = 3.14159265358979;

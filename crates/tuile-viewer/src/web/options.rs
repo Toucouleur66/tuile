@@ -53,6 +53,29 @@ pub(crate) struct Options {
     /// See [`tuile_wgpu::ImageryCompression`].
     #[serde(default, deserialize_with = "compression")]
     pub imagery_compression: tuile_wgpu::ImageryCompression,
+    /// The instant the scene is lit for: `now` (the default), `sunset`,
+    /// `sunrise` or an RFC 3339 instant — as the `--time` flag.
+    #[serde(default)]
+    pub time: Option<String>,
+    /// Added to it: `-3h30m`, `+45m` — as `--time-offset`.
+    #[serde(default)]
+    pub time_offset: Option<String>,
+    /// Scene seconds a second: 1 by default — as `--time-rate`.
+    #[serde(default)]
+    pub time_rate: Option<f64>,
+}
+
+impl Options {
+    /// The scene's clock these options state, or the sentence that says
+    /// which of them is wrong.
+    pub(crate) fn clock(&self) -> Result<tuile_atmosphere::ClockSettings, String> {
+        let rate = self.time_rate.map(|r| r.to_string());
+        tuile_atmosphere::ClockSettings::parse(
+            self.time.as_deref(),
+            self.time_offset.as_deref(),
+            rate.as_deref(),
+        )
+    }
 }
 
 /// A compression named as the flag names it: `off`, `auto`, `bc7`, `astc`.
@@ -452,6 +475,28 @@ mod tests {
 
     /// Each compression the package documents reads as the flag's; anything
     /// else is refused, naming the four.
+    /// The scene's clock, as the flags give it: the present in real time by
+    /// default, or a start, an offset and a rate; a wrong one refused.
+    #[test]
+    fn the_clock_is_read_as_the_flags_read_it() {
+        let with = |extra: &str| {
+            options(&CATALOG.replacen(
+                r#""name": "Atlas","#,
+                &format!(r#""name": "Atlas", {extra}"#),
+                1,
+            ))
+            .expect("valid")
+            .clock()
+        };
+        let none = options(CATALOG).expect("valid").clock();
+        assert_eq!(none, Ok(tuile_atmosphere::ClockSettings::default()));
+        let set =
+            with(r#""time": "sunset", "timeOffset": "-30m", "timeRate": 30,"#).expect("valid");
+        assert_eq!(set.start, tuile_atmosphere::Start::Sunset);
+        assert_eq!((set.offset, set.rate), (-1800.0, 30.0));
+        assert!(with(r#""time": "teatime","#).is_err());
+    }
+
     #[test]
     fn imagery_compression_is_named() {
         use tuile_core::texels::BlockFormat;

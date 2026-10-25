@@ -31,6 +31,12 @@ FLAGS (each takes one number; `--flag value` or `--flag=value`):
                        (asks the system's location service; the view moves
                        when the answer arrives, and stays put if none does)
     --imagery <name>   the imagery layer to open on, by key or by name
+    --time <when>      the instant the scene is lit for: now (the default),
+                       sunset or sunrise (the next one over the start view),
+                       or an RFC 3339 instant (2026-06-21T19:42:00Z)
+    --time-offset <d>  added to it: -3h30m, +45m, 90s
+    --time-rate <x>    scene seconds a second: 1 (real time, the default),
+                       60 (an hour a minute), 0 (frozen), -1 (backwards)
 IMAGERY_LAYERS
     --imagery-compression <off|auto|bc7|astc>
                        how imagery is held on the GPU: off (RGBA8, the
@@ -70,6 +76,14 @@ KEYS:
     W                  wireframe
     D                  cycle the diagnostic views
     F                  freeze the traversal
+    J                  the scene's clock a quarter of an hour back
+    K                  a quarter of an hour on
+    Y                  an hour back
+    U                  an hour on
+    E                  the clock slower (past real time: backwards)
+    R                  the clock faster
+    P                  pause the clock, or run it again
+    T                  back to the present, in real time
 ";
 
 /// What only an application that is its own window answers.
@@ -204,6 +218,8 @@ pub(crate) fn view_in_link(text: &str) -> Option<StartView> {
 /// What the command line asked for.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, PartialEq)]
+// Read once, at start: a few hundred bytes on the stack is nothing to box.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Invocation {
     /// Open the window on this view — and, with `here`, move it over the
     /// current location once the system says where that is. The view's own
@@ -221,6 +237,9 @@ pub(crate) enum Invocation {
         imagery: Option<String>,
         addresses: Addresses,
         compression: Option<tuile_wgpu::ImageryCompression>,
+        /// `--time`, `--time-offset` and `--time-rate`: the instant the scene
+        /// is lit for, and how it runs.
+        clock: tuile_atmosphere::ClockSettings,
     },
     /// Print [`usage`] and leave.
     Help,
@@ -407,11 +426,14 @@ where
     let mut here = false;
     let mut imagery: Option<String> = None;
     // The flags that take text: each at most once.
-    let mut texts: [(&str, Option<String>); 4] = [
+    let mut texts: [(&str, Option<String>); 7] = [
         ("--terrain-url", None),
         ("--imagery-template", None),
         ("--imagery-scheme", None),
         ("--imagery-max-level", None),
+        ("--time", None),
+        ("--time-offset", None),
+        ("--time-rate", None),
     ];
     let mut compression: Option<tuile_wgpu::ImageryCompression> = None;
     let mut seen = [false; FLAGS.len()];
@@ -498,7 +520,13 @@ where
     if here && (seen[0] || seen[1]) {
         return Err("--here and --lon/--lat both say where to start; give one".to_owned());
     }
-    let [(_, terrain), (_, template), (_, scheme), (_, max_level)] = texts;
+    let [(_, terrain), (_, template), (_, scheme), (_, max_level), (_, time), (_, offset), (_, rate)] =
+        texts;
+    let clock = tuile_atmosphere::ClockSettings::parse(
+        time.as_deref(),
+        offset.as_deref(),
+        rate.as_deref(),
+    )?;
     let addresses = addresses(terrain, template, scheme, max_level)?;
     // The template is the only layer: there is no other for `--imagery` to
     // name.
@@ -515,6 +543,7 @@ where
         imagery,
         addresses,
         compression,
+        clock,
     })
 }
 
@@ -582,6 +611,7 @@ mod tests {
             imagery: None,
             addresses,
             compression: None,
+            clock: _,
         }) = parsed
         else {
             unreachable!("{args:?} should start a session, got {parsed:?}");
@@ -889,6 +919,7 @@ mod tests {
                 imagery: None,
                 addresses: Addresses::default(),
                 compression: None,
+                clock: Default::default(),
             })
         );
         // Either order, either coordinate.

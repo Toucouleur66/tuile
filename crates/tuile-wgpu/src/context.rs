@@ -205,8 +205,13 @@ impl GpuContext {
     /// Wraps an existing device/queue (the viewer path: the host created
     /// them against its surface).
     pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
+        // The physical atmosphere's tables share the ground's fragment
+        // stage with the imagery.
         let imagery_slots = tuile_core::raster::imagery_slots(
-            device.limits().max_sampled_textures_per_shader_stage,
+            device
+                .limits()
+                .max_sampled_textures_per_shader_stage
+                .saturating_sub(tuile_atmosphere::gpu::GROUND_TEXTURES),
         );
         let uniform_entry = |binding| wgpu::BindGroupLayoutEntry {
             binding,

@@ -16,3 +16,13 @@ bytemuck.workspace = true
 tuile-core = { path = "../tuile-core" }
 solar-positioning.workspace = true
 astro.workspace = true
+# The tables, the sky-view and the uniform on a GPU, shared by every wgpu
+# renderer that draws this air — the film's and the viewer's — so that they
+# hold one implementation and not two. Optional: the physics needs no GPU.
+wgpu = { workspace = true, optional = true }
+
+[features]
+wgpu = ["dep:wgpu"]
+
+[dev-dependencies]
+pollster.workspace = true

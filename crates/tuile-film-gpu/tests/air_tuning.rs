@@ -61,7 +61,14 @@ fn uniforms(air: &AirTuning) -> (AtmosphereUniform, FrameUniform, Look) {
             camera: look.camera,
         },
     );
-    let atmosphere = AtmosphereUniform::new(&params, &sky, eye, 1.0, None, &look);
+    let atmosphere = AtmosphereUniform::new(
+        &params,
+        &sky,
+        eye,
+        1.0,
+        None,
+        &tuile_film_gpu::sky_look(&look),
+    );
     let view = BakedView {
         position: eye.to_array(),
         direction: (-eye.normalize()).to_array(),

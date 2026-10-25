@@ -82,6 +82,10 @@ pub const SKY_STEPS: usize = 30;
 /// Directions over which the sky's irradiance is summed.
 const IRRADIANCE_DIRECTIONS: usize = 1024;
 
+/// A clear day's tables ([`LutAtmosphere::today`]), as
+/// [`LutAtmosphere::table_bytes`] writes them.
+pub const TODAY_TABLES: &[u8] = include_bytes!("today.tables");
+
 /// The physical atmosphere of one [`AtmosphereParams`], its two constant
 /// tables built.
 #[derive(Debug, Clone)]
@@ -220,6 +224,62 @@ impl LutAtmosphere {
         atmosphere.multi_scattering = atmosphere.build_multi_scattering();
         atmosphere.irradiance = atmosphere.build_irradiance();
         atmosphere
+    }
+
+    /// A clear day's atmosphere ([`AtmosphereParams::default`]), its tables
+    /// read rather than computed: [`TODAY_TABLES`], made by
+    /// `examples/bake_today_tables.rs` from [`Self::new`] and held to it by a
+    /// test. Building them takes seconds even optimised — a wait an
+    /// interactive viewer cannot put before its first frame, least of all
+    /// in a browser, where it would hold the page's only thread. Stored as
+    /// 32-bit floats, which is what a GPU is handed anyway.
+    pub fn today() -> Self {
+        let mut texels = TODAY_TABLES
+            .as_chunks::<12>()
+            .0
+            .iter()
+            .map(|t| {
+                let c =
+                    |i: usize| f64::from(f32::from_le_bytes([t[i], t[i + 1], t[i + 2], t[i + 3]]));
+                [c(0), c(4), c(8)]
+            })
+            .collect::<Vec<_>>();
+        let count = |[w, h]: [usize; 2]| w * h;
+        assert_eq!(
+            texels.len(),
+            count(TRANSMITTANCE_SIZE) + count(MULTI_SCATTERING_SIZE) + count(IRRADIANCE_SIZE),
+            "TODAY_TABLES holds the three tables"
+        );
+        let irradiance = texels.split_off(texels.len() - count(IRRADIANCE_SIZE));
+        let multi_scattering = texels.split_off(texels.len() - count(MULTI_SCATTERING_SIZE));
+        Self {
+            params: AtmosphereParams::default(),
+            transmittance: texels,
+            multi_scattering,
+            irradiance,
+        }
+    }
+
+    /// `params`' atmosphere: a clear day's read ([`Self::today`]), any
+    /// other computed ([`Self::new`]).
+    pub fn of(params: AtmosphereParams) -> Self {
+        if params == AtmosphereParams::default() {
+            Self::today()
+        } else {
+            Self::new(params)
+        }
+    }
+
+    /// The three tables as [`TODAY_TABLES`] stores them: transmittance,
+    /// multiple scattering, then irradiance, three little-endian 32-bit
+    /// floats a texel.
+    pub fn table_bytes(&self) -> Vec<u8> {
+        self.transmittance
+            .iter()
+            .chain(&self.multi_scattering)
+            .chain(&self.irradiance)
+            .flat_map(|t| t.iter().flat_map(|&v| (v as f32).to_le_bytes()))
+            .collect()
     }
 
     pub fn params(&self) -> &AtmosphereParams {
@@ -1061,6 +1121,53 @@ mod tests {
     fn clear() -> &'static LutAtmosphere {
         static CLEAR: OnceLock<LutAtmosphere> = OnceLock::new();
         CLEAR.get_or_init(|| LutAtmosphere::new(AtmosphereParams::default()))
+    }
+
+    /// The tables a viewer reads instead of computing them are the ones the
+    /// model computes, to the 32-bit float they are stored in — on any
+    /// machine: one ulp of a float either way, for the last bit of an f64
+    /// a platform's `exp` rounds differently.
+    #[test]
+    fn todays_tables_are_what_the_model_computes() {
+        let read = LutAtmosphere::today();
+        let made = clear();
+        assert_eq!(read.params(), made.params());
+        for (name, a, b) in [
+            (
+                "transmittance",
+                read.transmittance_table(),
+                made.transmittance_table(),
+            ),
+            (
+                "multiple scattering",
+                read.multi_scattering_table(),
+                made.multi_scattering_table(),
+            ),
+            (
+                "irradiance",
+                read.irradiance_table(),
+                made.irradiance_table(),
+            ),
+        ] {
+            assert_eq!(a.len(), b.len(), "{name}");
+            for (i, (a, b)) in a.iter().zip(b).enumerate() {
+                for c in 0..3 {
+                    let off = (a[c] - b[c]).abs();
+                    assert!(
+                        off <= 3e-7 * b[c].abs() + 1e-30,
+                        "{name} texel {i} channel {c}: stored {} computed {} — run \
+                         `cargo run --release -p tuile-atmosphere --example bake_today_tables`",
+                        a[c],
+                        b[c]
+                    );
+                }
+            }
+        }
+        // And a clear day asked for by its parameters is the one read.
+        assert_eq!(
+            LutAtmosphere::of(AtmosphereParams::default()).table_bytes(),
+            TODAY_TABLES
+        );
     }
 
     fn up_at(elevation_deg: f64) -> DVec3 {

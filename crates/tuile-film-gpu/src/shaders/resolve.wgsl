@@ -221,17 +221,11 @@ fn resolve(@builtin(global_invocation_id) id: vec3u) {
             radiance = base * (ambient + frame.sun.xyz * cos * lit);
         }
         if (known && physical) {
-            // The ground's own light, where it is: its sun and Moon through
-            // the air above it, its sky — so that a terminator a frame
-            // shows falls where it is, the night side lit by the night.
-            let x = ground - atmosphere.centre.xyz;
-            let r = length(x);
-            let light = ground_light(r - atmosphere.centre.w, x / r, normal, ambient, lit);
-            // Never darker than ground of a fortieth's reflectance: a night
-            // sea's imagery is all but black, and so would be its picture.
-            let texel_floor = 0.025 * atmosphere.illuminance.y
-                / (ATMOSPHERE_PI * max(atmosphere.ground.y, 1e-30));
-            radiance = max(base, vec3f(texel_floor)) * light + city_light(p, light);
+            // The ground's own light and the air between the eye and it
+            // (`ground_seen`, the viewer's too). Under a physical
+            // atmosphere there is no closed-form haze: the block below is
+            // not reached.
+            radiance = ground_seen(base, p, ground, normal, ambient, lit);
         }
         if (known && frame.haze.w != 0.0) {
             // What the air leaves of the ground, and its own light for the
@@ -239,51 +233,6 @@ fn resolve(@builtin(global_invocation_id) id: vec3u) {
             // exactly as it was.
             let left = air_left(ground);
             radiance = radiance * left + frame.horizon.xyz * (1.0 - left);
-        }
-        if (known && physical) {
-            // The air between the eye and the ground, marched over the
-            // tables: what it lets through, and the light it scatters
-            // towards the eye under the sun and the Moon — with, at night,
-            // the floor's share of the sky's, so that far ground fades to
-            // the night sky.
-            let air = air_between(ground);
-            var veil = air.inscattered * atmosphere.illuminance.xyz;
-            {
-                // The veil bounded: never more than a few times the light of
-                // the ground under it, on ground of a tenth's reflectance.
-                // By day the air seldom reaches it; at twilight the air,
-                // still lit by the sky high above, would otherwise lay a
-                // uniform grey over ground lit by little — and the relief
-                // would go. A soft bound: the veil it leaves keeps its
-                // colour and its gradient with distance.
-                let luma = vec3f(0.2126, 0.7152, 0.0722);
-                let x = ground - atmosphere.centre.xyz;
-                let r = length(x);
-                let lit = ground_light(r - atmosphere.centre.w, x / r, x / r, ambient, 1.0);
-                let texel = 0.1 * atmosphere.illuminance.y / (ATMOSPHERE_PI * max(atmosphere.ground.y, 1e-30));
-                let cap = atmosphere.tuning.x * texel * dot(lit, luma);
-                let v = dot(veil, luma);
-                veil /= sqrt(1.0 + (v / max(cap, 1e-30)) * (v / max(cap, 1e-30)));
-            }
-            radiance = radiance * air.transmittance
-                + veil
-                + atmosphere.floor.xyz * (vec3f(1.0) - air.transmittance);
-            // Where the camera is exposed for a day side, the night side is
-            // shown no darker than the night sky beside it: ground of a
-            // tenth's reflectance at the sky's least, its own imagery
-            // scaling it (a sea darker, snow brighter), fading with
-            // distance to the sky's least itself. Without it, ground the
-            // least light shows at a sixteenth of noon times its
-            // reflectance is all but black, and across a night side seen
-            // at a grazing angle the air leaves next to nothing of it — a
-            // black band under a sky drawn no darker than its least.
-            let luma = vec3f(0.2126, 0.7152, 0.0722);
-            let texel_floor = 0.025 * atmosphere.illuminance.y
-                / (ATMOSPHERE_PI * max(atmosphere.ground.y, 1e-30));
-            let tenths = dot(max(base, vec3f(texel_floor)), luma)
-                / max(0.1 * atmosphere.illuminance.y / (ATMOSPHERE_PI * max(atmosphere.ground.y, 1e-30)), 1e-30);
-            let shown = atmosphere.least_sky.xyz * (min(tenths, 3.0) * air.transmittance + (vec3f(1.0) - air.transmittance));
-            radiance = max(radiance, shown);
         }
     }
     // The probe of holes: a pixel whose ground is not a place, or is

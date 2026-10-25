@@ -163,6 +163,7 @@ fn start_viewer_with(
     super::imagery::begin();
     let launch = session::start(&plan);
     let retries = Retries::new(move || session::start(&plan));
+    let clock = options.clock().map_err(|e| JsError::new(&e))?;
     let config = ViewerConfig {
         controller: CameraController::new(view.camera()).with_min_altitude(1.0),
         frame_host,
@@ -172,11 +173,8 @@ fn start_viewer_with(
         here: None,
         requests: crate::desktop::listen(),
         remembers,
-        lit_at_unix_seconds: web_time::SystemTime::now()
-            .duration_since(web_time::UNIX_EPOCH)
-            .map_or(0.0, |d| d.as_secs_f64()),
-        // A page has no environment: today's air.
-        air: tuile_atmosphere::AerialAir::default(),
+        clock,
+        air: tuile_atmosphere::AirTuning::default(),
         pinned_level: Some(profile.pinned_level),
         profile,
         retries: Some(retries),

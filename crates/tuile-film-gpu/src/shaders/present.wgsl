@@ -25,58 +25,12 @@ fn oetf(c: vec3f) -> vec3f {
     return select(1.055 * pow(x, vec3f(1.0 / 2.4)) - 0.055, 12.92 * x, x <= vec3f(0.0031308));
 }
 
-// The physical sky along `d` from the frame's eye: what the air sends
-// under the sun and under the Moon — from the frame's sky-view tables in
-// the air, marched along the ray itself from above it, where the air is a
-// band a few degrees thick along the limb that no table row could hold —
-// what the night floor adds, and behind the air the sun's disc, darkened
-// towards its limb, the Moon's in its phase and the stars, dimmed by the
-// air before them and hidden by the planet.
-fn sky_seen(d: vec3f) -> vec3f {
-    let n = normalize(d);
-    let h = atmosphere.sun.w;
-    let up = atmosphere.up.xyz;
-    var air = vec3f(0.0);
-    if (h > atmosphere.shape.y) {
-        var axis = vec3f(0.0, 0.0, 1.0);
-        if (abs(up.z) > 0.9) { axis = vec3f(1.0, 0.0, 0.0); }
-        let east = normalize(cross(axis, up));
-        let north = cross(up, east);
-        let local = vec3f(dot(n, east), dot(n, north), dot(n, up));
-        let s = atmosphere.sun.xyz;
-        air = sky_radiance(h, local, vec3f(dot(s, east), dot(s, north), dot(s, up)));
-        if (atmosphere.moon.w > 0.0) {
-            let m = atmosphere.moon.xyz;
-            air += sky_radiance(h, local, vec3f(dot(m, east), dot(m, north), dot(m, up)))
-                * atmosphere.moon.w;
-        }
-    } else {
-        air = lut_bilinear(sky_view_lut, sky_view_uv_of(d, atmosphere.sun.xyz)).rgb;
-        if (atmosphere.moon.w > 0.0) {
-            air += lut_bilinear(moon_view_lut, sky_view_uv_of(d, atmosphere.moon.xyz)).rgb
-                * atmosphere.moon.w;
-        }
-    }
-    var sky = max(air * atmosphere.illuminance.xyz + atmosphere.floor.xyz, atmosphere.least_sky.xyz);
-    // Behind the air, unless the planet stands before it.
-    let r = LUT_RADIUS + max(h, 0.0);
-    if (ground_distance(r, dot(n, up), max(h, 0.0)) >= 0.0) { return sky; }
-    var beyond = vec3f(0.0);
-    let apart = acos(clamp(dot(n, atmosphere.sun.xyz), -1.0, 1.0));
-    // Drawn larger by its scale, its surface as bright as it is.
-    let sun_rho = SUN_ANGULAR_RADIUS * max(atmosphere.discs.x, 0.0);
-    if (apart < sun_rho) {
-        let x = apart / sun_rho;
-        let limb = 1.0 - 0.6 * (1.0 - sqrt(max(1.0 - x * x, 0.0)));
-        let solid = 2.0 * ATMOSPHERE_PI * (1.0 - cos(SUN_ANGULAR_RADIUS));
-        let mu_s = dot(up, atmosphere.sun.xyz);
-        beyond += sunlight(h, mu_s) * limb / solid;
-    }
-    beyond += moon_seen(n);
-    // A star's image about a pixel wide: the pixel's angle, supersampled.
+// The physical sky is `sky_seen` (`tuile_atmosphere`'s `seen.wgsl`, the
+// viewer's too), a star's image about a pixel wide: the pixel's angle,
+// supersampled.
+fn star_sigma() -> f32 {
     let pixel = 2.0 * length(frame.up.xyz) / f32(frame.size.y);
-    beyond += stars_seen(n, 0.8 * pixel);
-    return sky + beyond * atmosphere.illuminance.xyz;
+    return 0.8 * pixel;
 }
 
 // Where the unit direction `s` from the eye falls on the supersampled
@@ -157,7 +111,7 @@ fn present(@builtin(global_invocation_id) id: vec3u) {
                 if (atmosphere.shape.w != 0.0) {
                     let ndc = (vec2f(s) + 0.5) / vec2f(frame.size.xy) * vec2f(2.0, -2.0)
                         + vec2f(-1.0, 1.0);
-                    sum += sky_seen(frame.fwd.xyz + ndc.x * frame.right.xyz + ndc.y * frame.up.xyz);
+                    sum += sky_seen(frame.fwd.xyz + ndc.x * frame.right.xyz + ndc.y * frame.up.xyz, star_sigma());
                 } else if (frame.haze.w != 0.0) {
                     // The sample's own ray, as the resolve builds it.
                     let ndc = (vec2f(s) + 0.5) / vec2f(frame.size.xy) * vec2f(2.0, -2.0)
@@ -195,19 +149,8 @@ fn present(@builtin(global_invocation_id) id: vec3u) {
         let y = dot(linear, luma);
         linear = max(vec3f(y) + (linear - vec3f(y)) * frame.to_sun.w, vec3f(0.0));
     }
-    // Highlights are rolled off, not cut: above the knee luminance bends
-    // towards white and never reaches past it, colours keeping their
-    // ratios. A picture pushed bright keeps what its bright ground showed,
-    // where a straight clip turned towns and beaches to flat white.
-    let lit = dot(linear, luma);
-    let knee = frame.white_balance.w;
-    if (lit > knee) {
-        // tanh of a large number is 1, but written as a ratio of two
-        // exponentials some drivers make it ∞/∞: a sun's disc, thousands of
-        // times white, came out black. Past 10 it is 1 to the last bit.
-        let bent = knee + (1.0 - knee) * tanh(min((lit - knee) / (1.0 - knee), 10.0));
-        linear *= bent / lit;
-    }
+    // Highlights are rolled off, not cut (`roll_off`).
+    linear = roll_off(linear, frame.white_balance.w);
     if (overlaid) {
         // Over what the display would show: the picture is clipped first,
         // as the curve below clips it anyway, so a pixel no overlay touches
