@@ -5,7 +5,7 @@
 
 This is an analysis and a set of proposals. It changes no code. It measures `origin/main` at
 `07be3d0` (v0.7.0) against the "one foundation for every render mode" manifesto
-(`docs/00-vision.md` on branch `docs/manifesto-universal`), against `CLAUDE.md`, and against
+(`docs/00-vision.md` as rewritten in PR #59), against `CLAUDE.md`, and against
 `docs/01-architecture.md`.
 
 The owner's position: film is one render mode among the others. The goal is a solid foundation
@@ -19,7 +19,91 @@ that serves everywhere and compiles everywhere: wasm, headset, mobile, film and 
 - In-flight branches: `../tuile-sky` and `../tuile-ios` were read and not modified. Both are
   uncommitted work on `3703e07`, two commits behind main.
 
+## Status on 2026-10-25 (v0.14.0)
+
+Everything after this section measures `07be3d0` (v0.7.0, 2026-10-17) and is kept as written: its
+`file:line` references are to that commit. This section records what changed since, and where each
+proposal stands.
+
+**What happened since 2026-10-17** (v0.7.1 → v0.14.0).
+- The two in-flight branches landed: the iPhone viewer with async launch, touch, mobile caches and a
+  lifecycle (#62), and the sky, sun and Moon that follow the clock (#61). An Android shell followed
+  (#74).
+- One viewer for the web and native (#70): `tuile-viewer` runs in the browser on `tuile-wgpu`, on
+  WebGPU and WebGL2. The hand-written GLSL copy is gone. Imagery and terrain decode in a pool of Web
+  Workers (#78).
+- The graphics budget (#71, #99, then A1 #109 and A3 #108): one ledger decides residency and uploads
+  for every mode — interactive on desktop, phone and web, and the bake under a batch profile.
+- Host APIs: the host camera (#103); a host's overlays drawn in the world, in a neutral
+  `tuile-overlay` crate with a world-overlay pass in `tuile-wgpu` (#111); `tuile-wgpu` drawing on a
+  device and queue and into a frame the host owns (#126).
+- wgpu 30, naga 30, glam 0.33.2, `rust-version = "1.97"` (#117), with an MSRV job.
+- GPU-compressed imagery, **the client's choice and off by default** (#114, #120, #121, #122, #127):
+  `ImageryCompression` Off / Auto / a format; BC7 or ASTC 4×4 encoded on the GPU, stored KTX2/UASTC
+  transcoded only, a CPU path in the web decode workers for WebGL2. The bake and the film stay RGBA8,
+  and tuile codes no licence rule.
+- Terrain from any `layer.json` URL and a heightfield source with a full quantized-mesh encoder
+  (#116, #118, #129).
+- CI: the wasm guard on every wasm crate plus clippy of the viewer, web and wgpu crates on wasm32
+  (#66), Android, the web package, the budget simulation and `cargo doc -D warnings`. A README per
+  crate shown as its rustdoc (#131; the render, film and tool crates in #133).
+
+**The first game consumer.** A mobile-first 3D strategy game, compiled to wasm on Bevy 0.20, is the
+first host outside film and the viewer. Its needs, stated generically, now shape the interactive
+side: Bevy integration that reuses `tuile-wgpu` on the host's device (`tuile-bevy`: 4a native globe in
+review as #136, then 4b web and 4c ground heights and picking); batched ground heights read from the
+displayed mesh; picking; host content sharing depth with the ground; a tile budget of about
+300–350 MB on a mid-range phone; terrain and imagery served by the host over plain HTTP. Nothing in
+tuile is specific to it.
+
+**The proposals of section 5.**
+
+| Move | Status |
+|---|---|
+| 5.0a Fix and guard the browser path | **Done** (#66; the guard now covers ten crates) |
+| 5.0b Bound the stream and the browser maps | **In part.** The graphics budget bounds residency and uploads in every consumer (#99). The stream's channel pair in `protocol.rs` is still `unbounded()`. |
+| 5.0c Park USD/Hydra | Not done: both are still workspace members |
+| 5.0d Delete dead features | Not done: `tuile-core/http` and `SkyShell` remain |
+| 5.1 Shared look crate | **In part.** No `tuile-look`; `tuile-wgpu` draws `tuile-atmosphere`'s aerial perspective from the crate's WGSL. `Look`, `FrameLight`, exposure and the Hillaire sky are still film-only. |
+| 5.2 Shared consumer scene state | Not done as written. To revisit against the graphics budget, which now decides what each consumer holds. |
+| 5.3 One camera model | Not done |
+| 5.4 Overlays as a shared host API | **Largely done** (#111): `tuile-overlay` holds the types, `tuile-wgpu` draws them natively and on the web. Lighting and shadows of overlays are still film-only. |
+| 5.5 Stereo in the live viewer | Not done |
+| 5.6 Bounded and device-sized everything | **In part.** Device profiles in the viewer (#62), budget profiles in the core, `TUILE_*` concurrency knobs (#75). No core `DeviceProfile` / `RenderIntent`. |
+| 5.7 Radiometry for every mode | Not done |
+| 5.8 Split the film-family plumbing | Not done: `tuile-film-native` still depends on `tuile-bake` |
+| 5.9 The interactive renderer on the web | **Done** (#70). Open question 3 is answered: `tuile-wgpu` is the browser renderer. |
+
+Open questions 6 (in-flight branches) and 8 (`block_on` at startup, fixed by the async launch of
+#62) are closed.
+
+**The road to 1.0 (section 7.5).**
+- Step 1: the wasm matrix, the MSRV job (1.97.1) and Android are in CI; an iOS check and cargo-deny
+  are not.
+- Step 3 is done (tuile-sky and tuile-ios landed).
+- `#[non_exhaustive]` now appears in the budget module and a few config types, not yet on the
+  protocol or content enums.
+- New public surface to weigh before freezing anything: the host frame API of `tuile-wgpu` (wgpu
+  types by design), `tuile-overlay`, the compression API (`ImageryCompression`, the capabilities
+  struct), the heightfield and HTTP terrain sources, and `tuile-bevy`.
+
+**New work that feeds this roadmap.**
+- **The compression budget** (next): with compression on, the budget under-counts what crosses
+  (87,408 resident bytes per BC7 tile against 349,524 RGBA8 bytes uploaded), never charges the
+  encode's transient memory or the encoder's scratch, and paces encodes outside `FrameDeadline`
+  (settle 5.0 s → 10.2 s with BC7). A plan of eight PRs moves cost per path, the transient peak,
+  reservations and an encode lane into the core budget, then the wgpu pump and the web CPU path.
+- **meshopt, always on.** Reading `EXT_meshopt_compression` / `KHR_meshopt_compression` and
+  `KHR_mesh_quantization` becomes part of tuile-core's glTF decoding by default, with no cargo
+  feature. It rests on a lapoule-dev fork of the pure-Rust `meshoptimizer-rs`, pinned by rev, with
+  versioned vectors against the scalar reference encoder and SIMD paths byte-identical to the
+  scalar one on every target. The crate stays independent of tuile and serves Bevy too. A plan is
+  to be approved before any code.
+- **Procedural terrain with unbounded detail** (exploration in #132): a separate deterministic
+  terrain source next to the heightfield, identical in native and wasm.
+
 **Contents.**
+- [Status on 2026-10-25](#status-on-2026-10-25-v0140)
 - [Executive summary](#executive-summary)
 - [1. Workspace map](#1-workspace-map)
 - [2. Duplication and divergence between modes](#2-duplication-and-divergence-between-modes)
