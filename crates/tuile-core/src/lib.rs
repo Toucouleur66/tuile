@@ -23,6 +23,7 @@ pub mod source;
 pub mod stitch;
 pub mod storage;
 pub mod stored;
+pub mod surface;
 pub mod texels;
 pub mod tiles3d;
 pub mod tileset;

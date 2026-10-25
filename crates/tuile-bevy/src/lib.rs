@@ -40,6 +40,9 @@
 //! - **Places its own entities** with a [`GeoAnchor`], in `f64`, and draws
 //!   them in its own pipelines: Bevy's main pass runs after the globe's and
 //!   is depth-tested against the ground.
+//! - **Stands its units on the ground and picks it** with [`TuileGround`]:
+//!   heights from the drawn triangles, batched, and screen rays — see
+//!   [`ground`].
 //! - **Says what it will need** with [`PreloadViews`]: poses traversed this
 //!   frame and never drawn.
 //! - **Sizes the globe's share** of the device with a [`TuileBudget`], and
@@ -67,6 +70,7 @@
 
 pub mod budget;
 pub mod camera;
+pub mod ground;
 mod render;
 mod session;
 pub mod sources;
@@ -83,6 +87,7 @@ pub use budget::TuileBudget;
 pub use camera::{
     local_frame, FloatingOrigin, GeoAnchor, PreloadView, PreloadViews, Priority, TuileCamera,
 };
+pub use ground::{GroundHeight, GroundHit, LonLat, TuileGround};
 pub use render::BARE_GROUND;
 pub use sources::{GlobeSources, ImagerySpec, TerrainSpec, XyzTemplate};
 pub use status::{SessionState, TuileLight, TuileStatus};
@@ -162,6 +167,10 @@ impl Plugin for TuilePlugin {
             .map(|adapter| tuile_wgpu::texture_caps(adapter))
             .unwrap_or_default();
         let shared = app.world().resource::<status::SharedStatus>().clone();
+        let ground = ground::SharedSurface::default();
+        app.insert_resource(TuileGround {
+            surface: ground.clone(),
+        });
         let plan = session::Plan {
             sources: self.sources.clone(),
             budget: self.budget.clone(),
@@ -172,7 +181,7 @@ impl Plugin for TuilePlugin {
         let slot = start(app, plan, &shared);
         render::add_to(
             app,
-            render::GlobeRender::new(slot, self.compression, Arc::clone(&shared.0)),
+            render::GlobeRender::new(slot, self.compression, Arc::clone(&shared.0), ground),
         );
     }
 }

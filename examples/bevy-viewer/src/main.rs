@@ -7,7 +7,9 @@
 //! An orbit camera of the kind a strategy game has: it looks at a point on
 //! the ground from a distance, tilted. Left-drag pans the point, right-drag
 //! turns and tilts, the wheel zooms from 30 km down to 50 m. Pillars of the
-//! application's own stand on the map, their feet hidden by the ground.
+//! application's own stand on the drawn ground (`TuileGround::ground_heights`,
+//! one batch a frame), and a marker follows the cursor on it
+//! (`TuileGround::pick_viewport`).
 //!
 //! ```text
 //! cargo run --release -p tuile-heightfield-serve        # terminal 1
@@ -41,9 +43,10 @@ use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseSc
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use bevy::render::view::Msaa;
+use glam::DVec3;
 use tuile_bevy::{
-    local_frame, GeoAnchor, GlobeCamera, GlobeSources, ImageryCompression, TuileBudget,
-    TuileCamera, TuilePlugin, TuileStatus, XyzTemplate,
+    local_frame, FloatingOrigin, GeoAnchor, GlobeCamera, GlobeSources, ImageryCompression, LonLat,
+    TuileBudget, TuileCamera, TuileGround, TuilePlugin, TuileStatus, XyzTemplate,
 };
 use tuile_core::geo::{enu_frame, geodetic_to_ecef, Geodetic};
 
@@ -249,7 +252,15 @@ fn main() {
     .add_systems(Startup, setup)
     .add_systems(
         Update,
-        (steer, aim, report, screenshot_when_settled).chain(),
+        (
+            steer,
+            aim,
+            stand_on_the_ground,
+            follow_the_cursor,
+            report,
+            screenshot_when_settled,
+        )
+            .chain(),
     );
     #[cfg(target_arch = "wasm32")]
     app.add_systems(Update, publish);
@@ -329,10 +340,10 @@ fn setup(
         },
         Transform::from_rotation(Quat::from_rotation_x(-1.0)),
     ));
-    // Pillars of the application's own, 1.2 km tall from 100 m under the
-    // ellipsoid: the map's relief stands 60 to 930 m, so their feet are
-    // hidden by the ground they stand in.
-    let pillar = meshes.add(Cuboid::new(80.0, 1200.0, 80.0));
+    // Pillars of the application's own, 300 m tall, stood on the drawn
+    // ground every frame (`stand_on_the_ground`): they follow it as it
+    // refines.
+    let pillar = meshes.add(Cuboid::new(60.0, PILLAR_M as f32, 60.0));
     let colours = [
         Color::srgb(0.85, 0.25, 0.2),
         Color::srgb(0.95, 0.75, 0.2),
@@ -340,11 +351,11 @@ fn setup(
     ];
     for i in -2i32..=2 {
         for j in -2..=2 {
-            let at = GeoAnchor::geodetic(
+            let place = LonLat::new(
                 orbit.lon + f64::from(i) * 0.012,
                 orbit.lat + f64::from(j) * 0.012,
-                500.0,
             );
+            let at = GeoAnchor::geodetic(place.lon, place.lat, 0.0);
             let colour = colours[(i + j).rem_euclid(3) as usize];
             commands.spawn((
                 Mesh3d(pillar.clone()),
@@ -353,9 +364,91 @@ fn setup(
                     ..default()
                 })),
                 at,
+                OnTheGround {
+                    place,
+                    lift: PILLAR_M / 2.0,
+                },
                 Transform::from_rotation(local_frame(at.0)),
             ));
         }
+    }
+    // The marker under the cursor: where a ray through the pixel meets the
+    // drawn ground (`follow_the_cursor`).
+    commands.spawn((
+        Mesh3d(meshes.add(Sphere::new(1.0))),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgb(1.0, 0.1, 0.8),
+            unlit: true,
+            ..default()
+        })),
+        GeoAnchor(DVec3::ZERO),
+        Transform::default(),
+        Visibility::Hidden,
+        Cursor,
+    ));
+}
+
+/// A pillar's height, metres.
+const PILLAR_M: f64 = 300.0;
+
+/// An entity stood on the drawn ground at `place`, its centre `lift`
+/// metres above it.
+#[derive(Component)]
+struct OnTheGround {
+    place: LonLat,
+    lift: f64,
+}
+
+/// The marker under the cursor.
+#[derive(Component)]
+struct Cursor;
+
+/// Every grounded entity, at the drawn ground's height under it: one batch
+/// a frame.
+fn stand_on_the_ground(
+    ground: Res<TuileGround>,
+    mut placed: Query<(&OnTheGround, &mut GeoAnchor)>,
+) {
+    let places: Vec<LonLat> = placed.iter().map(|(g, _)| g.place).collect();
+    let heights = ground.ground_heights(&places);
+    for ((on, mut anchor), h) in placed.iter_mut().zip(heights) {
+        let at = GeoAnchor::geodetic(on.place.lon, on.place.lat, h.height + on.lift);
+        if *anchor != at {
+            *anchor = at;
+        }
+    }
+}
+
+/// The marker, where the ray under the cursor meets the drawn ground (the
+/// window's middle without a cursor), sized
+/// to stay visible from any range.
+fn follow_the_cursor(
+    ground: Res<TuileGround>,
+    origin: Res<FloatingOrigin>,
+    windows: Query<&Window>,
+    cameras: Query<(&Camera, &GlobalTransform), With<TuileCamera>>,
+    mut marker: Query<(&mut GeoAnchor, &mut Transform, &mut Visibility), With<Cursor>>,
+) {
+    let Ok((mut anchor, mut transform, mut visibility)) = marker.single_mut() else {
+        return;
+    };
+    let hit = (|| {
+        // The cursor, or the middle of the window when there is none (a
+        // touch screen, a window not under the pointer).
+        let window = windows.iter().next()?;
+        let cursor = window
+            .cursor_position()
+            .unwrap_or(Vec2::new(window.width(), window.height()) / 2.0);
+        let (camera, camera_transform) = cameras.iter().next()?;
+        ground.pick_viewport(camera, camera_transform, &origin, cursor)
+    })();
+    match hit {
+        Some(hit) => {
+            anchor.0 = hit.ecef;
+            transform.scale = Vec3::splat((hit.distance * 0.006).max(1.0) as f32);
+            *visibility = Visibility::Visible;
+        }
+        None => *visibility = Visibility::Hidden,
     }
 }
 
