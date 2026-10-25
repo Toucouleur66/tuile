@@ -25,6 +25,8 @@ parameters; a backend draws with them.
 
 ## The pieces
 
+- [`clock`] — the scene's instant from the wall's: a start, an offset
+  and a rate ([`SceneClock`]).
 - [`sun`] — where the sun is at a stated instant. Everything else is
   downstream of it, which is why a globe lit "at 18:00 UTC" needs this rather
   than a direction someone picked by eye.

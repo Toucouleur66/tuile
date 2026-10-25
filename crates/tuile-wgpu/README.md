@@ -15,6 +15,12 @@ before fast — this is the core's shop window, not a game engine
   device supports it, + debug lines for bounding volumes)
 - [`ContentPump`] — the async→frame bridge over any
   [`tuile_core::protocol::GeometryStream`]
+- [`Atmosphere`] — the physical atmosphere a host configures
+  ([`AtmosphereConfig`]: on or off, the air, the look, the clock) and
+  draws each frame ([`TileRenderer::draw_atmosphere`]); [`SkyFrame`] —
+  the same for one stated instant: the sky, the sun,
+  the Moon and the stars past the ground, and the air before it
+  ([`TileRenderer::set_sky`]), the film's own model and code
 - [`OverlayRenderer`] — pixel-space triangles over the scene, for the
   on-screen controls a host builds with `tuile-ui`
 - [`FrameTargets`] — the multisampled colour and depth a frame is drawn
