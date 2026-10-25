@@ -164,8 +164,11 @@ fn start_viewer_with(
     let launch = session::start(&plan);
     let retries = Retries::new(move || session::start(&plan));
     let clock = options.clock().map_err(|e| JsError::new(&e))?;
+    let max_altitude = options.max_altitude().map_err(|e| JsError::new(&e))?;
     let config = ViewerConfig {
-        controller: CameraController::new(view.camera()).with_min_altitude(1.0),
+        controller: CameraController::new(view.camera())
+            .with_min_altitude(1.0)
+            .with_max_altitude(max_altitude),
         frame_host,
         title: options.name,
         layers,

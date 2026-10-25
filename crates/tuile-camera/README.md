@@ -16,7 +16,9 @@ The gestures follow Cesium's `ScreenSpaceCameraController`:
   under the end cursor — exact 1:1 surface dragging, independent of zoom
   (Cesium `pan3D`);
 - **zoom** scales the *altitude* toward the point under the cursor, clamped
-  above the surface (never through it);
+  above the surface (never through it) and under a ceiling it slows into
+  (`max_altitude`, by default twice the distance at which the globe fits
+  the view: 36 043 km — see `default_max_altitude`);
 - **tilt** / **heading** orbit the look-at point on the surface.
 
 Cameras that follow a subject along a route known in advance — smoothed,

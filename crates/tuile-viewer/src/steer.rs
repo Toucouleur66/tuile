@@ -533,10 +533,13 @@ pub(crate) fn north_up(controller: &mut CameraController, viewport: (f64, f64)) 
 /// A jump across a country is not a gesture, and easing it would drag the eye
 /// through the planet in a straight line. The controller is rebuilt rather
 /// than patched because its gesture target is private — and that is right: a
-/// target left behind would pull the eye straight back. The floor and the
-/// relief it is measured against carry over.
+/// target left behind would pull the eye straight back. The floor, the
+/// ceiling and the relief the floor is measured against carry over, so a
+/// goto beyond the ceiling lands at it.
 pub(crate) fn jump(controller: &mut CameraController, camera: GlobeCamera) {
-    let mut moved = CameraController::new(camera).with_min_altitude(controller.min_altitude);
+    let mut moved = CameraController::new(camera)
+        .with_min_altitude(controller.min_altitude)
+        .with_max_altitude(controller.max_altitude);
     if let Some(ground) = controller.ground() {
         moved = moved.with_ground(ground.clone());
     }
@@ -1102,6 +1105,31 @@ mod tests {
             assert!(turn.abs() < 1e-3, "{back:?}");
             assert!((back.pitch - view.pitch).abs() < 1e-3, "{back:?}");
         }
+    }
+
+    /// A goto past the ceiling lands at it, over the place it named; a
+    /// goto under it is untouched; the controller's own ceiling survives
+    /// the jump.
+    #[test]
+    fn a_goto_beyond_the_ceiling_is_held_to_it() {
+        let mut c = controller(StartView::default()).with_max_altitude(5_000_000.0);
+        let Command::Goto(goto) = one("tuile://goto?lon=139.69&lat=35.69&altitude=9e7&pitch=90")
+        else {
+            unreachable!("a goto");
+        };
+        go(&mut c, goto);
+        let there = view_of(&c.camera);
+        assert!((there.altitude - 5_000_000.0).abs() < 1e-3, "{there:?}");
+        assert!((there.lon - 139.69).abs() < 1e-9 && (there.lat - 35.69).abs() < 1e-9);
+        assert_eq!(c.max_altitude, 5_000_000.0);
+        go(
+            &mut c,
+            Goto {
+                altitude: Some(3_000.0),
+                ..Goto::default()
+            },
+        );
+        assert!((view_of(&c.camera).altitude - 3_000.0).abs() < 1e-3);
     }
 
     #[test]

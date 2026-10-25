@@ -30,6 +30,10 @@ pub(crate) struct Options {
     pub backend: BackendChoice,
     #[serde(default)]
     pub view: Option<ViewSpec>,
+    /// The highest the eye may go, metres above the ellipsoid — as
+    /// `--max-altitude`; the camera's own ceiling when left out.
+    #[serde(default)]
+    pub max_altitude: Option<f64>,
     /// Whether the on-screen controls and the menu are drawn.
     #[serde(default = "yes")]
     pub ui: bool,
@@ -66,6 +70,17 @@ pub(crate) struct Options {
 }
 
 impl Options {
+    /// The camera's ceiling these options state, held to the bounds an
+    /// altitude is, or the sentence that says it is out of them.
+    pub(crate) fn max_altitude(&self) -> Result<f64, String> {
+        self.max_altitude
+            .map(|m| {
+                crate::start::checked("altitude", m)
+                    .map_err(|why| why.replace("--altitude", "maxAltitude"))
+            })
+            .unwrap_or_else(|| Ok(tuile_camera::default_max_altitude()))
+    }
+
     /// The scene's clock these options state, or the sentence that says
     /// which of them is wrong.
     pub(crate) fn clock(&self) -> Result<tuile_atmosphere::ClockSettings, String> {
@@ -477,6 +492,26 @@ mod tests {
     /// else is refused, naming the four.
     /// The scene's clock, as the flags give it: the present in real time by
     /// default, or a start, an offset and a rate; a wrong one refused.
+    #[test]
+    fn the_max_altitude_is_an_altitude() {
+        let with = |extra: &str| {
+            options(&CATALOG.replacen(
+                r#""name": "Atlas","#,
+                &format!(r#""name": "Atlas", {extra}"#),
+                1,
+            ))
+            .expect("valid")
+            .max_altitude()
+        };
+        assert_eq!(
+            options(CATALOG).expect("valid").max_altitude(),
+            Ok(tuile_camera::default_max_altitude())
+        );
+        assert_eq!(with(r#""maxAltitude": 500000,"#), Ok(500_000.0));
+        let why = with(r#""maxAltitude": 0,"#).expect_err("out of bounds");
+        assert!(why.contains("maxAltitude"), "{why}");
+    }
+
     #[test]
     fn the_clock_is_read_as_the_flags_read_it() {
         let with = |extra: &str| {

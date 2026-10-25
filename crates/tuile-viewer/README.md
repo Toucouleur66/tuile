@@ -51,7 +51,19 @@ that, and are the only flags there are (`--help` lists them with the keys):
                           RFC 3339 (2026-06-21T19:42:00Z)
 --time-offset <d>         added to it: -30m, -3h30m, 45m, 90s
 --time-rate <x>           scene seconds a second: 1, 30, 0 (frozen), -1
+--max-altitude <m>        the highest the eye may go, above the ellipsoid;
+                          36 043 km by default (twice the distance at which
+                          the globe fits the view)
 ```
+
+The eye is held between a floor, a metre over the ground, and a ceiling,
+`--max-altitude` above the ellipsoid — every gesture, a link, `--altitude`,
+the control API and a host's `place` alike; only a host's `drive` is its own.
+Past either bound it is brought back without a word, and a zoom out slows
+into the ceiling rather than stopping against it. A host sets both per frame
+through `HostCamera::set_min_altitude` and `set_max_altitude`, or on the
+`CameraController` it hands the viewer.
+
 
 C copies a link to the present view and its moment. A running viewer can be
 steered by other programs with URLs of the same form — `tuile://goto?…`,

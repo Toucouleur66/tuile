@@ -100,7 +100,8 @@ impl App {
         };
         let (w, h) = self.viewport();
         let mut camera =
-            crate::frame_host::HostCamera::new(self.controller.camera, self.fixed_aspect);
+            crate::frame_host::HostCamera::new(self.controller.camera, self.fixed_aspect)
+                .with_altitude_range(self.controller.min_altitude, self.controller.max_altitude);
         let mut preload = std::mem::take(&mut self.preload);
         preload.clear();
         // Overlays are the other way round: taken out and put back as they
@@ -122,6 +123,14 @@ impl App {
                 ground: self.controller.ground().map(|g| g.as_ref()),
             };
             host.before_frame(dt.as_secs_f64(), &mut frame);
+        }
+        // The bounds first: a place this frame is held to the new ones.
+        let (min, max) = camera.taken_altitudes();
+        if let Some(min) = min {
+            self.controller.min_altitude = min;
+        }
+        if let Some(max) = max {
+            self.controller.set_max_altitude(max);
         }
         match camera.taken() {
             Some(crate::frame_host::Asked::Drive(pose)) => self.controller.drive(pose),

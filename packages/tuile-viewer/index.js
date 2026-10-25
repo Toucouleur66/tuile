@@ -101,6 +101,7 @@ export async function createViewer(container, options) {
     deviceMemory: navigator.deviceMemory,
     backend: o.backend ?? "auto",
     view: o.view,
+    maxAltitude: o.maxAltitude,
     ui: o.ui ?? true,
     attribution: o.attribution ?? "bottom-right",
     showUnsupportedMessage: o.showUnsupportedMessage ?? true,
