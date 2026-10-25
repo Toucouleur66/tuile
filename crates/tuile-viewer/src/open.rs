@@ -21,6 +21,7 @@
 //!   `--imagery-scheme` on the command line).
 
 use tuile_core::raster::TilingScheme;
+use tuile_terrain::LayerJson;
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::embed::ImageryChoice;
@@ -59,12 +60,48 @@ impl TerrainChoice {
             cache: format!("terrain-url-{}", address_key(url)),
         }
     }
+
+    /// The namespace its tiles are stored under, once its `layer.json` has
+    /// been read.
+    ///
+    /// A catalogued terrain keeps [`TerrainChoice::cache`] as its host named
+    /// it: the tiles stored by earlier releases are found again. A terrain at
+    /// a URL adds the edition its `layer.json` declares — its `version`, or,
+    /// when it has none, a hash of everything it says — so a server that
+    /// regenerates a different terrain at the same address does not get the
+    /// old one's tiles back from the store.
+    ///
+    /// What this cannot see: a server that changes its tiles while answering
+    /// the same `layer.json` word for word, `version` included. Bumping the
+    /// `version` is how such a server says the tiles are new.
+    pub(crate) fn namespace_for(&self, layer: &LayerJson) -> String {
+        if self.asset != URL_TERRAIN {
+            return self.cache.clone();
+        }
+        let edition = match layer.version.as_deref() {
+            Some(version) => format!("v{}", address_key(version)),
+            // As read, written back: the fields in the order they are
+            // declared, whatever order the server sent them in.
+            None => format!(
+                "h{}",
+                address_key(&serde_json::to_string(layer).unwrap_or_default())
+            ),
+        };
+        format!("{}-{edition}", self.cache)
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl ImageryChoice {
     /// A layer from a URL template, stored under a namespace of its own: two
     /// templates never serve each other's tiles, whatever their keys.
+    ///
+    /// The namespace is the template and nothing else. A template server
+    /// publishes no document to read an edition from, and its tiles' own
+    /// validators (`ETag`, `Last-Modified`) would cost a request per stored
+    /// tile to compare — the round trip the store is there to save. A server
+    /// that draws a different map at the same template says so by changing
+    /// the template: a query such as `?v=2`, which it may ignore, is enough.
     pub(crate) fn from_template(
         key: &str,
         name: &str,
@@ -135,6 +172,54 @@ mod tests {
             a.cache,
             TerrainChoice::at_url("http://127.0.0.1:8093/terrain/layer.json").cache
         );
+    }
+
+    /// A `layer.json` as a server would answer it, at `version`.
+    fn layer(version: Option<&str>, maxzoom: u32) -> LayerJson {
+        let mut layer = LayerJson::from_slice(
+            br#"{"format":"quantized-mesh-1.0","tiles":["{z}/{x}/{y}.terrain"]}"#,
+        )
+        .expect("a layer.json");
+        layer.version = version.map(str::to_owned);
+        layer.maxzoom = maxzoom;
+        layer
+    }
+
+    /// A server that regenerates a different terrain at the same URL says so
+    /// in its `layer.json` — its `version`, or else its contents — and the
+    /// store does not hand back the old one's tiles.
+    #[test]
+    fn a_terrain_at_a_url_is_stored_by_its_edition() {
+        let at = TerrainChoice::at_url("http://127.0.0.1:8092/terrain/layer.json");
+        let v1 = at.namespace_for(&layer(Some("1.0.0"), 14));
+        assert_eq!(v1, at.namespace_for(&layer(Some("1.0.0"), 14)), "stable");
+        assert!(v1.starts_with(&at.cache), "{v1}");
+        assert_ne!(v1, at.namespace_for(&layer(Some("2.0.0"), 14)));
+
+        // No version: what the layer.json says, all of it.
+        let bare = at.namespace_for(&layer(None, 14));
+        assert_eq!(bare, at.namespace_for(&layer(None, 14)), "stable");
+        assert_ne!(bare, at.namespace_for(&layer(None, 15)));
+        assert_ne!(bare, v1);
+
+        // Pinned: a release that changes these strings throws every stored
+        // tile of a URL terrain away.
+        assert_eq!(
+            at.namespace_for(&layer(Some("1.0.0"), 14)),
+            format!("{}-v{}", at.cache, address_key("1.0.0"))
+        );
+    }
+
+    /// A terrain a catalog names keeps the namespace its host gave it, read
+    /// or not: the tiles stored before this release are still found.
+    #[test]
+    fn a_catalogued_terrain_keeps_its_namespace() {
+        let ion = TerrainChoice {
+            asset: 1,
+            cache: "terrain-1".into(),
+        };
+        assert_eq!(ion.namespace_for(&layer(Some("1.2.0"), 14)), "terrain-1");
+        assert_eq!(ion.namespace_for(&layer(None, 3)), "terrain-1");
     }
 
     #[test]

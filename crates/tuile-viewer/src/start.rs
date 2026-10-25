@@ -45,6 +45,8 @@ SOURCES BY ADDRESS (no catalog, no token; each replaces the host's own):
                                  (TMS: row 0 in the south)
     --imagery-template <url>     imagery from a URL template naming {z}, {x}, {y},
                                  addressed XYZ (row 0 in the north); the only layer
+                                 Its tiles are stored by the template: when the server
+                                 redraws them, change it (`?v=2`) to fetch them anew
     --imagery-scheme <grid>      the template's grid: webmercator (1 tile at level 0,
                                  the default) or geographic (2 tiles at level 0)
     --imagery-max-level <n>      the deepest level the template serves; deeper,
