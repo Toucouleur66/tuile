@@ -27,6 +27,10 @@ FLAGS (each takes one number; `--flag value` or `--flag=value`):
     --altitude <m>     height of the eye above the ellipsoid [1, 1e8]      default 2000000
     --heading <deg>    view direction, 0 = north, clockwise  [-360, 360]   default 0
     --pitch <deg>      angle below the horizon, 90 = down    [0, 90]       default 90
+    --max-altitude <m> the highest the eye may go, metres above the ellipsoid
+                       [1, 1e8]; default 36043000, twice the distance at which
+                       the globe fits the view. --altitude above it, a link
+                       or a zoom out are held under it
     --here             start over the current location instead of --lon/--lat
                        (asks the system's location service; the view moves
                        when the answer arrives, and stays put if none does)
@@ -246,6 +250,8 @@ pub(crate) enum Invocation {
         /// `--time`, `--time-offset` and `--time-rate`: the instant the scene
         /// is lit for, and how it runs.
         clock: tuile_atmosphere::ClockSettings,
+        /// `--max-altitude`, metres: the camera's ceiling, when said.
+        max_altitude: Option<f64>,
     },
     /// Print [`usage`] and leave.
     Help,
@@ -432,7 +438,7 @@ where
     let mut here = false;
     let mut imagery: Option<String> = None;
     // The flags that take text: each at most once.
-    let mut texts: [(&str, Option<String>); 7] = [
+    let mut texts: [(&str, Option<String>); 8] = [
         ("--terrain-url", None),
         ("--imagery-template", None),
         ("--imagery-scheme", None),
@@ -440,6 +446,7 @@ where
         ("--time", None),
         ("--time-offset", None),
         ("--time-rate", None),
+        ("--max-altitude", None),
     ];
     let mut compression: Option<tuile_wgpu::ImageryCompression> = None;
     let mut seen = [false; FLAGS.len()];
@@ -526,8 +533,14 @@ where
     if here && (seen[0] || seen[1]) {
         return Err("--here and --lon/--lat both say where to start; give one".to_owned());
     }
-    let [(_, terrain), (_, template), (_, scheme), (_, max_level), (_, time), (_, offset), (_, rate)] =
+    let [(_, terrain), (_, template), (_, scheme), (_, max_level), (_, time), (_, offset), (_, rate), (_, ceiling)] =
         texts;
+    // Read as an altitude is, with the same bounds: it is one.
+    let max_altitude = ceiling
+        .map(|text| {
+            value("altitude", &text).map_err(|why| why.replace("--altitude", "--max-altitude"))
+        })
+        .transpose()?;
     let clock = tuile_atmosphere::ClockSettings::parse(
         time.as_deref(),
         offset.as_deref(),
@@ -550,6 +563,7 @@ where
         addresses,
         compression,
         clock,
+        max_altitude,
     })
 }
 
@@ -618,6 +632,7 @@ mod tests {
             addresses,
             compression: None,
             clock: _,
+            max_altitude: None,
         }) = parsed
         else {
             unreachable!("{args:?} should start a session, got {parsed:?}");
@@ -867,9 +882,38 @@ mod tests {
             "--imagery-template",
             "--imagery-scheme",
             "--imagery-max-level",
+            "--max-altitude",
         ] {
             assert!(FLAGS_TEXT.contains(flag), "{flag} is in --help");
         }
+    }
+
+    /// `--max-altitude` is an altitude, read and bounded as `--altitude`
+    /// is, once; the default `--help` states is the camera's own.
+    #[test]
+    fn the_max_altitude_is_read_as_an_altitude() {
+        let said = |args: &[&str]| match parse(args) {
+            Ok(Invocation::Run { max_altitude, .. }) => Ok(max_altitude),
+            Ok(other) => unreachable!("{other:?}"),
+            Err(why) => Err(why),
+        };
+        assert_eq!(said(&[]), Ok(None));
+        assert_eq!(said(&["--max-altitude", "500000"]), Ok(Some(500_000.0)));
+        assert_eq!(said(&["--max-altitude=2e7"]), Ok(Some(2.0e7)));
+        for bad in [
+            &["--max-altitude", "0"][..],
+            &["--max-altitude", "far"],
+            &["--max-altitude", "1e9"],
+        ] {
+            let why = said(bad).expect_err("refused");
+            assert!(why.contains("--max-altitude"), "{why}");
+        }
+        assert!(said(&["--max-altitude", "1e6", "--max-altitude", "2e6"]).is_err());
+        let default = (tuile_camera::default_max_altitude() / 1000.0).round() * 1000.0;
+        assert!(
+            FLAGS_TEXT.contains(&format!("default {default}")),
+            "{default}"
+        );
     }
 
     /// `--imagery-compression` takes one of four names, once; without it
@@ -926,6 +970,7 @@ mod tests {
                 addresses: Addresses::default(),
                 compression: None,
                 clock: Default::default(),
+                max_altitude: None,
             })
         );
         // Either order, either coordinate.

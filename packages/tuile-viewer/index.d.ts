@@ -92,6 +92,12 @@ export interface ViewerOptions {
    */
   decodeWorkers?: number;
   /**
+   * The highest the eye may go, metres above the ellipsoid: a zoom out slows
+   * into it, and a `view` or a `flyTo` above it is held to it. By default
+   * twice the distance at which the whole globe fits the view — 36 043 km.
+   */
+  maxAltitude?: number;
+  /**
    * How imagery is held on the GPU. `"off"` unless said: RGBA8, as always.
    * `"auto"` holds it block-compressed — a quarter of the memory — in the
    * best format the page's own device samples: BC7 or ASTC 4×4 encoded on the

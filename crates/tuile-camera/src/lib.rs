@@ -54,6 +54,25 @@ fn wrap_angle(radians: f64) -> f64 {
 /// this should re-measure with `examples/orbit-probe` rather than assume.
 pub const DEFAULT_GLOBE_FOVY: f64 = 35.0 * std::f64::consts::PI / 180.0;
 
+/// The highest a person's gestures take the eye by default, metres above the
+/// ellipsoid: twice as far from the Earth's centre as the eye that just fits
+/// the whole globe in [`DEFAULT_GLOBE_FOVY`].
+///
+/// ```text
+/// fit      = a / sin(fovy / 2)          the distance at which the globe's limb
+///                                       touches the top and bottom of the frame
+/// ceiling  = 2 × fit − a                metres above the ellipsoid
+///          = 2 × 6 378 137 / sin(17.5°) − 6 378 137 ≈ 36 043 km
+/// ```
+///
+/// From there the globe fills about half the frame's height: the whole
+/// planet in view with room around it, and nothing further out is a view of
+/// it. That it lands within a few hundred kilometres of the geostationary
+/// orbit is a coincidence, and a convenient one to remember.
+pub fn default_max_altitude() -> f64 {
+    2.0 * WGS84_A / (DEFAULT_GLOBE_FOVY * 0.5).sin() - WGS84_A
+}
+
 /// A free camera in ECEF: eye position, view direction and up — the minimal
 /// state Cesium's `Camera` carries, enough to build any view.
 #[derive(Debug, Clone, Copy)]
@@ -366,6 +385,16 @@ pub struct CameraController {
     /// ellipsoid otherwise. The difference is the whole point: a floor measured
     /// from the ellipsoid puts the eye kilometres inside anything mountainous.
     pub min_altitude: f64,
+    /// Farthest the eye may get from the surface (metres above the
+    /// ellipsoid): [`default_max_altitude`] unless said otherwise. The
+    /// floor wins where the two cross.
+    ///
+    /// Every way in but [`Self::drive`] is held under it, silently, as the
+    /// floor holds from below: gestures through [`Self::update`], a place
+    /// through [`Self::jump_to`] and a new controller through
+    /// [`Self::with_max_altitude`]. A zoom out slows as it comes near it
+    /// rather than stopping against it.
+    pub max_altitude: f64,
     /// Eased toward by [`Self::update`] for smooth motion (optional).
     target: GlobeCamera,
     /// The surface to stay above. `None` clamps against the ellipsoid alone.
@@ -404,6 +433,7 @@ impl std::fmt::Debug for CameraController {
         f.debug_struct("CameraController")
             .field("camera", &self.camera)
             .field("min_altitude", &self.min_altitude)
+            .field("max_altitude", &self.max_altitude)
             .field("target", &self.target)
             .field("ground", &self.ground.is_some())
             .finish()
@@ -419,6 +449,7 @@ impl CameraController {
             // a floor of zero would let the eye sink through a summit the
             // moment a finer tile raised it.
             min_altitude: 1.0,
+            max_altitude: default_max_altitude(),
             target: camera,
             ground: None,
             driven: false,
@@ -452,6 +483,31 @@ impl CameraController {
     /// there is nothing to say about the relief.
     fn lifted(&self, position: DVec3) -> DVec3 {
         lift_above_ground(position, &self.surface(), self.min_altitude)
+    }
+
+    /// The highest the eye may be, metres above the ellipsoid: the ceiling,
+    /// unless the floor stands above it.
+    fn ceiling(&self) -> f64 {
+        self.max_altitude.max(self.min_altitude)
+    }
+
+    /// Lowers a position to the ceiling if it has risen above it, straight
+    /// down: the same point of the globe under it, nearer.
+    fn lowered(&self, position: DVec3) -> DVec3 {
+        let g = ecef_to_geodetic(position);
+        let ceiling = self.ceiling();
+        if g.height <= ceiling {
+            return position;
+        }
+        geodetic_to_ecef(Geodetic {
+            height: ceiling,
+            ..g
+        })
+    }
+
+    /// Both bounds, the floor last: where they cross, the ground wins.
+    fn bounded(&self, position: DVec3) -> DVec3 {
+        self.lifted(self.lowered(position))
     }
 
     /// The surface point the orbiting gestures pivot about: what the screen
@@ -496,6 +552,48 @@ impl CameraController {
     pub fn with_min_altitude(mut self, m: f64) -> Self {
         self.min_altitude = m;
         self
+    }
+
+    /// Sets [`Self::max_altitude`] and holds the eye under it at once — the
+    /// camera and the gesture target both, so a controller made over a view
+    /// above the ceiling opens at the ceiling rather than sinking to it.
+    /// A value that is not a positive number leaves the ceiling as it was.
+    pub fn with_max_altitude(mut self, m: f64) -> Self {
+        self.set_max_altitude(m);
+        self
+    }
+
+    /// [`Self::with_max_altitude`], on a controller in use: what a host
+    /// changes between two frames.
+    pub fn set_max_altitude(&mut self, m: f64) {
+        if !(m.is_finite() && m > 0.0) {
+            return;
+        }
+        self.max_altitude = m;
+        if !self.driven {
+            self.camera.position = self.lowered(self.camera.position);
+            self.target.position = self.lowered(self.target.position);
+        }
+    }
+
+    /// Trims a zoom's climb so that the eye comes up to the ceiling ever more
+    /// slowly and never reaches past it: of the room left under the ceiling,
+    /// a step that would climb `c` climbs `room × (1 − e^(−c / room))`. Far
+    /// below the ceiling that is the step itself; near it, a shrinking share
+    /// of what is left — no wall to stop against, and nothing to bounce off.
+    fn short_of_the_ceiling(&self, candidate: DVec3) -> DVec3 {
+        let from = self.target.position;
+        let h0 = ecef_to_geodetic(from).height;
+        let climb = ecef_to_geodetic(candidate).height - h0;
+        if climb <= 0.0 {
+            return candidate;
+        }
+        let room = self.ceiling() - h0;
+        if room <= 0.0 {
+            return from;
+        }
+        let allowed = room * (1.0 - (-climb / room).exp());
+        from + (candidate - from) * (allowed / climb)
     }
 
     /// The world ray (origin, normalized direction) through a screen pixel
@@ -570,7 +668,7 @@ impl CameraController {
         // where it is useful and stops being a catapult where it is not.
         let candidate = self.bound_the_sideways_travel(candidate);
         self.target.position = if factor >= 1.0 {
-            candidate
+            self.short_of_the_ceiling(candidate)
         } else {
             self.lifted(candidate)
         };
@@ -665,7 +763,7 @@ impl CameraController {
         let cam = GlobeCamera::from_geodetic(
             lat,
             lon,
-            alt.max(self.min_altitude),
+            alt.min(self.ceiling()).max(self.min_altitude),
             0.0,
             std::f64::consts::FRAC_PI_2,
             self.target.fovy,
@@ -733,16 +831,17 @@ impl CameraController {
     ///
     /// Unlike [`Self::drive`], the altitude floor and the relief it is
     /// measured against still hold, so a pose inside a hillside is lifted out
-    /// of it as a gesture would be.
+    /// of it as a gesture would be — and so does the ceiling
+    /// ([`Self::max_altitude`]), so a pose beyond it is brought down to it.
     pub fn jump_to(&mut self, camera: GlobeCamera) {
         self.camera = camera;
         self.target = camera;
         // Placing is handing the camera back: a host that places is no longer
         // driving, or the floor it just asked for would not apply.
         self.driven = false;
-        // The same clamp a gesture gets, applied once here so `place` and a
-        // drag agree about where the floor is.
-        self.camera.position = self.lifted(self.camera.position);
+        // The same clamps a gesture gets, applied once here so `place` and a
+        // drag agree about where the floor and the ceiling are.
+        self.camera.position = self.bounded(self.camera.position);
         self.target.position = self.camera.position;
     }
 
@@ -791,7 +890,8 @@ impl CameraController {
         // laterally, so a camera legally placed a moment ago can end up inside
         // a ridge without any zoom at all; and the ground itself rises under a
         // stationary camera as finer tiles stream in.
-        self.target.position = self.lifted(self.target.position);
+        // And the ceiling: a tilt orbits the eye up as well as round.
+        self.target.position = self.bounded(self.target.position);
         let c = &mut self.camera;
         let t = &self.target;
         c.position = c.position.lerp(t.position, k);
@@ -961,6 +1061,135 @@ mod tests {
             "after release the eye sits at {height} m, under the {} m floor",
             ctrl.min_altitude
         );
+    }
+
+    /// The default ceiling is the formula on [`default_max_altitude`]: the
+    /// globe fits the default lens at half that distance from the centre.
+    #[test]
+    fn the_default_ceiling_is_twice_the_distance_that_fits_the_globe() {
+        let fit = WGS84_A / (DEFAULT_GLOBE_FOVY / 2.0).sin();
+        assert_eq!(default_max_altitude(), 2.0 * fit - WGS84_A);
+        assert!((default_max_altitude() / 1000.0 - 36_043.0).abs() < 1.0);
+        assert_eq!(
+            CameraController::new(nadir_over(0.0, 0.0, 1000.0).camera).max_altitude,
+            default_max_altitude()
+        );
+    }
+
+    /// Altitudes the drawn eye passes through while the wheel is turned
+    /// out, a notch every four frames at 60 Hz for `notches`.
+    fn zoom_out(ctrl: &mut CameraController, notches: usize) -> Vec<f64> {
+        let vp = (800.0, 600.0);
+        let mut seen = vec![ctrl.camera.altitude()];
+        for _ in 0..notches {
+            ctrl.zoom(-1.0, (400.0, 300.0), vp);
+            for _ in 0..4 {
+                ctrl.advance(1.0 / 60.0);
+                seen.push(ctrl.camera.altitude());
+            }
+        }
+        seen
+    }
+
+    /// A wheel turned out for as long as anyone likes never takes the eye
+    /// past the ceiling — the gesture target nor the drawn camera.
+    #[test]
+    fn a_wheel_zoom_out_never_passes_the_ceiling() {
+        let mut ctrl = nadir_over(0.3, 0.2, 2_000_000.0).with_max_altitude(9_000_000.0);
+        let seen = zoom_out(&mut ctrl, 200);
+        let highest = seen.iter().cloned().fold(f64::MIN, f64::max);
+        assert!(highest <= 9_000_000.0 + 1e-3, "{highest}");
+        assert!(ctrl.target().altitude() <= 9_000_000.0 + 1e-3);
+        // And it does get there: a ceiling, not a wall short of it.
+        assert!(highest > 8_990_000.0, "{highest}");
+        // The default ceiling holds the same way.
+        let mut ctrl = nadir_over(0.3, 0.2, 2_000_000.0);
+        let highest = zoom_out(&mut ctrl, 200)
+            .into_iter()
+            .fold(f64::MIN, f64::max);
+        assert!(highest <= default_max_altitude() + 1e-3, "{highest}");
+    }
+
+    /// Near the ceiling the eye slows into it: a notch that would carry it
+    /// past stops short, every frame climbs less than a quarter of the room
+    /// left — no step, no stop against a wall, no bounce back down.
+    #[test]
+    fn the_ceiling_is_approached_without_a_step() {
+        let max = 9_000_000.0;
+        let vp = (800.0, 600.0);
+        // A thousand kilometres short, and a notch climbs more than that
+        // from here: it goes most of the way, not all of it.
+        let mut ctrl = nadir_over(0.3, 0.2, 8_000_000.0).with_max_altitude(max);
+        ctrl.zoom(-1.0, (400.0, 300.0), vp);
+        let after = ctrl.target().altitude();
+        assert!(
+            after > 8_500_000.0 && after < max - 10_000.0,
+            "one notch from 1000 km under the ceiling went to {after}"
+        );
+        for _ in 0..40 {
+            let before = ctrl.target().altitude();
+            ctrl.zoom(-1.0, (400.0, 300.0), vp);
+            let after = ctrl.target().altitude();
+            assert!(after <= max + 1e-3, "{after}");
+            assert!(after >= before - 1e-3, "a zoom out came down: {before} → {after}");
+        }
+        let mut ctrl = nadir_over(0.3, 0.2, 5_000_000.0).with_max_altitude(max);
+        let seen = zoom_out(&mut ctrl, 60);
+        for pair in seen.windows(2) {
+            let (h0, h1) = (pair[0], pair[1]);
+            assert!(h1 >= h0 - 1e-3, "it bounced: {h0} → {h1}");
+            assert!(
+                h1 - h0 <= 0.25 * (max - h0) + 1e-3,
+                "a step of {} m with {} m of room",
+                h1 - h0,
+                max - h0
+            );
+        }
+    }
+
+    /// A place beyond the ceiling is brought down to it, straight down; a
+    /// controller made over such a view opens at the ceiling; a drive is
+    /// the host's and is left alone.
+    #[test]
+    fn a_place_beyond_the_ceiling_is_brought_down_to_it() {
+        let (lat, lon) = (0.4, -1.1);
+        let far = GlobeCamera::from_geodetic(lat, lon, 1.0e8, 0.0, FRAC_PI_2, 0.6);
+        let mut ctrl = nadir_over(lat, lon, 1_000_000.0).with_max_altitude(20_000_000.0);
+        ctrl.jump_to(far);
+        let g = ecef_to_geodetic(ctrl.camera.position);
+        assert!((g.height - 20_000_000.0).abs() < 1e-3, "{}", g.height);
+        assert!((g.lat - lat).abs() < 1e-9 && (g.lon - lon).abs() < 1e-9);
+        assert_eq!(ctrl.target().position, ctrl.camera.position);
+
+        let opened = CameraController::new(far).with_max_altitude(20_000_000.0);
+        assert!((opened.camera.altitude() - 20_000_000.0).abs() < 1e-3);
+        assert!((opened.target().altitude() - 20_000_000.0).abs() < 1e-3);
+
+        ctrl.drive(far);
+        ctrl.update(1.0);
+        assert_eq!(ctrl.camera.position, far.position, "a drive was lowered");
+    }
+
+    /// A host's ceiling, set on a running controller, holds the next frame
+    /// and every gesture after; the floor wins where the two cross; a
+    /// nonsense value changes nothing.
+    #[test]
+    fn a_hosts_ceiling_is_respected() {
+        let mut ctrl = nadir_over(0.3, 0.2, 3_000_000.0);
+        ctrl.set_max_altitude(500_000.0);
+        assert!((ctrl.camera.altitude() - 500_000.0).abs() < 1e-3);
+        let highest = zoom_out(&mut ctrl, 50)
+            .into_iter()
+            .fold(f64::MIN, f64::max);
+        assert!(highest <= 500_000.0 + 1e-3, "{highest}");
+        for nonsense in [f64::NAN, -1.0, 0.0, f64::INFINITY] {
+            ctrl.set_max_altitude(nonsense);
+            assert_eq!(ctrl.max_altitude, 500_000.0);
+        }
+        // A ceiling under the floor: the floor.
+        let mut low = nadir_over(0.3, 0.2, 3_000.0).with_max_altitude(50.0);
+        low.update(1.0);
+        assert!((low.camera.altitude() - low.min_altitude).abs() < 1.0);
     }
 
     #[test]

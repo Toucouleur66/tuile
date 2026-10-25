@@ -171,6 +171,11 @@ pub struct HostCamera {
     aspect: Option<f64>,
     /// Whether the host said anything about it this frame.
     aspect_set: bool,
+    /// The lowest and highest the controller holds the eye, metres: see
+    /// [`HostCamera::altitude_range`].
+    altitudes: (f64, f64),
+    /// What the host set them to this frame, each if it did.
+    altitudes_set: (Option<f64>, Option<f64>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -192,6 +197,52 @@ impl HostCamera {
             asked: None,
             aspect,
             aspect_set: false,
+            altitudes: (1.0, tuile_camera::default_max_altitude()),
+            altitudes_set: (None, None),
+        }
+    }
+
+    /// The range the controller holds the eye in, as it stands this frame.
+    pub(crate) fn with_altitude_range(mut self, min: f64, max: f64) -> Self {
+        self.altitudes = (min, max);
+        self
+    }
+
+    /// The lowest the eye may get over the ground, and the highest over the
+    /// ellipsoid, metres — what every gesture, `place`, `tuile://goto` and
+    /// `--altitude` are held between. A `drive` is not: it is the host's
+    /// own pose. What the frame was prepared with, or what the host has just
+    /// set.
+    pub fn altitude_range(&self) -> (f64, f64) {
+        (
+            self.altitudes_set.0.unwrap_or(self.altitudes.0),
+            self.altitudes_set.1.unwrap_or(self.altitudes.1),
+        )
+    }
+
+    /// The closest the eye may get to the ground, metres, from this frame
+    /// on. A metre over the ground is the floor under every floor: less is
+    /// held to it, and so is anything that is not a number.
+    pub fn set_min_altitude(&mut self, metres: f64) {
+        let metres = if metres.is_nan() {
+            1.0
+        } else {
+            metres.max(1.0)
+        };
+        if metres.is_finite() {
+            self.altitudes_set.0 = Some(metres);
+        }
+    }
+
+    /// The farthest the eye may get from the Earth, metres above the
+    /// ellipsoid, from this frame on: [`tuile_camera::default_max_altitude`]
+    /// unless a host or `--max-altitude` says otherwise. An eye above it is
+    /// brought down to it, without a word, as the floor lifts one from
+    /// below; a zoom out slows into it. A value that is not a positive
+    /// number is ignored. Where it is under the floor, the floor wins.
+    pub fn set_max_altitude(&mut self, metres: f64) {
+        if metres.is_finite() && metres > 0.0 {
+            self.altitudes_set.1 = Some(metres);
         }
     }
 
@@ -256,6 +307,11 @@ impl HostCamera {
     /// What the host asked for, for the shell to apply.
     pub(crate) fn taken(&self) -> Option<Asked> {
         self.asked
+    }
+
+    /// The altitude bounds the host set this frame, each if it did.
+    pub(crate) fn taken_altitudes(&self) -> (Option<f64>, Option<f64>) {
+        self.altitudes_set
     }
 
     /// The shape in force after the host had its say, and whether it said
@@ -710,6 +766,41 @@ mod tests {
             ctrl.camera.position, high.position,
             "release must not move the eye"
         );
+    }
+
+    /// A host's altitude range reaches the controller as the frame step
+    /// applies it, and holds there: a place above the ceiling lands at it,
+    /// under the floor at it. Nonsense is ignored; under a metre is a metre.
+    #[test]
+    fn a_hosts_altitude_range_is_respected() {
+        use tuile_camera::CameraController;
+
+        let mut camera = HostCamera::new(pose(1000.0), None).with_altitude_range(1.0, 36_000_000.0);
+        assert_eq!(camera.altitude_range(), (1.0, 36_000_000.0));
+        camera.set_max_altitude(f64::NAN);
+        camera.set_max_altitude(-3.0);
+        camera.set_min_altitude(0.2);
+        assert_eq!(camera.taken_altitudes(), (Some(1.0), None));
+        camera.set_min_altitude(250.0);
+        camera.set_max_altitude(400_000.0);
+        assert_eq!(camera.altitude_range(), (250.0, 400_000.0));
+        camera.place(pose(2_000_000.0));
+
+        // As the frame step does it: the bounds, then the door.
+        let mut ctrl = CameraController::new(pose(50_000.0));
+        let (min, max) = camera.taken_altitudes();
+        if let Some(min) = min {
+            ctrl.min_altitude = min;
+        }
+        if let Some(max) = max {
+            ctrl.set_max_altitude(max);
+        }
+        if let Some(Asked::Place(p)) = camera.taken() {
+            ctrl.jump_to(p);
+        }
+        assert!((ctrl.camera.altitude() - 400_000.0).abs() < 1e-3);
+        ctrl.jump_to(pose(10.0));
+        assert!(ctrl.camera.altitude() >= 250.0 - 1e-6);
     }
 
     /// The layer contract, and the one thing that separates it from

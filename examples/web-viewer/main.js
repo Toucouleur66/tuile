@@ -20,6 +20,8 @@ const PHOTOGRAPHY = "© Microsoft and its data suppliers";
 const params = new URLSearchParams(location.search);
 const backend = params.get("backend") ?? "auto";
 const imageryCompression = params.get("compression") ?? "off";
+// `?maxAltitude=500000`: the camera's ceiling, metres (the package's option).
+const maxAltitude = params.has("maxAltitude") ? Number(params.get("maxAltitude")) : undefined;
 // `?time=sunset&timeOffset=-30m&timeRate=30`: the scene's clock, as the
 // package's `time`, `timeOffset` and `timeRate` — the viewer's flags, and the
 // parameters of its `tuile://goto?…` links. A link's query opens the same
@@ -66,6 +68,7 @@ try {
     name: "Tuile",
     backend,
     imageryCompression,
+    maxAltitude,
     time,
     timeOffset,
     timeRate,

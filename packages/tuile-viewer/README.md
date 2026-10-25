@@ -78,6 +78,7 @@ is a canvas. It resolves once the viewer draws.
 | `profile` | `auto` (the default), `desktop` or `handheld`: memory budget, upload pacing and frame rate. |
 | `backend` | `auto` (the default: WebGPU, else WebGL2), `webgpu` or `webgl2`. |
 | `view` | Where the eye opens: `lon`, `lat`, `altitude`, and optionally `heading` and `pitch`. Without it, where the last viewer of this `name` on this site was left. |
+| `maxAltitude` | The highest the eye may go, metres above the ellipsoid (`1` to `1e8`). A zoom out slows into it; a `view`, `setView` or `flyTo` above it is held to it. By default twice the distance at which the whole globe fits the view: 36 043 km. |
 | `ui` | Whether the compass, zoom controls and menu are drawn (`true` by default). |
 | `attribution` | The bottom corner of the caption — whose pictures are on screen, and the last thing the viewer said: `bottom-right` (the default) or `bottom-left`. |
 | `showUnsupportedMessage` | Whether a viewer that cannot draw says so in the container (`true` by default). |

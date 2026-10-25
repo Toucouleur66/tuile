@@ -137,15 +137,16 @@ fn session(
 ) -> anyhow::Result<()> {
     // The command line, read by `main`. Exit code 2 is the usual one for a
     // command that was not understood.
-    let (view, here, imagery, compression, clock) = match invocation {
+    let (view, here, imagery, compression, clock, max_altitude) = match invocation {
         Ok(start::Invocation::Run {
             view,
             here,
             imagery,
             compression,
             clock,
+            max_altitude,
             ..
-        }) => (view, here, imagery, compression, clock),
+        }) => (view, here, imagery, compression, clock, max_altitude),
         Ok(start::Invocation::Help) => {
             println!("{}", start::usage());
             return Ok(());
@@ -309,7 +310,12 @@ fn session(
     // below it. The near plane follows — it is a quarter of the clearance — so
     // getting close costs nothing but the precision that rebasing already
     // provides.
-    let controller = CameraController::new(camera).with_min_altitude(1.0);
+    //
+    // And under the ceiling, the camera's own unless `--max-altitude` says
+    // otherwise: an `--altitude` above it opens at it.
+    let controller = CameraController::new(camera)
+        .with_min_altitude(1.0)
+        .with_max_altitude(max_altitude.unwrap_or_else(tuile_camera::default_max_altitude));
 
     tracing::info!(
         "globe viewer — streaming terrain and imagery\n\
