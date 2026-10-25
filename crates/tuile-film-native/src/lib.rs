@@ -1,28 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! A film rendered natively, from its packs and the tile store.
-//!
-//! The same film a browser renders, by the same parts — the pack's plan
-//! (`tuile_film::Cursor`), the store's tiles made into meshes and drapes
-//! (`tuile_film::from_store`), the GPU's composition and frame
-//! (`tuile_film_gpu`) — on a machine's own adapter, with no page around it.
-//!
-//! Three things, kept apart:
-//!
-//! - **what is read** ([`source`]): packs and the tile store, both behind
-//!   `tuile_repository::Objects`, both through a cache of chunks on disk,
-//!   both counted;
-//! - **the render** ([`render`](fn@render)): frame after frame, tiles entering and
-//!   leaving as the plan says, each picture handed to a [`Sink`];
-//! - **what watches** ([`observe`]): an [`Observer`] is told of every
-//!   imagery tile that comes in, every tile built, every picture that comes
-//!   out. The render knows nothing of what an observer does with it;
-//!   [`meter::LightMeter`] is one, and measures light; [`seams::SeamLog`]
-//!   another, and measures what is left between the tiles a frame draws.
-//!
-//! Beside them, [`reference`](mod@reference) reads another layer of the store under a
-//! film's imagery, for its tiles to be measured against.
+#![doc = include_str!("../README.md")]
 
 pub mod av1;
 pub mod compress;
