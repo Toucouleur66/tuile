@@ -478,3 +478,23 @@ Looked at:
 - No black.
 
 The viewer meters its own frame, sky included, so it shows a given star later than the test probes do. The probes are metered on level ground (`crates/tuile-atmosphere/tests/stars_seen.rs`) and show Sirius from +20 min. The noon frame's nearest ground is still the coarse fill: the run settles in a fraction of a second, and its terrain was not all there.
+
+## planets-twilight-pic-du-midi-2026-06-21-west/ — Venus first, then Jupiter (2026-10-25)
+
+The Pic du Midi's evening, looking west, with the planets drawn by the stars' rule (branch `feat/planets-attenuated`, stacked on #147). The place and clock are those of `stars-twilight-pic-du-midi-2026-06-21/`: lon 0.1418, lat 42.9365, altitude 3100 (ellipsoid), sunset 19:41:54 UTC, every 10 min to +2 h, plus noon. The view is heading 290 and pitch −5 (5° above the horizon), 960×540, through the viewer's own frame.
+
+```bash
+TUILE_ION_TOKEN=… cargo run --release -p tuile-wgpu-viewer --example sunset -- \
+  --lon 0.1418 --lat 42.9365 --altitude 3100 --heading 290 --pitch -5 \
+  --date 2026-06-21 --from 0m --to 2h --every 10m --sheet-scale 1 \
+  --out videos/planets-twilight-pic-du-midi-2026-06-21-west
+# noon: --from -7h41m54s --to -7h41m54s --out …/noon
+```
+
+Looked at (`sheet-noon-and-twilight.png`):
+- **Noon.** No point of light.
+- **The sunset frame.** The sun's disc on the horizon.
+- **Venus** is the first point in the sky, at +40 min (sun −6.6°), at the top of the frame. It sets towards the west-north-west frame by frame, white with a warm cast, and saturates by +80.
+- **Jupiter**, reddened low in the glow, shows from +70–80 min.
+- **The first stars** come after Venus.
+- No black.
