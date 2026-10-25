@@ -102,9 +102,14 @@ jobs:
           -p tuile-film-gpu
           -p tuile-ui
           -p tuile-film
+          -p tuile-bevy
       # The viewer's web shell, its transport and its renderer, as the
       # browser builds them: no native build ever compiles that code.
-      - run: cargo clippy --target wasm32-unknown-unknown -p tuile-viewer -p tuile-web -p tuile-wgpu -- -D warnings
+      - run: cargo clippy --target wasm32-unknown-unknown -p tuile-viewer -p tuile-web -p tuile-wgpu -p tuile-bevy -- -D warnings
+      # The Bevy viewer's page, in each of its two builds: Bevy compiles for
+      # WebGPU or for WebGL2, never both.
+      - run: cargo clippy --target wasm32-unknown-unknown -p tuile-bevy-viewer --features webgpu -- -D warnings
+      - run: cargo clippy --target wasm32-unknown-unknown -p tuile-bevy-viewer --features webgl2 -- -D warnings
 
   # The package a page imports: the wasm build and its bindings, the
   # typings checked by tsc, and a bundler that ships the worker and the wasm.
