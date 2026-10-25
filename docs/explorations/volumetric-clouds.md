@@ -49,12 +49,29 @@ and on `docs/atmosphere-generalisation` (PR #141). Neither branch is edited.
 | Sun shadow map | `tuile-film-gpu` (`shadow.wgsl`, `resolve.wgsl`; up to 4 jittered maps) | the place a cloud shadow multiplies the sun's term on the ground |
 | Sky-view per frame | `sky_view.wgsl`, compute or render pass (`SkyViewPass::{Compute, Render}` on #137) | the pattern for a pass that has a WebGL2 twin |
 | `lib.rs` of `tuile-atmosphere` | "**Clouds.** Deliberately absent rather than stubbed … It wants its own module and its own pass" | the stated intent this study follows |
-| Doc 19 §7 | "Nuages : hors périmètre v1. Couche 2D … en v2 ; le volumétrique est incompatible avec le budget Cycles" | the OpenUSD/Cycles path stays out (§7.4); the film renderer is wgpu |
+| Doc 19 §7 (`docs/19-sky-atmosphere.md:489-491`) | "Nuages : hors périmètre v1. Couche 2D (épaisseur optique) … en v2 ; le volumétrique est incompatible avec le budget Cycles" | revisited in §1.1 |
 | Provider traits | `ImageryProvider` (`tuile-core/src/raster.rs`), `TerrainSource` (`tuile-terrain/src/source.rs`) | the shape `CloudSource` copies: async fetch of bytes with `Fetched` lifetime, `holds()` for the budget's presence oracle, `generation()`, an `Absence` that tells "nothing here" from "failed" |
 | PMTiles | `tuile-repository`, `tuile-tile-server`, `tuile-bake` | a store and a server for cloud tiles without new infrastructure |
 
 So the light, the integration and the aerial perspective exist; what is
 missing is a density field, its source, a march through it, and shadows.
+
+### 1.1 Doc 19's position, and what this study changes
+
+Doc 19 (`docs/19-sky-atmosphere.md:489-491`) put clouds out of scope for
+v1, planned a 2D layer of optical thickness lit by the same sun for v2, and
+judged volumetric clouds incompatible with the Cycles budget (~0.47 s a
+frame, 64 frames in ≤ 30 s). Point by point:
+
+| Doc 19 | This study | Why |
+|---|---|---|
+| Out of scope in v1 | still true of v1 of the atmosphere, which has shipped without clouds | — |
+| A 2D optical-thickness layer in v2 | **kept, as a part rather than the whole**: it is the far limit of the volume's LOD (§3.6), the cirrus layer, and the WebGL2 fallback (§6.4) | the 2D layer is what a volume filtered to a large footprint becomes; drawing it alone would leave flights *at* cloud base — the scenes that matter — without clouds that have a base, a side or an inside |
+| Volumetric incompatible with the Cycles budget | **still true, and kept**: no volumetric clouds in the OpenUSD/Cycles path (§9) | what changed since doc 19 is where films are drawn: the film renderer is now `tuile-film-gpu` on wgpu, whose budget is milliseconds per pass, not Cycles' path tracing. The volumetric march goes there and into the interactive renderer |
+
+So the proposal **revises doc 19's scope** (volumetric clouds on the wgpu
+paths, film and interactive) **without contradicting its verdict** (not in
+Cycles). If adopted, doc 19 §7's bullet would be amended to point here.
 
 ---
 
@@ -282,7 +299,7 @@ are a list of things to design for from the start (§6.4).
 | Data it matches | NWP: coverage, base/top, type per column | NWP per-level LWC/IWC profiles; simulations; authored VDBs |
 | Flying through | needs a careful near field (§3.6) | natural |
 | Planet scale | natural (the weather map is a texture over the globe) | streaming of voxel bricks like tiles |
-| Recommendation | **first** | a later form of the same tile (§5.3, "volume" form) |
+| Recommendation | **first** | a later form of the same field (§5.4, "volume" form) |
 
 ### 3.3 Temporal reuse
 
@@ -446,12 +463,66 @@ What these say together:
   flight's time. Which one is the provider's choice and licence question,
   not tuile's.
 
-### 4.2 From fields to a renderable field
+### 4.2 What a provider has in practice
 
-What tuile's lowering does with a provider's fields (a library in tuile,
-§5.4, so that every provider lowers alike):
+The table above is what *exists*; what a provider holds is usually far less.
+A realistic inventory, from a provider of tracked outdoor activities that
+would supply tuile's films:
+
+| Has | Does not have |
+|---|---|
+| **Point forecasts** per spot from a commercial forecast API (regional and global models), refreshed every ~20 min: low / middle / high cloud cover, **cloud fraction per pressure level up to 500 hPa only** (~5.5 km), wind, humidity | gridded fields: no GRIB or NetCDF pipeline, no weather tiles |
+| Geostationary satellite imagery as WMS pictures, viewed, not stored | liquid or ice water content; anything above 500 hPa |
+| A per-track product that **places cumulus** (bases and depths guessed from the pilot's thermals, plus satellite) in a small JSON per track | an agreement for a richer model (e.g. 40 levels of cloud fraction and boundary-layer height on a 2.5 km grid) — available elsewhere, not assumable |
+| | past dates: needs historical forecasts or ERA5; licences to confirm |
+
+Such a provider can offer a **per-scene field**: altitude levels in metres,
+UTC hours, per level cloud fraction, humidity and wind, plus base and top,
+source and credits — about **1.4 MB uncompressed for 50 × 50 km over 48 h**.
+
+Consequences for tuile's design, all taken up below:
+
+1. **Sparse and coarse inputs are the normal case.** Cover per level, a
+   fraction profile, base and top, wind: from that alone tuile synthesises
+   density, type and detail, procedurally and deterministically (§4.3).
+2. **Water content is optional**, never required.
+3. **One point or a few points per scene** is a valid input: the field is
+   then horizontally uniform in its statistics, and the procedural detail
+   alone decides where each cloud stands.
+4. **Placed clouds** (cumulus put where a pilot actually climbed) are an
+   input of their own: they say *where*, which no forecast does.
+5. **Both a per-scene volume and globe-tiled fields** come through the same
+   trait (§5.2), and lower to the same model.
+6. **No high-cloud profile**: above 500 hPa only the high cover is known; the
+   cirrus layer takes it (§4.3).
+
+### 4.3 From inputs to a renderable field
+
+What tuile's lowering does with a provider's inputs (a library in tuile,
+§5.4, so that every provider lowers alike). The rule throughout: **every
+missing quantity has a stated synthesis, and the synthesis is a pure
+function of the inputs and a seed derived from the scene** — two runs, two
+machines, the same field.
 
 | Input | Lowered to | Rule |
+|---|---|---|
+| Cloud fraction per level (height or pressure levels; pressure turned to height by the standard atmosphere or the provider's geopotential) | layers: runs of contiguous levels with fraction above a threshold; coverage = the run's maximum fraction (maximum-random overlap); base and top from the run's edges | refined by base/top when given |
+| Humidity per level, **when the fraction is missing** | fraction by a relative-humidity scheme, `C = 1 − √((1 − RH)/(1 − RH_c))`, `RH_c` ≈ 0.8 | Sundqvist et al. 1989 |
+| Low / middle / high cover only (no profile) | one layer per band at a default height (low 0.5–2 km above ground, middle 2–6 km, high 8–11 km), base refined by the LCL when T and T_d are given | stated defaults, documented |
+| Base and top | the convective layer's bounds, overriding the profile's edges | |
+| Type, **not given** | from thickness and shape: a layer thin against its coverage and flat (fraction profile ~constant) → stratiform; a layer with base at the boundary-layer top or the LCL, thicker than ~500 m, fraction peaking low → cumuliform; a continuous value, not a class | a table, documented and tested |
+| Water content, **not given** | cumuliform: sub-adiabatic, `LWC(z) ≈ f · Γ_ad · (z − base)` with `Γ_ad` ≈ 1–2 g/m³ per km and `f` ≈ 0.3–0.6; stratiform: a constant 0.1–0.3 g/m³; σ_t then by §2.1 with `r_e` per type | Rogers & Yau |
+| Water content `QC`, `QI`, **when given** | replaces the synthesis | ice where `T < −38 °C` or `QI > QC` |
+| High cover (no profile above 500 hPa) | the 2D cirrus layer: optical depth from the cover (τ ≈ 0.3–2 at full cover), altitude a default 9–11 km | the one place the altitude is a guess; satellite top height replaces it when given |
+| Placed clouds (position, base, top, optionally radius) | density *seeds*: the procedural cumulus are centred on them (the coverage field raised in a disc around each), the rest of the layer drawn from the forecast's coverage | they win over the forecast where they stand |
+| Wind per level | the layer's wind at its mid-height (advection, §5.5) | |
+| One point, or a few | horizontally uniform layers (one point), or interpolated between points (inverse-distance or natural neighbour) | |
+| Gridded fields | per texel, as above | |
+| Satellite cloud mask / top height | coverage and top, overriding the forecast where observed | the observation wins at observation times |
+
+For gridded NWP the rows map directly onto model fields:
+
+| Field | Lowered to | Rule |
 |---|---|---|
 | Cloud fraction per level `CLC(z)` | per layer: coverage = max (or random-overlap) of `CLC` over the layer's levels | layers split where `CLC` drops below a threshold between levels |
 | `QC`, `QI` (kg/kg) × air density | density scale; σ_t by §2.1 with `r_e` per type | ice where `T < −38 °C` or `QI > QC` |
@@ -460,7 +531,7 @@ What tuile's lowering does with a provider's fields (a library in tuile,
 | `U`, `V` at the layer's mid-height | the layer's wind (advection, §5.5) | |
 | Satellite cloud mask / top height | coverage and top, overriding NWP where observed | the observation wins over the forecast at observation times |
 
-### 4.3 Time
+### 4.4 Time
 
 Forecast fields come every hour (AROME, ICON-D2, HRRR) or every 3–6 hours
 (IFS, GFS); satellite products every 10–15 minutes. Between two steps
@@ -482,7 +553,7 @@ evolution coordinate of the noise, a pure function of time.
 
 | Crate | Holds | Depends on |
 |---|---|---|
-| **`tuile-clouds`** (new) | the `CloudSource` trait, the tile format, the manifest, residency and time interpolation (CPU, f64), the lowering library from neutral gridded fields, two sources shipped with tuile (§5.4) | `tuile-core` (tiling, `Fetched`, storage); **no GPU, no tokio**; compiles to `wasm32-unknown-unknown` |
+| **`tuile-clouds`** (new) | the `CloudSource` trait, the container (§5.3), the manifest, residency and time interpolation (CPU, f64), the lowering library from neutral gridded fields, two sources shipped with tuile (§5.4) | `tuile-core` (tiling, `Fetched`, storage); **no GPU, no tokio**; compiles to `wasm32-unknown-unknown` |
 | **`tuile-atmosphere`** (`clouds` module) | the cloud *medium* — extinction from water content, type height profiles, phase, octave multiple scattering, the light march — CPU reference (f64) and WGSL; behind the `wgpu` feature, the noise textures, cascades, shadow map and march passes, shared by both renderers like #137's `gpu` module | as today |
 | `tuile-film-gpu` | the film's cloud pass (compute, full resolution, no history) and its composition in the resolve and present | the above |
 | `tuile-wgpu` | the interactive cloud pass (compute, or render pass on WebGL2), temporal reuse, composition | the above |
@@ -493,76 +564,97 @@ the air is; the data plumbing — trait, tiles, time — has nothing to do
 with light and is what a server, a baker or a wasm worker needs without a
 renderer, the way `tuile-terrain` sits apart from `tuile-wgpu`.
 
-### 5.2 The trait
+### 5.2 What crosses the trait: inputs, not a rendered field
+
+The provider supplies **meteorological inputs** — the contract of §8 —
+and tuile lowers them (§4.3) on the client, in `tuile-clouds`, so that every
+provider's data is synthesised by the same deterministic code. The layered
+field of §5.4 is tuile's own form (cached, and servable pre-lowered for the
+globe), never something a provider has to produce.
+
+Two layouts, one model:
+
+| Layout | What it is | Typical use |
+|---|---|---|
+| **Scene** | one block of profiles for a region and a time window: a few points or a small grid (e.g. 50 × 50 km, 48 h) | a film of one flight; a provider with point forecasts; placed cumulus from a track |
+| **Tiled** | the same profiles, cut in the geographic tiling of imagery, one block per tile and time window | the globe in the viewer; a provider with gridded fields |
+
+Both decode to the same `CloudInputs` (profiles per grid point and hour,
+optional placed clouds, credits), and both lower to the same `CloudField`.
 
 ```rust
-/// Where a cloud tile is: a tile of a tiling scheme, at a valid time.
-pub struct CloudCoord { pub level: u32, pub x: u32, pub y: u32, pub valid: ValidTime }
+/// What a source serves: its layout (scene bounds, or tiling and levels),
+/// its hours, the altitude levels, which optional quantities it carries,
+/// its source and credits (shown by the host). The cloud twin of layer.json.
+pub struct CloudManifest { /* serde */ }
 
-/// What a source can serve: its valid times, its tiling, its levels, its
-/// bounds, the run it comes from, and its attribution (shown by the host).
-pub struct CloudManifest { /* serde, the cloud twin of layer.json */ }
+/// A block of inputs: the scene's (layout Scene), or a tile's (layout Tiled).
+pub enum CloudBlock { Scene, Tile { level: u32, x: u32, y: u32 } }
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait CloudSource: Send + Sync {
-    /// The manifest; asked again when `generation` changes (a new run).
+    /// The manifest; asked again when `generation` changes (a new forecast run).
     async fn manifest(&self) -> Result<Fetched<CloudManifest>, CloudSourceError>;
-    /// A tile's bytes, as served (the format of §5.3), with their lifetime.
-    async fn fetch_tile(&self, coord: CloudCoord) -> Result<Fetched<Bytes>, CloudSourceError>;
+    /// A block's bytes, as served (the container of §5.3), for the hours
+    /// `[from, to]` (UTC, Unix seconds), with their lifetime.
+    async fn fetch_block(&self, block: CloudBlock, from: i64, to: i64)
+        -> Result<Fetched<Bytes>, CloudSourceError>;
     /// Bumped when the source starts serving another run.
     fn generation(&self) -> u64 { 0 }
     /// The budget's presence oracle, as `ImageryProvider::holds`.
-    fn holds(&self, coord: CloudCoord) -> bool { let _ = coord; false }
+    fn holds(&self, block: CloudBlock) -> bool { let _ = block; false }
 }
 ```
 
 `CloudSourceError` carries an `Absence` like `TerrainSourceError`, and the
 distinction matters more here: **"no data" is not "clear sky"**. A missing
-tile falls back to its parent level, then to the nearest valid time, and
-only then to "no clouds" — the identity, which is safe (the scene without
-clouds) and never a hole. A tile arriving late fades in over a fixed time
-as the new cascade is activated before the old is released.
+tile falls back to its parent level, then to the nearest hour, and only
+then to "no clouds" — the identity, which is safe (the scene without
+clouds) and never a hole. A block arriving late fades in as the new
+cascade is activated before the old is released.
 
-### 5.3 The tile: a layered column
+### 5.3 The container: a small file of profiles
 
-Version 1, the **layers** form (what NWP resolution supports), per texel
-and per layer (up to 3 volumetric + 1 cirrus):
+One format for both layouts, adopted from the provider's own proposal
+(altitude levels in metres, UTC hours, per level fraction, humidity and
+wind, base and top, source and credits), in a container built like glb: a
+**JSON chunk** that describes and a **binary chunk** of little-endian
+arrays.
 
-| Field | Encoding | Range |
-|---|---|---|
-| coverage | u8 | 0–1 |
-| type | u8 | 0 stratus → 1 cumulus |
-| density scale | u8 | water content, log-encoded |
-| ice share | u8 | 0–1 |
-| base, top | u16 each | metres above the ellipsoid, 0.5 m units (0–32 km) |
-| wind u, v | per tile and layer, f32 (per-texel optional) | m/s |
+| JSON chunk | Binary chunk (f32 unless stated) |
+|---|---|
+| version; layout; bounds; grid (points: lon/lat list, or a regular lon/lat grid); altitude levels (metres, above sea level or the ellipsoid, stated); hours (UTC); which optional arrays are present; `source` and `credits` strings; licence | `fraction[hour][level][point]` (required); `wind_u`, `wind_v[hour][level][point]` (required); `humidity[hour][level][point]`; `base`, `top[hour][point]`; `cover_low/mid/high[hour][point]`; `t2m`, `td2m[hour][point]`; `boundary_layer[hour][point]`; `lwc`, `iwc[hour][level][point]`; placed clouds as a list in the JSON chunk (position, base, top, radius, hour span) |
 
-Little-endian planes after a small header (magic, version, size, layer
-count, valid time, run), compressed by the archive (PMTiles supports gzip
-and zstd tile compression). 256² × 4 layers × 8 B = 2 MiB raw; smooth
-fields compress tens of times. Tiles in the **geographic** tiling of
-imagery: level 6 (256-px tiles) reaches ~1.2 km texels, the AROME grid;
-levels 0–3 serve global models and the orbit view.
+Size check against the provider's estimate: 50 × 50 km at 2.5 km (21 × 21
+points), 48 hours, 30 levels, 4 arrays a level → 21 × 21 × 48 × 30 × 4 ×
+4 B ≈ 10 MB at that density; a few points or coarser levels bring it to the
+provider's ~1.4 MB; zstd or gzip on top. Small enough to ship a scene in a
+film's store whole.
 
-Version 2, the **volume** form: per texel, N height bins (16–32) of
-liquid and ice content, for providers that want per-level profiles to
-show (towering cumulus, multi-layer decks) — the 2.5D march then reads its
-profile from the tile instead of the type LUT.
+| Transport | Answer |
+|---|---|
+| One small file per scene | **yes**: the first form to implement (PR 1); stored in the film's store by key and digest |
+| PMTiles of 3D blocks | **yes**, for the tiled layout: the same container as each tile's payload, z/x/y in the geographic tiling, the hours window in the manifest (one archive per run or per day) |
+| Zarr | not read by tuile: its Rust readers are young for the wasm path (`CLAUDE.md` rule 8), and a chunked array store is a provider-side convenience; converting a Zarr scene to the container is a few lines on the provider's side |
 
-Storage and transport: **one PMTiles archive per valid time** (or per run
-with time in the key), and the manifest as a JSON beside them; served by
-`tuile-tile-server` or any HTTP/CDN like other tiles; or packed in the
-film's store for a film ("the render reads the store").
+### 5.4 The lowered field, and what tuile ships
 
-### 5.4 Sources and lowering shipped in tuile
+The lowered `CloudField` is tuile's internal form: per texel and per layer
+(up to 3 volumetric + 1 cirrus) coverage, type (0 stratus → 1 cumulus),
+density scale, ice share (u8 each), base and top (u16, 0.5 m), and the
+layer's wind — 8 B a layer a texel, resampled into the camera cascades of
+§3.6. It can be cached, and served pre-lowered in PMTiles by
+`tuile-tile-server` for a globe-wide source, but it is not the contract.
+A later **volume** form (N height bins of water content per texel) carries
+`lwc`/`iwc` profiles when a provider has them.
 
 | Item | What | Why in tuile |
 |---|---|---|
-| `TemplateCloudSource` | a manifest URL + a tile URL template (PMTiles or z/x/y), on the `TileFetcher` hosts already pass | the common case: a provider serves tiles |
-| `StatedCloudSource` | a field stated by the host: "cumulus, coverage 0.4, base 1 800 m, top 3 200 m, wind 5 m/s from 270°" everywhere or in a region | tests, demos, and hosts without data |
-| `lower::GriddedFields` → tiles | the lowering of §4.2 from neutral arrays (lat/lon grid, level heights, CLC, QC, QI, T, T_d, U, V), no file format | every provider lowers alike; deterministic; tested on fixtures |
-| GRIB2 reading | **not in tuile's core path**. If wanted, a tool crate on an established GRIB2 decoder (e.g. `grib` / grib-rs) that feeds `GriddedFields` | a WMO format, not a brand; still the provider's job by default |
+| `TemplateCloudSource` | a manifest URL + a block URL (a scene file, or a PMTiles/z/x/y template), on the `TileFetcher` hosts already pass | the common case |
+| `StatedCloudSource` | inputs stated by the host: "cumulus, cover 0.4, base 1 800 m, top 3 200 m, wind 5 m/s from 270°", everywhere or in a region | tests, demos, hosts without data |
+| `lower` | §4.3: profiles → layers, type, density, cirrus, placed clouds; point interpolation; LCL; RH scheme | every provider lowers alike; deterministic; tested on fixtures |
+| GRIB2 reading | **not in tuile's core path**; if wanted, a tool crate on an established decoder (e.g. grib-rs) writing the container | a WMO format, not a brand; the provider's job by default |
 
 ### 5.5 Advection and determinism
 
@@ -610,7 +702,7 @@ Passes, all compute, inserted between the resolve and present:
 
 1. **Cascades** (when the camera or time moved enough): resample decoded
    tiles of `t_A`, `t_B` into the local cascades with the advection-corrected
-   blend of §4.3.
+   blend of §4.4.
 2. **Cloud shadow map** from the sun (and the Moon at night), Beer form.
 3. **Resolve** reads it: the sun's term on the ground × cloud shadow, beside
    the existing sun map; the air march × cloud shadow per step (god rays).
@@ -719,7 +811,7 @@ branch, stacked where they depend.
 | PR | Content | Proof / acceptance |
 |---|---|---|
 | **0** | this study | review |
-| **1 — data** | `tuile-clouds`: `CloudSource`, `CloudManifest`, the tile format (encode/decode), `StatedCloudSource`, `TemplateCloudSource`, time interpolation with advection (f64), `lower::GriddedFields` (incl. LCL base); wasm check | round-trip and fixture tests; a small fixture of lowered fields over the Pyrenees committed (from an openly licensed model run, attribution in `fixtures/`); advection test: a stated field shifted by `u·Δt` exactly |
+| **1 — data** | `tuile-clouds`: `CloudSource`, `CloudManifest`, the container of §5.3 (scene layout first, tiled layout behind it), `StatedCloudSource`, `TemplateCloudSource`, `lower` (§4.3: profiles → layers, type, synthesised density, cirrus, placed clouds, LCL, RH scheme), time interpolation with advection (f64); wasm check | round-trip and fixture tests; a **scene fixture** over the Pyrenees in the container, from openly licensed inputs (attribution in `fixtures/`), holding only the minimum of §8 (fraction and wind per level) — the synthesis must give Scene A from that alone; a second fixture with placed clouds; advection test: a stated field shifted by `u·Δt` exactly; same inputs, same field bytes on native and wasm |
 | **2 — medium** | `tuile-atmosphere::clouds`: extinction from water content, type profiles, double-HG and tabulated phase, octaves, ambient by height, light march; CPU f64 reference marcher; Monte-Carlo path tracer of a 3D medium (shared with #141 §5.7); noise generation on an established crate, digest-tested | per-view-angle error vs. the path tracer recorded; noise bytes identical native/wasm |
 | **3 — film, clouds** | `tuile-film-gpu`: cascades, march (compute, full res, no history), compose with aerial perspective (§2.6); `Look::clouds` | **Scene A — a cumulus field over the Pyrenees** at a stated forecast time (fixture of PR 1), camera at 2 500 m looking along the range at 15:00 local: flat bases at the lowered LCL, silver linings towards the sun, haze in front of far clouds. Film opened. No-cloud digests unchanged |
 | **4 — shadows** | cloud shadow map; ground sun term; overcast ambient; god rays in the air march; overlays shaded | **Scene B — cloud shadows on terrain**: the same field, sun at 30°, shadows moving with the wind over slopes; low sun through gaps for rays. Film opened; ground never below the floor (test) |
@@ -736,35 +828,44 @@ cloud march loops over its lights; if not, it takes the sun and the Moon as
 
 ---
 
-## 8. What tuile needs from the data provider
+## 8. What tuile needs from a data provider — a contract to adopt
 
-The minimum, to draw Scene A:
+Written so that a provider can take it as the contract of its cloud
+export. Every quantity is per hour (UTC) and per point (a scene's points or
+grid, or a tile's grid); altitudes in metres, stating above sea level or
+above the ellipsoid; winds in m/s, eastward and northward.
 
-1. **A manifest**: valid times, run time, model name and attribution text,
-   bounds, tiling levels.
-2. **Per valid time, per layer** (low / middle / convective; plus high for
-   cirrus): coverage fraction, base and top heights (metres above the
-   ellipsoid, or above sea level with the geoid stated), a type or the
-   convective/stratiform share, and the wind at the layer.
-3. **Hourly steps** (or finer) over the period of the flight or film, and
-   the two steps bracketing every instant shown.
+**Minimum** — enough for Scenes A to D of §7:
 
-Better, when available:
+| # | Quantity | Shape | Note |
+|---|---|---|---|
+| M1 | Manifest: layout (scene bounds, or tiling), points or grid, altitude levels, hours, `source`, `credits`, licence | JSON chunk | attribution is shown by the host; tuile never invents it |
+| M2 | **Cloud fraction per altitude level** (0–1) | hour × level × point | up to whatever height the source has (500 hPa ≈ 5.5 km is enough for low and middle clouds) |
+| M3 | **Wind per level** (u, v) | hour × level × point | drives advection; without it clouds stand still |
+| M4 | Hours bracketing every instant shown | — | hourly or finer; tuile interpolates with advection (§4.4) |
 
-4. Liquid and ice water content per level (`QC`, `QI`), or per-level cloud
-   fraction (`CLC`) on height levels — the volume form.
-5. 2 m temperature and dew point, to place cumulus bases at the LCL where
-   the model's convective base is missing or coarse.
-6. For past flights: satellite cloud mask, cloud type and cloud-top height
-   at the flight's time.
+**Optional**, each improving one thing, none required:
 
-Either as tiles in tuile's format (§5.3), served from PMTiles or a URL
-template — the provider runs tuile's lowering library on its own fields —
-or as a `CloudSource` implementation of its own. The provider owns the
-choice of models, the licences and attributions, and the archive of past
-runs; tuile owns everything from the fields to the pixel.
+| # | Quantity | Improves | Without it, tuile… |
+|---|---|---|---|
+| O1 | Relative humidity per level | layer edges, fraction where missing | uses fraction alone |
+| O2 | Cloud base and top (convective) | flat cumulus bases at the right height | takes the fraction profile's edges, or the LCL from O3 |
+| O3 | 2 m temperature and dew point; boundary-layer height | the LCL and the cumuliform/stratiform decision | uses the fraction profile's shape |
+| O4 | Low / middle / high cover | a check on M2, and the high cover for cirrus | no cirrus layer |
+| O5 | **Placed clouds** (position, base, top, radius, hour span) — e.g. cumulus derived from a track's thermals and satellite | clouds *where they were*, not only plausible ones | draws the forecast's statistics only |
+| O6 | Liquid / ice water content per level | density, thickness of the look | synthesises it (§4.3) |
+| O7 | Satellite cloud mask and cloud-top height at the hours shown | coverage where observed, cirrus height | trusts the forecast |
+| O8 | Cloud fraction above 500 hPa | middle-high and towering clouds | guesses the cirrus altitude |
 
----
+**Form**: the container of §5.3 — one small file per scene first,
+PMTiles of the same blocks for globe-wide data later; or the provider's own
+`CloudSource` implementation returning those bytes.
+
+**What stays the provider's**: the choice of models and services, their
+licences and attributions, keeping data for past dates (historical
+forecasts, ERA5 or stored satellite products — imagery viewed as WMS and
+not stored cannot serve a replay later), and the per-track products. What
+stays tuile's: everything from these inputs to the pixel.
 
 ## 9. Out of scope
 
@@ -791,10 +892,15 @@ runs; tuile owns everything from the fields to the pixel.
   shadows and god rays from one cloud shadow map; LOD as filtering, from in
   the cloud to orbit, with no switch; WebGL2 by fragment passes, proved
   feasible by an open-source geospatial renderer.
-- **Data**: NWP gives coverage, base, top, water and wind per column — enough
-  for plausible clouds, not the actual ones; satellite products add where
-  they were. tuile lowers fields to layered tiles and interpolates in time
-  with advection; the provider supplies fields through a `CloudSource`.
+- **Data**: the normal input is sparse — cloud fraction and wind per level at
+  a few points, hourly, perhaps bases and tops and placed cumulus; water
+  content optional. tuile synthesises type, density and detail from that,
+  deterministically, and interpolates in time with advection. One trait takes
+  a per-scene block or globe-tiled blocks in one container; §8 is the
+  contract a provider can adopt.
+- **Doc 19**: its 2D layer stays (as the far LOD, the cirrus and the WebGL2
+  fallback) and its Cycles verdict stands; volumetric clouds move to the wgpu
+  film and interactive renderers.
 - **Budget**: ~47 MiB and 1–2 ms on desktop, ~14 MiB and 3–5 ms on mobile and
   WebGL2 (estimates to measure); tens of ms a frame in the film.
 - **Plan**: data crate → medium and reference → film clouds (Pyrenees cumulus)
@@ -812,6 +918,8 @@ runs; tuile owns everything from the fields to the pixel.
 - Bohren & Huffman 1983, *Absorption and Scattering of Light by Small Particles*, Wiley; P. Laven, MiePlot — [philiplaven.com/mieplot.htm](http://www.philiplaven.com/mieplot.htm)
 - Jendersie & d'Eon 2023, *An Approximate Mie Scattering Function for Fog and Cloud Rendering*, SIGGRAPH Talks — [research.nvidia.com/labs/rtr/approximate-mie](https://research.nvidia.com/labs/rtr/approximate-mie), [supplemental](https://research.nvidia.com/labs/rtr/approximate-mie/publications/approximate-mie-supplemental.pdf)
 - WMO International Cloud Atlas — [cloudatlas.wmo.int](https://cloudatlas.wmo.int/)
+- Sundqvist, Berge, Kristjánsson 1989, *Condensation and cloud parameterization studies with a mesoscale numerical weather prediction model*, Mon. Wea. Rev. — [doi:10.1175/1520-0493(1989)117<1641:CACPSW>2.0.CO;2](https://doi.org/10.1175/1520-0493(1989)117%3C1641:CACPSW%3E2.0.CO;2)
+- Rogers & Yau 1989, *A Short Course in Cloud Physics*, 3rd ed., Pergamon (adiabatic liquid water content)
 - Lawrence 2005, *The relationship between relative humidity and the dewpoint temperature*, BAMS — [doi:10.1175/BAMS-86-2-225](https://doi.org/10.1175/BAMS-86-2-225); Romps 2017, *Exact expression for the lifting condensation level*, J. Atmos. Sci. — [doi:10.1175/JAS-D-17-0102.1](https://doi.org/10.1175/JAS-D-17-0102.1)
 
 **Rendering**
