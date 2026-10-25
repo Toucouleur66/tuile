@@ -2,7 +2,9 @@
 
 Target: `crates/tuile-core/src/budget/` at `origin/main` 7b0ac83 (PR #71), 16 files, about 5,900 lines. All `file:line` references are to that commit.
 
-Method: I read every file of the module plus the budget tests (`budget_sim/soak.rs`, `server.rs`, the goldens) through `git show`. The main checkout was not touched. Clippy ran twice on a copy of `tuile-core` and `tuile-b3dm` extracted with `git archive` into the scratchpad, with its own target directory and `-j 2`, after checking that no other cargo or rustc process was running. Nothing was built or run in the repository.
+Method: a read of every file of the module and of the budget tests (`budget_sim/soak.rs`, `server.rs`, the goldens) at that commit, and two clippy runs on an extracted copy of `tuile-core` and `tuile-b3dm`. Nothing was built or run in the repository itself.
+
+**Status:** the fixes were made in #108 (decide allocations 6,492 → 13 per still step, `Decisions::digest` bit-identical). The line references below are to 7b0ac83 and no longer match `main`.
 
 **No runtime measurement was taken.** Allocation counts, lookup counts and impact figures below are estimates from reading the code under a stated workload model. The harness in section 8 turns them into measurements, and it should be built before anything is prioritised on the strength of these numbers.
 

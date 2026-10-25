@@ -1,6 +1,29 @@
 # Graphics budget: roadmap after the plan (A → B → C)
 
-Kept from the plan approved with Laurent on 2026-10-19/20. Status on 2026-10-21: A0 done (#99, v0.10.0), A1 done (#100, #109), A3 done (#108), A5 first half done (#105, v0.12.0); A6 in progress (texcomp, #107); A2, A4, B and C not started.
+Kept from the plan approved with Laurent on 2026-10-19/20.
+
+## Status on 2026-10-25 (v0.14.0)
+
+| Step | Status | Where |
+|---|---|---|
+| A0 cut-over | done | #99 (v0.10.0) |
+| A1 correctness defects | done | #100, #109 |
+| A3 audit fixes | done — decide allocations 6,492 → 13 per still step, digests bit-identical | #108 |
+| A5 bake | three-stage pipeline done (#105, v0.12.0); the shared tokio runtime and HTTP pool per process not started | #105 |
+| A6 loading and decoding | GPU-compressed imagery shipped as the client's choice, off by default: the format seam (#114), stored KTX2/UASTC transcode-only (#121), GPU encode to BC7/ASTC in tuile-wgpu (#122), the web paths — GPU encode on WebGPU, CPU encode in the decode workers on WebGL2 (#127); v0.13.0 and v0.14.0. zune-png dropped after the decode bench (#110, open). io_uring not started | #114, #121, #122, #127 |
+| A2 ledger hardening | not started | |
+| A4 incremental decide, dense structures | not started | |
+| B, C | not started | |
+
+**Next: the compression budget.** With compression on, the budget still under-counts it: `plan` caps on resident
+bytes (87,408 per BC7 tile) while 349,524 RGBA8 bytes cross; the encode's transient memory and the encoder scratch
+are never charged; the encode pacing (`EncodePace`, 4 ms a frame) sits outside `FrameDeadline` and assumes 5 ms
+per BC7 tile while it costs 9–10 ms, which explains the settle regression from 5.0 s to 10.2 s. A plan of eight
+PRs — numbered B1–B8 in that plan, unrelated to section B below — fixes it in the core first: a cost per path
+(transfer / resident / transient), the transient peak and fixed reservations in the ledger, an encode lane inside
+`FrameDeadline`, simulation profiles with goldens, then the wgpu pump and the web CPU path on the core's deadline,
+signals, and a measured acceptance (imagery peak ≤ 15.5 MB, BC7 settle ≤ 6.0 s, Off goldens unchanged). It comes
+before A2 and A4.
 
 
 Order is strict: A before B, B before C. Every step of A, B and C goes through the same battery before
@@ -15,8 +38,8 @@ is deleted (no switch).
 A0. The cut-over, EFFECTIVE everywhere: native (Mac first, then iOS/Android), web (page + worker over
     postMessage, WebGPU and WebGL2, verified in a real browser) and bake (tuile-bake Session on
     BudgetConfig::batch(), terrain digests identical) — the PR is not done until all run on the budget.
-    In progress (feat/budget-cutover).
-A1. Correctness defects found by the measurements:
+    Done (#99).
+A1. Correctness defects found by the measurements (done, #100 and #109):
     - the warm relaunch that refetches 1 537 items after a flushed store (lying index or lost writes)
       — the store ↔ ledger contract must be right before any cost-aware eviction;
     - the pooled ledger's phone slow dive over mountains (512 MB) that no longer converges in 8 s;
@@ -29,7 +52,7 @@ A2. Ledger hardening: cargo-mutants on crates/tuile-core/src/budget/ (1 141 muta
     remote sessions); cargo-fuzz on decide; runtime audit (full in debug/test, sampled in release →
     tuile_budget_audit_failures + alert); the MCAP corpus of real sessions replayed in the simulation;
     the 1 h soak with resizes and stereo.
-A3. Budget code audit fixes — BEFORE the algorithm work (Laurent, 2026-10-20). Read-only audit of origin/main
+A3. Budget code audit fixes — BEFORE the algorithm work (Laurent, 2026-10-20). Done (#108). Read-only audit of origin/main
     7b0ac83 (report: docs/explorations/graphics-budget-audit.md, 64 findings; clippy perf lints find nothing — the
     cost is structural): ~8–10k allocations per decide at 500 drawn tiles (estimate, to measure).
     Fixes, keeping Decisions::digest bit-identical (goldens.txt, pattern_goldens.txt):
@@ -67,7 +90,7 @@ A5. The farm bake: the three-stage pipeline — (1) serial selection per frame, 
     on rayon from frozen selections; (3) in-order pack writing through a reorder buffer — proven by
     bit-identical packs; the survey's double settles removed, its placements reused; the ground index
     built cheaper (no per-vertex trig, no rebuild when a tile's stitch plan is unchanged); phase labels
-    (survey_lift / survey_hud / pose) + stl_bake_pose_seconds. In progress (perf/bake-three-stage).
+    (survey_lift / survey_hud / pose) + stl_bake_pose_seconds. Done (#105).
     Then one tokio runtime and one HTTP connection pool per process shared by all bakes (HTTP/2 to the
     object store and stl-tiles). The branches are reconciled with the cut-over afterwards.
 A6. Loading and decoding: GPU-compressed textures (BC7/ASTC/ETC2 via KTX2 + Basis Universal: 4–8× less
@@ -75,6 +98,10 @@ A6. Loading and decoding: GPU-compressed textures (BC7/ASTC/ETC2 via KTX2 + Basi
     support wgpu/WebGL2); PNG through zune-png; io_uring for the farm's PMTiles reads only if syscalls
     still weigh after the shared runtime (Linux-only, needs a measurement). hyper instead of reqwest:
     not planned (marginal).
+    As shipped (v0.13.0–v0.14.0): BC7 and ASTC 4×4 only, chosen by tuile's client and off by default
+    (no compression in the bake or the film); stored imagery is read as KTX2/UASTC and transcoded, never
+    re-encoded; ETC2 and a client JPEG-free path were not pursued; zune-png was measured and dropped (decode bench, #110).
+    The budget accounting of compression is the next step (see the status above).
 
 ### B — The GC: the ledger's eviction side (after A)
 Inspiration: OS virtual memory (page-frame database = ledger, working set = need, mlock = protected,
