@@ -44,6 +44,8 @@ parameters; a backend draws with them.
   (`stars.table`, made by the `tuile-star-catalogue` tool) that the sky
   reads them from. They are always drawn: the air dims them and the
   camera decides whether they show.
+- [`planets`] — Mercury to Uranus: VSOP87 places, Mallama & Hilton's
+  magnitudes, drawn by the stars' rule.
 - [`tuning`] — every setting of the air as a tuning value: read from the
   environment by a native host, today's constant by default.
 - [`look`] — how a renderer draws the physical atmosphere: its

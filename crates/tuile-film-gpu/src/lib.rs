@@ -2815,10 +2815,8 @@ impl FilmGpu {
         // The stars of the instant, or — a film that states none — of
         // J2000: always there, the air and the camera deciding whether they
         // show.
-        let stars = tuile_atmosphere::stars::j2000_to_ecef(
-            light.instant.unwrap_or(tuile_atmosphere::stars::J2000_UNIX),
-        )
-        .transpose();
+        let instant = light.instant.unwrap_or(tuile_atmosphere::stars::J2000_UNIX);
+        let stars = tuile_atmosphere::stars::j2000_to_ecef(instant).transpose();
         self.atmosphere.frame_uniform = AtmosphereUniform::new(
             &params,
             &sky,
@@ -2826,7 +2824,8 @@ impl FilmGpu {
             self.lit.exposure_scale(),
             stars,
             &atmosphere::sky_look(&base),
-        );
+        )
+        .with_planets(&tuile_atmosphere::planets::lights_at(instant));
         self.atmosphere.frame_uniform.earth[3] = f32::from(u8::from(self.night_lights));
         // Written now for the sky-view, placed from each eye when drawn.
         self.queue.write_buffer(
