@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! # tuile-bing
-//!
-//! Bing Maps imagery connector. Resolves the Bing metadata REST document to
-//! get the tile URL template + subdomains, maps a tile to a quadkey, and
-//! implements the core's [`tuile_core::raster::ImageryProvider`] so it drapes
-//! onto terrain (or any geometry) like any other imagery source.
-//!
-//! Independent of ion: the Bing key may come from a `tuile-cesium-ion`
-//! `ImageryEndpoint` (`options.key`) or directly. Tile fetching goes through
-//! a [`tuile_core::fetch::TileFetcher`] — wasm-clean, no reqwest here.
+#![doc = include_str!("../README.md")]
 
 use async_trait::async_trait;
 use bytes::Bytes;

@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! # tuile-b3dm
-//!
-//! Codec for the Batched 3D Model container (b3dm, 3D Tiles 1.0): a 28-byte
-//! header, feature/batch tables, and an embedded binary glTF.
-//!
-//! This crate only handles the *container*: [`parse`] hands back table
-//! slices and the glb payload without copying; [`encode`] builds a valid
-//! b3dm around a glb (handy for tests and tilers). Decoding the embedded
-//! glTF is the caller's business.
-//!
-//! No I/O, no unsafe, wasm-clean.
+#![doc = include_str!("../README.md")]
 
 use serde_json::Value;
 
