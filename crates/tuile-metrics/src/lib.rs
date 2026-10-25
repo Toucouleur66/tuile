@@ -1,32 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! Publishes the engine's counters to a Prometheus endpoint.
-//!
-//! Every number used to reach a human by being printed into one wide log line
-//! per second, mixed with five unrelated subjects. That line is unreadable, and
-//! worse it is the wrong shape: a cumulative counter like `uploads` or
-//! `evictions` says almost nothing as an absolute value and everything as a
-//! *rate*, which a log forces the reader to compute by subtracting two lines by
-//! eye. So the numbers come here, where anything that speaks Prometheus takes
-//! their derivative, and `stdout` keeps only what is genuinely an **event**:
-//! ground drawn black, a server that stopped, imagery that never arrived.
-//!
-//! ```text
-//! curl -s localhost:9464/metrics | grep tuile_store
-//! ```
-//!
-//! # Why a bridge at all
-//!
-//! [`tuile_core::metrics`] is plain atomics: no allocation, no locks, nothing
-//! behind a feature, and it compiles to `wasm32-unknown-unknown`, where a
-//! registry and an HTTP listener cannot follow. The core may take no backend
-//! dependency, so recording stays there and publishing happens here — a copy of
-//! a few dozen integers, once a second.
-//!
-//! `metrics` + `metrics-exporter-prometheus` own the exposition format and the
-//! HTTP listener. Both were briefly written by hand in this file, which was a
-//! waste and worse than what the crates do.
+#![doc = include_str!("../README.md")]
 
 use std::net::SocketAddr;
 use std::time::Duration;

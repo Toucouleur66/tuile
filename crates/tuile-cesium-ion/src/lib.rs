@@ -1,21 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! # tuile-cesium-ion
-//!
-//! Source connector for Cesium ion: resolves asset endpoints
-//! (`/v1/assets/{id}/endpoint`), carries bearer tokens, refreshes them on
-//! 401/403, and exposes ion-hosted **3D Tiles** as a plain
-//! [`tuile_core::fetch::TileFetcher`] — the core never knows ion exists.
-//!
-//! **Imagery** assets resolve the same way ([`ImageryEndpoint`]); this
-//! crate is their *transport* (tile URLs + auth). Draping imagery onto
-//! geometry is the core's raster-overlay module (see roadmap) — not this
-//! crate's business.
-//!
-//! Tokens are never stored in any repository; pass them in (CLI flag, env
-//! var read by the caller). Attribution strings returned by ion must be
-//! displayed by consumers ([`Attribution`]).
+#![doc = include_str!("../README.md")]
 
 use async_trait::async_trait;
 use bytes::Bytes;

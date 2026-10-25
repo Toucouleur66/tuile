@@ -1,23 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! # tuile-planetary
-//!
-//! Planetary scene assembly: crosses a **terrain source** with an **imagery
-//! provider** into the [`TileTree`] + [`TileLoader`] pair the geometry server
-//! drives, so the globe streams through the same runtime as any other source.
-//!
-//! It is generic over [`tuile_terrain::TerrainSource`] and
-//! [`tuile_core::raster::ImageryProvider`] — it knows **nothing** about ion,
-//! Bing, HTTP or any transport. The host decides those at injection time
-//! (resolve the sources, then call [`globe`]); a wasm host and a native host
-//! plug in different backends behind the same two traits. This crate is pure
-//! and wasm-able: no I/O of its own beyond the injected sources.
-//!
-//! [`PlanetaryLoader`] is the geometry↔imagery crossing point: per terrain tile
-//! it decodes the quantized mesh and names the imagery tiles that cover it, each
-//! reprojected once onto its own rectangle and **shared** with every other
-//! terrain tile it drapes.
+#![doc = include_str!("../README.md")]
 
 pub mod jobs;
 mod provenance;
