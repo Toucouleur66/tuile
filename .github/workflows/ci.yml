@@ -41,8 +41,16 @@ jobs:
 
   test:
     strategy:
+      # One platform's failure must not cancel the other's report.
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # Pinned, not `ubuntu-latest`: the GPU tests render through lavapipe,
+        # so the Linux image is also the Vulkan driver. On 2026-10-25
+        # `ubuntu-latest` moved from ubuntu-24.04 (Mesa 25.2.8) to
+        # ubuntu-26.04 (Mesa 26.0.8), whose lavapipe dies with SIGSEGV in
+        # `tuile-film-gpu`'s headless and atmosphere tests. Moving the image
+        # is a deliberate change, made here with the driver it brings.
+        os: [ubuntu-24.04, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
