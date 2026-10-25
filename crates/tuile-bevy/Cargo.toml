@@ -1,0 +1,46 @@
+[package]
+name = "tuile-bevy"
+description = "The OGC 3D Tiles globe of tuile inside a Bevy application: tuile-wgpu's renderer and graphics budget drawing on the host's device, into the host's colour and depth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The engine itself, without its defaults: the render app, the 3D core
+# pipeline (whose schedule the globe's pass joins) and the camera. No window,
+# no audio, no asset formats: a host brings those.
+bevy = { version = "0.20.0", default-features = false, features = ["std", "bevy_render", "bevy_core_pipeline", "bevy_camera", "bevy_log"] }
+glam = { workspace = true }
+tracing = { workspace = true }
+tuile-camera = { version = "0.14.0", path = "../tuile-camera" }
+tuile-core = { version = "0.14.0", path = "../tuile-core" }
+tuile-planetary = { version = "0.14.0", path = "../tuile-planetary" }
+tuile-terrain = { version = "0.14.0", path = "../tuile-terrain" }
+tuile-wgpu = { version = "0.14.0", path = "../tuile-wgpu" }
+url = { workspace = true }
+wgpu = { workspace = true }
+
+# A desktop or a phone: loads as tasks on a runtime of the plugin's own, and
+# sources named by address fetched over the native HTTP stack.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+tuile-core = { version = "0.14.0", path = "../tuile-core", features = ["rt-tokio"] }
+tuile-native-fetchers = { version = "0.14.0", path = "../tuile-native-fetchers" }
+
+[dev-dependencies]
+# The tests' host: meshes and unlit materials of its own, drawn in the same
+# frame as the globe.
+#
+# The window layer and the multi-threaded executor are named so that their
+# plugins exist to be turned off: the workspace's viewer enables them, and a
+# test built beside it must not open an event loop off the main thread.
+bevy = { version = "0.20.0", default-features = false, features = ["std", "bevy_render", "bevy_core_pipeline", "bevy_camera", "bevy_log", "bevy_pbr", "bevy_window", "bevy_winit", "x11", "bevy_asset", "png", "multi_threaded"] }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+image = { workspace = true }
+pollster = { workspace = true }

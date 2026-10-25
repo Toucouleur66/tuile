@@ -1,0 +1,18 @@
+[package]
+name = "tuile-bevy-viewer"
+description = "A Bevy application showing tuile's globe: a camera the application drives, an orbit controller, and meshes of its own sharing the ground's depth"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bevy = { version = "0.20.0", default-features = false, features = ["std", "bevy_render", "bevy_core_pipeline", "bevy_camera", "bevy_log", "bevy_pbr", "bevy_window", "bevy_winit", "bevy_asset", "png", "multi_threaded", "x11", "tonemapping_luts", "ktx2", "zstd_rust"] }
+tuile-core = { version = "0.14.0", path = "../../crates/tuile-core" }
+tuile-bevy = { version = "0.14.0", path = "../../crates/tuile-bevy" }
+url = { workspace = true }
