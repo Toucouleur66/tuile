@@ -6,8 +6,8 @@
 **One foundation for geospatial 3D, in Rust, that runs everywhere and draws in
 every way.** The same engine streams and renders a globe of terrain draped with
 imagery, and OGC 3D Tiles content, in a browser, on a desktop, on a phone, in a
-headset, frame-exact into a film on a laptop or a farm of GPUs, and serves it
-to others. Each of these is a render mode of one core, not a separate product.
+headset, inside a game engine's own renderer, frame-exact into a film on a
+laptop or a farm of GPUs, and serves it to others. Each of these is a render mode of one core, not a separate product.
 
 The 3D Tiles world has tilers that produce static files and clients tied to
 their own ecosystems. What it lacks is the part in the middle: a small,

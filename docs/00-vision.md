@@ -10,9 +10,10 @@ exists:
 
 | Target | How it draws |
 |---|---|
-| **Browser** | the core in wasm in a Web Worker; WebGPU, or a JavaScript scene library on the page |
+| **Browser** | the core in wasm in a Web Worker, decoding in worker threads; the same wgpu renderer on WebGPU or WebGL2, or a JavaScript scene library on the page |
 | **Desktop** | the native viewer (wgpu: Metal, Vulkan, DX12) |
 | **Mobile** | the same viewer embedded in a phone app, with budgets, threading and lifecycle sized for it |
+| **A host's renderer** | the same renderer drawing on a device, queue and targets the host owns (a game engine's render graph), sharing its depth |
 | **Headset** | two converged eyes from one scene: stereo frames, spatial video (MV-HEVC), and later live headset rendering |
 | **Film** | frame-exact offline rendering of a camera path, on a laptop or a farm of GPUs |
 | **Server** | the same geometry served to others: streaming over the wire, or static, cacheable 3D Tiles over HTTP |
@@ -61,14 +62,18 @@ compiled for every target, and owned by no renderer.
    in a server session for a consumer that declares its budget (a render node,
    a farm) — decided on 2026-10-19.
 3. **One renderer family.** wgpu is the reference backend, native and WebGPU.
-   Other hosts (OpenUSD/Hydra, platform scene graphs, game engines) get a
-   specialised façade over the geometry server. There is no generic FFI.
+   A host with its own wgpu renderer (a game engine) hands tuile its device,
+   queue and targets, and tuile records its pass there. Other hosts
+   (OpenUSD/Hydra, platform scene graphs) get a specialised façade over the
+   geometry server. There is no generic FFI.
 4. **Precision by construction.** All geospatial arithmetic stays in f64 until
    the switch to a local frame. Raw Earth-centred coordinates never reach f32.
 5. **Embedded-first resource discipline.** Every cache, pool and queue is
    bounded and sized from the device it runs on. The main thread never blocks.
    Ground is never black: a coarser ancestor stays drawn until its replacement
-   is resident.
+   is resident. Cost-saving choices that trade quality, such as GPU-compressed
+   imagery textures, are the client's choice: off by default, and tuile only
+   offers the means (formats, a capability helper, an RGBA8 fallback).
 6. **Determinism where it is needed.** A camera path can be recorded and
    replayed exactly (`tuile-tape`). Film rendering is frame-exact and
    independent of how the frames are split across machines.
@@ -83,12 +88,15 @@ compiled for every target, and owned by no renderer.
    wasm-compatible. This is the central asset; everything else is a façade, a
    binding or a renderer.
 2. **The globe**: quantized-mesh terrain (`tuile-terrain`) crossed with raster
-   imagery (`tuile-planetary`), from interchangeable sources. Commercial
+   imagery (`tuile-planetary`), from interchangeable sources: a tile service,
+   a `layer.json` over plain HTTP, or a heightfield computed on the spot
+   (a grid, or a function such as a procedural terrain). Commercial
    sources come through connector crates with runtime credentials, never
    committed; open sources (open terrain, open orthophotos, slippy maps) are
    first-class, not a fallback.
 3. **Renderers for every mode** on one shading and one scene:
    - interactive native and browser (`tuile-wgpu`, `tuile-viewer`, `tuile-web`);
+   - inside a host's own renderer (a game engine);
    - mobile;
    - stereo and spatial video;
    - offline film (`tuile-film-*`).
@@ -106,7 +114,9 @@ compiled for every target, and owned by no renderer.
 ## Non-goals (for now)
 
 - **No tile generation** from raw sources (PostGIS, meshes). Tuile serves and
-  consumes existing data, and on-the-fly generation stays a later track.
+  consumes existing data, and on-the-fly generation stays a later track, with
+  one exception: terrain from a heightfield (a grid or a function), which
+  `tuile-terrain` encodes as quantized-mesh.
   Caching, re-packing and calibrating existing tiles are in scope.
 - **No gRPC as the sole interface.** Static mode is HTTP GET (CDN-cacheable)
   and streaming is a WebSocket. Connect RPC is the chosen path for a control
