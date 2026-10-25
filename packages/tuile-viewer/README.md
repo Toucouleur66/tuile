@@ -71,8 +71,8 @@ is a canvas. It resolves once the viewer draws.
 
 | Option | Meaning |
 |---|---|
-| `sources.catalog` | `{ url }`: the catalog proxy that resolves asset numbers to tile endpoints and holds the catalog's token on the server. Relative to the page unless absolute. Required. |
-| `sources.terrain` | `{ asset }`: the terrain, from the catalog. |
+| `sources.catalog` | `{ url }`: the catalog proxy that resolves asset numbers to tile endpoints and holds the catalog's token on the server. Relative to the page unless absolute. Required only when a source is named by `asset`. |
+| `sources.terrain` | `{ asset }`, the terrain from the catalog, or `{ url }`, the address of a quantized-mesh `layer.json` (relative to the page unless absolute; no token, and the server must answer with `Access-Control-Allow-Origin`). Its tiles are addressed as the `layer.json` says: TMS, row 0 in the south. |
 | `sources.imagery` | The layers, in order. Each has `key`, `name` and `attribution`, plus either a catalog `asset` or a URL `template` (`…/{z}/{x}/{y}.png`) with an optional `scheme` (`webmercator` or `geographic`) and `maxLevel`. |
 | `name` | Your application's name, used in messages. |
 | `profile` | `auto` (the default), `desktop` or `handheld`: memory budget, upload pacing and frame rate. |
