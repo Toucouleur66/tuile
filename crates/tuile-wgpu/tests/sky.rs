@@ -782,3 +782,123 @@ fn assert_sun_is_the_ephemeris_of(picture: &Picture, to_sun: DVec3) {
     let drawn = DVec3::new(f64::from(s[0]), f64::from(s[1]), f64::from(s[2]));
     assert!(drawn.angle_between(to_sun) < 1e-5);
 }
+
+/// What the physical atmosphere costs a frame, on this machine's GPU: the
+/// same scene at 1920×1080 (MSAA 4×) without it and with it, the mean of
+/// 60 frames each, waited for. A measurement, not an assertion: run it with
+/// `cargo test -p tuile-wgpu --test sky -- --ignored --nocapture frame_time`.
+#[test]
+#[ignore]
+fn frame_time_with_and_without_the_atmosphere() {
+    let Some(gpu) = gpu() else { return };
+    let (w, h) = (1920u32, 1080u32);
+    for (name, eye) in [
+        (
+            "pic du midi",
+            eye_at(PIC_LON, PIC_LAT, 2_877.0, 270.0, -4.0),
+        ),
+        ("orbit", eye_far(10.0, 40.0, 2.0e7)),
+    ] {
+        let origin = eye.at;
+        let mut tiles = globe(&gpu, origin, 4);
+        tiles.extend(ground_around(&gpu, origin, PIC_LON, PIC_LAT, 9, 6, 600.0));
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let targets = FrameTargets::new(&gpu, format, (w, h));
+        let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let instant = utc(2026, 6, 21, 19, 30);
+        let fewer = tuile_atmosphere::SkyLook {
+            march_steps: [6, 12],
+            ..Default::default()
+        };
+        for (sky, look, label) in [
+            (false, None, "without"),
+            (true, None, "with the atmosphere"),
+            (true, Some(fewer), "with the atmosphere, half the march"),
+        ] {
+            let mut renderer = TileRenderer::new(&gpu, format);
+            if let Some(look) = look {
+                renderer.set_air(Default::default(), look);
+            }
+            let sun = tuile_atmosphere::Sun::at_unix_seconds(instant);
+            let t = sun.light_travel_direction().as_vec3();
+            let clip =
+                glam::dcamera::rh::proj::directx::perspective(
+                    eye.fov_y,
+                    f64::from(w) / f64::from(h),
+                    (ecef_to_geodetic(eye.at).height * 0.25).clamp(0.5, 1.0e6),
+                    eye.at.length() + 2.0e7,
+                ) * glam::dcamera::rh::view::look_at_mat4(eye.at, eye.at + eye.forward, eye.up);
+            renderer.set_view(
+                &gpu.queue,
+                &ViewUniform {
+                    view_proj: view_proj_from_world(clip, origin),
+                    sun_dir: [t.x, t.y, t.z, 0.0],
+                    params: [0.25, 0.0, 0.0, 0.0],
+                    atmosphere: tuile_atmosphere::AerialPerspective::new(eye.at, origin, &sun, 1.0),
+                },
+            );
+            let mut view = view_of(&eye, origin);
+            view.aspect = f64::from(w) / f64::from(h);
+            view.height_px = h;
+            let frame = |renderer: &mut TileRenderer, f: u32| {
+                if sky {
+                    renderer.set_sky(&gpu, Some(&view.at(instant, f64::from(f) / 60.0)));
+                }
+                draw_to_texture(
+                    FrameOnTexture {
+                        gpu: &gpu,
+                        texture: &texture,
+                        targets: &targets,
+                        clear: wgpu::Color::BLACK,
+                        capture: None,
+                    },
+                    |pass| {
+                        renderer.paint(
+                            pass,
+                            std::iter::empty(),
+                            tiles.iter(),
+                            std::iter::empty(),
+                            None,
+                            false,
+                        )
+                    },
+                    |_, _| {},
+                );
+                gpu.device
+                    .poll(wgpu::PollType::wait_indefinitely())
+                    .expect("poll");
+            };
+            for f in 0..10 {
+                frame(&mut renderer, f);
+            }
+            let began = web_time::Instant::now();
+            for f in 10..70 {
+                frame(&mut renderer, f);
+            }
+            let ms = began.elapsed().as_secs_f64() * 1000.0 / 60.0;
+            eprintln!("{name}: {label} {ms:.2} ms a frame");
+        }
+        // The light worked out again: the CPU's share, once.
+        let mut renderer = TileRenderer::new(&gpu, format);
+        let view = view_of(&eye, origin);
+        let began = web_time::Instant::now();
+        renderer.set_sky(&gpu, Some(&view.at(instant, 0.0)));
+        eprintln!(
+            "{name}: a light and its sky-view worked out: {:.1} ms (CPU, and the submit)",
+            began.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}

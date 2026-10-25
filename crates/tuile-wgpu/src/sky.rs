@@ -56,6 +56,10 @@ const LIGHT_VIEW_STEP: f64 = 4.0 * std::f64::consts::PI / 180.0;
 /// light — and the sky-view, its horizon — is worked out again.
 const EYE_STEP: f64 = 0.02;
 
+/// How far, as a log of the ratio, the eye's height over the ground under
+/// it may change before the light is metered again: a tenth.
+const GROUND_STEP: f64 = 0.1;
+
 /// How far the sun moves in one frame, radians, for a jump: a degree,
 /// four minutes of a real sun — what a host setting its clock does, and no
 /// clock running does from one frame to the next.
@@ -506,6 +510,9 @@ impl Sky {
                 || moon_moved
                 || (frame.eye - key.eye).length() > EYE_STEP * key.clearance.min(clearance)
                 || angle(key.forward, frame.forward) > LIGHT_VIEW_STEP
+                // The ground under the eye found to be elsewhere — terrain
+                // streaming in: the meter met the wrong ground.
+                || (clearance / key.clearance).ln().abs() > GROUND_STEP
         };
         // A jump since the last frame is answered at once; motion, however
         // fast, once an interval.
