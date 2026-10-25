@@ -19,6 +19,12 @@
 #                                             #     phone on the cable
 #   scripts/try-viewer.sh android --gl        # … forcing OpenGL ES
 #
+# A sunset, half an hour before it at the Pic du Midi, an hour of the scene every two minutes:
+#   scripts/try-viewer.sh mac --lon 0.1418 --lat 42.9365 --altitude 3100 \
+#     --heading 290 --pitch 0 --time sunset --time-offset -30m --time-rate 30
+#   open "tuile://goto?lon=0.1418&lat=42.9365&altitude=3100&heading=290&pitch=0&time=sunset&timeOffset=-30m&timeRate=30"
+# and on the web, the same parameters in the page's query (printed below).
+#
 # The token is read from the workspace's `.env` (the main checkout's, from a
 # worktree) — TUILE_ION_TOKEN for the web, CESIUM_ION_TOKEN (or
 # TUILE_ION_TOKEN) for the Mac and the simulator. It is never printed and never
@@ -116,6 +122,8 @@ web() {
   echo "  $url"
   echo "  $url?backend=webgl2    (forces WebGL2)"
   echo "  $url?compression=auto  (imagery block-compressed; &backend=webgl2: encoded on the CPU)"
+  echo "  $url?lon=0.1418&lat=42.9365&altitude=3100&heading=290&pitch=0&time=sunset&timeOffset=-30m&timeRate=30"
+  echo "                         (half an hour before sunset at the Pic du Midi, as the tuile://goto link)"
   if [[ $lan == 1 ]] && command -v qrencode >/dev/null; then
     qrencode -t ANSIUTF8 "$url"
   elif [[ $lan == 1 ]]; then

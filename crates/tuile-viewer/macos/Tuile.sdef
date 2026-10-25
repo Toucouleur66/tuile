@@ -88,7 +88,7 @@
       <property name="frozen" code="Vfrz" type="boolean" access="rw" description="Whether the tile selection is frozen while the camera moves.">
         <cocoa key="frozen"/>
       </property>
-      <property name="view url" code="Vurl" type="text" access="r" description="The tuile://goto URL that returns to this view. Missing value when the view was centred on the current location.">
+      <property name="view url" code="Vurl" type="text" access="r" description="The tuile://goto URL that returns to this view and its moment (time=, timeOffset=, timeRate=). Missing value when the view was centred on the current location.">
         <cocoa key="viewURL"/>
       </property>
       <property name="tile count" code="Vtil" type="integer" access="r" description="Tiles drawn in the last frame.">

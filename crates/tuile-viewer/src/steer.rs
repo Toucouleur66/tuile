@@ -23,13 +23,45 @@
 //! | URL | effect |
 //! |---|---|
 //! | `tuile://goto?lon=&lat=&altitude=&heading=&pitch=` | puts the eye there; what is left out keeps its present value |
+//! | `tuile://goto?…&time=&timeOffset=&timeRate=` | also sets the scene's clock, as `--time`, `--time-offset` and `--time-rate` do: see below |
 //! | `tuile://north` | north up, about the point at the centre of the view |
 //! | `tuile://here` | centres on the current location (the system still asks the person) |
 //! | `tuile://view?freeze=on\|off&wireframe=on\|off` | the two display switches |
 //! | `tuile://imagery?name=<key>` | drapes another of the host's imagery layers; `name=next` takes the one after the present |
 //!
-//! **What a URL can do is all in that table.** It moves the camera, flips
-//! two display switches and picks among the layers the host listed. It reads no file, runs nothing, and carries no
+//! ## The scene's clock in a link
+//!
+//! A `goto` may also say when, with the flags' grammar, read by the same
+//! parser ([`tuile_atmosphere::ClockSettings::parse`]) as the flags and a
+//! page's options:
+//!
+//! | parameter | value |
+//! |---|---|
+//! | `time` | `now`, `sunset`, `sunrise`, or an RFC 3339 instant (`2026-06-21T19:42:00Z`) |
+//! | `timeOffset` | added to it, a signed duration: `-30m`, `-3h30m`, `45m`, `90s` |
+//! | `timeRate` | scene seconds a second: `1` real time, `30`, `0` frozen, `-1` backwards |
+//!
+//! `sunset` and `sunrise` are the next ones *at the place the link points
+//! to* — its `lon` and `lat`, the eye's present ones where it leaves them
+//! out — not where the eye was before. So a link watches a sunset in the
+//! Pyrenees, half an hour before it, an hour of the scene every two minutes:
+//!
+//! ```text
+//! tuile://goto?lon=0.1418&lat=42.9365&altitude=3100&heading=290&pitch=0&time=sunset&timeOffset=-30m&timeRate=30
+//! ```
+//!
+//! Without `time` the clock is left alone, as a left-out `lon` leaves the
+//! eye; `timeRate` alone changes the rate and keeps the instant, and
+//! `timeOffset` alone is refused — it has nothing to be counted from. A
+//! `goto` that says only when (`goto?time=sunset`) sets the clock where the
+//! eye is and does not move it. The link `C` copies carries the clock: from
+//! the nearest sunset or sunrise when the clock was started from one, so
+//! the link brings back the same moment of the evening whatever day it is
+//! opened, and as the instant otherwise; `timeRate` when it is not 1.
+//!
+//! **What a URL can do is all in that table.** It moves the camera, sets the
+//! scene's clock, flips two display switches and picks among the layers the
+//! host listed. It reads no file, runs nothing, and carries no
 //! credential; anything else — an unknown command, an unknown parameter, a
 //! value out of the flags' bounds, a URL longer than [`LONGEST_URL`] — is
 //! dropped whole with one line in the log, and the view does not move.
@@ -40,8 +72,9 @@
 
 use std::f64::consts::{PI, TAU};
 
+use tuile_atmosphere::{ClockSettings, SceneClock};
 use tuile_camera::{CameraController, GlobeCamera};
-use tuile_core::geo::ecef_to_geodetic;
+use tuile_core::geo::{ecef_to_geodetic, Geodetic};
 
 use crate::start::StartView;
 
@@ -69,6 +102,18 @@ pub(crate) struct Goto {
     /// Glide there over this many seconds rather than jump: see
     /// `app::flight`. `seconds=` in a URL, `flyTo` on a page.
     pub seconds: Option<f64>,
+    /// What it says of the scene's clock: `None` leaves it alone.
+    pub time: Option<Retime>,
+}
+
+/// What a link says of the scene's clock.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Retime {
+    /// `time=`, with `timeOffset=` and `timeRate=` if given: the clock
+    /// started again, a sunset or a sunrise at the place the link points to.
+    Start(ClockSettings),
+    /// `timeRate=` alone: the instant kept, the rate changed.
+    Rate(f64),
 }
 
 /// The longest glide a URL may ask for, seconds.
@@ -151,13 +196,11 @@ pub(crate) enum Request {
 }
 
 impl Goto {
-    /// Whether it says where, rather than only how long to take.
-    fn says_where(&self) -> bool {
-        *self
-            != Self {
-                seconds: self.seconds,
-                ..Self::default()
-            }
+    /// Whether it says where, rather than only how long to take or when.
+    pub(crate) fn says_where(&self) -> bool {
+        [self.lon, self.lat, self.altitude, self.heading, self.pitch]
+            .iter()
+            .any(Option::is_some)
     }
 
     /// A goto from numbers a script handed over, held to the flags' bounds
@@ -236,7 +279,18 @@ pub(crate) fn parse_url_among(
     match name.as_str() {
         "goto" => {
             let mut goto = Goto::default();
+            let (mut time, mut offset, mut rate) = (None, None, None);
             for (key, text) in &pairs {
+                let clock = match *key {
+                    "time" => Some(&mut time),
+                    "timeOffset" => Some(&mut offset),
+                    "timeRate" => Some(&mut rate),
+                    _ => None,
+                };
+                if let Some(slot) = clock {
+                    *slot = Some(*text);
+                    continue;
+                }
                 if *key == "seconds" {
                     goto.seconds = Some(
                         text.parse::<f64>()
@@ -258,9 +312,10 @@ pub(crate) fn parse_url_among(
                     _ => goto.pitch = Some(value),
                 }
             }
-            if !goto.says_where() {
-                return Err("goto says nowhere: give at least one of lon, lat, \
-                            altitude, heading, pitch"
+            goto.time = retime(time, offset, rate)?;
+            if !goto.says_where() && goto.time.is_none() {
+                return Err("goto says nothing: give at least one of lon, lat, \
+                            altitude, heading, pitch, time, timeRate"
                     .to_owned());
             }
             Ok(vec![Command::Goto(goto)])
@@ -293,6 +348,57 @@ pub(crate) fn parse_url_among(
                 .collect()
         }
         _ => Err(format!("unknown command {name:?}")),
+    }
+}
+
+/// The clock a `goto`'s `time`, `timeOffset` and `timeRate` say, read as
+/// the flags read theirs — by the same parser — or the sentence that says
+/// which is wrong.
+fn retime(
+    time: Option<&str>,
+    offset: Option<&str>,
+    rate: Option<&str>,
+) -> Result<Option<Retime>, String> {
+    let clock = |time| {
+        ClockSettings::parse(time, offset, rate).map_err(|why| format!("goto's clock: {why}"))
+    };
+    match (time, offset, rate) {
+        (None, None, None) => Ok(None),
+        (None, Some(o), _) => Err(format!(
+            "timeOffset={o} has nothing to be counted from: give time= \
+             (now, sunset, sunrise or an RFC 3339 instant) beside it"
+        )),
+        (None, None, Some(_)) => Ok(Some(Retime::Rate(clock(None)?.rate))),
+        (Some(t), _, _) => Ok(Some(Retime::Start(clock(Some(t))?))),
+    }
+}
+
+/// Where a view's eye is, for the sun: what a sunset is the next one at.
+fn place(view: &StartView) -> Geodetic {
+    Geodetic {
+        lon: view.lon.to_radians(),
+        lat: view.lat.to_radians(),
+        height: view.altitude,
+    }
+}
+
+/// The clock a `goto` leaves behind, from `clock` at `wall` (Unix seconds):
+/// `clock` itself when the link said no time; started again at `to` — the
+/// view the link leads to, not the one it leaves — when it said one.
+pub(crate) fn retimed(
+    clock: SceneClock,
+    time: Option<Retime>,
+    to: &StartView,
+    wall: f64,
+) -> SceneClock {
+    match time {
+        None => clock,
+        Some(Retime::Start(settings)) => settings.start(wall, place(to)),
+        Some(Retime::Rate(rate)) => {
+            let mut clock = clock;
+            clock.set_rate(rate, wall);
+            clock
+        }
     }
 }
 
@@ -360,6 +466,30 @@ pub(crate) fn link(view: &StartView) -> String {
         },
         view.pitch
     )
+}
+
+/// [`link`], with the scene's clock: the URL that brings back this view at
+/// this moment — what `C` copies and a script's `view url` reads.
+///
+/// Counted from the sunset or the sunrise nearest the instant, at this
+/// view's place, when the clock was started from one
+/// ([`crate::menu::Clock::event`]): `time=sunset&timeOffset=-12m` brings
+/// back twelve minutes before sunset on whatever day it is opened. As the
+/// instant otherwise. `timeRate` when the clock does not run in real time.
+///
+/// The view kept for the next session is [`link`], without it: a session
+/// opens on the present, wherever the last one left the clock.
+pub(crate) fn link_at(view: &StartView, clock: &crate::menu::Clock) -> String {
+    let settings = ClockSettings::of_instant(clock.instant, clock.rate, clock.event, place(view));
+    let (time, offset, rate) = settings.texts();
+    let mut url = format!("{}&time={time}", link(view));
+    if let Some(offset) = offset {
+        url.push_str(&format!("&timeOffset={offset}"));
+    }
+    if let Some(rate) = rate {
+        url.push_str(&format!("&timeRate={rate}"));
+    }
+    url
 }
 
 /// Turns the view north-up about the ground point at the centre of the screen.
@@ -611,8 +741,196 @@ mod tests {
                 heading: Some(0.0),
                 pitch: Some(30.0),
                 seconds: None,
+                time: None,
             })
         );
+    }
+
+    /// The example the documentation gives: the Pic du Midi, half an hour
+    /// before sunset, an hour of the scene every two minutes.
+    const SUNSET: &str = "tuile://goto?lon=0.1418&lat=42.9365&altitude=3100&heading=290\
+                          &pitch=0&time=sunset&timeOffset=-30m&timeRate=30";
+
+    /// A goto's clock is read by the flags' parser: the keywords, an
+    /// instant, an offset and a rate; a bad value refuses the whole link and
+    /// says which one; an offset with nothing to count from is refused.
+    #[test]
+    fn a_goto_reads_the_clock_as_the_flags_do() {
+        let Command::Goto(goto) = one(SUNSET) else {
+            unreachable!("a goto");
+        };
+        assert_eq!(goto.lon, Some(0.1418));
+        assert_eq!(
+            goto.time,
+            Some(Retime::Start(
+                ClockSettings::parse(Some("sunset"), Some("-30m"), Some("30")).unwrap()
+            ))
+        );
+        let time = |url: &str| match one(url) {
+            Command::Goto(goto) => goto.time,
+            other => unreachable!("{other:?}"),
+        };
+        let start = |time, offset, rate| {
+            Some(Retime::Start(
+                ClockSettings::parse(time, offset, rate).unwrap(),
+            ))
+        };
+        assert_eq!(
+            time("tuile://goto?lat=1&time=sunrise"),
+            start(Some("sunrise"), None, None)
+        );
+        assert_eq!(
+            time("tuile://goto?lat=1&time=now&timeOffset=-3h30m"),
+            start(Some("now"), Some("-3h30m"), None)
+        );
+        assert_eq!(
+            time("tuile://goto?lat=1&time=2026-06-21T19:42:00Z&timeRate=-1"),
+            start(Some("2026-06-21T19:42:00Z"), None, Some("-1"))
+        );
+        // A rate alone keeps the instant; a clock alone does not move the eye.
+        assert_eq!(
+            time("tuile://goto?lat=1&timeRate=0"),
+            Some(Retime::Rate(0.0))
+        );
+        let Command::Goto(only_when) = one("tuile://goto?time=sunset") else {
+            unreachable!("a goto");
+        };
+        assert!(!only_when.says_where());
+        // No time, no clock.
+        assert_eq!(time("tuile://goto?lon=2&lat=46"), None);
+
+        for (url, says) in [
+            ("tuile://goto?lat=1&time=teatime", "RFC 3339"),
+            ("tuile://goto?lat=1&time=sunset&timeOffset=soon", "duration"),
+            ("tuile://goto?lat=1&time=sunset&timeRate=fast", "time rate"),
+            ("tuile://goto?lat=1&time=sunset&timeRate=nan", "time rate"),
+            ("tuile://goto?lat=1&timeOffset=-30m", "counted from"),
+            ("tuile://goto?lat=1&time=now&time=sunset", "twice"),
+            ("tuile://goto?lat=1&time=", "RFC 3339"),
+        ] {
+            let why = parse_url(url).expect_err(url);
+            assert!(why.contains(says), "{url}: {why}");
+        }
+    }
+
+    fn pic() -> StartView {
+        StartView {
+            lon: 0.1418,
+            lat: 42.9365,
+            altitude: 3100.0,
+            heading: 290.0,
+            pitch: 0.0,
+        }
+    }
+
+    /// `time=sunset` is the sunset where the link leads, not where the eye
+    /// was: from the Pic du Midi, a link to Tokyo is lit for Tokyo's sunset,
+    /// some eight hours earlier.
+    #[test]
+    fn a_sunset_is_the_one_where_the_link_leads() {
+        let wall = tuile_atmosphere::clock::parse_rfc3339("2026-06-21T00:00:00Z").unwrap();
+        let mut c = controller(pic());
+        let Command::Goto(goto) =
+            one("tuile://goto?lon=139.6917&lat=35.6895&altitude=3000&time=sunset&timeOffset=-30m")
+        else {
+            unreachable!("a goto");
+        };
+        let to = destination(&c, goto);
+        go(&mut c, goto);
+        let clock = retimed(SceneClock::real_time(wall), goto.time, &to, wall);
+        let sunset_at = |view: &StartView| {
+            tuile_atmosphere::Sun::next_sunset(wall, place(view)).expect("the sun sets")
+        };
+        let tokyo = sunset_at(&view_of(&c.camera));
+        assert!((clock.at(wall) - (tokyo - 1800.0)).abs() < 1.0);
+        assert!(
+            (sunset_at(&pic()) - tokyo) > 6.0 * 3600.0,
+            "two sunsets apart"
+        );
+        // And it runs at the link's rate: real time, as it did not say.
+        assert_eq!(clock.rate(), 1.0);
+    }
+
+    /// A link without `time` leaves the clock as it was — instant, rate,
+    /// pause and all; `timeRate` alone keeps the instant.
+    #[test]
+    fn a_goto_without_time_leaves_the_clock_alone() {
+        let wall = 1_790_000_000.0;
+        let mut clock = SceneClock::real_time(wall - 100.0);
+        clock.set_rate(60.0, wall - 50.0);
+        clock.pause(wall - 10.0);
+        let Command::Goto(goto) = one("tuile://goto?lon=139.69&lat=35.69") else {
+            unreachable!("a goto");
+        };
+        assert_eq!(retimed(clock, goto.time, &pic(), wall), clock);
+        let Command::Goto(rate) = one("tuile://goto?lat=1&timeRate=10") else {
+            unreachable!("a goto");
+        };
+        let after = retimed(clock, rate.time, &pic(), wall);
+        assert_eq!(after.at(wall), clock.at(wall));
+        assert_eq!(after.rate(), 10.0);
+    }
+
+    /// The link `C` copies brings back the view and the clock: twelve
+    /// minutes before the sunset it was counted from, at its rate; and an
+    /// absolute instant when the clock was started from none.
+    #[test]
+    fn the_link_with_its_clock_leads_back_to_the_view_and_the_moment() {
+        let noon = tuile_atmosphere::clock::parse_rfc3339("2026-06-21T12:00:00Z").unwrap();
+        let view = pic();
+        let sunset = tuile_atmosphere::Sun::next_sunset(noon, place(&view)).unwrap();
+        let instant = (sunset - 720.0).round();
+        let from_sunset = crate::menu::Clock {
+            instant,
+            rate: 30.0,
+            resume: 30.0,
+            event: Some(tuile_atmosphere::Event::Sunset),
+        };
+        let url = link_at(&view, &from_sunset);
+        assert!(url.contains("&time=sunset&timeOffset=-1"), "{url}");
+        assert!(url.ends_with("&timeRate=30"), "{url}");
+        // Twelve minutes before it, to the second the ephemeris finds the
+        // sunset to.
+        let offset = url
+            .split("timeOffset=")
+            .nth(1)
+            .and_then(|rest| rest.split('&').next())
+            .expect("an offset");
+        let offset = tuile_atmosphere::clock::parse_duration(offset).unwrap();
+        assert!((offset + 720.0).abs() <= 2.0, "{url}");
+        let absolute = link_at(
+            &view,
+            &crate::menu::Clock {
+                event: None,
+                rate: 1.0,
+                ..from_sunset
+            },
+        );
+        assert!(absolute.contains("&time=2026-06-21T"), "{absolute}");
+        assert!(!absolute.contains("timeRate"), "{absolute}");
+
+        for (url, rate) in [(url, 30.0), (absolute, 1.0)] {
+            let Command::Goto(goto) = one(&url) else {
+                unreachable!("a link is a goto");
+            };
+            let mut c = controller(StartView {
+                lon: 139.69,
+                lat: 35.69,
+                altitude: 50_000.0,
+                heading: 10.0,
+                pitch: 45.0,
+            });
+            let to = destination(&c, goto);
+            go(&mut c, goto);
+            // Opened at noon on that day.
+            let clock = retimed(SceneClock::real_time(noon), goto.time, &to, noon);
+            assert!((clock.at(noon) - instant).abs() <= 2.0, "{url}");
+            assert_eq!(clock.rate(), rate);
+            let back = view_of(&c.camera);
+            assert!((back.lon - view.lon).abs() < 1e-6, "{back:?}");
+            assert!((back.lat - view.lat).abs() < 1e-6, "{back:?}");
+            assert!((back.altitude - view.altitude).abs() < 1e-2, "{back:?}");
+        }
     }
 
     /// `seconds=` makes a goto a glide; it is bounded, and alone it says

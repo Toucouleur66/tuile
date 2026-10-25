@@ -18,7 +18,7 @@ pub mod sun;
 pub mod tuning;
 
 pub use aerial::{AerialAir, AerialPerspective, WGSL};
-pub use clock::{ClockSettings, SceneClock, Start};
+pub use clock::{ClockSettings, Event, SceneClock, Start};
 pub use hillaire::{Calibration, LutAtmosphere, SkyLight};
 #[allow(deprecated)]
 pub use illumination::MAX_ADAPTATION_EV;

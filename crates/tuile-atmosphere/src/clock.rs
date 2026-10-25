@@ -48,6 +48,50 @@ pub enum Start {
     Sunrise,
 }
 
+impl Start {
+    /// The event a start is counted from, for a clock started at one.
+    pub fn event(&self) -> Option<Event> {
+        match self {
+            Start::Sunset => Some(Event::Sunset),
+            Start::Sunrise => Some(Event::Sunrise),
+            Start::Now | Start::At(_) => None,
+        }
+    }
+}
+
+/// A moment of the day a clock can be started from, wherever it is: what
+/// `time=sunset` names, rather than an instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Event {
+    Sunset,
+    Sunrise,
+}
+
+impl Event {
+    /// The first one at `at` after `after` (Unix seconds); `None` where the
+    /// sun does not cross the horizon that day.
+    pub fn next(self, after: f64, at: Geodetic) -> Option<f64> {
+        match self {
+            Event::Sunset => Sun::next_sunset(after, at),
+            Event::Sunrise => Sun::next_sunrise(after, at),
+        }
+    }
+
+    /// The one at `at` nearest `instant` — the first after half a day before
+    /// it, so within about half a day of it either way.
+    pub fn nearest(self, instant: f64, at: Geodetic) -> Option<f64> {
+        self.next(instant - DAY / 2.0, at)
+    }
+
+    /// The word a start is written with: `sunset`, `sunrise`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Event::Sunset => "sunset",
+            Event::Sunrise => "sunrise",
+        }
+    }
+}
+
 /// A clock as a host states it, before it runs: its start, its offset and
 /// its rate.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -112,8 +156,8 @@ impl ClockSettings {
         let start = match self.start {
             Start::Now => wall,
             Start::At(t) => t,
-            Start::Sunset => Sun::next_sunset(wall, at).unwrap_or(wall),
-            Start::Sunrise => Sun::next_sunrise(wall, at).unwrap_or(wall),
+            Start::Sunset => Event::Sunset.next(wall, at).unwrap_or(wall),
+            Start::Sunrise => Event::Sunrise.next(wall, at).unwrap_or(wall),
         };
         SceneClock {
             wall,
@@ -121,6 +165,46 @@ impl ClockSettings {
             rate: self.rate,
             paused: None,
         }
+    }
+
+    /// The settings that start a clock at `instant`, running at `rate`, as a
+    /// link writes them: counted from the `event` nearest `instant` at `at`
+    /// when there is one — so that the link brings back "half an hour
+    /// before sunset" on whatever day it is opened, as `time=sunset` does —
+    /// and as the instant itself otherwise, or where the sun does not set.
+    /// To the second: a link is text, and a second is no light anyone sees.
+    pub fn of_instant(instant: f64, rate: f64, event: Option<Event>, at: Geodetic) -> Self {
+        let instant = instant.round();
+        let from = event.and_then(|e| Some((e, e.nearest(instant, at)?)));
+        let (start, offset) = match from {
+            Some((event, at_event)) => (
+                match event {
+                    Event::Sunset => Start::Sunset,
+                    Event::Sunrise => Start::Sunrise,
+                },
+                (instant - at_event).round(),
+            ),
+            None => (Start::At(instant), 0.0),
+        };
+        Self {
+            start,
+            offset,
+            rate,
+        }
+    }
+
+    /// The three texts [`Self::parse`] reads these back from: the start, the
+    /// offset when there is one, and the rate when it is not real time.
+    pub fn texts(&self) -> (String, Option<String>, Option<String>) {
+        let start = match self.start {
+            Start::Now => "now".to_owned(),
+            Start::At(t) => format_rfc3339(t),
+            Start::Sunset => Event::Sunset.name().to_owned(),
+            Start::Sunrise => Event::Sunrise.name().to_owned(),
+        };
+        let offset = (self.offset != 0.0).then(|| format_duration(self.offset));
+        let rate = (self.rate != 1.0).then(|| self.rate.to_string());
+        (start, offset, rate)
     }
 }
 
@@ -297,6 +381,26 @@ pub fn parse_duration(text: &str) -> Result<f64, String> {
     Ok(sign * total)
 }
 
+/// A duration as [`parse_duration`] reads it, to the second: `-12m`,
+/// `1h30m`, `-45s`, `0s`. Hours are the largest unit, so a day and a half is
+/// `36h`.
+pub fn format_duration(seconds: f64) -> String {
+    let total = seconds.round();
+    if total == 0.0 {
+        return "0s".to_owned();
+    }
+    let sign = if total < 0.0 { "-" } else { "" };
+    let total = total.abs() as u64;
+    let (h, m, s) = (total / 3600, total / 60 % 60, total % 60);
+    let mut text = sign.to_owned();
+    for (n, unit) in [(h, 'h'), (m, 'm'), (s, 's')] {
+        if n != 0 {
+            text.push_str(&format!("{n}{unit}"));
+        }
+    }
+    text
+}
+
 /// An instant as RFC 3339, to the second, UTC.
 pub fn format_rfc3339(instant: f64) -> String {
     let seconds = instant.floor() as i64;
@@ -442,6 +546,67 @@ mod tests {
         let sunset = Sun::next_sunset(noon, at).unwrap();
         assert_eq!(clock.at(noon), sunset - 1800.0);
         assert!((clock.at(noon) - parse_rfc3339("2026-06-21T19:12:30Z").unwrap()).abs() < 60.0);
+    }
+
+    #[test]
+    fn durations_are_written_as_they_are_read() {
+        for (seconds, text) in [
+            (-720.0, "-12m"),
+            (5_400.0, "1h30m"),
+            (-45.0, "-45s"),
+            (0.0, "0s"),
+            (129_600.0, "36h"),
+            (3_661.4, "1h1m1s"),
+        ] {
+            assert_eq!(format_duration(seconds), text);
+            assert_eq!(parse_duration(text).unwrap(), seconds.round(), "{text}");
+        }
+    }
+
+    /// A clock written out for a link is counted from the sunset nearest
+    /// its instant when it was started from one, and read back, it starts
+    /// at that instant again — on that day, and at the same distance from
+    /// the sunset on any other.
+    #[test]
+    fn a_clock_written_from_a_sunset_reads_back_as_the_same_moment() {
+        let pic = Geodetic {
+            lon: 0.1418f64.to_radians(),
+            lat: 42.9365f64.to_radians(),
+            height: 2877.0,
+        };
+        let noon = parse_rfc3339("2026-06-21T12:00:00Z").unwrap();
+        let sunset = Sun::next_sunset(noon, pic).unwrap();
+        // Twelve minutes before it, and four after: the nearest either way.
+        for shift in [-720.0, 240.0] {
+            let offset = shift;
+            let instant = (sunset + shift).round();
+            let s = ClockSettings::of_instant(instant, 30.0, Some(Event::Sunset), pic);
+            let (time, written, rate) = s.texts();
+            assert_eq!(time, "sunset");
+            assert_eq!(rate.as_deref(), Some("30"));
+            let back =
+                ClockSettings::parse(Some(&time), written.as_deref(), rate.as_deref()).unwrap();
+            assert_eq!(back, s);
+            // Opened at noon that day, it is that instant again — within the
+            // second the sunset is rounded to, and the one the ephemeris finds
+            // it to.
+            assert!((back.start(noon, pic).at(noon) - instant).abs() <= 2.0);
+            // The offset is the distance from the sunset, to the second the
+            // ephemeris finds it to.
+            let written = parse_duration(written.as_deref().expect("an offset")).unwrap();
+            assert!((written - offset).abs() <= 2.0, "{written} for {offset}");
+        }
+        // Started from no event, or where there is none: the instant itself.
+        let at = ClockSettings::of_instant(noon + 0.4, 1.0, None, pic);
+        assert_eq!(at.texts(), ("2026-06-21T12:00:00Z".to_owned(), None, None));
+        let pole = Geodetic {
+            lon: 0.0,
+            lat: 89f64.to_radians(),
+            height: 0.0,
+        };
+        let polar = ClockSettings::of_instant(noon, 0.0, Some(Event::Sunset), pole);
+        assert_eq!(polar.start, Start::At(noon));
+        assert_eq!(polar.texts().2.as_deref(), Some("0"));
     }
 
     #[test]

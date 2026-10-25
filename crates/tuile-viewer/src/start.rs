@@ -37,6 +37,10 @@ FLAGS (each takes one number; `--flag value` or `--flag=value`):
     --time-offset <d>  added to it: -3h30m, +45m, 90s
     --time-rate <x>    scene seconds a second: 1 (real time, the default),
                        60 (an hour a minute), 0 (frozen), -1 (backwards)
+                       A link says the same three as time=, timeOffset= and
+                       timeRate=, a sunset being the one where it leads:
+                       tuile://goto?lon=0.1418&lat=42.9365&altitude=3100
+                         &heading=290&pitch=0&time=sunset&timeOffset=-30m&timeRate=30
 IMAGERY_LAYERS
     --imagery-compression <off|auto|bc7|astc>
                        how imagery is held on the GPU: off (RGBA8, the
@@ -70,7 +74,9 @@ KEYS:
     N                  north up: turn the view about the point at its centre
                        (a click on the compass ring does the same)
     L                  centre on the current location, at the present altitude
-    C                  copy a link to this view (a tuile://goto?… URL)
+    C                  copy a link to this view and its moment (a
+                       tuile://goto?… URL; time=sunset&timeOffset=… when the
+                       clock was started from a sunset)
     V                  go to the link on the clipboard
     I                  the next imagery layer
     W                  wireframe

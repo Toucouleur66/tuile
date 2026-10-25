@@ -21,7 +21,10 @@ const params = new URLSearchParams(location.search);
 const backend = params.get("backend") ?? "auto";
 const imageryCompression = params.get("compression") ?? "off";
 // `?time=sunset&timeOffset=-30m&timeRate=30`: the scene's clock, as the
-// package's `time`, `timeOffset` and `timeRate` (and the viewer's flags).
+// package's `time`, `timeOffset` and `timeRate` — the viewer's flags, and the
+// parameters of its `tuile://goto?…` links. A link's query opens the same
+// view at the same moment here: a sunset is the one over `lon`, `lat`.
+//   ?lon=0.1418&lat=42.9365&altitude=3100&heading=290&pitch=0&time=sunset&timeOffset=-30m&timeRate=30
 const time = params.get("time") ?? undefined;
 const timeOffset = params.get("timeOffset") ?? undefined;
 const timeRate = params.has("timeRate") ? Number(params.get("timeRate")) : undefined;

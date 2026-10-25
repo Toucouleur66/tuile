@@ -242,6 +242,7 @@ impl WebViewer {
                 .transpose()
                 .map_err(|e| JsError::new(&e))?,
             seconds: seconds.filter(|s| s.is_finite() && *s > 0.0),
+            time: None,
         };
         if self.current() {
             crate::desktop::queue(Request::Do(Command::Goto(goto)));
