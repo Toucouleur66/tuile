@@ -8,3 +8,25 @@ No third-party code has been ported into this repository.
 Algorithmic inspiration from open-source Apache-2.0 implementations of the
 standard creates no attribution obligation; any literal porting, should it
 ever occur, will be recorded here.
+
+Third-party data
+----------------
+
+The star catalogue (crates/tuile-star-catalogue/data/bright_stars.parquet,
+and the table made from it, crates/tuile-atmosphere/src/stars.table) is
+derived from:
+
+  The Bright Star Catalogue, 5th Revised Ed. (Preliminary Version),
+  Hoffleit D., Warren Jr W.H., Astronomical Data Center, NSSDC/ADC (1991),
+  =1964BS....C......0H, =1991bsc..book.....H.
+  Distributed by the CDS, Strasbourg, as catalogue V/50
+  (VizieR service, DOI 10.26093/cds/vizier).
+  Source: https://cdsarc.cds.unistra.fr/ftp/V/50/catalog.gz
+  SHA-256 of catalog.gz: 3dc44b1e90be8fbe5bcc7656032560f51275f985c7e3f783c9028e1838ec7bed
+  SHA-256 of catalog:    69797549cc1605aad7ff94e9325e29a1661f2a253917faaa056d9bf20b809afd
+  Fetched 2026-10-25.
+
+The CDS states that the copyright of a catalogue depends on its origin and is
+given in its ReadMe; the ReadMe of V/50 states no copyright. The catalogue is
+a work of NASA's National Space Science Data Center (Astronomical Data
+Center). Its authors and the CDS are acknowledged here as the CDS asks.

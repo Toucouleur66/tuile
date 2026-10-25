@@ -14,6 +14,7 @@
 //   var multi_scattering_lut: texture_2d<f32>;
 //   var irradiance_lut: texture_2d<f32>;
 //   var night_lights_lut: texture_2d<f32>;   // filterable
+//   var star_table: texture_2d<f32>;   // `stars::StarTable`; read by the sky
 //   var lut_sampler: sampler;   // filtering: the night lights'
 //
 // `hillaire::wgsl_bindings` writes them.
@@ -74,8 +75,8 @@ struct Atmosphere {
     // xyz: level ground's sky light where the frame's light was worked
     // out, from the tables: what a fragment's own is set against.
     level_ref: vec4f,
-    // Rows of the turn from the Earth's axes to the stars'. w of the
-    // first: 1 to draw stars.
+    // Rows of the turn from the planet's axes to the star catalogue's
+    // (J2000). w: nothing.
     stars_x: vec4f,
     stars_y: vec4f,
     stars_z: vec4f,
@@ -523,33 +524,24 @@ fn glare_of(n: vec3f, s: vec3f, light: vec3f, right: vec3f, up: vec3f) -> vec3f 
     return light * glare_psf(theta, phi) * c * c * atmosphere.discs.z;
 }
 
-fn star_hash(v: vec3u) -> vec3u {
-    // A PCG-style mix: three words in, three out.
-    var x = v * 1664525u + 1013904223u;
-    x.x += x.y * x.z;
-    x.y += x.z * x.x;
-    x.z += x.x * x.y;
-    x ^= x >> vec3u(16u);
-    x.x += x.y * x.z;
-    x.y += x.z * x.x;
-    x.z += x.x * x.y;
-    return x;
+// The star table's layout: `stars.rs`, whose constants these are.
+const STAR_CELLS: u32 = 32u;
+const STAR_TABLE_WIDTH: u32 = 256u;
+const STAR_INDEX_TEXELS: u32 = 6144u;
+const STAR_ENTRY_FIRST: u32 = 6198u;
+const STAR_REACH: f32 = 0.008726646;
+const SUN_V: f32 = -26.76;
+
+fn star_texel(i: u32) -> vec4f {
+    return textureLoad(star_table, vec2u(i % STAR_TABLE_WIDTH, i / STAR_TABLE_WIDTH), 0);
 }
 
-// Stars along the unit `n`, in the model's units, `sigma` the radius of a
-// star's image in radians (about a pixel). Not a catalogue: one star a cell
-// of a cube laid on the celestial sphere, its magnitude so drawn that the
-// whole sky holds the stars it does — five brighter than magnitude 0, five
-// thousand than 6 — fixed to the stars' own frame, so they turn about the
-// pole once a sidereal day; dimmed by the air below them, and lost in any
-// sky brighter than they are.
-fn stars_seen(n: vec3f, sigma: f32) -> vec3f {
-    if (atmosphere.stars_x.w == 0.0) { return vec3f(0.0); }
-    let c = vec3f(dot(atmosphere.stars_x.xyz, n), dot(atmosphere.stars_y.xyz, n), dot(atmosphere.stars_z.xyz, n));
+// The cell of the table's cube the unit `c` falls in: `stars::cell_of`.
+fn star_cell(c: vec3f) -> u32 {
     let a = abs(c);
     var face = 0u;
-    var uv = vec2f(0.0);
     var major = 0.0;
+    var uv = vec2f(0.0);
     if (a.x >= a.y && a.x >= a.z) {
         face = select(1u, 0u, c.x > 0.0); major = a.x; uv = c.yz;
     } else if (a.y >= a.z) {
@@ -557,28 +549,57 @@ fn stars_seen(n: vec3f, sigma: f32) -> vec3f {
     } else {
         face = select(5u, 4u, c.z > 0.0); major = a.z; uv = c.xy;
     }
-    let cells = 96.0;
-    let q = (uv / major * 0.5 + 0.5) * cells;
-    let cell = floor(q);
-    let h = star_hash(vec3u(u32(cell.x), u32(cell.y), face));
-    let r = vec3f(h & vec3u(0xffffffu)) / 16777216.0;
-    let at = (cell + 0.2 + 0.6 * r.xy) / cells * 2.0 - 1.0;
-    var s = vec3f(0.0);
-    let sign = select(-1.0, 1.0, face % 2u == 0u);
-    if (face < 2u) { s = vec3f(sign, at.x, at.y); }
-    else if (face < 4u) { s = vec3f(at.x, sign, at.y); }
-    else { s = vec3f(at.x, at.y, sign); }
-    s = normalize(s);
-    // Its rank among the cells, brightest first, and so its magnitude.
-    let rank = max(r.z, 1e-6) * 6.0 * cells * cells;
-    let magnitude = 2.0 * log2(rank / 5.0) / log2(10.0);
-    if (magnitude > 7.5) { return vec3f(0.0); }
-    let e = pow(10.0, -0.4 * (magnitude + 26.74));
-    let theta2 = dot(c - s, c - s);
-    let spot = e / (2.0 * ATMOSPHERE_PI * sigma * sigma) * exp(-theta2 / (2.0 * sigma * sigma));
-    let tint = mix(vec3f(1.0, 0.82, 0.66), vec3f(0.78, 0.86, 1.0), f32((h.x >> 24u) & 255u) / 255.0);
+    let n = f32(STAR_CELLS);
+    let q = clamp(floor((uv / major * 0.5 + 0.5) * n), vec2f(0.0), vec2f(n - 1.0));
+    return face * STAR_CELLS * STAR_CELLS + u32(q.y) * STAR_CELLS + u32(q.x);
+}
+
+// Whether the sun's or the Moon's disc, as drawn, stands before the unit
+// `n`: a star or a planet behind it is hidden. Chords, not angles: an
+// arccosine near one has no digits left in f32.
+fn behind_a_disc(n: vec3f) -> bool {
+    let sun_rho = SUN_ANGULAR_RADIUS * max(atmosphere.discs.x, 0.0);
+    let to_sun = n - atmosphere.sun.xyz;
+    if (dot(to_sun, to_sun) < 4.0 * sin(0.5 * sun_rho) * sin(0.5 * sun_rho)) { return true; }
+    if (atmosphere.moon.w > 0.0) {
+        let moon_rho = atmosphere.moon_disc.w * max(atmosphere.discs.y, 0.0);
+        let to_moon = n - atmosphere.moon.xyz;
+        if (dot(to_moon, to_moon) < 4.0 * sin(0.5 * moon_rho) * sin(0.5 * moon_rho)) { return true; }
+    }
+    return false;
+}
+
+// The stars along the unit `n`, in the model's units (per unit of the sun's
+// irradiance outside the air), `sigma` the radius of a star's image in
+// radians (about a pixel). The Bright Star Catalogue (`stars.rs`): each
+// star's irradiance from its magnitude, 10^(−0.4 (V − V☉)), its colour a
+// black body's of its B−V in units of the sun's, its image a Gaussian of
+// unit integral — energy-conserving wherever it falls on the pixels — and
+// all of it through the air before it, the same transmittance the sun's
+// light comes through. Never switched off: by day a star is a few
+// millionths of the sky's light in its pixel and the camera's response
+// alone decides whether it shows. Hidden by the sun's and the Moon's discs;
+// the planet hides it in `sky_seen`, the terrain by being drawn over it.
+fn stars_seen(n: vec3f, sigma: f32) -> vec3f {
+    if (sigma <= 0.0 || behind_a_disc(n)) { return vec3f(0.0); }
+    let c = vec3f(dot(atmosphere.stars_x.xyz, n), dot(atmosphere.stars_y.xyz, n), dot(atmosphere.stars_z.xyz, n));
+    let cell = star_texel(star_cell(c));
+    let first = STAR_ENTRY_FIRST + u32(cell.x);
+    let count = u32(cell.y);
+    let k = 1.0 / (2.0 * sigma * sigma);
+    var sum = vec3f(0.0);
+    for (var i = 0u; i < count; i++) {
+        let star = star_texel(first + i);
+        let d = c - star.xyz;
+        let d2 = dot(d, d);
+        if (d2 > STAR_REACH * STAR_REACH) { continue; }
+        let code = u32(star.w);
+        let v = f32(code % 1024u) * 0.01 - 2.0;
+        let irradiance = exp2(-0.4 * (v - SUN_V) * 3.321928);
+        sum += star_texel(STAR_INDEX_TEXELS + code / 1024u).rgb * (irradiance * exp(-d2 * k));
+    }
     let mu = dot(atmosphere.up.xyz, n);
-    return spot * tint * transmittance(atmosphere.sun.w, mu);
+    return sum * (k / ATMOSPHERE_PI) * transmittance(atmosphere.sun.w, mu);
 }
 
 // The light of towns at night at `p` (eye-relative), in the renderer's

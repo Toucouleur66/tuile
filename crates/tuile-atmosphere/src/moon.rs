@@ -189,7 +189,7 @@ pub fn celestial_to_ecef(utc: f64) -> DMat3 {
     DMat3::from_rotation_z(-apparent_sidereal_time(jd, jde))
 }
 
-fn delta_t(jd: f64) -> f64 {
+pub(crate) fn delta_t(jd: f64) -> f64 {
     let year = 2000.0 + (jd - 2_451_545.0) / 365.25;
     solar_positioning::delta_t::estimate(year).unwrap_or(FALLBACK_DELTA_T)
 }

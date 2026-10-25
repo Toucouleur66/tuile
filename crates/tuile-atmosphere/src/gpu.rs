@@ -64,6 +64,8 @@ pub struct AtmosphereUniform {
     pub least: [f32; 4],
     pub least_sky: [f32; 4],
     pub level_ref: [f32; 4],
+    /// Rows of the turn from the planet's axes to the star catalogue's
+    /// (J2000); w: nothing.
     pub stars_x: [f32; 4],
     pub stars_y: [f32; 4],
     pub stars_z: [f32; 4],
@@ -94,13 +96,15 @@ impl AtmosphereUniform {
     /// `params` as the shaders read them, lit by `light`, from the frame's
     /// eye at `frame_eye` (ECEF), every light pre-exposed by `exposure` —
     /// so that the HDR picture holds a night in half floats — with the
-    /// stars turned by `stars` (Earth to celestial axes), if drawn.
+    /// stars turned by `stars`, from the planet's axes to the catalogue's
+    /// (J2000): the transpose of [`crate::stars::j2000_to_ecef`]. Stars are
+    /// always drawn; whether they show is the air's and the camera's.
     pub fn new(
         params: &AtmosphereParams,
         light: &SkyLight,
         frame_eye: DVec3,
         exposure: f32,
-        stars: Option<glam::DMat3>,
+        stars: glam::DMat3,
         look: &SkyLook,
     ) -> Self {
         let i = &light.illumination;
@@ -141,13 +145,10 @@ impl AtmosphereUniform {
             }
             None => ([0.0; 4], [0.0; 4], [1.0, 0.0, 0.0, 0.0]),
         };
-        let star_rows = stars.map(|m| m.transpose());
-        let row = |n: usize, on: f32| match star_rows {
-            Some(r) => {
-                let c = r.col(n).as_vec3();
-                [c.x, c.y, c.z, on]
-            }
-            None => [0.0; 4],
+        let star_rows = stars.transpose();
+        let row = |n: usize| {
+            let c = star_rows.col(n).as_vec3();
+            [c.x, c.y, c.z, 0.0]
         };
         let p = params;
         Self {
@@ -201,9 +202,9 @@ impl AtmosphereUniform {
                 [0, 1, 2].map(|c| light.floor[c] * light.least[c] / light.added[c].max(1e-30))
             ),
             level_ref: rgb(light.level_reference),
-            stars_x: row(0, 1.0),
-            stars_y: row(1, 0.0),
-            stars_z: row(2, 0.0),
+            stars_x: row(0),
+            stars_y: row(1),
+            stars_z: row(2),
             earth: [0.0; 4],
             discs: [
                 look.sun_scale.max(0.0),
@@ -281,6 +282,10 @@ pub struct AtmosphereGpu {
     layout: wgpu::BindGroupLayout,
     /// The night lights: city light, a luminance on a geographic grid.
     pub night_lights: wgpu::Texture,
+    /// The star catalogue's table ([`crate::stars::StarTable`]), and
+    /// whether it is uploaded yet.
+    pub stars: wgpu::Texture,
+    stars_held: bool,
     maker: SkyViewMaker,
 }
 
@@ -308,7 +313,7 @@ pub fn declarations(group: u32) -> String {
 
 /// The layout of [`AtmosphereGpu::bind_group`], seen by `visibility`:
 /// every binding of [`declarations`], or — without `sky_view` — all but
-/// the two sky-view tables, which only the sky reads: four textures fewer
+/// the two sky-view tables and the stars, which only the sky reads: textures fewer
 /// against a stage's limit, for a pass that has the ground's imagery to
 /// bind beside them.
 pub fn layout(
@@ -358,7 +363,7 @@ pub fn layout(
         },
     ];
     if sky_view {
-        entries.extend([lut(3), lut(6)]);
+        entries.extend([lut(3), lut(6), lut(8)]);
         entries.sort_by_key(|e| e.binding);
     }
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -407,6 +412,12 @@ impl AtmosphereGpu {
         let irradiance = texture("atmosphere irradiance", IRRADIANCE_SIZE, U::COPY_DST);
         let sky_view = texture("atmosphere sky view", SKY_VIEW_SIZE, made);
         let moon_view = texture("atmosphere moon view", SKY_VIEW_SIZE, made);
+        let star_table = crate::stars::StarTable::catalogue();
+        let stars = texture(
+            "atmosphere stars",
+            [star_table.width as usize, star_table.height as usize],
+            U::COPY_DST,
+        );
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("atmosphere"),
             size: std::mem::size_of::<AtmosphereUniform>() as u64,
@@ -435,6 +446,7 @@ impl AtmosphereGpu {
             irradiance: iv.clone(),
             moon_view: nv.clone(),
             night_lights: night_lights.create_view(&Default::default()),
+            stars: view(&stars),
             sampler: sampler.clone(),
         };
         let bind = views.bind(device, layout, &uniform, true);
@@ -447,6 +459,7 @@ impl AtmosphereGpu {
                  @group(0) @binding(6) var irradiance_lut: texture_2d<f32>;\n\
                  @group(0) @binding(7) var night_lights_lut: texture_2d<f32>;\n\
                  @group(0) @binding(8) var lut_sampler: sampler;\n\
+                 @group(0) @binding(9) var star_table: texture_2d<f32>;\n\
                  {}\n{}",
                 crate::hillaire::WGSL,
                 SKY_VIEW_WGSL,
@@ -559,6 +572,8 @@ impl AtmosphereGpu {
             views,
             layout: layout.clone(),
             night_lights,
+            stars,
+            stars_held: false,
             maker,
         }
     }
@@ -584,6 +599,20 @@ impl AtmosphereGpu {
         params: AtmosphereParams,
         make: impl Fn(AtmosphereParams) -> LutAtmosphere,
     ) {
+        if !self.stars_held {
+            let table = crate::stars::StarTable::catalogue();
+            queue.write_texture(
+                self.stars.as_image_copy(),
+                bytemuck::cast_slice(&table.texels),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(table.width * 16),
+                    rows_per_image: Some(table.height),
+                },
+                self.stars.size(),
+            );
+            self.stars_held = true;
+        }
         if self.reference.is_none() {
             self.reference = Some(make(AtmosphereParams::default()));
         }
@@ -680,6 +709,7 @@ struct Views {
     irradiance: wgpu::TextureView,
     moon_view: wgpu::TextureView,
     night_lights: wgpu::TextureView,
+    stars: wgpu::TextureView,
     sampler: wgpu::Sampler,
 }
 
@@ -714,6 +744,7 @@ impl Views {
         if sky_view {
             entries.push(view(3, &self.sky_view));
             entries.push(view(6, &self.moon_view));
+            entries.push(view(8, &self.stars));
             entries.sort_by_key(|e| e.binding);
         }
         device.create_bind_group(&wgpu::BindGroupDescriptor {

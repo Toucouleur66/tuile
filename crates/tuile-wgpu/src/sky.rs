@@ -77,8 +77,10 @@ pub struct Bodies {
     pub to_sun: DVec3,
     /// The Moon, if there is one: where, its phase, its size.
     pub moon: Option<Moonlight>,
-    /// The turn from the planet's axes to the stars', if stars are drawn.
-    pub stars: Option<DMat3>,
+    /// The turn from the star catalogue's axes (J2000) to the planet's.
+    /// Stars are always drawn: the air and the camera decide whether they
+    /// show.
+    pub stars: DMat3,
 }
 
 impl Bodies {
@@ -88,13 +90,14 @@ impl Bodies {
         Self {
             to_sun: Sun::at_unix_seconds(instant).direction_ecef,
             moon: Moon::seen_from(instant, ecef_to_geodetic(eye)).map(|m| Moonlight::of(&m)),
-            stars: Some(tuile_atmosphere::celestial_to_ecef(instant)),
+            stars: tuile_atmosphere::stars::j2000_to_ecef(instant),
         }
     }
 
     /// A sun along `to_sun` and a Moon along `to_moon`, as a host sets
     /// them: the Moon at the mean distance, in the phase the two directions
-    /// make. No stars: a stated sky has no instant to turn them by.
+    /// make; the stars as they stood at J2000 — a stated sky has no instant
+    /// to turn them by, and its stars are there all the same.
     pub fn fixed(to_sun: DVec3, to_moon: Option<DVec3>) -> Self {
         let to_sun = to_sun.normalize_or(DVec3::Z);
         Self {
@@ -112,7 +115,7 @@ impl Bodies {
                     moon_rgb: [0.0; 3],
                 }
             }),
-            stars: None,
+            stars: tuile_atmosphere::stars::j2000_to_ecef(tuile_atmosphere::stars::J2000_UNIX),
         }
     }
 }
@@ -228,7 +231,7 @@ impl Lights {
                 Bodies {
                     to_sun,
                     moon: None,
-                    stars: Some(DMat3::from_rotation_z(-lon)),
+                    stars: DMat3::from_rotation_z(-lon),
                 }
             }
             Self::Fixed { to_sun, to_moon } => Bodies::fixed(to_sun, to_moon),
@@ -581,7 +584,7 @@ impl Sky {
             });
         }
         let view_eye = self.view_key.expect("set above").eye;
-        let stars = bodies.stars.map(|m| m.transpose());
+        let stars = bodies.stars.transpose();
         let uniform = AtmosphereUniform::new(
             &self.params,
             &light,

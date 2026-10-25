@@ -902,3 +902,104 @@ fn frame_time_with_and_without_the_atmosphere() {
         );
     }
 }
+
+/// A star behind a mountainside is not drawn through it. The stars are
+/// always in the sky; the terrain, drawn over it, hides them. One night,
+/// a slope rising north of the Pic to 9 km, and the stars turned two ways:
+/// over the slope nothing changes, and where the slope is taken away the
+/// stars that were behind it show.
+#[test]
+fn the_terrain_hides_the_stars_behind_it() {
+    let Some(gpu) = gpu() else { return };
+    let instant = utc(2026, 6, 22, 0, 0);
+    let eye = eye_at(PIC_LON, PIC_LAT, 2_877.0, 0.0, 12.0);
+    let origin = eye.at;
+    let scheme = GeographicTilingScheme::default();
+    let level = 11u32;
+    let x0 = ((PIC_LON + 180.0) / 360.0 * f64::from(2u32 << level)).floor() as u64;
+    // TMS rows: 0 at the south pole.
+    let y0 = ((PIC_LAT + 90.0) / 180.0 * f64::from(1u32 << level)).floor() as u64;
+    let here = scheme.tile_rect(TileCoord::new(level, x0, y0));
+    let north = scheme.tile_rect(TileCoord::new(level, x0, y0 + 1));
+    // [sw, se, nw, ne]: from under the eye to 9 km at the far edge.
+    let (low, high) = (2_800.0, 9_000.0);
+    let slope = vec![
+        prepare(
+            &gpu,
+            &grey(fill_content(&here, [Some(low); 4], low)),
+            origin,
+        ),
+        prepare(
+            &gpu,
+            &grey(fill_content(
+                &north,
+                [Some(low), Some(low), Some(high), Some(high)],
+                low,
+            )),
+            origin,
+        ),
+    ];
+    // Where the slope surely is: its inner part, over the horizon by a
+    // degree at least — so that what hides a star there is the terrain,
+    // not the planet.
+    let up = enu_frame(ecef_to_geodetic(eye.at)).z_axis;
+    let mut core = std::collections::BTreeSet::new();
+    for j in 0..=40 {
+        for i in 0..=40 {
+            let (u, v) = (
+                0.2 + 0.6 * f64::from(i) / 40.0,
+                0.3 + 0.6 * f64::from(j) / 40.0,
+            );
+            let p = geodetic_to_ecef(Geodetic {
+                lon: north.west + (north.east - north.west) * u,
+                lat: north.south + (north.north - north.south) * v,
+                height: low + (high - low) * v,
+            });
+            if (p - eye.at).normalize().dot(up) < 1f64.to_radians().sin() {
+                continue;
+            }
+            let (x, y) = point_on_picture(&eye, p);
+            if x < WIDTH && y < HEIGHT {
+                core.insert((x, y));
+            }
+        }
+    }
+    assert!(
+        core.len() > 200,
+        "the slope's core is {} pixels",
+        core.len()
+    );
+    let to_sun = tuile_atmosphere::Sun::at_unix_seconds(instant).direction_ecef;
+    let frame = |turn: f64| {
+        let mut bodies = tuile_wgpu::Bodies::fixed(to_sun, None);
+        bodies.stars = tuile_atmosphere::stars::j2000_to_ecef(instant + turn);
+        tuile_wgpu::SkyFrame {
+            bodies,
+            view: view_of(&eye, origin),
+            wall: 0.0,
+        }
+    };
+    let differ = |a: &Picture, b: &Picture| -> Vec<(u32, u32)> {
+        core.iter()
+            .copied()
+            .filter(|&(x, y)| a.px(x, y) != b.px(x, y))
+            .collect()
+    };
+    let a = shoot_frame(&gpu, &slope, origin, eye, frame(0.0), "stars-slope-a");
+    let b = shoot_frame(&gpu, &slope, origin, eye, frame(7_200.0), "stars-slope-b");
+    let c = shoot_frame(&gpu, &[], origin, eye, frame(0.0), "stars-open-a");
+    let d = shoot_frame(&gpu, &[], origin, eye, frame(7_200.0), "stars-open-b");
+    let open = differ(&c, &d);
+    assert!(
+        open.len() > 5,
+        "without the slope, the stars turned show where it stood: {} pixels",
+        open.len()
+    );
+    let through = differ(&a, &b);
+    assert!(
+        through.is_empty(),
+        "{} pixels of the slope show the stars behind it: {:?}",
+        through.len(),
+        &through[..through.len().min(8)]
+    );
+}

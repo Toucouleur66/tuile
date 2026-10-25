@@ -96,7 +96,7 @@ fn the_compute_and_the_render_pass_make_the_same_sky_view() {
         &light,
         eye,
         1.0,
-        None,
+        glam::DMat3::IDENTITY,
         &SkyLook::default(),
     )
     .seen_from(&light, eye);
