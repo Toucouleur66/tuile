@@ -32,6 +32,10 @@ pub(super) struct Gpu {
     format: tuile_wgpu::SurfaceFormat,
     gpu: GpuContext,
     backend: wgpu::Backend,
+    /// What the person's choice does with tiles stored compressed, on this
+    /// adapter: told to a page's worker beside the plan.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    stored_imagery: tuile_core::texels::StoredPlan,
 }
 
 /// The GPU, asked for and not yet collected.
@@ -78,8 +82,21 @@ impl GpuOnItsWay {
     ) -> Self {
         let slot = Rc::new(RefCell::new(None));
         let answer = Rc::clone(&slot);
+        let viewer = crate::web::imagery::viewer();
         wasm_bindgen_futures::spawn_local(async move {
             let up = bring_up(Arc::clone(&window), backends, compression).await;
+            // How the device holds imagery, for the session's worker waiting
+            // on it: RGBA8 where there is no device — nothing will draw, and
+            // the session must not wait for ever.
+            crate::web::imagery::held_by_the_device(
+                viewer,
+                match &up {
+                    Ok(gpu) => {
+                        crate::web::imagery::Held::new(gpu.gpu.imagery_plan(), gpu.stored_imagery)
+                    }
+                    Err(_) => crate::web::imagery::Held::RGBA8,
+                },
+            );
             *answer.borrow_mut() = Some(up);
             // The loop may be asleep, with nothing else to wake it: a frame
             // asked for is a turn of the loop, which collects the answer.
@@ -203,6 +220,7 @@ async fn bring_up(
     // for nothing; a block format asks for its own feature, which the
     // adapter was checked to have.
     let (imagery_plan, imagery_features) = tuile_wgpu::plan_for(compression, &adapter);
+    let stored_imagery = compression.stored(tuile_wgpu::texture_caps(&adapter));
     tracing::info!(
         ?compression,
         held = tuile_wgpu::format_name(imagery_plan.target),
@@ -240,6 +258,7 @@ async fn bring_up(
         format,
         gpu: GpuContext::new(device, queue).with_imagery_plan(imagery_plan),
         backend: info.backend,
+        stored_imagery,
     })
 }
 
@@ -312,6 +331,7 @@ impl App {
             format,
             gpu,
             backend,
+            stored_imagery: _,
         } = up;
         // The drawable is the whole window, edge to edge; on a phone the
         // inner size is only its safe area, which the controls keep to.

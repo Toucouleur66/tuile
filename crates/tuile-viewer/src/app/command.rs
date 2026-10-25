@@ -185,10 +185,11 @@ impl App {
     }
 
     /// The imagery on the GPU, by the format it is held in: `imagery BC7
-    /// 31 MiB`, and the RGBA8 beside it where some had to stay RGBA8.
+    /// 31 MiB (360 × 88 KiB)`, and the RGBA8 beside it where some had to
+    /// stay RGBA8.
     fn imagery_held(&self) -> Option<String> {
         let active = self.active.as_ref()?;
-        let mut held = active.gpu.imagery.lock().ok()?.live_by_format();
+        let mut held = active.gpu.imagery.lock().ok()?.live_textures_by_format();
         Some(held_line(active.gpu.imagery_plan().target, &mut held))
     }
 
@@ -261,21 +262,24 @@ impl App {
     }
 }
 
-/// `imagery BC7 31 MiB`: the plan's format first, then any other the
-/// imagery is held in.
+/// `imagery BC7 31 MiB (360 × 88 KiB)`: the plan's format first, then any
+/// other the imagery is held in — each with its texture count and what one
+/// texture holds on average, mip chain included, which is where a quarter
+/// shows.
 fn held_line(
     plan: tuile_core::texels::ImageryFormat,
-    held: &mut [(tuile_core::texels::ImageryFormat, usize)],
+    held: &mut [(tuile_core::texels::ImageryFormat, usize, usize)],
 ) -> String {
-    held.sort_by_key(|(format, _)| *format != plan);
+    held.sort_by_key(|(format, _, _)| *format != plan);
     let mib = |bytes: usize| bytes as f64 / f64::from(1u32 << 20);
     let mut parts: Vec<String> = held
         .iter()
-        .map(|(format, bytes)| {
+        .map(|(format, bytes, count)| {
             format!(
-                "{} {:.0} MiB",
+                "{} {:.0} MiB ({count} × {:.0} KiB)",
                 tuile_wgpu::format_name(*format),
-                mib(*bytes)
+                mib(*bytes),
+                *bytes as f64 / 1024.0 / (*count).max(1) as f64
             )
         })
         .collect();
@@ -295,19 +299,19 @@ mod held_tests {
     fn the_held_line_names_each_format() {
         assert_eq!(held_line(ImageryFormat::Bc7, &mut []), "imagery BC7 0 MiB");
         let mut held = [
-            (ImageryFormat::Rgba8, 3 << 20),
-            (ImageryFormat::Bc7, 31 << 20),
+            (ImageryFormat::Rgba8, 3 << 20, 9),
+            (ImageryFormat::Bc7, 87_408 * 360, 360),
         ];
         assert_eq!(
             held_line(ImageryFormat::Bc7, &mut held),
-            "imagery BC7 31 MiB + RGBA8 3 MiB"
+            "imagery BC7 30 MiB (360 × 85 KiB) + RGBA8 3 MiB (9 × 341 KiB)"
         );
         assert_eq!(
             held_line(
                 ImageryFormat::Rgba8,
-                &mut [(ImageryFormat::Rgba8, 120 << 20)]
+                &mut [(ImageryFormat::Rgba8, 349_524 * 360, 360)]
             ),
-            "imagery RGBA8 120 MiB"
+            "imagery RGBA8 120 MiB (360 × 341 KiB)"
         );
     }
 }

@@ -48,6 +48,9 @@ pub(crate) struct Plan {
     pub profile: ProfileChoice,
     pub device_memory: Option<f64>,
     pub decode_workers: Option<u32>,
+    /// The host's choice of how imagery is held. Off, the session starts at
+    /// once; otherwise it waits for the page's device to say what it holds.
+    pub compression: tuile_wgpu::ImageryCompression,
 }
 
 /// The worker, and the page's ear on it. Dropping the last handle ends both:
@@ -86,8 +89,8 @@ pub(crate) struct Started {
 }
 
 impl Started {
-    /// A page's loader is in its worker and holds imagery as RGBA8: the plan
-    /// does not cross to it yet.
+    /// A page's loader is in its worker, which was given the device's plan
+    /// in its start message: there is no handle here to set.
     pub(crate) fn imagery_plan(&self) -> Option<&tuile_planetary::ImageryPlanHandle> {
         None
     }
@@ -281,18 +284,41 @@ pub(crate) fn start(plan: &Plan) -> Launch {
         worker,
         _connection: connection,
     });
-    link.post(&ToWorker::Start {
-        sources: plan.sources.clone(),
-        opening: 0,
-        profile: plan.profile,
-        device_memory: plan.device_memory,
-        decode_workers: plan.decode_workers,
-    });
+    let start = {
+        let link = Rc::downgrade(&link);
+        let (sources, profile, device_memory, decode_workers) = (
+            plan.sources.clone(),
+            plan.profile,
+            plan.device_memory,
+            plan.decode_workers,
+        );
+        move |imagery: super::imagery::Held| {
+            // A start-up given up on in the meantime has dropped its worker.
+            if let Some(link) = link.upgrade() {
+                link.post(&ToWorker::Start {
+                    sources,
+                    opening: 0,
+                    profile,
+                    device_memory,
+                    decode_workers,
+                    imagery,
+                });
+            }
+        }
+    };
     *waiting.borrow_mut() = Some(Waiting {
         answer,
         stream,
         link,
     });
+    // Off asks nothing of the device: the session starts now, as it always
+    // did. A compression waits for the device's answer — the plan every
+    // tile is decoded by.
+    if plan.compression == tuile_wgpu::ImageryCompression::Off {
+        start(super::imagery::Held::RGBA8);
+    } else {
+        super::imagery::when_the_device_holds(start);
+    }
     give_up_after(START_TIMEOUT, move || {
         if let Some(w) = waiting.borrow_mut().take() {
             let _ = w.answer.send(Err(format!(

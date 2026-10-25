@@ -47,6 +47,7 @@ pub fn run_worker(make_decode_worker: Option<js_sys::Function>) {
                     profile,
                     device_memory,
                     decode_workers,
+                    imagery,
                 }) => {
                     // The page speaks no more until it hears back; nothing else
                     // is listened for until the session decides who listens.
@@ -63,7 +64,7 @@ pub fn run_worker(make_decode_worker: Option<js_sys::Function>) {
                     wasm_bindgen_futures::spawn_local(async move {
                         let profile =
                             Profile::browser(profile == ProfileChoice::Handheld, device_memory);
-                        if let Err(reason) = start(sources, opening, profile).await {
+                        if let Err(reason) = start(sources, opening, profile, imagery).await {
                             tracing::error!("the session could not start: {reason}");
                             post(&ToPage::Failed { reason });
                         }
@@ -79,7 +80,12 @@ pub fn run_worker(make_decode_worker: Option<js_sys::Function>) {
 }
 
 /// Brings the session up and serves it to the page.
-async fn start(spec: SourcesSpec, opening: usize, profile: Profile) -> Result<(), String> {
+async fn start(
+    spec: SourcesSpec,
+    opening: usize,
+    profile: Profile,
+    imagery: super::imagery::Held,
+) -> Result<(), String> {
     let (terrain, layers) = spec.choices()?;
     let sources = Arc::new(PageSources::new(spec)?);
     let globe = crate::globe::assemble(
@@ -89,11 +95,16 @@ async fn start(spec: SourcesSpec, opening: usize, profile: Profile) -> Result<()
         &layers,
         opening,
         Arc::new(super::decode::WebDecode),
-        // The worker takes no plan yet: tiles stored compressed are unpacked.
-        tuile_core::texels::StoredPlan::OFF,
+        // The page's device's: what tiles stored compressed become.
+        imagery.stored(),
     )
     .await
     .map_err(|e| format!("{e:#}"))?;
+    // And how a JPEG or PNG is held: RGBA8 the page's GPU encodes, blocks the
+    // decode workers encode, or RGBA8 as it is. Each imagery job carries it
+    // to the decode worker that runs it.
+    globe.plan.set(imagery.plan());
+    tracing::info!(?imagery, "imagery, as the page's device holds it");
     let gate = Gate::default();
     let loader: Arc<dyn TileLoader> = Arc::new(Gated {
         inner: globe.loader,

@@ -6893,6 +6893,7 @@ dependencies = [
  "tracing",
  "tuile-core",
  "tuile-terrain",
+ "web-time",
 ]
 
 [[package]]

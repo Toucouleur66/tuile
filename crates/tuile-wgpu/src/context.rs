@@ -135,6 +135,22 @@ impl ImageryTextures {
         out
     }
 
+    /// Live imagery by the format each texture went resident in: the bytes,
+    /// and how many textures hold them.
+    pub fn live_textures_by_format(&self) -> Vec<(ImageryFormat, usize, usize)> {
+        let mut out: Vec<(ImageryFormat, usize, usize)> = Vec::new();
+        for held in self.0.live() {
+            match out.iter_mut().find(|(f, _, _)| *f == held.format) {
+                Some((_, bytes, count)) => {
+                    *bytes += held.bytes;
+                    *count += 1;
+                }
+                None => out.push((held.format, held.bytes, 1)),
+            }
+        }
+        out
+    }
+
     /// Whether tile `coord` of imagery `source` is on the GPU now.
     pub(crate) fn holds(&self, source: u32, coord: ImageryCoord) -> bool {
         self.0.holds(source, coord)

@@ -48,6 +48,19 @@ pub(crate) struct Options {
     /// geometry server's own thread.
     #[serde(default)]
     pub decode_workers: Option<u32>,
+    /// How imagery is held on the GPU: `off` (the default), `auto`, `bc7` or
+    /// `astc` — the host's choice, resolved against the page's own adapter.
+    /// See [`tuile_wgpu::ImageryCompression`].
+    #[serde(default, deserialize_with = "compression")]
+    pub imagery_compression: tuile_wgpu::ImageryCompression,
+}
+
+/// A compression named as the flag names it: `off`, `auto`, `bc7`, `astc`.
+fn compression<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<tuile_wgpu::ImageryCompression, D::Error> {
+    let name = String::deserialize(d)?;
+    tuile_wgpu::compression_named(&name).map_err(serde::de::Error::custom)
 }
 
 /// Which bottom corner the caption keeps to.
@@ -373,6 +386,11 @@ mod tests {
         assert_eq!(o.backend, BackendChoice::Auto);
         assert_eq!(o.profile, ProfileChoice::Desktop);
         assert_eq!(
+            o.imagery_compression,
+            tuile_wgpu::ImageryCompression::Off,
+            "compression is off unless the page asks"
+        );
+        assert_eq!(
             template.tiling(),
             tuile_core::raster::TilingScheme::web_mercator()
         );
@@ -391,7 +409,7 @@ mod tests {
             "name": "Atlas", "profile": "handheld", "deviceMemory": 4, "backend": "webgl2",
             "ui": false, "view": { "lon": 6.86, "lat": 45.83, "altitude": 6000 },
             "attribution": "bottom-left", "showUnsupportedMessage": false, "rememberView": false,
-            "decodeWorkers": 0,
+            "decodeWorkers": 0, "imageryCompression": "astc",
             "sources": {
                 "catalog": { "url": "https://catalog.test/" },
                 "terrain": { "asset": 7 },
@@ -409,6 +427,10 @@ mod tests {
         assert!(!o.show_unsupported_message);
         assert!(!o.remember_view);
         assert_eq!(o.decode_workers, Some(0));
+        assert_eq!(
+            o.imagery_compression,
+            tuile_wgpu::ImageryCompression::Format(tuile_core::texels::BlockFormat::Astc4x4)
+        );
         let view = o.view.expect("a view").view().expect("in bounds");
         assert_eq!((view.heading, view.pitch), (0.0, 90.0));
         assert_eq!(
@@ -426,6 +448,39 @@ mod tests {
             BackendChoice::Webgpu.backends(),
             BackendChoice::Webgl2.backends()
         );
+    }
+
+    /// Each compression the package documents reads as the flag's; anything
+    /// else is refused, naming the four.
+    #[test]
+    fn imagery_compression_is_named() {
+        use tuile_core::texels::BlockFormat;
+        use tuile_wgpu::ImageryCompression;
+        let with = |value: &str| {
+            options(&CATALOG.replacen(
+                r#""name": "Atlas","#,
+                &format!(r#""name": "Atlas", "imageryCompression": {value},"#),
+                1,
+            ))
+        };
+        for (value, wanted) in [
+            (r#""off""#, ImageryCompression::Off),
+            (r#""auto""#, ImageryCompression::Auto),
+            (r#""bc7""#, ImageryCompression::Format(BlockFormat::Bc7)),
+            (
+                r#""ASTC""#,
+                ImageryCompression::Format(BlockFormat::Astc4x4),
+            ),
+        ] {
+            assert_eq!(
+                with(value).expect(value).imagery_compression,
+                wanted,
+                "{value}"
+            );
+        }
+        let refused = with(r#""etc2""#).expect_err("not a compression");
+        assert!(refused.contains("off, auto, bc7, astc"), "{refused}");
+        assert!(with("true").is_err());
     }
 
     /// What a host can get wrong is refused in a sentence that names it.

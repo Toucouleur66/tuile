@@ -115,6 +115,7 @@ web() {
   echo
   echo "  $url"
   echo "  $url?backend=webgl2    (forces WebGL2)"
+  echo "  $url?compression=auto  (imagery block-compressed; &backend=webgl2: encoded on the CPU)"
   if [[ $lan == 1 ]] && command -v qrencode >/dev/null; then
     qrencode -t ANSIUTF8 "$url"
   elif [[ $lan == 1 ]]; then
