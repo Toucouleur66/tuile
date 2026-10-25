@@ -3,228 +3,182 @@
 
 # Browser / WebAssembly viewer — status
 
-Status review, 2026-10-17, on `origin/main` at `70e17d9` (PR #62 merged). Read-only:
-no code was changed. Builds ran in a throwaway detached worktree with
-`CARGO_BUILD_JOBS=4`, logs redirected to files.
+Status on 2026-10-25, read on `origin/main` at `eaebfbd7` (v0.14.0, plus #129–#131 and
+#135). It replaces the review of 2026-10-17, written at `70e17d9`, when the browser had
+no working interactive viewer. Read from the code, the package and the CI workflow; no
+browser run was made for this revision. The companion audit is
+`docs/explorations/wasm-audit.md`.
 
 **Summary.**
-- The interactive browser viewer does not build on main and has not since
-  2026-08-18/20. `tuile-web` fails `cargo check --target wasm32` with 3 errors, so
-  `examples/web-viewer` cannot run.
-- Every other crate that claims wasm passes `cargo check` for wasm32.
-- `examples/wasm-globe` builds with `wasm-pack` and loads in Chrome. It draws nothing:
-  it is a geometry report.
-- The only browser path that is alive and maintained is the **film** path
-  (`tuile-film-web`, wgpu on WebGPU plus WebCodecs). It does not traverse and has no
-  interaction.
-- CI checks only `tuile-core` for wasm.
+- The browser viewer is `tuile-viewer` itself, compiled to WebAssembly and published as
+  the ES module package `@lapoule-dev/tuile-viewer` (`packages/tuile-viewer`): the same
+  application, renderer (`tuile-wgpu`), gestures, menu, caption and budget as the desktop
+  and the phones. There is no second renderer.
+- It draws with **WebGPU**, or **WebGL2** where the browser has no WebGPU, both through
+  wgpu.
+- Its geometry server runs in a Web Worker, and imagery and terrain decode in a pool of
+  **decode workers** beside it.
+- **Imagery compression is the page's choice, off by default** (`imageryCompression`):
+  encoded on the GPU under WebGPU, on the CPU in the decode workers under WebGL2.
+- Terrain comes from a catalog asset **or from any quantized-mesh `layer.json` URL**.
+- CI builds and type-checks the package and checks and lints every wasm crate, but runs
+  nothing in a browser.
 
-## 1. Inventory
+## 1. What changed since the 2026-10-17 review
 
-| Item | Purpose | Last meaningful change (excluding version bumps and renames) |
-|---|---|---|
-| `crates/tuile-web` | The real `GeometryServer`, SSE traversal and `tuile_planetary::globe` in a Web Worker; `fetch` through `web-sys`; encodes `ServerMessage` into JS objects | 2026-08-20 `5a6fe90` (generation); content 2026-08-16 `e766006` |
-| `examples/web-viewer/www` | THREE.js r171 page (unpkg import map), `engine-worker.js` mailbox, a GLSL ground material that blends the imagery mosaic | 2026-08-16 `e766006` |
-| `examples/wasm-globe` | Raw wasm, no renderer: drives `traverse` directly, with its own residency and request loop, and prints a `GeometryReport` | 2026-08-16 `e766006` (created 2026-06-15 `20f91c0`) |
-| `crates/tuile-film-web` + `examples/film-web/www` | Plays back a baked pack in the browser: wgpu on WebGPU through `tuile-film-gpu`, WebCodecs H.264 with a rav1e fallback, page UI in Rust | 2026-10-13 `8d24189`; features up to 2026-10-10 |
-| `crates/tuile-pack-worker` | Cloudflare Worker that serves the bench API and the store (demonstrator `tuile-demo.lapoule.dev`) | 2026-10-10 `4008227` |
-| `crates/tuile-pack-api` | The same bench API as a native axum binary; serves `examples/film-web/www` locally | — |
-| `crates/tuile-wgpu` | Interactive renderer; its description says "native + wasm" | 2026-10-17 `e4b6e2e` |
-| `site/` | Astro static site and rustdoc under `/docs`; it has no viewer | 2026-10-09 `c5bbce2` |
+The 2026-10-17 review found `tuile-web` not compiling since August, a THREE.js page that
+forked the renderer, a fourth traversal driver in `examples/wasm-globe`, and only the film
+path alive in a browser. The convergence (`docs/explorations/web-native-convergence.md`)
+replaced all of it:
 
-## 2. What builds (wasm32-unknown-unknown, `cargo check`)
-
-| Crate | Result |
+| Then (2026-10-17) | Now |
 |---|---|
-| tuile-core | OK |
-| **tuile-web** | **FAIL**: 3 × E0027 |
-| tuile-wgpu | OK (check only; there is no wasm consumer of it) |
-| tuile-planetary, tuile-terrain, tuile-camera, tuile-atmosphere | OK |
-| tuile-film-web | OK, with 2 dead-code warnings (`store.rs:112 blocks_read`, `store.rs:300 small`). It would fail under the CI's `RUSTFLAGS=-D warnings` if CI checked it |
-| tuile-ui | OK (the tray and menu are optional features) |
-| tuile-wasm-globe, tuile-pack-worker, tuile-film | OK |
-| tuile-viewer (not claimed) | FAIL: `getrandom 0.3` without `wasm_js`, pulled in by foyer (`tuile-storage-foyer`) and by `metrics-exporter-prometheus` (`tuile-metrics`) |
+| `tuile-web` fails `cargo check` for wasm32 (3 × E0027) | `tuile-web` is the browser **transport**: the `fetch` seams (`transport.rs`) and the streaming protocol over `postMessage` (`post.rs`, `wire.rs`). Its old `worker.rs` is gone |
+| A THREE.js page with its own GLSL ground, camera and residency | Removed (`7b76baf9`). The page is a package consumer: one import, one `createViewer` |
+| `examples/wasm-globe`, a fourth traversal driver | Removed (`7b76baf9`) |
+| `tuile-film-web`, `examples/film-web`, `tuile-pack-worker` (the film demo) | Removed (`a14cc95f`, `3c38b82e`). Films render natively; the browser hosts the interactive viewer |
+| No ancestor fallback, `retire` ignored, errors overwritten | The desktop's own pump and swap order: never a black ground, new before old |
+| `wasm-guard` checks `tuile-core` only | 10 crates checked under `-D warnings`, wasm clippy on the viewer, the transport and the renderer, and a `web-package` job (§5) |
+| No attribution, no lifecycle handling | The caption names whose pictures are on screen (`attributionChanged`); a hidden tab holds drawing and loading (`pause`/`resume`) |
+| `Config::default()` budget, saturating on wasm32 | The graphics budget runs in the worker, on the profile's numbers sized from `navigator.deviceMemory` (`profile`: `auto`, `desktop`, `handheld`) |
 
-The `tuile-web` errors confirm the PR #60 claim exactly:
+## 2. Inventory
 
-```
-error[E0027]: pattern does not mention fields `ancestry`, `generation`  --> crates/tuile-web/src/worker.rs:210  (Select)
-error[E0027]: pattern does not mention field `ancestry`                --> crates/tuile-web/src/worker.rs:244  (Fill)
-error[E0027]: pattern does not mention field `ancestry`                --> crates/tuile-web/src/worker.rs:269  (Content)
-```
-
-- The core added `ancestry` in `9d2f662` (2026-08-18) and `generation` on `Select` in
-  `5a6fe90` (2026-08-20). See `crates/tuile-core/src/protocol.rs:93-114`.
-- `tuile-web/src/lib.rs:33` is `#![cfg(target_arch = "wasm32")]`, so the native
-  workspace build, clippy and test never compile it.
-- `wasm-pack build --dev --target web` (wasm-pack is installed):
-  - `examples/wasm-globe` builds;
-  - `crates/tuile-web` fails with the same 3 errors.
-- A minimal local fix (adding `..` to the patterns) was not applied: no code change was
-  allowed.
+| Item | Purpose |
+|---|---|
+| `crates/tuile-viewer/src/web` | The browser shell: `page` (the viewer on a canvas), `worker` (the geometry server), `decode` (the decode pool), `session`, `options`, `menu`, `screen`, `system`, `control` |
+| `crates/tuile-web` | The transport: `WebFetcher` and `WebIonHttp` over `fetch`, the protocol over `postMessage`, the wire encoding of `ServerMessage` |
+| `packages/tuile-viewer` | The npm package: `index.js` / `index.d.ts` (`createViewer`), `worker.js`, `decode-worker.js`, and the wasm built by `build.sh` |
+| `examples/web-viewer` | A host page over the catalog proxy; `?terrain=`, `?imagery=`, `?backend=`, `?compression=` |
+| `examples/web-viewer-vite` | The same package imported from a Vite build (built in CI) |
+| `examples/catalog-proxy` | `tuile-catalog-proxy`: serves the page and the package, holds the catalog token on the server |
+| `examples/heightfield-serve` | A synthetic relief served as quantized-mesh terrain plus imagery over HTTP with CORS; prints a `web-viewer` URL for it |
+| `scripts/try-viewer.sh web` | Builds the package and serves the page (`--lan`, and `--lan --https` for a phone) |
+| `scripts/web-bench.py` | A headless-Chrome bench over the public JS API: coverage, convergence, requests, budget, black patches, compression |
 
 ## 3. What runs
 
-Both pages were served with `python3 -m http.server` from their `www/` directories, as
-the README says, and opened in Chrome 155 (`navigator.gpu` present).
+### Backends
 
-- **web-viewer** (`videos/web-status-web-viewer-no-pkg.jpg`):
-  - The page loads.
-  - The worker's `import "../pkg/tuile_web.js"` returns 404: the module cannot be
-    built. Nothing can start.
-  - A stale `pkg/` dated 2026-08-09 sits in the main checkout. It predates the
-    current JS, which expects `layerTable`, so it was not used.
-  - **Page bug:** `render()` overwrites `#status` on every frame (`main.js`, end of
-    `render`). The token prompt and any `engine error: …` message
-    (`worker.onmessage`) vanish within one frame, so errors are invisible.
-- **wasm-globe** (`videos/web-status-wasm-globe-loaded.jpg`):
-  - The module loads, `init()` succeeds, and it exports `Globe`, `DecodedTile` and
-    `ImageryDecoder`.
-  - A run needs a Cesium ion token pasted into the page. The local `.env` has one, but
-    it is a real third-party credential, and entering it into a page is outside what
-    the agent may do. **The runtime globe was not exercised.** Paste it yourself to
-    test.
-- **film-web**: not run.
-  - It needs a release build of `tuile-pack-api` (native, heavy), a fresh
-    `wasm-pack` of `tuile-film-web` (wgpu and rav1e), and the production bucket
-    credentials from `.env.film`.
-  - Not cheap, and it touches production storage. The `pkg` in the main checkout is
-    dated 2026-10-07.
-- Both screenshots are also copied to `~/Documents/stl-videos/`.
+- `backend: "auto"` (the default) takes WebGPU and falls back to WebGL2; `"webgpu"`
+  refuses the fallback, and `"webgl2"` forces it. `createViewer` rejects with
+  `UnsupportedError` when neither can draw.
+- Known WebGL2 differences (package README): at most 15 imagery layers bound per pass
+  instead of up to 25, so some tiles draw in two passes; no GPU timestamps; surfaces drawn
+  through an sRGB view. World overlays draw on WebGL2 too (`6f6663de`).
 
-## 4. Parity with the native viewer (`tuile-viewer` + `tuile-wgpu`)
+### Sources
 
-The "Web (interactive)" column describes what the code would do once `tuile-web`
-compiles again.
+- **Terrain:** `sources.terrain` is `{ asset }`, resolved through the catalog proxy, or
+  `{ url }`, the address of a quantized-mesh `layer.json` (`c8aa470e`). The URL form needs
+  no token and no catalog; the server must send `Access-Control-Allow-Origin`, and tiles
+  are addressed as the `layer.json` says (TMS, row 0 in the south). A URL terrain is cached
+  under the edition its `layer.json` declares (`d41a556a`).
+- **Imagery:** each layer is a catalog `asset` or a URL `template` with a `scheme`
+  (`webmercator` or `geographic`) and an optional `maxLevel`.
+- `sources.catalog` is required only when a source is named by asset number. The page
+  never holds a token: the catalog proxy keeps it on the server.
 
-| Feature | Web (interactive) | Film-web | Evidence |
-|---|---|---|---|
-| Terrain + imagery globe | **Partial**: the real planetary loader; the full mosaic table is blended by the GLSL shader | Done (replays the bake) | `worker.rs:119`, `ground-material.js:49-60`. The README still says "one imagery layer per tile", which is stale |
-| Never-black ground, ancestor fallback | **Missing**. `ancestry` is not forwarded. The page draws only `selected ∩ resident` over a near-black clear (`0x05070d`), so a selected tile not yet loaded is a hole | n/a (frame-exact) | `main.js:166-172`, `worker.rs:210` |
-| New before old | Partial: `addTile` drops then adds in one synchronous call (no frame gap). **A late `Fill` overwrites real content**: `m.fill` is ignored. **`retire` is not handled**: there is no case in `apply()` | n/a | `main.js:155-185, 188-190` |
-| Stitching / skirts | Same geometry as native, from the engine | Same as bake | — |
-| Camera controls | Minimal: drag orbit and wheel zoom on a sphere; no `tuile-camera`, no touch, no collision | Pack camera | `main.js:96-133` |
-| On-screen UI (`tuile-ui`) | Missing: one status line | Own Rust page UI | — |
-| Atmosphere / sky (Hillaire, PR #57) | Missing: flat lighting with a fixed sun | Done (`tuile-film-gpu` uses `hillaire::WGSL`) | `main.js:51`, `film-gpu/src/lib.rs:971` |
-| Per-frame light | Missing | Done (film `Look`) | — |
-| Overlays API | Missing | Done (`tuile-film/overlay.rs`) | `tuile-wgpu/src/overlay.rs` exists for native |
-| Stereo | Missing | Done in the film (`tuile-film/stereo.rs`) | — |
-| Persistent cache (IndexedDB/OPFS) | Missing ("IndexedDB is its own piece of work") | Partial: block store over HTTP, in memory | `worker.rs:113-115` |
-| Budgets / memory | Partial: `Config::default()` (512 MiB resident) and not `interactive_globe`. The page's `textures` Map is never freed (unbounded) | Fixed 1024-texture cap | `worker.rs:122`, `main.js:39, 211` |
-| Lifecycle (hidden tab, context loss) | Missing | — | No `visibilitychange` handler |
-| Loading indicator | Partial: priming progress, but overwritten (see §3) | Progress bars | `main.js:174-181, 330-345` |
-| Error handling | Partial: errors are sent but become invisible | Done | — |
-| Tokens and auth | Paste an ion token; JWT shape check; not stored | Server-side credentials | `main.js:350-365` |
-| Attribution display | **Missing** (a licence issue for Bing/ion) | Unverified | Native: `command.rs:183` |
-| 3D Tiles content (b3dm/glb) | Missing: globe only | Only what the bake packs | — |
-| Film playback | — | Done (WebGPU + WebCodecs/rav1e) | `tuile-film-web/src/lib.rs` |
+### Worker and decode workers
 
-## 5. Architecture gap
+- The geometry server runs in one Web Worker, assembled as the desktop's is
+  (`crate::globe::assemble`, the same gate, the same budget).
+- It starts up to `decodeWorkers` decode workers (4 by default, capped at the core count
+  less one; `0` decodes on the geometry worker). They are handed the compiled
+  `WebAssembly.Module`, so they fetch and compile nothing, and they exchange transferred
+  `ArrayBuffer`s: no `SharedArrayBuffer`, so no COOP/COEP headers are asked of the host.
+- A worker that fails is replaced (up to 8 times), and its job falls back to the
+  geometry worker's own thread: never a hole.
 
-- **Shared with native:**
-  - the traversal, `GeometryServer`, `InProcessStream`, planetary loader, terrain
-    decode, `imagery_layer_table` and f64 rebasing.
-  - This is the right half.
-- **Duplicated:**
-  1. the consumer bookkeeping: a JS `tiles` Map instead of `tuile-wgpu`'s `pump.rs`
-     and `tuile_core::drive::SceneState`;
-  2. the GPU residency;
-  3. the ground shading: a GLSL copy of the mosaic blend and the lighting;
-  4. a camera in JS;
-  5. `wasm-globe`, a fourth traversal driver (`examples/wasm-globe/src/lib.rs:283`).
-- **Under the manifesto** (one foundation, every render mode; a fork for one mode is a
-  design error), the THREE façade is exactly such a fork:
-  - every renderer feature (Hillaire, overlays, per-frame light, stereo, ancestor
-    climb, swap order) must be written twice, in WGSL and GLSL, and the GLSL copy has
-    already fallen behind;
-  - wgpu on WebGPU is already proven in this repo by the film path (`tuile-film-web`,
-    `wgpu` with `webgpu`);
-  - `tuile-wgpu` already passes `cargo check` for wasm32.
-- **Recommendation:**
-  - The reference web renderer is `tuile-wgpu` on WebGPU in an `OffscreenCanvas`
-    worker, with `tuile-camera` for input.
-  - The THREE façade becomes an optional integration package for people who already
-    have a THREE scene, fed by the same messages. It is not the reference.
-  - What blocks the wgpu path:
-    - `tuile-viewer` does not build for wasm (foyer, metrics exporter, tokio, winit
-      desktop paths);
-    - so a `tuile-viewer` "web profile" is needed: the store behind a trait, with an
-      IndexedDB/OPFS store on the web; no metrics listener; `spawn_local`.
-- **What the budget core spec (PR #64) implies:**
-  - `tuile_core::budget` is pure and builds for wasm32, so the browser gets it for
-    free.
-  - `Credit { bytes }` on `InProcessStream` is how a worker should push meshes to the
-    page or to the renderer without unbounded `postMessage` queues.
-  - `Tier::Stored` needs a browser store that answers `holds(key)` from an index, so an
-    IndexedDB/OPFS store must implement it. The HTTP disk cache is not queryable from
-    JS without the Cache API, which is an option.
-  - The headless control API (§4c) is native-socket only. A web equivalent
-    (`postMessage`/JS API, `frame()` readback) is what a headless-browser test would
-    drive.
-  - The spec lists `tuile-web/src/worker.rs:129` as a downstream change. It cannot land
-    while the crate does not compile and nothing checks it.
+### Imagery compression, the page's choice
 
-## 6. CI
+`imageryCompression` is `"off"` (the default: RGBA8, as before), `"auto"`, `"bc7"` or
+`"astc"`. The choice is resolved against the page's adapter when its device comes up
+(`ImageryCompression::plan`, `tuile-core/src/texels.rs`) and passed to the worker in its
+start message. With `"off"` the session starts at once, as before.
 
-- **Today:** `wasm-guard` runs only `cargo check --target wasm32-unknown-unknown -p
-  tuile-core` (`.github/workflows/ci.yml:45-53`).
-- **Missing:**
-  - wasm checks of `tuile-web`, `tuile-film-web`, `tuile-wgpu`, `tuile-planetary`,
-    `tuile-terrain`, `tuile-camera`, `tuile-atmosphere`, `tuile-ui`,
-    `tuile-wasm-globe` and `tuile-pack-worker`, under `-D warnings`;
-  - a `wasm-pack build` of the examples;
-  - any browser test. There is no headless Chrome with WebGPU (Playwright with
-    `--enable-unsafe-webgpu`, or SwiftShader), no black-pixel scan and no recorded
-    network.
+| Backend | Path | Where it runs |
+|---|---|---|
+| WebGPU | RGBA8 crosses to the page; `tuile-wgpu` encodes BC7 or ASTC 4×4 with texcomp's compute encoders at upload | the page's GPU |
+| WebGL2 (no compute) | `encode_on_cpu`: UASTC level 0 (the fastest), transcoded to ASTC 4×4 (phones) or BC7 (desktops), whole mip chain; blocks cross to the page | the decode workers |
+| Neither format sampled | RGBA8 | — |
 
-## 7. Recommendation (ordered)
+- A tile that cannot be encoded is held as RGBA8, never left out.
+- The caption says what is held (`imagery ASTC 4x4 23 MiB (276 × 85 KiB)`). A 256² tile
+  with its chain is 341 KiB as RGBA8 and 85 KiB as blocks.
+- The decode workers log their CPU encoder's cost (one console line per 32 tiles a thread
+  encodes: mean and peak, mip chain included); `web-bench.py --compression` reads the
+  caption's held line.
+- What remains — the encode's time and transient memory counted by the budget, the CPU
+  path's reservation — is the compression-budget plan (B1–B8), not built yet.
 
-1. **S** — Repair `tuile-web`:
-   - forward `ancestry` and `generation`;
-   - handle `retire`;
-   - refuse a `Fill` over real content;
-   - stop the status line from overwriting errors.
-2. **S** — CI: put every wasm crate in `wasm-guard` with `-D warnings`; fix the 2
-   film-web warnings.
-3. **S** — Web viewer README: the stale "one layer" note, the build path, and how to
-   get a token.
-4. **M** — Ancestor climb on the page, which needs `ancestry` from step 1. This is the
-   minimum that satisfies "never black" in THREE.
-5. **M** — Attribution display (a licence requirement before any public page) and a
-   visibility/lifecycle handler.
-6. **M** — Headless-browser smoke test (Playwright with WebGPU):
-   - load a recorded tileset;
-   - scan for clear-colour pixels;
-   - fail on console errors.
-7. **L** — Decision point (see below). If wgpu: a `tuile-viewer` web profile, with
-   `tuile-wgpu`, `tuile-camera`, `tuile-ui` and the atmosphere in a worker
-   `OffscreenCanvas`, sharing `pump.rs` and the shaders.
-8. **L** — A browser store (IndexedDB or OPFS) behind the store trait, answering
-   `holds()` for `Tier::Stored`.
-9. **M** — Retire `examples/wasm-globe` (the fourth driver) or rebuild it on
-   `GeometryServer`.
+### Embedding
 
-- **Dependencies:**
-  - Items 1 to 6 are independent of the budget core and the rebalancing, and should go
-    first.
-  - Items 7 and 8 should follow PR #64 (`Credit`, tiers, `Profile`) and the PR #60
-    rebalancing (one consumer bookkeeping, `SceneState` or `pump`), or they will be
-    written against APIs about to change.
-- **Owner decisions:**
-  - (a) THREE façade versus wgpu/WebGPU as the reference web renderer. The
-    recommendation is wgpu, with THREE as an optional adapter.
-  - (b) Browser targets: WebGPU only (Chrome/Edge, Safari 26+, Firefox 141+ on
-    Windows) or a WebGL2 fallback, which wgpu's GL backend allows at the cost of
-    compute-free paths.
-  - (c) Hosting: a static page on the site or demo Worker, how tokens are handled
-    (a user token versus a proxy), and attribution.
+- `createViewer(container, options)` draws into a canvas it creates, or into the one it
+  is given. One viewer per page at a time.
+- The viewer API: `setView`, `flyTo`, `getView`, `on` (`ready`, `loading`, `error`,
+  `viewChanged`, `attributionChanged`), `resize`, `pause`/`resume`, `destroy`.
+- A host that owns its own wgpu device and render graph uses `tuile-wgpu`'s `HostPass`
+  (`889c9cc7`) instead of the package: tuile draws into the host's colour and depth
+  targets. Its first consumer is the Bevy integration (`tuile-bevy`, native first); its
+  web build (WebGPU and WebGL2) is a planned step, not on main.
+
+## 4. Parity with the native viewer
+
+The code is the same, so the question is only what a browser lacks:
+
+| Feature | Web | Note |
+|---|---|---|
+| Terrain + imagery, never-black ground, new before old | Same as native | Shared pump and renderer |
+| Controls, menu, caption, alerts, loading indicator | Same as native | Drawn by the shared UI |
+| Budget | The same budget, on browser numbers | Profile sized from `navigator.deviceMemory` |
+| Imagery compression | Yes, off by default | GPU encode on WebGPU, CPU encode on WebGL2 |
+| Persistent tile cache | **Missing** | The worker keeps its residency in memory; a browser store (IndexedDB or OPFS) is still to come |
+| GPU timestamps | WebGPU, where the browser exposes them | None on WebGL2 |
+| Sky model beyond aerial perspective, stereo | Missing | Not in the shared layers yet |
+| `debug` control API (budgets, readback, scripted moves) | Reserved, not available | Native has the headless control socket |
+| Several viewers on one page | No | A second `createViewer` destroys the first |
+
+## 5. CI
+
+From `.github/workflows/ci.yml`:
+
+- **`wasm-guard`:** `cargo check --target wasm32-unknown-unknown` under `-D warnings` for
+  `tuile-core`, `tuile-web`, `tuile-wgpu`, `tuile-planetary`, `tuile-terrain`,
+  `tuile-camera`, `tuile-atmosphere`, `tuile-film-gpu`, `tuile-ui` and `tuile-film`; then
+  wasm clippy on `tuile-viewer`, `tuile-web` and `tuile-wgpu`.
+- **`web-package`:** builds the package (`packages/tuile-viewer/build.sh --dev`) with
+  `wasm-bindgen-cli` at the locked version, then runs `npm run build` in
+  `examples/web-viewer-vite`.
+- **Host tests** cover the pure parts of the web code: options parsing (terrain
+  `asset`/`url`, compression names), the decode pool's scheduler and imagery bookkeeping,
+  and the wire encoding (`tuile-web`).
+- **The `test` job's Linux runner is pinned to `ubuntu-24.04`.** Its GPU tests render
+  through Mesa's lavapipe. On 2026-10-25 `ubuntu-latest` moved to 26.04 (Mesa 26.0.8),
+  whose lavapipe crashes with SIGSEGV in `tuile-film-gpu`'s headless and atmosphere tests.
+  This concerns the native GPU tests, not the browser: no CI job runs a browser.
+- **Missing:** a headless browser in CI. `scripts/web-bench.py` is the browser test, run
+  by hand against `scripts/try-viewer.sh web`.
+
+## 6. Open items
+
+1. **A browser tile store** (IndexedDB or OPFS), answering `holds()` for the budget's
+   stored tier. Today every reload fetches everything again.
+2. **`web-bench.py` in CI**: headless Chrome on WebGPU (SwiftShader or a flag) and on
+   WebGL2, at least the `still` pattern on both with the black-patch check.
+3. **The compression budget** (the compression-budget plan, B1–B8): the GPU encode's time
+   and transient memory counted by the budget, and the CPU path's reservation.
+4. **Phone measurements** on the reference device, WebGPU and WebGL2, compression on and
+   off (the B8 acceptance).
+5. **The `debug` control API**, a web equivalent of the native headless runner.
+6. **Third-party notices in the package** (see the audit, L10).
+
+This PR also fixes the package README, whose options table still named the terrain by
+`asset` only and called `sources.catalog` required.
 
 ## Not verified
 
-- No interactive globe has run in a browser on current main: `tuile-web` does not
-  compile.
-- `wasm-globe` and film-web were not exercised at runtime: they need a token or
-  production credentials.
-- `tuile-wgpu` on wasm was only `cargo check`ed: no wasm consumer exists.
-- The public demo was not touched.
-- The parity column for web interactive is read from the code, not observed.
+- No browser run for this revision: the behaviour above is read from the code, the
+  package README and the commit messages of the PRs that built it.
+- The WebGL2 layer limit and timestamp behaviour are the package README's statements,
+  not measured again here.
