@@ -189,7 +189,7 @@ pub(crate) fn property(s: &Snapshot, key: &str) -> Option<Value> {
         "wireframe" => Value::Flag(s.wireframe),
         "frozen" => Value::Flag(s.frozen),
         "viewURL" if s.located => Value::Withheld,
-        "viewURL" => Value::Text(crate::steer::link(&s.view)),
+        "viewURL" => Value::Text(crate::steer::link_at(&s.view, &s.clock)),
         "tileCount" => Value::Integer(i64::try_from(s.tiles).unwrap_or(i64::MAX)),
         "settled" => Value::Flag(s.settled),
         "imagery" => s
@@ -301,7 +301,7 @@ mod tests {
         assert_eq!(property(&s, "settled"), Some(Value::Flag(true)));
         assert_eq!(
             property(&s, "viewURL"),
-            Some(Value::Text(crate::steer::link(&s.view)))
+            Some(Value::Text(crate::steer::link_at(&s.view, &s.clock)))
         );
         assert_eq!(property(&s, "password"), None);
     }

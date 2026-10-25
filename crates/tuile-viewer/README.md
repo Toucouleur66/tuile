@@ -46,11 +46,33 @@ that, and are the only flags there are (`--help` lists them with the keys):
 --heading <deg>           where it looks, 0 = north, clockwise
 --pitch <deg>             how far below the horizon, 90 = straight down
 --here                    over the current location, instead of --lon/--lat
+--time <when>             the instant the scene is lit for: now, sunset,
+                          sunrise (the next one over the start view), or
+                          RFC 3339 (2026-06-21T19:42:00Z)
+--time-offset <d>         added to it: -30m, -3h30m, 45m, 90s
+--time-rate <x>           scene seconds a second: 1, 30, 0 (frozen), -1
 ```
 
-C copies a link to the present view. A running viewer can be steered by
-other programs with URLs of the same form — `tuile://goto?…`, `north`,
-`here`, `view?…`: see `steer` for the vocabulary and what it cannot do. The
+C copies a link to the present view and its moment. A running viewer can be
+steered by other programs with URLs of the same form — `tuile://goto?…`,
+`north`, `here`, `view?…`: see `steer` for the vocabulary and what it cannot
+do.
+
+A `goto` takes the clock's three flags as `time=`, `timeOffset=` and
+`timeRate=`, read by the same parser as the flags and a page's options. A
+`sunset` or a `sunrise` is the next one *where the link leads*, not where the
+eye was; without `time=` the clock is left as it is. Half an hour before
+sunset at the Pic du Midi, an hour of the scene every two minutes:
+
+```text
+open "tuile://goto?lon=0.1418&lat=42.9365&altitude=3100&heading=290&pitch=0&time=sunset&timeOffset=-30m&timeRate=30"
+```
+
+The link C copies carries the clock the same way: counted from the nearest
+sunset or sunrise when the clock was started from one
+(`time=sunset&timeOffset=-12m`), so it brings back that moment of the evening
+on whatever day it is opened; as an RFC 3339 instant otherwise; with
+`timeRate=` when the clock does not run in real time. The
 application bundle (`macos/README.md`) registers the scheme and carries a
 scripting dictionary, through which a script reads the view — position,
 attitude, target, range, tile counts: see `snapshot` — and commands it.

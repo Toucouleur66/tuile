@@ -98,14 +98,22 @@ osascript -e 'tell application "Tuile" to go to longitude -4.02 latitude 5.34 al
 | URL | effect |
 |---|---|
 | `tuile://goto?lon=&lat=&altitude=&heading=&pitch=` | puts the eye there; what is left out keeps its present value |
+| `tuile://goto?…&time=&timeOffset=&timeRate=` | also sets the scene's clock, as `--time`, `--time-offset`, `--time-rate`; a sunset is the one where the link leads |
 | `tuile://north` | north up, about the point at the centre of the view |
 | `tuile://here` | centres on the current location |
 | `tuile://view?freeze=on\|off&wireframe=on\|off` | the two display switches |
 | `tuile://imagery?name=<layer>` | drapes another imagery layer; `name=next` takes the one after the present |
 
 The parameters are the command-line flags' — same names, same units, same
-bounds, one table in the source. In the window, `C` copies the `goto` link of
-the present view to the clipboard.
+bounds, one table in the source; `time`, `timeOffset` and `timeRate` are read
+by the flags' own parser. Without `time` the clock is left as it is. In the
+window, `C` copies the `goto` link of the present view to the clipboard, with
+its clock — counted from a sunset or a sunrise when the clock was started
+from one:
+
+```bash
+open "tuile://goto?lon=0.1418&lat=42.9365&altitude=3100&heading=290&pitch=0&time=sunset&timeOffset=-30m&timeRate=30"
+```
 
 **A URL starts the application when it is not running**, and that start is a
 plain one: it opens on the view the last session ended on (the default view the
@@ -127,7 +135,7 @@ application object, read-only unless noted:
 | `field of view` | vertical, degrees |
 | `view width`, `view height` | the drawable surface, device pixels |
 | `wireframe`, `frozen` | the display switches — **read and write** |
-| `view url` | the `tuile://goto?…` of the present view |
+| `view url` | the `tuile://goto?…` of the present view, with the scene's clock (`time=`, `timeOffset=`, `timeRate=`) |
 | `tile count` | tiles drawn in the last frame |
 | `settled` | every tile drawn is the one selected, no coarser stand-in left: wait for this before capturing |
 

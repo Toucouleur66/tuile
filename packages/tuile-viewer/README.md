@@ -84,6 +84,24 @@ is a canvas. It resolves once the viewer draws.
 | `rememberView` | Whether a viewer created without `view` opens where the last one was left, kept in the site's local storage (`true` by default). |
 | `decodeWorkers` | The most Web Workers that decode imagery and terrain beside the geometry server's: one per core less one, up to this (`4` by default). `0` decodes on the geometry server's own worker. They exchange transferred buffers: no `SharedArrayBuffer`, so no cross-origin isolation headers are needed. |
 | `imageryCompression` | How imagery is held on the GPU: `"off"` (the default: RGBA8), `"auto"`, `"bc7"` or `"astc"`. Compressed imagery takes a quarter of the memory. `"auto"` picks the best format the page's device samples: under WebGPU, BC7 or ASTC 4×4 encoded on the GPU; under WebGL2, which has no compute, ASTC 4×4 (phones) or BC7 (desktops) encoded in the decode workers. A device that holds neither stays RGBA8, and a tile that cannot be encoded is held as RGBA8, never left out. The caption says what is held: `imagery ASTC 4x4 23 MiB (276 × 85 KiB)`. |
+| `time` | The instant the scene is lit for — where the sun, the Moon and the stars stand: `"now"` (the default), `"sunset"` or `"sunrise"` (the next one over the opening `view`), or an RFC 3339 instant (`"2026-06-21T19:42:00Z"`). |
+| `timeOffset` | Added to `time`: a signed duration, `"-30m"`, `"-3h30m"`, `"45m"`, `"90s"`. |
+| `timeRate` | Scene seconds a second: `1` (real time, the default), `30`, `0` (frozen), negative to run backwards. |
+
+`time`, `timeOffset` and `timeRate` are the desktop viewer's `--time`,
+`--time-offset` and `--time-rate`, and the parameters of the same names in
+its `tuile://goto?…` links, read by one parser: a value one accepts, the
+others accept. The example page (`examples/web-viewer`) takes them from its
+query with the view, under the link's names, so the query of a link opens
+the same view at the same moment:
+
+```text
+?lon=0.1418&lat=42.9365&altitude=3100&heading=290&pitch=0&time=sunset&timeOffset=-30m&timeRate=30
+```
+
+— half an hour before sunset at the Pic du Midi, an hour of the scene every
+two minutes. In a query `+` reads as a space: write an instant's zone as `Z`
+(or `%2B02:00`), and a positive offset without its sign.
 
 ## The viewer
 

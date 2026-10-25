@@ -40,10 +40,18 @@ impl App {
     pub(super) fn apply(&mut self, command: Command) {
         match command {
             Command::Goto(goto) => {
+                // Where it leads, before the eye leaves: a sunset in the
+                // link is the one there.
+                let to = steer::destination(&self.controller, goto);
+                if let Some(time) = goto.time {
+                    self.retime(time, &to);
+                }
+                if !goto.says_where() {
+                    return;
+                }
                 match goto.seconds.filter(|s| *s > 0.0) {
                     Some(seconds) => {
                         let from = steer::view_of(self.controller.target());
-                        let to = steer::destination(&self.controller, goto);
                         self.flight = Some(super::flight::Flight::new(
                             from,
                             to,
@@ -104,6 +112,7 @@ impl App {
             Command::ClockNow => {
                 self.atmosphere.clock.now(super::wall_seconds());
                 self.resume_rate = 1.0;
+                self.clock_event = None;
             }
             Command::NextImagery => {
                 if let Some(next) = self.imagery.next() {
@@ -113,11 +122,30 @@ impl App {
         }
     }
 
+    /// Sets the scene's clock as a link says, for the view `to` it leads to.
+    fn retime(&mut self, time: steer::Retime, to: &crate::start::StartView) {
+        let wall = super::wall_seconds();
+        self.atmosphere.clock = steer::retimed(self.atmosphere.clock, Some(time), to, wall);
+        let rate = match time {
+            steer::Retime::Start(settings) => {
+                self.clock_event = settings.start.event();
+                settings.rate
+            }
+            steer::Retime::Rate(rate) => rate,
+        };
+        if rate != 0.0 {
+            self.resume_rate = rate;
+        }
+    }
+
     /// Puts the link to the present view on the clipboard: a bookmark to keep
-    /// or to send. The person's own key press, so it is theirs to copy
-    /// whatever the view shows.
+    /// or to send, with the scene's clock. The person's own key press, so it
+    /// is theirs to copy whatever the view shows.
     pub(super) fn copy_the_link(&mut self) {
-        let link = steer::link(&steer::view_of(self.controller.target()));
+        let link = steer::link_at(
+            &steer::view_of(self.controller.target()),
+            &self.clock_state(),
+        );
         if crate::desktop::copy(&link) {
             self.say("link to this view copied");
         } else {
@@ -158,6 +186,7 @@ impl App {
             instant: self.instant,
             rate: self.atmosphere.clock.rate(),
             resume: self.resume_rate,
+            event: self.clock_event,
         }
     }
 

@@ -147,6 +147,7 @@ impl View {
             heading: Some(self.heading),
             pitch: Some(self.pitch),
             seconds,
+            time: None,
         })
     }
 

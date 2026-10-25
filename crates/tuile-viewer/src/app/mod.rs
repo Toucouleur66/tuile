@@ -248,6 +248,10 @@ pub struct App {
     /// The rate the clock ran at before it was paused: what `P` runs it at
     /// again.
     resume_rate: f64,
+    /// The sunset or the sunrise the clock was started from, by the flags or
+    /// a link, until `T` brings it back to the present: what a link to the
+    /// view counts its time from.
+    clock_event: Option<tuile_atmosphere::Event>,
     /// This frame's instant, Unix seconds UTC, and its sun.
     instant: f64,
     sun: tuile_atmosphere::Sun,
@@ -436,6 +440,7 @@ impl App {
             } else {
                 1.0
             },
+            clock_event: config.clock.start.event(),
             instant: atmosphere.instant(wall),
             sun: tuile_atmosphere::Sun::at_unix_seconds(atmosphere.instant(wall)),
             atmosphere,

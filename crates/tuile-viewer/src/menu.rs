@@ -75,13 +75,16 @@ pub(crate) const RATES: [f64; 10] = [
     -3600.0, -600.0, -60.0, -10.0, -1.0, 1.0, 10.0, 60.0, 600.0, 3600.0,
 ];
 
-/// The clock as last published: the scene's instant, its rate, and the
-/// rate a pause would run it at again.
+/// The clock as last published: the scene's instant, its rate, the rate a
+/// pause would run it at again, and the sunset or the sunrise it was started
+/// from, if it was — what a link to the view counts its time from
+/// ([`crate::steer::link_at`]).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub(crate) struct Clock {
     pub instant: f64,
     pub rate: f64,
     pub resume: f64,
+    pub event: Option<tuile_atmosphere::Event>,
 }
 
 /// As much of the published state as an [`Ask`] is read against.
@@ -547,6 +550,7 @@ impl Default for State {
                 instant: 0.0,
                 rate: 1.0,
                 resume: 1.0,
+                event: None,
             },
         }
     }
@@ -707,6 +711,7 @@ mod tests {
                 instant,
                 rate,
                 resume,
+                event: None,
             },
             ..State::default()
         };
@@ -760,6 +765,7 @@ mod tests {
                 instant: 1000.0,
                 rate: 60.0,
                 resume: 60.0,
+                event: None,
             },
         };
         for (ask, command) in [
