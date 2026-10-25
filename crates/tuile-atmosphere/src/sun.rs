@@ -140,7 +140,56 @@ impl Sun {
     pub fn light_travel_direction(&self) -> DVec3 {
         -self.direction_ecef
     }
+    /// The first sunset at `at` after `after_utc` (Unix seconds), to the
+    /// second: the instant the sun's centre goes down through
+    /// [`SUNSET_ELEVATION_DEG`], the almanac's sunset. `None` when it does
+    /// not set within two days — a midnight sun, a polar night.
+    pub fn next_sunset(after_utc: f64, at: Geodetic) -> Option<f64> {
+        Self::next_crossing(after_utc, at, true)
+    }
+
+    /// The first sunrise at `at` after `after_utc`, as [`Self::next_sunset`].
+    pub fn next_sunrise(after_utc: f64, at: Geodetic) -> Option<f64> {
+        Self::next_crossing(after_utc, at, false)
+    }
+
+    fn next_crossing(after_utc: f64, at: Geodetic, setting: bool) -> Option<f64> {
+        // Over the horizon by how much, the sign the way the crossing goes.
+        let over = |t: f64| -> Option<f64> {
+            let e = Self::seen_from(t, at)?.elevation_deg - SUNSET_ELEVATION_DEG;
+            Some(if setting { e } else { -e })
+        };
+        const STEP: f64 = 600.0;
+        let mut t = after_utc;
+        let mut before = over(t)?;
+        while t < after_utc + 2.0 * 86_400.0 {
+            let next = t + STEP;
+            let now = over(next)?;
+            if before > 0.0 && now <= 0.0 {
+                // Bisected to a second: the sun's height is monotonic over
+                // ten minutes about a crossing.
+                let (mut lo, mut hi) = (t, next);
+                while hi - lo > 0.5 {
+                    let mid = 0.5 * (lo + hi);
+                    if over(mid)? > 0.0 {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                return Some(0.5 * (lo + hi));
+            }
+            t = next;
+            before = now;
+        }
+        None
+    }
 }
+
+/// The almanac's sunset and sunrise: the sun's centre this far under the
+/// geometric horizon, its half-diameter and the refraction at the horizon
+/// (16′ + 34′).
+pub const SUNSET_ELEVATION_DEG: f64 = -0.833;
 
 /// The sun from one place: where it stands over that place's horizon.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -271,6 +320,39 @@ mod tests {
         let b = Sun::at_unix_seconds(start + 86_400.0);
         let drift = wrap_to_pi(b.subsolar_lon - a.subsolar_lon).to_degrees();
         assert!(drift.abs() < 0.5, "a day moved the meridian by {drift}°");
+    }
+
+    /// The almanac's sunset at Bagnères-de-Bigorre, under the Pic du Midi,
+    /// on midsummer's day 2026: 21:42 CEST, 19:42 UTC (calendriergratuit.fr,
+    /// for 43.0667° N 0.15° E, to the minute). Ours, within a minute of it;
+    /// and the next sunrise, 06:20 CEST, the same.
+    #[test]
+    fn the_next_sunset_is_the_almanacs() {
+        let at = Geodetic {
+            lon: 0.15f64.to_radians(),
+            lat: 43.0667f64.to_radians(),
+            height: 0.0,
+        };
+        let sunset = Sun::next_sunset(utc(2026, 6, 21, 12, 0), at).expect("it sets");
+        let almanac = utc(2026, 6, 21, 19, 42) + 30.0;
+        assert!(
+            (sunset - almanac).abs() <= 60.0,
+            "{} s from the almanac",
+            sunset - almanac
+        );
+        let sunrise = Sun::next_sunrise(sunset, at).expect("it rises");
+        let almanac = utc(2026, 6, 22, 4, 20) + 30.0;
+        assert!(
+            (sunrise - almanac).abs() <= 60.0,
+            "{} s from the almanac",
+            sunrise - almanac
+        );
+        // Over the pole in June, it does not set.
+        let pole = Geodetic {
+            lat: 80f64.to_radians(),
+            ..at
+        };
+        assert_eq!(Sun::next_sunset(utc(2026, 6, 21, 0, 0), pole), None);
     }
 
     /// NREL's own worked example (Reda & Andreas 2003, table A4.1):

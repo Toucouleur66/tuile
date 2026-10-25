@@ -15,7 +15,7 @@ bytemuck = { workspace = true }
 futures-util = { workspace = true }
 glam = { workspace = true }
 thiserror = { workspace = true }
-tuile-atmosphere = { version = "0.14.0", path = "../tuile-atmosphere" }
+tuile-atmosphere = { version = "0.14.0", path = "../tuile-atmosphere", features = ["wgpu"] }
 tuile-core = { version = "0.14.0", path = "../tuile-core" }
 # The shapes a host hands over, their vertex packing and the light they share
 # with the film: data and WGSL text, no GPU of its own.

@@ -172,7 +172,14 @@ fn vs_main(in: VsIn) -> VsOut {
     out.normal = (tile.model * vec4f(in.normal, 0.0)).xyz;
     out.uv = in.uv;
     out.world = world.xyz;
-    out.height = length(world.xyz - view.air.earth.xyz) - view.air.earth.w;
+    if (atmosphere.shape.w != 0.0) {
+        // Over the physical atmosphere's sphere: its centre from the eye,
+        // and the eye from the origin.
+        let centre = atmosphere.centre.xyz + atmosphere.eye.xyz;
+        out.height = length(world.xyz - centre) - atmosphere.centre.w;
+    } else {
+        out.height = length(world.xyz - view.air.earth.xyz) - view.air.earth.w;
+    }
     return out;
 }
 /// thing left behind.
@@ -254,6 +261,24 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     // the black survives this, no amount of sun or atmosphere caused it.
     if (mode == DIAGNOSTIC_UNLIT) {
         return vec4f(albedo.rgb, opacity);
+    }
+    if (atmosphere.shape.w != 0.0) {
+        // The physical atmosphere (`ground_seen`, the film's own): the
+        // fragment lit by the sun and the Moon where it is, and seen through
+        // the air between it and the eye. From the eye; the ground it means
+        // is the drawn point moved to the height its vertices interpolate —
+        // a coarse tile's flat facet is a chord kilometres under it.
+        let p = in.world - atmosphere.eye.xyz;
+        var facing = n;
+        if (dot(facing, p) > 0.0) { facing = -facing; }
+        let x = p - atmosphere.centre.xyz;
+        let ground = atmosphere.centre.xyz + normalize(x) * (atmosphere.centre.w + in.height);
+        let ambient = max(
+            atmosphere.ambient.xyz + atmosphere.sh_x.xyz * facing.x + atmosphere.sh_y.xyz * facing.y
+                + atmosphere.sh_z.xyz * facing.z,
+            vec3f(0.0),
+        );
+        return vec4f(graded(ground_seen(albedo.rgb, p, ground, facing, ambient, 1.0)), albedo.a);
     }
     return vec4f(aerial_perspective(lit, in.world, in.height, view.air), albedo.a);
 }

@@ -7787,6 +7787,7 @@ dependencies = [
  "astro",
  "bytemuck",
  "glam 0.33.2",
+ "pollster",
  "solar-positioning",
  "tuile-core",
  "wgpu",

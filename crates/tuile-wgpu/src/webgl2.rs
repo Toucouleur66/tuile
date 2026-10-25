@@ -77,7 +77,7 @@ fn webgl2(name: &str, source: &str) -> Vec<String> {
 fn every_viewer_shader_runs_on_webgl2() {
     for slots in [
         tuile_core::raster::MIN_IMAGERY_SLOTS,
-        tuile_core::raster::imagery_slots(WEBGL2_TEXTURE_UNITS),
+        webgl2_slots(),
         tuile_core::raster::USEFUL_IMAGERY_SLOTS,
     ] {
         webgl2(
@@ -90,6 +90,26 @@ fn every_viewer_shader_runs_on_webgl2() {
     // sample a pixel there, `frag_depth` written from a depth texture.
     webgl2("depth crossing", &crate::host::crossing_wgsl(false));
     webgl2("lines", include_str!("lines.wgsl"));
+    // The physical atmosphere: the sky past the ground, in either depth
+    // convention, and its sky-view tables drawn by a render pass — WebGL2
+    // has no compute to make them in.
+    webgl2("sky", &crate::renderer::sky_wgsl(1.0));
+    webgl2("sky (reverse depth)", &crate::renderer::sky_wgsl(0.0));
+    webgl2(
+        "sky view",
+        &format!(
+            "@group(0) @binding(0) var<uniform> atmosphere: Atmosphere;\n\
+             @group(0) @binding(1) var transmittance_lut: texture_2d<f32>;\n\
+             @group(0) @binding(2) var multi_scattering_lut: texture_2d<f32>;\n\
+             @group(0) @binding(6) var irradiance_lut: texture_2d<f32>;\n\
+             @group(0) @binding(7) var night_lights_lut: texture_2d<f32>;\n\
+             @group(0) @binding(8) var lut_sampler: sampler;\n\
+             {}\n{}\n{}",
+            tuile_atmosphere::hillaire::WGSL,
+            tuile_atmosphere::gpu::SKY_VIEW_WGSL,
+            tuile_atmosphere::gpu::SKY_VIEW_RENDER_WGSL
+        ),
+    );
     // A host's shapes in the world, with the light it shares with the film:
     // the same text the film compiles, so a WebGL2 browser draws the HUD.
     webgl2(
@@ -102,12 +122,19 @@ fn every_viewer_shader_runs_on_webgl2() {
     );
 }
 
+/// The imagery slots a WebGL2 device gets: its units, less the physical
+/// atmosphere's tables, as [`crate::GpuContext::new`] counts them.
+fn webgl2_slots() -> u32 {
+    tuile_core::raster::imagery_slots(WEBGL2_TEXTURE_UNITS - tuile_atmosphere::gpu::GROUND_TEXTURES)
+}
+
 /// At the budget WebGL2 reports, the ground's fragment stage fits the
-/// texture units WebGL2 guarantees: the imagery slots and the tile's own
-/// base colour, each a sampler of its own once translated.
+/// texture units WebGL2 guarantees: the imagery slots, the tile's own base
+/// colour and the atmosphere's tables, each a sampler of its own once
+/// translated.
 #[test]
 fn the_ground_fits_webgl2_texture_units() {
-    let slots = tuile_core::raster::imagery_slots(WEBGL2_TEXTURE_UNITS);
+    let slots = webgl2_slots();
     let glsl = webgl2("ground", &crate::renderer::ground_wgsl(slots));
     let fragment = glsl
         .iter()
