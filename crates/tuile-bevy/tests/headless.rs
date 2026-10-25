@@ -12,6 +12,7 @@
 //! - **one depth**: a cube of the host's above the ground is seen, a cube
 //!   buried under it is not — the host's meshes, in Bevy's own pipelines,
 //!   depth-tested against the ground the globe's pass wrote;
+//! - **no seam**: no sample of the backdrop between two tiles;
 //! - in every target a Bevy camera renders into: with and without MSAA, in
 //!   8-bit sRGB and in HDR.
 //!
@@ -182,5 +183,19 @@ fn the_host_shares_the_grounds_depth_and_no_ground_is_black() {
             .filter(|p| p[2] > 150 && p[0] < 80 && p[1] < 80)
             .count();
         assert_eq!(blue, 0, "{target:?}: {blue} pixels of the buried cube");
+        // Nor any of the backdrop between two tiles: the greens hold no
+        // more blue than 90, the backdrop 134, and a sample of it blended
+        // into an edge pixel shows as a bluish hairline.
+        let backdrop = picture
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[2] > 100 && p[0] < 200)
+            .count();
+        assert_eq!(
+            backdrop, 0,
+            "{target:?}: {backdrop} pixels of backdrop between tiles"
+        );
     }
 }
