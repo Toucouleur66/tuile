@@ -3,6 +3,8 @@
 Normative reference: OGC 3D Tiles 1.1 — https://docs.ogc.org/cs/22-025r4/22-025r4.html
 Behavioral reference (gray areas): the open source reference implementations of the standard, as local clones in `references/` (gitignored, never committed) — on the web side, the traversals under `packages/engine/Source/Scene/`; on the C++ side, the 3D Tiles selection module. (Apache-2.0 — free inspiration, attribution if literal port.)
 
+**What tuile supports today (v0.14.0):** tileset.json 1.0 and 1.1 with external tilesets grafted in; glb and b3dm content, with JPEG/PNG textures; SSE traversal with REPLACE hold-until-ready and ADD; the three bounding volumes. Implicit tiling parses but does not traverse (no subtree decoding), and no glTF compression extension is read yet (§2). 3D Tiles content is drawn by the offscreen snapshot (`cargo run -p tuile-wgpu --example snapshot -- <tileset.json> <out.png>`); the interactive viewer draws the terrain-and-imagery globe, which is not 3D Tiles (quantized-mesh terrain + raster imagery, `tuile-terrain` / `tuile-planetary`) but goes through the same traversal and geometry server.
+
 ## 1. tileset.json
 
 Tile tree. Fields to model (serde):
@@ -14,14 +16,17 @@ Tile tree. Fields to model (serde):
   - `box`: 12 floats (center + 3 half-axes) — OBB.
   - `region`: 6 floats (west, south, east, north in **radians**, minHeight, maxHeight) — WGS84.
   - `sphere`: 4 floats (center + radius).
-- **Implicit tiling (1.1)**: `implicitTiling` on root — `subdivisionScheme` (QUADTREE/OCTREE), `subtreeLevels`, `availableLevels`, URI templates `{level}/{x}/{y}[/{z}]`. Availability is encoded in **binary subtree** files (availability bitstreams: tile/content/childSubtree). To implement in M1 if simple, otherwise M2 — but the serde types must exist from M1.
+- **Implicit tiling (1.1)**: `implicitTiling` on root — `subdivisionScheme` (QUADTREE/OCTREE), `subtreeLevels`, `availableLevels`, URI templates `{level}/{x}/{y}[/{z}]`. Availability is encoded in **binary subtree** files (availability bitstreams: tile/content/childSubtree). Status: the serde types exist (`core::implicit`), so such tilesets parse; subtree decoding and implicit traversal are not implemented.
 
 ## 2. Content formats
 
 - **glTF/GLB direct (1.1)**: the content IS a glb. `gltf` crate (`import_slice`). Main path.
 - **b3dm (1.0 legacy)**: 28-byte header — magic "b3dm", version u32, byteLength u32, featureTableJSONByteLength, featureTableBinaryByteLength, batchTableJSONByteLength, batchTableBinaryByteLength — then the tables, then an embedded glb → same glTF path afterwards. Read `RTC_CENTER` from the feature table if present (translation to compose).
 - **i3dm, pnts, cmpt**: out of scope for v1. Return a typed `UnsupportedContent` error, not a panic.
-- glTF extensions to handle at decode time: `KHR_draco_mesh_compression` (optional feature, behind a flag), `EXT_meshopt_compression` (`meshopt` crate), `KHR_texture_basisu` (KTX2 — transcoding via `basis-universal` or pass the bytes through to a backend that supports it). In M1: uncompressed meshes + JPEG/PNG textures are enough; the extensions are M2+ features.
+- glTF extensions met in real tilesets: `EXT_meshopt_compression` / `KHR_meshopt_compression` with `KHR_mesh_quantization`, `KHR_draco_mesh_compression`, `KHR_texture_basisu` (KTX2). Status:
+  - none is read today: uncompressed meshes + JPEG/PNG textures;
+  - **meshopt is planned built into the core's glTF decoding, always on — no feature flag** — on a pure-Rust decoder (a lapoule-dev fork of `meshoptimizer-rs`, pinned by revision, wasm-clean), see `10-crate-core.md`;
+  - Draco and `KHR_texture_basisu` are not scheduled. (KTX2 is already read for *imagery tiles*, `core::stored` — not for glTF textures.)
 
 ## 3. Coordinates and up-axis
 
@@ -48,14 +53,16 @@ sse = (geometricError * viewportHeight) / (distanceToCamera * 2 * tan(fovY / 2))
 ## 5. Lifecycle and memory budget
 
 Tile states: `Unloaded → Loading → Decoded → Resident → (Evicted)`.
-Resident cache: LRU bounded by a byte budget (default 512 MiB, configurable). Eviction: never a tile currently selected; LRU among the non-selected ones.
+
+The spec leaves memory to the client. In tuile it is the **graphics budget** (`core::budget`, `10-crate-core.md`): per memory class, a target, an overflow and a hard limit derived from the memory the device or the consumer declares (not a fixed 512 MiB); a decoded tier on the server and a GPU tier on the consumer, charged with the bytes the consumer acknowledges. Eviction never removes what is drawn, nor the ancestor chain and pinned coarse floor a fallback lands on; among the rest, priority decides, not recency alone.
 
 ## 6. Test fixtures
 
-Build `fixtures/` with:
+Status: there is no top-level `fixtures/` directory. The traversal and content tests build their tilesets in code (a hand-crafted mini-tileset, b3dm/glb pairs encoded by `tuile-b3dm`), and the fixtures that exist live with the crate that reads them (`crates/*/tests/fixtures/`, each with a README naming its provenance and licence).
+
+Still to do, when 3D Tiles conformance work resumes:
 - The official sample tilesets from the 3D Tiles spec repo (`Samples/` — permissive license, verify and note in NOTICE): at minimum a simple b3dm tileset, a glTF 1.1, an external tileset, an implicit tiling.
-- A hand-crafted mini-tileset (cube + 4 children) for the traversal unit tests, committed in readable JSON.
-- NO data from proprietary services (tile SaaS, Google, Bing).
+- NO data from proprietary services (tile SaaS, commercial imagery) in the repository, ever.
 
 ## 7. Known pitfalls (review checklist)
 

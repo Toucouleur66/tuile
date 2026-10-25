@@ -1,96 +1,100 @@
 # 13 — `tuile-usd` spec
 
-The differentiating feature: the only 3D Tiles → Apple ecosystem bridge (AR Quick Look on any iPhone/iPad, RealityKit, visionOS). Generation **in pure Rust, without OpenUSD binding**: USDA is text, USDZ is an uncompressed zip with an alignment constraint. No C++ dependency.
+`tuile-usd` writes USD **in pure Rust, without an OpenUSD binding**: USDA is
+text. No C++ dependency, and the tile server never depends on it.
 
-## USDZ format — packaging rules (normative, source of 90% of failures)
+| Part | Status |
+|---|---|
+| The manifest stage: a recorded camera path plus one `Globe` prim, as `.usda` | **Shipped** (`stage.rs`, `tuile-tape-to-usd-stage`) |
+| USDZ export of a tileset region (geometry, materials, a trajectory marker) | **Planned**, not started — no exporter, no USDZ writer in the crate |
 
-1. **zip** archive where EVERY entry is **stored** (compression 0).
-2. The start of the DATA of each file must be aligned on **64 bytes** from the start of the archive → padding via the "extra" field of the local file header. Implement a dedicated writer (`UsdzWriter`); test the alignment byte by byte.
-3. First file in the archive: the root `.usda` (or .usdc).
-4. Embedded textures in PNG/JPEG referenced by internal relative path.
-5. Validation: `usdview` (if available in CI via container) + homemade structural assertions (magic, alignments, readability by standard `zip`).
+## Shipped: the manifest stage
 
-## USDA generation
+A tape (`tuile-tape`, MCAP) becomes a few-kilobyte `.usda` that carries **no
+geometry**: it says where the camera is, frame by frame, and that there is a
+globe. The tiles are streamed when the stage is rendered, by the
+`tuileGlobe` generative procedural of `integrations/hydra` (docs 14, 15).
 
-Emit USDA text (readable, diffable, sufficient — binary usdc = post-v1 optimization).
-
-Scene structure:
-
-```usda
-#usda 1.0
-(
-    defaultPrim = "Root"
-    metersPerUnit = 1
-    upAxis = "Y"
-)
-def Xform "Root" {
-    def Scope "Tiles" {
-        def Mesh "tile_0" ( ... ) {
-            point3f[] points = [...]
-            int[] faceVertexIndices = [...]
-            int[] faceVertexCounts = [3, 3, ...]
-            normal3f[] normals = [...]   (interpolation = "vertex")
-            texCoord2f[] primvars:st = [...] (interpolation = "vertex")
-            rel material:binding = </Root/Materials/mat_0>
-        }
-    }
-    def Scope "Materials" {
-        def Material "mat_0" { UsdPreviewSurface + UsdUVTexture st reader }
-    }
-}
+```text
+cargo run -p tuile-usd --bin tuile-tape-to-usd-stage -- flight.mcap flight.usda \
+    [--fps 24] [--viewport 1920x1440] [--terrain 0] [--imagery 0] [--sse 0]
 ```
 
-Points of attention:
-- **Coordinate frame**: USD/Quick Look = Y-up, meters. The content comes out of the core in local Z-up (rebased ECEF) → apply the inverse rotation. Origin of the USDZ = center of the requested bbox, placed so that the ground is at y=0 (Quick Look anchors on y=0).
-- Materials: `UsdPreviewSurface` only (that is what Quick Look understands) — diffuseColor from texture via `UsdUVTexture` + `UsdPrimvarReader_float2` on `st`, metallic/roughness as constants.
-- glTF indices (triangles) → `faceVertexCounts` filled with 3.
-- Float formatting: bounded precision (6-7 decimals), no exotic scientific notation.
-- Budget: option to merge meshes by material (reduces the number of prims, Quick Look does not like thousands of prims).
+The library entry point is `write_manifest(&[Frame], &ManifestConfig, &mut impl Write)`.
+`ManifestConfig` holds `fps`, `viewport_px`, `terrain_asset_id`,
+`imagery_asset_id`, `max_sse`, `first_frame` and an optional fixed `origin`.
 
-## Deliverable shape: lib + CLI, NEVER in the server
+What the stage contains, under `/World`:
 
-`tuile-usd` is a library plus a `tuile-export-usd` binary. **The tile server does not depend on this crate and exposes no USD route** — this is an architecture boundary, not a detail. The export consumes a tileset like any client (local path or HTTP URL, including a `tuile serve` instance), via the core's `TileFetcher`.
+- `Camera "ShotCam"` — one `matrix4d` time sample per tape frame, time codes
+  starting at `first_frame` (1 for a whole shot, the shot's own numbers for a
+  stretch of it), so `--frames 1:n` on any driver addresses the instants the
+  tape held. Focal length from the tape's vertical field of view; the near plane
+  follows the height above the ellipsoid.
+- `DomeLight "Sky"` and `DistantLight "Sun"`.
+- `GenerativeProcedural "Globe"` with `HydraGenerativeProceduralAPI` applied,
+  `proceduralSystem = "hydraGenerativeProcedural"` authored explicitly (the
+  schema fallback is not delivered on every host), and its arguments as
+  primvars: `hdGp:proceduralType = "tuileGlobe"`, `tuile:cameras` (a **string
+  attribute**, not a relationship — hdGp passes arguments as primvars, and a
+  `primvars:`-prefixed relationship never reached the procedural),
+  `tuile:renderOrigin`, `tuile:terrainAssetId`, `tuile:imageryAssetId`,
+  `tuile:maxSse`, `tuile:viewportPx`.
 
-```bash
-tuile-export-usd ./fixtures/demo/tileset.json --bbox -0.51,44.83,-0.49,44.85 --target-error 4 -o zone.usdz
-tuile-export-usd https://tiles.example.com/tilesets/demo/tileset.json --bbox ... --track track.json -o replay.usdz
-```
+**The render origin.** Every camera sample is written relative to
+`primvars:tuile:renderOrigin` — the centroid of the camera path unless the
+caller fixes it — because an ECEF camera ~6.4e6 m from the origin would be
+quantised into metre-scale jitter by any host holding transforms in f32. The
+procedural adds the origin back (to traverse in true ECEF) and subtracts it
+from every tile's origin (to place geometry): one subtraction, one addition,
+in f64. Every layer rendered with a stage must use the same origin.
 
-If an HTTP export service ever becomes relevant, it will be a separate binary composing this lib.
+Who reads it: `usdrecord` reads it natively; the Blender farm image composes
+it into the render through the plugin's manifest scene index
+(`TUILE_MANIFEST`, `integrations/hydra/src/manifest.h`) and imports the camera.
 
-## Tile selection for export
+Tests (`stage.rs`): rebasing round-trips at ECEF scale, the camera matrix is an
+orthonormal USD basis, focal length inverts the field of view, the manifest
+text is stable, a stretch keeps the shot's frame numbers and the given origin,
+the camera is named by an attribute, an empty tape is refused.
 
-Reuse the core's traversal in bounded mode, without a camera:
-- Input: WGS84 `bbox` (degrees in the CLI, converted) + `target_error` (target level of detail) → we descend the tree as long as `geometricError > target_error` AND there is intersection with the bbox.
-- Hard bounds: `max_tiles` (default 256), source `max_bytes` (default 128 MiB) → explicit error if exceeded, with a message indicating how to reduce (smaller bbox or larger target error).
-- Determinism: same inputs → same output bytes (apart from timestamp metadata, disableable via `--reproducible`). This is what will allow any external orchestrator to cache the results.
+## Planned: USDZ export
 
-## Animations — trajectory replay
+Not implemented. The design below is kept as the target for the 3D Tiles →
+USDZ bridge (AR viewers, RealityKit, visionOS); when it is built it lands in
+this crate as a library plus its own binary.
 
-Crate API (exposed by the CLI via `--track <file.json>`; input format: JSON `[{t, lat, lon, h}]`):
+### Packaging rules (normative, the source of most failures)
 
-```rust
-pub struct TrackSample { pub t_seconds: f64, pub position_wgs84: (f64, f64, f64) }
-pub struct TrackExport {
-    pub samples: Vec<TrackSample>,    // timestamped, monotonic
-    pub marker: MarkerStyle,          // colored sphere v1; custom mesh post-v1
-    pub resample_max_points: usize,   // default 2000 — Quick Look does not like 50k samples
-}
-```
+1. A **zip** archive where every entry is **stored** (compression 0).
+2. Each file's data starts on a **64-byte** boundary from the start of the
+   archive (padding through the local header's extra field) — a dedicated
+   writer, tested byte by byte.
+3. The root layer is the first file in the archive.
+4. Textures embedded as PNG/JPEG, referenced by relative path.
+5. Validation: `usdview` where available, plus structural assertions
+   (alignment, readability by a standard zip reader).
 
-Generation:
-- An `Xform "Track/Marker"` prim with `double3 xformOp:translate.timeSamples = { 0: (...), 0.5: (...), ... }`.
-- Stage metadata: `startTimeCode`, `endTimeCode`, `timeCodesPerSecond` (map t_seconds → timeCodes; `speedup` option to compress 4h into 60s).
-- Resampling: spatio-temporal Douglas-Peucker or fixed step, capped at `resample_max_points`.
-- Marker orientation along the trajectory (yaw from the current segment): optional, behind a flag.
-- A static polyline of the full path (`BasisCurves`) under the marker, for visual context.
+### Content
 
-Quick Look constraints to respect (document in the crate's README): a single global timeline, automatic looping playback, no clip selection, no animated materials.
+- USDA text, `metersPerUnit = 1`, `upAxis = "Y"`: content leaves the core in
+  local Z-up (rebased ECEF), so the export applies the inverse rotation; the
+  origin is the centre of the requested area, ground at y = 0.
+- `UsdPreviewSurface` materials only (diffuse from `UsdUVTexture` on `st`,
+  metallic/roughness constant); triangle indices → `faceVertexCounts` of 3;
+  bounded float precision; an option to merge meshes by material.
+- Tile selection: the core's traversal in bounded mode, without a camera — a
+  WGS84 area plus a target geometric error, hard limits on tiles and source
+  bytes with an explicit error past them, and deterministic output (same
+  inputs → same bytes).
+- Trajectory replay: a marker `Xform` with `xformOp:translate` time samples
+  from a timestamped `[{t, lat, lon, h}]` track, resampled to a cap, plus a
+  `BasisCurves` polyline of the whole path; one global timeline, as AR viewers
+  require.
 
-## Tests
+### Boundary
 
-- Golden files: generated USDA compared to committed snapshots (with float normalization).
-- Packaging: 64-byte alignment verified programmatically on each entry; archive re-read by standard `zip-rs`.
-- Geometry round-trip: known cube → USDA → homemade re-parse of the points → identity.
-- Animation: monotonicity of the timeCodes, correct start/end bounds, resampling ≤ cap.
-- Documented manual test: opening in AR Quick Look (link served locally + iPhone) and usdview — checklist in `docs/manual-tests.md`.
+The exporter will consume a tileset like any client, through the core's
+`TileFetcher`. **The tile server does not depend on this crate and exposes no
+USD route** — an architecture boundary, not a detail. If an HTTP export service
+is ever needed, it is a separate binary composing the library.
