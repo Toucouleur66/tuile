@@ -11,6 +11,24 @@ is a decision.** The code was read, not changed, and the numbers come from
 archives already on this laptop. Scripts are in `lab/pmtiles-compression/`.
 Data and results stayed in a scratch directory and are not committed.
 
+> **Since this study (25 Oct. 2026).** Three things it discusses have moved:
+>
+> - **GPU-compressed imagery shipped** in the interactive viewers (v0.13–v0.14),
+>   encoded **at load, in memory**, as section 5 recommends for phones and
+>   headsets: `ImageryCompression { Off, Auto, Format }`, a GPU encoder in
+>   `tuile-wgpu` (BC7, ASTC 4×4) and a CPU path in the web decode workers.
+> - **It is the client's choice, off by default** (Laurent, 24 Oct.). tuile
+>   never picks compression, codes no licence rule, and `tuile-bake` neither
+>   encodes nor prepares compressed layers. Where this study suggests a
+>   derived KTX2 layer "at bake", read: a client's own tool, outside
+>   `tuile-bake`, if a client wants one.
+> - **Storing GPU blocks in the archives** is studied on its own in
+>   [compressed-imagery-in-pmtiles.md](compressed-imagery-in-pmtiles.md),
+>   which builds on the KTX2/UASTC measurements in section 3.2 below.
+>
+> The rest — gzip terrain, source JPEGs untouched, directories, packs v4,
+> containers — is unchanged and still a study.
+
 **Short answer.**
 
 - **Terrain** is stored uncompressed today. It should be stored **gzip**:
@@ -367,7 +385,8 @@ aerial tiles (lossy JPEG, WebP, AVIF, JXL, KTX2) is **a derived work stored
 and redistributed**. A lossless repacking (jpegtran, JXL reconstruction) is
 arguably the same work in another container, but it is still a modification
 of the delivered file. ⚠ Either needs the provider's terms reread before any
-deployed layer: the internal memo "PoC on commercial imagery OK" covers
+deployed layer, and that check belongs to the client that stores it (tuile
+itself codes no licence rule, decided 24 Oct.). The internal memo "PoC on commercial imagery OK" covers
 on-the-fly computation, not stored derivatives. Open ortho sources under
 licences that allow derivatives (e.g. Etalab 2.0, CC-BY) can be transcoded
 freely, with attribution.
@@ -387,7 +406,7 @@ reconstruction does.
 |---|---|---|---|
 | Terrain | **`tile_compression: gzip`**, level 9 at publish. **zopfli** at compaction (another −10 %, still gzip) | — | Nowhere. Served with `Content-Encoding: gzip`, which is what quantized-mesh clients already expect from the wire |
 | Imagery, commercial | `jpeg`, `none`, **source bytes untouched** | the source JPEG | Nowhere in storage. On the GPU at load where memory matters (below) |
-| Imagery, open ortho | as delivered (JPEG/WebP). A derived **KTX2 ETC1S/UASTC sibling layer** only if mobile and headset make it worth it | the delivered file | at bake, as a separate layer |
+| Imagery, open ortho | as delivered (JPEG/WebP). A derived **KTX2 ETC1S/UASTC sibling layer** only if a client wants one for mobile and headset | the delivered file | in a client's own preparation tool, as a separate layer; never in `tuile-bake` |
 | Directories | gzip (unchanged); set bounds and center in the header | — | — |
 | `.absent` | unchanged | — | — |
 
@@ -405,7 +424,8 @@ reconstruction does.
   JPEG decode (≈ 0.2 ms per 256² tile native) is not the bottleneck of a
   render. Packs stay LZ4.
 - **Phone and headset.** The cost is GPU memory and upload, not bytes on
-  disk. Decode the JPEG (native or `createImageBitmap`), then compress to
+  disk. Where the client opts in (compression is off by default), decode
+  the JPEG (native or `createImageBitmap`), then compress to
   BC7/ASTC/ETC2 **at load, in memory**. A compute-shader block encoder, an
   established one, belongs in the wgpu backend. A transient in-memory
   texture is a decode, not a stored derivative, so the licence question does
