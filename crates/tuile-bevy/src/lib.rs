@@ -50,7 +50,7 @@
 //!
 //! The same plugin, on WebGPU or WebGL2 (one Bevy build each). The session
 //! runs on the page's thread and decodes in tuile's web decode workers: see
-//! [`web`] for the three things the page does. On WebGL2 a camera draws
+//! `web` (wasm32 only) for the three things the page does. On WebGL2 a camera draws
 //! single-sampled (`Msaa::Off`): it can neither read a multisampled depth nor
 //! shade per sample, which sharing a stencil-less depth needs.
 //!
@@ -100,7 +100,7 @@ pub struct TuilePlugin {
     /// falls back to RGBA8.
     pub compression: ImageryCompression,
     /// In a browser, the module worker script the decode workers are made
-    /// from ([`web`]); `None` decodes on the page's thread. Ignored
+    /// from (`web` (wasm32 only)); `None` decodes on the page's thread. Ignored
     /// elsewhere, where decoding has threads of its own.
     pub decode_workers: Option<String>,
 }
@@ -118,7 +118,7 @@ impl TuilePlugin {
     }
 
     /// In a browser, decode in workers made from the module worker script at
-    /// `script`, relative to the page ([`web`]).
+    /// `script`, relative to the page (`web` (wasm32 only)).
     #[must_use]
     pub fn with_decode_workers(mut self, script: impl Into<String>) -> Self {
         self.decode_workers = Some(script.into());
