@@ -99,6 +99,10 @@ struct Atmosphere {
     // xyz: the camera's white balance; w: where the roll-off of highlights
     // begins. For a renderer that draws straight to the display (`graded`).
     grade: vec4f,
+    // The planets: xyz towards each from the eye (ECEF), w its irradiance
+    // over the sun's — 0 for none; and their colours.
+    planets: array<vec4f, 6>,
+    planet_colours: array<vec4f, 6>,
 }
 
 const ATMOSPHERE_PI: f32 = 3.14159265358979;
@@ -569,7 +573,7 @@ fn behind_a_disc(n: vec3f) -> bool {
     return false;
 }
 
-// The stars along the unit `n`, in the model's units (per unit of the sun's
+// The stars and the planets along the unit `n`, in the model's units (per unit of the sun's
 // irradiance outside the air), `sigma` the radius of a star's image in
 // radians (about a pixel). The Bright Star Catalogue (`stars.rs`): each
 // star's irradiance from its magnitude, 10^(−0.4 (V − V☉)), its colour a
@@ -597,6 +601,16 @@ fn stars_seen(n: vec3f, sigma: f32) -> vec3f {
         let v = f32(code % 1024u) * 0.01 - 2.0;
         let irradiance = exp2(-0.4 * (v - SUN_V) * 3.321928);
         sum += star_texel(STAR_INDEX_TEXELS + code / 1024u).rgb * (irradiance * exp(-d2 * k));
+    }
+    // The planets, by the same rule: points of light, their places in the
+    // Earth's frame.
+    for (var p = 0u; p < 6u; p++) {
+        let planet = atmosphere.planets[p];
+        let d = n - planet.xyz;
+        let d2 = dot(d, d);
+        if (planet.w > 0.0 && d2 <= STAR_REACH * STAR_REACH) {
+            sum += atmosphere.planet_colours[p].rgb * (planet.w * exp(-d2 * k));
+        }
     }
     let mu = dot(atmosphere.up.xyz, n);
     return sum * (k / ATMOSPHERE_PI) * transmittance(atmosphere.sun.w, mu);

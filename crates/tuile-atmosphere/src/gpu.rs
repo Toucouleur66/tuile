@@ -85,6 +85,11 @@ pub struct AtmosphereUniform {
     pub ambient: [f32; 4],
     /// xyz: the white balance; w: the highlight knee.
     pub grade: [f32; 4],
+    /// The planets, Mercury to Uranus: xyz towards each, ECEF; w its
+    /// irradiance over the sun's — 0 for none.
+    pub planets: [[f32; 4]; 6],
+    /// Their colours, in units of the sun's (rgb).
+    pub planet_colours: [[f32; 4]; 6],
 }
 
 /// The share of the full Moon's light its night side sends back by the
@@ -224,7 +229,19 @@ impl AtmosphereUniform {
                 let w = look.white_balance_under(light);
                 [w[0], w[1], w[2], look.highlight_knee]
             },
+            planets: [[0.0; 4]; 6],
+            planet_colours: [[0.0; 4]; 6],
         }
+    }
+
+    /// With the planets `lights` ([`crate::planets::lights_at`]): drawn as
+    /// the stars are, points of light through the air.
+    pub fn with_planets(mut self, lights: &[([f32; 4], [f32; 4]); 6]) -> Self {
+        for (i, (at, colour)) in lights.iter().enumerate() {
+            self.planets[i] = *at;
+            self.planet_colours[i] = *colour;
+        }
+        self
     }
 
     /// For the picture whose eye is at `eye` (ECEF): the sphere's centre

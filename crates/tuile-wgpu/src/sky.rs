@@ -81,6 +81,10 @@ pub struct Bodies {
     /// Stars are always drawn: the air and the camera decide whether they
     /// show.
     pub stars: DMat3,
+    /// The planets, Mercury to Uranus, as the sky draws them
+    /// ([`tuile_atmosphere::planets::lights_at`]): towards each (ECEF) and
+    /// its irradiance over the sun's, and its colour.
+    pub planets: [([f32; 4], [f32; 4]); 6],
 }
 
 impl Bodies {
@@ -91,6 +95,7 @@ impl Bodies {
             to_sun: Sun::at_unix_seconds(instant).direction_ecef,
             moon: Moon::seen_from(instant, ecef_to_geodetic(eye)).map(|m| Moonlight::of(&m)),
             stars: tuile_atmosphere::stars::j2000_to_ecef(instant),
+            planets: tuile_atmosphere::planets::lights_at(instant),
         }
     }
 
@@ -116,6 +121,7 @@ impl Bodies {
                 }
             }),
             stars: tuile_atmosphere::stars::j2000_to_ecef(tuile_atmosphere::stars::J2000_UNIX),
+            planets: tuile_atmosphere::planets::lights_at(tuile_atmosphere::stars::J2000_UNIX),
         }
     }
 }
@@ -232,6 +238,12 @@ impl Lights {
                     to_sun,
                     moon: None,
                     stars: DMat3::from_rotation_z(-lon),
+                    // The planets of J2000, turning with the stars: a
+                    // world of its own has no date to move them by.
+                    planets: tuile_atmosphere::planets::lights_turned(
+                        tuile_atmosphere::stars::J2000_UNIX,
+                        DMat3::from_rotation_z(-lon),
+                    ),
                 }
             }
             Self::Fixed { to_sun, to_moon } => Bodies::fixed(to_sun, to_moon),
@@ -592,7 +604,8 @@ impl Sky {
             self.exposure,
             stars,
             &self.look,
-        );
+        )
+        .with_planets(&bodies.planets);
         if view_stale {
             // Written for the table's own pass, from its own eye, then made.
             queue.write_buffer(

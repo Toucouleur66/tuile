@@ -572,3 +572,69 @@ fn the_sun_the_moon_and_the_planet_hide_the_stars_behind_them() {
     let s = probe(&mut gpu, &sky, &[(below, sigma())])[0].stars();
     assert!(s.iter().all(|&v| v == 0.0), "under the horizon: {s:?}");
 }
+
+#[test]
+fn venus_comes_out_in_the_west_before_any_star_by_the_stars_rule() {
+    let Some(mut gpu) = gpu() else {
+        eprintln!("skipping GPU test: no usable adapter with compute");
+        return;
+    };
+    let sunset = Sun::next_sunset(
+        NOON,
+        Geodetic {
+            height: 0.0,
+            ..pic()
+        },
+    )
+    .expect("a sunset");
+    let up = enu_frame(pic()).z_axis;
+    let mut venus_first = None;
+    let mut sirius_first = None;
+    for k in 0..=12 {
+        let t = sunset + f64::from(k) * 600.0;
+        let lights = tuile_atmosphere::planets::lights_at(t);
+        let (at, colour) = lights[1];
+        let venus = DVec3::new(f64::from(at[0]), f64::from(at[1]), f64::from(at[2]));
+        if venus.dot(up) < 0.03 {
+            break;
+        }
+        // Sirius, for a star of the same sky, where Venus is not: 20° to
+        // the side of it, as high.
+        let beside = (venus + up.cross(venus).normalize() * 0.35).normalize();
+        let sky = {
+            let mut s = sky(t, sirius_along(beside));
+            s.uniform = s.uniform.with_planets(&lights);
+            s
+        };
+        let seen = probe(&mut gpu, &sky, &[(venus, sigma()), (beside, sigma())]);
+        // At its centre, Venus is its irradiance over 2πσ², through the
+        // air, as a star is.
+        let s = f64::from(sigma());
+        let peak = f64::from(at[3]) / (2.0 * std::f64::consts::PI * s * s);
+        let got = seen[0].stars();
+        for c in 0..3 {
+            let want = peak
+                * f64::from(colour[c])
+                * f64::from(seen[0].transmittance[c])
+                * f64::from(sky.uniform.illuminance[c]);
+            assert!(
+                (f64::from(got[c]) / want - 1.0).abs() < 2e-3,
+                "Venus, channel {c}: {} against {want}",
+                got[c]
+            );
+        }
+        let (v, sirius) = (shown(&sky, &seen[0]), shown(&sky, &seen[1]));
+        eprintln!("+{:3} min: Venus {v:6.2}, Sirius {sirius:6.2}", k * 10);
+        if v >= 1.0 && venus_first.is_none() {
+            venus_first = Some(k);
+        }
+        if sirius >= 1.0 && sirius_first.is_none() {
+            sirius_first = Some(k);
+        }
+    }
+    let venus_first = venus_first.expect("Venus shows before it sets");
+    assert!(
+        sirius_first.is_none_or(|s| venus_first < s),
+        "Venus at step {venus_first}, Sirius at {sirius_first:?}"
+    );
+}
