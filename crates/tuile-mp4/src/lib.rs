@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! H.264 samples into an mp4, in memory.
-//!
-//! The browser's encoder (WebCodecs) hands out an `avcC` description and
-//! length-prefixed access units; a native encoder hands out Annex-B. Both end
-//! up here as the samples of one video track, written to a `Vec<u8>` — no
-//! file, so it runs the same in a wasm worker as in a binary.
-//!
-//! Several encoders may feed one film, each owning a contiguous slice of it.
-//! That only joins into something decodable if they all produced the same
-//! parameter sets, so every slice's `avcC` is checked against the first and a
-//! mismatch is an error, never a film that turns to garbage half-way.
+#![doc = include_str!("../README.md")]
 
 mod av1;
 pub mod film;

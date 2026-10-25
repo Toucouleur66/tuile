@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! A synthetic relief served as quantized-mesh terrain and XYZ imagery over
-//! plain HTTP, for `tuile-viewer` to show with no catalog and no token.
-//!
-//! | Route | What |
-//! |---|---|
-//! | `/terrain/layer.json` | the terrain's description: TMS, octvertexnormals, the levels available |
-//! | `/terrain/{z}/{x}/{y}.terrain` | a quantized-mesh tile, TMS (row 0 in the south); the ellipsoid outside the map, 404 deeper than its levels |
-//! | `/imagery/{z}/{x}/{y}.png` | the relief coloured by height, geographic grid, XYZ (row 0 in the north) |
-//!
-//! Flags: `--listen ADDR` (default `127.0.0.1:8092`), `--tls-cert PEM
-//! --tls-key PEM` (HTTPS, for a phone whose page is HTTPS), `--public-url
-//! URL` (the address the printed commands use, for a server reached from
-//! another machine). See the README.
+#![doc = include_str!("../README.md")]
 
 mod relief;
 

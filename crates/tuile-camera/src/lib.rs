@@ -1,26 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! # tuile-camera
-//!
-//! A render-agnostic globe camera and input controller. Everything is f64
-//! ECEF; the only outputs are a [`tuile_core::traversal::ViewState`] (for the
-//! SSE traversal) and a rebased f32 view-projection (for any renderer). There
-//! is **no** dependency on a windowing or graphics library: a façade feeds
-//! pixel-space gestures in and reads the camera out, so the very same control
-//! logic drives winit, an egui panel, a web front-end or touch.
-//!
-//! The gestures follow Cesium's `ScreenSpaceCameraController`:
-//! - **drag** = pick the ellipsoid under the cursor at the gesture's start and
-//!   end, then rotate the camera about the geocenter so the start point lands
-//!   under the end cursor — exact 1:1 surface dragging, independent of zoom
-//!   (Cesium `pan3D`);
-//! - **zoom** scales the *altitude* toward the point under the cursor, clamped
-//!   above the surface (never through it);
-//! - **tilt** / **heading** orbit the look-at point on the surface.
-//!
-//! Cameras that follow a subject along a route known in advance — smoothed,
-//! with bounded turns — are in [`path`].
+#![doc = include_str!("../README.md")]
 
 pub mod path;
 

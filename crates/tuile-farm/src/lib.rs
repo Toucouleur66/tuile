@@ -1,31 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! A render farm's object storage, behind one repository.
-//!
-//! Every byte a farm job moves — the pack in, the segments out, the logs, the
-//! traces, the OptiX cache, the finished film — goes through [`RunStore`]. The
-//! job holds a bucket's access key and secret and talks to the bucket itself;
-//! nothing is presigned, and no launcher stands between the job and its data.
-//!
-//! # Why a crate and not `curl`
-//!
-//! `curl -o` on a presigned URL is one TCP stream. Measured on a Cloud Run L4
-//! on 21 September 2026: a 2.3 GB pack in **88 seconds**, every task, before a
-//! single frame — a single stream to object storage is capped far below what
-//! the machine's network can carry. Many ranged reads in flight at once are
-//! what the storage is built for, and a multipart upload is the only way to put
-//! a film of several gigabytes at all. Both are the client's job, not ours:
-//! [`object_store`] does the chunking, the part bookkeeping and the retries.
-//!
-//! # One implementation, two backends
-//!
-//! [`ObjectRunStore`] is written once against the `ObjectStore` interface and
-//! built either on an S3-compatible bucket ([`ObjectRunStore::bucket`]) or on a
-//! local directory ([`ObjectRunStore::local`]). The directory is not a mock:
-//! it runs the same parallel reads and the same multipart writes, which is
-//! what lets the contract below be checked on a workstation in a second and on
-//! the real bucket with the same function.
+#![doc = include_str!("../README.md")]
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
