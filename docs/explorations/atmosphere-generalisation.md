@@ -78,6 +78,7 @@ building on Bruneton & Neyret 2008,
 | Thick air (Venus, Titan's haze) | A5, and A7 (refraction) | the multiple-scattering approximation is the weak point (§4.4) |
 | Dusty air (Mars), coloured haze | A3 (grey, one *g*) | RGB albedo and per-channel phase are needed (§4.2) |
 | Clouds, dust storms | A4 | out of scope (§6) |
+| Refraction, polarisation, relativity, gas giants, spectra | A7, A6, A4 | opened in §7 |
 | Black hole, accretion disc | A7 (curved rays), A2 (extended emitter) | not an atmosphere problem: a background and a light (§3.6) |
 | Pulsar | A2 (time-varying intensity) | trivial for the air, a determinism question (§3.7) |
 | Nebula / galactic background | A2 (extended, faint emitter) | an emissive background and an ambient term (§3.8) |
@@ -218,7 +219,7 @@ blackbody colours per radius, a stylised Doppler brightening of the
 approaching side. As a light on the planet it is an *extended* source:
 approximate it by 2–4 directional lights (its brightest arcs) or by its
 irradiance projected on an L1 harmonic, both of which the light model above
-already takes. Lensing of the light *reaching the planet* is out of scope.
+already takes. Lensing of the light *reaching the planet* is out of scope; Kerr and film-quality lensing are discussed in §7.3.
 
 ### 3.7 Pulsars
 
@@ -333,8 +334,7 @@ weight, not a switch. It is the most expensive item of the study to get
 right and the least needed; it closes the plan (§5.8, PR 7).
 
 Refraction (A7) matters for thick air: on Venus the surface is close to
-"super-refraction" — the horizon appears to rise. Out of scope beyond a
-mention.
+"super-refraction" — the horizon appears to rise. See §7.1.
 
 ### 4.5 Body radius, thickness, ground
 
@@ -360,7 +360,7 @@ lowering* (blackbody → RGB, cross-sections → three wavelengths), with a CPU
 spectral reference in tests to measure the RGB error per preset (ΔE). The
 Earth preset passes today's RGB constants verbatim — never recomputed from
 a spectrum, which would move their last bits. An N-bin engine is a later,
-separate decision, after the error has been measured.
+separate decision, after the error has been measured (§7.5).
 
 ---
 
@@ -563,10 +563,14 @@ plan; each is reviewed before merge.
 | 1 | **Constants to uniforms**: `LUT_RADIUS`, `SUN_ANGULAR_RADIUS`, limb `u` become uniform fields; CPU-side derived values | Earth table bytes, uniform digest, film digest (atmosphere on) frozen before — identical |
 | 2 | **N lights**: lights array, sky-view texture array, `Slots` in `Bodies`, RGB weights; sun and Moon as lights 0 and 1; second shadow map out of scope | Earth digests identical; a two-sun test against two one-sun renders summed (linearity) |
 | 3 | **Stars as data**: blackbody → RGB (relative to the Sun), irradiance from distance, angular size, quadratic limb darkening; `Lights::System` with Kepler motions; eclipse overlap per light (sky and per fragment) | Kepler-16-like and Proxima-like presets; eclipse fraction tests against closed form |
-| 4 | **Media presets**: `Body` radius, RGB albedo/extinction, per-channel `g`, typed profiles; Mars, Titan, airless; baked tables per preset; CPU path-tracer reference | per-preset error vs the reference, opened renders of each preset (the film opened, not a counter) |
+| 3b | **Refraction** (§7.1): Bennett/Bouguer correction in the ephemeris, refracted-elevation table, flattened disc; Earth default changed as a deliberate golden update, in its own commit | zero-correction configuration identical to today; sunset times against an almanac |
+| 4 | **Media presets**: `Body` radius, RGB albedo/extinction, per-channel `g`, typed profiles; Mars, Titan, airless; baked tables per preset; CPU path-tracer reference and CPU spectral reference (§7.5) | per-preset error vs the reference, opened renders of each preset (the film opened, not a counter) |
+| 4b | **Body ellipsoid in `tuile-core`** (§7.4): `a, f` per body instead of WGS84 constants, for the Moon, Mars and gas giants as globes | WGS84 body reproduces today's coordinates to the bit |
+| 4c | *Optional*: **polariser** in the film's look (§7.2): Q, U beside I in the single-scattering terms | no polariser: identical to today |
 | 5 | **Secondary lights and rings**: planetshine with large discs, ring shadows and ringshine | Saturn-from-Titan render |
 | 6 | **Exotic**: emissive background maps, pulsar (time-averaged periodic light), stylised lensing, accretion disc as lights; then Bruneton 2020's precomputed lensing | stylised presets, rendered and opened |
-| 7 | **Opaque regime**: two-stream term for τ ≫ 5 (Venus below the deck), only if wanted | Venus render vs Venera panorama colours |
+| 7 | **Opaque regime**: two-stream term for τ ≫ 5 (Venus below the deck), only if wanted; curved rays in the tables (§7.1) | Venus render vs Venera panorama colours |
+| 8 | *Conditional*: runtime N-bin spectral engine (§7.5), only if the measured RGB error exceeds the agreed threshold | N = 3 instance identical to today; ΔE per preset vs the CPU spectral reference |
 
 A GPU table builder (compute + WebGL2 fragment fallback), held to the f64
 builder, can slot in between 3 and 4 if hosts need live air changes; baked
@@ -576,22 +580,361 @@ presets cover the plan without it.
 
 ## 6. Out of scope
 
-- Volumetric clouds (Hillaire's and Schneider's cloud work is a separate
-  system; Venus's deck is handled as a layered aerosol, not clouds).
-- Refraction (flattened suns, super-refraction, red lunar umbra beyond the
-  cheap colour), polarisation.
-- Relativistic effects beyond a stylised or precomputed Schwarzschild
-  lensing of the background: no Kerr, no lensing of the light reaching the
-  planet, no time dilation, no redshift of the planet's own light.
-- Gas giants' interiors (flying *into* Jupiter): a deep, non-spherical,
-  banded atmosphere is another model.
+- **Volumetric clouds** (Hillaire's and Schneider's cloud work is a separate
+  system; Venus's deck is handled as a layered aerosol, not clouds). Too
+  early; not opened here.
 - Horizontal structure (dust storms, plumes, aurorae — though an aurora is
   a cheap emissive layer to revisit later).
-- Full spectral rendering in the real-time engine (§4.6).
+
+Refraction, polarisation, relativistic effects, gas giants and full
+spectral rendering were out of scope in the first draft; they are opened
+in §7.
 
 ---
 
-## 7. How others do it
+## 7. Open questions: five further generalisations
+
+Each is judged on the same rules as the rest of the study: one engine, the
+Earth configuration reproducing today's output to the byte (§5.2, §5.3),
+costs per backend, and a verdict — **now**, **later**, **offline only** or
+**no** — with a slot in the PR plan (§5.8).
+
+A note on the reduction that applies to the first three: *today's* Earth
+has no refraction, no polarisation and no relativity. The Earth
+configuration that reproduces today therefore sets each of them to its
+neutral value (refraction coefficient 0, no polariser, β = 0). Turning one
+of them on for the Earth *by default* is a different configuration; it
+moves the goldens and is, as `a_default_films_pictures_are_the_same_to_the_byte`
+already says of its own digest, "a decision, never an accident".
+
+### 7.1 Refraction
+
+**On screen.** The setting sun flattened into an oval (its vertical
+diameter about a fifth short at the horizon), its rim jagged under
+inversions; the sun still whole in the sky when it has geometrically set
+— astronomical refraction at the horizon is about 34′, more than the
+sun's diameter, so sunset comes two to three minutes late at mid-latitudes;
+the green (rarely blue) rim and green flashes; distant ridges raised
+("looming") and the horizon pushed out; a red-coppery umbra in a lunar
+eclipse, lit by sunsets refracted round the Earth's limb. On Venus and
+Titan, much stronger: Venus's lower atmosphere bends horizontal rays with
+a radius of curvature close to the planet's own, so the horizon appears to
+rise and the ground to curve up like a bowl.
+
+**Why it matters for tuile.** It matters in two places, the second of
+which is unusual among engines: (1) **the clock** — doc 19 notes that
+`sun.rs` does not model refraction; a film "at sunset" in the Pyrenees is
+lit minutes off, and the disc is drawn round where a photograph shows
+it flattened; (2) **the geometry of a globe** — a globe viewer draws
+distant terrain with straight rays: under standard refraction
+(coefficient k ≈ 0.13, the surveyor's "7/6 Earth"), a ridge 100 km away
+is seen about 100 m higher than drawn (curvature drop `d²/2R` ≈ 785 m,
+times k). Film shots along the horizon from a paraglider see exactly
+those ridges.
+
+**Physics.** In a spherically layered medium a ray keeps `n(r) · r · sin z`
+constant (Bouguer's invariant); the bending follows from the refractivity
+profile `n − 1 ∝ density` (≈ 2.9 × 10⁻⁴ at the Earth's sea level), so it
+derives from the same density profiles as scattering, plus one number per
+gas (its refractivity). Dispersion (`n` a few percent larger in the blue)
+separates the channels by ~10–40″ near the horizon: sub-pixel except
+through a long lens; a visible green flash needs a mirage to magnify it.
+Bennett's formula (1982,
+[doi:10.1017/S0373463300022037](https://doi.org/10.1017/S0373463300022037))
+gives the standard refraction to 0.07′ for the ephemeris; Young's pages are
+the reference on green flashes and sunset mirages
+([aty.sdsu.edu](https://aty.sdsu.edu/),
+[explanations](https://aty.sdsu.edu/explain/explanations.html)).
+
+**Known real-time techniques.**
+
+| Technique | What it gives | Reference |
+|---|---|---|
+| Refracted-elevation table: apparent ↔ true elevation by eye height (and channel, for dispersion), integrated once per medium from Bouguer's invariant | sun/Moon/star positions, disc flattening (the disc drawn through the inverse map), sky-view rows looked up along the bent ray | Zhang 2015 (UMBC MS thesis, sunset mirages over the ocean, precomputed refraction profiles + ray tracing of the sun's image), [PDF](https://redirect.cs.umbc.edu/~olano/papers/theses/Zhang2015.pdf) |
+| Transmittance and scattering along curved rays in the precomputed tables | correct reddening at grazing angles, red lunar umbra, eclipses | Schneegans et al. 2025, "Physically Based Real-Time Rendering of Eclipses" (Bruneton's model extended with refraction), [CGF](https://diglib.eg.org/handle/10.1111/cgf70017), [PDF](https://cgvr.cs.uni-bremen.de/papers/cgf25/paper1037_CRC-1.pdf) |
+| Terrestrial refraction as a vertex lift: `+ k · d² / 2R` along the local up | looming of distant terrain | survey practice (k-factor); no rendering paper needed |
+| Mirage layers (inversions) | jagged suns, green flash magnification | ray tracing through tabulated `n(h)` profiles; offline |
+
+**Cost.** The table: e.g. 256 × 64 × 3 channels f32 ≈ 200 KB, built once per
+medium on the CPU in f64 (milliseconds), like the transmittance table. Per
+frame: the ephemeris correction (CPU, nothing). Per sky pixel: one extra
+fetch (all backends, WebGL2 included). Per terrain vertex: a multiply-add.
+Curved rays in the transmittance and multiple-scattering tables change
+their build (a ray march with bending, ~2–5× the build time) but not their
+size nor their lookups. Mirages: offline only.
+
+**Fits one engine?** Yes. Refraction is a medium property (refractivity per
+gas, a terrestrial coefficient k); at 0 the ray stays straight and the
+table is the identity: `apparent = true` exactly, the vertex lift `+ 0`,
+the tables unchanged. The reduction test holds as long as the identity is
+exact by construction (the lookup bypassed by its own value, not
+approximated by an interpolated identity table — an interpolated table
+would move bits; the lookup is `true + correction(h, e)` with the
+correction table all zeros, and `x + 0 = x`).
+
+**Verdict.** *Astronomical refraction in the ephemeris and the disc
+flattening*: **now-ish** — cheap, and it corrects the time of a lit scene
+by minutes; slot it right after PR 3 (stars as data), as **PR 3b**, with
+the Earth default change as its own deliberate golden update.
+*Terrestrial refraction (looming)*: **later**, behind a measured
+comparison with photographs, same PR or the next. *Curved rays in the
+tables (eclipses, Venus, Titan)*: **later**, with PR 7. *Mirages and
+magnified green flashes*: **offline only** (films), stylised.
+
+### 7.2 Polarisation
+
+**On screen.** Nothing, to the naked eye (Haidinger's brush is barely
+visible). Through a **polarising filter** — a photographer's circular
+polariser, polarised sunglasses — a lot: a dark band of sky 90° from the
+sun, deeper blue and more contrast; reflections removed from water and
+glass and the ground's sheen reduced; the effect changing as the filter or
+the head turns. Many landscape and aerial photographs that set a viewer's
+expectation of "a real sky" were shot through one.
+
+**Why it matters for tuile.** Films: a "polariser" look is a plausible
+camera option for aerial films, and it is physically different from a
+saturation boost (it depends on the angle to the sun). Simulators: drones
+and robots with polarisation sensors navigating by the sky's pattern
+(insect-inspired compasses) need a correct polarisation map. Globe viewer
+and games: no.
+
+**Physics.** Light as a Stokes vector `(I, Q, U, V)`; each scattering
+event a Mueller matrix. Single Rayleigh scattering gives a degree of
+polarisation `P = sin²θ / (1 + cos²θ)` (θ the scattering angle), 100 % at
+90°; multiple scattering, aerosols and ground reflection lower the
+maximum to ~60–80 % on a clear day and create neutral points (Arago,
+Babinet, Brewster). `V` (circular) is negligible in the sky. Fresnel
+reflection polarises reflected light (water at Brewster's angle, ~53°).
+Wilkie et al.'s Prague sky model ships fitted polarisation data
+([Zenodo dataset](https://zenodo.org/records/19140728),
+[code](https://github.com/PetrVevoda/pragueskymodel),
+[a re-implementation](https://colour.readthedocs.io/en/latest/generated/colour.phenomena.sky_polarisation_Wilkie2021.html));
+Mitsuba 3 is a reference polarised path tracer
+([docs](https://mitsuba.readthedocs.io/en/stable/src/key_topics/polarization.html)).
+
+**Known real-time techniques.** Carry `(I, Q, U)` in the single-scattering
+part of the sky-view and aerial-perspective computation, in a frame tied
+to the scattering plane, and treat Hillaire's multiple-scattering term as
+unpolarised (it is isotropic by construction, consistent with it). A
+filter at angle φ then shows `½ (I + Q cos 2φ + U sin 2φ)` per pixel.
+Alternatively, a fitted analytic `P(θ, sun elevation)` map (Prague-model
+style) applied only to the sky, with a Fresnel-based treatment of water.
+
+**Cost.** Sky-view: three channels become nine (I, Q, U in RGB) —
+memory ×3 per light layer (~330 KB → ~1 MB), march ALU ~×1.5 (phase
+matrices on the single-scattering term only). Aerial perspective per
+fragment: the same ~×1.5 on the march — the expensive part, on every
+backend. WebGL2: sky-view needs 3 render targets (within the MRT limit);
+mobile: too heavy for the per-fragment march; film/offline: fine.
+
+**Fits one engine?** Yes: the camera's polariser is a configuration value
+(none, or an angle and an efficiency); `Q, U` are channels the engine
+computes only when a consumer reads them — with no polariser there is no
+consumer, and `I` is computed by today's arithmetic, so the reduction
+holds. The risk to watch is that the polarised march must keep `I`'s
+operations identical to the unpolarised one (compute `Q, U` beside `I`,
+never derive `I` from them).
+
+**Verdict.** **Later, film first**: a polariser in the film's look, after
+PR 4; the interactive viewer and mobile only if a host asks. A simulator's
+polarisation map: **later**, on request. Not before the medium presets are
+validated: polarisation amplifies whatever the aerosol model gets wrong.
+
+### 7.3 Relativistic effects
+
+**On screen.** For a camera at everyday speeds: nothing (β = v/c ≈ 10⁻⁵
+even in orbit; aberration of ~20″, the annual stellar aberration). For a
+relativistic camera (a space game, an educational simulator): the sky
+crowds forward and brightens ahead (**aberration**, the "searchlight"),
+stars shift blue ahead and red behind (**Doppler**), and brighten or fade
+with it (**beaming**, intensity ∝ D³–D⁴). Near a black hole: Einstein
+rings, a secondary image of the accretion disc over and under the hole,
+the disc's approaching side brighter and bluer, frequencies shifted by the
+gravitational redshift.
+
+**Why it matters for tuile.** Globe viewer, Earth films: not at all. Space
+games and simulators built on tuile: aberration and Doppler are cheap
+signature effects; lensing is the black-hole preset's whole point (§3.6).
+
+**Physics.** Aberration: `cos θ' = (cos θ + β) / (1 + β cos θ)`. Doppler
+factor `D = 1 / (γ (1 − β cos θ))`; a blackbody seen with Doppler factor D
+is a blackbody of temperature `D · T` — **the reason it fits an RGB
+engine**: stars described by temperature (§3.1) are shifted by changing
+their temperature, no spectrum needed; arbitrary spectra (a nebula map) do
+need spectral data (§7.5). Lensing: Schwarzschild geodesics depend on one
+impact parameter (1D tables); Kerr geodesics (spinning holes) on more
+(per-pixel integration).
+
+**Known techniques.**
+
+| Level | Technique | Real time? | Reference |
+|---|---|---|---|
+| Aberration + Doppler + beaming | per-pixel remap of the background direction, temperature shift per star | yes, trivial | MIT Game Lab, *A Slower Speed of Light* / OpenRelativity, [gamelab.mit.edu](http://gamelab.mit.edu/games/a-slower-speed-of-light/) |
+| Schwarzschild lensing with disc | precomputed deflection and disc-intersection tables, filtered stars | yes (WebGL2) | Bruneton 2020, [arXiv:2010.08735](https://arxiv.org/abs/2010.08735) |
+| Kerr lensing | per-pixel geodesic integration on the GPU | near real time at reduced resolution | Chan, Psaltis, Özel 2013 (GRay), [arXiv:1303.5057](https://arxiv.org/abs/1303.5057); Riazuelo 2019, [arXiv:1511.06025](https://arxiv.org/abs/1511.06025) |
+| Film quality (ray bundles, Kerr, Doppler, redshift) | offline | no | James et al. 2015 (DNGR), [arXiv:1502.03808](https://arxiv.org/abs/1502.03808) |
+
+**Cost.** Aberration/Doppler: a few ALU per background pixel and per star,
+all backends. Schwarzschild tables: a few MB, one full-screen pass with a
+couple of fetches per pixel; fine on WebGPU and WebGL2, acceptable on
+mobile at reduced resolution. Kerr per-pixel integration: hundreds of
+steps per pixel — desktop at reduced resolution, offline for films.
+
+**Fits one engine?** Yes, as the background/observer part of the
+configuration: β = 0 makes aberration the identity (`(cos θ + 0)/(1 + 0)`)
+and D = 1 leaves temperatures as they are; no black hole, no lensing pass.
+The Earth reduction holds by those identities (and by not running a
+lensing pass that has nothing to lens). Note the atmosphere itself is not
+touched: relativity acts on what lies beyond it and on the observer.
+
+**Verdict.** Aberration + Doppler + beaming for a moving observer:
+**later**, cheap, with PR 6 (exotic sources), only when a host has a
+relativistic camera. Schwarzschild lensing: **later**, PR 6 (already
+planned). Kerr and DNGR-quality: **offline only**, and probably **no**
+unless a film asks for it.
+
+### 7.4 Gas giants
+
+**On screen.** From orbit or a moon: a banded disc (belts and zones,
+storms such as Jupiter's Great Red Spot), strong limb darkening and a
+bright haze at the limb, a terminator softened by the deep atmosphere,
+rings and their shadow (Saturn), the bands drifting at different speeds.
+From inside, descending: a blue-tinted upper sky (Rayleigh on H₂), haze
+layers, then successive cloud decks — ammonia ice near 0.7 bar,
+ammonium hydrosulfide near 2 bar, water near 5 bar on Jupiter (Atreya et
+al. 1999,
+[doi:10.1016/S0032-0633(99)00047-1](https://doi.org/10.1016/S0032-0633(99)00047-1))
+— and darkness below, with no surface ever.
+
+**Why it matters for tuile.** As a **body in the sky** of a moon (Saturn
+from Titan, Jupiter from Europa): yes, soon — it is the large secondary
+light and the large disc of §3.5. As a **destination to fly over**: a
+globe viewer and films can show a gas giant from above its cloud tops,
+which is a globe with imagery. As a place to **descend into**: that is a
+cloud-rendering problem, and clouds are out of scope.
+
+**Physics.** "Radius" is conventional: the 1-bar level (Jupiter
+71 492 km equatorial, strongly oblate, f ≈ 0.065; Saturn f ≈ 0.098,
+[NASA Jupiter fact sheet](https://nssdc.gsfc.nasa.gov/planetary/factsheet/jupiterfact.html),
+[Saturn](https://nssdc.gsfc.nasa.gov/planetary/factsheet/saturnfact.html)).
+Scale height ~27 km on Jupiter. H₂ scatters less per molecule than N₂
+(its refractivity is about half), helium even less; above the clouds the
+atmosphere is Earth-like in kind. The bands are horizontal structure
+(latitude-dependent clouds and winds), which breaks assumption A4.
+
+**How the terrain/globe model handles a body without ground.** The
+**cloud-top level is the ground**: an ellipsoid of the planet's own shape
+(the 1-bar or the visible cloud-top level), no elevation, imagery from a
+global map (e.g. Hubble's OPAL maps of the giants,
+[MAST OPAL](https://archive.stsci.edu/prepds/opal/)), its albedo the
+ground's, the haze above it a layered aerosol of §4.3. Two consequences:
+
+1. **The ellipsoid must become a parameter** of the body. `tuile-core`'s
+   geodesy is WGS84 (`WGS84_A`, `WGS84_F`); a body description with its own
+   `a, f` threads through `geodetic_to_ecef` and every consumer. That is an
+   architecture change across crates, with its own reduction test (the
+   WGS84 body reproducing today's coordinates to the bit), useful well
+   beyond gas giants (the Moon, Mars as globes of their own). The
+   atmosphere side already copes: `AtmosphereFrame` lays the air on an
+   osculating sphere, which stays valid at f ≈ 0.1.
+2. **Differential rotation**: bands drift at different rates; the imagery
+   can be offset in longitude per latitude as a pure function of the
+   instant (deterministic), a texture-coordinate change in the ground
+   shader.
+
+**Cost.** From outside: the same as any preset (tables per medium, imagery
+like any globe) — every backend. The ellipsoid generalisation: no runtime
+cost, a broad code change. Descent through decks: volumetric clouds —
+excluded.
+
+**Fits one engine?** Yes from outside: a gas giant is a body with an
+ellipsoid, an imagery source and a medium; the Earth is the WGS84 body
+with today's medium. Inside: no, not without clouds.
+
+**Verdict.** As a lit disc in a moon's sky: **now**, it is PR 5. As a
+globe seen from above its cloud tops: **later**, after a "body ellipsoid
+in `tuile-core`" PR (new, slot between 4 and 5, its own reduction test on
+WGS84). Descending into it: **no** for now (clouds).
+
+### 7.5 Full spectral rendering
+
+**On screen.** Mostly subtle, sometimes decisive: the hues of deep
+twilight and the blue hour (long grazing paths through ozone's Chappuis
+band, where products of exponentials at three wavelengths drift from the
+spectral integral); Mars' butterscotch day and blue sunset (dust whose
+albedo and phase change steeply with wavelength); skies under red dwarfs
+(Rayleigh's λ⁻⁴ weighted by a spectrum falling steeply in the blue —
+§4.6); narrow absorption bands (methane on Titan and the giants); any
+Doppler shift of a non-blackbody spectrum (§7.3).
+
+**Why it matters for tuile.** Films: twilight is where tuile's films
+already spend time (doc 21's sky, sun and Moon validation film), and where
+RGB's error is largest on the Earth. Exoplanet presets: the red-dwarf
+world is the case where RGB is most suspect. Globe viewer, games: rarely
+worth the cost.
+
+**Physics and where RGB fails.** RGB is exact for anything linear in the
+light (single scattering times a light colour) and only approximate for
+products of spectra — transmittance `e^(−τ(λ))` along long paths,
+absorption bands narrower than a channel, reflectance × illuminant ×
+filter. Wilkie & Hošek 2013 used their spectral sky model to predict
+skies under other stars and found the appearance changes less than one
+might expect, with oddities in binary systems
+([PDF](https://cgg.mff.cuni.cz/projects/SkylightModelling/sccg_2013_alien_sun_preprint.pdf),
+[project](https://cgg.mff.cuni.cz/projects/SkylightModelling/)) — a useful
+prior for how much a spectral engine would change.
+
+**Known techniques.**
+
+| Technique | Where | Reference |
+|---|---|---|
+| N fixed bins (4, 8, 16) in the tables, packed four to an RGBA texture, converted to XYZ → linear sRGB at the end with CIE-weighted coefficients | real time, at N/3 the cost | Elek & Kmoch 2010, [PDF](https://cgg.mff.cuni.cz/~tomas/publications/pub-cescg-real-time-scattering/paper.pdf) |
+| Spectral precompute, RGB tables (luminance from radiance): the tables integrated over many wavelengths, stored as RGB | removes part of the error at no runtime cost; the runtime products stay RGB | Bruneton 2017, [code](https://github.com/ebruneton/precomputed_atmospheric_scattering) |
+| Spectral upsampling of RGB inputs (imagery albedo, look colours) | needed by any spectral path, since tuile's imagery is RGB | Jakob & Hanika 2019, [project](https://rgl.epfl.ch/publications/Jakob2019Spectral); Smits 1999, [doi:10.1080/10867651.1999.10487511](https://doi.org/10.1080/10867651.1999.10487511) |
+| Hero-wavelength sampling | path tracers | Wilkie et al. 2014, [doi:10.1111/cgf.12419](https://doi.org/10.1111/cgf.12419) |
+
+**Cost** (N = 8 against today's 3): tables ×2.7 (transmittance ~200 →
+~530 KB; each sky-view layer ~330 KB → ~880 KB); march ALU ~×2.7 in the
+sky-view and per fragment — the per-fragment march is what no mobile
+budget absorbs. WebGPU compute: fine for tables and sky-view; per
+fragment, a desktop-only option. WebGL2: two RGBA32F render targets per
+table, within limits, but the per-fragment cost is the same problem.
+Film/offline: fine — and Cycles, the film's other renderer, is RGB, so a
+spectral wgpu film would no longer match it (doc 19's wgpu ↔ Cycles
+coherence requirement).
+
+**Fits one engine?** Only with care. The channel count is a parameter
+whose Earth value is 3, at 680/550/440 nm, with today's coefficients and
+*no* conversion at the end (an identity, not a matrix multiply, so `x`
+stays `x`). WGSL has no generics: the shader would be generated per channel
+count, and the N = 3 instance must be today's shader text, operation for
+operation — the reduction test (§5.3) proves it, but it is the one
+generalisation where "one engine" means "one generator" and must be
+watched.
+
+**Verdict.** **Offline first**: a CPU spectral reference (beside the
+Monte-Carlo path tracer of §5.7, in PR 4) measures RGB's error per preset —
+Earth twilight, Mars, the red-dwarf world. A runtime N-bin engine is
+**later and conditional**: only if that error exceeds a threshold agreed
+beforehand (for instance ΔE2000 > 3 on a preset a film uses), as a
+**PR 8**, desktop and film only. Spectral precompute with RGB tables
+(Bruneton's luminance mode) is the cheaper intermediate and moves the
+Earth's table bits — so it would be a deliberate Earth golden change, not
+part of the reduction.
+
+### 7.6 Summary of the five
+
+| Topic | Visible? | Cost (hot path) | One engine, Earth exact? | Verdict | Slot |
+|---|---|---|---|---|---|
+| Refraction | yes: sunset time and shape, looming, red umbra | one fetch per sky pixel, a vertex MAD | yes (zero correction, `x + 0`) | ephemeris + disc **now-ish**; looming, curved tables **later**; mirages **offline** | PR 3b; PR 7 |
+| Polarisation | only through a polariser | sky-view ×3 memory, march ×1.5 | yes (no polariser, no consumer of Q, U) | **later**, film first | after PR 4 |
+| Relativity | only for fast observers and black holes | trivial (aberration); a pass (Schwarzschild) | yes (β = 0, D = 1, no lens) | aberration/Doppler and Schwarzschild **later**; Kerr **offline/no** | PR 6 |
+| Gas giants | yes: discs in moons' skies; globes from above | as any preset | yes outside; inside needs clouds | disc **now** (PR 5); globe **later**; descent **no** | PR 5; new "body ellipsoid" PR |
+| Full spectral | twilight, Mars, red dwarfs, bands | ×2.7 everything at N = 8 | yes with a generated shader whose N = 3 instance is today's | reference **offline** (PR 4); runtime **conditional** | PR 4; PR 8 |
+
+---
+
+## 8. How others do it
 
 | Engine / work | Lights | Media | Notes | Source |
 |---|---|---|---|---|
@@ -608,6 +951,8 @@ presets cover the plan without it.
 | **Universe Sandbox** | any number of stars (physics first) | simplified | simulation, not sky realism | [universesandbox.com](https://universesandbox.com/) |
 | **Collienne et al. 2013** | sun | Bruneton 2008 adapted to Mars | colours matched to rover images | [DLR elib](https://elib.dlr.de/86477) |
 | **Schneegans et al. 2024** | sun | Mie-theory phase tables per wavelength; Earth, Mars | blue Martian sunset; real-time | [CGF](https://diglib.eg.org/handle/10.1111/cgf15010) |
+| **Schneegans et al. 2025** | sun, Moon | Bruneton's model with refraction | real-time eclipses, deformed sun at the horizon | [CGF](https://diglib.eg.org/handle/10.1111/cgf70017) |
+| **Wilkie & Hošek 2013** | other stars, binaries | spectral sky model rescaled to other stars | skies of Earth-like exoplanets differ less than expected | [PDF](https://cgg.mff.cuni.cz/projects/SkylightModelling/sccg_2013_alien_sun_preprint.pdf) |
 | **Bruneton 2020** | accretion disc, stars | — | real-time Schwarzschild lensing from precomputed tables | [arXiv:2010.08735](https://arxiv.org/abs/2010.08735) |
 | **DNGR (Interstellar)** | disc, stars | — | Kerr lensing, ray bundles, offline | [arXiv:1502.03808](https://arxiv.org/abs/1502.03808) |
 
@@ -621,7 +966,7 @@ medium", not "every frame".
 
 ---
 
-## 8. Summary
+## 9. Summary
 
 - **Lights are where the generality is.** Transmittance, multiple scattering
   and irradiance tables are per unit of light and shared by every star;
@@ -638,6 +983,7 @@ medium", not "every frame".
   + 0, same order, same expressions), and the reduction is proved by table
   bytes, uniform bytes and a film digest with the atmosphere on, frozen
   before the first PR.
+- **Further questions (§7)**: refraction soon (ephemeris and disc, PR 3b), gas giants as discs now and as globes after a body-ellipsoid PR, polarisation and relativity later, spectral as an offline reference first and a runtime engine only if measured RGB error demands it; volumetric clouds stay out.
 - **Plan**: `#[non_exhaustive]` on #137's types → constants to uniforms
   (identity only) → N lights → stars as data and eclipses → media presets
   with a CPU path-tracer reference → secondary lights and rings → exotic
