@@ -1,30 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! The sky's star catalogue, as tuile keeps it, and the table its shaders
-//! read, made from it.
-//!
-//! Two steps, each a binary of this crate, each run once and its output
-//! committed:
-//!
-//! 1. `convert`: the Bright Star Catalogue, 5th Revised Edition (Hoffleit
-//!    & Warren 1991), as the CDS distributes it (catalogue V/50, fixed
-//!    columns), into `data/bright_stars.parquet` — typed columns, each
-//!    described in its field metadata, the source's URL and SHA-256 in the
-//!    file's.
-//! 2. `table`: that Parquet file into `tuile-atmosphere/src/stars.table`,
-//!    the binned texture `stars_seen` reads ([`tuile_atmosphere::stars::StarTable`]).
-//!
-//! ```text
-//! mkdir /tmp/bsc5 && cd /tmp/bsc5 && curl -O https://cdsarc.cds.unistra.fr/ftp/V/50/catalog.gz
-//! cargo run -p tuile-star-catalogue --bin convert -- /tmp/bsc5/catalog.gz \
-//!     crates/tuile-star-catalogue/data/bright_stars.parquet
-//! cargo run -p tuile-star-catalogue --bin table -- \
-//!     crates/tuile-star-catalogue/data/bright_stars.parquet crates/tuile-atmosphere/src/stars.table
-//! ```
-//!
-//! Parquet and Arrow live here and nowhere else: no renderer links this
-//! crate, and nothing of it reaches a wasm build.
+#![doc = include_str!("../README.md")]
 
 use std::path::Path;
 use std::sync::Arc;

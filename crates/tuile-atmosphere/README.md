@@ -39,6 +39,11 @@ parameters; a backend draws with them.
   ground marched over them, and a moment's [`ReferenceIllumination`]
   worked out from them. [`params`] says what the air is made of and
   which sphere it is laid on.
+- [`stars`] — the stars of the Bright Star Catalogue: each one's light
+  from its magnitude, its colour from its B−V, and the binned table
+  (`stars.table`, made by the `tuile-star-catalogue` tool) that the sky
+  reads them from. They are always drawn: the air dims them and the
+  camera decides whether they show.
 - [`tuning`] — every setting of the air as a tuning value: read from the
   environment by a native host, today's constant by default.
 - [`look`] — how a renderer draws the physical atmosphere: its
