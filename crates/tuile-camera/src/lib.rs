@@ -1131,7 +1131,10 @@ mod tests {
             ctrl.zoom(-1.0, (400.0, 300.0), vp);
             let after = ctrl.target().altitude();
             assert!(after <= max + 1e-3, "{after}");
-            assert!(after >= before - 1e-3, "a zoom out came down: {before} → {after}");
+            assert!(
+                after >= before - 1e-3,
+                "a zoom out came down: {before} → {after}"
+            );
         }
         let mut ctrl = nadir_over(0.3, 0.2, 5_000_000.0).with_max_altitude(max);
         let seen = zoom_out(&mut ctrl, 60);
@@ -1178,9 +1181,7 @@ mod tests {
         let mut ctrl = nadir_over(0.3, 0.2, 3_000_000.0);
         ctrl.set_max_altitude(500_000.0);
         assert!((ctrl.camera.altitude() - 500_000.0).abs() < 1e-3);
-        let highest = zoom_out(&mut ctrl, 50)
-            .into_iter()
-            .fold(f64::MIN, f64::max);
+        let highest = zoom_out(&mut ctrl, 50).into_iter().fold(f64::MIN, f64::max);
         assert!(highest <= 500_000.0 + 1e-3, "{highest}");
         for nonsense in [f64::NAN, -1.0, 0.0, f64::INFINITY] {
             ctrl.set_max_altitude(nonsense);
