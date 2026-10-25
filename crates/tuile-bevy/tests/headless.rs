@@ -29,6 +29,12 @@ use tuile_bevy::{local_frame, GeoAnchor, SessionState, TuileCamera};
 const ALTITUDE: f64 = 3_000.0;
 const FOVY_DEG: f64 = 35.0;
 
+/// How long a frame may take to settle, wall seconds: a bound, not a wait.
+/// A software rasterizer (lavapipe, on CI) draws a debug build at a frame or two a
+/// second, and a tile's stitch slides over twelve frames: 240 s is what
+/// it needs, and a GPU settles in seconds.
+const SETTLE_S: f64 = 240.0;
+
 /// Straight down over the map, north up the frame.
 fn camera() -> TuileCamera {
     TuileCamera::looking(LON, LAT, ALTITUDE, 0.0, 90.0, FOVY_DEG)
@@ -154,7 +160,7 @@ fn the_host_shares_the_grounds_depth_and_no_ground_is_black() {
             300.0,
             Color::srgb(0.0, 0.0, 1.0),
         );
-        let status = app.settle(60.0);
+        let status = app.settle(SETTLE_S);
         assert_eq!(status.session, SessionState::Running, "{status:?}");
         assert!(status.is_settled(), "{target:?}: never settled: {status:?}");
         let picture = app.picture();
@@ -198,4 +204,77 @@ fn the_host_shares_the_grounds_depth_and_no_ground_is_black() {
             "{target:?}: {backdrop} pixels of backdrop between tiles"
         );
     }
+}
+
+/// Settled, the ground the host reads is the ground drawn: heights from the
+/// drawn tiles at their level, the relief's to its sampling, stable while
+/// nothing changes; and the ray through the middle of the frame meets it
+/// under the camera.
+#[test]
+fn the_host_reads_the_ground_it_sees() {
+    if !support::has_gpu() {
+        eprintln!("no GPU: skipped");
+        return;
+    }
+    use support::Hill;
+    use tuile_bevy::{LonLat, TuileGround};
+    use tuile_terrain::Heights;
+    let target = Target {
+        msaa: Msaa::Off,
+        hdr: false,
+        size: 256,
+    };
+    let mut app = Headless::new(support::plugin(), camera(), target);
+    let status = app.settle(SETTLE_S);
+    assert!(status.is_settled(), "never settled: {status:?}");
+    // A frame more, so the snapshot is the settled draw's.
+    app.update();
+    let ground = app.world().resource::<TuileGround>().clone();
+    // 2 500 places over the frame's ground.
+    let places: Vec<LonLat> = (0..50)
+        .flat_map(|i| {
+            (0..50).map(move |j| {
+                LonLat::new(
+                    LON - 0.007 + 0.014 * f64::from(i) / 49.0,
+                    LAT - 0.007 + 0.014 * f64::from(j) / 49.0,
+                )
+            })
+        })
+        .collect();
+    let started = std::time::Instant::now();
+    let heights = ground.ground_heights(&places);
+    let took = started.elapsed();
+    let mut worst = 0.0f64;
+    for (place, h) in places.iter().zip(&heights) {
+        assert!(h.drawn, "{place:?} is on screen: {h:?}");
+        assert!(h.level.is_some());
+        worst = worst.max((h.height - Hill.height(place.lon, place.lat)).abs());
+    }
+    assert!(worst < 2.0, "{worst} m from the relief");
+    eprintln!(
+        "2 500 heights in {took:?}, {} tiles, worst {worst:.3} m off the relief",
+        ground.tiles()
+    );
+    // Nothing changed: the same answers, the same generations.
+    app.update();
+    let again = ground.ground_heights(&places);
+    assert_eq!(heights, again);
+
+    // The middle of the frame, straight down: under the camera.
+    let world = app.world();
+    let mut cameras = world.query::<(&Camera, &GlobalTransform)>();
+    let (camera, transform) = cameras.single(world).expect("one camera");
+    let origin = *world.resource::<tuile_bevy::FloatingOrigin>();
+    let hit = ground
+        .pick_viewport(camera, transform, &origin, Vec2::splat(128.0))
+        .expect("the ground under the camera");
+    assert!(
+        (hit.lon - LON).abs() < 1e-4 && (hit.lat - LAT).abs() < 1e-4,
+        "{hit:?}"
+    );
+    let under = ground.height_at(LonLat::new(hit.lon, hit.lat));
+    assert!(
+        (hit.height - under.height).abs() < 0.05,
+        "{hit:?} vs {under:?}"
+    );
 }

@@ -51,8 +51,10 @@ use tuile_wgpu::{
 
 use crate::budget::BACKDROP_LEVEL;
 use crate::camera::{FloatingOrigin, PreloadViews, TuileCamera};
+use crate::ground::SharedSurface;
 use crate::session::{SessionSlot, Started};
 use crate::status::{PumpFacts, SessionState, TuileLight, TuileStatus};
+use tuile_core::surface::Surface;
 
 /// The colour bare ground is painted: a deep, desaturated ocean blue, the
 /// colour most of the planet is — and never black.
@@ -103,6 +105,10 @@ struct Globe {
     session: Session,
     compression: ImageryCompression,
     status: Arc<Mutex<TuileStatus>>,
+    /// The drawn ground, as the main world reads it ([`crate::TuileGround`]),
+    /// and the snapshot last handed over.
+    ground: SharedSurface,
+    surface: Surface,
 }
 
 impl GlobeRender {
@@ -110,9 +116,13 @@ impl GlobeRender {
         slot: SessionSlot,
         compression: ImageryCompression,
         status: Arc<Mutex<TuileStatus>>,
+        ground: SharedSurface,
     ) -> Self {
         let mut pump = ContentPump::new(DVec3::ZERO);
         pump.set_backdrop_level(Some(BACKDROP_LEVEL));
+        // The decoded meshes, shared with the server's own tier, for the
+        // ground the host reads on the CPU.
+        pump.keep_contents(true);
         Self(Mutex::new(Globe {
             gpu: None,
             pump,
@@ -121,6 +131,8 @@ impl GlobeRender {
             session: Session::Starting(slot),
             compression,
             status,
+            ground,
+            surface: Surface::default(),
         }))
     }
 }
@@ -271,6 +283,8 @@ fn draw_globe(
         shell,
         targets,
         status,
+        ground,
+        surface,
         ..
     } = &mut *globe;
     let (Some(gpu), Some(shell)) = (gpu.as_ref(), shell.as_ref()) else {
@@ -365,4 +379,27 @@ fn draw_globe(
             );
         },
     );
+    // What was just drawn, for the host's ground queries: a new snapshot
+    // only when it changed.
+    let drawn: std::collections::HashSet<u64> = pump.drawn_tiles().iter().map(|t| t.0).collect();
+    let next = surface.with(
+        pump.resident_contents().map(|(t, level, content)| {
+            // The globe's tiles are terrain tiles: their extent is their
+            // grid rectangle, and nothing has to be read off the vertices.
+            let (z, x, y) = t.terrain_coord();
+            let r = tuile_terrain::GeographicTilingScheme::default()
+                .tile_rect(tuile_terrain::TileCoord::new(z, x, y));
+            tuile_core::surface::Resident {
+                key: t.0,
+                level,
+                content,
+                rect: Some([r.west, r.south, r.east, r.north]),
+            }
+        }),
+        &drawn,
+    );
+    if next.version() != surface.version() {
+        ground.publish(next.clone());
+        *surface = next;
+    }
 }

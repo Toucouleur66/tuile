@@ -128,6 +128,11 @@ pub struct ContentPump {
     /// The GPU time a frame's imagery encodes may take: see
     /// [`Self::set_encode_pace`].
     encode_pace: EncodePace,
+    /// Each resident mesh's decoded content, when kept: see
+    /// [`Self::keep_contents`].
+    contents: Option<HashMap<TileId, std::sync::Arc<tuile_core::DecodedTileContent>>>,
+    /// The meshes the last [`Self::resolve`] drew: exact, held and fallback.
+    drawn_tiles: std::collections::HashSet<TileId>,
 }
 
 /// Frames a tile takes to slide to its new edge when what is drawn beside it
@@ -173,7 +178,36 @@ impl ContentPump {
             meter: None,
             undress_wearers: Vec::new(),
             encode_pace: EncodePace::DEFAULT,
+            contents: None,
+            drawn_tiles: std::collections::HashSet::new(),
         }
+    }
+
+    /// Keeps each resident mesh's decoded content beside its GPU copy, for a
+    /// host that reads the drawn ground on the CPU (`tuile_core::surface`):
+    /// [`Self::resident_contents`]. The content is shared with the server's
+    /// decoded tier, so keeping it costs memory only once the server has let
+    /// go of its copy, and only until the mesh is evicted. Off by default.
+    pub fn keep_contents(&mut self, keep: bool) {
+        self.contents = keep.then(|| self.contents.take().unwrap_or_default());
+    }
+
+    /// Every resident mesh, its level and its decoded content, when
+    /// [`Self::keep_contents`] is on.
+    pub fn resident_contents(
+        &self,
+    ) -> impl Iterator<Item = (TileId, u32, &std::sync::Arc<tuile_core::DecodedTileContent>)> {
+        self.contents
+            .iter()
+            .flatten()
+            .filter(|(tile, _)| self.prepared.contains_key(tile))
+            .map(|(tile, content)| (*tile, self.level(*tile), content))
+    }
+
+    /// The meshes the last [`Self::resolve`] drew — exact, held and fallback
+    /// — not the backdrop behind them.
+    pub fn drawn_tiles(&self) -> &std::collections::HashSet<TileId> {
+        &self.drawn_tiles
     }
 
     /// How much GPU time a frame's imagery encodes may take, when the
@@ -552,6 +586,10 @@ impl ContentPump {
                 let tile = r.tile();
                 let prepared = prepare(gpu, content, self.render_origin);
                 let bytes = mesh_bytes(&prepared, content);
+                let kept = self
+                    .contents
+                    .is_some()
+                    .then(|| std::sync::Arc::clone(content));
                 (
                     bytes,
                     Box::new(move |pump: &mut Self| {
@@ -559,6 +597,9 @@ impl ContentPump {
                         m.meshes_by_level.inc(level);
                         m.mesh_bytes_by_level.add(level, prepared.gpu_bytes as u64);
                         pump.gpu_bytes += prepared.gpu_bytes;
+                        if let (Some(contents), Some(kept)) = (pump.contents.as_mut(), kept) {
+                            contents.insert(tile, kept);
+                        }
                         if let Some(old) = pump.prepared.insert(tile, prepared) {
                             pump.gpu_bytes -= old.gpu_bytes;
                             m.meshes_by_level.sub(level, 1);
@@ -722,6 +763,9 @@ impl ContentPump {
                     }
                     match r {
                         ResourceId::Mesh(tile) => {
+                            if let Some(contents) = self.contents.as_mut() {
+                                contents.remove(tile);
+                            }
                             if let Some(p) = self.prepared.remove(tile) {
                                 self.gpu_bytes -= p.gpu_bytes;
                                 let level = self.level(*tile);
@@ -906,6 +950,13 @@ impl ContentPump {
         m.frame_digest.set(
             tuile_core::determinism::digest(exact.iter().map(|t| t.0))
                 ^ tuile_core::determinism::digest(fallback.iter().map(|t| t.0)).rotate_left(29),
+        );
+        self.drawn_tiles.clear();
+        self.drawn_tiles.extend(
+            exact
+                .iter()
+                .chain(fallback.iter())
+                .filter(|t| self.prepared.contains_key(t)),
         );
         let surfaces = |ids: &[TileId]| -> Vec<&PreparedTile> {
             ids.iter().filter_map(|id| self.prepared.get(id)).collect()
