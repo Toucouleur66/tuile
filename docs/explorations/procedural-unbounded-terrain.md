@@ -21,7 +21,7 @@ The figures marked *(est.)* are orders of magnitude, not measurements.
 | Gradient (Perlin) noise | Random gradients on a lattice, quintic fade ([Perlin 2002]) | The workhorse. Analytic derivatives are cheap ([IQ derivatives]) |
 | Simplex / OpenSimplex | Simplex lattice, fewer corners in 3D/4D ([Gustavson]) | Worth it in 3D (sphere evaluation). In 2D, gradient noise is enough |
 | fBm | Σ octaves, frequency × lacunarity (≈2) and amplitude × gain (≈0.5) per octave ([IQ fBm]) | Each octave maps onto one quadtree level (§3.3) |
-| Ridged / billow multifractals | `1-|n|` squared, or `|n|`, with each octave's weight driven by the previous one ([Musgrave], in [Ebert et al.]) | Gives sharp crests and smooth valleys: real mountain statistics |
+| Ridged / billow multifractals | `1-\|n\|` squared, or `\|n\|`, with each octave's weight driven by the previous one ([Musgrave], in [Ebert et al.]) | Gives sharp crests and smooth valleys: real mountain statistics |
 | Derivative-damped fBm | Each octave is attenuated by the slope accumulated so far ([IQ derivatives]) | An erosion-like look at almost no cost |
 | Domain warping | `f(p + g(p))`, with g itself an fBm ([IQ warp]) | Breaks up the lattice's isotropy. It roughly doubles the cost |
 | Cellular / Worley | Distance to random feature points | Craters, plateaus, terraces, rock fields |
@@ -203,8 +203,9 @@ pub struct ProceduralImagery { /* Generator + colour rules */ }
   seam-free by construction.
 - The `Heights::mean_height(…, span)` idea, a value band-limited to what a
   vertex stands for, becomes the generator's `level` argument (§3.3).
-- `Ellipsoid` fallback, the graphics budget, the imagery pipeline with its
-  GPU-compression path: unchanged, the new sources plug into them.
+- `Ellipsoid` fallback, the graphics budget, the imagery pipeline (and its
+  GPU compression, when the client turns it on): unchanged, the new sources
+  plug into them.
 
 ### 3.2 Deterministic noise design
 
@@ -277,7 +278,8 @@ pub struct ProceduralImagery { /* Generator + colour rules */ }
 1. **A procedural imagery provider** (same interface as `TemplateProvider`):
    a 256² tile per (level, x, y), coloured from height, slope, curvature,
    altitude bands and a moisture noise. It is generated in the worker and
-   then goes through the existing GPU-compression path and budget. It works
+   then goes through the existing budget, and through GPU compression when the
+   client has chosen it. It works
    unchanged for the film, USD and Hydra. Over real imagery, the same rules
    only modulate the satellite colour (detail variation), never replace it.
 2. **Later, close-range shading** in the ground shader: a small texture array
@@ -326,8 +328,8 @@ Each PR comes with its test written first and seen to fail. Each runs
    `heightfield-serve` or `HeightfieldSource`.
 4. **`Detailed<Host>`**: bicubic host + high-pass + masks. Faithfulness test
    on a real DEM fixture.
-5. **`ProceduralImagery`** in the same crate (CPU worker), plugged into compression and
-   the budget. Render it and open the film.
+5. **`ProceduralImagery`** in the same crate (CPU worker), plugged into the
+   budget and, when the client turns it on, compression. Render it and open the film.
 6. **Erosion-like octaves** (derivative damping, then a point-evaluable gully
    filter, written in-house). Visual check against a baked Gaea/World Machine
    host.
