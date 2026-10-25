@@ -16,3 +16,15 @@ bevy = { version = "0.20.0", default-features = false, features = ["std", "bevy_
 tuile-core = { version = "0.14.0", path = "../../crates/tuile-core" }
 tuile-bevy = { version = "0.14.0", path = "../../crates/tuile-bevy" }
 url = { workspace = true }
+
+# A page: the JS bindings, and the page's address the options are read from.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3.76"
+wasm-bindgen = "0.2.99"
+web-sys = { version = "0.3.76", features = ["Location", "Window"] }
+
+# Which browser API the page draws with: one build each, as Bevy compiles its
+# shaders for one or the other (`web/build.sh`).
+[features]
+webgpu = ["bevy/webgpu"]
+webgl2 = ["bevy/webgl2"]

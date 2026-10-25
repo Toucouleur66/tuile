@@ -34,7 +34,7 @@ futures here never claim otherwise, and the server is driven by
 made faster by pretending: a worker has one thread, and parallelism comes
 from running several workers, not from a scheduler inside one.
 
-# Three pieces
+# Four pieces
 
 - `WebFetcher` and `WebIonHttp`: the engine's two fetch seams over the
   global `fetch`, the counterpart of `tuile-native-fetchers` — each
@@ -47,6 +47,8 @@ from running several workers, not from a scheduler inside one.
   in-process channels and the WebSocket — a
   [`GeometryStream`](tuile_core::protocol::GeometryStream) on the page whose
   server runs in a worker.
+- `decode` (and the pool's bookkeeping, [`schedule`]): Web Workers that
+  decode for the thread the geometry server runs on, buffers transferred.
 
 None of it knows what draws the tiles, or why.
 

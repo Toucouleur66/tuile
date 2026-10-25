@@ -1,0 +1,34 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+<!-- Copyright (c) lapoule.dev -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>tuile-bevy-viewer</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+    #bevy { display: block; width: 100%; height: 100%; outline: none; }
+  </style>
+</head>
+<body>
+  <canvas id="bevy"></canvas>
+  <script type="module">
+    // `?backend=webgl2` loads the WebGL2 build; WebGPU otherwise. Every
+    // other parameter is the application's own (see src/main.rs).
+    const backend = new URLSearchParams(location.search).get("backend") === "webgl2"
+      ? "webgl2" : "webgpu";
+    const { default: init } = await import(`./pkg/${backend}/tuile_bevy_viewer.js`);
+    try {
+      await init();
+    } catch (e) {
+      // Bevy's event loop on the web returns by throwing; anything else is
+      // a failure worth saying.
+      if (!String(e?.message ?? e).includes("Using exceptions for control flow")) {
+        console.error(e);
+        window.tuileStatus = `Failed ${e}`;
+      }
+    }
+  </script>
+</body>
+</html>

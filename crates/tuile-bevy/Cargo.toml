@@ -32,6 +32,16 @@ tokio = { workspace = true, features = ["rt-multi-thread"] }
 tuile-core = { version = "0.14.0", path = "../tuile-core", features = ["rt-tokio"] }
 tuile-native-fetchers = { version = "0.14.0", path = "../tuile-native-fetchers" }
 
+# A page: fetch for the sources, the decode workers of tuile's web viewer,
+# and the server as a future on the page's thread.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3.76"
+tuile-web = { version = "0.14.0", path = "../tuile-web" }
+wasm-bindgen = "0.2.99"
+wasm-bindgen-futures = "0.4.49"
+web-sys = { version = "0.3.76", features = ["Window", "Worker", "WorkerOptions", "WorkerType"] }
+web-time = { workspace = true }
+
 [dev-dependencies]
 # The tests' host: meshes and unlit materials of its own, drawn in the same
 # frame as the globe.

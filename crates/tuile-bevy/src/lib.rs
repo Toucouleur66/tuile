@@ -46,6 +46,20 @@
 //!   chooses whether imagery is held compressed
 //!   ([`ImageryCompression`], off unless asked).
 //!
+//! # In a browser
+//!
+//! The same plugin, on WebGPU or WebGL2 (one Bevy build each). The session
+//! runs on the page's thread and decodes in tuile's web decode workers: see
+//! [`web`] for the three things the page does. On WebGL2 a camera draws
+//! single-sampled (`Msaa::Off`): it can neither read a multisampled depth nor
+//! shade per sample, which sharing a stencil-less depth needs.
+//!
+//! # Logging
+//!
+//! The engine traces every tile decision under the target `tuile_det`, at
+//! `info`, for determinism checks. A host's console wants
+//! `tuile_det=off` in its `LogPlugin` filter.
+//!
 //! The camera's depth must be bindable for the ground to share it; the plugin
 //! adds `TEXTURE_BINDING` to a [`TuileCamera`]'s `Camera3d` itself. Its
 //! perspective's `far` is the host's frustum culling distance for its own
@@ -57,6 +71,8 @@ mod render;
 mod session;
 pub mod sources;
 mod status;
+#[cfg(target_arch = "wasm32")]
+pub mod web;
 
 use std::sync::Arc;
 
@@ -83,6 +99,10 @@ pub struct TuilePlugin {
     /// asks. Resolved against the device; a format the device cannot sample
     /// falls back to RGBA8.
     pub compression: ImageryCompression,
+    /// In a browser, the module worker script the decode workers are made
+    /// from ([`web`]); `None` decodes on the page's thread. Ignored
+    /// elsewhere, where decoding has threads of its own.
+    pub decode_workers: Option<String>,
 }
 
 impl TuilePlugin {
@@ -93,7 +113,16 @@ impl TuilePlugin {
             sources,
             budget: TuileBudget::default(),
             compression: ImageryCompression::Off,
+            decode_workers: None,
         }
+    }
+
+    /// In a browser, decode in workers made from the module worker script at
+    /// `script`, relative to the page ([`web`]).
+    #[must_use]
+    pub fn with_decode_workers(mut self, script: impl Into<String>) -> Self {
+        self.decode_workers = Some(script.into());
+        self
     }
 
     #[must_use]
@@ -138,6 +167,7 @@ impl Plugin for TuilePlugin {
             budget: self.budget.clone(),
             compression: self.compression,
             caps,
+            decode_workers: self.decode_workers.clone(),
         };
         let slot = start(app, plan, &shared);
         render::add_to(
@@ -171,6 +201,19 @@ fn start(
             session::SessionSlot::default()
         }
     }
+}
+
+/// Starts the session as a future on the page's thread.
+#[cfg(target_arch = "wasm32")]
+fn start(
+    _app: &mut App,
+    plan: session::Plan,
+    _shared: &status::SharedStatus,
+) -> session::SessionSlot {
+    if let Some(script) = &plan.decode_workers {
+        web::start_decode_workers(script, None);
+    }
+    session::launch(plan)
 }
 
 /// Keeps the plugin's runtime alive for the application's life.

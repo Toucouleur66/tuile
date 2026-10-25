@@ -150,12 +150,21 @@ pub(crate) struct Resolved {
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) type Http = tuile_native_fetchers::NativeHttp;
 
+#[cfg(target_arch = "wasm32")]
+pub(crate) type Http = tuile_web::WebFetcher;
+
 #[cfg(not(target_arch = "wasm32"))]
 async fn http() -> Result<Arc<Http>, String> {
     Http::shared()
         .await
         .map(Arc::new)
         .map_err(|e| format!("the HTTP client: {e}"))
+}
+
+/// The page's `fetch`: nothing to open.
+#[cfg(target_arch = "wasm32")]
+async fn http() -> Result<Arc<Http>, String> {
+    Ok(Arc::new(tuile_web::WebFetcher))
 }
 
 impl GlobeSources {

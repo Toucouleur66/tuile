@@ -19,6 +19,8 @@ glam = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
+# The decode pool's timings: `performance.now()` in a browser.
+web-time = { workspace = true }
 
 tuile-core = { version = "0.14.0", path = "../tuile-core" }
 tuile-cesium-ion = { version = "0.14.0", path = "../tuile-cesium-ion" }
@@ -38,8 +40,10 @@ features = [
     "AbortController",
     "AbortSignal",
     "DedicatedWorkerGlobalScope",
+    "Event",
     "Headers",
     "MessageEvent",
+    "Navigator",
     "Request",
     "RequestInit",
     "RequestMode",
@@ -47,5 +51,6 @@ features = [
     "Window",
     "Worker",
     "WorkerGlobalScope",
+    "WorkerNavigator",
 ]
 
