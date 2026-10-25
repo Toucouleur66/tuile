@@ -39,6 +39,11 @@ parameters; a backend draws with them.
   which sphere it is laid on.
 - [`tuning`] — every setting of the air as a tuning value: read from the
   environment by a native host, today's constant by default.
+- [`look`] — how a renderer draws the physical atmosphere: its
+  calibration, exposure, grade, discs and march ([`SkyLook`]).
+- `gpu` (feature `wgpu`) — the tables, the sky-view and the uniform on
+  a GPU, and the WGSL that draws the sky and the lit ground with them:
+  the one implementation a film's renderer and the viewer's share.
 - [`sky`] — the air with nothing behind it but space. A colour of its own,
   drawn as a shell, turning over from blue through orange to dark with the
   hour.

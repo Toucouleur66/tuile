@@ -11,7 +11,7 @@ authors.workspace = true
 bytemuck = { workspace = true }
 glam = { workspace = true }
 thiserror = { workspace = true }
-tuile-atmosphere = { version = "0.14.0", path = "../tuile-atmosphere" }
+tuile-atmosphere = { version = "0.14.0", path = "../tuile-atmosphere", features = ["wgpu"] }
 # The stitching's band and the strips of a tile that has none.
 tuile-core = { version = "0.14.0", path = "../tuile-core" }
 tuile-film = { version = "0.14.0", path = "../tuile-film" }

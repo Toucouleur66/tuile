@@ -4,8 +4,11 @@
 #![doc = include_str!("../README.md")]
 
 pub mod aerial;
+#[cfg(feature = "wgpu")]
+pub mod gpu;
 pub mod hillaire;
 pub mod illumination;
+pub mod look;
 pub mod moon;
 pub mod params;
 pub mod sky;
@@ -20,6 +23,7 @@ pub use illumination::{
     shown_ev, CameraResponse, Moonlight, ReferenceIllumination, DAYLIGHT_EV100, EXPOSURE_FOLLOWS,
     NIGHT_DEPTH_EV,
 };
+pub use look::SkyLook;
 pub use moon::{celestial_to_ecef, moon_irradiance, Moon, MoonSeen};
 pub use params::{AtmosphereFrame, AtmosphereParams};
 pub use sky::SkyShell;

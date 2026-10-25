@@ -7789,6 +7789,7 @@ dependencies = [
  "glam 0.33.2",
  "solar-positioning",
  "tuile-core",
+ "wgpu",
 ]
 
 [[package]]

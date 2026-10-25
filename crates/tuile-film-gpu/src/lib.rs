@@ -17,7 +17,7 @@ use tuile_film::{
 use tuile_overlay::gpu::OverlayVertex;
 use wgpu::util::DeviceExt;
 
-pub use atmosphere::AtmosphereUniform;
+pub use atmosphere::{sky_look, AtmosphereUniform};
 pub use frame::{shadow_reach, FrameUniform, SunView, TileFrame};
 
 /// How many tiles may be resident at once. Fixed because the scan that bins
@@ -339,6 +339,9 @@ pub struct FilmGpu {
     lit: Look,
     /// The physical atmosphere's tables, uniform and sky-view.
     atmosphere: atmosphere::AtmosphereGpu,
+    /// What the frame's light under the physical atmosphere was worked out
+    /// from.
+    light_key: Option<atmosphere::LightKey>,
     /// Whether night lights were given ([`Self::set_night_lights`]).
     night_lights: bool,
 }
@@ -1057,9 +1060,10 @@ impl FilmGpu {
             &device,
             "film resolve",
             &format!(
-                "{}{}{}{}{}",
+                "{}{}\n{}{}{}{}",
                 atmosphere::declarations(3),
                 tuile_atmosphere::hillaire::WGSL,
+                tuile_atmosphere::gpu::SEEN_WGSL,
                 include_str!("shaders/air.wgsl"),
                 include_str!("shaders/sunlit.wgsl"),
                 include_str!("shaders/resolve.wgsl")
@@ -1079,9 +1083,10 @@ impl FilmGpu {
             &device,
             "film present",
             &format!(
-                "{}{}{}{}",
+                "{}{}\n{}{}{}",
                 atmosphere::declarations(1),
                 tuile_atmosphere::hillaire::WGSL,
+                tuile_atmosphere::gpu::SEEN_WGSL,
                 include_str!("shaders/air.wgsl"),
                 include_str!("shaders/present.wgsl")
             ),
@@ -1328,7 +1333,11 @@ impl FilmGpu {
             &shadow_sampler,
         );
 
-        let atmosphere = atmosphere::AtmosphereGpu::new(&device, &atmosphere_bgl);
+        let atmosphere = atmosphere::AtmosphereGpu::new(
+            &device,
+            &atmosphere_bgl,
+            atmosphere::SkyViewPass::Compute,
+        );
         queue.write_buffer(
             &atmosphere.uniform,
             0,
@@ -1339,6 +1348,7 @@ impl FilmGpu {
             light: FrameLight::of(&settings.look),
             lit: settings.look,
             atmosphere,
+            light_key: None,
             night_lights: false,
             device,
             queue,
@@ -1661,7 +1671,7 @@ impl FilmGpu {
             .set_night_lights(&self.device, &self.queue, width, height, luma);
         self.night_lights = true;
         // The next frame's light is worked out again, with the lights on.
-        self.atmosphere.key = None;
+        self.light_key = None;
     }
 
     pub fn set_light(&mut self, light: FrameLight) {
@@ -2763,7 +2773,7 @@ impl FilmGpu {
             instant: light.instant,
             compensation_ev: light.illumination.compensation_ev,
         };
-        if self.atmosphere.key == Some(key) {
+        if self.light_key == Some(key) {
             return Ok(());
         }
         self.atmosphere.hold(&self.queue, params);
@@ -2811,7 +2821,7 @@ impl FilmGpu {
             frame.eye,
             self.lit.exposure_scale(),
             stars,
-            &self.lit,
+            &atmosphere::sky_look(&base),
         );
         self.atmosphere.frame_uniform.earth[3] = f32::from(u8::from(self.night_lights));
         // Written now for the sky-view, placed from each eye when drawn.
@@ -2821,7 +2831,7 @@ impl FilmGpu {
             bytemuck::bytes_of(&self.atmosphere.frame_uniform.seen_from(&sky, frame.eye)),
         );
         self.atmosphere.light = Some(sky);
-        self.atmosphere.key = Some(key);
+        self.light_key = Some(key);
         self.atmosphere.sky_view_stale = true;
         Ok(())
     }
