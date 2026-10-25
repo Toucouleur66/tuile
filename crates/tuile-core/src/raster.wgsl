@@ -31,13 +31,28 @@ fn blend_layer(
     coverage: vec4f,
     placement: vec4f,
 ) -> vec4f {
-    let above = step(coverage.xy, uv);
-    let below = step(uv, coverage.zw);
+    // The fragment is the tile's, so its place is in the tile's own uv
+    // square, edges included, whatever the rasteriser hands over.
+    //
+    // Under multisampling it hands over something else along every edge. A
+    // pixel the triangle covers only in part still runs one fragment, its
+    // inputs interpolated at the pixel's *centre* — and that centre lies
+    // outside the triangle, so the uv arrives extrapolated past 0 or 1 by up
+    // to half a pixel's footprint: a thousandth of a tile seen from a
+    // kilometre, far more towards the horizon, ten times and more what
+    // `EDGE_REACH` was sized for (an interpolation ULP). Every mask answered
+    // zero together and the samples that pixel covered took the bare base
+    // colour: a dotted light hairline along every tile edge, the same on
+    // every backend. Clamped, the fragment is back on the edge it belongs to,
+    // where the layers that reach it meet; inside the tile nothing changes.
+    let inside = clamp(uv, vec2f(0.0), vec2f(1.0));
+    let above = step(coverage.xy, inside);
+    let below = step(inside, coverage.zw);
     let mask = above.x * above.y * below.x * below.y;
     // Outside the coverage rectangle this reads past the layer's own edge and
     // the clamping sampler smears it — which never shows, because that is
     // exactly where the mask is zero.
-    let texel = textureSample(tex, samp, uv * placement.zw + placement.xy);
+    let texel = textureSample(tex, samp, inside * placement.zw + placement.xy);
     // `w` accumulates how many layers actually covered this fragment. It costs
     // one add and it is the only way to tell, at a pixel, "no imagery reached
     // here" from "imagery reached here and is dark" — the two look identical
