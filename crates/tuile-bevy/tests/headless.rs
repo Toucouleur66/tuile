@@ -30,8 +30,9 @@ const ALTITUDE: f64 = 3_000.0;
 const FOVY_DEG: f64 = 35.0;
 
 /// How long a frame may take to settle, wall seconds: a bound, not a wait.
-/// A software rasterizer in CI draws a debug build at a frame or two a
-/// second, and a tile's stitch slides over twelve frames.
+/// A software rasterizer (lavapipe, on CI) draws a debug build at a frame or two a
+/// second, and a tile's stitch slides over twelve frames: 240 s is what
+/// it needs, and a GPU settles in seconds.
 const SETTLE_S: f64 = 240.0;
 
 /// Straight down over the map, north up the frame.
