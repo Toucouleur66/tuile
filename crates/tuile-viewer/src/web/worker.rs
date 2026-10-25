@@ -53,12 +53,12 @@ pub fn run_worker(make_decode_worker: Option<js_sys::Function>) {
                     // is listened for until the session decides who listens.
                     scope().set_onmessage(None);
                     if let Some(make) = make_decode_worker.clone() {
-                        let count = super::schedule::pool_size(
+                        let count = tuile_web::schedule::pool_size(
                             decode_workers,
-                            super::decode::hardware_concurrency(),
+                            tuile_web::decode::hardware_concurrency(),
                         );
                         if count > 0 {
-                            super::decode::start(make, count);
+                            tuile_web::decode::start(make, count);
                         }
                     }
                     wasm_bindgen_futures::spawn_local(async move {
@@ -94,7 +94,7 @@ async fn start(
         &terrain,
         &layers,
         opening,
-        Arc::new(super::decode::WebDecode),
+        Arc::new(tuile_web::decode::WebDecode),
         // The page's device's: what tiles stored compressed become.
         imagery.stored(),
     )
@@ -128,7 +128,7 @@ async fn start(
         .with_clock(clock());
     // The decode pool takes its jobs in the order the budget ranks the loads
     // waiting on them.
-    super::decode::follow(server.load_ranks());
+    tuile_web::decode::follow(server.load_ranks());
     wasm_bindgen_futures::spawn_local(async move {
         server.run().await;
         tracing::info!("the geometry server has stopped");

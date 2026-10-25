@@ -30,6 +30,11 @@
 //! --gpu-mib N                the globe's GPU budget
 //! --screenshot PATH          once the globe has settled, save the window and quit
 //! ```
+//!
+//! In a browser (`web/build.sh`, then `web/check.py` for the headless run)
+//! the same options are the page's query —
+//! `?lon=10&range=3000&hdr` — and the page's `window.tuileStatus` says how
+//! the globe stands, for a test driving it.
 
 use bevy::camera::Hdr;
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit};
@@ -68,18 +73,57 @@ fn number(flag: &str, value: Option<String>) -> Result<f64, String> {
         .map_err(|e| format!("{flag}: {e}"))
 }
 
+/// The command line's words — or, on a page, the query's: `?a=1&b` reads
+/// as `--a 1 --b`.
+fn words() -> Vec<String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::env::args().skip(1).collect()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let search = web_sys::window()
+            .and_then(|w| w.location().search().ok())
+            .unwrap_or_default();
+        let mut words = Vec::new();
+        for pair in search.trim_start_matches('?').split('&') {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            // The page's own, not the application's.
+            if key.is_empty() || key == "backend" {
+                continue;
+            }
+            words.push(format!("--{key}"));
+            if !value.is_empty() {
+                words.push(
+                    js_sys::decode_uri_component(value)
+                        .ok()
+                        .and_then(|v| v.as_string())
+                        .unwrap_or_else(|| value.to_owned()),
+                );
+            }
+        }
+        words
+    }
+}
+
 fn options() -> Result<Options, String> {
     let mut terrain = DEFAULT_TERRAIN.to_owned();
     let mut template = DEFAULT_IMAGERY.to_owned();
     let mut geographic = true;
     let mut max_level = Some(15);
     let mut view = Orbit::default();
-    let mut msaa = Msaa::Sample4;
+    // WebGL2 can neither read a multisampled depth nor shade per sample: a
+    // host whose depth has no stencil draws single-sampled there.
+    let mut msaa = if cfg!(feature = "webgl2") {
+        Msaa::Off
+    } else {
+        Msaa::Sample4
+    };
     let mut hdr = false;
     let mut compression = ImageryCompression::Off;
     let mut gpu_mib = None;
     let mut screenshot = None;
-    let mut args = std::env::args().skip(1);
+    let mut args = words().into_iter();
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--terrain-url" => terrain = args.next().ok_or("--terrain-url needs a URL")?,
@@ -147,6 +191,14 @@ fn options() -> Result<Options, String> {
 }
 
 fn main() {
+    #[cfg(target_arch = "wasm32")]
+    {
+        // The decode workers instantiate this very module, and the bindings
+        // call `main` there too.
+        if tuile_bevy::web::is_decode_worker() {
+            return;
+        }
+    }
     let options = match options() {
         Ok(options) => options,
         Err(why) => {
@@ -163,25 +215,45 @@ fn main() {
         options.imagery.clone(),
     ))
     .with_budget(budget)
-    .with_compression(options.compression);
-    App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "tuile-bevy-viewer".into(),
-                resolution: (1280, 720).into(),
+    .with_compression(options.compression)
+    // In a browser, the decode workers this page ships (`web/`), loading the
+    // same build as the page.
+    .with_decode_workers(if cfg!(feature = "webgl2") {
+        "./decode-worker.js?pkg=webgl2"
+    } else {
+        "./decode-worker.js?pkg=webgpu"
+    });
+    let mut app = App::new();
+    app.add_plugins(
+        DefaultPlugins
+            .set(bevy::log::LogPlugin {
+                // The engine's determinism trace (`tuile_det`), one line per
+                // tile decision: a file's business, never a console's.
+                filter: format!("{},tuile_det=off", bevy::log::DEFAULT_FILTER),
+                ..default()
+            })
+            .set(WindowPlugin {
+                primary_window: Some(Window {
+                    title: "tuile-bevy-viewer".into(),
+                    resolution: (1280, 720).into(),
+                    canvas: Some("#bevy".into()),
+                    fit_canvas_to_parent: true,
+                    ..default()
+                }),
                 ..default()
             }),
-            ..default()
-        }))
-        .add_plugins(globe)
-        .insert_resource(options.view)
-        .insert_resource(options)
-        .add_systems(Startup, setup)
-        .add_systems(
-            Update,
-            (steer, aim, report, screenshot_when_settled).chain(),
-        )
-        .run();
+    )
+    .add_plugins(globe)
+    .insert_resource(options.view)
+    .insert_resource(options)
+    .add_systems(Startup, setup)
+    .add_systems(
+        Update,
+        (steer, aim, report, screenshot_when_settled).chain(),
+    );
+    #[cfg(target_arch = "wasm32")]
+    app.add_systems(Update, publish);
+    app.run();
 }
 
 /// The orbit camera's state: what it looks at, from how far, from where.
@@ -344,6 +416,24 @@ fn report(status: Res<TuileStatus>, mut last: Local<Option<(bool, usize)>>) {
         );
         *last = Some(now);
     }
+}
+
+/// The globe's state where a page's test can read it: `window.tuileStatus`.
+#[cfg(target_arch = "wasm32")]
+fn publish(status: Res<TuileStatus>) {
+    if !status.is_changed() {
+        return;
+    }
+    let line = format!(
+        "{:?} settled={} exact={} coarser={} lost={} mib={:.0}",
+        status.session,
+        status.is_settled(),
+        status.exact,
+        status.coarser,
+        status.lost,
+        status.gpu_bytes as f64 / 1_048_576.0
+    );
+    let _ = js_sys::Reflect::set(&js_sys::global(), &"tuileStatus".into(), &line.into());
 }
 
 /// With `--screenshot`, the window once the globe has settled, then quit.

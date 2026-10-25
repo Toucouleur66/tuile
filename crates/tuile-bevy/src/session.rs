@@ -52,6 +52,9 @@ pub(crate) struct Plan {
     pub compression: ImageryCompression,
     /// What the adapter can sample, for imagery stored already compressed.
     pub caps: GpuTextureCaps,
+    /// The decode workers' script, in a browser.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub decode_workers: Option<String>,
 }
 
 /// The runtime the loads, the network and the server run on: the plugin's
@@ -102,12 +105,19 @@ pub(crate) fn launch(runtime: &tokio::runtime::Handle, plan: Plan) -> SessionSlo
     slot
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-async fn bring_up(plan: Plan, runtime: tokio::runtime::Handle) -> Result<Started, String> {
+/// The globe crossed from its sources and its geometry server, not yet
+/// running.
+struct Assembled {
+    stream: InProcessStream,
+    server: tuile_core::runtime::GeometryServer,
+    started: Box<dyn FnOnce(InProcessStream) -> Started + Send>,
+}
+
+async fn assemble(
+    plan: Plan,
+    decode: Arc<dyn tuile_core::offload::Offload>,
+) -> Result<Assembled, String> {
     let resolved = plan.sources.resolve().await?;
-    let decode = Arc::new(tuile_core::offload::ThreadPool::with_threads(
-        plan.budget.decode_threads.max(1),
-    ));
     let layer_budget = LayerBudget::default();
     let options = GlobeOptions {
         imagery_slots: layer_budget.clone(),
@@ -130,6 +140,28 @@ async fn bring_up(plan: Plan, runtime: tokio::runtime::Handle) -> Result<Started
         plan.budget.config(),
     )
     .map_err(|e| format!("the graphics budget cannot run: {e}"))?;
+    Ok(Assembled {
+        stream,
+        server,
+        started: Box::new(move |stream| Started {
+            stream,
+            heights,
+            layer_budget,
+            plan: imagery_plan,
+        }),
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn bring_up(plan: Plan, runtime: tokio::runtime::Handle) -> Result<Started, String> {
+    let decode = Arc::new(tuile_core::offload::ThreadPool::with_threads(
+        plan.budget.decode_threads.max(1),
+    ));
+    let Assembled {
+        stream,
+        server,
+        started,
+    } = assemble(plan, decode).await?;
     let server = server.with_spawn(tuile_core::runtime::Spawn::Tokio(runtime.clone()));
     // Its own thread, blocking on the runtime: the session is one long
     // future the frame talks to over channels. It ends when the stream is
@@ -138,10 +170,43 @@ async fn bring_up(plan: Plan, runtime: tokio::runtime::Handle) -> Result<Started
         .name("tuile-geometry-server".into())
         .spawn(move || runtime.block_on(server.run()))
         .map_err(|e| format!("the geometry server could not start: {e}"))?;
-    Ok(Started {
+    Ok(started(stream))
+}
+
+/// Starts the launch on the page's thread and returns at once.
+///
+/// A page has one thread for the application: the geometry server runs on it
+/// as a future among the others, handing the page its turn after every burst
+/// of work, and the decoding goes to the decode workers when the host started
+/// them ([`crate::web::start_decode_workers`]), here otherwise.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn launch(plan: Plan) -> SessionSlot {
+    let slot = SessionSlot::default();
+    let out = slot.clone();
+    wasm_bindgen_futures::spawn_local(async move {
+        let outcome = bring_up(plan).await;
+        if let Err(why) = &outcome {
+            tracing::error!("the globe's session did not start: {why}");
+        }
+        out.put(outcome);
+    });
+    slot
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn bring_up(plan: Plan) -> Result<Started, String> {
+    let Assembled {
         stream,
-        heights,
-        layer_budget,
-        plan: imagery_plan,
-    })
+        server,
+        started,
+    } = assemble(plan, Arc::new(tuile_web::decode::WebDecode)).await?;
+    let server = server
+        .with_breather(1, Arc::new(crate::web::breathe))
+        .with_clock(crate::web::clock());
+    tuile_web::decode::follow(server.load_ranks());
+    wasm_bindgen_futures::spawn_local(async move {
+        server.run().await;
+        tracing::info!("the geometry server has stopped");
+    });
+    Ok(started(stream))
 }

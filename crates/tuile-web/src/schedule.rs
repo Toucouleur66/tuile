@@ -16,13 +16,13 @@ use std::collections::VecDeque;
 
 /// The most decode workers a page starts when it does not say: past four, a
 /// browser's pages and its GPU process want the cores more than the decoder.
-pub(crate) const DEFAULT_MOST: u32 = 4;
+pub const DEFAULT_MOST: u32 = 4;
 
 /// How many decode workers to start: one per core the browser reports, less
 /// the one the geometry server runs on, at least one, and at most `most` (the
 /// page's `decodeWorkers`, [`DEFAULT_MOST`] unless said). `most` of 0 starts
 /// none, and decoding stays on the server's thread.
-pub(crate) fn pool_size(most: Option<u32>, hardware: Option<f64>) -> usize {
+pub fn pool_size(most: Option<u32>, hardware: Option<f64>) -> usize {
     let most = most.unwrap_or(DEFAULT_MOST) as usize;
     // A browser that hides its core count is treated as a small machine.
     let cores = hardware
@@ -32,7 +32,7 @@ pub(crate) fn pool_size(most: Option<u32>, hardware: Option<f64>) -> usize {
 }
 
 /// What the queue needs to know of a job.
-pub(crate) trait Queued {
+pub trait Queued {
     /// Whether anyone still waits for it.
     fn wanted(&self) -> bool;
     /// Where the load waiting on it stands in the budget's order, 0 first;
@@ -55,14 +55,14 @@ enum Worker {
 
 /// A job, and the worker it goes to.
 #[derive(Debug)]
-pub(crate) struct Dispatch<J> {
+pub struct Dispatch<J> {
     pub worker: usize,
     pub job: J,
 }
 
 /// The workers' states and the jobs waiting for one.
 #[derive(Debug)]
-pub(crate) struct Scheduler<J> {
+pub struct Scheduler<J> {
     workers: Vec<Worker>,
     queue: VecDeque<J>,
     /// The longest the queue has been: the number to watch.
@@ -73,7 +73,7 @@ pub(crate) struct Scheduler<J> {
 
 impl<J: Queued> Scheduler<J> {
     /// `workers` workers, all starting.
-    pub(crate) fn new(workers: usize) -> Self {
+    pub fn new(workers: usize) -> Self {
         Self {
             workers: vec![Worker::Starting; workers],
             queue: VecDeque::new(),
@@ -83,25 +83,25 @@ impl<J: Queued> Scheduler<J> {
     }
 
     /// Whether any worker is, or may yet be, able to take a job.
-    pub(crate) fn alive(&self) -> bool {
+    pub fn alive(&self) -> bool {
         self.workers.iter().any(|w| *w != Worker::Lost)
     }
 
-    pub(crate) fn queued(&self) -> usize {
+    pub fn queued(&self) -> usize {
         self.queue.len()
     }
 
-    pub(crate) fn peak(&self) -> usize {
+    pub fn peak(&self) -> usize {
         self.peak
     }
 
-    pub(crate) fn dropped(&self) -> u64 {
+    pub fn dropped(&self) -> u64 {
         self.dropped
     }
 
     /// Takes a job: to an idle worker at once, else to the back of the queue.
     /// Handed back when no worker can ever take it.
-    pub(crate) fn submit(&mut self, job: J) -> Result<Option<Dispatch<J>>, J> {
+    pub fn submit(&mut self, job: J) -> Result<Option<Dispatch<J>>, J> {
         if !self.alive() {
             return Err(job);
         }
@@ -115,7 +115,7 @@ impl<J: Queued> Scheduler<J> {
     }
 
     /// `worker` has loaded and can take work: the next job, if one waits.
-    pub(crate) fn ready(&mut self, worker: usize) -> Option<Dispatch<J>> {
+    pub fn ready(&mut self, worker: usize) -> Option<Dispatch<J>> {
         match self.workers.get(worker) {
             Some(Worker::Starting) => self.next_for(worker),
             _ => None,
@@ -123,7 +123,7 @@ impl<J: Queued> Scheduler<J> {
     }
 
     /// `worker` has answered its job: the next one, if one waits.
-    pub(crate) fn finished(&mut self, worker: usize) -> Option<Dispatch<J>> {
+    pub fn finished(&mut self, worker: usize) -> Option<Dispatch<J>> {
         match self.workers.get(worker) {
             Some(Worker::Busy) => self.next_for(worker),
             _ => None,
@@ -132,7 +132,7 @@ impl<J: Queued> Scheduler<J> {
 
     /// `worker` has failed. When it was the last that could work, every job
     /// still queued is handed back, for its caller to run itself.
-    pub(crate) fn lost(&mut self, worker: usize) -> Vec<J> {
+    pub fn lost(&mut self, worker: usize) -> Vec<J> {
         if let Some(state) = self.workers.get_mut(worker) {
             *state = Worker::Lost;
         }
@@ -145,14 +145,14 @@ impl<J: Queued> Scheduler<J> {
 
     /// `worker` is loading again — a replacement for one that failed. Any
     /// job it was running is its caller's to fail.
-    pub(crate) fn restarted(&mut self, worker: usize) {
+    pub fn restarted(&mut self, worker: usize) {
         if let Some(state) = self.workers.get_mut(worker) {
             *state = Worker::Starting;
         }
     }
 
     /// Whether `worker` is still loading.
-    pub(crate) fn starting(&self, worker: usize) -> bool {
+    pub fn starting(&self, worker: usize) -> bool {
         self.workers.get(worker) == Some(&Worker::Starting)
     }
 

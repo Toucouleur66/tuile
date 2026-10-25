@@ -28,7 +28,7 @@ pub(crate) enum ToWorker {
         opening: usize,
         profile: ProfileChoice,
         device_memory: Option<f64>,
-        /// The most decode workers to start: see `schedule::pool_size`.
+        /// The most decode workers to start: see `tuile_web::schedule::pool_size`.
         #[serde(default)]
         decode_workers: Option<u32>,
         /// How the page's device holds imagery: the plans the loader decodes
