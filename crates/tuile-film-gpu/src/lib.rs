@@ -2812,9 +2812,13 @@ impl FilmGpu {
         let mut lit = FrameLight::new(sky.illumination, light.air);
         lit.instant = light.instant;
         self.lit = base.lit_by(lit);
-        let stars = light
-            .instant
-            .map(|t| tuile_atmosphere::celestial_to_ecef(t).transpose());
+        // The stars of the instant, or — a film that states none — of
+        // J2000: always there, the air and the camera deciding whether they
+        // show.
+        let stars = tuile_atmosphere::stars::j2000_to_ecef(
+            light.instant.unwrap_or(tuile_atmosphere::stars::J2000_UNIX),
+        )
+        .transpose();
         self.atmosphere.frame_uniform = AtmosphereUniform::new(
             &params,
             &sky,

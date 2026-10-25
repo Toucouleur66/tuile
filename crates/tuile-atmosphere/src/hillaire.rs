@@ -50,7 +50,8 @@ pub fn wgsl_bindings(group: u32) -> String {
          @group({group}) @binding(4) var lut_sampler: sampler;\n\
          @group({group}) @binding(5) var irradiance_lut: texture_2d<f32>;\n\
          @group({group}) @binding(6) var moon_view_lut: texture_2d<f32>;\n\
-         @group({group}) @binding(7) var night_lights_lut: texture_2d<f32>;\n"
+         @group({group}) @binding(7) var night_lights_lut: texture_2d<f32>;\n\
+         @group({group}) @binding(8) var star_table: texture_2d<f32>;\n"
     )
 }
 

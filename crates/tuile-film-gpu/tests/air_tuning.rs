@@ -66,7 +66,7 @@ fn uniforms(air: &AirTuning) -> (AtmosphereUniform, FrameUniform, Look) {
         &sky,
         eye,
         1.0,
-        None,
+        glam::DMat3::IDENTITY,
         &tuile_film_gpu::sky_look(&look),
     );
     let view = BakedView {

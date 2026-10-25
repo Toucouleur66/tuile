@@ -23,6 +23,7 @@ members = [
     "crates/tuile-metrics",
     "crates/tuile-planetary",
     "crates/tuile-radiometry",
+    "crates/tuile-star-catalogue",
     "crates/tuile-storage-foyer",
     "crates/tuile-tape",
     "crates/tuile-terrain",

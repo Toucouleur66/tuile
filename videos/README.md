@@ -446,3 +446,35 @@ tuile-film-render 1557732/20260924T221734Z-577d/packs --frames 4500:4500 \
 `x0` is the hard shadow as before the penumbra; `x1` the sun's own disc (the default), `x2` … `x40` the disc cut that many times wider. The grids are crops of the same frames: the forest east of the plateau (880,120)–(1680,620), and the ribbon's left turn (180,40)–(580,340) at twice the size.
 
 Looked at: at x1 the edge is already softer than x0, the band still dark; at x2 it reads as a soft, diffuse band and holds its darkness; at x4 it is faint, at x8 and past it barely there — an 8 m ribbon a few hundred metres up under a disc 20 m and more across hides a fifth of the sun or less. The shadow's upper end, cast from higher, fades first. `…-before-after-x4.png` sets the hard shadow, x1 and x4 side by side (the left turn and the forest, twice the size): x4 is the value chosen for a track ribbon; on this 8 m ribbon a few hundred metres up it is a light, diffuse veil, darker where the ribbon runs lower. No black, no gap, nothing flickers (one frame; the GPU tests pin the stillness).
+
+## stars-twilight-pic-du-midi-2026-06-21/, …-up20/ — the stars come out through twilight (2026-10-25)
+
+Two viewer series from the Pic du Midi, the stars drawn from the Bright Star Catalogue, always in the sky and dimmed only by the air (branch `feat/stars-attenuated`, PR stacked on #137):
+- Each holds the frames `000.png`–`012.png` and `noon/000.png`.
+- `sheet.png` is the twilight frames at their own size, so that a star stays a pixel.
+- `sheet-noon-and-twilight.png` is the noon frame, then the twilight frames, labelled.
+
+The settings:
+- Place: lon 0.1418, lat 42.9365, **altitude 3100** (ellipsoid height: 2900 is under the summit), heading 110 (east, towards the darkening sky).
+- Date: 2026-06-21. The sunset is 19:41:54 UTC (the ephemeris, sea-level horizon). Frames run every 10 minutes from sunset to +2 h; the noon frame is at 12:00 UTC.
+- Viewport: 960×540, the viewer's own frame (its metering, exposure, white balance and roll-off). Real terrain and imagery come through the ion catalogue proxy (`TUILE_ION_TOKEN` from `.env`).
+- `…-2026-06-21/` is pitch 10 as asked. In this viewer that is 10° **below** the horizon (`View::pitch`, "degrees below the horizon"), so the sky is the top fifth of the frame.
+- `…-up20/` is pitch −20 (20° above), all sky, and shows the stars coming out.
+
+```bash
+TUILE_ION_TOKEN=… cargo run --release -p tuile-wgpu-viewer --example sunset -- \
+  --lon 0.1418 --lat 42.9365 --altitude 3100 --heading 110 --pitch 10 \
+  --date 2026-06-21 --from 0m --to 2h --every 10m --sheet-scale 1 \
+  --out videos/stars-twilight-pic-du-midi-2026-06-21
+# the noon frame: --from -7h41m54s --to -7h41m54s --out …/noon
+# the upward series: the same with --pitch -20 --out videos/stars-twilight-pic-du-midi-2026-06-21-up20
+```
+
+Looked at:
+- **Noon.** A blue sky with no star in it: the stars are in its radiance at a few millionths of it, and no 8-bit picture shows them.
+- **The upward series.** The sky goes from orange to deep blue. Point sources (local maxima 3 code values over their ring, the controls left out) number 0, 0, 0, 0, 0, 1, 34, 62, 157, 426, 427, 420 and 384 from sunset to +2 h. The first star shows at +50 min, a few dozen at +60, the naked-eye sky by +90.
+- Near the horizon the stars are dimmer and redder.
+- The pitch-10 series shows the terrain under a strip of sky, with the stars over the ridge line by +90 min.
+- No black.
+
+The viewer meters its own frame, sky included, so it shows a given star later than the test probes do. The probes are metered on level ground (`crates/tuile-atmosphere/tests/stars_seen.rs`) and show Sirius from +20 min. The noon frame's nearest ground is still the coarse fill: the run settles in a fraction of a second, and its terrain was not all there.

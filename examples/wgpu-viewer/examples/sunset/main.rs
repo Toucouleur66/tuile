@@ -12,6 +12,9 @@
 //!     --date 2026-06-21 --from -30m --to 45m --every 2m --out videos/sunset-pic-du-midi
 //! ```
 //!
+//! `--sheet-scale 1` lays the frames on the sheet at their own size, so
+//! that a star stays the pixel it is (3, the default, shrinks them).
+//!
 //! The instants are the ephemeris's: the sunset is `Sun::next_sunset` over
 //! the place on that date (UTC noon on), and `--from`/`--to` are durations
 //! from it. The token is read from `TUILE_ION_TOKEN` and only the catalog
@@ -35,6 +38,9 @@ struct Asked {
     every: f64,
     out: PathBuf,
     size: (u32, u32),
+    /// How many times smaller the sheet's frames are than the frames:
+    /// 1 keeps a star a pixel wide.
+    sheet_scale: u32,
 }
 
 fn read(args: &[String]) -> Result<Asked, String> {
@@ -72,6 +78,7 @@ fn read(args: &[String]) -> Result<Asked, String> {
             number("--width", 960.0)? as u32,
             number("--height", 540.0)? as u32,
         ),
+        sheet_scale: (number("--sheet-scale", 3.0)? as u32).max(1),
     })
 }
 
@@ -154,18 +161,18 @@ fn run(asked: &Asked) -> Result<(), String> {
         t += asked.every;
         n += 1;
     }
-    sheet(&frames, &asked.out.join("sheet.png"))?;
+    sheet(&frames, asked.sheet_scale, &asked.out.join("sheet.png"))?;
     run.finish()?;
     Ok(())
 }
 
 /// Every frame, small, in reading order: one picture to look at.
-fn sheet(frames: &[image::RgbaImage], path: &std::path::Path) -> Result<(), String> {
+fn sheet(frames: &[image::RgbaImage], scale: u32, path: &std::path::Path) -> Result<(), String> {
     let Some(first) = frames.first() else {
         return Ok(());
     };
-    let (w, h) = (first.width() / 3, first.height() / 3);
-    let columns = 6u32;
+    let (w, h) = (first.width() / scale, first.height() / scale);
+    let columns = if scale == 1 { 3 } else { 6u32 };
     let rows = (frames.len() as u32).div_ceil(columns);
     let mut out = image::RgbaImage::new(w * columns, h * rows);
     for (i, frame) in frames.iter().enumerate() {

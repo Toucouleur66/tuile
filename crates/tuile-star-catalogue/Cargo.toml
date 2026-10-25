@@ -1,0 +1,27 @@
+[package]
+name = "tuile-star-catalogue"
+description = "The sky's star catalogue as tuile keeps it: the Bright Star Catalogue as typed Parquet, and the binned table the shaders read, made from it"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+# A tool, never linked by a renderer: Parquet and Arrow stay out of
+# tuile-atmosphere and of every wasm build. The renderer reads only the table
+# this crate writes (`tuile-atmosphere/src/stars.table`).
+[dependencies]
+arrow-array = "58.4.0"
+arrow-schema = "58.4.0"
+# Snappy only: pure Rust, no C codec to build.
+parquet = { version = "58.4.0", default-features = false, features = ["arrow", "snap"] }
+glam = { workspace = true }
+# The source as the CDS serves it, gzipped, read and checked against its
+# recorded SHA-256.
+flate2 = { workspace = true }
+sha2 = "0.11"
+tuile-atmosphere = { path = "../tuile-atmosphere" }

@@ -104,6 +104,7 @@ fn every_viewer_shader_runs_on_webgl2() {
              @group(0) @binding(6) var irradiance_lut: texture_2d<f32>;\n\
              @group(0) @binding(7) var night_lights_lut: texture_2d<f32>;\n\
              @group(0) @binding(8) var lut_sampler: sampler;\n\
+             @group(0) @binding(9) var star_table: texture_2d<f32>;\n\
              {}\n{}\n{}",
             tuile_atmosphere::hillaire::WGSL,
             tuile_atmosphere::gpu::SKY_VIEW_WGSL,
