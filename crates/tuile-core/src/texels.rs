@@ -327,8 +327,7 @@ impl StoredPlan {
 /// and desktop WebGPU on Apple. Both hold 8 bits per texel, so memory does not
 /// choose; quality does. On the imagery the gates measure, the GPU encoder's
 /// BC7 has a worst tile at 40.3 dB against ASTC 4×4's 36.4, and a p99 ΔE2000
-/// of 5.4 against 9.4 (`docs/explorations/gpu-compressed-textures.md`, §3,
-/// §4.4 and §9.3).
+/// of 5.4 against 9.4 (`docs/explorations/gpu-compressed-textures.md`, §8).
 pub const fn select(caps: GpuTextureCaps) -> ImageryPlan {
     let (target, encode) = match (caps.compute, caps.bc, caps.astc) {
         (true, true, _) => (ImageryFormat::Bc7, ImageryEncode::Gpu),
