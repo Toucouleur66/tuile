@@ -174,7 +174,10 @@ pub(crate) fn layers() -> &'static [ImageryChoice] {
 pub struct TerrainChoice {
     /// The number [`Sources::terrain`] is asked for.
     pub asset: i64,
-    /// The namespace its tiles are stored under, inside [`Identity::store`].
+    /// The namespace its tiles are stored under, inside [`Identity::store`],
+    /// exactly as given. (A terrain named by its `layer.json` URL alone adds
+    /// the edition that file declares, so a server that regenerates its
+    /// terrain is not answered from the store.)
     pub cache: String,
 }
 

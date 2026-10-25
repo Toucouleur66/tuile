@@ -161,7 +161,7 @@ pub(crate) async fn assemble(
         Some(store) => Arc::new(CachedTerrain::new(
             Held(ground),
             Arc::clone(store),
-            terrain.cache.clone(),
+            terrain.namespace_for(&layer),
         )),
         None => ground,
     };

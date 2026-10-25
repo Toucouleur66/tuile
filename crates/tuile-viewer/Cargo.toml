@@ -32,6 +32,9 @@ tuile-ui = { version = "0.14.0", path = "../tuile-ui" }
 tuile-wgpu = { version = "0.14.0", path = "../tuile-wgpu" }
 # Sources named by address (`open`): a terrain's layer.json, an imagery template.
 url = { workspace = true }
+# A terrain at a URL is stored under a hash of its layer.json when it declares
+# no version (`open`); the control API's socket speaks JSON too.
+serde_json = { workspace = true }
 wgpu = { workspace = true }
 web-time = { workspace = true }
 winit = { workspace = true }
@@ -57,9 +60,8 @@ ctrlc = { version = "3.5", features = ["termination"] }
 # nothing about publishing the engine's counters is specific to a wgpu window:
 # the headless probes and the warm-up job want exactly the same endpoint.
 tuile-metrics = { version = "0.14.0", path = "../tuile-metrics" }
-# The control API's, and only with its feature: the socket speaks JSON, and
-# writes an eye's picture as PNG.
-serde_json = { workspace = true, optional = true }
+# The control API's, and only with its feature: it writes an eye's picture as
+# PNG.
 image = { workspace = true, optional = true }
 
 # The browser: the page and the worker are one wasm module (see `web`). Each
@@ -187,4 +189,4 @@ application = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-app-kit", "dep:mu
 # and for debug builds a device is driven through; never in a build that
 # ships, and refused outright in an iOS release build. A build feature and
 # never a runtime switch: a binary either has it or does not.
-control = ["dep:serde_json", "dep:image"]
+control = ["dep:image"]
