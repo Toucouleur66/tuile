@@ -9,6 +9,17 @@ const sse = `sse = (geometricError * viewportHeight)
 
 const states = `Unloaded → Loading → Decoded → Resident → (Evicted)`;
 
+const support = [
+  ['tileset.json 1.0 and 1.1', 'Supported, with refinement inheritance and transforms composed in f64.'],
+  ['External tilesets', 'Supported: grafted into the same tile arena at load time.'],
+  ['Box, region and sphere volumes', 'Supported.'],
+  ['glb content (1.1)', 'Supported, with JPEG and PNG textures.'],
+  ['b3dm (1.0)', 'Supported, relative-to-centre offset composed.'],
+  ['Implicit tiling', 'Parsed; subtree decoding and implicit traversal are not implemented.'],
+  ['glTF mesh compression', 'Not yet. Meshopt is planned, built into the decoder and always on; other extensions are not scheduled.'],
+  ['i3dm, pnts, cmpt', 'Not supported: a typed unsupported-content error, never a panic.'],
+];
+
 const pitfalls = [
   ['The Y-up to Z-up rotation on glTF content', 'Forget it and every model lies on its side. Classic mistake number one.'],
   ['A geometric error of zero on a leaf', 'Means never attempt to refine further. Not "refine infinitely".'],
@@ -28,6 +39,21 @@ const pitfalls = [
   heading="3D Tiles, condensed."
   lede="A working summary of what the standard asks an implementation to do, written from the notes the engine was built against. The normative reference is OGC 3D Tiles 1.1; where the specification leaves grey areas, the behaviour of the established open-source implementations settles them."
 >
+  <h2>What Tuile supports today</h2>
+
+  <table>
+    <thead><tr><th>Part of the standard</th><th>In Tuile v0.14.0</th></tr></thead>
+    <tbody>
+      {support.map(([a, b]) => (<tr><td>{a}</td><td>{b}</td></tr>))}
+    </tbody>
+  </table>
+
+  <p>
+    3D Tiles content is drawn today by the offscreen snapshot of the wgpu backend; the
+    interactive viewers draw the terrain-and-imagery globe, which goes through the same
+    traversal and geometry server (see the end of this page).
+  </p>
+
   <h2>The tile tree</h2>
 
   <p>
@@ -75,14 +101,15 @@ const pitfalls = [
 
   <p>
     The glTF payload may itself be compressed — mesh compression, a compact vertex encoding,
-    or a supercompressed texture format. Because geometry is carried as glb all the way to
-    the consumer, those compressions survive the whole journey instead of being decoded and
-    re-encoded in the middle.
+    or a supercompressed texture format. A conforming client has to decode those at the
+    edge, where the geometry is consumed; carried as glb, they survive every hop before it.
+    Tuile reads none of them yet: support for the compact vertex encoding is planned inside
+    the core's decoder, in pure Rust.
   </p>
 
   <p>
-    Instanced models, point clouds and composite tiles are out of scope for the first
-    version. They return a typed unsupported-content error — not a panic.
+    Instanced models, point clouds and composite tiles are out of scope for now. They
+    return a typed unsupported-content error — not a panic.
   </p>
 
   <h2>Coordinates</h2>
@@ -133,9 +160,11 @@ const pitfalls = [
   <pre><code>{states}</code></pre>
 
   <p>
-    Residency is a least-recently-used cache bounded by a byte budget. The one rule that
-    cannot be broken: a tile currently selected for drawing is never evicted. Everything
-    else is fair game.
+    The standard leaves memory to the client. In Tuile it is a graphics budget: per class of
+    memory, a target and a hard limit derived from what the device or the consumer
+    declares, charged with the bytes the renderer acknowledges it really holds. The rules
+    that cannot be broken: what is drawn is never evicted, nor the coarser ancestors a
+    fallback lands on — the ground is never left black while a finer tile streams in.
   </p>
 
   <h2>Beyond the standard: the terrain globe</h2>

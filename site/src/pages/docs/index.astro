@@ -37,10 +37,12 @@ const groups: [string, string[]][] = [
       'tuile_camera',
       'tuile_ui',
       'tuile_atmosphere',
+      'tuile_overlay',
       'tuile_radiometry',
       'tuile_wgpu',
     ],
   ],
+  ['Viewers', ['tuile_viewer', 'tuile_wgpu_viewer']],
   [
     'Film',
     [
@@ -52,7 +54,7 @@ const groups: [string, string[]][] = [
     ],
   ],
   ['Integrations', ['tuile_usd', 'tuile_hydra', 'tuile_metrics']],
-  ['Programs', ['tuile_film_render', 'tuile_pack_api', 'wgpu_viewer']],
+  ['Programs', ['tuile_film_render', 'tuile_pack_api']],
 ];
 
 const known = groups.flatMap(([, crates]) => crates);
@@ -135,8 +137,16 @@ const sections = [
       one into the other.
     </li>
     <li>
-      <code>tuile_core::fetch</code> and <code>tuile_core::cache</code> — the input seams,
+      <code>tuile_core::budget</code> — the graphics budget: what is loaded, delivered,
+      drawn and evicted, decided purely and deterministically.
+    </li>
+    <li>
+      <code>tuile_core::fetch</code> and <code>tuile_core::storage</code> — the input seams,
       and the implementations of them that live in the transport crates.
+    </li>
+    <li>
+      <code>tuile_core::texels</code> — the imagery format seam: compression as the
+      client's choice, off by default.
     </li>
     <li>
       <code>tuile_core::geo</code> and <code>tuile_core::math</code> — the f64 geodetic and

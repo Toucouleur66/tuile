@@ -258,6 +258,7 @@ hr {
 }
 .tag.shipping { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
 .tag.planned { color: var(--fg-faint); }
+.tag.review { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
 
 table {
   border-collapse: collapse;
