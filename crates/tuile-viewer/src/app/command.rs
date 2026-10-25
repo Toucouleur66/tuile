@@ -93,6 +93,18 @@ impl App {
                 &crate::start::keys(),
             ),
             Command::Imagery(layer) => self.drape(layer),
+            Command::Clock { instant, rate } => {
+                let wall = super::wall_seconds();
+                self.atmosphere.clock.set(instant, wall);
+                self.atmosphere.clock.set_rate(rate, wall);
+                if rate != 0.0 {
+                    self.resume_rate = rate;
+                }
+            }
+            Command::ClockNow => {
+                self.atmosphere.clock.now(super::wall_seconds());
+                self.resume_rate = 1.0;
+            }
             Command::NextImagery => {
                 if let Some(next) = self.imagery.next() {
                     self.drape(next);
@@ -139,6 +151,16 @@ impl App {
         }
     }
 
+    /// The clock as published: this frame's instant, its rate, and what a
+    /// pause would run it at again.
+    fn clock_state(&self) -> crate::menu::Clock {
+        crate::menu::Clock {
+            instant: self.instant,
+            rate: self.atmosphere.clock.rate(),
+            resume: self.resume_rate,
+        }
+    }
+
     /// The state a key or a menu item is read against: the one last
     /// published, so that one press delivered twice asks for the same thing
     /// twice — see `crate::menu`.
@@ -151,6 +173,7 @@ impl App {
                 diagnostic: self.views.diagnostic,
                 layer: self.imagery.layer,
                 layers,
+                clock: self.clock_state(),
             },
             |snapshot| crate::menu::State::of(&snapshot, layers),
         )
@@ -175,6 +198,7 @@ impl App {
             imagery: self.imagery.layers.get(self.imagery.layer),
             layer: self.imagery.layer,
             diagnostic: self.views.diagnostic,
+            clock: self.clock_state(),
             ..Snapshot::of(&self.controller, size)
         };
         crate::snapshot::publish(snapshot);
@@ -217,7 +241,16 @@ impl App {
         {
             self.notice = None;
         }
-        let mut title = format!("{} — {}", self.title, crate::snapshot::title(snapshot));
+        let mut title = format!(
+            "{} — {} — {}",
+            self.title,
+            crate::snapshot::title(snapshot),
+            clock_line(
+                self.instant,
+                self.atmosphere.clock.rate(),
+                snapshot.view.lon.to_radians()
+            )
+        );
         // Whose pictures these are, for as long as they are on screen: the
         // title bar is the one piece of text this window has.
         if let Some(layer) = snapshot.imagery {
@@ -287,6 +320,27 @@ fn held_line(
         parts.push(format!("{} 0 MiB", tuile_wgpu::format_name(plan)));
     }
     format!("imagery {}", parts.join(" + "))
+}
+
+/// `2026-06-21 19:42 UTC · solar 19:43 · ×60`: the instant drawn, the local
+/// apparent solar time under the eye, and the rate when it is not real time.
+pub(crate) fn clock_line(instant: f64, rate: f64, lon: f64) -> String {
+    let utc = tuile_atmosphere::clock::format_rfc3339(instant);
+    let solar = tuile_atmosphere::clock::solar_time_hours(instant, lon);
+    let minutes = (solar * 60.0).floor() as u32;
+    let mut line = format!(
+        "{} {} UTC · solar {:02}:{:02}",
+        &utc[..10],
+        &utc[11..16],
+        minutes / 60 % 24,
+        minutes % 60
+    );
+    if rate == 0.0 {
+        line.push_str(" · paused");
+    } else if rate != 1.0 {
+        line.push_str(&format!(" · ×{rate}"));
+    }
+    line
 }
 
 #[cfg(test)]

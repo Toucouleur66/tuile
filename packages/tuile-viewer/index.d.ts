@@ -101,6 +101,19 @@ export interface ViewerOptions {
    * that cannot be encoded is held as RGBA8, never left out.
    */
   imageryCompression?: "off" | "auto" | "bc7" | "astc";
+  /**
+   * The instant the scene is lit for — where the sun, the Moon and the stars
+   * stand: `"now"` (the default), `"sunset"` or `"sunrise"` (the next one over
+   * the opening view), or an RFC 3339 instant (`"2026-06-21T19:42:00Z"`).
+   */
+  time?: string;
+  /** Added to `time`: a signed duration, `"-3h30m"`, `"+45m"`, `"90s"`. */
+  timeOffset?: string;
+  /**
+   * Scene seconds a second: 1 (real time, the default), 60 (an hour a
+   * minute), 0 (frozen), negative to run backwards.
+   */
+  timeRate?: number;
 }
 
 export interface ViewerEvents {

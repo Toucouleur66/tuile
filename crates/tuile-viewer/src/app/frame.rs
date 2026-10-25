@@ -112,6 +112,8 @@ impl App {
                 camera: &mut camera,
                 preload: &mut preload,
                 overlays: &mut overlays,
+                atmosphere: &mut self.atmosphere,
+                wall: super::wall_seconds(),
                 viewport: (w as u32, h as u32),
                 // The viewer's own relief, the one the controller keeps its
                 // floor against: a host placing anything on the ground
@@ -252,12 +254,46 @@ impl App {
     /// Uploads the view matrix, the sun and the air — the first eye's, which
     /// is a window's only one.
     fn upload_the_view(&mut self) {
+        // The frame's instant, from the scene's clock — after the host, which
+        // may have set it.
+        let wall = super::wall_seconds();
+        self.instant = self.atmosphere.instant(wall);
+        let sky = self.sky_view();
+        let mut atmosphere = self.atmosphere;
+        // The atmosphere checkbox, over what the host asked.
+        atmosphere.enabled &= self.nav.atmosphere_enabled();
+        // The flat light's sun, for the path without an atmosphere, is the
+        // atmosphere's own.
+        self.sun = tuile_atmosphere::Sun::from_direction(
+            atmosphere.lights.at(self.instant, sky.eye).to_sun,
+        );
         let views = self.view_uniforms();
         let Some(active) = self.active.as_mut() else {
             return;
         };
         if let Some(view) = views.first() {
             active.renderer.set_view(&active.gpu.queue, view);
+        }
+        active
+            .renderer
+            .draw_atmosphere(&active.gpu, &atmosphere, &sky, wall);
+    }
+
+    /// What the camera sees, for the sky: the first eye.
+    fn sky_view(&self) -> tuile_wgpu::SkyView {
+        let cam = self.controller.camera;
+        let (_, h) = self.viewport();
+        let eye = cam.position;
+        let height = tuile_core::geo::ecef_to_geodetic(eye).height;
+        tuile_wgpu::SkyView {
+            eye,
+            render_origin: cam.position,
+            forward: cam.direction,
+            up: cam.up,
+            fov_y: cam.fovy,
+            aspect: f64::from(self.aspect()),
+            height_px: h as u32,
+            ground_height: height - self.controller.height_above_ground(),
         }
     }
 

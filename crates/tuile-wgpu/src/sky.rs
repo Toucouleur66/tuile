@@ -30,6 +30,7 @@
 //! Between those, a frame writes one uniform: the air's sphere placed from
 //! its eye, and the stars turned to its instant.
 
+use glam::DMat3;
 use glam::{DMat4, DVec3, Mat4};
 use tuile_atmosphere::gpu::{AtmosphereGpu, AtmosphereUniform, SkyViewPass};
 use tuile_atmosphere::hillaire::{metering, Moment};
@@ -43,9 +44,9 @@ use tuile_core::geo::{ecef_to_geodetic, geodetic_to_ecef, Geodetic};
 /// sun's day.
 pub const LIGHT_SUN_STEP: f64 = 0.05 * std::f64::consts::PI / 180.0;
 
-/// The shortest time between two lights, however fast the sun moves or the
-/// eye travels: a quarter of a second.
-pub const LIGHT_INTERVAL: web_time::Duration = web_time::Duration::from_millis(250);
+/// The shortest time between two lights, wall seconds, however fast the sun
+/// moves or the eye travels: a quarter of a second.
+pub const LIGHT_INTERVAL: f64 = 0.25;
 
 /// How far the view may turn, in radians, before the light is metered
 /// again over what it now sees.
@@ -63,13 +64,188 @@ const JUMP_SUN: f64 = std::f64::consts::PI / 180.0;
 /// How many times [`EYE_STEP`] the eye moves in one frame for a jump.
 const JUMP_EYE: f64 = 10.0;
 
-/// What the sky of one frame is drawn for: the instant, the eye and what
-/// it looks at, in the frame tiles were rebased onto.
+/// Where the lights of one frame are: towards the sun and the Moon from
+/// the planet, and the stars' turn — whichever [`Lights`] put them there.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub struct Bodies {
+    /// Unit vector towards the sun, in the planet's frame (ECEF).
+    pub to_sun: DVec3,
+    /// The Moon, if there is one: where, its phase, its size.
+    pub moon: Option<Moonlight>,
+    /// The turn from the planet's axes to the stars', if stars are drawn.
+    pub stars: Option<DMat3>,
+}
+
+impl Bodies {
+    /// The real sun, Moon and stars at `instant` (Unix seconds UTC), the
+    /// Moon as seen from `eye` (ECEF): `illumination.rs`'s ephemerides.
+    pub fn ephemeris(instant: f64, eye: DVec3) -> Self {
+        Self {
+            to_sun: Sun::at_unix_seconds(instant).direction_ecef,
+            moon: Moon::seen_from(instant, ecef_to_geodetic(eye)).map(|m| Moonlight::of(&m)),
+            stars: Some(tuile_atmosphere::celestial_to_ecef(instant)),
+        }
+    }
+
+    /// A sun along `to_sun` and a Moon along `to_moon`, as a host sets
+    /// them: the Moon at the mean distance, in the phase the two directions
+    /// make. No stars: a stated sky has no instant to turn them by.
+    pub fn fixed(to_sun: DVec3, to_moon: Option<DVec3>) -> Self {
+        let to_sun = to_sun.normalize_or(DVec3::Z);
+        Self {
+            to_sun,
+            moon: to_moon.map(|m| {
+                let m = m.normalize_or(DVec3::X);
+                Moonlight {
+                    to_moon_ecef: m,
+                    // At the Moon, between the sun and the eye: the sun is
+                    // as far as to be along `to_sun` from either.
+                    phase_angle: (std::f64::consts::PI - m.angle_between(to_sun)) as f32,
+                    angular_radius: (tuile_atmosphere::moon::MOON_RADIUS
+                        / tuile_atmosphere::moon::MOON_MEAN_DISTANCE)
+                        .asin() as f32,
+                    moon_rgb: [0.0; 3],
+                }
+            }),
+            stars: None,
+        }
+    }
+}
+
+/// Where a scene's sun comes from: a host's choice, a value and not a
+/// switch. The light on every point, the terminator, the sky — everything
+/// downstream is the same for all three.
+///
+/// Open to more sources (several suns, other bodies): a host matching on it
+/// keeps a wildcard arm.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub enum Lights {
+    /// The real sun, Moon and stars at the clock's instant, read as Unix
+    /// seconds UTC: the Earth as it is ([`Bodies::ephemeris`]).
+    Ephemeris {
+        /// Whether the Moon is drawn and lights the night.
+        moon: bool,
+    },
+    /// A world of its own: a sun going round in `day_length` seconds of the
+    /// clock, its declination swinging by `axial_tilt` radians over
+    /// `year_length` seconds (no seasons without one), `phase` the share of
+    /// a day past local noon at the prime meridian at the clock's zero. No
+    /// Moon; the stars turn with the day.
+    Orbit {
+        day_length: f64,
+        year_length: Option<f64>,
+        axial_tilt: f64,
+        phase: f64,
+    },
+    /// The directions as the host sets them (ECEF), changed by the host
+    /// when it likes: a frozen golden hour, a scripted scene.
+    Fixed {
+        to_sun: DVec3,
+        to_moon: Option<DVec3>,
+    },
+}
+
+impl Default for Lights {
+    fn default() -> Self {
+        Self::Ephemeris { moon: true }
+    }
+}
+
+impl Lights {
+    /// The real sun and Moon ([`Self::Ephemeris`]).
+    pub fn ephemeris() -> Self {
+        Self::Ephemeris { moon: true }
+    }
+
+    /// A world's own sun going round once in `day_length` seconds of the
+    /// clock, no seasons ([`Self::Orbit`]); [`Self::with_seasons`] adds them.
+    pub fn orbit(day_length: f64) -> Self {
+        Self::Orbit {
+            day_length,
+            year_length: None,
+            axial_tilt: 0.0,
+            phase: 0.0,
+        }
+    }
+
+    /// An orbit with seasons: a year of `year_length` seconds, an axis
+    /// tilted by `axial_tilt` radians. Nothing on another source.
+    pub fn with_seasons(self, year_length: f64, axial_tilt: f64) -> Self {
+        match self {
+            Self::Orbit {
+                day_length, phase, ..
+            } => Self::Orbit {
+                day_length,
+                year_length: Some(year_length),
+                axial_tilt,
+                phase,
+            },
+            other => other,
+        }
+    }
+
+    /// The directions a host sets ([`Self::Fixed`]).
+    pub fn fixed(to_sun: DVec3, to_moon: Option<DVec3>) -> Self {
+        Self::Fixed { to_sun, to_moon }
+    }
+
+    /// Where the lights are at the clock's `instant`, seen from `eye`.
+    pub fn at(&self, instant: f64, eye: DVec3) -> Bodies {
+        match *self {
+            Self::Ephemeris { moon } => {
+                let b = Bodies::ephemeris(instant, eye);
+                Bodies {
+                    moon: b.moon.filter(|_| moon),
+                    ..b
+                }
+            }
+            Self::Orbit {
+                day_length,
+                year_length,
+                axial_tilt,
+                phase,
+            } => {
+                let tau = std::f64::consts::TAU;
+                let day = instant / day_length.abs().max(1e-3) + phase;
+                // The sun over the meridian `−day` turns west of the prime
+                // one: the planet turns east, as the Earth does.
+                let lon = -tau * day;
+                let declination = match year_length {
+                    Some(year) => axial_tilt * (tau * instant / year.abs().max(1e-3)).sin(),
+                    None => 0.0,
+                };
+                let to_sun = DVec3::new(
+                    declination.cos() * lon.cos(),
+                    declination.cos() * lon.sin(),
+                    declination.sin(),
+                );
+                Bodies {
+                    to_sun,
+                    moon: None,
+                    stars: Some(DMat3::from_rotation_z(-lon)),
+                }
+            }
+            Self::Fixed { to_sun, to_moon } => Bodies::fixed(to_sun, to_moon),
+        }
+    }
+}
+
+/// What the sky of one frame is drawn for: where its lights are, what the
+/// camera sees, and the wall's time — the one clock its budget is kept by.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SkyFrame {
-    /// The instant, Unix seconds UTC: where the sun, the Moon and the stars
-    /// stand.
-    pub instant: f64,
+    pub bodies: Bodies,
+    pub view: SkyView,
+    /// The wall's present, seconds (any origin): how often the light is
+    /// worked out again is measured on it, and nothing else reads a clock.
+    pub wall: f64,
+}
+
+/// Where the camera is and what it sees, for the sky.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SkyView {
     /// The eye, ECEF metres.
     pub eye: DVec3,
     /// The origin tiles were rebased onto ([`crate::ContentPump::render_origin`]).
@@ -88,6 +264,141 @@ pub struct SkyFrame {
     pub ground_height: f64,
 }
 
+impl SkyView {
+    /// This view under the real sky of `instant` (Unix seconds UTC), at
+    /// the wall's `wall`.
+    pub fn at(self, instant: f64, wall: f64) -> SkyFrame {
+        SkyFrame {
+            bodies: Bodies::ephemeris(instant, self.eye),
+            view: self,
+            wall,
+        }
+    }
+}
+
+/// How a host wants the physical atmosphere, before it runs: on or off,
+/// where its lights come from, what the air is made of, how it is drawn,
+/// and its clock.
+///
+/// Off by default: a scene that is not a planet has no air, and its ground
+/// keeps [`crate::ViewUniform::atmosphere`]'s closed-form haze, past it the
+/// clear colour. A globe asks for it — the viewer does, from its flags.
+///
+/// The body is the terrain's: the air is laid on the sphere osculating its
+/// ellipsoid under the eye, and the tables are laid out for an Earth-sized
+/// planet — a planet of another radius is not offered.
+///
+/// Open to more (media, rings, several suns): built from
+/// [`Self::default`], [`Self::earth`] or [`Self::tuned`] and the `with_*`
+/// methods.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[non_exhaustive]
+pub struct AtmosphereConfig {
+    pub enabled: bool,
+    pub lights: Lights,
+    /// The air: its molecules (Rayleigh), aerosols (Mie), ozone, their
+    /// scale heights, its thickness and the ground's albedo
+    /// ([`AtmosphereParams::default`] a clear day; see its presets).
+    pub params: AtmosphereParams,
+    /// How it is drawn: the calibration of its light against the imagery,
+    /// the exposure, the white balance, the highlights, the discs' sizes and
+    /// glare, the march. A film's default look by default.
+    pub look: SkyLook,
+    /// The scene's clock: start, offset, rate. The present in real time by
+    /// default.
+    pub clock: tuile_atmosphere::ClockSettings,
+}
+
+impl AtmosphereConfig {
+    /// The Earth as it is: on, the real sun and Moon, a clear day's air and
+    /// a film's look, at `clock`.
+    pub fn earth(clock: tuile_atmosphere::ClockSettings) -> Self {
+        Self {
+            enabled: true,
+            clock,
+            ..Self::default()
+        }
+    }
+
+    /// On or off.
+    pub fn enabled(self, enabled: bool) -> Self {
+        Self { enabled, ..self }
+    }
+
+    pub fn with_lights(self, lights: Lights) -> Self {
+        Self { lights, ..self }
+    }
+
+    pub fn with_params(self, params: AtmosphereParams) -> Self {
+        Self { params, ..self }
+    }
+
+    pub fn with_look(self, look: SkyLook) -> Self {
+        Self { look, ..self }
+    }
+
+    pub fn with_clock(self, clock: tuile_atmosphere::ClockSettings) -> Self {
+        Self { clock, ..self }
+    }
+
+    /// [`Self::earth`] with the air and the look a host read from its
+    /// tuning values ([`tuile_atmosphere::AirTuning`]).
+    pub fn tuned(
+        air: &tuile_atmosphere::AirTuning,
+        clock: tuile_atmosphere::ClockSettings,
+    ) -> Self {
+        Self {
+            params: air.params,
+            look: SkyLook::default().tuned(air),
+            ..Self::earth(clock)
+        }
+    }
+}
+
+/// The physical atmosphere as it runs: a host's [`AtmosphereConfig`] with
+/// its clock started. Every field may be changed between two frames — the
+/// next [`crate::TileRenderer::draw_atmosphere`] draws what it says. Given
+/// the same configuration and the same clock, the same sky: nothing here
+/// reads a clock of its own.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Atmosphere {
+    pub enabled: bool,
+    pub lights: Lights,
+    pub params: AtmosphereParams,
+    pub look: SkyLook,
+    /// The scene's clock, running: shift it, set its rate, pause it.
+    pub clock: tuile_atmosphere::SceneClock,
+}
+
+impl Atmosphere {
+    /// `config`, its clock started at `wall` (Unix seconds) for a camera at
+    /// `eye` (ECEF) — where a sunset or a sunrise start is resolved.
+    pub fn new(config: AtmosphereConfig, wall: f64, eye: DVec3) -> Self {
+        Self {
+            enabled: config.enabled,
+            lights: config.lights,
+            params: config.params,
+            look: config.look,
+            clock: config.clock.start(wall, ecef_to_geodetic(eye)),
+        }
+    }
+
+    /// The instant a frame at `wall` is lit for.
+    pub fn instant(&self, wall: f64) -> f64 {
+        self.clock.at(wall)
+    }
+
+    /// The frame of `view` at `wall`: its lights where [`Self::lights`]
+    /// puts them at the clock's instant.
+    pub fn frame(&self, view: SkyView, wall: f64) -> SkyFrame {
+        SkyFrame {
+            bodies: self.lights.at(self.instant(wall), view.eye),
+            view,
+            wall,
+        }
+    }
+}
+
 /// What a frame's light was worked out from.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct LightKey {
@@ -96,7 +407,7 @@ struct LightKey {
     eye: DVec3,
     forward: DVec3,
     clearance: f64,
-    at: web_time::Instant,
+    at: f64,
 }
 
 /// What the sky-view was made from.
@@ -172,15 +483,17 @@ impl Sky {
     /// The frame's uniform, and — when the sun, the Moon or the eye moved
     /// enough — its light and its sky-view made again.
     pub(crate) fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &SkyFrame) {
-        let now = web_time::Instant::now();
-        let to_sun = Sun::at_unix_seconds(frame.instant).direction_ecef;
+        let now = frame.wall;
+        let bodies = frame.bodies;
+        let frame = &frame.view;
+        let to_sun = bodies.to_sun;
         if !to_sun.is_finite() || !frame.eye.is_finite() {
             self.off(queue);
             return;
         }
         let at_eye = ecef_to_geodetic(frame.eye);
-        let moon = Moon::seen_from(frame.instant, at_eye);
-        let to_moon = moon.map(|m| m.direction_ecef);
+        let moon = bodies.moon;
+        let to_moon = moon.map(|m| m.to_moon_ecef);
         let clearance = (at_eye.height - frame.ground_height).max(1.0);
         let moved = |key: &LightKey| {
             let angle = |a: DVec3, b: DVec3| a.angle_between(b);
@@ -203,7 +516,7 @@ impl Sky {
         self.last = Some((to_sun, frame.eye));
         let due = match &self.light_key {
             None => true,
-            Some(key) => moved(key) && (jumped || now.duration_since(key.at) >= LIGHT_INTERVAL),
+            Some(key) => moved(key) && (jumped || now - key.at >= LIGHT_INTERVAL),
         };
         self.atmosphere
             .hold_with(queue, self.params, LutAtmosphere::of);
@@ -228,7 +541,7 @@ impl Sky {
                 ground,
                 Moment {
                     to_sun_ecef: to_sun,
-                    moon: moon.map(|m| Moonlight::of(&m)),
+                    moon,
                     compensation_ev: 0.0,
                 },
                 &metered,
@@ -261,7 +574,7 @@ impl Sky {
             });
         }
         let view_eye = self.view_key.expect("set above").eye;
-        let stars = Some(tuile_atmosphere::celestial_to_ecef(frame.instant).transpose());
+        let stars = bodies.stars.map(|m| m.transpose());
         let uniform = AtmosphereUniform::new(
             &self.params,
             &light,
@@ -296,7 +609,7 @@ impl Sky {
 
 /// The camera's right and up, ECEF, each scaled to the half-extent of the
 /// picture at unit distance — what the meter's rays are spread over.
-fn view_axes(frame: &SkyFrame) -> (DVec3, DVec3) {
+fn view_axes(frame: &SkyView) -> (DVec3, DVec3) {
     let forward = frame.forward.normalize_or(DVec3::X);
     let right = forward
         .cross(frame.up)
@@ -307,7 +620,7 @@ fn view_axes(frame: &SkyFrame) -> (DVec3, DVec3) {
 }
 
 /// The radius of a star's image, radians: about a pixel.
-pub(crate) fn star_sigma(frame: &SkyFrame) -> f32 {
+pub(crate) fn star_sigma(frame: &SkyView) -> f32 {
     let pixel = 2.0 * (frame.fov_y * 0.5).tan() / f64::from(frame.height_px.max(1));
     (0.8 * pixel) as f32
 }

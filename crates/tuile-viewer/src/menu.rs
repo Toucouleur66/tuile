@@ -59,10 +59,33 @@ pub(crate) enum Ask {
     NextDiagnostic,
     Imagery(usize),
     NextImagery,
+    /// The scene's clock moved by this many seconds.
+    Shift(i32),
+    /// The clock a step slower, or faster, along [`RATES`].
+    Slower,
+    Faster,
+    /// Paused, or running again.
+    Pause,
+}
+
+/// The rates the clock steps through, scene seconds a second: backwards an
+/// hour a second to forwards an hour a second. Paused is not among them —
+/// `P` is.
+pub(crate) const RATES: [f64; 10] = [
+    -3600.0, -600.0, -60.0, -10.0, -1.0, 1.0, 10.0, 60.0, 600.0, 3600.0,
+];
+
+/// The clock as last published: the scene's instant, its rate, and the
+/// rate a pause would run it at again.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(crate) struct Clock {
+    pub instant: f64,
+    pub rate: f64,
+    pub resume: f64,
 }
 
 /// As much of the published state as an [`Ask`] is read against.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct State {
     pub wireframe: bool,
     pub frozen: bool,
@@ -70,6 +93,7 @@ pub(crate) struct State {
     /// The imagery layer being draped, and how many the host offers.
     pub layer: usize,
     pub layers: usize,
+    pub clock: Clock,
 }
 
 impl State {
@@ -80,6 +104,20 @@ impl State {
             diagnostic: snapshot.diagnostic,
             layer: snapshot.layer,
             layers,
+            clock: snapshot.clock,
+        }
+    }
+
+    /// What the check marks show: the state without its clock, which moves
+    /// every frame and marks nothing.
+    #[cfg_attr(
+        not(all(target_os = "macos", feature = "application")),
+        allow(dead_code)
+    )]
+    pub(crate) fn marked(self) -> Self {
+        Self {
+            clock: Clock::default(),
+            ..self
         }
     }
 }
@@ -95,6 +133,34 @@ impl Ask {
             Self::NextDiagnostic => Command::Diagnostic((now.diagnostic + 1) % DIAGNOSTICS.len()),
             Self::Imagery(layer) => Command::Imagery(layer),
             Self::NextImagery => Command::Imagery((now.layer + 1) % now.layers.max(1)),
+            Self::Shift(seconds) => Command::Clock {
+                instant: now.clock.instant + f64::from(seconds),
+                rate: now.clock.rate,
+            },
+            Self::Slower | Self::Faster => {
+                let rate = if now.clock.rate == 0.0 {
+                    now.clock.resume
+                } else {
+                    now.clock.rate
+                };
+                let next = if self == Self::Faster {
+                    RATES.iter().copied().find(|r| *r > rate)
+                } else {
+                    RATES.iter().rev().copied().find(|r| *r < rate)
+                };
+                Command::Clock {
+                    instant: now.clock.instant,
+                    rate: next.unwrap_or(rate),
+                }
+            }
+            Self::Pause => Command::Clock {
+                instant: now.clock.instant,
+                rate: if now.clock.rate == 0.0 {
+                    now.clock.resume
+                } else {
+                    0.0
+                },
+            },
         }
     }
 
@@ -113,14 +179,20 @@ impl Ask {
             Self::ToggleFreeze => Some(now.frozen),
             Self::Diagnostic(view) => Some(now.diagnostic == view),
             Self::Imagery(layer) => Some(now.layer == layer),
-            Self::Do(_) | Self::NextDiagnostic | Self::NextImagery => None,
+            Self::Pause => Some(now.clock.rate == 0.0),
+            Self::Do(_)
+            | Self::NextDiagnostic
+            | Self::NextImagery
+            | Self::Shift(_)
+            | Self::Slower
+            | Self::Faster => None,
         }
     }
 }
 
 /// The letter keys. Lower case; the window reads a key without regard to
 /// case.
-pub(crate) const KEYS: [(char, Ask); 8] = [
+pub(crate) const KEYS: [(char, Ask); 16] = [
     ('w', Ask::ToggleWireframe),
     ('f', Ask::ToggleFreeze),
     ('d', Ask::NextDiagnostic),
@@ -129,6 +201,16 @@ pub(crate) const KEYS: [(char, Ask); 8] = [
     ('c', Ask::Do(Command::CopyLink)),
     ('v', Ask::Do(Command::PasteLink)),
     ('i', Ask::NextImagery),
+    // The scene's clock: J and K, then Y and U, side by side on every
+    // layout that has letters where these are.
+    ('j', Ask::Shift(-900)),
+    ('k', Ask::Shift(900)),
+    ('y', Ask::Shift(-3600)),
+    ('u', Ask::Shift(3600)),
+    ('e', Ask::Slower),
+    ('r', Ask::Faster),
+    ('p', Ask::Pause),
+    ('t', Ask::Do(Command::ClockNow)),
 ];
 
 /// What the key `c` asks for; `None` for a key that is not one of the
@@ -213,7 +295,24 @@ pub(crate) fn layout(layers: &[ImageryChoice]) -> Vec<(&'static str, Vec<Entry>)
         imagery.push(Entry::Separator);
         imagery.push(item("Next Layer", Ask::NextImagery));
     }
-    vec![("View", view), ("Go", go), ("Imagery", imagery)]
+    let time = vec![
+        item("A Quarter of an Hour Back", Ask::Shift(-900)),
+        item("A Quarter of an Hour On", Ask::Shift(900)),
+        item("An Hour Back", Ask::Shift(-3600)),
+        item("An Hour On", Ask::Shift(3600)),
+        Entry::Separator,
+        item("Slower", Ask::Slower),
+        item("Faster", Ask::Faster),
+        item("Pause", Ask::Pause),
+        Entry::Separator,
+        item("Now, in Real Time", Ask::Do(Command::ClockNow)),
+    ];
+    vec![
+        ("View", view),
+        ("Go", go),
+        ("Imagery", imagery),
+        ("Time", time),
+    ]
 }
 
 pub(crate) use platform::Installed;
@@ -365,6 +464,7 @@ mod platform {
         /// has just moved a mark by itself.
         pub(crate) fn show(&mut self, now: State) {
             let clicked = CLICKED.swap(false, Ordering::Relaxed);
+            let now = now.marked();
             if !clicked && self.shown == Some(now) {
                 return;
             }
@@ -443,6 +543,11 @@ impl Default for State {
             diagnostic: 0,
             layer: 0,
             layers: 1,
+            clock: Clock {
+                instant: 0.0,
+                rate: 1.0,
+                resume: 1.0,
+            },
         }
     }
 }
@@ -568,6 +673,7 @@ mod tests {
             diagnostic: 2,
             layer: 1,
             layers: layers.len(),
+            clock: State::default().clock,
         };
         let marked: Vec<String> = items(&layers)
             .into_iter()
@@ -592,6 +698,42 @@ mod tests {
         }
     }
 
+    /// The clock's keys, read against the published clock: absolute — an
+    /// instant and a rate — so one press delivered twice is one change.
+    #[test]
+    fn the_clock_keys_shift_step_pause_and_resume() {
+        let at = |instant, rate, resume| State {
+            clock: Clock {
+                instant,
+                rate,
+                resume,
+            },
+            ..State::default()
+        };
+        let running = at(1000.0, 60.0, 60.0);
+        let clock = |ask: Ask, now: &State| match ask.command(now) {
+            Command::Clock { instant, rate } => (instant, rate),
+            other => unreachable!("{other:?}"),
+        };
+        assert_eq!(clock(key('k').unwrap(), &running), (1900.0, 60.0));
+        assert_eq!(clock(key('j').unwrap(), &running), (100.0, 60.0));
+        assert_eq!(clock(key('u').unwrap(), &running), (4600.0, 60.0));
+        assert_eq!(clock(key('y').unwrap(), &running), (-2600.0, 60.0));
+        assert_eq!(clock(key('r').unwrap(), &running), (1000.0, 600.0));
+        assert_eq!(clock(key('e').unwrap(), &running), (1000.0, 10.0));
+        // Slower than real time is backwards: the ladder skips the pause.
+        assert_eq!(clock(Ask::Slower, &at(0.0, 1.0, 1.0)), (0.0, -1.0));
+        assert_eq!(clock(Ask::Faster, &at(0.0, 3600.0, 3600.0)), (0.0, 3600.0));
+        // Paused, then running again at the rate it had.
+        assert_eq!(clock(key('p').unwrap(), &running), (1000.0, 0.0));
+        assert_eq!(
+            clock(key('p').unwrap(), &at(1000.0, 0.0, 60.0)),
+            (1000.0, 60.0)
+        );
+        assert_eq!(Ask::Pause.checked(&at(1000.0, 0.0, 60.0)), Some(true));
+        assert_eq!(key('t').unwrap().command(&running), Command::ClockNow);
+    }
+
     /// The menu names the views the renderer draws, in the renderer's order.
     #[test]
     fn the_menu_names_the_views_the_window_cycles() {
@@ -614,6 +756,11 @@ mod tests {
             diagnostic: 3,
             layer: 2,
             layers: 3,
+            clock: Clock {
+                instant: 1000.0,
+                rate: 60.0,
+                resume: 60.0,
+            },
         };
         for (ask, command) in [
             (Ask::ToggleWireframe, Command::Wireframe(true)),

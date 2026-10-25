@@ -293,6 +293,12 @@ fn mapped(gpu: &GpuContext, buffer: &wgpu::Buffer) -> Vec<u8> {
 /// The host draws its quads, then tuile draws the globe into the same colour
 /// and depth — loading both, clearing neither.
 fn render_into_the_host(gpu: &GpuContext, host: Host, ground: Ground) -> Picture {
+    render_into_the_host_under(gpu, host, ground, false)
+}
+
+/// The same, with the physical atmosphere drawn — its sky on the far plane —
+/// when `sky` says.
+fn render_into_the_host_under(gpu: &GpuContext, host: Host, ground: Ground, sky: bool) -> Picture {
     let here = TileId::from_terrain(3, 4, 4);
     let neighbour = TileId::from_terrain(3, 5, 4);
     let grandparent = TileId::from_terrain(1, 1, 1);
@@ -353,7 +359,7 @@ fn render_into_the_host(gpu: &GpuContext, host: Host, ground: Ground) -> Picture
         samples: host.samples,
         direction: host.direction,
     };
-    let renderer = TileRenderer::for_layout(gpu, layout);
+    let mut renderer = TileRenderer::for_layout(gpu, layout);
     let mut tuile = HostPass::new(gpu, layout);
 
     // The host's camera, f64 and in the world tuile's tiles are in, with the
@@ -379,6 +385,25 @@ fn render_into_the_host(gpu: &GpuContext, host: Host, ground: Ground) -> Picture
             ..Default::default()
         },
     );
+    if sky {
+        // Midsummer noon over Europe, the eye over the tiles.
+        renderer.set_sky(
+            gpu,
+            Some(
+                &tuile_wgpu::SkyView {
+                    eye,
+                    render_origin: pump.render_origin,
+                    forward: down,
+                    up,
+                    fov_y: fov,
+                    aspect: 1.0,
+                    height_px: SIZE,
+                    ground_height: 0.0,
+                }
+                .at(1_782_043_200.0, 0.0),
+            ),
+        );
+    }
     let (drawn, _) = pump.resolve(gpu);
 
     let mut encoder = gpu.device.create_command_encoder(&Default::default());
@@ -548,6 +573,40 @@ fn the_globe_composes_into_a_forward_depth_stencil_host() {
                 Ground::WithFallback,
             );
             assert_composed(&picture, &format!("forward, {colour:?}, {samples}×"));
+        }
+    }
+}
+
+/// The physical atmosphere composes as the globe does: its sky on the far
+/// plane, depth and stencil untouched — the host's quad in front kept, the
+/// one behind the planet hidden, in either convention.
+#[test]
+fn the_sky_composes_into_a_host_too() {
+    let Some(gpu) = gpu() else { return };
+    for (direction, depth, near_z, far_z) in [
+        (
+            DepthDirection::Reverse,
+            wgpu::TextureFormat::Depth32Float,
+            0.5,
+            1e-7,
+        ),
+        (DepthDirection::Forward, DEPTH_FORMAT, 0.1, 0.999_99),
+    ] {
+        for samples in [1, 4] {
+            let picture = render_into_the_host_under(
+                &gpu,
+                Host {
+                    colour: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    direction,
+                    depth,
+                    samples,
+                    near_z,
+                    far_z,
+                },
+                Ground::WithFallback,
+                true,
+            );
+            assert_composed(&picture, &format!("sky, {direction:?}, {samples}×"));
         }
     }
 }

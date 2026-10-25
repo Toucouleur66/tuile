@@ -656,20 +656,18 @@ mod tests {
             |r| r.order.look.reflectance = 5.0,
             |r| r.order.look.atmosphere = Some(tuile_film::AtmosphereParams::default()),
             |r| {
-                r.order.look.atmosphere = Some(tuile_film::AtmosphereParams {
-                    mie_albedo: 0.95,
-                    ..tuile_film::AtmosphereParams::default()
-                })
+                let mut air = tuile_film::AtmosphereParams::default();
+                air.mie_albedo = 0.95;
+                r.order.look.atmosphere = Some(air)
             },
             |r| {
                 r.order.look.atmosphere =
                     Some(tuile_film::AtmosphereParams::default().with_aerosol_depth(0.06))
             },
             |r| {
-                r.order.look.atmosphere = Some(tuile_film::AtmosphereParams {
-                    mie_scale_height: 2000.0,
-                    ..tuile_film::AtmosphereParams::default()
-                })
+                let mut air = tuile_film::AtmosphereParams::default();
+                air.mie_scale_height = 2000.0;
+                r.order.look.atmosphere = Some(air)
             },
         ] {
             let mut changed = rendering();

@@ -137,14 +137,15 @@ fn session(
 ) -> anyhow::Result<()> {
     // The command line, read by `main`. Exit code 2 is the usual one for a
     // command that was not understood.
-    let (view, here, imagery, compression) = match invocation {
+    let (view, here, imagery, compression, clock) = match invocation {
         Ok(start::Invocation::Run {
             view,
             here,
             imagery,
             compression,
+            clock,
             ..
-        }) => (view, here, imagery, compression),
+        }) => (view, here, imagery, compression, clock),
         Ok(start::Invocation::Help) => {
             println!("{}", start::usage());
             return Ok(());
@@ -334,8 +335,8 @@ fn session(
             heading: view.heading,
             pitch: view.pitch,
         }),
-        lit_at_unix_seconds: settings::lit_at()?,
-        air: tuile_atmosphere::AirTuning::from_env()?.viewer,
+        clock: settings::clock(clock)?,
+        air: tuile_atmosphere::AirTuning::from_env()?,
         pinned_level: budget.pinned_level,
         profile: profile.clone(),
         retries,

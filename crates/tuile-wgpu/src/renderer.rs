@@ -516,10 +516,30 @@ impl TileRenderer {
                 gpu.queue.write_buffer(
                     &self.sky_buf,
                     64,
-                    bytemuck::bytes_of(&[crate::sky::star_sigma(frame), 0.0, 0.0, 0.0]),
+                    bytemuck::bytes_of(&[crate::sky::star_sigma(&frame.view), 0.0, 0.0, 0.0]),
                 );
             }
         }
+    }
+
+    /// The host's atmosphere for this frame: drawn, from its clock at
+    /// `wall` (Unix seconds) and `view`, when it is enabled; when it is
+    /// not, the path without one — closed-form haze, the clear colour past
+    /// the ground. The same as [`Self::set_air`] and [`Self::set_sky`]
+    /// together.
+    pub fn draw_atmosphere(
+        &mut self,
+        gpu: &GpuContext,
+        atmosphere: &crate::sky::Atmosphere,
+        view: &crate::sky::SkyView,
+        wall: f64,
+    ) {
+        if !atmosphere.enabled {
+            self.set_sky(gpu, None);
+            return;
+        }
+        self.set_air(atmosphere.params, atmosphere.look);
+        self.set_sky(gpu, Some(&atmosphere.frame(*view, wall)));
     }
 
     /// What the air is made of and how it is drawn: a clear day's and a

@@ -564,8 +564,13 @@ impl Headless {
             here: None,
             requests: queue,
             remembers: false,
-            lit_at_unix_seconds: start.lit_at,
-            air: tuile_atmosphere::AerialAir::default(),
+            // A stated instant, held: two runs of a scenario are lit alike.
+            clock: tuile_atmosphere::ClockSettings {
+                start: tuile_atmosphere::Start::At(start.lit_at),
+                offset: 0.0,
+                rate: 0.0,
+            },
+            air: tuile_atmosphere::AirTuning::default(),
             pinned_level: pinned,
             profile,
             retries,

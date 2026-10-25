@@ -89,13 +89,14 @@ pub struct ViewerConfig {
     /// Whether to leave the last view for the next session: see
     /// `App::remember_the_view`.
     pub remembers: bool,
-    /// The instant the scene is lit for, UTC seconds since the Unix epoch —
-    /// which sets where the sun is, and so where the terminator falls.
-    pub lit_at_unix_seconds: f64,
-    /// The air between the eye and the ground: its molecules, its aerosols
-    /// and its strength, today's by default — on a desktop, as the
-    /// `TUILE_AIR_*` tuning values say ([`tuile_atmosphere::tuning`]).
-    pub air: tuile_atmosphere::AerialAir,
+    /// The scene's clock: the instant it is lit for — which sets where the
+    /// sun and the Moon are, and so where the terminator falls — and how it
+    /// runs. The present in real time by default.
+    pub clock: tuile_atmosphere::ClockSettings,
+    /// The air: its molecules, its aerosols, how it is drawn — today's by
+    /// default, on a desktop as the `TUILE_AIR_*` tuning values say
+    /// ([`tuile_atmosphere::tuning`]).
+    pub air: tuile_atmosphere::AirTuning,
     /// The level held in memory for the session, if any.
     pub pinned_level: Option<u32>,
     /// How hard the session may push the machine.
@@ -240,11 +241,19 @@ pub struct App {
     controller: CameraController,
     layer_budget: crate::shell::Budget,
     title: String,
-    /// Where the sun is for the instant the scene is lit at. Resolved once: the
-    /// hour is fixed for a session, so recomputing the ephemeris every frame
-    /// would answer the same question sixty times a second.
+    /// The physical atmosphere ([`ViewerConfig::clock`], [`ViewerConfig::air`]):
+    /// its clock running from the wall's — the instant each frame is lit
+    /// for — its lights, its air and its look.
+    atmosphere: tuile_wgpu::Atmosphere,
+    /// The rate the clock ran at before it was paused: what `P` runs it at
+    /// again.
+    resume_rate: f64,
+    /// This frame's instant, Unix seconds UTC, and its sun.
+    instant: f64,
     sun: tuile_atmosphere::Sun,
-    /// The air between the eye and the ground ([`ViewerConfig::air`]).
+    /// The air ([`ViewerConfig::air`]): its closed-form haze where the
+    /// physical atmosphere is off, and the physical atmosphere's make-up and
+    /// look.
     air: tuile_atmosphere::AerialAir,
     /// Everything that only exists once there is a window. `None` until
     /// `resumed`, and that is the only reason this is an `Option`.
@@ -396,6 +405,13 @@ impl App {
             locator.request(web_time::Instant::now(), placement);
         }
         let now = web_time::Instant::now();
+        let wall = wall_seconds();
+        // A sunset or a sunrise is the next one over where the view opens.
+        let atmosphere = tuile_wgpu::Atmosphere::new(
+            tuile_wgpu::AtmosphereConfig::tuned(&config.air, config.clock),
+            wall,
+            config.controller.camera.position,
+        );
         let mut app = Self {
             imagery: imagery::Imagery::new(config.layers, config.layer),
             locator,
@@ -415,8 +431,15 @@ impl App {
             controller: config.controller.clone(),
             layer_budget: Default::default(),
             title: config.title.clone(),
-            sun: tuile_atmosphere::Sun::at_unix_seconds(config.lit_at_unix_seconds),
-            air: config.air,
+            resume_rate: if config.clock.rate != 0.0 {
+                config.clock.rate
+            } else {
+                1.0
+            },
+            instant: atmosphere.instant(wall),
+            sun: tuile_atmosphere::Sun::at_unix_seconds(atmosphere.instant(wall)),
+            atmosphere,
+            air: config.air.viewer,
             active: None,
             session: None,
             launch: Some(launch),
@@ -997,6 +1020,13 @@ fn world_overlay_view(
     // direction to the eye is measured from.
     tuile_wgpu::WorldOverlayView::new(view_proj, right, right.cross(fwd))
         .with_eye((camera.position - origin).as_vec3())
+}
+
+/// The wall's present, Unix seconds UTC.
+pub(crate) fn wall_seconds() -> f64 {
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64())
 }
 
 #[cfg(test)]

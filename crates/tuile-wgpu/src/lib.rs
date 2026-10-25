@@ -34,7 +34,10 @@ pub use prepare::{
 pub use pump::{ContentPump, Drawn, Resolution, STITCH_SLIDE_FRAMES, UPLOAD_SHARE_PERMILLE};
 pub use readback::Readback;
 pub use renderer::{sky_wgsl, LineVertex, TileRenderer, ViewUniform};
-pub use sky::{ecef_of, SkyFrame, LIGHT_INTERVAL, LIGHT_SUN_STEP};
+pub use sky::{
+    ecef_of, Atmosphere, AtmosphereConfig, Bodies, Lights, SkyFrame, SkyView, LIGHT_INTERVAL,
+    LIGHT_SUN_STEP,
+};
 pub use surface::{
     draw_to_surface, draw_to_texture, preferred_format, surface_format, FrameOnSurface,
     FrameOnTexture, FramePass, Presented, SurfaceFormat,

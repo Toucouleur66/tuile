@@ -77,6 +77,13 @@
 //! out for 16:9 and drawn into a tall window is not the film's HUD. Outside
 //! the picture is a plain clear; inside it the ground is drawn in full.
 //!
+//! # The scene's clock
+//!
+//! [`HostFrame::atmosphere`]'s clock is the instant the frame is lit for, as a start, an
+//! offset and a rate: a replay sets it to its own film's time, a page to an
+//! hour a person picked. The sun, the Moon, the stars and the light on every
+//! point of the globe follow it.
+//!
 //! # One contract, two shells
 //!
 //! The same trait is handed to the native embedding and to the web start, so a
@@ -424,6 +431,16 @@ pub struct HostFrame<'a> {
     /// The drawn frame's size in device pixels — the whole frame, bars
     /// included when the camera is held to a fixed aspect.
     pub viewport: (u32, u32),
+    /// The physical atmosphere: on or off, where its lights come from
+    /// (the real sun and Moon, a world's own, or directions the host sets),
+    /// its air, its look, and its clock — the instant this frame is lit for
+    /// is `atmosphere.clock.at(wall)`. A host sets any of it, every frame if
+    /// it likes ([`tuile_wgpu::Atmosphere`]); a host that leaves it alone
+    /// leaves it as the viewer's flags and keys set it — the Earth, the
+    /// present, in real time.
+    pub atmosphere: &'a mut tuile_wgpu::Atmosphere,
+    /// The wall's present, Unix seconds UTC: what the clock's methods take.
+    pub wall: f64,
     /// The relief the viewer itself stands on, read through
     /// [`Self::ground_at`].
     ///
@@ -602,6 +619,8 @@ mod tests {
             camera: &mut camera,
             preload: &mut preload,
             overlays: &mut overlays,
+            atmosphere: &mut tuile_wgpu::Atmosphere::new(Default::default(), 0.0, glam::DVec3::X),
+            wall: 0.0,
             ground: None,
             viewport: (1920, 1080),
         };
@@ -624,6 +643,8 @@ mod tests {
             camera: &mut camera,
             preload: &mut preload,
             overlays: &mut overlays,
+            atmosphere: &mut tuile_wgpu::Atmosphere::new(Default::default(), 0.0, glam::DVec3::X),
+            wall: 0.0,
             ground: None,
             viewport: (1920, 1080),
         };
@@ -638,6 +659,8 @@ mod tests {
             camera: &mut camera,
             preload: &mut preload,
             overlays: &mut overlays,
+            atmosphere: &mut tuile_wgpu::Atmosphere::new(Default::default(), 0.0, glam::DVec3::X),
+            wall: 0.0,
             ground: None,
             viewport: (0, 0),
         };
@@ -836,6 +859,8 @@ mod tests {
             camera: &mut camera,
             preload: &mut preload,
             overlays: &mut overlays,
+            atmosphere: &mut tuile_wgpu::Atmosphere::new(Default::default(), 0.0, glam::DVec3::X),
+            wall: 0.0,
             ground: Some(&ridge),
             viewport: (1920, 1080),
         };
@@ -854,6 +879,8 @@ mod tests {
             camera: &mut camera,
             preload: &mut preload,
             overlays: &mut overlays,
+            atmosphere: &mut tuile_wgpu::Atmosphere::new(Default::default(), 0.0, glam::DVec3::X),
+            wall: 0.0,
             ground: None,
             viewport: (1920, 1080),
         };
@@ -872,6 +899,8 @@ mod tests {
             camera: &mut camera,
             preload: &mut preload,
             overlays: &mut overlays,
+            atmosphere: &mut tuile_wgpu::Atmosphere::new(Default::default(), 0.0, glam::DVec3::X),
+            wall: 0.0,
             ground: None,
             viewport: (1000, 1000),
         };

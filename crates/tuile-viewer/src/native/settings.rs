@@ -60,27 +60,28 @@ pub(crate) fn imagery_compression(
     }
 }
 
-/// The instant the scene is lit for, UTC seconds since the Unix epoch.
-///
-/// `TUILE_LIT_AT` overrides it, so a session can be pinned to a stated moment —
-/// which is the only way two runs, or two machines, can be compared. Without it
-/// the answer is "now", and "now" is never the same twice.
-///
-/// Seconds rather than a formatted date because this crate has no calendar in
-/// it and adding one to parse a debugging knob would be the wrong trade. `date
-/// -u -d '2024-06-21 06:00' +%s` produces the number.
-pub(crate) fn lit_at() -> anyhow::Result<f64> {
+/// The scene's clock: what the command line said (`--time`, `--time-offset`,
+/// `--time-rate`), or — where it named no instant — `TUILE_LIT_AT`, UTC
+/// seconds since the Unix epoch, a session pinned to a stated moment for
+/// comparing two runs. Neither: the present, in real time.
+pub(crate) fn clock(
+    flags: tuile_atmosphere::ClockSettings,
+) -> anyhow::Result<tuile_atmosphere::ClockSettings> {
+    if flags.start != tuile_atmosphere::Start::Now {
+        return Ok(flags);
+    }
     if let Ok(pinned) = std::env::var("TUILE_LIT_AT") {
         let seconds: f64 = pinned
             .trim()
             .parse()
             .map_err(|_| anyhow::anyhow!("TUILE_LIT_AT must be UTC seconds, got {pinned:?}"))?;
         tracing::info!("scene lit for the instant TUILE_LIT_AT={seconds}");
-        return Ok(seconds);
+        return Ok(tuile_atmosphere::ClockSettings {
+            start: tuile_atmosphere::Start::At(seconds),
+            ..flags
+        });
     }
-    Ok(web_time::SystemTime::now()
-        .duration_since(web_time::UNIX_EPOCH)?
-        .as_secs_f64())
+    Ok(flags)
 }
 
 /// Which level is held in memory for the whole session, from `TUILE_PIN_LEVEL`.

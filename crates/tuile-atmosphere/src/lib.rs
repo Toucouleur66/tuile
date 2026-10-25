@@ -4,6 +4,7 @@
 #![doc = include_str!("../README.md")]
 
 pub mod aerial;
+pub mod clock;
 #[cfg(feature = "wgpu")]
 pub mod gpu;
 pub mod hillaire;
@@ -16,6 +17,7 @@ pub mod sun;
 pub mod tuning;
 
 pub use aerial::{AerialAir, AerialPerspective, WGSL};
+pub use clock::{ClockSettings, SceneClock, Start};
 pub use hillaire::{Calibration, LutAtmosphere, SkyLight};
 #[allow(deprecated)]
 pub use illumination::MAX_ADAPTATION_EV;

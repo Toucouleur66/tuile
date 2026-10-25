@@ -107,6 +107,9 @@ export async function createViewer(container, options) {
     rememberView: o.rememberView ?? true,
     decodeWorkers: o.decodeWorkers,
     imageryCompression: o.imageryCompression ?? "off",
+    time: o.time,
+    timeOffset: o.timeOffset,
+    timeRate: o.timeRate,
   };
 
   const listeners = new Map(EVENTS.map((kind) => [kind, new Set()]));

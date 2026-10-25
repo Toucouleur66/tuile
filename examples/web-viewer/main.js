@@ -20,6 +20,11 @@ const PHOTOGRAPHY = "© Microsoft and its data suppliers";
 const params = new URLSearchParams(location.search);
 const backend = params.get("backend") ?? "auto";
 const imageryCompression = params.get("compression") ?? "off";
+// `?time=sunset&timeOffset=-30m&timeRate=30`: the scene's clock, as the
+// package's `time`, `timeOffset` and `timeRate` (and the viewer's flags).
+const time = params.get("time") ?? undefined;
+const timeOffset = params.get("timeOffset") ?? undefined;
+const timeRate = params.has("timeRate") ? Number(params.get("timeRate")) : undefined;
 
 /** The sources by address the query names, or none. */
 function addressed() {
@@ -58,6 +63,9 @@ try {
     name: "Tuile",
     backend,
     imageryCompression,
+    time,
+    timeOffset,
+    timeRate,
     view: view(),
     sources: addressed() ?? {
       catalog: { url: "/catalog/" },

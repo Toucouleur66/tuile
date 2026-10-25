@@ -22,7 +22,7 @@ use tuile_core::geo::{ecef_to_geodetic, enu_frame, geodetic_to_ecef, Geodetic};
 use tuile_terrain::{fill_content, GeographicTilingScheme, TileCoord};
 use tuile_wgpu::{
     draw_to_texture, prepare, view_proj_from_world, FrameOnTexture, FrameTargets, GpuContext,
-    PreparedTile, Readback, SkyFrame, TileRenderer, ViewUniform,
+    PreparedTile, Readback, SkyView, TileRenderer, ViewUniform,
 };
 
 const WIDTH: u32 = 384;
@@ -255,6 +255,19 @@ impl Picture {
 /// One picture of `tiles` from `eye` at `instant`, through the viewer's
 /// frame, with the physical atmosphere on — a renderer of its own, so that
 /// its light is this instant's and no other's.
+fn view_of(eye: &Eye, origin: DVec3) -> SkyView {
+    SkyView {
+        eye: eye.at,
+        render_origin: origin,
+        forward: eye.forward,
+        up: eye.up,
+        fov_y: eye.fov_y,
+        aspect: f64::from(WIDTH) / f64::from(HEIGHT),
+        height_px: HEIGHT,
+        ground_height: 0.0,
+    }
+}
+
 fn shoot(
     gpu: &GpuContext,
     tiles: &[PreparedTile],
@@ -263,9 +276,28 @@ fn shoot(
     instant: f64,
     name: &str,
 ) -> Picture {
+    shoot_frame(
+        gpu,
+        tiles,
+        origin,
+        eye,
+        view_of(&eye, origin).at(instant, 0.0),
+        name,
+    )
+}
+
+/// One picture under `frame`'s sky.
+fn shoot_frame(
+    gpu: &GpuContext,
+    tiles: &[PreparedTile],
+    origin: DVec3,
+    eye: Eye,
+    frame: tuile_wgpu::SkyFrame,
+    name: &str,
+) -> Picture {
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let mut renderer = TileRenderer::new(gpu, format);
-    let sun = tuile_atmosphere::Sun::at_unix_seconds(instant);
+    let sun = tuile_atmosphere::Sun::from_direction(frame.bodies.to_sun);
     let travel = sun.light_travel_direction().as_vec3();
     renderer.set_view(
         &gpu.queue,
@@ -276,20 +308,7 @@ fn shoot(
             atmosphere: tuile_atmosphere::AerialPerspective::new(eye.at, origin, &sun, 0.0),
         },
     );
-    renderer.set_sky(
-        gpu,
-        Some(&SkyFrame {
-            instant,
-            eye: eye.at,
-            render_origin: origin,
-            forward: eye.forward,
-            up: eye.up,
-            fov_y: eye.fov_y,
-            aspect: f64::from(WIDTH) / f64::from(HEIGHT),
-            height_px: HEIGHT,
-            ground_height: 0.0,
-        }),
-    );
+    renderer.set_sky(gpu, Some(&frame));
     let targets = FrameTargets::new(gpu, format, (WIDTH, HEIGHT));
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("sky test"),
@@ -616,38 +635,28 @@ fn the_light_is_worked_out_as_the_sun_moves_and_no_more() {
     let Some(gpu) = gpu() else { return };
     let eye = eye_at(PIC_LON, PIC_LAT, 2_877.0, 270.0, -4.0);
     let origin = eye.at;
-    let frame = |instant: f64| SkyFrame {
-        instant,
-        eye: eye.at,
-        render_origin: origin,
-        forward: eye.forward,
-        up: eye.up,
-        fov_y: FOV_Y,
-        aspect: 1.5,
-        height_px: HEIGHT,
-        ground_height: 0.0,
-    };
+    let view = view_of(&eye, origin);
+    let frame = |instant: f64, wall: f64| view.at(instant, wall);
     let start = utc(2026, 6, 21, 18, 0);
     // Real time at sixty frames a second, for a simulated ten seconds: the
     // sun moves 0.04°, under the step.
     let mut renderer = TileRenderer::new(&gpu, wgpu::TextureFormat::Rgba8UnormSrgb);
     for f in 0..600 {
-        renderer.set_sky(&gpu, Some(&frame(start + f64::from(f) / 60.0)));
+        let wall = f64::from(f) / 60.0;
+        renderer.set_sky(&gpu, Some(&frame(start + wall, wall)));
     }
     let (lights, views) = renderer.sky_updates();
     assert_eq!((lights, views), (1, 1), "real time for ten seconds");
-    // A thousand times faster, frames as fast as they come: the sun moves
-    // degrees, and the light follows at most once an interval.
+    // A thousand times faster, at 240 frames a second: the sun moves
+    // degrees, and the light follows at most once an interval of the wall.
     let mut renderer = TileRenderer::new(&gpu, wgpu::TextureFormat::Rgba8UnormSrgb);
-    let began = web_time::Instant::now();
-    let mut f = 0u32;
-    while began.elapsed().as_secs_f64() < 1.2 {
-        renderer.set_sky(&gpu, Some(&frame(start + f64::from(f) * 1000.0 / 60.0)));
-        f += 1;
+    for f in 0..600 {
+        let wall = f64::from(f) / 240.0;
+        renderer.set_sky(&gpu, Some(&frame(start + wall * 1000.0, wall)));
     }
-    let elapsed = began.elapsed().as_secs_f64();
+    let elapsed = 600.0 / 240.0;
     let (lights, _) = renderer.sky_updates();
-    let allowed = 2 + (elapsed / tuile_wgpu::LIGHT_INTERVAL.as_secs_f64()) as u64;
+    let allowed = 2 + (elapsed / tuile_wgpu::LIGHT_INTERVAL) as u64;
     eprintln!("{lights} lights in {elapsed:.2} s at a thousand times");
     assert!(lights >= 2, "the light follows a moving sun");
     assert!(
@@ -662,24 +671,114 @@ fn the_light_is_worked_out_as_the_sun_moves_and_no_more() {
 fn a_jump_of_the_clock_is_lit_at_once() {
     let Some(gpu) = gpu() else { return };
     let eye = eye_at(PIC_LON, PIC_LAT, 2_877.0, 270.0, -4.0);
-    let frame = |instant: f64| SkyFrame {
-        instant,
-        eye: eye.at,
-        render_origin: eye.at,
-        forward: eye.forward,
-        up: eye.up,
-        fov_y: FOV_Y,
-        aspect: 1.5,
-        height_px: HEIGHT,
-        ground_height: 0.0,
-    };
+    let view = view_of(&eye, eye.at);
     let start = utc(2026, 6, 21, 18, 0);
     let mut renderer = TileRenderer::new(&gpu, wgpu::TextureFormat::Rgba8UnormSrgb);
-    renderer.set_sky(&gpu, Some(&frame(start)));
-    renderer.set_sky(&gpu, Some(&frame(start + 900.0)));
+    renderer.set_sky(&gpu, Some(&view.at(start, 0.0)));
+    renderer.set_sky(&gpu, Some(&view.at(start + 900.0, 1.0 / 60.0)));
     assert_eq!(renderer.sky_updates().0, 2, "the jump was lit at once");
     let s = renderer.sky_uniform().expect("on").sun;
     let drawn = DVec3::new(f64::from(s[0]), f64::from(s[1]), f64::from(s[2]));
     let ephemeris = tuile_atmosphere::Sun::at_unix_seconds(start + 900.0).direction_ecef;
     assert!(drawn.angle_between(ephemeris) < 1e-4);
+}
+
+/// A world of its own: a twenty-minute day. Its sun goes round once in
+/// twenty minutes of the clock, and a place on its equator has noon, then a
+/// night half a day later — the same per-point light, another sun.
+#[test]
+fn a_fictional_day_turns_its_sun_and_lights_its_ground() {
+    let Some(gpu) = gpu() else { return };
+    let lights = tuile_wgpu::Lights::orbit(1200.0);
+    // At the clock's zero the sun is over the prime meridian; a quarter of
+    // a day later, a quarter of a turn west.
+    let at = |t: f64| lights.at(t, DVec3::X).to_sun;
+    assert!(at(0.0).angle_between(DVec3::X) < 1e-9);
+    assert!(at(300.0).angle_between(DVec3::NEG_Y) < 1e-9);
+    assert!(at(1200.0).angle_between(DVec3::X) < 1e-9);
+    let eye = eye_at(0.0, 0.0, 2_000.0, 90.0, -6.0);
+    let origin = eye.at;
+    let mut tiles = globe(&gpu, origin, 2);
+    tiles.extend(ground_around(&gpu, origin, 0.0, 0.0, 9, 2, 0.0));
+    let mut ground = Vec::new();
+    for (name, t) in [("noon", 0.0), ("midnight", 600.0)] {
+        let atmosphere = tuile_wgpu::Atmosphere::new(
+            tuile_wgpu::AtmosphereConfig::default()
+                .enabled(true)
+                .with_lights(lights)
+                .with_clock(tuile_atmosphere::ClockSettings {
+                    start: tuile_atmosphere::Start::At(t),
+                    offset: 0.0,
+                    rate: 0.0,
+                }),
+            0.0,
+            eye.at,
+        );
+        let frame = atmosphere.frame(view_of(&eye, origin), 0.0);
+        let p = shoot_frame(&gpu, &tiles, origin, eye, frame, &format!("orbit-{name}"));
+        assert_eq!(p.black(HEIGHT / 2..HEIGHT, 2), 0, "{name}: black ground");
+        ground.push(p.luma_about(WIDTH / 2, HEIGHT * 3 / 4, 20));
+    }
+    eprintln!(
+        "a twenty-minute day: noon {:.1}, midnight {:.1}",
+        ground[0], ground[1]
+    );
+    assert!(ground[0] > 1.4 * ground[1]);
+}
+
+/// The same configuration and the same clock give the same sky, to the
+/// bit: no clock is read but the one handed in.
+#[test]
+fn the_same_clock_gives_the_same_sky() {
+    let Some(gpu) = gpu() else { return };
+    let eye = eye_at(PIC_LON, PIC_LAT, 2_877.0, 270.0, -4.0);
+    let view = view_of(&eye, eye.at);
+    let run = || {
+        let mut renderer = TileRenderer::new(&gpu, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let start = utc(2026, 6, 21, 19, 0);
+        for f in 0..120 {
+            let wall = f64::from(f) / 60.0;
+            renderer.set_sky(&gpu, Some(&view.at(start + wall * 120.0, wall)));
+        }
+        (renderer.sky_updates(), renderer.sky_uniform().expect("on"))
+    };
+    assert_eq!(run(), run());
+}
+
+/// A host's own directions: a sun fixed low in the west lights the slopes
+/// that face it and leaves the rest dark, whatever the clock.
+#[test]
+fn a_fixed_sun_is_where_the_host_puts_it() {
+    let Some(gpu) = gpu() else { return };
+    let eye = eye_at(PIC_LON, PIC_LAT, 2_877.0, 270.0, -4.0);
+    let enu = enu_frame(Geodetic {
+        lon: PIC_LON.to_radians(),
+        lat: PIC_LAT.to_radians(),
+        height: 0.0,
+    });
+    let to_sun = (-enu.x_axis * 0.99 + enu.z_axis * 0.1).normalize();
+    let lights = tuile_wgpu::Lights::fixed(to_sun, None);
+    let bodies = lights.at(0.0, eye.at);
+    assert!(bodies.to_sun.angle_between(to_sun) < 1e-12);
+    assert_eq!(
+        lights.at(1.0e9, eye.at),
+        bodies,
+        "the clock does not move it"
+    );
+    let origin = eye.at;
+    let (tiles, _, _) = pic_du_midi(&gpu);
+    let frame = tuile_wgpu::SkyFrame {
+        bodies,
+        view: view_of(&eye, origin),
+        wall: 0.0,
+    };
+    let p = shoot_frame(&gpu, &tiles, origin, eye, frame, "fixed-golden-hour");
+    assert_sun_is_the_ephemeris_of(&p, to_sun);
+    assert_eq!(p.black(HEIGHT / 2..HEIGHT, 3), 0, "black ground");
+}
+
+fn assert_sun_is_the_ephemeris_of(picture: &Picture, to_sun: DVec3) {
+    let s = picture.uniform.sun;
+    let drawn = DVec3::new(f64::from(s[0]), f64::from(s[1]), f64::from(s[2]));
+    assert!(drawn.angle_between(to_sun) < 1e-5);
 }
