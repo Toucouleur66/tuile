@@ -851,7 +851,7 @@ impl Default for SkyUniform {
 /// sky's own pass, drawn at `far_depth` — the far plane of the target's
 /// depth convention.
 ///
-/// Public for the same reason as [`ground_wgsl`]: a test, or a translator,
+/// Public for the same reason as the ground's shader: a test, or a translator,
 /// asks for exactly what the backend compiles.
 pub fn sky_wgsl(far_depth: f32) -> String {
     format!(

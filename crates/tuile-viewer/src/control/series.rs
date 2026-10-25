@@ -64,6 +64,9 @@ pub enum Action {
     Background,
     /// It comes back.
     Foreground,
+    /// The scene's clock set to `instant` (Unix seconds UTC), running at
+    /// `rate` from there: 0 holds it.
+    Time { instant: f64, rate: f64 },
 }
 
 /// How short of memory the system says it is.
@@ -148,6 +151,10 @@ pub(super) fn carry_out(run: &mut Headless, action: &Action) {
         Action::Go(view) => run.queue(Request::Do(view.command(None))),
         Action::Glide(view, seconds) => run.queue(Request::Do(view.command(Some(*seconds)))),
         Action::Url(url) => run.queue(Request::Url(url.clone())),
+        Action::Time { instant, rate } => run.queue(Request::Do(crate::steer::Command::Clock {
+            instant: *instant,
+            rate: *rate,
+        })),
         Action::Touch { id, finger, at } => run.app_mut().finger(*id, finger.phase(), px(*at)),
         Action::Wheel { amount, at } => {
             let app = run.app_mut();
