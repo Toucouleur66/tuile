@@ -321,8 +321,9 @@ impl Look {
 
     /// This look under `light`: its sun's place and strength and its dome
     /// are the light's, the light's exposure is added to its own and its
-    /// white balance laid over its own, and its air takes what the light says of it; contrast,
-    /// saturation, shadows and imagery stay the look's. A light whose
+    /// white balance laid over its own, and its air takes what the light says of it; its
+    /// saturation is scaled by the light's ([`FrameLight::saturation`]); contrast,
+    /// shadows and imagery stay the look's. A light whose
     /// direction has no length leaves the sun where the look has it.
     pub fn lit_by(self, light: FrameLight) -> Self {
         let lit = &light.illumination;
@@ -341,6 +342,13 @@ impl Look {
                 (haze, _) => haze,
             },
             turbidity: light.air.turbidity.or(self.turbidity),
+            // `1` is the look's own, to the bit: a product with one is the
+            // value it was.
+            saturation: if light.saturation == 1.0 {
+                self.saturation
+            } else {
+                self.saturation * light.saturation
+            },
             ..self
         }
     }
@@ -354,10 +362,12 @@ impl Look {
 /// a sun moves across a film rather than jumping between the segments it is
 /// rendered in. One light a frame, for both eyes of a stereo frame.
 ///
-/// The film's grade is not the light's: contrast and saturation stay the
-/// look's, and the light's exposure is *added* to the look's — a camera's
-/// automatic exposure on top of the film's
-/// ([`ReferenceIllumination::exposure_offset_ev`]).
+/// The film's grade is not the light's: contrast stays the look's, the
+/// light's exposure is *added* to the look's — a camera's automatic exposure
+/// on top of the film's ([`ReferenceIllumination::exposure_offset_ev`]) —
+/// and its [`FrameLight::saturation`] *scales* the look's, `1` changing
+/// nothing: a host fades a frame to black and white (a film's end credits)
+/// without touching the grade every other frame is drawn with.
 ///
 /// Without a physical atmosphere ([`Look::atmosphere`]), the renderer reads
 /// of the sky's irradiance only its first term
@@ -373,6 +383,11 @@ pub struct FrameLight {
     /// The frame's instant, Unix seconds UTC, when the host states it:
     /// what turns the stars of a physical sky. `None`: no stars.
     pub instant: Option<f64>,
+    /// What the frame does to the look's saturation, as a factor: `1`
+    /// leaves it, `0` draws the picture in black and white. The ground and
+    /// the sky only: overlays are laid over the graded picture and keep
+    /// their own colours, which is the host's to grey if it wants.
+    pub saturation: f32,
 }
 
 /// What a host may say of a frame's air; what it leaves unsaid is the
@@ -394,6 +409,7 @@ impl FrameLight {
             illumination,
             air,
             instant: None,
+            saturation: 1.0,
         }
     }
 
@@ -401,6 +417,15 @@ impl FrameLight {
     pub fn with_instant(self, instant: f64) -> Self {
         Self {
             instant: Some(instant),
+            ..self
+        }
+    }
+
+    /// With the look's saturation scaled by `factor` on this frame
+    /// ([`Self::saturation`]).
+    pub fn with_saturation(self, factor: f32) -> Self {
+        Self {
+            saturation: factor,
             ..self
         }
     }
@@ -415,6 +440,7 @@ impl FrameLight {
             ),
             air: FrameAir::default(),
             instant: None,
+            saturation: 1.0,
         }
     }
 }
@@ -432,6 +458,18 @@ pub fn blender_sun(euler_xyz: Vec3) -> Vec3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_frames_saturation_scales_the_looks_and_one_leaves_it() {
+        let look = Look {
+            saturation: 1.3,
+            ..Look::default()
+        };
+        let light = FrameLight::of(&look);
+        assert_eq!(look.lit_by(light).saturation.to_bits(), 1.3f32.to_bits());
+        assert_eq!(look.lit_by(light.with_saturation(0.0)).saturation, 0.0);
+        assert!((look.lit_by(light.with_saturation(0.5)).saturation - 0.65).abs() < 1e-6);
+    }
 
     #[test]
     fn a_frames_light_replaces_the_looks_light_and_nothing_else() {
