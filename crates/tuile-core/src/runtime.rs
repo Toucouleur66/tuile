@@ -804,6 +804,13 @@ struct State {
     /// The decoded copies the budget counts (its decoded tier): delivered
     /// from here, again after an eviction, until the budget releases them.
     decoded: BTreeMap<ResourceId, (Generation, ResourceContent)>,
+    /// The steepest ground of each terrain tile whose mesh has landed, as
+    /// the cosine of its steepest face against the globe's up there (see
+    /// [`steepest_ground`]): what lets a slope's imagery need be read square.
+    /// Kept once measured, for as long as the session: a tile still drawn
+    /// after its decoded copy is released keeps its need, and an entry is a
+    /// few bytes.
+    steepest: HashMap<TileId, f64>,
     /// What the host handed the budget since the last step, for its record.
     events: Vec<BudgetEvent>,
     /// The loader's epoch the drapes were last refreshed for.
@@ -857,6 +864,7 @@ impl State {
             ranks: crate::offload::LoadRanks::default(),
             presence: std::cell::RefCell::default(),
             decoded: BTreeMap::new(),
+            steepest: HashMap::new(),
             events: Vec::new(),
             epoch: 0,
             views: Vec::new(),
@@ -966,6 +974,9 @@ impl State {
             Ok(fetched) => {
                 let (content, cost) = match fetched {
                     Fetched::Mesh(Loaded::Content(c)) => {
+                        if let (ResourceId::Mesh(tile), Some(cos)) = (r, steepest_ground(&c)) {
+                            self.steepest.insert(tile, cos);
+                        }
                         let cost = c.cost();
                         (ResourceContent::Mesh(Arc::new(c)), cost)
                     }
@@ -1050,7 +1061,13 @@ impl State {
     /// One tile's need, over every view: the largest screen-space error and
     /// centrality, the smallest distance, and the finest imagery footprint
     /// any view gives it (spec §13.3).
-    fn need_of(host: &Host<'_>, views: &[ViewState], tau: f64, tile: TileId) -> Need {
+    fn need_of(
+        host: &Host<'_>,
+        steepest: &HashMap<TileId, f64>,
+        views: &[ViewState],
+        tau: f64,
+        tile: TileId,
+    ) -> Need {
         let tree = host.tree;
         let props = tree.properties(tile);
         let mut need = Need::new(tree.level(tile), tree.mesh_class(tile));
@@ -1076,11 +1093,18 @@ impl State {
             };
             centrality = centrality.max((1.0 + cos_off) / 2.0);
             if let Some(reach) = &reach {
-                // The surface's normal is the globe's up at the tile: a
-                // texel seen obliquely covers fewer pixels.
+                // A texel seen obliquely covers fewer pixels. The angle is
+                // the view ray's against the globe's up at the tile, eased by
+                // the tile's steepest ground: a slope facing the eye is seen
+                // square however grazing its up says (see `seen_on_slope`).
                 let up = center.normalize_or_zero();
                 let cos_obliquity = if len > 1e-9 && up != glam::DVec3::ZERO {
-                    (to / len).dot(up).abs().clamp(0.05, 1.0)
+                    let against_up = (to / len).dot(up).abs();
+                    match steepest.get(&tile) {
+                        Some(&steepest) => seen_on_slope(against_up, steepest),
+                        None => against_up,
+                    }
+                    .clamp(0.05, 1.0)
                 } else {
                     1.0
                 };
@@ -1185,7 +1209,7 @@ impl State {
         };
         let list = |set: &BTreeSet<TileId>, views: &[ViewState]| -> Vec<(TileId, Need)> {
             set.iter()
-                .map(|t| (*t, Self::need_of(host, views, tau, *t)))
+                .map(|t| (*t, Self::need_of(host, &self.steepest, views, tau, *t)))
                 .collect()
         };
         let views = &self.views;
@@ -1600,8 +1624,133 @@ impl State {
         Ok(())
     }
 }
+/// The cosine of a terrain tile's steepest face against the globe's up at
+/// the tile: 1 for flat ground, 0 for a vertical face. Skirts are left out
+/// (they are vertical by construction). `None` for content with no
+/// triangle to measure.
+///
+/// Computed with `+ − × ÷ √` and comparisons only, as the imagery level it
+/// feeds (`budget::imagery`): the same mesh gives the same value everywhere.
+fn steepest_ground(content: &DecodedTileContent) -> Option<f64> {
+    let origin = content.local_origin_ecef;
+    let up = origin.normalize_or_zero();
+    if up == glam::DVec3::ZERO {
+        return None;
+    }
+    let mut steepest: Option<f64> = None;
+    for mesh in &content.meshes {
+        let ground = crate::stitch::without_skirts(mesh, origin);
+        let at = |i: u32| glam::Vec3::from(ground.positions[i as usize]).as_dvec3();
+        for face in ground.indices.as_chunks::<3>().0 {
+            let normal = (at(face[1]) - at(face[0])).cross(at(face[2]) - at(face[0]));
+            let length = normal.length();
+            if length.is_nan() || length <= 0.0 {
+                continue;
+            }
+            let cos = (normal.dot(up) / length).abs().min(1.0);
+            steepest = Some(steepest.map_or(cos, |s| s.min(cos)));
+        }
+    }
+    steepest
+}
+
+/// The cosine of the angle a surface is seen at, for a view ray at
+/// `against_up` (its cosine against the globe's up) over ground whose
+/// steepest face is at `steepest` (its cosine against the same up).
+///
+/// The ground may tilt toward the eye by as much as its steepest face, so the
+/// ray's angle from up, `β`, is eased by that tilt, `α`: square (1) when
+/// `β ≤ α`, `cos(β − α)` beyond. Flat ground (`α = 0`) is seen at `β`, as
+/// before; a slope is never needed coarser than its steepest face allows.
+/// `cos(β − α) = cos β cos α + sin β sin α`, so no trigonometric function
+/// is called and the value is the same everywhere.
+fn seen_on_slope(against_up: f64, steepest: f64) -> f64 {
+    let (cos_b, cos_a) = (against_up.clamp(0.0, 1.0), steepest.clamp(0.0, 1.0));
+    if cos_b >= cos_a {
+        return 1.0;
+    }
+    let sin = |c: f64| (1.0 - c * c).max(0.0).sqrt();
+    (cos_b * cos_a + sin(cos_b) * sin(cos_a)).min(1.0)
+}
+
 #[cfg(test)]
 mod tests {
+    /// Flat ground is seen at the ray's own angle; ground whose steepest
+    /// face tilts as far as the ray is seen square; in between, the ray's
+    /// angle less the tilt.
+    #[test]
+    fn a_slope_eases_the_angle_its_imagery_is_needed_at() {
+        let deg = |d: f64| d.to_radians().cos();
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-12;
+        assert!(
+            near(super::seen_on_slope(deg(70.0), 1.0), deg(70.0)),
+            "flat: as before"
+        );
+        assert_eq!(
+            super::seen_on_slope(deg(70.0), deg(75.0)),
+            1.0,
+            "a face steeper than the ray: square"
+        );
+        assert_eq!(super::seen_on_slope(deg(70.0), deg(70.0)), 1.0);
+        assert!(
+            near(super::seen_on_slope(deg(70.0), deg(30.0)), deg(40.0)),
+            "70° less 30°"
+        );
+        assert!(
+            near(super::seen_on_slope(1.0, deg(30.0)), 1.0),
+            "straight down stays square"
+        );
+        for (b, a) in [(0.0, 0.0), (0.3, 0.9), (0.9, 0.3), (1.0, 0.0)] {
+            let s = super::seen_on_slope(b, a);
+            assert!(
+                s >= b && s <= 1.0,
+                "never coarser than the up alone says: {b} {a} -> {s}"
+            );
+        }
+    }
+
+    /// The steepest face of a mesh, against the globe's up at its origin:
+    /// a flat square reads 1, a ramp at 45° reads cos 45°, and a mesh with
+    /// no triangle reads nothing.
+    #[test]
+    fn a_tile_s_steepest_ground_is_its_steepest_face() {
+        use crate::content::{DecodedMesh, DecodedTileContent};
+        let origin = glam::DVec3::new(0.0, 0.0, 6_371_000.0);
+        let content = |positions: Vec<[f32; 3]>, indices: Vec<u32>| DecodedTileContent {
+            meshes: vec![DecodedMesh {
+                positions,
+                normals: None,
+                uvs: None,
+                indices,
+                material: Default::default(),
+            }],
+            textures: Vec::new(),
+            imagery: Vec::new(),
+            withheld_drape: None,
+            local_origin_ecef: origin,
+            transform_local: glam::Mat4::IDENTITY,
+        };
+        // Up is +z at this origin.
+        let flat = content(
+            vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0]],
+            vec![0, 1, 2],
+        );
+        assert_eq!(super::steepest_ground(&flat), Some(1.0));
+        let ramp = content(
+            vec![
+                [0.0, 0.0, 0.0],
+                [10.0, 0.0, 0.0],
+                [0.0, 10.0, 0.0],
+                [10.0, 10.0, 10.0],
+                [0.0, 20.0, 10.0],
+            ],
+            vec![0, 1, 2, 2, 3, 4],
+        );
+        let cos = super::steepest_ground(&ramp).expect("a ramp");
+        assert!(cos < 1.0 && cos > 0.0, "{cos}");
+        assert!(super::steepest_ground(&content(Vec::new(), Vec::new())).is_none());
+    }
+
     use super::*;
     use crate::budget::{Bytes, DrawSet, GeoRect, LayerId, LayerReach, Policy, Role};
     use crate::fetch::FsFetcher;

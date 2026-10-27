@@ -275,6 +275,13 @@ impl GpuContext {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            // Ground seen at a grazing angle is foreshortened along the view
+            // only: an isotropic filter picks the mip level of the long axis
+            // and blurs the short one, which is the whole of an oblique view
+            // over a plain. The film's albedo sampler takes 16 already
+            // (`tuile-film-gpu`), and the two pictures are compared. A device
+            // without anisotropic filtering filters as before.
+            anisotropy_clamp: 16,
             ..Default::default()
         });
         let white = device.create_texture_with_data(
