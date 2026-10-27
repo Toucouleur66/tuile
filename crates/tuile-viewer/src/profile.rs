@@ -73,6 +73,9 @@ pub(crate) struct Profile {
     /// The most imagery levels a drape may sit above its tile's terrain
     /// level: what one draw's slots hold (a 5 × 5 mosaic is two levels).
     pub imagery_over_terrain_cap: u32,
+    /// The largest drape side, texels, when a host asked for one: the
+    /// budget's own (2048) otherwise.
+    pub max_drape_side: Option<u32>,
     /// The traversal's screen-space error threshold, logical pixels (D-L1):
     /// a desktop's 1, the 2 device pixels it always drew at on a display of
     /// density 2; a phone's ⅔, the same 2 at its density 3. A window moved
@@ -140,6 +143,7 @@ impl Profile {
             pinned_level: crate::backdrop::BASE_LEVEL,
             max_local_reads: 32,
             imagery_over_terrain_cap: 2,
+            max_drape_side: None,
             sse_threshold: 1.0,
             load_timeout_s: 4.0,
             runtime_workers: cores,
@@ -173,6 +177,7 @@ impl Profile {
             max_local_reads: 8,
             // The low clamp drapes one level over its terrain, the rest two.
             imagery_over_terrain_cap: if gpu_bytes <= 192 * MIB { 1 } else { 2 },
+            max_drape_side: None,
             sse_threshold: 2.0 / 3.0,
             load_timeout_s: 4.0,
             runtime_workers: 2,
@@ -284,8 +289,21 @@ impl Profile {
         b.pinned_level = Some(self.pinned_level);
         b.max_local_reads = self.max_local_reads;
         b.imagery_over_terrain_cap = self.imagery_over_terrain_cap;
+        if let Some(side) = self.max_drape_side {
+            b.max_drape_side = side;
+        }
         b.load_timeout = tuile_core::budget::Micros((self.load_timeout_s * 1e6) as u64);
         b
+    }
+
+    /// This profile with the drapes a host asked for: how many imagery
+    /// levels above its terrain a drape may climb, and its largest side.
+    pub(crate) fn with_drapes(self, levels: Option<u32>, side: Option<u32>) -> Self {
+        Self {
+            imagery_over_terrain_cap: levels.unwrap_or(self.imagery_over_terrain_cap),
+            max_drape_side: side.or(self.max_drape_side),
+            ..self
+        }
     }
 
     /// This profile with the traversal's threshold a host asked for, when

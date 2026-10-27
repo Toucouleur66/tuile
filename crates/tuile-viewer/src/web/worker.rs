@@ -49,6 +49,8 @@ pub fn run_worker(make_decode_worker: Option<js_sys::Function>) {
                     decode_workers,
                     imagery,
                     maximum_screen_space_error,
+                    imagery_over_terrain_cap,
+                    max_drape_side,
                 }) => {
                     // The page speaks no more until it hears back; nothing else
                     // is listened for until the session decides who listens.
@@ -65,7 +67,8 @@ pub fn run_worker(make_decode_worker: Option<js_sys::Function>) {
                     wasm_bindgen_futures::spawn_local(async move {
                         let profile =
                             Profile::browser(profile == ProfileChoice::Handheld, device_memory)
-                                .with_threshold(maximum_screen_space_error);
+                                .with_threshold(maximum_screen_space_error)
+                                .with_drapes(imagery_over_terrain_cap, max_drape_side);
                         if let Err(reason) = start(sources, opening, profile, imagery).await {
                             tracing::error!("the session could not start: {reason}");
                             post(&ToPage::Failed { reason });

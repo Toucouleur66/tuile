@@ -53,6 +53,10 @@ pub(crate) struct Plan {
     pub compression: tuile_wgpu::ImageryCompression,
     /// The traversal's threshold the host asked for, if any.
     pub maximum_screen_space_error: Option<f64>,
+    /// The drapes the host asked for, if any: levels above the terrain, and
+    /// the largest side.
+    pub imagery_over_terrain_cap: Option<u32>,
+    pub max_drape_side: Option<u32>,
 }
 
 /// The worker, and the page's ear on it. Dropping the last handle ends both:
@@ -295,6 +299,8 @@ pub(crate) fn start(plan: &Plan) -> Launch {
             plan.decode_workers,
             plan.maximum_screen_space_error,
         );
+        let (imagery_over_terrain_cap, max_drape_side) =
+            (plan.imagery_over_terrain_cap, plan.max_drape_side);
         move |imagery: super::imagery::Held| {
             // A start-up given up on in the meantime has dropped its worker.
             if let Some(link) = link.upgrade() {
@@ -306,6 +312,8 @@ pub(crate) fn start(plan: &Plan) -> Launch {
                     decode_workers,
                     imagery,
                     maximum_screen_space_error,
+                    imagery_over_terrain_cap,
+                    max_drape_side,
                 });
             }
         }

@@ -60,6 +60,38 @@ pub(crate) struct Options {
     /// finite positive number is refused.
     #[serde(default, deserialize_with = "threshold")]
     pub maximum_screen_space_error: Option<f64>,
+    /// The most imagery levels a drape may climb above its tile's terrain
+    /// level, in place of the profile's (2 on a desktop). A host comparing
+    /// with a film asks for the film's (3). From 1 to 8.
+    #[serde(default, deserialize_with = "drape_levels")]
+    pub imagery_over_terrain_cap: Option<u32>,
+    /// The largest drape texture side, texels, in place of the budget's
+    /// (2048): what lets a drape climb more than three levels. A power of
+    /// two from 256 to 16384.
+    #[serde(default, deserialize_with = "drape_side")]
+    pub max_drape_side: Option<u32>,
+}
+
+/// A drape's levels above its terrain, when given: 1 to 8.
+fn drape_levels<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+    match Option::<u32>::deserialize(d)? {
+        Some(levels) if !(1..=8).contains(&levels) => Err(serde::de::Error::custom(format!(
+            "imageryOverTerrainCap is 1 to 8 levels, not {levels}"
+        ))),
+        levels => Ok(levels),
+    }
+}
+
+/// A drape's largest side, when given: a power of two, 256 to 16384.
+fn drape_side<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+    match Option::<u32>::deserialize(d)? {
+        Some(side) if !(side.is_power_of_two() && (256..=16_384).contains(&side)) => {
+            Err(serde::de::Error::custom(format!(
+                "maxDrapeSide is a power of two from 256 to 16384 texels, not {side}"
+            )))
+        }
+        side => Ok(side),
+    }
 }
 
 /// A threshold, when one is given: finite and positive.
@@ -489,6 +521,48 @@ mod tests {
             desktop.sse_threshold
         );
         assert_eq!(desktop.with_threshold(Some(3.0)).sse_threshold, 3.0);
+    }
+
+    #[test]
+    fn drapes_are_the_profile_s_unless_asked_and_only_within_bounds() {
+        let with = |field: &str, value: &str| {
+            options(&CATALOG.replacen(
+                r#""name": "Atlas","#,
+                &format!(r#""name": "Atlas", "{field}": {value},"#),
+                1,
+            ))
+        };
+        let plain = options(CATALOG).unwrap();
+        assert_eq!(
+            (plain.imagery_over_terrain_cap, plain.max_drape_side),
+            (None, None)
+        );
+        assert_eq!(
+            with("imageryOverTerrainCap", "3")
+                .unwrap()
+                .imagery_over_terrain_cap,
+            Some(3)
+        );
+        assert_eq!(
+            with("maxDrapeSide", "4096").unwrap().max_drape_side,
+            Some(4096)
+        );
+        for wrong in ["0", "9"] {
+            assert!(with("imageryOverTerrainCap", wrong).is_err(), "{wrong}");
+        }
+        for wrong in ["128", "3000", "32768"] {
+            assert!(with("maxDrapeSide", wrong).is_err(), "{wrong}");
+        }
+        let desktop = crate::profile::Profile::browser(false, None);
+        let asked = desktop.clone().with_drapes(Some(4), Some(4096));
+        assert_eq!(
+            (asked.imagery_over_terrain_cap, asked.max_drape_side),
+            (4, Some(4096))
+        );
+        let budget = asked.budget();
+        assert_eq!((budget.imagery_cap(), budget.max_drape_side), (4, 4096));
+        assert_eq!(desktop.clone().with_drapes(None, None), desktop);
+        assert_eq!(desktop.budget().imagery_cap(), 2, "a desktop's own");
     }
 
     #[test]

@@ -139,11 +139,13 @@ fn start_viewer_with(
         .unwrap_or_default();
     let handheld = options.profile == ProfileChoice::Handheld;
     let profile = Profile::browser(handheld, options.device_memory)
-        .with_threshold(options.maximum_screen_space_error);
+        .with_threshold(options.maximum_screen_space_error)
+        .with_drapes(options.imagery_over_terrain_cap, options.max_drape_side);
     tracing::info!(
         handheld,
         gpu_mib = profile.gpu_bytes >> 20,
         sse = profile.sse_threshold,
+        drape_levels = profile.imagery_over_terrain_cap,
         backend = ?options.backend,
         "browser profile"
     );
@@ -161,6 +163,8 @@ fn start_viewer_with(
         decode_workers: options.decode_workers,
         compression: options.imagery_compression,
         maximum_screen_space_error: options.maximum_screen_space_error,
+        imagery_over_terrain_cap: options.imagery_over_terrain_cap,
+        max_drape_side: options.max_drape_side,
     });
     // A new viewer, whose device has not yet said how it holds imagery.
     super::imagery::begin();
