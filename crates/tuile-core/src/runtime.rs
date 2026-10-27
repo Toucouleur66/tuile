@@ -1079,7 +1079,9 @@ impl State {
                 // The surface's normal is the globe's up at the tile: a
                 // texel seen obliquely covers fewer pixels.
                 let up = center.normalize_or_zero();
-                let cos_obliquity = if len > 1e-9 && up != glam::DVec3::ZERO {
+                let cos_obliquity = if !imagery_obliquity() {
+                    1.0
+                } else if len > 1e-9 && up != glam::DVec3::ZERO {
                     (to / len).dot(up).abs().clamp(0.05, 1.0)
                 } else {
                     1.0
@@ -2993,4 +2995,23 @@ mod tests {
             std::f64::consts::FRAC_PI_3,
         )
     }
+}
+
+/// Whether a tile's imagery need is lowered for the angle the tile is seen
+/// at (its centre's ray against the globe's up there): on unless
+/// `TUILE_IMAGERY_OBLIQUITY=off`. The globe's up is not the ground's: a
+/// slope facing the eye is seen square while its up says grazing, and its
+/// drape comes out up to two levels coarser than the slope needs. Off, every
+/// tile is needed as if seen square, as a viewer without the factor does.
+fn imagery_obliquity() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("TUILE_IMAGERY_OBLIQUITY")
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("off" | "0" | "false")
+        )
+    })
 }
