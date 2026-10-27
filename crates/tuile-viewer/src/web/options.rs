@@ -53,6 +53,23 @@ pub(crate) struct Options {
     /// See [`tuile_wgpu::ImageryCompression`].
     #[serde(default, deserialize_with = "compression")]
     pub imagery_compression: tuile_wgpu::ImageryCompression,
+    /// The traversal's threshold, in pixels: a tile is refined while its
+    /// error on screen passes it. Absent: the profile's own (1 on a desktop,
+    /// 2/3 on a phone). A host that previews another renderer's picture — a
+    /// film baked at a coarser threshold — asks for that one. Anything but a
+    /// finite positive number is refused.
+    #[serde(default, deserialize_with = "threshold")]
+    pub maximum_screen_space_error: Option<f64>,
+}
+
+/// A threshold, when one is given: finite and positive.
+fn threshold<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+    match Option::<f64>::deserialize(d)? {
+        Some(sse) if !(sse.is_finite() && sse > 0.0) => Err(serde::de::Error::custom(format!(
+            "maximumScreenSpaceError is a positive number of pixels, not {sse}"
+        ))),
+        sse => Ok(sse),
+    }
 }
 
 /// A compression named as the flag names it: `off`, `auto`, `bc7`, `astc`.
@@ -452,6 +469,28 @@ mod tests {
 
     /// Each compression the package documents reads as the flag's; anything
     /// else is refused, naming the four.
+    #[test]
+    fn the_threshold_is_the_profile_s_unless_asked_and_only_a_positive_one() {
+        let with = |value: &str| {
+            options(&CATALOG.replacen(
+                r#""name": "Atlas","#,
+                &format!(r#""name": "Atlas", "maximumScreenSpaceError": {value},"#),
+                1,
+            ))
+        };
+        assert_eq!(options(CATALOG).unwrap().maximum_screen_space_error, None);
+        assert_eq!(with("4.5").unwrap().maximum_screen_space_error, Some(4.5));
+        for wrong in ["0", "-2", "\"6\""] {
+            assert!(with(wrong).is_err(), "{wrong}");
+        }
+        let desktop = crate::profile::Profile::browser(false, None);
+        assert_eq!(
+            desktop.clone().with_threshold(None).sse_threshold,
+            desktop.sse_threshold
+        );
+        assert_eq!(desktop.with_threshold(Some(3.0)).sse_threshold, 3.0);
+    }
+
     #[test]
     fn imagery_compression_is_named() {
         use tuile_core::texels::BlockFormat;

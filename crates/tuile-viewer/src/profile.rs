@@ -288,6 +288,18 @@ impl Profile {
         b
     }
 
+    /// This profile with the traversal's threshold a host asked for, when
+    /// it asked for one.
+    pub(crate) fn with_threshold(self, sse: Option<f64>) -> Self {
+        match sse {
+            Some(sse_threshold) => Self {
+                sse_threshold,
+                ..self
+            },
+            None => self,
+        }
+    }
+
     /// The traversal's configuration for this profile: the reference
     /// interactive session at the profile's threshold.
     pub(crate) fn traversal(&self) -> tuile_core::traversal::Config {

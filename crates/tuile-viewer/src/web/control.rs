@@ -36,6 +36,10 @@ pub(crate) enum ToWorker {
         /// can hold it: see [`super::imagery`].
         #[serde(default)]
         imagery: super::imagery::Held,
+        /// The traversal's threshold the host asked for: see
+        /// `Options::maximum_screen_space_error`.
+        #[serde(default)]
+        maximum_screen_space_error: Option<f64>,
     },
     /// The sampled textures per stage the device reported: how many imagery
     /// tiles one drape may stack (`tuile_planetary::LayerBudget`). A count of

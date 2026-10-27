@@ -51,6 +51,8 @@ pub(crate) struct Plan {
     /// The host's choice of how imagery is held. Off, the session starts at
     /// once; otherwise it waits for the page's device to say what it holds.
     pub compression: tuile_wgpu::ImageryCompression,
+    /// The traversal's threshold the host asked for, if any.
+    pub maximum_screen_space_error: Option<f64>,
 }
 
 /// The worker, and the page's ear on it. Dropping the last handle ends both:
@@ -286,11 +288,12 @@ pub(crate) fn start(plan: &Plan) -> Launch {
     });
     let start = {
         let link = Rc::downgrade(&link);
-        let (sources, profile, device_memory, decode_workers) = (
+        let (sources, profile, device_memory, decode_workers, maximum_screen_space_error) = (
             plan.sources.clone(),
             plan.profile,
             plan.device_memory,
             plan.decode_workers,
+            plan.maximum_screen_space_error,
         );
         move |imagery: super::imagery::Held| {
             // A start-up given up on in the meantime has dropped its worker.
@@ -302,6 +305,7 @@ pub(crate) fn start(plan: &Plan) -> Launch {
                     device_memory,
                     decode_workers,
                     imagery,
+                    maximum_screen_space_error,
                 });
             }
         }

@@ -138,10 +138,12 @@ fn start_viewer_with(
         })
         .unwrap_or_default();
     let handheld = options.profile == ProfileChoice::Handheld;
-    let profile = Profile::browser(handheld, options.device_memory);
+    let profile = Profile::browser(handheld, options.device_memory)
+        .with_threshold(options.maximum_screen_space_error);
     tracing::info!(
         handheld,
         gpu_mib = profile.gpu_bytes >> 20,
+        sse = profile.sse_threshold,
         backend = ?options.backend,
         "browser profile"
     );
@@ -158,6 +160,7 @@ fn start_viewer_with(
         device_memory: options.device_memory,
         decode_workers: options.decode_workers,
         compression: options.imagery_compression,
+        maximum_screen_space_error: options.maximum_screen_space_error,
     });
     // A new viewer, whose device has not yet said how it holds imagery.
     super::imagery::begin();
