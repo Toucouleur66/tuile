@@ -1707,6 +1707,8 @@ pub fn exact_traversal(mut config: Config) -> Config {
 ///   cold frame's cost. `-1` leaves no floor.
 /// - `TUILE_IMAGERY_BOOST` is how many levels a drape may climb above its
 ///   terrain tile (`imagery_over_terrain_cap`).
+/// - `TUILE_MAX_DRAPE_SIDE` is the largest drape composed, texels
+///   (`max_drape_side`, 2048): what lets the boost climb past three levels.
 /// - `TUILE_LOAD_TIMEOUT_S` is how long one load may take before the
 ///   session ends on it (`load_timeout`, 120 s in `BudgetConfig::batch`):
 ///   set it to cover the retry envelope of the client the tiles come
@@ -1729,6 +1731,16 @@ pub fn exact_budget(mut budget: BudgetConfig) -> BudgetConfig {
         .parse::<u32>()
     {
         budget.imagery_over_terrain_cap = cap;
+    }
+    // The largest drape a bake composes, texels: 2048 unless said, which
+    // holds three imagery levels above the terrain whatever
+    // `TUILE_IMAGERY_BOOST` asks. A power of two, 256 to 16384.
+    if let Some(side) = std::env::var("TUILE_MAX_DRAPE_SIDE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|side| side.is_power_of_two() && (256..=16_384).contains(side))
+    {
+        budget.max_drape_side = side;
     }
     if let Some(seconds) = std::env::var("TUILE_LOAD_TIMEOUT_S")
         .ok()
