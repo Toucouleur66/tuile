@@ -9,6 +9,16 @@ use crate::math::Obb;
 use glam::{DMat3, DVec3, Mat4};
 use std::f64::consts::{FRAC_PI_2, PI};
 
+// The ellipsoid's trigonometry is libm's, not the platform's: Apple's libm and
+// glibc differ in the last bits of `sin`/`cos`/`atan2`, and a position made on
+// one must be the same position, bit for bit, on another (a bake recorded on
+// the builder and checked on a Mac).
+use libm::{atan2, cos, sin};
+
+fn sin_cos(x: f64) -> (f64, f64) {
+    (sin(x), cos(x))
+}
+
 /// Anti-jitter model matrix (the second half of the protocol): places a tile —
 /// whose vertices are stored relative to `origin_ecef`, with intrinsic
 /// `transform_local` — into a frame rebased on `render_origin`, as the f32
@@ -41,8 +51,8 @@ pub struct Geodetic {
 
 /// Geodetic → ECEF (EPSG:4978).
 pub fn geodetic_to_ecef(g: Geodetic) -> DVec3 {
-    let (sin_lat, cos_lat) = g.lat.sin_cos();
-    let (sin_lon, cos_lon) = g.lon.sin_cos();
+    let (sin_lat, cos_lat) = sin_cos(g.lat);
+    let (sin_lon, cos_lon) = sin_cos(g.lon);
     // Prime vertical radius of curvature.
     let n = WGS84_A / (1.0 - E2 * sin_lat * sin_lat).sqrt();
     DVec3::new(
@@ -56,7 +66,7 @@ pub fn geodetic_to_ecef(g: Geodetic) -> DVec3 {
 /// Converges well below 1e-9 m for any point from the geocenter vicinity
 /// to satellite altitudes.
 pub fn ecef_to_geodetic(p: DVec3) -> Geodetic {
-    let lon = p.y.atan2(p.x);
+    let lon = atan2(p.y, p.x);
     let rho = (p.x * p.x + p.y * p.y).sqrt();
 
     // On the axis itself the iteration below divides zero by zero — `z / ρ`
@@ -71,22 +81,25 @@ pub fn ecef_to_geodetic(p: DVec3) -> Geodetic {
     }
 
     // Bowring's initial guess.
-    let beta = (p.z * WGS84_A).atan2(rho * WGS84_B);
-    let (sin_b, cos_b) = beta.sin_cos();
+    let beta = atan2(p.z * WGS84_A, rho * WGS84_B);
+    let (sin_b, cos_b) = sin_cos(beta);
     let ep2 = (WGS84_A * WGS84_A - WGS84_B * WGS84_B) / (WGS84_B * WGS84_B);
-    let mut lat = (p.z + ep2 * WGS84_B * sin_b.powi(3)).atan2(rho - E2 * WGS84_A * cos_b.powi(3));
+    let mut lat = atan2(
+        p.z + ep2 * WGS84_B * sin_b.powi(3),
+        rho - E2 * WGS84_A * cos_b.powi(3),
+    );
 
     // A few fixed-point iterations to drive the residual to f64 noise.
     for _ in 0..4 {
-        let sin_lat = lat.sin();
+        let sin_lat = sin(lat);
         let n = WGS84_A / (1.0 - E2 * sin_lat * sin_lat).sqrt();
-        let h = rho / lat.cos() - n;
-        lat = (p.z / rho).atan2(1.0 - E2 * n / (n + h));
+        let h = rho / cos(lat) - n;
+        lat = atan2(p.z / rho, 1.0 - E2 * n / (n + h));
     }
-    let sin_lat = lat.sin();
+    let sin_lat = sin(lat);
     let n = WGS84_A / (1.0 - E2 * sin_lat * sin_lat).sqrt();
     let height = if rho > 1.0 {
-        rho / lat.cos() - n
+        rho / cos(lat) - n
     } else {
         // Near the poles cos(lat) ~ 0: use the Z form.
         p.z.abs() / sin_lat.abs() - n * (1.0 - E2)
@@ -96,8 +109,8 @@ pub fn ecef_to_geodetic(p: DVec3) -> Geodetic {
 
 /// Local east/north/up unit vectors at a geodetic position.
 pub fn enu_frame(g: Geodetic) -> DMat3 {
-    let (sin_lat, cos_lat) = g.lat.sin_cos();
-    let (sin_lon, cos_lon) = g.lon.sin_cos();
+    let (sin_lat, cos_lat) = sin_cos(g.lat);
+    let (sin_lon, cos_lon) = sin_cos(g.lon);
     let east = DVec3::new(-sin_lon, cos_lon, 0.0);
     let north = DVec3::new(-sin_lat * cos_lon, -sin_lat * sin_lon, cos_lat);
     let up = DVec3::new(cos_lat * cos_lon, cos_lat * sin_lon, sin_lat);

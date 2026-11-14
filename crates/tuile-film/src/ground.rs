@@ -557,14 +557,19 @@ fn geodetic(p: DVec3) -> Geodetic {
     use tuile_core::geo::{WGS84_A as A, WGS84_B as B};
     let e2 = 1.0 - (B * B) / (A * A);
     let ep2 = (A * A - B * B) / (B * B);
-    let rho = p.x.hypot(p.y);
-    let beta = (p.z * A).atan2(rho * B);
-    let (sin_b, cos_b) = beta.sin_cos();
-    let lat = (p.z + ep2 * B * sin_b * sin_b * sin_b).atan2(rho - e2 * A * cos_b * cos_b * cos_b);
-    let (sin_lat, cos_lat) = lat.sin_cos();
+    // libm, as `tuile_core::geo`: the same bits on every target.
+    use libm::{atan2, cos, hypot, sin};
+    let rho = hypot(p.x, p.y);
+    let beta = atan2(p.z * A, rho * B);
+    let (sin_b, cos_b) = (sin(beta), cos(beta));
+    let lat = atan2(
+        p.z + ep2 * B * sin_b * sin_b * sin_b,
+        rho - e2 * A * cos_b * cos_b * cos_b,
+    );
+    let (sin_lat, cos_lat) = (sin(lat), cos(lat));
     let n = A / (1.0 - e2 * sin_lat * sin_lat).sqrt();
     Geodetic {
-        lon: p.y.atan2(p.x),
+        lon: atan2(p.y, p.x),
         lat,
         // Only ever compared with `LOWEST_M`: kilometres from any doubt.
         height: rho * cos_lat + p.z * sin_lat - A * A / n,
@@ -644,10 +649,11 @@ fn span(positions: &[[f32; 3]], places: &[Geodetic], t: &[u32; 3]) -> Option<[f6
     if !placed {
         return None;
     }
-    let margin =
-        2.0 * poleward.tan() * longest * longest / (8.0 * RADIUS_M) + 3.0e-6 * longest + SLACK_M;
+    let margin = 2.0 * libm::tan(poleward) * longest * longest / (8.0 * RADIUS_M)
+        + 3.0e-6 * longest
+        + SLACK_M;
     let lat = margin / RADIUS_M;
-    let lon = margin / (RADIUS_M * (poleward + lat).cos());
+    let lon = margin / (RADIUS_M * libm::cos(poleward + lat));
     Some([
         p.lon.min(q.lon).min(r.lon) - lon,
         p.lon.max(q.lon).max(r.lon) + lon,
@@ -664,7 +670,8 @@ fn line_down(lon: f64, lat: f64) -> (DVec3, DVec3) {
         lat,
         height: ABOVE_M,
     });
-    let down = -DVec3::new(lat.cos() * lon.cos(), lat.cos() * lon.sin(), lat.sin());
+    use libm::{cos, sin};
+    let down = -DVec3::new(cos(lat) * cos(lon), cos(lat) * sin(lon), sin(lat));
     (top, down)
 }
 

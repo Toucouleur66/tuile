@@ -131,7 +131,7 @@ fn inner_footprint(p: &TileProperties) -> Option<GeoRect> {
     let g = crate::geo::ecef_to_geodetic(center);
     // The square inscribed in the disc, as angles at the volume's centre.
     let half = radius * std::f64::consts::FRAC_1_SQRT_2 / r;
-    let cos_lat = g.lat.cos();
+    let cos_lat = libm::cos(g.lat);
     if cos_lat <= 1e-6 {
         return None;
     }

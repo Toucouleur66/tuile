@@ -164,7 +164,7 @@ pub fn terrain_tile_factor(
         / width_m(Grid::Geographic, 0, 0, 0);
     let threshold =
         traversal.maximum_screen_space_error * (1.0 - traversal.refine_hysteresis.clamp(0.0, 0.9));
-    let rho = error_per_width * viewport_height_px / (threshold * 2.0 * (fovy_rad / 2.0).tan());
+    let rho = error_per_width * viewport_height_px / (threshold * 2.0 * libm::tan(fovy_rad / 2.0));
     FACTOR_MARGIN * (2.0 * rho + 2.0 * std::f64::consts::SQRT_2)
 }
 /// A bake has no use for other writers' newest deltas: it reads its scene

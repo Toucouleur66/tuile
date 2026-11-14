@@ -26,6 +26,8 @@ tuile-overlay = { version = "0.17.1", path = "../tuile-overlay" }
 wgpu = { workspace = true }
 
 [dev-dependencies]
+# The made-up relief of tuile-terrain's test support: libm's sin/cos.
+libm = { workspace = true }
 image = { workspace = true }
 # The made-up terrain of tests/no_seams.rs.
 tuile-terrain = { version = "0.17.1", path = "../tuile-terrain" }

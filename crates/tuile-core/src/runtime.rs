@@ -1318,7 +1318,7 @@ impl State {
         // The tile's own threshold, as the traversal refines against it.
         let tau = tau * tree.sse_factor(tile);
         let excess = if sse > 0.0 && tau > 0.0 {
-            (sse / tau).log2().clamp(-16.0, 16.0)
+            libm::log2(sse / tau).clamp(-16.0, 16.0)
         } else {
             -16.0
         };

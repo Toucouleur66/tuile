@@ -299,7 +299,11 @@ impl SurfaceTile {
         });
         // The ellipsoid's normal there, unit: the line heights are measured
         // along.
-        let up = DVec3::new(lat.cos() * lon.cos(), lat.cos() * lon.sin(), lat.sin());
+        let up = DVec3::new(
+            libm::cos(lat) * libm::cos(lon),
+            libm::cos(lat) * libm::sin(lon),
+            libm::sin(lat),
+        );
         let from = ground + up * ABOVE_M;
         let mut nearest: Option<f64> = None;
         for &(mesh, first) in &index.triangles[start as usize..end as usize] {

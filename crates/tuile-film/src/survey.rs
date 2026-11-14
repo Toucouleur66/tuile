@@ -42,8 +42,8 @@ pub fn cameras(pack: &Pack<'_>, max: usize) -> Vec<CameraSample> {
                 lon_deg: g.lon.to_degrees(),
                 lat_deg: g.lat.to_degrees(),
                 height_m: g.height,
-                heading_deg: d.dot(enu.x_axis).atan2(d.dot(enu.y_axis)).to_degrees(),
-                pitch_deg: d.dot(enu.z_axis).clamp(-1.0, 1.0).asin().to_degrees(),
+                heading_deg: libm::atan2(d.dot(enu.x_axis), d.dot(enu.y_axis)).to_degrees(),
+                pitch_deg: libm::asin(d.dot(enu.z_axis).clamp(-1.0, 1.0)).to_degrees(),
                 fovy_deg: view.fovy_rad.to_degrees(),
             }
         })

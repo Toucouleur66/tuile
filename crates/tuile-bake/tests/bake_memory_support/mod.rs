@@ -159,8 +159,11 @@ pub fn pose(i: u32) -> tuile_tape::Frame {
     let pitch: f64 = knob("BAKE_MEMORY_PITCH", 0.45);
     let lat = LAT + f64::from(i) * 0.00036;
     let (p, l) = (lat.to_radians(), LON.to_radians());
-    let up = DVec3::new(p.cos() * l.cos(), p.cos() * l.sin(), p.sin());
-    let north = DVec3::new(-p.sin() * l.cos(), -p.sin() * l.sin(), p.cos());
+    // libm, not the platform's: the same bits on every target, so that a
+    // flight recorded on one is the same flight on another.
+    let (sp, cp, sl, cl) = (libm::sin(p), libm::cos(p), libm::sin(l), libm::cos(l));
+    let up = DVec3::new(cp * cl, cp * sl, sp);
+    let north = DVec3::new(-sp * cl, -sp * sl, cp);
     let eye = tuile_core::geo::geodetic_to_ecef(tuile_core::geo::Geodetic {
         lon: l,
         lat: p,
