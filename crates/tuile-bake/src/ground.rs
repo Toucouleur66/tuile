@@ -177,7 +177,9 @@ fn heights_allowed(rect: &GeoRect, origin: DVec3, place: [u16; 2], came: [f32; 3
         lat,
         height: 0.0,
     }) - origin;
-    let up = DVec3::new(lat.cos() * lon.cos(), lat.cos() * lon.sin(), lat.sin());
+    // libm, as `tuile_core::geo`: the same bits on every target.
+    let (sin_lat, cos_lat) = (libm::sin(lat), libm::cos(lat));
+    let up = DVec3::new(cos_lat * libm::cos(lon), cos_lat * libm::sin(lon), sin_lat);
     let (mut from, mut to) = (f64::NEG_INFINITY, f64::INFINITY);
     for axis in 0..3 {
         let t = came[axis];

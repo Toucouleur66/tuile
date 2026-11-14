@@ -129,7 +129,7 @@ impl Projection {
         let y = match self {
             Projection::WebMercator => {
                 let lat = g.lat.clamp(-MERCATOR_MAX_LAT, MERCATOR_MAX_LAT);
-                let merc = (FRAC_PI_4 + lat / 2.0).tan().ln();
+                let merc = libm::log(libm::tan(FRAC_PI_4 + lat / 2.0));
                 0.5 - merc / TAU
             }
             Projection::Geographic => 0.5 - g.lat / PI,
@@ -147,7 +147,7 @@ impl Projection {
         use std::f64::consts::{FRAC_PI_2, PI, TAU};
         let lon = x * TAU - PI;
         let lat = match self {
-            Projection::WebMercator => 2.0 * ((0.5 - y) * TAU).exp().atan() - FRAC_PI_2,
+            Projection::WebMercator => 2.0 * libm::atan(libm::exp((0.5 - y) * TAU)) - FRAC_PI_2,
             Projection::Geographic => (0.5 - y) * PI,
         };
         Geodetic {
@@ -385,13 +385,13 @@ impl TilingScheme {
     pub fn level_for_texel_spacing(&self, texel_spacing: f64, lat: f64) -> u32 {
         use std::f64::consts::TAU;
         let lat_factor = match self.projection {
-            Projection::WebMercator => lat.cos(),
+            Projection::WebMercator => libm::cos(lat),
             Projection::Geographic => 1.0,
         };
         let level_zero_spacing =
             WGS84_A * TAU * lat_factor / (self.tile_size as f64 * self.root_tiles_x as f64);
         let ratio = level_zero_spacing / texel_spacing.max(1.0e-3);
-        let level = ratio.log2().round().max(0.0) as u32;
+        let level = libm::log2(ratio).round().max(0.0) as u32;
         level.clamp(self.minimum_level, self.maximum_level)
     }
 

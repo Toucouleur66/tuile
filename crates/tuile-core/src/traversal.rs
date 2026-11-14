@@ -68,7 +68,7 @@ impl Fov {
     /// (width over height).
     pub fn symmetric(fovy_rad: f64, aspect: f64) -> Fov {
         let half = fovy_rad / 2.0;
-        let side = (aspect * half.tan()).atan();
+        let side = libm::atan(aspect * libm::tan(half));
         Fov {
             left: -side,
             right: side,
@@ -216,7 +216,7 @@ impl ViewState {
             scale: 1.0,
             frustum: Frustum::from_view_proj(&(proj * view)),
             sse_numerator_px: viewport_px.y,
-            sse_denominator: 2.0 * (fovy_rad / 2.0).tan(),
+            sse_denominator: 2.0 * libm::tan(fovy_rad / 2.0),
         }
     }
 
@@ -235,7 +235,7 @@ impl ViewState {
         // Each angle is widened by the culling margin, as `perspective`
         // widens its field of view; the focal below is not.
         let limit = std::f64::consts::FRAC_PI_2 * 0.98;
-        let widened = |a: f64| (a * (1.0 + CULL_MARGIN)).clamp(-limit, limit).tan();
+        let widened = |a: f64| libm::tan((a * (1.0 + CULL_MARGIN)).clamp(-limit, limit));
         let proj = off_center_rh(
             widened(fov.left),
             widened(fov.right),
@@ -245,8 +245,8 @@ impl ViewState {
             1.0e10,
         );
         // The focal of the sharper axis, so that neither is under-refined.
-        let across = viewport_px.x / (fov.right.tan() - fov.left.tan());
-        let high = viewport_px.y / (fov.up.tan() - fov.down.tan());
+        let across = viewport_px.x / (libm::tan(fov.right) - libm::tan(fov.left));
+        let high = viewport_px.y / (libm::tan(fov.up) - libm::tan(fov.down));
         Self {
             position,
             direction,

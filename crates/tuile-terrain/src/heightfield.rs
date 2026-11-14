@@ -479,7 +479,7 @@ impl Samples {
     fn normal(&self, i: i64, j: i64) -> [f32; 3] {
         let (lon, lat, _) = self.get(i, j);
         let (lon, lat) = (lon.to_radians(), lat.to_radians());
-        let east_metres = 2.0 * self.span_lon.to_radians() * WGS84_A * lat.cos();
+        let east_metres = 2.0 * self.span_lon.to_radians() * WGS84_A * libm::cos(lat);
         let north_metres = 2.0 * self.span_lat.to_radians() * WGS84_A;
         let rise_east = self.get(i + 1, j).2 - self.get(i - 1, j).2;
         let rise_north = self.get(i, j + 1).2 - self.get(i, j - 1).2;

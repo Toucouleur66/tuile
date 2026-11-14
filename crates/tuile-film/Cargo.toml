@@ -12,6 +12,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+# sin/cos/atan2 with the same bits on every target, as tuile-core's `geo`.
+libm = { workspace = true }
 glam = { workspace = true }
 thiserror = { workspace = true }
 tuile-atmosphere = { version = "0.17.1", path = "../tuile-atmosphere" }

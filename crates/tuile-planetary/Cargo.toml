@@ -29,6 +29,8 @@ tuile-terrain = { version = "0.17.1", path = "../tuile-terrain" }
 url = { workspace = true }
 
 [dev-dependencies]
+# The made-up relief of tuile-terrain's test support: libm's sin/cos.
+libm = { workspace = true }
 image = { workspace = true }
 # KTX 2.0 tiles for the stored-imagery jobs' tests.
 texcomp = { workspace = true }

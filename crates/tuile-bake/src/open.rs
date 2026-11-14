@@ -314,7 +314,7 @@ pub fn night_footprint(poses: &[tuile_tape::Frame]) -> std::collections::BTreeSe
         let g = tuile_core::geo::ecef_to_geodetic(glam::DVec3::from_array(pose.position));
         // The horizon's angle at the Earth's centre, and a margin so that a
         // tile just past it is kept.
-        let reach = (WGS84_A / (WGS84_A + g.height.max(0.0))).acos() + 0.05;
+        let reach = libm::acos(WGS84_A / (WGS84_A + g.height.max(0.0))) + 0.05;
         for y in 0..down {
             for x in 0..across {
                 let rect = scheme.tile_rect(ImageryCoord {
@@ -337,8 +337,9 @@ pub fn night_footprint(poses: &[tuile_tape::Frame]) -> std::collections::BTreeSe
                         rect.east
                     }
                 };
-                let cos = g.lat.sin() * lat.sin() + g.lat.cos() * lat.cos() * (lon - g.lon).cos();
-                if cos.clamp(-1.0, 1.0).acos() <= reach {
+                let cos = libm::sin(g.lat) * libm::sin(lat)
+                    + libm::cos(g.lat) * libm::cos(lat) * libm::cos(lon - g.lon);
+                if libm::acos(cos.clamp(-1.0, 1.0)) <= reach {
                     seen.insert((x, y));
                 }
             }

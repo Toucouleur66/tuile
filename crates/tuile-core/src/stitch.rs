@@ -266,7 +266,7 @@ impl Edges {
         if height.is_nan() || height <= 0.0 {
             return None;
         }
-        let level = (PI / height).log2().round();
+        let level = libm::log2(PI / height).round();
         if !(0.0..=40.0).contains(&level) {
             return None;
         }

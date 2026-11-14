@@ -44,7 +44,7 @@ pub fn on_screen_px(radius: f64, distance: f64, height_px: f64, fovy_rad: f64) -
     if nearest <= 0.0 {
         return f64::INFINITY;
     }
-    2.0 * radius * height_px / (nearest * 2.0 * (fovy_rad / 2.0).tan())
+    2.0 * radius * height_px / (nearest * 2.0 * libm::tan(fovy_rad / 2.0))
 }
 
 /// The levels at the large end of a drape's mip chain that a tile spanning

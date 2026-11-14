@@ -18,13 +18,17 @@ pub const LAT: f64 = 52.51;
 
 /// Metres over the ellipsoid: hills a couple of kilometres across and 120 m
 /// high, with smaller ones of 35 m on them.
+///
+/// Made with libm rather than the platform's `sin`/`cos`: the same relief,
+/// bit for bit, on every target.
 pub fn relief(lon: f64, lat: f64) -> f64 {
-    let x = lon * WGS84_A * LAT.to_radians().cos();
+    use libm::{cos, sin};
+    let x = lon * WGS84_A * cos(LAT.to_radians());
     let y = lat * WGS84_A;
     let tau = std::f64::consts::TAU;
     300.0
-        + 120.0 * (tau * x / 1700.0).sin() * (tau * y / 2300.0).cos()
-        + 35.0 * (tau * x / 430.0 + 1.0).sin() * (tau * y / 510.0).sin()
+        + 120.0 * sin(tau * x / 1700.0) * cos(tau * y / 2300.0)
+        + 35.0 * sin(tau * x / 430.0 + 1.0) * sin(tau * y / 510.0)
 }
 
 /// The tile of `level` that holds a place, in degrees.
