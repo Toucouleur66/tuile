@@ -153,6 +153,7 @@ struct Setup {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    tuile_farm::log_to_stderr();
     let cli = Cli::parse();
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,

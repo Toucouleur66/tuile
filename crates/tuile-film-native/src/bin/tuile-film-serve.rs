@@ -33,12 +33,13 @@ use tuile_film_native::Error;
 
 async fn run() -> Result<(), Error> {
     let service = Arc::new(serve::service_from_env().await?);
-    eprintln!("tuile-film-serve: {:?}", service.limits);
+    tracing::info!("tuile-film-serve: {:?}", service.limits);
     serve::serve(serve::router(service, None)).await
 }
 
 fn main() -> ExitCode {
     dotenvy::dotenv().ok();
+    tuile_farm::log_to_stderr();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -54,7 +55,7 @@ fn main() -> ExitCode {
     match ended {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("tuile-film-serve: {e}");
+            tracing::error!("tuile-film-serve: {e}");
             ExitCode::FAILURE
         }
     }

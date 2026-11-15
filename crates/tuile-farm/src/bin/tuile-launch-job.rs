@@ -103,6 +103,7 @@ fn videos() -> PathBuf {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    tuile_farm::log_to_stderr();
     let cli = Cli::parse();
     let region = match &cli.verb {
         Verb::Film { film, .. } if film.spatial => Some(

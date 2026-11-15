@@ -507,6 +507,7 @@ async fn run(args: Args) -> Result<Ended, Error> {
 
 fn main() -> ExitCode {
     dotenvy::dotenv().ok();
+    tuile_farm::log_to_stderr();
     let args = Args::parse();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()

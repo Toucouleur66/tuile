@@ -658,7 +658,7 @@ pub async fn produce(
     )
     .await
     {
-        eprintln!("the journal was not put in the store: {e}");
+        tracing::warn!("the journal was not put in the store: {e}");
     }
     made
 }

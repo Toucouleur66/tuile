@@ -252,7 +252,7 @@ pub fn tuned(
         match var(name) {
             Some(v) if !v.trim().is_empty() => {
                 let n = v.trim().parse().map_err(|e| format!("{name}={v}: {e}"))?;
-                eprintln!("compress {key}: {name}={n}");
+                tracing::info!(profile = %key, "compress {key}: {name}={n}");
                 Ok(Some(n))
             }
             _ => Ok(None),
@@ -426,7 +426,10 @@ pub fn deliver(
             // Missed by so much: asked for that much less, and a little more.
             average = (f64::from(average) * cap as f64 / written.bytes as f64 * 0.97) as u32;
         }
-        eprintln!(
+        tracing::info!(
+            bytes = written.bytes,
+            cap,
+            average,
             "compress {}: {} bytes over the cap of {cap}: again at {average} b/s",
             profile.key(),
             written.bytes
