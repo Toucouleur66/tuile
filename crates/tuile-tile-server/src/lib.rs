@@ -47,7 +47,7 @@ pub use service::{
 };
 pub use store::{Census, Clock, Compaction, Fresh, Scrub, StatsSnapshot, StoreConfig, TileStore};
 pub use tier_cache::{CacheClass, ClassStats, TierCache, TierCacheConfig, TierCacheStats};
-pub use tiered::{Prefetched, Tier, TierClock, Tiered, TieredStats, Touch};
+pub use tiered::{Prefetched, Tier, Tiered, TieredStats};
 pub use tiering::Tiering;
 pub use upstream::{TemplateUpstream, Upstream, UpstreamError};
 

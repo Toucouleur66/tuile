@@ -29,11 +29,14 @@
 //!   down, up to [`DEFAULT_WHOLE_BELOW`], and is served from it: the next
 //!   range is in a tier. A larger archive is read from the origin by ranges,
 //!   as without tiers.
-//! - **Touched when written.** A tier that forgets what is not used — a
-//!   bucket whose lifecycle deletes an object some days after its custom
-//!   time — is given a [`Touch`], and an archive written into it is touched
-//!   then, and only then: a read is never a write. A touch another machine
-//!   got in first (the time already further) is no failure.
+//! - **Never edited.** An object written into a tier is never written
+//!   again, nor its metadata: a read is never a write. A tier that forgets
+//!   forgets by age — a bucket's lifecycle deleting an object some days
+//!   after its creation — and an archive it forgot is read from the origin
+//!   by its next reader and written back, its age starting over. Data
+//!   updated often does not belong in an object store: should the use of
+//!   each archive ever be counted, it is counted in the host's register of
+//!   tiles, not in object metadata.
 //!
 //! Without tiers it is its origin: every call passes through.
 
@@ -43,7 +46,6 @@ use std::future::Future;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -83,26 +85,12 @@ pub fn is_archive_key(key: &str) -> bool {
         && salt.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Tells a tier that one of its objects is in use, `at` this time: on a
-/// bucket, its custom time moved forward, which its lifecycle counts an
-/// object's idleness from. See [`Tier::with_touch`].
-///
-/// A touch answered [`object_store::Error::Precondition`],
-/// [`object_store::Error::NotModified`] or
-/// [`object_store::Error::AlreadyExists`] — the object's time already
-/// further, moved by another machine — is a touch done.
-#[async_trait]
-pub trait Touch: fmt::Debug + Send + Sync {
-    async fn touch(&self, location: &Path, at: SystemTime) -> Result<()>;
-}
-
-/// One tier: a name for the counters and the permits, where it keeps its
-/// copies, and what tells it a copy is in use, if it needs telling.
+/// One tier: a name for the counters and the permits, and where it keeps
+/// its copies.
 #[derive(Debug, Clone)]
 pub struct Tier {
     pub name: String,
     pub objects: Arc<dyn ObjectStore>,
-    pub touch: Option<Arc<dyn Touch>>,
 }
 
 impl Tier {
@@ -110,19 +98,9 @@ impl Tier {
         Self {
             name: name.into(),
             objects,
-            touch: None,
         }
     }
-
-    /// The tier, its archives touched when written into it.
-    pub fn with_touch(mut self, touch: Arc<dyn Touch>) -> Self {
-        self.touch = Some(touch);
-        self
-    }
 }
-
-/// The time, as a [`Tiered`] reads it.
-pub type TierClock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
 
 /// What the tiers answered, since they were made.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -137,9 +115,6 @@ pub struct TieredStats {
     pub already_there: u64,
     /// Ranges of archives too large to bring down whole, read by range.
     pub ranges_passed: u64,
-    /// Archives touched in a tier ([`Touch`]), and touches that failed.
-    pub touched: u64,
-    pub touch_failures: u64,
     /// The process's cache and caps, which every [`Tiered`] sharing them
     /// counts in.
     pub cache: TierCacheStats,
@@ -164,8 +139,6 @@ struct Counters {
     written: AtomicU64,
     already_there: AtomicU64,
     ranges_passed: AtomicU64,
-    touched: AtomicU64,
-    touch_failures: AtomicU64,
 }
 
 /// A download's failure, shared by everyone waiting on it.
@@ -282,7 +255,6 @@ struct Inner {
     whole_below: u64,
     downloads: Mutex<HashMap<String, Download>>,
     counters: Counters,
-    clock: TierClock,
     cache: Arc<TierCache>,
 }
 
@@ -337,19 +309,9 @@ impl Tiered {
                     hit_bytes: (0..n).map(|_| AtomicU64::new(0)).collect(),
                     ..Counters::default()
                 },
-                clock: Arc::new(SystemTime::now),
                 cache: Arc::new(TierCache::default()),
             }),
         }
-    }
-
-    /// The same, its time read from `clock`: for a test that moves it.
-    pub fn with_clock(mut self, clock: TierClock) -> Self {
-        match Arc::get_mut(&mut self.inner) {
-            Some(inner) => inner.clock = clock,
-            None => tracing::warn!("a tiered store already shared keeps its clock"),
-        }
-        self
     }
 
     /// The same, reading through `cache` and asking its tiers under its
@@ -405,8 +367,7 @@ impl Tiered {
     /// yet, never in the origin: for an object made from archives — named by
     /// what it was made from, so that the same key is the same content —
     /// that the next reader behind these tiers then reads whole instead of
-    /// making it again. Written once ([`PutMode::Create`]), touched as an
-    /// archive written is; a tier that holds it already is not sent the
+    /// making it again. Written once ([`PutMode::Create`]); a tier that holds it already is not sent the
     /// bytes again. A tier that fails is told in the log.
     pub async fn keep_in_tiers(&self, location: &Path, bytes: Bytes) {
         let inner = &self.inner;
@@ -479,8 +440,6 @@ impl Tiered {
             written: g(&c.written),
             already_there: g(&c.already_there),
             ranges_passed: g(&c.ranges_passed),
-            touched: g(&c.touched),
-            touch_failures: g(&c.touch_failures),
             cache: self.inner.cache.stats(),
         }
     }
@@ -870,8 +829,7 @@ impl Inner {
         }
     }
 
-    /// `bytes` written into tier `i`, unless it holds them already; touched
-    /// there when written.
+    /// `bytes` written into tier `i`, unless it holds them already.
     async fn keep_one(&self, i: usize, at: &Path, bytes: &Bytes) {
         let tier = &self.tiers[i];
         let opts = PutOptions {
@@ -886,45 +844,14 @@ impl Inner {
                 self.counters.written.fetch_add(1, Ordering::Relaxed);
                 metrics::counter!("tuile_tiles_tier_writes_total", "tier" => tier.name.clone())
                     .increment(1);
-                // A copy written now is in use now.
-                self.touch(i, at).await;
             }
             Err(object_store::Error::AlreadyExists { .. }) => {
-                // Written, and touched, by whoever put it there.
+                // Written by whoever put it there: the same bytes.
                 self.counters.already_there.fetch_add(1, Ordering::Relaxed);
             }
             Err(error) => {
                 tracing::warn!(tier = %tier.name, key = %at, %error, "TIER-WRITE-FAILED");
                 metrics::counter!("tuile_tiles_tier_write_failures_total", "tier" => tier.name.clone())
-                    .increment(1);
-            }
-        }
-    }
-
-    /// Tier `i` told that `at` is in use, if it is to be told. An answer
-    /// that its time is already further is a touch done; a touch that fails
-    /// is told in the log: the read goes on.
-    async fn touch(&self, i: usize, at: &Path) {
-        let Some(touch) = &self.tiers[i].touch else {
-            return;
-        };
-        let now = (self.clock)();
-        let tier = &self.tiers[i].name;
-        match self.cache.request(tier, 0, touch.touch(at, now)).await {
-            Ok(())
-            | Err(
-                object_store::Error::Precondition { .. }
-                | object_store::Error::NotModified { .. }
-                | object_store::Error::AlreadyExists { .. },
-            ) => {
-                self.counters.touched.fetch_add(1, Ordering::Relaxed);
-                metrics::counter!("tuile_tiles_tier_touches_total", "tier" => tier.clone())
-                    .increment(1);
-            }
-            Err(error) => {
-                self.counters.touch_failures.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(tier = %tier, key = %at, %error, "TIER-TOUCH-FAILED");
-                metrics::counter!("tuile_tiles_tier_touch_failures_total", "tier" => tier.clone())
                     .increment(1);
             }
         }
@@ -1283,82 +1210,38 @@ mod tests {
         assert_eq!(tiered.stats().ranges_passed, 1);
     }
 
-    /// The touches a tier is given, in order.
-    #[derive(Debug, Default)]
-    struct Touches(Mutex<Vec<(String, SystemTime)>>);
-
-    impl Touches {
-        fn count(&self) -> usize {
-            self.0.lock().unwrap().len()
-        }
-    }
-
-    #[async_trait]
-    impl Touch for Touches {
-        async fn touch(&self, location: &Path, at: SystemTime) -> Result<()> {
-            self.0.lock().unwrap().push((location.to_string(), at));
-            Ok(())
-        }
-    }
-
-    /// A clock a test moves.
-    fn clock() -> (Arc<Mutex<SystemTime>>, TierClock) {
-        let now = Arc::new(Mutex::new(
-            SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000),
-        ));
-        let read = now.clone();
-        (now, Arc::new(move || *read.lock().unwrap()))
-    }
-
+    /// **An archive a tier forgot is read from the origin and kept again.**
+    /// A bucket's lifecycle deletes by age: the next process that reads
+    /// the archive finds it absent, reads the origin once, and writes it
+    /// back — and a read of what a tier holds never writes to it.
     #[tokio::test]
-    async fn a_touched_tier_is_touched_when_written_and_never_when_read() {
-        let origin = origin_with_archive().await;
-        let (local, global) = (Arc::new(InMemory::new()), Arc::new(InMemory::new()));
-        let touches = Arc::new(Touches::default());
-        let (now, clock) = clock();
-        let tiered = Tiered::new(
-            origin.clone(),
-            vec![
-                // A tier that forgets nothing it is not told to: no touch.
-                Tier::new("local", local.clone()),
-                Tier::new("global", global.clone()).with_touch(touches.clone()),
-            ],
-        )
-        .with_clock(clock);
-        let at = Path::from(ARCHIVE);
-        tiered.get(&at).await.unwrap().bytes().await.unwrap();
-        assert_eq!(touches.count(), 1, "written into the global tier: touched");
-        assert_eq!(touches.0.lock().unwrap()[0].0, ARCHIVE);
-        // Read again and again, whole and by range, days on: a read is
-        // never a write.
-        for _ in 0..3 {
-            *now.lock().unwrap() += Duration::from_secs(25 * 3600);
-            tiered.get(&at).await.unwrap().bytes().await.unwrap();
-            tiered.get_range(&at, 0..10).await.unwrap();
-        }
-        assert_eq!(touches.count(), 1, "reads touch nothing");
-        let s = tiered.stats();
-        assert_eq!((s.touched, s.touch_failures), (1, 0));
-        assert_eq!(origin.gets(ARCHIVE), 1);
-    }
-
-    #[tokio::test]
-    async fn a_global_hit_from_another_machine_s_download_is_not_touched() {
+    async fn an_archive_a_tier_forgot_is_read_from_the_origin_and_kept_again() {
         let origin = origin_with_archive().await;
         let global = Arc::new(InMemory::new());
         let at = Path::from(ARCHIVE);
-        global.put(&at, bytes().into()).await.unwrap();
-        let touches = Arc::new(Touches::default());
-        let (_, clock) = clock();
-        let tiered = Tiered::new(
-            origin.clone(),
-            vec![Tier::new("global", global).with_touch(touches.clone())],
-        )
-        .with_clock(clock);
-        tiered.get_range(&at, 0..10).await.unwrap();
-        tiered.get(&at).await.unwrap().bytes().await.unwrap();
-        assert_eq!(touches.count(), 0, "touched by the machine that wrote it");
-        assert_eq!(origin.gets(ARCHIVE), 0);
+        // One process per read: each with a cache of its own.
+        let process = || Tiered::new(origin.clone(), vec![Tier::new("global", global.clone())]);
+        process().get(&at).await.unwrap().bytes().await.unwrap();
+        assert_eq!(origin.gets(ARCHIVE), 1, "the first reader reads the origin");
+        let written = global.head(&at).await.expect("kept").last_modified;
+        // Read whole and by range by other processes: no write, no edit.
+        for _ in 0..3 {
+            let p = process();
+            p.get(&at).await.unwrap().bytes().await.unwrap();
+            p.get_range(&at, 0..10).await.unwrap();
+        }
+        assert_eq!(origin.gets(ARCHIVE), 1, "kept: the origin is not asked");
+        assert_eq!(global.head(&at).await.unwrap().last_modified, written, "a read writes nothing");
+        // The lifecycle deletes it.
+        global.delete(&at).await.unwrap();
+        let p = process();
+        assert_eq!(&p.get_range(&at, 100..110).await.unwrap()[..], &bytes()[100..110]);
+        assert_eq!(origin.gets(ARCHIVE), 2, "absent from the tier: read from the origin");
+        let again = global.head(&at).await.expect("kept again");
+        assert!(again.last_modified >= written, "written back, its age starting over");
+        assert_eq!(p.stats().written, 1);
+        process().get(&at).await.unwrap().bytes().await.unwrap();
+        assert_eq!(origin.gets(ARCHIVE), 2, "the next reader reads the tier again");
     }
 
     /// A slow tier, as a bucket across a busy network is: it counts the
@@ -1520,47 +1403,6 @@ mod tests {
             archive.slice(300_000..301_000)
         );
         assert_eq!(global.gets(), first, "the second read is kept");
-    }
-
-    /// A tier that answers every touch as GCS does when another machine
-    /// moved the custom time further first.
-    #[derive(Debug, Default)]
-    struct Superseded(AtomicU64);
-
-    #[async_trait]
-    impl Touch for Superseded {
-        async fn touch(&self, location: &Path, _: SystemTime) -> Result<()> {
-            let n = self.0.fetch_add(1, Ordering::SeqCst);
-            Err(if n.is_multiple_of(2) {
-                object_store::Error::Precondition {
-                    path: location.to_string(),
-                    source: "409: edited during the operation".into(),
-                }
-            } else {
-                object_store::Error::NotModified {
-                    path: location.to_string(),
-                    source: "400: custom time cannot be decreased".into(),
-                }
-            })
-        }
-    }
-
-    /// **A touch another machine got in first is no failure.**
-    #[tokio::test]
-    async fn a_touch_answered_already_further_is_no_failure() {
-        let origin = origin_with_archive().await;
-        let touches = Arc::new(Superseded::default());
-        let tiered = Tiered::new(
-            origin,
-            vec![
-                Tier::new("global", Arc::new(InMemory::new())).with_touch(touches.clone()),
-            ],
-        );
-        let at = Path::from(ARCHIVE);
-        tiered.get(&at).await.unwrap().bytes().await.unwrap();
-        assert_eq!(touches.0.load(Ordering::SeqCst), 1, "touched once, on write");
-        let s = tiered.stats();
-        assert_eq!((s.touched, s.touch_failures), (1, 0));
     }
 
     /// A tiered store over `global` alone, its data blocks kept `ttl`.
