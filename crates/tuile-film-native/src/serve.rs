@@ -291,8 +291,12 @@ pub struct Service<F: OverlayFactory = NoOverlays> {
     /// store when there is none.
     pub mezzanine: Option<Arc<ObjectRunStore>>,
     /// The tile store's server, when it is one: zones are fetched from it
-    /// as extracts before a render.
+    /// as extracts before a render — unless [`Self::extracts`] keeps them.
     pub remote: Option<Arc<dyn tuile_repository::Get>>,
+    /// Where a render's extracts are kept when they are working files of
+    /// its film rather than the tile store server's (`TUILE_EXTRACTS_STORE`,
+    /// `gs://<bucket>` or a directory): fetched whole from there.
+    pub extracts: Option<Arc<ObjectRunStore>>,
     /// The tile store, as the bucket or the routes give it.
     pub tiles: Arc<dyn tuile_repository::Objects>,
     /// Where generations of caches are opened.
@@ -390,6 +394,7 @@ impl<F: OverlayFactory> Service<F> {
             runs,
             mezzanine: None,
             remote: None,
+            extracts: None,
             tiles,
             cache,
             limits,
@@ -438,11 +443,16 @@ impl<F: OverlayFactory> Service<F> {
         if order.extracts.is_empty() {
             return Ok(None);
         }
-        let get = self
-            .remote
-            .as_ref()
-            .ok_or("extracts named and no tile store server to fetch them from")?;
-        let fetched = crate::extract::fetch(get.clone(), &order.extracts, dir).await?;
+        let fetched = match (&self.extracts, &self.remote) {
+            (Some(store), _) => crate::extract::fetch_from(store, &order.extracts, dir).await?,
+            (None, Some(get)) => crate::extract::fetch(get.clone(), &order.extracts, dir).await?,
+            (None, None) => {
+                return Err(
+                    "extracts named and neither a store nor a tile store server to fetch them from"
+                        .into(),
+                )
+            }
+        };
         let local: Arc<dyn tuile_repository::Objects> =
             Arc::new(ObjectRunStore::local(dir, tuile_farm::Tuning::default())?);
         let store = &sources.store.tiles;
@@ -1030,6 +1040,12 @@ pub async fn service_from_env_with<F: OverlayFactory>(overlays: F) -> Result<Ser
     let mut service =
         Service::with_overlays(runs, tiles.objects, cache, limits_from_env()?, overlays);
     service.mezzanine = ObjectRunStore::mezzanine_from_env()?.map(Arc::new);
+    // Where the extracts are kept, when they are the films' own files.
+    service.extracts = ObjectRunStore::named_at(
+        "TUILE_EXTRACTS_STORE",
+        std::env::var("TUILE_EXTRACTS_STORE").ok().as_deref(),
+    )?
+    .map(Arc::new);
     // The tile store's server, when the store is one: extracts come from it.
     service.remote = tuile_repository::HttpGet::from_env()?
         .map(|get| Arc::new(get) as Arc<dyn tuile_repository::Get>);

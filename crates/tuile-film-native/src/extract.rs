@@ -156,6 +156,53 @@ pub async fn fetch(
     })
 }
 
+/// Fetches `extracts` under `dir` from `store`, where their keys are: a
+/// render whose extracts are working files of its film, kept in a bucket
+/// beside its other files (`TUILE_EXTRACTS_STORE`), rather than on the tile
+/// store's server. Each comes down whole in the store's parallel ranged
+/// reads ([`tuile_farm::RunStore::get`]), a few at once; one whose size is
+/// not the one announced is an error.
+pub async fn fetch_from(
+    store: &tuile_farm::ObjectRunStore,
+    extracts: &[ExtractRef],
+    dir: &Path,
+) -> Result<Fetched, Error> {
+    use tuile_farm::RunStore;
+    let began = Instant::now();
+    // Owned, each with its file: no borrow of the slice crosses an await.
+    let mut asked = Vec::with_capacity(extracts.len());
+    for extract in extracts {
+        let path = dir.join(local_key(extract));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        asked.push((extract.key.clone(), extract.bytes, path));
+    }
+    futures_util::stream::iter(asked)
+        .map(|(key, bytes, path)| async move {
+            let got = store.get(&key, &path).await?;
+            if got != bytes {
+                return Err::<(), Error>(
+                    format!(
+                        "extract {key}: {got} bytes in {}, {bytes} announced",
+                        store.label()
+                    )
+                    .into(),
+                );
+            }
+            Ok(())
+        })
+        .buffer_unordered(4)
+        .try_collect::<()>()
+        .await?;
+    Ok(Fetched {
+        extracts: extracts.len() as u64,
+        parts: extracts.len() as u64,
+        bytes: extracts.iter().map(|e| e.bytes).sum(),
+        seconds: began.elapsed().as_secs_f64(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,5 +284,42 @@ mod tests {
             ..refs[1].clone()
         }];
         assert!(fetch(server, &wrong, dir.path()).await.is_err());
+    }
+
+    /// Extracts kept in a bucket beside the film's other files come down
+    /// from it whole, at the local key the render reads them from.
+    #[tokio::test]
+    async fn an_extract_comes_down_whole_from_the_store_that_keeps_it() {
+        let bucket = tempfile::tempdir().expect("bucket");
+        let store = tuile_farm::ObjectRunStore::local(bucket.path(), tuile_farm::Tuning::default())
+            .expect("store");
+        let big: Vec<u8> = (0..(3 << 20)).map(|i| (i % 253) as u8).collect();
+        let key = "1554285/20261020T101500Z-ab12/extracts/c0001.pmtiles";
+        let file = bucket.path().join("upload");
+        std::fs::write(&file, &big).expect("write");
+        tuile_farm::RunStore::put(&store, &file, key)
+            .await
+            .expect("put");
+        let refs = [ExtractRef {
+            key: key.into(),
+            bytes: big.len() as u64,
+            layers: vec!["terrain".into(), "imagery".into()],
+        }];
+        let dir = tempfile::tempdir().expect("dir");
+        let fetched = fetch_from(&store, &refs, dir.path())
+            .await
+            .expect("fetched");
+        assert_eq!((fetched.extracts, fetched.bytes), (1, big.len() as u64));
+        assert_eq!(
+            std::fs::read(dir.path().join(local_key(&refs[0]))).expect("read"),
+            big
+        );
+        // Another size than the one announced is an error.
+        let wrong = [ExtractRef {
+            bytes: 1,
+            ..refs[0].clone()
+        }];
+        let other = tempfile::tempdir().expect("dir");
+        assert!(fetch_from(&store, &wrong, other.path()).await.is_err());
     }
 }

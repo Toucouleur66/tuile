@@ -353,6 +353,20 @@ impl TileStore {
         asks: &[ExtractAsk],
         key: &str,
     ) -> Result<ExtractReport, StoreError> {
+        let own = self.object_store().clone();
+        self.extract_whole_to(asks, own.as_ref(), key).await
+    }
+
+    /// [`TileStore::extract_whole_into`], put in `to` rather than in this
+    /// store's bucket: for an extract that is its reader's working file —
+    /// a film's, kept beside the film's other intermediates — and no part
+    /// of the tile store. Nothing is put when a tile is missing.
+    pub async fn extract_whole_to(
+        &self,
+        asks: &[ExtractAsk],
+        to: &dyn object_store::ObjectStore,
+        key: &str,
+    ) -> Result<ExtractReport, StoreError> {
         let (file, mut report) = self.extract(asks).await?;
         if let Some(said) = report.incomplete() {
             return Err(StoreError::Incomplete {
@@ -361,7 +375,7 @@ impl TileStore {
             });
         }
         let began = Instant::now();
-        put_file(self.object_store().as_ref(), file.path(), key)
+        put_file(to, file.path(), key)
             .instrument(tracing::info_span!(
                 "tiles.extract.put",
                 bytes = report.bytes
@@ -1101,8 +1115,33 @@ mod tests {
         // Once stored, the same ask goes up whole.
         put(&store, (7, 78, 50), "b").await;
         store.flush_all().await.expect("flush");
-        let report = store.extract_whole_into(&[ask], key).await.expect("whole");
+        let report = store
+            .extract_whole_into(std::slice::from_ref(&ask), key)
+            .await
+            .expect("whole");
         assert_eq!((report.tiles, report.absent), (2, 0));
+
+        // Put elsewhere: in the store it is given, never in the tile
+        // store's own bucket.
+        let elsewhere = object_store::memory::InMemory::new();
+        let theirs = "1/r/extracts/c0002.pmtiles";
+        let report = store
+            .extract_whole_to(&[ask], &elsewhere, theirs)
+            .await
+            .expect("whole, elsewhere");
+        let put = elsewhere
+            .head(&object_store::path::Path::from(theirs))
+            .await
+            .expect("the extract, where it was asked");
+        assert_eq!(put.size, report.bytes);
+        assert!(
+            store
+                .object_store()
+                .head(&object_store::path::Path::from(theirs))
+                .await
+                .is_err(),
+            "nothing put in the tile store's bucket"
+        );
     }
 
     #[tokio::test]

@@ -879,6 +879,19 @@ impl Tiles {
             .block_on(self.store.extract_whole_into(asks, key))
     }
 
+    /// [`Self::extract_whole_into`], put in `to` rather than in the store's
+    /// bucket: an extract that is its reader's working file, kept with that
+    /// reader's other files (`tuile_tile_server::TileStore::extract_whole_to`).
+    pub fn extract_whole_to(
+        &self,
+        asks: &[tuile_tile_server::ExtractAsk],
+        to: &dyn object_store::ObjectStore,
+        key: &str,
+    ) -> Result<tuile_tile_server::ExtractReport, tuile_tile_server::StoreError> {
+        self.runtime
+            .block_on(self.store.extract_whole_to(asks, to, key))
+    }
+
     /// Publishes whatever is still buffered. Called on the way out, success or
     /// not: tiles fetched by a failed bake are still worth keeping.
     pub fn flush(&self) -> Result<(), String> {
