@@ -9,6 +9,7 @@ mod context;
 mod encode;
 mod host;
 mod in_place;
+mod mist;
 mod ops;
 mod overlay;
 mod prepare;
@@ -33,6 +34,7 @@ pub use context::{
     TEXTURE_FORMAT,
 };
 pub use host::{view_proj_from_world, DepthDirection, HostFrame, HostPass, TargetLayout};
+pub use mist::{mist_wgsl, MistFrame, MistRenderer};
 pub use ops::UploadOps;
 pub use overlay::{OverlayMask, OverlayRenderer, OverlayVertex};
 pub use prepare::{

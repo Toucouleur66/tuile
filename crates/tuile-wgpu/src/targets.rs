@@ -26,7 +26,9 @@
 //! 2400×1436 with four samples. The one exception is a pass after the frame that loads the
 //! samples to draw over them (the overlays with a depth of their own): that
 //! frame draws into a second, kept colour target, made the first time one
-//! is asked for ([`FrameTargets::samples`]).
+//! is asked for ([`FrameTargets::samples`]). A pass after the frame that
+//! reads its depth in a shader (the mist) likewise gets a second, kept and
+//! bindable depth, made the first time one is asked for.
 //!
 //! The surface itself is **not** here. This crate creates no window and no
 //! surface — the host owns those, and owns the resolve into them.
@@ -46,6 +48,11 @@ pub struct FrameTargets {
     /// made when first asked for, and `colour` itself where that is not
     /// transient.
     kept: std::sync::OnceLock<wgpu::TextureView>,
+    /// The depth a frame draws into when a pass after it reads the depth in
+    /// a shader (the mist, [`crate::MistRenderer`]): made when first asked
+    /// for, never transient, and bindable. Never made where the device
+    /// cannot bind a multisampled depth, which WebGL2 cannot.
+    kept_depth: std::sync::OnceLock<KeptDepth>,
     format: wgpu::TextureFormat,
     size: (u32, u32),
     /// The surface's format, when the frame reaches it through an encoding
@@ -63,6 +70,7 @@ impl FrameTargets {
             colour: attachment(gpu, format, size, "tuile frame colour", TRANSIENT),
             depth: attachment(gpu, DEPTH_FORMAT, size, "tuile frame depth", TRANSIENT),
             kept: std::sync::OnceLock::new(),
+            kept_depth: std::sync::OnceLock::new(),
             format,
             size,
             surface: None,
@@ -138,11 +146,44 @@ impl FrameTargets {
         })
     }
 
+    /// The depth a frame draws into when a pass after it reads that depth
+    /// in a shader, with its depth-only view for binding — or `None` where
+    /// the device cannot bind a multisampled depth ([`crate::MistRenderer::supported`]).
+    pub(crate) fn readable_depth(&self, gpu: &GpuContext) -> Option<&KeptDepth> {
+        if !crate::MistRenderer::supported(gpu) {
+            return None;
+        }
+        Some(self.kept_depth.get_or_init(|| {
+            let depth = texture(
+                gpu,
+                DEPTH_FORMAT,
+                self.size,
+                "tuile frame depth (kept)",
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            );
+            KeptDepth {
+                attachment: depth.create_view(&wgpu::TextureViewDescriptor::default()),
+                binding: depth.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("tuile frame depth (read)"),
+                    aspect: wgpu::TextureAspect::DepthOnly,
+                    ..Default::default()
+                }),
+            }
+        }))
+    }
+
     /// The colour format the frame is drawn in — and so the format the
     /// drawable it resolves into is viewed as.
     pub fn format(&self) -> wgpu::TextureFormat {
         self.format
     }
+}
+
+/// A depth that outlives the frame's pass: drawn into as its attachment,
+/// read by a pass after it through `binding`, its depth aspect alone.
+pub(crate) struct KeptDepth {
+    pub attachment: wgpu::TextureView,
+    pub binding: wgpu::TextureView,
 }
 
 /// Whether the frame's attachments are made transient.
@@ -162,25 +203,40 @@ fn attachment(
     label: &str,
     transient: bool,
 ) -> wgpu::TextureView {
-    gpu.device
-        .create_texture(&wgpu::TextureDescriptor {
-            label: Some(label),
-            size: wgpu::Extent3d {
-                width: size.0,
-                height: size.1,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            // The one number that must match the pipelines. See the module doc.
-            sample_count: SAMPLES,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: if transient {
-                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TRANSIENT_ATTACHMENT
-            } else {
-                wgpu::TextureUsages::RENDER_ATTACHMENT
-            },
-            view_formats: &[],
-        })
-        .create_view(&wgpu::TextureViewDescriptor::default())
+    texture(
+        gpu,
+        format,
+        size,
+        label,
+        if transient {
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TRANSIENT_ATTACHMENT
+        } else {
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+        },
+    )
+    .create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+fn texture(
+    gpu: &GpuContext,
+    format: wgpu::TextureFormat,
+    size: (u32, u32),
+    label: &str,
+    usage: wgpu::TextureUsages,
+) -> wgpu::Texture {
+    gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: size.0,
+            height: size.1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        // The one number that must match the pipelines. See the module doc.
+        sample_count: SAMPLES,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage,
+        view_formats: &[],
+    })
 }

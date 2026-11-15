@@ -79,6 +79,13 @@ pub struct FramePass<'a> {
     pub colour: &'a wgpu::TextureView,
     /// What it resolves into.
     pub resolve: &'a wgpu::TextureView,
+    /// The frame's depth, viewed for a shader to read — the ground's, for
+    /// a pass that marches up to it ([`crate::MistRenderer`]). `None`
+    /// where the device cannot bind a multisampled depth
+    /// ([`crate::MistRenderer::supported`]). Given, the frame drew into a
+    /// kept depth rather than the transient one: a pass after the frame
+    /// keeps it, read or not.
+    pub depth: Option<&'a wgpu::TextureView>,
     /// The frame in device pixels.
     pub size: (u32, u32),
 }
@@ -247,6 +254,12 @@ fn encode_frame(
     // The samples outlive the frame's pass only when a pass after it draws
     // over them; otherwise the resolve is all that leaves the GPU's tiles.
     let colour = targets.samples(gpu, after.is_some());
+    // So does the depth, for a pass after the frame that reads it in a
+    // shader — where the device can bind it at all. See [`FramePass::depth`].
+    let readable = after
+        .is_some()
+        .then(|| targets.readable_depth(gpu))
+        .flatten();
     // Our own frame is a host like any other: the pass a host's frame gets is
     // this one. It lends its depth's stencil, so the pass is drawn straight
     // into it, and it asks for a fresh frame.
@@ -259,15 +272,15 @@ fn encode_frame(
             // where the staircase on the limb disappears.
             colour,
             resolve: Some(resolve),
-            depth: &targets.depth,
+            depth: readable.map_or(&targets.depth, |kept| &kept.attachment),
             size: targets.size(),
             clear: Some(clear),
         },
-        // Nothing reads the depth after the frame: a pass after it brings
-        // its own ([`FramePass`]).
+        // The depth is kept only for a pass after the frame that may read
+        // it; one that tests against a depth brings its own ([`FramePass`]).
         Kept {
             samples: after.is_some(),
-            depth: false,
+            depth: readable.is_some(),
         },
         paint,
     );
@@ -280,6 +293,7 @@ fn encode_frame(
             &FramePass {
                 colour,
                 resolve,
+                depth: readable.map(|kept| &kept.binding),
                 size: targets.size(),
             },
         );

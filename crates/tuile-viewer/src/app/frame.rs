@@ -224,6 +224,7 @@ impl App {
                 preload: &mut preload,
                 overlays: &mut overlays,
                 atmosphere: &mut self.atmosphere,
+                mist: &mut self.mist,
                 wall: super::wall_seconds(),
                 viewport: (w as u32, h as u32),
                 // The viewer's own relief, the one the controller keeps its
@@ -392,6 +393,8 @@ impl App {
         // The atmosphere checkbox, over what the host asked.
         atmosphere.enabled &= self.nav.atmosphere_enabled();
         let views = self.view_uniforms();
+        let to_sun = atmosphere.lights.at(self.instant, sky.eye).to_sun;
+        let eye = self.controller.camera.position;
         let Some(active) = self.active.as_mut() else {
             return;
         };
@@ -399,9 +402,19 @@ impl App {
             active.renderer.set_view(&active.gpu.queue, view);
             // What the underlay is culled against: the first eye's view, in
             // the render space every tile is rebased onto, and its ECEF eye.
-            active
-                .pump
-                .set_underlay_view(view.view_proj, self.controller.camera.position);
+            active.pump.set_underlay_view(view.view_proj, eye);
+            // The mist a host stated, seen from this frame's eye: the
+            // render origin is the eye (`view_uniforms`).
+            if let Some(mist) = active.mist.as_mut() {
+                let frame = self.mist.as_ref().map(|field| tuile_wgpu::MistFrame {
+                    field,
+                    origin: eye,
+                    eye,
+                    view_proj: view.view_proj,
+                    to_sun,
+                });
+                mist.set(&active.gpu.queue, frame.as_ref());
+            }
         }
         active
             .renderer
@@ -701,6 +714,11 @@ impl App {
         );
         let world = std::cell::RefCell::new(&mut active.world_overlay);
         let world_gpu = &active.gpu;
+        // The mist, when a host stated one this frame: drawn after the
+        // frame's pass, over the ground and the overlays the ground hides,
+        // and under the never-hidden ones, which then wait for the pass
+        // after it.
+        let mist = active.mist.as_ref().filter(|m| m.is_on());
         // The picture, inside whatever the window is: everything of the scene
         // is drawn in it, and the bars around it keep the clear.
         let box_ = picture;
@@ -755,9 +773,13 @@ impl App {
             );
             // A host's shapes, after the ground that may hide them. What asked
             // for `OverlaysOnly` is not here: it goes in the pass that
-            // follows, which has a depth of its own.
+            // follows, which has a depth of its own — and so does what is
+            // never hidden, on a frame with mist, to stand in front of it.
             if layers.shapes {
-                world.borrow().render(pass);
+                match mist {
+                    Some(_) => world.borrow().render_terrain_only(pass),
+                    None => world.borrow().render(pass),
+                }
             }
             if !layers.controls {
                 return;
@@ -781,23 +803,68 @@ impl App {
         // The overlays' own pass, on the frame's encoder once its pass has
         // closed: the HUD's mode needs a depth attachment the ground never
         // reached, and that is a second pass or nothing. Nothing when no
-        // overlay asked for it — and then the frame's samples are discarded
-        // once resolved rather than written out for a pass that never comes.
-        let has_after = world.borrow().needs_own_depth();
-        let after = |encoder: &mut wgpu::CommandEncoder, frame: &tuile_wgpu::FramePass<'_>| {
-            world.borrow_mut().render_overlays_only(
-                world_gpu,
-                encoder,
-                frame.colour,
-                Some(frame.resolve),
-                frame.size,
-                // The picture, not the frame: this pass is held to the same
-                // rectangle the frame's own pass was, or a HUD laid out in
-                // fractions of the film would be laid out in fractions of
-                // the window instead.
-                box_.into(),
-            );
+        // overlay asked for it and no mist is drawn — and then the frame's
+        // samples are discarded once resolved rather than written out for a
+        // pass that never comes.
+        let has_after = |layers: crate::photo::Layers| {
+            mist.is_some() || (layers.hud && world.borrow().needs_own_depth())
         };
+        let after_with = |encoder: &mut wgpu::CommandEncoder,
+                          frame: &tuile_wgpu::FramePass<'_>,
+                          layers: crate::photo::Layers| {
+            // The picture, not the frame: these passes are held to the same
+            // rectangle the frame's own pass was, or a HUD laid out in
+            // fractions of the film would be laid out in fractions of the
+            // window instead.
+            let picture: tuile_wgpu::Picture = box_.into();
+            match (mist, frame.depth) {
+                // The mist over the frame, then what stands in front of it:
+                // the never-hidden shapes the frame's pass left, and the HUD.
+                (Some(mist), Some(depth)) => {
+                    mist.render(
+                        world_gpu,
+                        encoder,
+                        frame.colour,
+                        Some(frame.resolve),
+                        depth,
+                        picture,
+                    );
+                    match (layers.shapes, layers.hud) {
+                        (true, hud) => world.borrow_mut().render_after_mist(
+                            world_gpu,
+                            encoder,
+                            frame.colour,
+                            Some(frame.resolve),
+                            frame.size,
+                            picture,
+                            hud,
+                        ),
+                        (false, true) => world.borrow_mut().render_overlays_only(
+                            world_gpu,
+                            encoder,
+                            frame.colour,
+                            Some(frame.resolve),
+                            frame.size,
+                            picture,
+                        ),
+                        (false, false) => {}
+                    }
+                }
+                _ if layers.hud => world.borrow_mut().render_overlays_only(
+                    world_gpu,
+                    encoder,
+                    frame.colour,
+                    Some(frame.resolve),
+                    frame.size,
+                    picture,
+                ),
+                _ => {}
+            }
+        };
+        let after = |encoder: &mut wgpu::CommandEncoder, frame: &tuile_wgpu::FramePass<'_>| {
+            after_with(encoder, frame, on_screen)
+        };
+        let after_on_screen = has_after(on_screen);
         let outcome = match &mut active.screen {
             super::screen::Screen::Window(windowed) => {
                 let surface = windowed.surface.as_ref()?;
@@ -829,7 +896,7 @@ impl App {
                     || super::setup::configure(surface, &active.gpu, active.format, active.size),
                     || window.pre_present_notify(),
                     paint,
-                    has_after.then_some(after),
+                    after_on_screen.then_some(after),
                 )
             }
             // Every eye, from the one resolved set of tiles, each with its own
@@ -844,7 +911,7 @@ impl App {
                     &views,
                     |view| renderer.set_view(&gpu.queue, view),
                     clear,
-                    (&paint, has_after.then_some(&after)),
+                    (&paint, after_on_screen.then_some(&after)),
                 );
                 tuile_wgpu::Presented::Yes
             }
@@ -859,7 +926,12 @@ impl App {
                 clear,
                 (
                     |pass: &mut wgpu::RenderPass<'_>| paint_with(pass, layers),
-                    (has_after && layers.hud).then_some(after),
+                    has_after(layers).then_some(
+                        move |encoder: &mut wgpu::CommandEncoder,
+                              frame: &tuile_wgpu::FramePass<'_>| {
+                            after_with(encoder, frame, layers)
+                        },
+                    ),
                 ),
                 exposure,
                 picture,
