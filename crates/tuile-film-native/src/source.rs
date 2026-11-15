@@ -201,6 +201,7 @@ impl Objects for Held {
 }
 
 /// One side of what a render reads, counted before and after its cache.
+#[derive(Clone)]
 pub struct Cache {
     /// What the render reads from.
     pub objects: Arc<dyn Objects>,
@@ -396,6 +397,27 @@ impl Sources {
             revalidated,
             keeper,
         })
+    }
+
+    /// The same sources, the tile store read with zones of its own
+    /// ([`ArchivedTiles::view`]): everything read and kept is shared — the
+    /// packs' and archives' chunks, the store's small objects, the store's
+    /// heads, directories and manifests — but the extracts and pinned zones
+    /// given to the view are its own. What each of several renders at once
+    /// reads through, so that none forgets the zones another reads from.
+    pub fn view(&self) -> Self {
+        Self {
+            runs: self.runs.clone(),
+            packs: self.packs.clone(),
+            archives: self.archives.clone(),
+            store: Store {
+                tiles: self.store.tiles.view(),
+                live: self.store.live.clone(),
+            },
+            live: self.live.clone(),
+            revalidated: self.revalidated.clone(),
+            keeper: self.keeper.clone(),
+        }
     }
 
     /// The grade of a film, from what is kept beside its packs; `None` for
