@@ -29,6 +29,9 @@ futures-util = { workspace = true }
 # An index records each image tile's size, read from its header alone.
 image = { workspace = true }
 metrics = "0.24"
+# What a process keeps of the immutable archives it reads through its
+# tiers: byte-weighted caches whose loads are single flight.
+moka = { version = "0.12", features = ["future"] }
 rand = "0.9"
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -14,6 +14,13 @@
 //!
 //! - **Content keyed.** Only archive keys are tiered. A manifest, the
 //!   catalog, an extract — keys that are rewritten — always go to the origin.
+//! - **Kept in memory.** A range of an archive is read through the process's
+//!   [`TierCache`]: its directories kept for the process, its tile data in
+//!   aligned blocks kept for a while, each piece read once however many
+//!   readers want it at once. A range read again costs no request.
+//! - **Capped.** Every request to a tier, and to the origin, holds one of its
+//!   permits: a reader past the cap waits, and each request is given a time
+//!   scaled to its bytes ([`crate::tier_cache`]).
 //! - **Single flight.** However many readers of this process miss the same
 //!   archive at once, it is downloaded once.
 //! - **Written once.** A tier is written with [`PutMode::Create`]: an archive
@@ -22,24 +29,24 @@
 //!   down, up to [`DEFAULT_WHOLE_BELOW`], and is served from it: the next
 //!   range is in a tier. A larger archive is read from the origin by ranges,
 //!   as without tiers.
-//! - **Kept while used.** A tier that forgets what is not used — a bucket
-//!   whose lifecycle deletes an object some days after its custom time —
-//!   is given a [`Touch`]: an archive written into it is touched, and so is
-//!   one read from it or from a nearer tier, at most once every
-//!   [`TOUCH_EVERY`] for each archive this process reads. A tier without
-//!   one is never touched.
+//! - **Touched when written.** A tier that forgets what is not used — a
+//!   bucket whose lifecycle deletes an object some days after its custom
+//!   time — is given a [`Touch`], and an archive written into it is touched
+//!   then, and only then: a read is never a write. A touch another machine
+//!   got in first (the time already further) is no failure.
 //!
 //! Without tiers it is its origin: every call passes through.
 
 use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::future::{BoxFuture, FutureExt, Shared};
 use futures_util::stream::{BoxStream, StreamExt};
 use object_store::path::Path;
@@ -49,8 +56,14 @@ use object_store::{
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
 };
 
+use crate::tier_cache::{CacheClass, DirPiece, InFlight, TierCache, TierCacheStats, LAYOUT, ORIGIN};
+
 /// Archives up to this size are brought down whole on a range miss.
 pub const DEFAULT_WHOLE_BELOW: u64 = 256 << 20;
+
+/// What an archive's first read asks for: its header and, within these
+/// bytes, its root directory (the specification's own bound).
+pub const HEAD_BYTES: u64 = 16_384;
 
 /// Whether `key` names a store archive: `…/<epoch>-<24 digits>-<16 hex>.pmtiles`,
 /// a key written once and never again.
@@ -70,21 +83,21 @@ pub fn is_archive_key(key: &str) -> bool {
         && salt.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// An archive of a tier touched again no sooner than this after the last
-/// time this process touched it: a bucket that forgets objects by their
-/// custom time counts in days, and each touch is a write.
-pub const TOUCH_EVERY: Duration = Duration::from_secs(24 * 3600);
-
 /// Tells a tier that one of its objects is in use, `at` this time: on a
 /// bucket, its custom time moved forward, which its lifecycle counts an
 /// object's idleness from. See [`Tier::with_touch`].
+///
+/// A touch answered [`object_store::Error::Precondition`],
+/// [`object_store::Error::NotModified`] or
+/// [`object_store::Error::AlreadyExists`] — the object's time already
+/// further, moved by another machine — is a touch done.
 #[async_trait]
 pub trait Touch: fmt::Debug + Send + Sync {
     async fn touch(&self, location: &Path, at: SystemTime) -> Result<()>;
 }
 
-/// One tier: a name for the counters, where it keeps its copies, and what
-/// tells it a copy is in use, if it needs telling.
+/// One tier: a name for the counters and the permits, where it keeps its
+/// copies, and what tells it a copy is in use, if it needs telling.
 #[derive(Debug, Clone)]
 pub struct Tier {
     pub name: String,
@@ -101,8 +114,7 @@ impl Tier {
         }
     }
 
-    /// The tier, its archives touched when written and when read: once on
-    /// writing, then at most once every [`TOUCH_EVERY`] for each.
+    /// The tier, its archives touched when written into it.
     pub fn with_touch(mut self, touch: Arc<dyn Touch>) -> Self {
         self.touch = Some(touch);
         self
@@ -128,6 +140,19 @@ pub struct TieredStats {
     /// Archives touched in a tier ([`Touch`]), and touches that failed.
     pub touched: u64,
     pub touch_failures: u64,
+    /// The process's cache and caps, which every [`Tiered`] sharing them
+    /// counts in.
+    pub cache: TierCacheStats,
+}
+
+/// What a [`Tiered::prefetch`] brought in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Prefetched {
+    /// Ranges read in (most from what was kept already), and their bytes.
+    pub ranges: u64,
+    pub bytes: u64,
+    /// Ranges that could not be read: their readers will try again.
+    pub failed: u64,
 }
 
 #[derive(Debug, Default)]
@@ -172,7 +197,84 @@ impl Failed {
     }
 }
 
+/// A failure of a cache's load, shared by every reader waiting on it.
+fn shared_error(e: Arc<object_store::Error>) -> object_store::Error {
+    match &*e {
+        object_store::Error::NotFound { path, .. } => object_store::Error::NotFound {
+            path: path.clone(),
+            source: e.to_string().into(),
+        },
+        _ => object_store::Error::Generic {
+            store: "tiered",
+            source: e.to_string().into(),
+        },
+    }
+}
+
+fn invalid(said: impl fmt::Display) -> object_store::Error {
+    object_store::Error::Generic {
+        store: "tiered",
+        source: said.to_string().into(),
+    }
+}
+
 type Download = Shared<BoxFuture<'static, std::result::Result<(Bytes, ObjectMeta), Failed>>>;
+
+/// Where an archive's directories lie, read from its head: what its first
+/// read brings in, kept for the process.
+#[derive(Debug)]
+pub(crate) struct Layout {
+    pub(crate) meta: ObjectMeta,
+    /// The archive's first [`HEAD_BYTES`]: its header and root directory.
+    pub(crate) head: Bytes,
+    /// Its directory sections past the head — root, metadata, leaves — as
+    /// its header places them; none when it has no PMTiles header.
+    pub(crate) sections: Vec<Range<u64>>,
+}
+
+/// The directory sections of an archive of `size` bytes whose first bytes
+/// are `head`, past the head: none when `head` is no PMTiles v3 header.
+fn sections_of(head: &[u8], size: u64) -> Vec<Range<u64>> {
+    if head.len() < crate::archive::HEADER_LEN || &head[..7] != b"PMTiles" || head[7] != 3 {
+        return Vec::new();
+    }
+    let field = |at: usize| {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&head[at..at + 8]);
+        u64::from_le_bytes(b)
+    };
+    // Root directory, metadata, leaf directories: (offset, length) each.
+    [(8, 16), (24, 32), (40, 48)]
+        .into_iter()
+        .filter_map(|(offset, length)| {
+            let (offset, length) = (field(offset), field(length));
+            let start = offset.max(head.len() as u64);
+            let end = offset.saturating_add(length).min(size);
+            (length > 0 && start < end).then_some(start..end)
+        })
+        .collect()
+}
+
+/// `bytes[from..to]`, offsets within `bytes` itself; a read that came back
+/// short is an error, never a shorter answer.
+fn cut(bytes: &Bytes, from: u64, to: u64) -> Result<Bytes> {
+    if to > bytes.len() as u64 || from > to {
+        return Err(invalid(format!(
+            "a read of {} bytes asked for {from}..{to}",
+            bytes.len()
+        )));
+    }
+    Ok(bytes.slice(from as usize..to as usize))
+}
+
+/// One piece of a range: from the archive's head, one of its directory
+/// sections, or one of its data blocks; the bytes taken from it, in the
+/// archive's offsets.
+enum Piece {
+    Head(Range<u64>),
+    Section(Range<u64>, Range<u64>),
+    Block(u64, Range<u64>),
+}
 
 struct Inner {
     origin: Arc<dyn ObjectStore>,
@@ -181,8 +283,7 @@ struct Inner {
     downloads: Mutex<HashMap<String, Download>>,
     counters: Counters,
     clock: TierClock,
-    /// When this process last touched an archive, by tier and key.
-    touched: Mutex<HashMap<(usize, String), SystemTime>>,
+    cache: Arc<TierCache>,
 }
 
 /// An origin with tiers in front of it: see the [module](self).
@@ -211,7 +312,8 @@ impl fmt::Display for Tiered {
 }
 
 impl Tiered {
-    /// `origin` behind `tiers`, nearest first.
+    /// `origin` behind `tiers`, nearest first, with a cache of its own at
+    /// the defaults ([`Self::with_cache`] shares the process's).
     pub fn new(origin: Arc<dyn ObjectStore>, tiers: Vec<Tier>) -> Self {
         Self::with_whole_below(origin, tiers, DEFAULT_WHOLE_BELOW)
     }
@@ -236,7 +338,7 @@ impl Tiered {
                     ..Counters::default()
                 },
                 clock: Arc::new(SystemTime::now),
-                touched: Mutex::default(),
+                cache: Arc::new(TierCache::default()),
             }),
         }
     }
@@ -250,14 +352,28 @@ impl Tiered {
         self
     }
 
+    /// The same, reading through `cache` and asking its tiers under its
+    /// permits: the process's one, shared by every store it opens.
+    pub fn with_cache(mut self, cache: Arc<TierCache>) -> Self {
+        match Arc::get_mut(&mut self.inner) {
+            Some(inner) => inner.cache = cache,
+            None => tracing::warn!("a tiered store already shared keeps its cache"),
+        }
+        self
+    }
+
     pub fn origin(&self) -> &Arc<dyn ObjectStore> {
         &self.inner.origin
     }
 
+    pub fn cache(&self) -> &Arc<TierCache> {
+        &self.inner.cache
+    }
+
     /// An object the tiers keep and the origin never holds — one written by
-    /// [`Self::keep_in_tiers`] — from the nearest tier that has it, touched
-    /// there and farther as an archive read is; `None` when no tier has it.
-    /// The origin is never asked: it would only answer that it has none.
+    /// [`Self::keep_in_tiers`] — from the nearest tier that has it; `None`
+    /// when no tier has it. The origin is never asked: it would only answer
+    /// that it has none.
     pub async fn get_kept(&self, location: &Path) -> Result<Option<GetResult>> {
         self.get_kept_opts(location, GetOptions::default()).await
     }
@@ -270,10 +386,9 @@ impl Tiered {
     ) -> Result<Option<GetResult>> {
         let inner = &self.inner;
         for (i, tier) in inner.tiers.iter().enumerate() {
-            match tier.objects.get_opts(location, options.clone()).await {
+            match inner.get_from(i, location, options.clone()).await {
                 Ok(got) => {
                     inner.hit(i, got.range.end - got.range.start);
-                    inner.touch_from(i, location).await;
                     return Ok(Some(got));
                 }
                 Err(object_store::Error::NotFound { .. }) => continue,
@@ -296,12 +411,56 @@ impl Tiered {
     pub async fn keep_in_tiers(&self, location: &Path, bytes: Bytes) {
         let inner = &self.inner;
         for i in 0..inner.tiers.len() {
-            if inner.tiers[i].objects.head(location).await.is_ok() {
+            let tier = &inner.tiers[i];
+            if inner
+                .cache
+                .request(&tier.name, 0, tier.objects.head(location))
+                .await
+                .is_ok()
+            {
                 inner.counters.already_there.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             inner.keep_one(i, location, &bytes).await;
         }
+    }
+
+    /// The archive ranges `reads` brought into the cache ahead of their
+    /// readers, in their order, at most a tier's cap of them at once: for
+    /// a caller who knows what it will read — a bake knows its film — to
+    /// read it while it does something else. What a range needs that is
+    /// kept already costs nothing; a range of a key that is no archive is
+    /// left alone (it is never kept). A range that fails is counted and
+    /// left to its reader.
+    pub async fn prefetch(&self, reads: impl IntoIterator<Item = (Path, Range<u64>)>) -> Prefetched {
+        let inner = &self.inner;
+        if inner.tiers.is_empty() {
+            return Prefetched::default();
+        }
+        let at_once = inner.cache.config().in_flight.max(1);
+        futures_util::stream::iter(reads)
+            .filter(|(at, _)| std::future::ready(is_archive_key(at.as_ref())))
+            .map(|(at, range)| async move {
+                inner
+                    .read_range(&at, &GetRange::Bounded(range))
+                    .await
+                    .map(|got| got.range.end - got.range.start)
+            })
+            .buffered(at_once)
+            .fold(Prefetched::default(), |mut done, read| async move {
+                match read {
+                    Ok(bytes) => {
+                        done.ranges += 1;
+                        done.bytes += bytes;
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "TIER-PREFETCH-FAILED");
+                        done.failed += 1;
+                    }
+                }
+                done
+            })
+            .await
     }
 
     pub fn stats(&self) -> TieredStats {
@@ -322,26 +481,340 @@ impl Tiered {
             ranges_passed: g(&c.ranges_passed),
             touched: g(&c.touched),
             touch_failures: g(&c.touch_failures),
+            cache: self.inner.cache.stats(),
         }
+    }
+}
+
+/// A ranged read's answer, its body read: what a cap holds a permit for.
+async fn buffered(got: GetResult) -> Result<GetResult> {
+    let (meta, range, attributes) = (got.meta.clone(), got.range.clone(), got.attributes.clone());
+    let body = got.bytes().await?;
+    Ok(GetResult {
+        payload: GetResultPayload::Stream(
+            futures_util::stream::once(async move { Ok(body) }).boxed(),
+        ),
+        meta,
+        range,
+        attributes,
+        extensions: Extensions::default(),
+    })
+}
+
+/// A whole object's answer, its tier's permit held until its body is read
+/// or let go.
+fn held(got: GetResult, in_flight: InFlight) -> GetResult {
+    let GetResult {
+        payload,
+        meta,
+        range,
+        attributes,
+        extensions,
+    } = got;
+    let payload = match payload {
+        GetResultPayload::Stream(body) => GetResultPayload::Stream(
+            body.map(move |chunk| {
+                let _held = &in_flight;
+                chunk
+            })
+            .boxed(),
+        ),
+        // A local file: read here, nothing of the tier's held.
+        #[allow(unreachable_patterns)]
+        local => local,
+    };
+    GetResult {
+        payload,
+        meta,
+        range,
+        attributes,
+        extensions,
+    }
+}
+
+impl Inner {
+    /// A read of tier `i`, under its cap: a range read whole within its
+    /// deadline, a head as it is, a whole object streamed with its permit
+    /// held until the stream is done.
+    async fn get_from(&self, i: usize, at: &Path, options: GetOptions) -> Result<GetResult> {
+        let tier = &self.tiers[i];
+        if options.head {
+            return self
+                .cache
+                .request(&tier.name, 0, tier.objects.get_opts(at, options))
+                .await;
+        }
+        if let Some(range) = &options.range {
+            let asked = match range {
+                GetRange::Bounded(r) => r.end.saturating_sub(r.start),
+                GetRange::Offset(_) => self.whole_below,
+                GetRange::Suffix(n) => *n,
+            };
+            return self
+                .cache
+                .request(&tier.name, asked, async {
+                    buffered(tier.objects.get_opts(at, options).await?).await
+                })
+                .await;
+        }
+        let in_flight = self.cache.permit(&tier.name).await;
+        let deadline = self.cache.config().request_timeout;
+        match tokio::time::timeout(deadline, tier.objects.get_opts(at, options)).await {
+            Ok(got) => Ok(held(got?, in_flight)),
+            Err(_) => Err(self.cache.timed_out(&tier.name, deadline)),
+        }
+    }
+
+    /// `at` — or `range` of it — from the origin, under its cap: given its
+    /// deadline, and a longer one each time it is not met, up to
+    /// [`crate::TierCacheConfig::attempts`]. A failure the origin's client
+    /// answered (after its own retries) is not asked again.
+    async fn read_origin(
+        &self,
+        at: &Path,
+        range: Option<Range<u64>>,
+        asked: u64,
+    ) -> Result<(Bytes, ObjectMeta)> {
+        let config = self.cache.config();
+        let mut deadline = config.deadline(asked);
+        let mut attempt = 1;
+        loop {
+            let options = GetOptions {
+                range: range.clone().map(GetRange::Bounded),
+                ..GetOptions::default()
+            };
+            let in_flight = self.cache.permit(ORIGIN).await;
+            let read = async {
+                let got = self.origin.get_opts(at, options).await?;
+                let meta = got.meta.clone();
+                Ok::<_, object_store::Error>((got.bytes().await?, meta))
+            };
+            let answer = tokio::time::timeout(deadline, read).await;
+            drop(in_flight);
+            match answer {
+                Ok(Ok((bytes, meta))) => {
+                    TierCache::read_bytes(ORIGIN, bytes.len() as u64);
+                    return Ok((bytes, meta));
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(_) => {
+                    let error = self.cache.timed_out(ORIGIN, deadline);
+                    if attempt >= config.attempts {
+                        return Err(error);
+                    }
+                    tracing::warn!(key = %at, %error, attempt, "TIER-ORIGIN-SLOW");
+                    attempt += 1;
+                    deadline += config.deadline(asked);
+                }
+            }
+        }
+    }
+
+    /// `range` of the archive `at`, from the nearest tier that has it,
+    /// else from the origin: an archive up to `whole_below` brought down
+    /// whole — and kept in the tiers — then cut, a larger one read by
+    /// range. `size` when it is known.
+    async fn fetch(
+        self: &Arc<Self>,
+        at: &Path,
+        range: Range<u64>,
+        size: Option<u64>,
+    ) -> Result<(Bytes, ObjectMeta)> {
+        let asked = range.end - range.start;
+        for (i, tier) in self.tiers.iter().enumerate() {
+            let options = GetOptions {
+                range: Some(GetRange::Bounded(range.clone())),
+                ..GetOptions::default()
+            };
+            let read = async {
+                let got = tier.objects.get_opts(at, options).await?;
+                let meta = got.meta.clone();
+                Ok::<_, object_store::Error>((got.bytes().await?, meta))
+            };
+            match self.cache.request(&tier.name, asked, read).await {
+                Ok((bytes, meta)) => {
+                    self.hit(i, bytes.len() as u64);
+                    return Ok((bytes, meta));
+                }
+                Err(object_store::Error::NotFound { .. }) => continue,
+                Err(error) => {
+                    tracing::warn!(tier = %tier.name, key = %at, %error, "TIER-READ-FAILED");
+                    continue;
+                }
+            }
+        }
+        let size = match size {
+            Some(size) => size,
+            None => self.cache.request(ORIGIN, 0, self.origin.head(at)).await?.size,
+        };
+        if size <= self.whole_below {
+            let (whole, meta) = self.download(at).await?;
+            let r = GetRange::Bounded(range)
+                .as_range(whole.len() as u64)
+                .map_err(invalid)?;
+            // Copied: a slice would keep the whole archive alive in the cache.
+            return Ok((Bytes::copy_from_slice(&cut(&whole, r.start, r.end)?), meta));
+        }
+        self.counters.ranges_passed.fetch_add(1, Ordering::Relaxed);
+        self.read_origin(at, Some(range), asked).await
+    }
+
+    /// `load` of `key` in `cache`, once however many ask at once, counted
+    /// in `class`.
+    async fn kept<V>(
+        &self,
+        cache: &moka::future::Cache<(String, u64), V>,
+        key: (String, u64),
+        class: CacheClass,
+        load: impl Future<Output = Result<V>>,
+    ) -> Result<V>
+    where
+        V: Clone + Send + Sync + 'static,
+    {
+        if let Some(v) = cache.get(&key).await {
+            self.cache.counted(class, true, false);
+            return Ok(v);
+        }
+        let loaded = AtomicBool::new(false);
+        let got = cache
+            .try_get_with(key, async {
+                loaded.store(true, Ordering::Relaxed);
+                load.await
+            })
+            .await
+            .map_err(shared_error);
+        self.cache
+            .counted(class, false, loaded.load(Ordering::Relaxed));
+        if loaded.load(Ordering::Relaxed) {
+            self.cache.gauge_sizes();
+        }
+        got
+    }
+
+    /// The archive's layout, read once for the process.
+    async fn layout(self: &Arc<Self>, at: &Path) -> Result<Arc<Layout>> {
+        let load = async {
+            let (head, meta) = self.fetch(at, 0..HEAD_BYTES, None).await?;
+            let sections = sections_of(&head, meta.size);
+            Ok(DirPiece::Layout(Arc::new(Layout {
+                meta,
+                head,
+                sections,
+            })))
+        };
+        let key = (at.to_string(), LAYOUT);
+        match self
+            .kept(&self.cache.directories, key, CacheClass::Directory, load)
+            .await?
+        {
+            DirPiece::Layout(layout) => Ok(layout),
+            DirPiece::Section(_) => Err(invalid("a layout's key holds a section")),
+        }
+    }
+
+    /// The directory section `section` of the archive, read once for the
+    /// process.
+    async fn section(self: &Arc<Self>, at: &Path, section: &Range<u64>, size: u64) -> Result<Bytes> {
+        let load = async {
+            let (bytes, _) = self.fetch(at, section.clone(), Some(size)).await?;
+            Ok(DirPiece::Section(bytes))
+        };
+        let key = (at.to_string(), section.start);
+        match self
+            .kept(&self.cache.directories, key, CacheClass::Directory, load)
+            .await?
+        {
+            DirPiece::Section(bytes) => Ok(bytes),
+            DirPiece::Layout(_) => Err(invalid("a section's key holds a layout")),
+        }
+    }
+
+    /// The `k`th data block of the archive, kept a while.
+    async fn block(self: &Arc<Self>, at: &Path, k: u64, size: u64) -> Result<Bytes> {
+        let block = self.cache.config().block_bytes;
+        let range = k * block..((k + 1) * block).min(size);
+        let load = async {
+            let (bytes, _) = self.fetch(at, range, Some(size)).await?;
+            Ok(bytes)
+        };
+        self.kept(&self.cache.data, (at.to_string(), k), CacheClass::Data, load)
+            .await
+    }
+
+    /// `range` of the archive `at`, read through the cache: its head, its
+    /// directory sections and its data blocks, each read once.
+    async fn read_range(self: &Arc<Self>, at: &Path, range: &GetRange) -> Result<GetResult> {
+        let layout = self.layout(at).await?;
+        let size = layout.meta.size;
+        let r = range.as_range(size).map_err(invalid)?;
+        metrics::histogram!("tuile_tiles_range_bytes").record((r.end - r.start) as f64);
+        let head = layout.head.len() as u64;
+        let block = self.cache.config().block_bytes;
+        let mut pieces = Vec::new();
+        let mut pos = r.start;
+        while pos < r.end {
+            let piece = if pos < head {
+                Piece::Head(pos..r.end.min(head))
+            } else if let Some(s) = layout.sections.iter().find(|s| s.contains(&pos)) {
+                Piece::Section(s.clone(), pos..r.end.min(s.end))
+            } else {
+                let k = pos / block;
+                Piece::Block(k, pos..r.end.min((k + 1) * block).min(size))
+            };
+            pos = match &piece {
+                Piece::Head(t) | Piece::Section(_, t) | Piece::Block(_, t) => t.end,
+            };
+            pieces.push(piece);
+        }
+        let layout = &layout;
+        let parts = futures_util::future::try_join_all(pieces.into_iter().map(|piece| async move {
+            match piece {
+                Piece::Head(t) => cut(&layout.head, t.start, t.end),
+                Piece::Section(s, t) => {
+                    let bytes = self.section(at, &s, size).await?;
+                    cut(&bytes, t.start - s.start, t.end - s.start)
+                }
+                Piece::Block(k, t) => {
+                    let bytes = self.block(at, k, size).await?;
+                    cut(&bytes, t.start - k * block, t.end - k * block)
+                }
+            }
+        }))
+        .await?;
+        let body = match parts.len() {
+            1 => parts.into_iter().next().unwrap_or_default(),
+            _ => {
+                let mut all = BytesMut::with_capacity((r.end - r.start) as usize);
+                for part in parts {
+                    all.extend_from_slice(&part);
+                }
+                all.freeze()
+            }
+        };
+        Ok(GetResult {
+            payload: GetResultPayload::Stream(
+                futures_util::stream::once(async move { Ok(body) }).boxed(),
+            ),
+            meta: layout.meta.clone(),
+            range: r,
+            attributes: Attributes::default(),
+            extensions: Extensions::default(),
+        })
     }
 
     /// The archive from the origin, written into every tier: once however
     /// many ask at the same time.
-    async fn download(&self, location: &Path) -> Result<(Bytes, ObjectMeta)> {
+    async fn download(self: &Arc<Self>, location: &Path) -> Result<(Bytes, ObjectMeta)> {
         let key = location.to_string();
         let flight = {
-            let mut downloads =
-                self.inner
-                    .downloads
-                    .lock()
-                    .map_err(|_| object_store::Error::Generic {
-                        store: "tiered",
-                        source: "a lock was poisoned".into(),
-                    })?;
+            let mut downloads = self
+                .downloads
+                .lock()
+                .map_err(|_| invalid("a lock was poisoned"))?;
             match downloads.get(&key) {
                 Some(d) => d.clone(),
                 None => {
-                    let inner = self.inner.clone();
+                    let inner = self.clone();
                     let at = location.clone();
                     let d: Download = async move {
                         let got = inner.fetch_and_keep(&at).await;
@@ -359,24 +832,24 @@ impl Tiered {
         };
         flight.await.map_err(Failed::error)
     }
-}
 
-impl Inner {
     async fn fetch_and_keep(&self, at: &Path) -> std::result::Result<(Bytes, ObjectMeta), Failed> {
         // Kept by a download that ended since this reader missed the tiers.
         for (i, tier) in self.tiers.iter().enumerate() {
-            if let Ok(got) = tier.objects.get(at).await {
+            let read = async {
+                let got = tier.objects.get(at).await?;
                 let meta = got.meta.clone();
-                if let Ok(bytes) = got.bytes().await {
-                    self.hit(i, bytes.len() as u64);
-                    self.touch_from(i, at).await;
-                    return Ok((bytes, meta));
-                }
+                Ok::<_, object_store::Error>((got.bytes().await?, meta))
+            };
+            if let Ok((bytes, meta)) = self.cache.request(&tier.name, self.whole_below, read).await {
+                self.hit(i, bytes.len() as u64);
+                return Ok((bytes, meta));
             }
         }
-        let got = self.origin.get(at).await.map_err(|e| Failed::of(at, e))?;
-        let meta = got.meta.clone();
-        let bytes = got.bytes().await.map_err(|e| Failed::of(at, e))?;
+        let (bytes, meta) = self
+            .read_origin(at, None, self.whole_below)
+            .await
+            .map_err(|e| Failed::of(at, e))?;
         self.counters
             .origin_requests
             .fetch_add(1, Ordering::Relaxed);
@@ -397,28 +870,28 @@ impl Inner {
         }
     }
 
-    /// `bytes` written into tier `i`, unless it holds them already.
+    /// `bytes` written into tier `i`, unless it holds them already; touched
+    /// there when written.
     async fn keep_one(&self, i: usize, at: &Path, bytes: &Bytes) {
         let tier = &self.tiers[i];
         let opts = PutOptions {
             mode: PutMode::Create,
             ..PutOptions::default()
         };
-        match tier
+        let put = tier
             .objects
-            .put_opts(at, PutPayload::from_bytes(bytes.clone()), opts)
-            .await
-        {
+            .put_opts(at, PutPayload::from_bytes(bytes.clone()), opts);
+        match self.cache.request(&tier.name, bytes.len() as u64, put).await {
             Ok(_) => {
                 self.counters.written.fetch_add(1, Ordering::Relaxed);
                 metrics::counter!("tuile_tiles_tier_writes_total", "tier" => tier.name.clone())
                     .increment(1);
                 // A copy written now is in use now.
-                self.touch_if_due(i, at, true).await;
+                self.touch(i, at).await;
             }
             Err(object_store::Error::AlreadyExists { .. }) => {
+                // Written, and touched, by whoever put it there.
                 self.counters.already_there.fetch_add(1, Ordering::Relaxed);
-                self.touch_if_due(i, at, false).await;
             }
             Err(error) => {
                 tracing::warn!(tier = %tier.name, key = %at, %error, "TIER-WRITE-FAILED");
@@ -428,51 +901,27 @@ impl Inner {
         }
     }
 
-    /// An archive read from tier `i`: that tier and every farther one told
-    /// it is in use, if they are to be told. A read answered near is a use
-    /// of the copy kept far, which the machines of the region share.
-    async fn touch_from(&self, i: usize, at: &Path) {
-        for j in i..self.tiers.len() {
-            self.touch_if_due(j, at, false).await;
-        }
-    }
-
-    /// Tier `i` told that `at` is in use, if it is to be told: always when
-    /// `written`, else when this process has not touched it in the last
-    /// [`TOUCH_EVERY`]. A touch that fails is told in the log, and tried
-    /// again on the next read: the read goes on.
-    async fn touch_if_due(&self, i: usize, at: &Path, written: bool) {
+    /// Tier `i` told that `at` is in use, if it is to be told. An answer
+    /// that its time is already further is a touch done; a touch that fails
+    /// is told in the log: the read goes on.
+    async fn touch(&self, i: usize, at: &Path) {
         let Some(touch) = &self.tiers[i].touch else {
             return;
         };
         let now = (self.clock)();
-        {
-            let Ok(mut touched) = self.touched.lock() else {
-                return;
-            };
-            let key = (i, at.to_string());
-            let due = written
-                || touched.get(&key).is_none_or(|last| {
-                    now.duration_since(*last)
-                        .is_ok_and(|idle| idle >= TOUCH_EVERY)
-                });
-            if !due {
-                return;
-            }
-            // Before the request: readers at the same time touch it once.
-            touched.insert(key, now);
-        }
         let tier = &self.tiers[i].name;
-        match touch.touch(at, now).await {
-            Ok(()) => {
+        match self.cache.request(tier, 0, touch.touch(at, now)).await {
+            Ok(())
+            | Err(
+                object_store::Error::Precondition { .. }
+                | object_store::Error::NotModified { .. }
+                | object_store::Error::AlreadyExists { .. },
+            ) => {
                 self.counters.touched.fetch_add(1, Ordering::Relaxed);
                 metrics::counter!("tuile_tiles_tier_touches_total", "tier" => tier.clone())
                     .increment(1);
             }
             Err(error) => {
-                if let Ok(mut touched) = self.touched.lock() {
-                    touched.remove(&(i, at.to_string()));
-                }
                 self.counters.touch_failures.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(tier = %tier, key = %at, %error, "TIER-TOUCH-FAILED");
                 metrics::counter!("tuile_tiles_tier_touch_failures_total", "tier" => tier.clone())
@@ -484,6 +933,7 @@ impl Inner {
     fn hit(&self, i: usize, bytes: u64) {
         self.counters.hits[i].fetch_add(1, Ordering::Relaxed);
         self.counters.hit_bytes[i].fetch_add(bytes, Ordering::Relaxed);
+        TierCache::read_bytes(&self.tiers[i].name, bytes);
         metrics::counter!("tuile_tiles_tier_hits_total", "tier" => self.tiers[i].name.clone())
             .increment(1);
         metrics::counter!("tuile_tiles_tier_hit_bytes_total", "tier" => self.tiers[i].name.clone())
@@ -504,12 +954,7 @@ fn conditional(o: &GetOptions) -> bool {
 fn served(meta: ObjectMeta, bytes: Bytes, range: Option<&GetRange>) -> Result<GetResult> {
     let whole = bytes.len() as u64;
     let r: Range<u64> = match range {
-        Some(r) => r
-            .as_range(whole)
-            .map_err(|e| object_store::Error::Generic {
-                store: "tiered",
-                source: e.to_string().into(),
-            })?,
+        Some(r) => r.as_range(whole).map_err(invalid)?,
         None => 0..whole,
     };
     let body = bytes.slice(r.start as usize..r.end as usize);
@@ -548,22 +993,23 @@ impl ObjectStore for Tiered {
         if inner.tiers.is_empty() || conditional(&options) || !is_archive_key(location.as_ref()) {
             return inner.origin.get_opts(location, options).await;
         }
+        if !options.head {
+            if let Some(range) = &options.range {
+                return inner.read_range(location, range).await;
+            }
+        }
         for (i, tier) in inner.tiers.iter().enumerate() {
-            match tier.objects.get_opts(location, options.clone()).await {
+            match inner.get_from(i, location, options.clone()).await {
                 Ok(got) => {
-                    if i > 0 && options.range.is_none() && !options.head {
+                    if i > 0 && !options.head {
                         // Found farther away: kept nearer too.
                         let meta = got.meta.clone();
                         let bytes = got.bytes().await?;
                         inner.hit(i, bytes.len() as u64);
-                        inner.touch_from(i, location).await;
                         inner.keep(i, location, &bytes).await;
                         return served(meta, bytes, None);
                     }
                     inner.hit(i, got.range.end - got.range.start);
-                    if !options.head {
-                        inner.touch_from(i, location).await;
-                    }
                     return Ok(got);
                 }
                 Err(object_store::Error::NotFound { .. }) => continue,
@@ -574,17 +1020,13 @@ impl ObjectStore for Tiered {
             }
         }
         if options.head {
-            return inner.origin.get_opts(location, options).await;
+            return inner
+                .cache
+                .request(ORIGIN, 0, inner.origin.get_opts(location, options))
+                .await;
         }
-        if options.range.is_some() {
-            let meta = inner.origin.head(location).await?;
-            if meta.size > inner.whole_below {
-                inner.counters.ranges_passed.fetch_add(1, Ordering::Relaxed);
-                return inner.origin.get_opts(location, options).await;
-            }
-        }
-        let (bytes, meta) = self.download(location).await?;
-        served(meta, bytes, options.range.as_ref())
+        let (bytes, meta) = inner.download(location).await?;
+        served(meta, bytes, None)
     }
 
     fn delete_stream(
@@ -612,6 +1054,8 @@ impl ObjectStore for Tiered {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{TierCache, TierCacheConfig};
+    use std::time::Duration;
     use object_store::memory::InMemory;
 
     const ARCHIVE: &str =
@@ -867,7 +1311,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_touched_tier_is_touched_when_written_then_at_most_once_a_day() {
+    async fn a_touched_tier_is_touched_when_written_and_never_when_read() {
         let origin = origin_with_archive().await;
         let (local, global) = (Arc::new(InMemory::new()), Arc::new(InMemory::new()));
         let touches = Arc::new(Touches::default());
@@ -885,27 +1329,21 @@ mod tests {
         tiered.get(&at).await.unwrap().bytes().await.unwrap();
         assert_eq!(touches.count(), 1, "written into the global tier: touched");
         assert_eq!(touches.0.lock().unwrap()[0].0, ARCHIVE);
-        // Read again and again, whole and by range, from the local tier:
-        // the global copy is in use, and touched once a day at most.
+        // Read again and again, whole and by range, days on: a read is
+        // never a write.
         for _ in 0..3 {
+            *now.lock().unwrap() += Duration::from_secs(25 * 3600);
             tiered.get(&at).await.unwrap().bytes().await.unwrap();
             tiered.get_range(&at, 0..10).await.unwrap();
         }
-        assert_eq!(touches.count(), 1, "not again within the day");
-        *now.lock().unwrap() += Duration::from_secs(23 * 3600);
-        tiered.get_range(&at, 0..10).await.unwrap();
-        assert_eq!(touches.count(), 1, "23 hours on");
-        *now.lock().unwrap() += Duration::from_secs(2 * 3600);
-        tiered.get_range(&at, 0..10).await.unwrap();
-        tiered.get_range(&at, 0..10).await.unwrap();
-        assert_eq!(touches.count(), 2, "a day on: once more, and once only");
+        assert_eq!(touches.count(), 1, "reads touch nothing");
         let s = tiered.stats();
-        assert_eq!((s.touched, s.touch_failures), (2, 0));
+        assert_eq!((s.touched, s.touch_failures), (1, 0));
         assert_eq!(origin.gets(ARCHIVE), 1);
     }
 
     #[tokio::test]
-    async fn a_global_hit_from_another_machine_s_download_is_touched() {
+    async fn a_global_hit_from_another_machine_s_download_is_not_touched() {
         let origin = origin_with_archive().await;
         let global = Arc::new(InMemory::new());
         let at = Path::from(ARCHIVE);
@@ -919,13 +1357,321 @@ mod tests {
         .with_clock(clock);
         tiered.get_range(&at, 0..10).await.unwrap();
         tiered.get(&at).await.unwrap().bytes().await.unwrap();
-        assert_eq!(touches.count(), 1);
+        assert_eq!(touches.count(), 0, "touched by the machine that wrote it");
         assert_eq!(origin.gets(ARCHIVE), 0);
-        // What is rewritten is never tiered, so never touched.
-        tiered
-            .get(&Path::from("imagery/zones/z4/1/2/manifest.json"))
-            .await
-            .unwrap();
-        assert_eq!(touches.count(), 1);
+    }
+
+    /// A slow tier, as a bucket across a busy network is: it counts the
+    /// reads it answers and the most it was answering at once.
+    #[derive(Debug, Default)]
+    struct Slow {
+        inner: InMemory,
+        gets: AtomicU64,
+        now: AtomicU64,
+        most: AtomicU64,
+    }
+
+    impl Slow {
+        fn gets(&self) -> u64 {
+            self.gets.load(Ordering::SeqCst)
+        }
+        fn most(&self) -> u64 {
+            self.most.load(Ordering::SeqCst)
+        }
+    }
+
+    impl fmt::Display for Slow {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "Slow")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for Slow {
+        async fn put_opts(&self, l: &Path, p: PutPayload, o: PutOptions) -> Result<PutResult> {
+            self.inner.put_opts(l, p, o).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            l: &Path,
+            o: PutMultipartOptions,
+        ) -> Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(l, o).await
+        }
+        async fn get_opts(&self, l: &Path, o: GetOptions) -> Result<GetResult> {
+            if o.head {
+                return self.inner.get_opts(l, o).await;
+            }
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            let now = self.now.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let got = self.inner.get_opts(l, o).await;
+            self.now.fetch_sub(1, Ordering::SeqCst);
+            got
+        }
+        fn delete_stream(
+            &self,
+            l: BoxStream<'static, Result<Path>>,
+        ) -> BoxStream<'static, Result<Path>> {
+            self.inner.delete_stream(l)
+        }
+        fn list(&self, p: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+            self.inner.list(p)
+        }
+        async fn list_with_delimiter(&self, p: Option<&Path>) -> Result<ListResult> {
+            self.inner.list_with_delimiter(p).await
+        }
+        async fn copy_opts(&self, f: &Path, t: &Path, o: CopyOptions) -> Result<()> {
+            self.inner.copy_opts(f, t, o).await
+        }
+    }
+
+    /// The `n`th archive key of a test.
+    fn archive(n: u64) -> String {
+        format!("imagery/zones/z4/1/2/202611-1762790400000000{n:08}-00000000deadbeef.pmtiles")
+    }
+
+    /// **However many readers, a tier is asked at most its cap at once.**
+    /// Two hundred ranges of two hundred archives read together: without a
+    /// cap, two hundred requests in flight, the storm a bake start made.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_tier_is_never_asked_more_than_its_cap_at_once() {
+        let origin = Arc::new(Counted::default());
+        let global = Arc::new(Slow::default());
+        for n in 0..200 {
+            global
+                .inner
+                .put(&Path::from(archive(n)), bytes().into())
+                .await
+                .unwrap();
+        }
+        let tiered = Tiered::new(origin.clone(), vec![Tier::new("global", global.clone())])
+            .with_cache(Arc::new(TierCache::new(TierCacheConfig {
+                in_flight: 16,
+                ..TierCacheConfig::default()
+            })));
+        let reads = (0..200).map(|n| {
+            let t = tiered.clone();
+            async move { t.get_range(&Path::from(archive(n)), 100..200).await.unwrap() }
+        });
+        for got in futures_util::future::join_all(reads).await {
+            assert_eq!(got, bytes().slice(100..200));
+        }
+        assert!(global.most() <= 16, "{} requests at once", global.most());
+        assert!(tiered.stats().cache.cap_waits > 0, "readers waited");
+        assert_eq!(global.gets(), 200, "each archive read once");
+        assert_eq!(origin.gets.lock().unwrap().len(), 0);
+    }
+
+    /// **Two readers of one range make one request.**
+    #[tokio::test]
+    async fn two_readers_of_one_range_make_one_request() {
+        let origin = Arc::new(Counted::default());
+        let global = Arc::new(Slow::default());
+        let at = Path::from(ARCHIVE);
+        global.inner.put(&at, bytes().into()).await.unwrap();
+        let tiered = Tiered::new(origin, vec![Tier::new("global", global.clone())]);
+        let (a, b) = futures_util::join!(
+            tiered.get_range(&at, 100..200),
+            tiered.get_range(&at, 100..200)
+        );
+        assert_eq!(a.unwrap(), bytes().slice(100..200));
+        assert_eq!(b.unwrap(), bytes().slice(100..200));
+        assert_eq!(global.gets(), 1);
+    }
+
+    /// An archive's bytes, `len` of them, its header saying its leaf
+    /// directories lie at `leaves` and its tiles at `data`: the layout of a
+    /// PMTiles archive, the rest of it filler.
+    fn laid_out(len: usize, leaves: Range<u64>, data: Range<u64>) -> Bytes {
+        let mut b: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        b[..7].copy_from_slice(b"PMTiles");
+        b[7] = 3;
+        let mut field = |at: usize, v: u64| b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        field(8, 127);
+        field(16, 100);
+        field(24, 227);
+        field(32, 0);
+        field(40, leaves.start);
+        field(48, leaves.end - leaves.start);
+        field(56, data.start);
+        field(64, data.end - data.start);
+        Bytes::from(b)
+    }
+
+    /// **A range read is kept: read again, it costs no request.**
+    #[tokio::test]
+    async fn a_range_read_again_costs_no_request() {
+        let origin = Arc::new(Counted::default());
+        let global = Arc::new(Slow::default());
+        let at = Path::from(ARCHIVE);
+        let archive = laid_out(1 << 20, 20_000..24_000, 24_000..1 << 20);
+        global.inner.put(&at, archive.clone().into()).await.unwrap();
+        let tiered = Tiered::new(origin, vec![Tier::new("global", global.clone())]);
+        let range = 300_000..301_000;
+        assert_eq!(
+            tiered.get_range(&at, range.clone()).await.unwrap(),
+            archive.slice(300_000..301_000)
+        );
+        let first = global.gets();
+        assert_eq!(
+            tiered.get_range(&at, range).await.unwrap(),
+            archive.slice(300_000..301_000)
+        );
+        assert_eq!(global.gets(), first, "the second read is kept");
+    }
+
+    /// A tier that answers every touch as GCS does when another machine
+    /// moved the custom time further first.
+    #[derive(Debug, Default)]
+    struct Superseded(AtomicU64);
+
+    #[async_trait]
+    impl Touch for Superseded {
+        async fn touch(&self, location: &Path, _: SystemTime) -> Result<()> {
+            let n = self.0.fetch_add(1, Ordering::SeqCst);
+            Err(if n.is_multiple_of(2) {
+                object_store::Error::Precondition {
+                    path: location.to_string(),
+                    source: "409: edited during the operation".into(),
+                }
+            } else {
+                object_store::Error::NotModified {
+                    path: location.to_string(),
+                    source: "400: custom time cannot be decreased".into(),
+                }
+            })
+        }
+    }
+
+    /// **A touch another machine got in first is no failure.**
+    #[tokio::test]
+    async fn a_touch_answered_already_further_is_no_failure() {
+        let origin = origin_with_archive().await;
+        let touches = Arc::new(Superseded::default());
+        let tiered = Tiered::new(
+            origin,
+            vec![
+                Tier::new("global", Arc::new(InMemory::new())).with_touch(touches.clone()),
+            ],
+        );
+        let at = Path::from(ARCHIVE);
+        tiered.get(&at).await.unwrap().bytes().await.unwrap();
+        assert_eq!(touches.0.load(Ordering::SeqCst), 1, "touched once, on write");
+        let s = tiered.stats();
+        assert_eq!((s.touched, s.touch_failures), (1, 0));
+    }
+
+    /// A tiered store over `global` alone, its data blocks kept `ttl`.
+    fn kept_for(global: Arc<Slow>, ttl: Duration) -> Tiered {
+        Tiered::new(Arc::new(Counted::default()), vec![Tier::new("global", global)]).with_cache(
+            Arc::new(TierCache::new(TierCacheConfig {
+                block_bytes: 64 << 10,
+                data_ttl: ttl,
+                ..TierCacheConfig::default()
+            })),
+        )
+    }
+
+    /// **Tile data is kept for its time, then read again once.**
+    #[tokio::test]
+    async fn tile_data_is_read_again_once_its_time_is_up() {
+        let global = Arc::new(Slow::default());
+        let at = Path::from(ARCHIVE);
+        let archive = laid_out(1 << 20, 20_000..24_000, 24_000..1 << 20);
+        global.inner.put(&at, archive.clone().into()).await.unwrap();
+        let tiered = kept_for(global.clone(), Duration::from_millis(300));
+        let range = 300_000..301_000;
+        tiered.get_range(&at, range.clone()).await.unwrap();
+        assert_eq!(global.gets(), 2, "its layout, then its block");
+        tiered.get_range(&at, range.clone()).await.unwrap();
+        assert_eq!(global.gets(), 2, "within its time: no request");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            tiered.get_range(&at, range).await.unwrap(),
+            archive.slice(300_000..301_000)
+        );
+        assert_eq!(global.gets(), 3, "past its time: the block once more");
+        let s = tiered.stats().cache;
+        assert_eq!((s.data.hits, s.data.loads), (1, 2), "{s:?}");
+    }
+
+    /// **Directories outlive tile data.** An archive's header and leaf
+    /// directories are read once for the process; its tiles, once a while.
+    #[tokio::test]
+    async fn directories_stay_kept_past_the_data_s_time() {
+        let global = Arc::new(Slow::default());
+        let at = Path::from(ARCHIVE);
+        let archive = laid_out(1 << 20, 200_000..210_000, 210_000..1 << 20);
+        global.inner.put(&at, archive.clone().into()).await.unwrap();
+        let tiered = kept_for(global.clone(), Duration::from_millis(300));
+        let (leaves, tiles) = (201_000..202_000, 500_000..501_000);
+        tiered.get_range(&at, 0..127).await.unwrap();
+        tiered.get_range(&at, leaves.clone()).await.unwrap();
+        tiered.get_range(&at, tiles.clone()).await.unwrap();
+        assert_eq!(global.gets(), 3, "head, leaves, a block");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            tiered.get_range(&at, leaves).await.unwrap(),
+            archive.slice(201_000..202_000)
+        );
+        tiered.get_range(&at, 0..127).await.unwrap();
+        assert_eq!(global.gets(), 3, "directories still kept");
+        assert_eq!(
+            tiered.get_range(&at, tiles).await.unwrap(),
+            archive.slice(500_000..501_000)
+        );
+        assert_eq!(global.gets(), 4, "the tiles read again");
+    }
+
+    /// **A range across blocks, sections and the head is the archive's
+    /// bytes, exactly.**
+    #[tokio::test]
+    async fn a_range_across_pieces_is_the_archive_s_bytes() {
+        let global = Arc::new(Slow::default());
+        let at = Path::from(ARCHIVE);
+        let archive = laid_out(1 << 20, 20_000..24_000, 24_000..1 << 20);
+        global.inner.put(&at, archive.clone().into()).await.unwrap();
+        let tiered = kept_for(global.clone(), Duration::from_secs(60));
+        for r in [0..1 << 20, 10..300_000, 16_000..25_000, 65_000..200_000, 1_000_000..1 << 20] {
+            assert_eq!(
+                tiered.get_range(&at, r.clone()).await.unwrap(),
+                archive.slice(r.start as usize..r.end as usize),
+                "{r:?}"
+            );
+        }
+        // Past the end: clamped as an object store clamps it.
+        assert_eq!(
+            tiered.get_range(&at, 1_048_000..2_000_000).await.unwrap(),
+            archive.slice(1_048_000..)
+        );
+    }
+
+    /// **An archive no tier holds is brought down once, its blocks cut from
+    /// it; a planned read brings them in ahead.**
+    #[tokio::test]
+    async fn a_prefetch_brings_the_blocks_in_ahead_of_their_readers() {
+        let origin = Arc::new(Counted::default());
+        let at = Path::from(ARCHIVE);
+        let archive = laid_out(1 << 20, 20_000..24_000, 24_000..1 << 20);
+        origin.inner.put(&at, archive.clone().into()).await.unwrap();
+        let global = Arc::new(Slow::default());
+        let tiered = Tiered::new(origin.clone(), vec![Tier::new("global", global.clone())]);
+        let ranges = [100_000..110_000, 400_000..500_000, 900_000..901_000];
+        let done = tiered
+            .prefetch(ranges.iter().map(|r| (at.clone(), r.clone())))
+            .await;
+        assert_eq!((done.ranges, done.failed), (3, 0));
+        assert_eq!(origin.gets(ARCHIVE), 1, "brought down whole, once");
+        let before = global.gets();
+        for r in ranges {
+            assert_eq!(
+                tiered.get_range(&at, r.clone()).await.unwrap(),
+                archive.slice(r.start as usize..r.end as usize)
+            );
+        }
+        assert_eq!(global.gets(), before, "every range kept");
+        assert_eq!(origin.gets(ARCHIVE), 1);
     }
 }
