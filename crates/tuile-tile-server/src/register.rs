@@ -90,6 +90,9 @@ pub struct ZoneEntry {
     pub generation: u64,
     /// A tile was taken out that an older archive may hold.
     pub stale: bool,
+    /// Moves with every change to what it holds of the zone's tiles,
+    /// absences apart: [`KnownZone::generation`].
+    pub version: u64,
 }
 
 /// Everything a [`MemoryRegister`] holds.
@@ -230,6 +233,7 @@ impl MemoryRegister {
         b.tiles
             .retain(|_, t| t.absent || t.generation > g || !zone_archives.contains(&t.archive));
         let z = b.zones.entry((base.into(), zone)).or_default();
+        z.version += 1;
         if g >= z.generation {
             z.generation = g;
             z.stale = false;
@@ -366,6 +370,7 @@ impl Ledger for MemoryRegister {
             dropped += before - b.tiles.len();
         }
         let z = b.zones.entry((p.layer.into(), p.zone)).or_default();
+        z.version += 1;
         z.generation = z.generation.max(g);
         if p.uncovering && dropped > 0 {
             z.stale = true;
@@ -373,10 +378,14 @@ impl Ledger for MemoryRegister {
         Ok(())
     }
 
-    async fn deleting(&self, _layer: &str, _zone: Zone, keys: &[String]) -> Result<(), String> {
+    async fn deleting(&self, layer: &str, zone: Zone, keys: &[String]) -> Result<(), String> {
         let mut b = self.lock();
         b.tiles
             .retain(|_, t| t.absent || !keys.contains(&t.archive));
+        let (base, _) = base_of(layer);
+        if let Some(z) = b.zones.get_mut(&(base.to_string(), zone)) {
+            z.version += 1;
+        }
         Ok(())
     }
 
@@ -430,6 +439,7 @@ impl IndexReader for MemoryRegister {
                     KnownZone {
                         zone: *zone,
                         indexed: !z.stale && complete,
+                        generation: Some(z.version),
                     }
                 })
                 .collect(),
