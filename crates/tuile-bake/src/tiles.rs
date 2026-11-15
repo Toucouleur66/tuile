@@ -26,10 +26,22 @@
 //! - a bucket shared by every machine, `TUILE_TILES_GLOBAL`: `gs://bucket/
 //!   prefix` (credentials as `object_store` reads them from the environment)
 //!   or `file:///dir`. What the bucket gives is written there once. On GCS,
-//!   an archive's custom time is set when it is written and moved forward
-//!   when it is read, once a day at most ([`GcsCustomTime`]): the bucket's
-//!   lifecycle deletes what has not been used for its days. A directory has
+//!   an archive's custom time is set when it is written, and only then
+//!   ([`GcsCustomTime`]): the bucket's lifecycle deletes it some days on, and
+//!   the next reader brings it down from the bucket again. A directory has
 //!   no custom time and is never touched.
+//!
+//! What the process reads of the archives through these tiers is kept in
+//! memory, and every request to a tier or to the bucket waits for one of a
+//! fixed number of permits: one [`TierCache`] for the whole process, however
+//! many stores it opens ([`process_tier_cache`]), set by the
+//! `TUILE_TILES_BLOCK_KIB`, `TUILE_TILES_DATA_CACHE_MIB`,
+//! `TUILE_TILES_DATA_TTL_S`, `TUILE_TILES_DIRECTORY_CACHE_MIB`,
+//! `TUILE_TILES_IN_FLIGHT`, `TUILE_TILES_ORIGIN_IN_FLIGHT`,
+//! `TUILE_TILES_REQUEST_TIMEOUT_S`, `TUILE_TILES_MIN_KIB_PER_S`,
+//! `TUILE_TILES_ATTEMPTS` and `TUILE_TILES_CLIENT_RETRIES` numbers
+//! ([`tuile_tile_server::tier_cache`]). Its budgets are memory the host
+//! counts once per process: [`TierCacheConfig::memory_bytes`].
 //!
 //! The projections, under `TUILE_TILES_DIR`, are reused whenever the zone's
 //! archives are the ones they were made from. A zone projected whole — the
@@ -55,8 +67,8 @@ use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use object_store::client::SpawnedReqwestConnector;
 use tuile_tile_server::projection::width_m;
 use tuile_tile_server::{
-    DiskCacheConfig, Eye, Footprint, Grid, LayerDef, StoreConfig, StoreContent, Tier, Tiered,
-    TileStore,
+    DiskCacheConfig, Eye, Footprint, Grid, LayerDef, StoreConfig, StoreContent, Tier, TierCache,
+    TierCacheConfig, Tiered, TileStore,
 };
 
 const DEFAULT_REGION: &str = "auto";
@@ -208,17 +220,53 @@ pub struct Tiles {
     tiered: Option<Tiered>,
 }
 
+/// The process's cache of what it reads through its tiers, and their
+/// permits: made from the environment ([`TierCacheConfig::from_env`]) the
+/// first time a store is opened, then shared by every store the process
+/// opens — its budgets and caps are the process's.
+pub fn process_tier_cache() -> Arc<TierCache> {
+    static CACHE: std::sync::OnceLock<Arc<TierCache>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let config = TierCacheConfig::from_env();
+            tracing::info!(
+                block_kib = config.block_bytes >> 10,
+                data_mib = config.data_bytes >> 20,
+                data_ttl_s = config.data_ttl.as_secs(),
+                directory_mib = config.directory_bytes >> 20,
+                in_flight = config.in_flight,
+                origin_in_flight = config.origin_in_flight,
+                "TILES-TIER-CACHE"
+            );
+            Arc::new(TierCache::new(config))
+        })
+        .clone()
+}
+
 /// The tiers the environment names, nearest first: the disk's, then the
-/// global one. See the [module](self).
+/// global one, and what the process keeps of what it reads through them.
+/// See the [module](self).
 #[derive(Debug, Default)]
 pub struct Tiers {
     pub disk: Option<DiskCacheConfig>,
     pub global: Option<Tier>,
+    /// The process's ([`process_tier_cache`]) when read from the
+    /// environment; one of its own, at the defaults, otherwise.
+    pub cache: Arc<TierCache>,
 }
 
 impl Tiers {
+    /// `origin` behind the global tier, read through the cache: `None`
+    /// when there is no global tier.
+    pub fn tiered(&self, origin: Arc<dyn object_store::ObjectStore>) -> Option<Tiered> {
+        self.global
+            .clone()
+            .map(|global| Tiered::new(origin, vec![global]).with_cache(self.cache.clone()))
+    }
+
     /// Their clients' requests run on `io`: see the [module](self).
     pub fn from_env(io: &tokio::runtime::Handle) -> Result<Self, String> {
+        let cache = process_tier_cache();
         let disk = var("TUILE_TILES_CACHE_DIR").ok().map(|dir| {
             let gib = std::env::var("TUILE_TILES_CACHE_GIB")
                 .ok()
@@ -231,7 +279,7 @@ impl Tiers {
         });
         let global = match var("TUILE_TILES_GLOBAL") {
             Ok(url) => {
-                let (objects, touch) = global_tier(&url, io)?;
+                let (objects, touch) = global_tier(&url, io, cache.config())?;
                 let tier = Tier::new("global", objects);
                 Some(match touch {
                     Some(touch) => tier.with_touch(touch),
@@ -240,7 +288,11 @@ impl Tiers {
             }
             Err(_) => None,
         };
-        Ok(Self { disk, global })
+        Ok(Self {
+            disk,
+            global,
+            cache,
+        })
     }
 }
 
@@ -253,7 +305,14 @@ type GlobalTier = (
 
 /// The global tier at `url`: `gs://bucket[/prefix]` or `file:///dir`, a
 /// bucket's requests (its objects' and its custom times') run on `io`.
-fn global_tier(url: &str, io: &tokio::runtime::Handle) -> Result<GlobalTier, String> {
+/// A bucket's client gives a request the time its largest — an archive
+/// brought down whole — takes at the slowest `limits` allows, and retries it
+/// `limits.client_retries` times within that time, never ten times over.
+fn global_tier(
+    url: &str,
+    io: &tokio::runtime::Handle,
+    limits: &TierCacheConfig,
+) -> Result<GlobalTier, String> {
     let parsed = url::Url::parse(url).map_err(|e| format!("TUILE_TILES_GLOBAL {url}: {e}"))?;
     let prefix = parsed.path().trim_matches('/').to_string();
     let (objects, touch): GlobalTier = match parsed.scheme() {
@@ -261,8 +320,19 @@ fn global_tier(url: &str, io: &tokio::runtime::Handle) -> Result<GlobalTier, Str
             let bucket = parsed
                 .host_str()
                 .ok_or_else(|| format!("TUILE_TILES_GLOBAL {url}: no bucket"))?;
+            let largest = limits.deadline(tuile_tile_server::tiered::DEFAULT_WHOLE_BELOW);
             let gcs = object_store::gcp::GoogleCloudStorageBuilder::from_env()
                 .with_http_connector(SpawnedReqwestConnector::new(io.clone()))
+                .with_client_options(
+                    object_store::ClientOptions::new()
+                        .with_timeout(largest)
+                        .with_connect_timeout(limits.request_timeout),
+                )
+                .with_retry(object_store::RetryConfig {
+                    max_retries: limits.client_retries,
+                    retry_timeout: largest,
+                    ..object_store::RetryConfig::default()
+                })
                 .with_bucket_name(bucket)
                 .build()
                 .map_err(|e| format!("TUILE_TILES_GLOBAL {url}: {e}"))?;
@@ -403,10 +473,38 @@ impl tuile_tile_server::Touch for GcsCustomTime {
             .await
             .map_err(|e| failed(format!("{location}: {e}")))?;
         let (status, body) = answered.map_err(|e| failed(format!("{location}: {e}")))?;
-        if status.is_success() {
-            return Ok(());
+        touch_answer(location, status.as_u16(), &body)
+    }
+}
+
+/// What GCS's answer to a touch says. A custom time can only move forward,
+/// so `400 … cannot be decreased` — another machine moved it further first
+/// — and `409`, the object edited by another touch during this one, are a
+/// touch done: [`object_store::Error::NotModified`] and
+/// [`object_store::Error::Precondition`], which a tiered store counts as
+/// touched.
+fn touch_answer(
+    location: &object_store::path::Path,
+    status: u16,
+    body: &str,
+) -> object_store::Result<()> {
+    let said = format!("{location}: {status}: {body}");
+    match status {
+        200..=299 => Ok(()),
+        409 => Err(object_store::Error::Precondition {
+            path: location.to_string(),
+            source: said.into(),
+        }),
+        400 if body.to_ascii_lowercase().contains("cannot be decreased") => {
+            Err(object_store::Error::NotModified {
+                path: location.to_string(),
+                source: said.into(),
+            })
         }
-        Err(failed(format!("{location}: {status}: {body}")))
+        _ => Err(object_store::Error::Generic {
+            store: "gcs custom time",
+            source: said.into(),
+        }),
     }
 }
 
@@ -571,9 +669,7 @@ impl Tiles {
             .enable_all()
             .build()
             .map_err(|e| format!("tile store runtime: {e}"))?;
-        let tiered = tiers
-            .global
-            .map(|global| Tiered::new(origin.clone(), vec![global]));
+        let tiered = tiers.tiered(origin.clone());
         let s3: Arc<dyn object_store::ObjectStore> = match &tiered {
             Some(t) => Arc::new(t.clone()),
             None => origin,
@@ -951,6 +1047,18 @@ impl Tiles {
                 written = t.written,
                 already_there = t.already_there,
                 ranges_passed = t.ranges_passed,
+                touched = t.touched,
+                touch_failures = t.touch_failures,
+                directory_hits = t.cache.directory.hits,
+                directory_loads = t.cache.directory.loads,
+                directory_joined = t.cache.directory.joined,
+                directory_mb = t.cache.directory.bytes as f64 / 1e6,
+                data_hits = t.cache.data.hits,
+                data_loads = t.cache.data.loads,
+                data_joined = t.cache.data.joined,
+                data_mb = t.cache.data.bytes as f64 / 1e6,
+                cap_waits = t.cache.cap_waits,
+                timeouts = t.cache.timeouts,
                 "TILES-TIERS"
             );
         }
@@ -1054,7 +1162,9 @@ mod tier_tests {
         let dir = tempfile::tempdir().expect("dir");
         let url = url::Url::from_directory_path(dir.path()).expect("url");
         let io = tokio::runtime::Runtime::new().expect("io");
-        let (tier, _) = super::global_tier(url.as_str(), io.handle()).expect("tier");
+        let (tier, _) =
+            super::global_tier(url.as_str(), io.handle(), &super::TierCacheConfig::default())
+            .expect("tier");
         let at = object_store::path::Path::from(
             "layer/top/1-000000000000000000000001-0123456789abcdef.pmtiles",
         );
@@ -1232,7 +1342,32 @@ mod custom_time_tests {
         let dir = tempfile::tempdir().expect("dir");
         let url = url::Url::from_directory_path(dir.path()).expect("url");
         let io = tokio::runtime::Runtime::new().expect("io");
-        let (_, touch) = global_tier(url.as_str(), io.handle()).expect("tier");
+        let (_, touch) = global_tier(url.as_str(), io.handle(), &TierCacheConfig::default())
+            .expect("tier");
         assert!(touch.is_none());
+    }
+
+    /// A custom time another machine moved further first is a touch done,
+    /// as is one edited during the touch; anything else is a failure.
+    #[test]
+    fn a_touch_answered_already_further_is_a_touch_done() {
+        let at = object_store::path::Path::from("a.pmtiles");
+        assert!(touch_answer(&at, 200, "").is_ok());
+        assert!(matches!(
+            touch_answer(&at, 400, r#"{"error":{"message":"The custom time cannot be decreased."}}"#),
+            Err(object_store::Error::NotModified { .. })
+        ));
+        assert!(matches!(
+            touch_answer(&at, 409, "The object was edited during the operation."),
+            Err(object_store::Error::Precondition { .. })
+        ));
+        assert!(matches!(
+            touch_answer(&at, 400, "Invalid argument."),
+            Err(object_store::Error::Generic { .. })
+        ));
+        assert!(matches!(
+            touch_answer(&at, 403, "denied"),
+            Err(object_store::Error::Generic { .. })
+        ));
     }
 }

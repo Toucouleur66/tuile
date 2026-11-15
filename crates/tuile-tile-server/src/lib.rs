@@ -23,6 +23,7 @@ pub mod projection;
 pub mod register;
 pub mod service;
 pub mod store;
+pub mod tier_cache;
 pub mod tiered;
 pub mod tiering;
 pub mod upstream;
@@ -45,7 +46,8 @@ pub use service::{
     TileService,
 };
 pub use store::{Census, Clock, Compaction, Fresh, Scrub, StatsSnapshot, StoreConfig, TileStore};
-pub use tiered::{Tier, TierClock, Tiered, TieredStats, Touch, TOUCH_EVERY};
+pub use tier_cache::{CacheClass, ClassStats, TierCache, TierCacheConfig, TierCacheStats};
+pub use tiered::{Prefetched, Tier, TierClock, Tiered, TieredStats, Touch};
 pub use tiering::Tiering;
 pub use upstream::{TemplateUpstream, Upstream, UpstreamError};
 

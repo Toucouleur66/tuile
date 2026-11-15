@@ -657,6 +657,8 @@ fn a_global_tier_spares_the_bucket_a_second_download() {
     let tiers = || tuile_bake::tiles::Tiers {
         disk: None,
         global: Some(tuile_tile_server::Tier::new("global", global.clone())),
+        // Each store a machine of its own: a cache of its own.
+        cache: Default::default(),
     };
     let whole = Footprint::from_eyes(eyes(), 12.0);
 
@@ -705,6 +707,8 @@ fn a_second_machine_reads_each_whole_zone_as_one_object() {
             "global",
             global.clone() as Arc<dyn object_store::ObjectStore>,
         )),
+        // Each store a machine of its own: a cache of its own.
+        cache: Default::default(),
     };
 
     // As before: no tier, the reference pack.
