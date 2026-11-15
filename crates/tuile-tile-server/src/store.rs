@@ -341,6 +341,13 @@ pub struct TileStore {
     /// Zones known by their archives' indexes alone: which tiles they hold
     /// and a digest of each, nothing downloaded (see [`crate::index`]).
     indexes: Mutex<HashMap<ZoneKey, Arc<ZoneIndex>>>,
+    /// Zones whose index came from the register, and at which of its
+    /// generations: kept for every later projection of this store until
+    /// the register moves (see [`crate::projection`]).
+    pub(crate) registered: Mutex<HashMap<ZoneKey, crate::projection::Registered>>,
+    /// One read of the register at a time: a second bake that wants the
+    /// same zones waits for the first, then finds them held.
+    pub(crate) register_reads: tokio::sync::Mutex<()>,
     /// Told of every manifest this store publishes, if anyone is to be.
     announcer: Option<Arc<dyn Announce>>,
     ledger: Option<Arc<dyn crate::Ledger>>,
@@ -417,6 +424,8 @@ impl TileStore {
             projection_locks: Mutex::default(),
             listings: Mutex::new(Lru::new(crate::projection::listing_cache_tiles())),
             indexes: Mutex::default(),
+            registered: Mutex::default(),
+            register_reads: tokio::sync::Mutex::const_new(()),
             announcer: None,
             ledger: None,
             index_reader: None,

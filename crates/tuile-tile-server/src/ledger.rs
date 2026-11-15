@@ -99,6 +99,20 @@ pub struct KnownZone {
     /// reader gets. A zone it does not (a publication it missed, a zone not
     /// rebuilt yet) is read by its archives' indexes, as without a register.
     pub indexed: bool,
+    /// Where the register is in the zone's history: a number that moves
+    /// whenever the copy a reader gets of one of its tiles changes — a
+    /// publication, a rebuild, a deletion; not an absence, which is said
+    /// without touching its zone. A store that read the zone's tiles at
+    /// this generation keeps them for the next projections of its process,
+    /// and reads them again only once it moves
+    /// ([`TileStore::project`](crate::TileStore::project)). `None`: the
+    /// register cannot say, and the zone's tiles are read at every
+    /// projection.
+    ///
+    /// An absence said after the tiles were read is not in what is kept:
+    /// the store knows that tile as not held, and a reader asks for it as
+    /// it would without an index — slower, never wrong.
+    pub generation: Option<u64>,
 }
 
 /// One tile as a register gives it back: its id, the stamp of the copy a

@@ -61,10 +61,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt};
+use tracing::Instrument;
 
 use crate::archive;
 use crate::grid::Grid;
@@ -356,6 +357,14 @@ pub struct ProjectionReport {
     pub tiles_registered: u64,
     pub register_batches: u64,
     pub register_millis: u64,
+    /// Rows the register gave this projection: none for a zone held.
+    pub register_rows: u64,
+    /// Time spent waiting for another bake of the process to finish making
+    /// a zone this one wants too, summed over the zones.
+    pub lock_wait_millis: u64,
+    /// Zones known by the register whose tiles this store already held, at
+    /// the generation the register says: nothing read for them.
+    pub zones_register_held: usize,
     /// Layers whose zones were listed from the bucket, and from the register.
     pub layers_listed: usize,
     pub layers_from_register: usize,
@@ -409,6 +418,9 @@ impl ProjectionReport {
         self.tiles_registered += r.tiles_registered;
         self.register_batches += r.register_batches;
         self.register_millis += r.register_millis;
+        self.register_rows += r.register_rows;
+        self.lock_wait_millis += r.lock_wait_millis;
+        self.zones_register_held += r.zones_register_held;
         self.zones_reused += r.zones_reused;
         self.zones_shared += r.zones_shared;
         self.zones_shared_written += r.zones_shared_written;
@@ -548,6 +560,36 @@ pub(crate) fn listing_cache_tiles() -> u64 {
     crate::knob::count(&N, "TUILE_LISTING_CACHE_TILES", LISTING_CACHE_TILES) as u64
 }
 
+/// A zone whose index this store read from the register: at which of its
+/// generations, until when what was read stays good, and how many tiles.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Registered {
+    generation: u64,
+    /// The first expiry among the absences and archives' copies held.
+    good_until: Option<SystemTime>,
+    tiles: u64,
+}
+
+impl Registered {
+    fn good_at(&self, now: SystemTime) -> bool {
+        self.good_until.is_none_or(|at| now < at)
+    }
+
+    /// What a projection says of the zone, held.
+    fn report_held(&self) -> ProjectionReport {
+        ProjectionReport {
+            zones_seen: 1,
+            zones_indexed: 1,
+            tiles_indexed: self.tiles,
+            tiles_listed: self.tiles,
+            zones_registered: 1,
+            tiles_registered: self.tiles,
+            zones_register_held: 1,
+            ..Default::default()
+        }
+    }
+}
+
 /// The ids a projection holds, from its directories alone.
 async fn ids_of(
     reader: &Arc<archive::LocalReader>,
@@ -592,7 +634,7 @@ impl TileStore {
     ) -> Result<ProjectionReport, StoreError> {
         let began = Instant::now();
         let mut total = ProjectionReport::default();
-        let mut zones: Vec<(String, Zone)> = Vec::new();
+        let mut zones: Vec<(String, Zone, bool)> = Vec::new();
         let mut names: Vec<String> = self.layers().map(|l| l.name.clone()).collect();
         names.sort();
         for name in &names {
@@ -610,15 +652,22 @@ impl TileStore {
             } else {
                 total.layers_listed += 1;
             }
+            let by_index = footprint.by_index(name);
+            // A cell zone of a layer projected by index that the register
+            // does not know whole is cut tile by tile: what the bake names
+            // there is read by its bytes, and only what the footprint keeps
+            // comes down — not every archive of the zone, whole.
+            let targeted = |zone: Zone| (footprint.targets(name) || by_index) && zone != Zone::Top;
             let mut from_register = Vec::new();
-            for (zone, indexed) in listed {
-                if !footprint.reaches(layer, zone) {
+            for known in listed {
+                if !footprint.reaches(layer, known.zone) {
                     continue;
                 }
-                if indexed && footprint.by_index(name) {
-                    from_register.push(zone);
+                if known.indexed && by_index {
+                    from_register.push((known.zone, known.generation));
                 } else {
-                    zones.push((name.clone(), zone));
+                    self.forget_registered(name, known.zone);
+                    zones.push((name.clone(), known.zone, targeted(known.zone)));
                 }
             }
             if from_register.is_empty() {
@@ -634,14 +683,17 @@ impl TileStore {
                     // Read as without a register: slower, and as right.
                     tracing::warn!(layer = %name, %error, zones = from_register.len(), "REGISTER-READ-FAILED: the zones are read by their indexes");
                     metrics::counter!("tuile_tiles_register_failures_total", "layer" => name.clone(), "what" => "tiles").increment(1);
-                    zones.extend(from_register.into_iter().map(|z| (name.clone(), z)));
+                    zones.extend(
+                        from_register
+                            .into_iter()
+                            .map(|(z, _)| (name.clone(), z, targeted(z))),
+                    );
                 }
             }
         }
         let results: Vec<(String, Zone, bool, Result<ProjectionReport, StoreError>)> =
             futures_util::stream::iter(zones)
-                .map(|(layer, zone)| async move {
-                    let targeted = footprint.targets(&layer) && zone != Zone::Top;
+                .map(|(layer, zone, targeted)| async move {
                     metrics::counter!("tuile_tiles_zones_projected_total", "layer" => layer.clone(), "by" => "archives").increment(1);
                     let r = if targeted {
                         self.project_zone_targeted(footprint, dir, &layer, zone)
@@ -682,7 +734,7 @@ impl TileStore {
     async fn zones_for_projection(
         &self,
         layer: &Layer,
-    ) -> Result<(Vec<(Zone, bool)>, bool), StoreError> {
+    ) -> Result<(Vec<crate::KnownZone>, bool), StoreError> {
         if let Some(reader) = self.index_reader() {
             let began = Instant::now();
             match reader.zones(&layer.name).await {
@@ -694,10 +746,7 @@ impl TileStore {
                         seconds = began.elapsed().as_secs_f64(),
                         "REGISTER-ZONES"
                     );
-                    return Ok((
-                        known.into_iter().map(|z| (z.zone, z.indexed)).collect(),
-                        true,
-                    ));
+                    return Ok((known, true));
                 }
                 Ok(None) => {
                     tracing::info!(layer = %layer.name, "REGISTER-LAYER-UNKNOWN: the bucket is listed");
@@ -712,95 +761,170 @@ impl TileStore {
         let listed = self.zones_of(layer).await?;
         metrics::histogram!("tuile_tiles_zone_listing_seconds", "layer" => layer.name.clone())
             .record(began.elapsed().as_secs_f64());
-        Ok((listed.into_iter().map(|z| (z, false)).collect(), false))
+        Ok((
+            listed
+                .into_iter()
+                .map(|zone| crate::KnownZone {
+                    zone,
+                    indexed: false,
+                    generation: None,
+                })
+                .collect(),
+            false,
+        ))
     }
 
     /// Knows `zones` of `layer` by the register alone: their tiles streamed
     /// by ranges of ids, in batches, and each zone attached as if its
     /// archives' indexes had been read. A tile whose winning copy is in an
     /// expired archive is not held, as the store would not read it.
+    ///
+    /// A zone this store read before at the generation the register says
+    /// now ([`crate::KnownZone::generation`]), and whose tiles held then
+    /// are all still good — no copy in an archive expired since, no absence
+    /// expired since — is not read again: its index is still attached. One
+    /// read at a time ([`TileStore::register_reads`]): a second bake that
+    /// wants the same zones waits for the first, then reads none of them.
     async fn index_from_register(
         &self,
         layer: &Layer,
-        zones: &[Zone],
+        zones: &[(Zone, Option<u64>)],
     ) -> Result<Vec<(Zone, ProjectionReport)>, String> {
         let Some(reader) = self.index_reader() else {
             return Err("no register".into());
         };
+        let span = tracing::info_span!(
+            "tiles.register",
+            layer = %layer.name,
+            zones = zones.len(),
+            held = tracing::field::Empty,
+            rows = tracing::field::Empty,
+            wait_s = tracing::field::Empty,
+        );
+        let waited = Instant::now();
+        let _one_read = self.register_reads.lock().instrument(span.clone()).await;
+        span.record("wait_s", waited.elapsed().as_secs_f64());
         let began = Instant::now();
         let now = self.now();
-        let mut ranges: Vec<std::ops::RangeInclusive<u64>> = zones
+        let mut out = Vec::with_capacity(zones.len());
+        let mut to_read: Vec<(Zone, Option<u64>)> = Vec::new();
+        {
+            let held = self.registered.lock().map_err(|e| e.to_string())?;
+            for (zone, generation) in zones {
+                match (generation, held.get(&(layer.name.clone(), *zone))) {
+                    (Some(g), Some(r)) if r.generation == *g && r.good_at(now) => {
+                        out.push((*zone, r.report_held()));
+                    }
+                    _ => to_read.push((*zone, *generation)),
+                }
+            }
+        }
+        let zones_held = out.len();
+        span.record("held", zones_held as u64);
+        if to_read.is_empty() {
+            tracing::info!(
+                layer = %layer.name,
+                zones = zones.len(),
+                held = zones_held,
+                "REGISTER-TILES-HELD"
+            );
+            metrics::counter!("tuile_tiles_register_zones_held_total", "layer" => layer.name.clone())
+                .increment(zones_held as u64);
+            return Ok(out);
+        }
+        let mut ranges: Vec<std::ops::RangeInclusive<u64>> = to_read
             .iter()
-            .flat_map(|z| layer.zone_id_ranges(*z))
+            .flat_map(|(z, _)| layer.zone_id_ranges(*z))
             .collect();
         ranges.sort_by_key(|r| *r.start());
         let ranges = merge_ranges(ranges);
         let mut tiles: HashMap<Zone, HashMap<u64, crate::index::Stamp>> =
-            zones.iter().map(|z| (*z, HashMap::new())).collect();
+            to_read.iter().map(|(z, _)| (*z, HashMap::new())).collect();
+        // Until when what is read of each zone stays good: the first expiry
+        // of an absence held, or of an archive whose copy is held.
+        let mut good_until: HashMap<Zone, SystemTime> = HashMap::new();
+        let mut until = |zone: Zone, at: Option<SystemTime>| {
+            if let Some(at) = at {
+                good_until
+                    .entry(zone)
+                    .and_modify(|u| *u = (*u).min(at))
+                    .or_insert(at);
+            }
+        };
         // The layer's absences, when an absence store keeps them: the same
         // rows, flagged, for the absence sibling's index.
         let absent_layer = format!("{}{}", layer.name, crate::catalog::ABSENT_SUFFIX);
         let absences_here = self.absences_first() && self.layer(&absent_layer).is_ok();
         let mut absent: HashMap<Zone, HashMap<u64, crate::index::Stamp>> = if absences_here {
-            zones.iter().map(|z| (*z, HashMap::new())).collect()
+            to_read.iter().map(|(z, _)| (*z, HashMap::new())).collect()
         } else {
             HashMap::new()
         };
-        let mut expired: HashMap<String, bool> = HashMap::new();
+        let mut expired: HashMap<String, (bool, Option<SystemTime>)> = HashMap::new();
         let (mut rows, mut batches, mut skipped) = (0u64, 0u64, 0u64);
-        let mut stream = reader.tiles(&layer.name, &ranges);
-        while let Some(batch) = stream.next().await {
-            let batch = batch?;
-            batches += 1;
-            rows += batch.len() as u64;
-            for t in batch {
-                if t.absent {
-                    if !absences_here || t.expires_at.is_some_and(|at| at <= now) {
-                        skipped += 1;
-                        continue;
-                    }
+        async {
+            let mut stream = reader.tiles(&layer.name, &ranges);
+            while let Some(batch) = stream.next().await {
+                let batch = batch?;
+                batches += 1;
+                rows += batch.len() as u64;
+                for t in batch {
                     let zone = layer
                         .grid
                         .from_id(t.id)
                         .and_then(|(level, x, y)| layer.zone_of(level, x, y).ok());
-                    if let Some(held) = zone.and_then(|z| absent.get_mut(&z)) {
+                    if t.absent {
+                        if !absences_here || t.expires_at.is_some_and(|at| at <= now) {
+                            skipped += 1;
+                            continue;
+                        }
+                        if let Some(zone) = zone {
+                            if let Some(held) = absent.get_mut(&zone) {
+                                held.insert(t.id, t.stamp);
+                                until(zone, t.expires_at);
+                            }
+                        }
+                        continue;
+                    }
+                    let (gone, expires) = match expired.get(&t.epoch) {
+                        Some(e) => *e,
+                        None => {
+                            let e = (layer.is_expired(&t.epoch, now), layer.expires_at(&t.epoch));
+                            expired.insert(t.epoch.clone(), e);
+                            e
+                        }
+                    };
+                    if gone {
+                        skipped += 1;
+                        continue;
+                    }
+                    let Some(zone) = zone else {
+                        continue;
+                    };
+                    if let Some(held) = tiles.get_mut(&zone) {
                         held.insert(t.id, t.stamp);
+                        until(zone, expires);
                     }
-                    continue;
-                }
-                let gone = match expired.get(&t.epoch) {
-                    Some(gone) => *gone,
-                    None => {
-                        let gone = layer.is_expired(&t.epoch, now);
-                        expired.insert(t.epoch.clone(), gone);
-                        gone
-                    }
-                };
-                if gone {
-                    skipped += 1;
-                    continue;
-                }
-                let Some(zone) = layer
-                    .grid
-                    .from_id(t.id)
-                    .and_then(|(level, x, y)| layer.zone_of(level, x, y).ok())
-                else {
-                    continue;
-                };
-                if let Some(held) = tiles.get_mut(&zone) {
-                    held.insert(t.id, t.stamp);
                 }
             }
+            drop(stream);
+            Ok::<(), String>(())
         }
-        drop(stream);
+        .instrument(span.clone())
+        .await?;
+        span.record("rows", rows);
         let millis = began.elapsed().as_millis() as u64;
         metrics::counter!("tuile_tiles_register_rows_total", "layer" => layer.name.clone())
             .increment(rows);
+        metrics::counter!("tuile_tiles_register_zones_held_total", "layer" => layer.name.clone())
+            .increment(zones_held as u64);
         metrics::histogram!("tuile_tiles_register_read_seconds", "layer" => layer.name.clone())
             .record(began.elapsed().as_secs_f64());
         tracing::info!(
             layer = %layer.name,
             zones = zones.len(),
+            held = zones_held,
+            read = to_read.len(),
             ranges = ranges.len(),
             rows,
             batches,
@@ -821,8 +945,9 @@ impl TileStore {
                 );
             }
         }
-        let mut out = Vec::with_capacity(zones.len());
-        for (i, (zone, held)) in tiles.into_iter().enumerate() {
+        let generations: HashMap<Zone, Option<u64>> = to_read.iter().copied().collect();
+        let mut first = true;
+        for (zone, held) in tiles {
             let n = held.len() as u64;
             self.attach_index(
                 layer,
@@ -830,6 +955,23 @@ impl TileStore {
                 Arc::new(crate::index::ZoneIndex::from_tiles(held)),
             );
             metrics::counter!("tuile_tiles_zones_projected_total", "layer" => layer.name.clone(), "by" => "register").increment(1);
+            if let Ok(mut kept) = self.registered.lock() {
+                match generations.get(&zone).copied().flatten() {
+                    Some(generation) => {
+                        kept.insert(
+                            (layer.name.clone(), zone),
+                            Registered {
+                                generation,
+                                good_until: good_until.get(&zone).copied(),
+                                tiles: n,
+                            },
+                        );
+                    }
+                    None => {
+                        kept.remove(&(layer.name.clone(), zone));
+                    }
+                }
+            }
             out.push((
                 zone,
                 ProjectionReport {
@@ -839,15 +981,25 @@ impl TileStore {
                     tiles_listed: n,
                     zones_registered: 1,
                     tiles_registered: n,
-                    // Said once, on the first zone, so that the sum is the
-                    // layer's.
-                    register_batches: if i == 0 { batches } else { 0 },
-                    register_millis: if i == 0 { millis } else { 0 },
+                    // Said once, on the first zone read, so that the sum is
+                    // the layer's.
+                    register_batches: if first { batches } else { 0 },
+                    register_millis: if first { millis } else { 0 },
+                    register_rows: if first { rows } else { 0 },
                     ..Default::default()
                 },
             ));
+            first = false;
         }
         Ok(out)
+    }
+
+    /// Forgets that the register's tiles of a zone are held: it is no
+    /// longer known whole, and is read another way.
+    fn forget_registered(&self, layer: &str, zone: Zone) {
+        if let Ok(mut kept) = self.registered.lock() {
+            kept.remove(&(layer.to_string(), zone));
+        }
     }
 
     /// An archive's listing: from memory when this store listed it before
@@ -972,10 +1124,13 @@ impl TileStore {
         let path = projection_path(dir, &layer, zone);
         // Before the listing: a second bake that wants this zone waits, then
         // lists it from memory and finds its tiles projected.
+        let waited = Instant::now();
         let _made = self.projection_lock(&path).await;
+        let lock_wait_millis = waited.elapsed().as_millis() as u64;
         let listing = self.zone_listing(&layer, zone).await?;
         let mut report = ProjectionReport {
             zones_seen: 1,
+            lock_wait_millis,
             tiles_listed: listing.listed,
             requests: listing.requests,
             bytes: listing.bytes,
@@ -1123,13 +1278,15 @@ impl TileStore {
         zone: Zone,
     ) -> Result<ProjectionReport, StoreError> {
         let layer = self.layer(layer_name)?.clone();
-        let mut report = ProjectionReport {
-            zones_seen: 1,
-            ..Default::default()
-        };
+        let waited = Instant::now();
         let _made = self
             .projection_lock(&projection_path(dir, &layer, zone))
             .await;
+        let mut report = ProjectionReport {
+            zones_seen: 1,
+            lock_wait_millis: waited.elapsed().as_millis() as u64,
+            ..Default::default()
+        };
         let now = self.now();
         let m = manifest::read(self.object_store().as_ref(), &layer.zone_prefix(zone))
             .await?

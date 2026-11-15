@@ -281,9 +281,7 @@ impl Tiers {
             }
         });
         let global = match var("TUILE_TILES_GLOBAL") {
-            Ok(url) => {
-                Some(Tier::new("global", global_tier(&url, io, cache.config())?))
-            }
+            Ok(url) => Some(Tier::new("global", global_tier(&url, io, cache.config())?)),
             Err(_) => None,
         };
         Ok(Self {
@@ -740,6 +738,10 @@ impl Tiles {
             reused = tracing::field::Empty,
             shared = tracing::field::Empty,
             shared_written = tracing::field::Empty,
+            register_s = tracing::field::Empty,
+            register_rows = tracing::field::Empty,
+            register_held = tracing::field::Empty,
+            lock_wait_s = tracing::field::Empty,
         );
         let report =
             span.in_scope(|| self.project_footprint(&footprint, std::path::Path::new(&dir)))?;
@@ -750,6 +752,10 @@ impl Tiles {
         span.record("reused", report.zones_reused as u64);
         span.record("shared", report.zones_shared as u64);
         span.record("shared_written", report.zones_shared_written as u64);
+        span.record("register_s", report.register_millis as f64 / 1e3);
+        span.record("register_rows", report.register_rows);
+        span.record("register_held", report.zones_register_held as u64);
+        span.record("lock_wait_s", report.lock_wait_millis as f64 / 1e3);
         tracing::info!(
             eyes = footprint.eyes().len(),
             factor,
@@ -770,6 +776,9 @@ impl Tiles {
             tiles_registered = report.tiles_registered,
             register_batches = report.register_batches,
             register_s = report.register_millis as f64 / 1e3,
+            register_rows = report.register_rows,
+            zones_register_held = report.zones_register_held,
+            lock_wait_s = report.lock_wait_millis as f64 / 1e3,
             layers_listed = report.layers_listed,
             layers_from_register = report.layers_from_register,
             zones_reused = report.zones_reused,
@@ -1005,9 +1014,12 @@ mod tier_tests {
         let dir = tempfile::tempdir().expect("dir");
         let url = url::Url::from_directory_path(dir.path()).expect("url");
         let io = tokio::runtime::Runtime::new().expect("io");
-        let tier =
-            super::global_tier(url.as_str(), io.handle(), &super::TierCacheConfig::default())
-            .expect("tier");
+        let tier = super::global_tier(
+            url.as_str(),
+            io.handle(),
+            &super::TierCacheConfig::default(),
+        )
+        .expect("tier");
         let at = object_store::path::Path::from(
             "layer/top/1-000000000000000000000001-0123456789abcdef.pmtiles",
         );

@@ -69,6 +69,9 @@ struct Mem {
     said: Mutex<Vec<String>>,
     refuse_deleting: std::sync::atomic::AtomicBool,
     fail_reads: std::sync::atomic::AtomicBool,
+    /// Rows given back by `tiles`, and the calls.
+    rows: std::sync::atomic::AtomicU64,
+    reads: std::sync::atomic::AtomicU64,
 }
 
 impl Mem {
@@ -77,6 +80,12 @@ impl Mem {
     }
     fn say(&self, what: String) {
         self.said.lock().expect("said").push(what);
+    }
+    fn rows(&self) -> u64 {
+        self.rows.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn reads(&self) -> u64 {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -141,7 +150,14 @@ impl IndexReader for Mem {
         self.inner.zones(layer).await
     }
     fn tiles<'a>(&'a self, layer: &'a str, ranges: &'a [RangeInclusive<u64>]) -> TileBatches<'a> {
-        self.inner.tiles(layer, ranges)
+        use futures_util::StreamExt;
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(self.inner.tiles(layer, ranges).inspect(|batch| {
+            if let Ok(b) = batch {
+                self.rows
+                    .fetch_add(b.len() as u64, std::sync::atomic::Ordering::SeqCst);
+            }
+        }))
     }
 }
 
@@ -463,11 +479,11 @@ async fn a_scrub_that_uncovers_an_older_copy_leaves_the_zone_to_its_archives() {
     );
     let known = mem.zones(IMAGERY).await.expect("zones").expect("known");
     assert_eq!(
-        known,
-        vec![KnownZone {
-            zone: zone(),
-            indexed: false
-        }]
+        known
+            .iter()
+            .map(|k: &KnownZone| (k.zone, k.indexed))
+            .collect::<Vec<_>>(),
+        vec![(zone(), false)]
     );
     // Projected from its archives then, and right: the old copy uncovered.
     let (truth, looked, counting, store) = both_ways_store(objects, &clock, mem, 2).await;
@@ -783,4 +799,193 @@ async fn the_newer_of_a_copy_and_an_absence_wins_and_an_absence_expires() {
         "expired: the older copy, still in the bucket, is read again"
     );
     assert_eq!(mem.inner.expire(clock.now()), 2, "tiles 1 and 3");
+}
+
+/// **The register is read once per process**: a second projection of the
+/// same store, over a zone whose generation did not move, reads no row and
+/// knows the zone as the first did. Once the zone moves (a publication), it
+/// is read again — it alone — and the new copy is what the store knows.
+#[tokio::test]
+async fn a_zone_read_from_the_register_is_read_again_only_once_it_moves() {
+    let clock = TestClock::new();
+    let objects = memory();
+    let mem = Arc::new(Mem {
+        inner: MemoryRegister::new().with_batch(3),
+        ..Mem::default()
+    });
+    let s = TileStore::with_clock(objects.clone(), layers(), eager(), clock.clock())
+        .with_ledger(mem.clone())
+        .with_absences(mem.clone());
+    history(&s).await;
+    let store = TileStore::with_clock(objects.clone(), layers(), eager(), clock.clock())
+        .with_index_reader(mem.clone())
+        .with_absences(mem.clone());
+    let dir = tempfile::tempdir().expect("dir");
+    let first = store
+        .project(&by_index(), dir.path())
+        .await
+        .expect("project");
+    let rows = mem.rows();
+    assert!(rows >= 10, "the zone's rows, read: {rows}");
+    assert_eq!(first.register_rows, rows);
+    assert_eq!(first.zones_register_held, 0);
+    let known = lookups(&store, 24);
+
+    let second = store
+        .project(&by_index(), dir.path())
+        .await
+        .expect("project");
+    assert_eq!(mem.rows(), rows, "not a row read again");
+    assert_eq!(second.register_rows, 0);
+    assert_eq!(second.zones_register_held, 1);
+    assert_eq!(second.zones_registered, 1);
+    assert_eq!(second.tiles_indexed, first.tiles_indexed);
+    assert_eq!(
+        lookups(&store, 24),
+        known,
+        "known as the first read knew it"
+    );
+    assert_eq!(known, truth(objects.clone(), &clock, &mem, 24).await);
+
+    // A new copy of tile 5: the zone moves, and is read again.
+    let (x, y) = in_zone(5);
+    s.put(IMAGERY, LEVEL, x, y, png(5, 11)).await.expect("put");
+    s.flush_all().await.expect("flush");
+    let third = store
+        .project(&by_index(), dir.path())
+        .await
+        .expect("project");
+    assert!(mem.rows() > rows, "read again once it moved");
+    assert_eq!(third.zones_register_held, 0);
+    assert_eq!(
+        lookups(&store, 24)[5].0,
+        Lookup::Held(Stamp::of(&png(5, 11), true)),
+        "the new copy"
+    );
+    assert_eq!(lookups(&store, 24), truth(objects, &clock, &mem, 24).await);
+}
+
+/// Two bakes of a process that project the same zones at once read them
+/// once: the second waits for the first, then holds them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bakes_projecting_at_once_read_the_register_once() {
+    let clock = TestClock::new();
+    let objects = memory();
+    let mem = Arc::new(Mem {
+        inner: MemoryRegister::new().with_batch(3),
+        ..Mem::default()
+    });
+    let s = TileStore::with_clock(objects.clone(), layers(), eager(), clock.clock())
+        .with_ledger(mem.clone())
+        .with_absences(mem.clone());
+    history(&s).await;
+    let store = Arc::new(
+        TileStore::with_clock(objects.clone(), layers(), eager(), clock.clock())
+            .with_index_reader(mem.clone())
+            .with_absences(mem.clone()),
+    );
+    let dir = tempfile::tempdir().expect("dir");
+    let footprint = by_index();
+    let (a, b, c) = tokio::join!(
+        store.project(&footprint, dir.path()),
+        store.project(&footprint, dir.path()),
+        store.project(&footprint, dir.path()),
+    );
+    let held: usize = [a, b, c]
+        .into_iter()
+        .map(|r| r.expect("project").zones_register_held)
+        .sum();
+    assert_eq!(mem.reads(), 1, "one read of the register");
+    assert_eq!(held, 2, "the two others held what it read");
+}
+
+/// What is held stays good only as long as every copy and absence in it:
+/// once an archive whose copy was held expires, the zone is read again,
+/// even at the same generation — and the expired copy is not known.
+#[tokio::test]
+async fn a_zone_held_is_read_again_once_a_copy_in_it_expires() {
+    let clock = TestClock::new();
+    let objects = memory();
+    let mem = Arc::new(Mem::default());
+    let s = TileStore::with_clock(objects.clone(), layers(), eager(), clock.clock())
+        .with_ledger(mem.clone())
+        .with_absences(mem.clone());
+    let (x, y) = in_zone(0);
+    s.put(IMAGERY, LEVEL, x, y, png(0, 0)).await.expect("put");
+    s.flush_all().await.expect("flush");
+    clock.advance(days(31));
+    let (x1, y1) = in_zone(1);
+    s.put(IMAGERY, LEVEL, x1, y1, png(1, 0)).await.expect("put");
+    s.flush_all().await.expect("flush");
+    let store = TileStore::with_clock(objects.clone(), layers(), eager(), clock.clock())
+        .with_index_reader(mem.clone())
+        .with_absences(mem.clone());
+    let dir = tempfile::tempdir().expect("dir");
+    store
+        .project(&by_index(), dir.path())
+        .await
+        .expect("project");
+    assert!(matches!(lookups(&store, 2)[0].0, Lookup::Held(_)));
+    let rows = mem.rows();
+    // Past the first epoch's expiry: nothing published, the generation is
+    // the same.
+    clock.advance(IMAGERY_EXPIRY);
+    let again = store
+        .project(&by_index(), dir.path())
+        .await
+        .expect("project");
+    assert_eq!(again.zones_register_held, 0, "not held past an expiry");
+    assert!(mem.rows() > rows, "read again");
+    let looked = lookups(&store, 2);
+    assert_eq!(looked[0].0, Lookup::NotHeld, "expired, not read");
+    assert!(matches!(looked[1].0, Lookup::Held(_)));
+}
+
+/// A cell zone of a layer projected by index that the register does not
+/// know whole is cut tile by tile, as a targeted layer's: what the
+/// footprint keeps comes down by ranges, not the zone's archives whole —
+/// and a reader of the store gets what it got before, every tile.
+#[tokio::test]
+async fn a_zone_the_register_cannot_index_comes_down_by_ranges_not_whole() {
+    let clock = TestClock::new();
+    let objects = memory();
+    let s = TileStore::with_clock(objects.clone(), layers(), eager(), clock.clock());
+    // Tiles 0 and 1 under the eye, and the zone's far half, mostly out of
+    // reach.
+    let far = ZONE_SIDE * ZONE_SIDE - 1;
+    for i in [0, 1].into_iter().chain(ZONE_SIDE * ZONE_SIDE / 2..=far) {
+        let (x, y) = in_zone(i);
+        s.put(IMAGERY, LEVEL, x, y, png(i, 0)).await.expect("put");
+    }
+    s.flush_all().await.expect("flush");
+    let prefix = indexed().zone_prefix(zone());
+    let whole: u64 = tuile_tile_server::manifest::read(objects.as_ref(), &prefix)
+        .await
+        .expect("manifest")
+        .manifest
+        .archives
+        .iter()
+        .map(|a| a.bytes)
+        .sum();
+    // No register at all: the zone is listed from the bucket, not indexed.
+    let counting = Counting::over(objects.clone());
+    let store = TileStore::with_clock(counting.clone(), layers(), eager(), clock.clock());
+    let dir = tempfile::tempdir().expect("dir");
+    let report = store
+        .project(&by_index(), dir.path())
+        .await
+        .expect("project");
+    let l = &report.layers[IMAGERY];
+    assert!(l.targeted, "cut tile by tile: {l:?}");
+    assert!(
+        l.tiles_kept >= 2 && l.tiles_kept < l.tiles_listed,
+        "those in reach, not the zone: {l:?}"
+    );
+    assert!(
+        counting.archive_bytes() < whole,
+        "{} bytes read of {whole}: not the archive whole",
+        counting.archive_bytes()
+    );
+    let plain = TileStore::with_clock(objects, layers(), eager(), clock.clock());
+    assert_eq!(got(&store, far + 1).await, got(&plain, far + 1).await);
 }
