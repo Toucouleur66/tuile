@@ -209,20 +209,25 @@ pub const EXTRACT_BANDS: [u64; 2] = [0, 1 << 60];
 pub struct ArchivedTiles {
     live: Arc<dyn Objects>,
     archives: Arc<dyn Objects>,
-    layers: Vec<Layer>,
+    layers: Arc<Vec<Layer>>,
     now: Now,
-    opened: Mutex<HashMap<String, Arc<Opened>>>,
+    // What was read from the store, shared by every view of it
+    // ([`Self::view`]): archives never change, and a manifest is the
+    // store's, whoever reads it.
+    opened: Arc<Mutex<HashMap<String, Arc<Opened>>>>,
     /// Leaf directories read lately, by archive and offset. A frame's tiles
     /// are neighbours, and neighbours share a leaf: without this, each of
     /// them reads, inflates and parses the same few thousand entries.
-    leaves: Mutex<HashMap<(String, u64), Arc<Directory>>>,
+    leaves: Arc<Leaves>,
     /// Manifests read lately, by zone, with when: a film asks for thousands
     /// of tiles of a handful of zones.
-    manifests: Mutex<HashMap<String, HeldManifest>>,
+    manifests: Arc<Mutex<HashMap<String, HeldManifest>>>,
     /// One lock per zone and per archive being read for the first time: a
     /// frame asks for many tiles of one zone at once, and they wait for one
     /// read of its manifest and of each archive's head.
-    opening: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    opening: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    // Which zones are read from where instead of their manifest: this
+    // view's own, never another's.
     /// Zones read from an extract rather than their manifest: by zone,
     /// where it lies, its key there, and what is added to a tile's id in it.
     extracts: Mutex<HashMap<String, ZoneExtract>>,
@@ -230,6 +235,9 @@ pub struct ArchivedTiles {
     /// manifest ([`Self::read_zone_pinned`]).
     pinned: Mutex<HashMap<String, Arc<Vec<String>>>>,
 }
+
+/// Leaf directories by archive and offset: see `ArchivedTiles::leaves`.
+type Leaves = Mutex<HashMap<(String, u64), Arc<Directory>>>;
 
 /// Where a zone's extract lies, its key there, and its band.
 type ZoneExtract = (Arc<dyn Objects>, String, u64);
@@ -380,15 +388,37 @@ impl ArchivedTiles {
         Ok(Self {
             live,
             archives,
-            layers,
+            layers: Arc::new(layers),
             now,
-            opened: Mutex::new(HashMap::new()),
-            leaves: Mutex::new(HashMap::new()),
-            manifests: Mutex::new(HashMap::new()),
-            opening: Mutex::new(HashMap::new()),
+            opened: Arc::default(),
+            leaves: Arc::default(),
+            manifests: Arc::default(),
+            opening: Arc::default(),
             extracts: Mutex::new(HashMap::new()),
             pinned: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Another reader of the same store, with zones of its own: it shares
+    /// everything read from the store — archive heads, leaf directories,
+    /// manifests — but no extract and no pinned zone. Those it is given
+    /// ([`Self::read_zone_from`], [`Self::read_pinned`]) are its own, and
+    /// [`Self::forget_extracts`] forgets only its own: what several readers
+    /// of one store reading at once each take, so that none forgets or
+    /// replaces the zones another is reading from.
+    pub fn view(&self) -> Self {
+        Self {
+            live: self.live.clone(),
+            archives: self.archives.clone(),
+            layers: self.layers.clone(),
+            now: self.now.clone(),
+            opened: self.opened.clone(),
+            leaves: self.leaves.clone(),
+            manifests: self.manifests.clone(),
+            opening: self.opening.clone(),
+            extracts: Mutex::new(HashMap::new()),
+            pinned: Mutex::new(HashMap::new()),
+        }
     }
 
     /// The key prefix of the zone tile `level/x/y` of `layer` lies in.
@@ -438,8 +468,8 @@ impl ArchivedTiles {
         zones
     }
 
-    /// Forgets every extract and every pinned zone: zones are read from
-    /// their manifests again.
+    /// Forgets every extract and every pinned zone of this view: its zones
+    /// are read from their manifests again. Another view's are untouched.
     pub fn forget_extracts(&self) {
         if let Ok(mut extracts) = self.extracts.lock() {
             extracts.clear();
@@ -574,9 +604,11 @@ impl ArchivedTiles {
         )))
     }
 
-    /// Forgets every zone's manifest read so far: the next read of a zone
-    /// reads it again. For a reader told that tiles were just published —
-    /// its clock may not move, and a manifest held is believed until it does.
+    /// Forgets every zone's manifest read so far, by every view: the next
+    /// read of a zone reads it again. For a reader told that tiles were just
+    /// published — its clock may not move, and a manifest held is believed
+    /// until it does. Safe while another view reads: a manifest forgotten is
+    /// read again, and a zone read from an extract or its pins reads none.
     pub fn forget_manifests(&self) {
         if let Ok(mut held) = self.manifests.lock() {
             held.clear();

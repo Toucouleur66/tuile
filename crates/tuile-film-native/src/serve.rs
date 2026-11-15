@@ -423,7 +423,8 @@ impl<F: OverlayFactory> Service<F> {
 impl<F: OverlayFactory> Service<F> {
     /// The extracts `order` names, fetched under `dir`, and every zone the
     /// frames of `film` read pointed at its layer's; `None` when it names
-    /// none.
+    /// none. `sources` is the segment's own view ([`Sources::view`]): the
+    /// zones are given to it alone, never to a segment rendering beside it.
     async fn fetch_extracts(
         &self,
         sources: &Sources,
@@ -476,7 +477,8 @@ impl<F: OverlayFactory> Service<F> {
     }
 
     /// The pins under `key` read from the tile store, and every zone they
-    /// name read from its pinned archives from now on.
+    /// name read from its pinned archives from now on, by `sources` — the
+    /// segment's own view — alone.
     async fn read_pinned(&self, sources: &Sources, key: &str) -> Result<Fetched, Error> {
         let began = Instant::now();
         let bytes = self.tiles.read_all(key).await?;
@@ -548,7 +550,12 @@ impl<F: OverlayFactory> Service<F> {
         let mut overlays = self.overlays_of(order).await?;
         let within = Duration::from_secs(order.pack_within_seconds.unwrap_or(3600));
         let generation = self.generation().await?;
-        let sources = &generation.sources;
+        // The segment reads the generation's store through a view of its
+        // own: the zones its extracts or pins give are its alone, and no
+        // segment rendering beside it can forget or replace them. All that
+        // is read and kept stays the generation's, shared.
+        let segment_sources = generation.sources.view();
+        let sources = &segment_sources;
         progress.step(Step::PackWait);
         async {
             loop {
@@ -651,6 +658,7 @@ impl<F: OverlayFactory> Service<F> {
         // for on this runtime.
         let rendered = Instant::now();
         let runtime = tokio::runtime::Handle::current();
+        // The generation kept alive as long as the render reads its cache.
         let (to, kept) = (local.clone(), generation.clone());
         let keys = keys_within(&order.key_frames, order.frames);
         // A frame's steps summed over the segment, in milliseconds: the
@@ -684,8 +692,9 @@ impl<F: OverlayFactory> Service<F> {
                 )?,
                 progress: told.clone(),
             };
+            let _kept = kept;
             let done = runtime.block_on(render(
-                &kept.sources,
+                &segment_sources,
                 &film,
                 &render_order,
                 overlays.as_mut(),
@@ -1500,6 +1509,137 @@ mod tests {
             .read_pinned(&generation.sources, "_pins/none.json")
             .await
             .is_err());
+    }
+
+    /// Two segments of one generation rendering at once each read the
+    /// zones their own pins give: the second's pins, read while the first
+    /// holds its own and before it reads them, neither forget nor replace
+    /// the first's. The zones' manifests no longer name the pinned
+    /// archives, as when the store merged them since: a segment whose pins
+    /// were forgotten finds its tiles gone from the store.
+    #[tokio::test]
+    async fn segments_rendering_at_once_each_keep_the_zones_their_pins_give() {
+        use tuile_repository::TileRepository;
+        use tuile_tile_server::{catalog, Catalog, Grid, LayerDef, StoreConfig, TileStore};
+        let dir = tempfile::tempdir().expect("dir");
+        let disk: Arc<dyn object_store::ObjectStore> = Arc::new(
+            object_store::local::LocalFileSystem::new_with_prefix(dir.path()).expect("disk"),
+        );
+        let layer = LayerDef {
+            name: "imagery".into(),
+            grid: Grid::WebMercator,
+            tile_type: "png".into(),
+            tile_compression: "none".into(),
+            zone_level: 4,
+            expiry_days: None,
+            content_type: "image/png".into(),
+            index: false,
+            licence: None,
+            attribution: None,
+        };
+        catalog::write(
+            disk.as_ref(),
+            &Catalog {
+                layers: vec![layer],
+            },
+        )
+        .await
+        .expect("catalog");
+        let written = TileStore::open(disk, StoreConfig::default())
+            .await
+            .expect("store");
+        // A in one zone, B in another.
+        let (a, b) = ((7, 77, 50), (7, 120, 50));
+        for ((level, x, y), said) in [(a, "A"), (b, "B")] {
+            written
+                .put("imagery", level, x, y, bytes::Bytes::from(said))
+                .await
+                .expect("put");
+        }
+        written.flush_all().await.expect("flush");
+
+        let runs = Arc::new(
+            ObjectRunStore::local(dir.path(), tuile_farm::Tuning::default()).expect("store"),
+        );
+        let tiles: Arc<dyn tuile_repository::Objects> = runs.clone();
+        // Each segment's pins, as its bake left them in the store.
+        let pinner = tuile_repository::ArchivedTiles::open(
+            tiles.clone(),
+            tiles.clone(),
+            Arc::new(|| 1_800_000_000),
+        )
+        .await
+        .expect("pinner");
+        let mut keys = Vec::new();
+        for at in [a, b] {
+            let (pinned, report) = pinner.pin("imagery", &[at]).await.expect("pin");
+            assert_eq!((report.tiles, report.absent), (1, 0));
+            let pins = tuile_repository::Pins {
+                layers: vec![pinned],
+            };
+            let key = pins.key();
+            let file = dir.path().join(&key);
+            std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&file, pins.to_bytes()).expect("pins");
+            keys.push(key);
+        }
+        // The store moves on: neither zone's manifest names its archive.
+        for zone in ["imagery/zones/z4/9/6", "imagery/zones/z4/15/6"] {
+            std::fs::write(
+                dir.path().join(zone).join("manifest.json"),
+                br#"{"archives": []}"#,
+            )
+            .expect("manifest");
+        }
+        let limits = Limits {
+            renders_at_once: 2,
+            ..Limits::default()
+        };
+        let service = Service::new(runs, tiles, dir.path().join("cache"), limits);
+        let generation = service.generation().await.expect("generation");
+        let said = |tile: Result<Option<tuile_repository::Tile>, _>| match tile {
+            Ok(Some(tile)) => String::from_utf8_lossy(&tile.bytes).into_owned(),
+            Ok(None) => "absent".to_string(),
+            Err(e) => format!("error: {e}"),
+        };
+
+        // Segment A has fetched and holds its zones.
+        let first = generation.sources.view();
+        first.store.tiles.forget_manifests();
+        service
+            .read_pinned(&first, &keys[0])
+            .await
+            .expect("A's pins");
+        assert_eq!(
+            said(first.store.tiles.tile("imagery", a.0, a.1, a.2).await),
+            "A"
+        );
+        // Segment B fetches beside it, as its own segment begins.
+        let second = generation.sources.view();
+        second.store.tiles.forget_manifests();
+        service
+            .read_pinned(&second, &keys[1])
+            .await
+            .expect("B's pins");
+        // A reads on: its zones are still its own.
+        assert_eq!(
+            said(first.store.tiles.tile("imagery", a.0, a.1, a.2).await),
+            "A",
+            "the first segment's tiles, after the second's fetch"
+        );
+        assert_eq!(
+            said(second.store.tiles.tile("imagery", b.0, b.1, b.2).await),
+            "B"
+        );
+        // And neither reads from the other's pins.
+        assert_eq!(
+            said(first.store.tiles.tile("imagery", b.0, b.1, b.2).await),
+            "absent"
+        );
+        assert_eq!(
+            said(second.store.tiles.tile("imagery", a.0, a.1, a.2).await),
+            "absent"
+        );
     }
 
     /// A service, its run store and a render of two segments in its

@@ -720,6 +720,92 @@ async fn a_zone_read_from_its_extract_answers_with_what_the_extract_holds() {
     );
 }
 
+/// Views of one reader each read their zones from the extracts given to
+/// them alone: one view forgetting its extracts and reading a zone from
+/// another extract leaves the zone of the first view where it was read
+/// from — what two renders reading one store at once rely on.
+#[tokio::test]
+async fn each_view_of_a_reader_reads_its_zones_from_its_own_extracts() {
+    let memory: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let written = Catalog {
+        layers: vec![layer("imagery", Grid::WebMercator, None)],
+    };
+    catalog::write(memory.as_ref(), &written)
+        .await
+        .expect("catalog");
+    let store = TileStore::open(memory.clone(), StoreConfig::default())
+        .await
+        .expect("open");
+    for (x, y) in [(77, 50), (78, 50)] {
+        store
+            .put("imagery", 7, x, y, Bytes::from(body("imagery", 7, x, y)))
+            .await
+            .expect("put");
+    }
+    store.flush_all().await.expect("flush");
+    let dir = tempfile::tempdir().expect("tempdir");
+    copy_out(memory.as_ref(), dir.path()).await;
+    let objects: Arc<dyn Objects> =
+        Arc::new(ObjectRunStore::local(dir.path(), Tuning::default()).expect("store"));
+    let reader = ArchivedTiles::open(objects.clone(), objects, Arc::new(|| 1_800_000_000))
+        .await
+        .expect("open");
+    // Two extracts of the one zone, each of one of its tiles, each in a
+    // directory of its own.
+    let ask = |at| tuile_tile_server::ExtractAsk {
+        layer: "imagery".into(),
+        tiles: vec![at],
+        ..Default::default()
+    };
+    let mut extracts = Vec::new();
+    for (at, key) in [
+        ((7, 77, 50), "extracts/a.pmtiles"),
+        ((7, 78, 50), "extracts/b.pmtiles"),
+    ] {
+        let (file, _) = store.extract(&[ask(at)]).await.expect("extract");
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(elsewhere.path().join("extracts")).expect("mkdir");
+        std::fs::copy(file.path(), elsewhere.path().join(key)).expect("copy");
+        let local: Arc<dyn Objects> =
+            Arc::new(ObjectRunStore::local(elsewhere.path(), Tuning::default()).expect("store"));
+        extracts.push((elsewhere, local));
+    }
+    let zone = reader.zone_of("imagery", 7, 77, 50).expect("a zone");
+
+    let first = reader.view();
+    first.read_zone_from(&zone, extracts[0].1.clone(), "extracts/a.pmtiles", 0);
+    assert_eq!(
+        answer(&first, "imagery", 7, 77, 50).await,
+        "image/png imagery/7/77/50"
+    );
+    // A second view of the same reader is given the zone from the other
+    // extract, as a second render begins.
+    let second = reader.view();
+    second.forget_extracts();
+    assert_eq!(
+        answer(&second, "imagery", 7, 77, 50).await,
+        "image/png imagery/7/77/50",
+        "a view given nothing reads the zone's manifest"
+    );
+    second.read_zone_from(&zone, extracts[1].1.clone(), "extracts/b.pmtiles", 0);
+    // The first reads on from its own extract, and only from it.
+    assert_eq!(
+        answer(&first, "imagery", 7, 77, 50).await,
+        "image/png imagery/7/77/50"
+    );
+    assert_eq!(answer(&first, "imagery", 7, 78, 50).await, "absent");
+    assert_eq!(
+        answer(&second, "imagery", 7, 78, 50).await,
+        "image/png imagery/7/78/50"
+    );
+    assert_eq!(answer(&second, "imagery", 7, 77, 50).await, "absent");
+    // The reader viewed has neither's zones.
+    assert_eq!(
+        answer(&reader, "imagery", 7, 78, 50).await,
+        "image/png imagery/7/78/50"
+    );
+}
+
 #[test]
 fn the_reader_s_bands_are_the_writer_s() {
     assert_eq!(

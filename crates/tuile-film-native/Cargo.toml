@@ -79,6 +79,9 @@ nvidia-video-codec-sdk = { git = "https://github.com/lapoule-dev/nvidia-video-co
 cudarc = { version = "0.16.4", optional = true, features = ["cuda-version-from-build-system"] }
 
 [dev-dependencies]
+# A tile store written on disk, as the tile store's server writes one.
+bytes = { workspace = true }
+object_store = { version = "0.14.2", default-features = false, features = ["fs"] }
 pollster = { workspace = true }
 # A request answered in lines, read as an asker reads it: over a socket.
 reqwest = { workspace = true }
