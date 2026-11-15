@@ -1598,6 +1598,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_card_admits_as_many_renders_at_once_as_the_limits_say_and_no_more() {
+        let dir = tempfile::tempdir().expect("dir");
+        let runs = Arc::new(
+            ObjectRunStore::local(dir.path(), tuile_farm::Tuning::default()).expect("store"),
+        );
+        let tiles: Arc<dyn tuile_repository::Objects> = runs.clone();
+        let limits = Limits {
+            renders_at_once: 4,
+            ..Limits::default()
+        };
+        let service = Service::new(runs, tiles, dir.path().join("cache"), limits);
+        let soon = Duration::from_millis(50);
+
+        let mut held = Vec::new();
+        for n in 1..=4 {
+            let permit = tokio::time::timeout(soon, service.card())
+                .await
+                .unwrap_or_else(|_| panic!("render {n} of 4 waited for the card"))
+                .expect("card");
+            held.push(permit);
+        }
+        assert!(
+            tokio::time::timeout(soon, service.card()).await.is_err(),
+            "a fifth render waits its turn"
+        );
+
+        // One ends: the next one in goes at once.
+        held.pop();
+        let _next = tokio::time::timeout(soon, service.card())
+            .await
+            .expect("the place one freed is taken")
+            .expect("card");
+    }
+
+    #[tokio::test]
     async fn a_generation_is_kept_until_its_caches_pass_their_budget_or_their_age() {
         let dir = tempfile::tempdir().expect("dir");
         std::fs::write(dir.path().join("catalog.json"), br#"{"layers": []}"#).expect("catalog");
