@@ -9045,6 +9045,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "tuile-mp4",
  "tuile-pack",
  "url",
