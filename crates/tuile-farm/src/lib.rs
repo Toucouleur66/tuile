@@ -249,15 +249,43 @@ impl ObjectRunStore {
         })
     }
 
-    /// `TUILE_STORE_DIR` if set, the bucket from the environment otherwise;
+    /// `TUILE_STORE_DIR` if set; otherwise `TUILE_STORE_BUCKET`, a Google
+    /// Cloud Storage bucket when it is `gs://<bucket>` (signed for by the
+    /// machine's own identity, [`Self::gcs`]: no endpoint, no key), an
+    /// S3-compatible one at `TUILE_STORE_ENDPOINT` with its keys otherwise;
     /// under `TUILE_STORE_PREFIX` when it is set.
     pub fn from_env() -> Result<Self> {
+        Self::from_vars(|name| std::env::var(name).ok())
+    }
+
+    /// [`Self::from_env`], each variable read through `var`.
+    pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Self> {
         let tuning = Tuning::from_env();
-        let store = match std::env::var("TUILE_STORE_DIR") {
-            Ok(dir) if !dir.is_empty() => Self::local(Path::new(&dir), tuning)?,
-            _ => Self::bucket(&BucketConfig::from_env()?, tuning)?,
+        let set = |name: &str| {
+            var(name)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
         };
-        Ok(store.under(&std::env::var("TUILE_STORE_PREFIX").unwrap_or_default()))
+        let store = match (set("TUILE_STORE_DIR"), set("TUILE_STORE_BUCKET")) {
+            (Some(dir), _) => Self::local(Path::new(&dir), tuning)?,
+            (None, Some(bucket)) if bucket.starts_with("gs://") => {
+                Self::gcs(bucket["gs://".len()..].trim_end_matches('/'), tuning)?
+            }
+            _ => {
+                let need = |name: &str| {
+                    set(name).ok_or_else(|| StoreError::Config(format!("{name} is not set")))
+                };
+                let config = BucketConfig {
+                    endpoint: need("TUILE_STORE_ENDPOINT")?,
+                    bucket: need("TUILE_STORE_BUCKET")?,
+                    access_key_id: need("TUILE_STORE_ACCESS_KEY_ID")?,
+                    secret_access_key: need("TUILE_STORE_SECRET_ACCESS_KEY")?,
+                    region: set("TUILE_STORE_REGION").unwrap_or_else(|| "auto".into()),
+                };
+                Self::bucket(&config, tuning)?
+            }
+        };
+        Ok(store.under(&set("TUILE_STORE_PREFIX").unwrap_or_default()))
     }
 
     /// A Google Cloud Storage bucket, signed for by the machine's own
@@ -287,6 +315,13 @@ impl ObjectRunStore {
 
     /// [`Self::mezzanine_from_env`] for the value given.
     pub fn mezzanine_at(at: Option<&str>) -> Result<Option<Self>> {
+        Self::named_at("TUILE_MEZZANINE_STORE", at)
+    }
+
+    /// The store a variable names, `variable` being its name in what is
+    /// said: `gs://<bucket>` or a directory; `None` when it is unset or
+    /// blank.
+    pub fn named_at(variable: &str, at: Option<&str>) -> Result<Option<Self>> {
         let Some(at) = at.map(str::trim).filter(|v| !v.is_empty()) else {
             return Ok(None);
         };
@@ -295,7 +330,7 @@ impl ObjectRunStore {
             Some(bucket) => Self::gcs(bucket.trim_end_matches('/'), tuning)?,
             None if at.contains("://") => {
                 return Err(StoreError::Config(format!(
-                    "TUILE_MEZZANINE_STORE is gs://<bucket> or a directory, not {at}"
+                    "{variable} is gs://<bucket> or a directory, not {at}"
                 )))
             }
             None => Self::local(Path::new(at), tuning)?,
@@ -818,6 +853,43 @@ mod tests {
     }
 
     use super::*;
+
+    /// The run store is a GCS bucket when `TUILE_STORE_BUCKET` says
+    /// `gs://`: no endpoint and no key asked for, the machine's identity
+    /// signs. An S3 bucket still wants its endpoint and keys; a directory
+    /// wins over both.
+    #[test]
+    fn the_run_store_is_a_gcs_bucket_when_its_name_says_gs() {
+        let vars = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let gcs = ObjectRunStore::from_vars(vars(&[("TUILE_STORE_BUCKET", "gs://stl-film-work/")]))
+            .expect("a GCS run store, with no endpoint nor key");
+        assert_eq!(gcs.label(), "gs://stl-film-work");
+        let under = ObjectRunStore::from_vars(vars(&[
+            ("TUILE_STORE_BUCKET", "gs://stl-film-work"),
+            ("TUILE_STORE_PREFIX", "trial"),
+        ]))
+        .expect("under a prefix");
+        assert_eq!(under.label(), "gs://stl-film-work under trial");
+        let s3 = ObjectRunStore::from_vars(vars(&[("TUILE_STORE_BUCKET", "stl-renders")]));
+        assert!(
+            matches!(&s3, Err(StoreError::Config(said)) if said.contains("TUILE_STORE_ENDPOINT")),
+            "an S3 bucket without its endpoint"
+        );
+        let dir = tempfile::tempdir().expect("dir");
+        let path: &'static str = Box::leak(dir.path().display().to_string().into_boxed_str());
+        let pairs: &'static [(&'static str, &'static str)] = Box::leak(
+            vec![("TUILE_STORE_DIR", path), ("TUILE_STORE_BUCKET", "gs://x")].into_boxed_slice(),
+        );
+        let local = ObjectRunStore::from_vars(vars(pairs)).expect("a directory");
+        assert!(local.label().starts_with("dir "), "{}", local.label());
+    }
 
     #[test]
     fn a_count_falls_back_to_its_default_unless_set_to_a_positive_number() {
