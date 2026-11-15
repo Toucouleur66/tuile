@@ -536,7 +536,13 @@ impl RunStore for ObjectRunStore {
         tokio::fs::rename(&tmp, dest)
             .await
             .map_err(|e| StoreError::io(dest, e))?;
-        eprintln!("GET {key} ← {}: {}", self.label, rate(meta.size, started));
+        tracing::info!(
+            key,
+            bytes = meta.size,
+            "GET {key} ← {}: {}",
+            self.label,
+            rate(meta.size, started)
+        );
         Ok(meta.size)
     }
 
@@ -598,7 +604,13 @@ impl RunStore for ObjectRunStore {
                 .await
                 .map_err(|e| StoreError::store(key, e))?;
         }
-        eprintln!("PUT {key} → {}: {}", self.label, rate(size, started));
+        tracing::info!(
+            key,
+            bytes = size,
+            "PUT {key} → {}: {}",
+            self.label,
+            rate(size, started)
+        );
         Ok(size)
     }
 
@@ -767,6 +779,20 @@ pub async fn assert_run_store_contract(store: &dyn RunStore, prefix: &str, part_
         !work.path().join("never").exists(),
         "a failed get left a file at dest"
     );
+}
+
+/// Prints the process's `tracing` events on stderr, for a command line run
+/// by hand: `RUST_LOG` filters them, `info` and above when it is unset. A
+/// process that exports its events elsewhere installs its own subscriber and
+/// never calls this.
+pub fn log_to_stderr() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    // Already installed (a test, an embedding process): its own wins.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
 }
 
 #[cfg(test)]

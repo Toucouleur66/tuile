@@ -619,7 +619,12 @@ impl<F: OverlayFactory> Service<F> {
             progress.bytes(fetched.bytes);
         }
         if let Some(fetched) = &extract {
-            eprintln!(
+            tracing::info!(
+                segment = %order.out,
+                extracts = fetched.extracts,
+                parts = fetched.parts,
+                bytes = fetched.bytes,
+                seconds = fetched.seconds,
                 "segment {}: {} extracts, {} parts, {:.1} MB in {:.1} s ({:.0} MB/s)",
                 order.out,
                 fetched.extracts,
@@ -702,7 +707,11 @@ impl<F: OverlayFactory> Service<F> {
             tiles_from_store: done.tiles_from_store,
             tiles_from_pack: done.tiles_from_pack,
         };
-        eprintln!(
+        tracing::info!(
+            segment = %order.out,
+            frames = done.frames,
+            seconds = render_seconds,
+            setup_seconds = render.setup_seconds,
             "segment {}: {} frames in {render_seconds:.1} s — setup {:.1} s; frames: {}",
             order.out,
             done.frames,
@@ -907,7 +916,14 @@ impl<F: OverlayFactory> Service<F> {
             .await?;
         progress.bytes(bytes);
         let bitrate = (bytes as f64 * 8.0 / probe.seconds.max(1e-3)).round() as u64;
-        eprintln!(
+        tracing::info!(
+            key = %key,
+            frames,
+            bytes,
+            joined_bytes,
+            bitrate,
+            passes = compressed.passes,
+            seconds = compressed.seconds,
             "compress {key}: {frames} frames, {:.1} MB from {:.1} MB joined ({:.1} Mb/s), \
              {} pass(es) in {:.1} s",
             bytes as f64 / 1e6,
@@ -944,13 +960,7 @@ impl<F: OverlayFactory> Service<F> {
         let accepted = tracing::Span::current();
         tokio::spawn(async move {
             let outcome = service.segment(&order).instrument(accepted).await;
-            match &outcome {
-                Ok(done) => eprintln!(
-                    "segment {} done: {} frames, waited {:.0} s, rendered in {:.0} s",
-                    done.out, done.frames, done.waited_seconds, done.render_seconds
-                ),
-                Err(e) => eprintln!("segment {} failed: {e}", order.out),
-            }
+            told_segment(&order.out, &outcome);
             notify
                 .segment_done(&order, outcome.as_ref().map_err(|e| e.to_string()))
                 .await;
@@ -1089,9 +1099,16 @@ pub fn router<F: OverlayFactory>(
         headers: axum::http::HeaderMap,
         Json(order): Json<SegmentOrder<F::Order>>,
     ) -> axum::response::Response {
-        eprintln!(
+        tracing::info!(
+            segment = %order.out,
+            pack = %order.pack,
+            first = order.frames.0,
+            last = order.frames.1,
             "segment {} ← {} {}:{}",
-            order.out, order.pack, order.frames.0, order.frames.1
+            order.out,
+            order.pack,
+            order.frames.0,
+            order.frames.1
         );
         match notify {
             Some(notify) => {
@@ -1108,29 +1125,18 @@ pub fn router<F: OverlayFactory>(
                 let (told, cadence) = (progress.clone(), service.cadence);
                 in_lines(progress, cadence, async move {
                     let outcome = service.segment_watched(&order, &told).await;
-                    match &outcome {
-                        Ok(done) => eprintln!(
-                            "segment {} done: {} frames, waited {:.0} s, rendered in {:.0} s",
-                            done.out, done.frames, done.waited_seconds, done.render_seconds
-                        ),
-                        Err(e) => eprintln!("segment {} failed: {e}", order.out),
-                    }
+                    told_segment(&order.out, &outcome);
                     outcome
                 })
             }
-            None => match service.segment(&order).await {
-                Ok(done) => {
-                    eprintln!(
-                        "segment {} done: {} frames, waited {:.0} s, rendered in {:.0} s",
-                        done.out, done.frames, done.waited_seconds, done.render_seconds
-                    );
-                    Json(done).into_response()
+            None => {
+                let outcome = service.segment(&order).await;
+                told_segment(&order.out, &outcome);
+                match outcome {
+                    Ok(done) => Json(done).into_response(),
+                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
                 }
-                Err(e) => {
-                    eprintln!("segment {} failed: {e}", order.out);
-                    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-                }
-            },
+            }
         }
     }
     async fn compress<F: OverlayFactory>(
@@ -1138,7 +1144,9 @@ pub fn router<F: OverlayFactory>(
         headers: axum::http::HeaderMap,
         Json(order): Json<tuile_farm::compress::CompressOrder>,
     ) -> axum::response::Response {
-        eprintln!(
+        tracing::info!(
+            run = %order.run,
+            render = %order.render_id,
             "compress {} ← render {} as {}",
             order.run,
             order.render_id,
@@ -1150,7 +1158,7 @@ pub fn router<F: OverlayFactory>(
             return in_lines(progress, cadence, async move {
                 let outcome = service.compress_watched(&order, &told).await;
                 if let Err(e) = &outcome {
-                    eprintln!("compress {} failed: {e}", order.run);
+                    tracing::error!(run = %order.run, "compress {} failed: {e}", order.run);
                 }
                 outcome
             });
@@ -1158,7 +1166,7 @@ pub fn router<F: OverlayFactory>(
         match service.compress(&order).await {
             Ok(done) => Json(done).into_response(),
             Err(e) => {
-                eprintln!("compress {} failed: {e}", order.run);
+                tracing::error!(run = %order.run, "compress {} failed: {e}", order.run);
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
             }
         }
@@ -1170,11 +1178,30 @@ pub fn router<F: OverlayFactory>(
         .with_state((service, notify))
 }
 
+/// Says how a segment ended, in the service's log: an info line when it
+/// rendered, an error when it did not.
+fn told_segment(out: &str, outcome: &Result<SegmentDone, Error>) {
+    match outcome {
+        Ok(done) => tracing::info!(
+            segment = %done.out,
+            frames = done.frames,
+            waited_seconds = done.waited_seconds,
+            render_seconds = done.render_seconds,
+            "segment {} done: {} frames, waited {:.0} s, rendered in {:.0} s",
+            done.out,
+            done.frames,
+            done.waited_seconds,
+            done.render_seconds
+        ),
+        Err(e) => tracing::error!(segment = %out, "segment {out} failed: {e}"),
+    }
+}
+
 /// Serves `router` on `PORT` (8080 unless said) until the process ends.
 pub async fn serve(router: axum::Router) -> Result<(), Error> {
     let port = number("PORT")?.unwrap_or(8080);
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port as u16)).await?;
-    eprintln!("tuile-film-serve: on :{port}");
+    tracing::info!(port, "tuile-film-serve: on :{port}");
     axum::serve(listener, router).await?;
     Ok(())
 }

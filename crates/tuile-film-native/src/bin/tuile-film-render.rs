@@ -457,6 +457,7 @@ impl Sink for Both {
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     dotenvy::dotenv().ok();
+    tuile_farm::log_to_stderr();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let value = |name: &str| {
         args.iter()

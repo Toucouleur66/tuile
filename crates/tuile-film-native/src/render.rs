@@ -494,7 +494,8 @@ pub async fn render(
         wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let adapter = wgpu::util::initialize_adapter_from_env_or_default(&instance, None).await?;
     let info = adapter.get_info();
-    println!(
+    tracing::info!(
+        adapter = %info.name,
         "adapter: {} ({:?}, driver {} {})",
         info.name, info.backend, info.driver, info.driver_info
     );
@@ -640,7 +641,10 @@ pub async fn render(
                     tiles: absent,
                 }));
             }
-            println!(
+            tracing::info!(
+                first = a,
+                last = b,
+                tiles = count,
                 "ahead of frames {a}–{b}: {count} tiles of the store asked for in {:.1} s",
                 ahead.elapsed().as_secs_f64()
             );
@@ -1309,8 +1313,11 @@ pub async fn render(
             index += 1;
             if index.is_multiple_of(200) {
                 let so_far = began.elapsed().as_secs_f64();
-                eprintln!(
-                    "  frame {} — {index} rendered in {so_far:.0} s ({:.1} frames/s)",
+                tracing::info!(
+                    frame = diff.frame,
+                    frames = index,
+                    seconds = so_far,
+                    "frame {} — {index} rendered in {so_far:.0} s ({:.1} frames/s)",
                     diff.frame,
                     f64::from(index) / so_far
                 );

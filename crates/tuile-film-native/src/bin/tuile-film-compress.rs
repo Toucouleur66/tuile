@@ -209,6 +209,7 @@ async fn run(args: &[String]) -> Result<(), Error> {
 
 fn main() -> ExitCode {
     dotenvy::dotenv().ok();
+    tuile_farm::log_to_stderr();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()

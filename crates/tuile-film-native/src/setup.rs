@@ -46,7 +46,7 @@ pub fn tile_bucket(name: &str, io: &tokio::runtime::Handle) -> Result<Arc<dyn Ob
     let tiers = tuile_bake::tiles::Tiers::from_env(io)?;
     Ok(Arc::new(match tiers.global {
         Some(global) => {
-            println!(
+            tracing::info!(
                 "tile store: bucket {name}, its archives behind {}",
                 global.name
             );
@@ -95,7 +95,7 @@ pub async fn tile_store(cache: &Path) -> Result<TileStore, Error> {
     }
     match tuile_repository::HttpGet::from_env()? {
         Some(get) => {
-            println!("tile store: {}/store, by its routes", get.root());
+            tracing::info!("tile store: {}/store, by its routes", get.root());
             // A block is downloaded once: kept in a store of its own beside
             // the film's other caches — memory over disk — for this render
             // and the next. Sized well above a film's blocks: what the store
