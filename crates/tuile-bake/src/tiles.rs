@@ -25,11 +25,14 @@
 //!   processes of one machine may share it;
 //! - a bucket shared by every machine, `TUILE_TILES_GLOBAL`: `gs://bucket/
 //!   prefix` (credentials as `object_store` reads them from the environment)
-//!   or `file:///dir`. What the bucket gives is written there once. On GCS,
-//!   an archive's custom time is set when it is written, and only then
-//!   ([`GcsCustomTime`]): the bucket's lifecycle deletes it some days on, and
-//!   the next reader brings it down from the bucket again. A directory has
-//!   no custom time and is never touched.
+//!   or `file:///dir`. What the bucket gives is written there once, and
+//!   never written again: no object's metadata is ever edited, so nothing
+//!   counts reads there. A bucket that forgets is to forget by age (a
+//!   lifecycle rule on the object's creation): an archive deleted that way
+//!   is read from the bucket again by its next reader and written back,
+//!   its age starting over. Data updated often does not belong in an
+//!   object store: if the use of each archive is ever to be counted, it is
+//!   counted in the host's register of tiles, not in object metadata.
 //!
 //! What the process reads of the archives through these tiers is kept in
 //! memory, and every request to a tier or to the bucket waits for one of a
@@ -279,12 +282,7 @@ impl Tiers {
         });
         let global = match var("TUILE_TILES_GLOBAL") {
             Ok(url) => {
-                let (objects, touch) = global_tier(&url, io, cache.config())?;
-                let tier = Tier::new("global", objects);
-                Some(match touch {
-                    Some(touch) => tier.with_touch(touch),
-                    None => tier,
-                })
+                Some(Tier::new("global", global_tier(&url, io, cache.config())?))
             }
             Err(_) => None,
         };
@@ -296,15 +294,8 @@ impl Tiers {
     }
 }
 
-/// A global tier's objects, and what touches them when it has a custom
-/// time.
-type GlobalTier = (
-    Arc<dyn object_store::ObjectStore>,
-    Option<Arc<dyn tuile_tile_server::Touch>>,
-);
-
 /// The global tier at `url`: `gs://bucket[/prefix]` or `file:///dir`, a
-/// bucket's requests (its objects' and its custom times') run on `io`.
+/// bucket's requests run on `io`.
 /// A bucket's client gives a request the time its largest — an archive
 /// brought down whole — takes at the slowest `limits` allows, and retries it
 /// `limits.client_retries` times within that time, never ten times over.
@@ -312,10 +303,10 @@ fn global_tier(
     url: &str,
     io: &tokio::runtime::Handle,
     limits: &TierCacheConfig,
-) -> Result<GlobalTier, String> {
+) -> Result<Arc<dyn object_store::ObjectStore>, String> {
     let parsed = url::Url::parse(url).map_err(|e| format!("TUILE_TILES_GLOBAL {url}: {e}"))?;
     let prefix = parsed.path().trim_matches('/').to_string();
-    let (objects, touch): GlobalTier = match parsed.scheme() {
+    let objects: Arc<dyn object_store::ObjectStore> = match parsed.scheme() {
         "gs" => {
             let bucket = parsed
                 .host_str()
@@ -336,21 +327,16 @@ fn global_tier(
                 .with_bucket_name(bucket)
                 .build()
                 .map_err(|e| format!("TUILE_TILES_GLOBAL {url}: {e}"))?;
-            let touch = GcsCustomTime::new(bucket, &prefix, gcs.credentials().clone(), io.clone())?;
-            (Arc::new(gcs), Some(Arc::new(touch)))
+            Arc::new(gcs)
         }
         "file" => {
             let dir = parsed
                 .to_file_path()
                 .map_err(|()| format!("TUILE_TILES_GLOBAL {url}: not a path"))?;
             std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-            // A directory keeps no custom time: nothing to touch.
-            return Ok((
-                Arc::new(
-                    object_store::local::LocalFileSystem::new_with_prefix(&dir)
-                        .map_err(|e| format!("TUILE_TILES_GLOBAL {url}: {e}"))?,
-                ),
-                None,
+            return Ok(Arc::new(
+                object_store::local::LocalFileSystem::new_with_prefix(&dir)
+                    .map_err(|e| format!("TUILE_TILES_GLOBAL {url}: {e}"))?,
             ));
         }
         other => {
@@ -364,148 +350,7 @@ fn global_tier(
     } else {
         Arc::new(object_store::prefix::PrefixStore::new(objects, prefix))
     };
-    Ok((objects, touch))
-}
-
-/// The JSON API's objects, where an object's metadata is patched.
-const GCS_OBJECTS_API: &str = "https://storage.googleapis.com/storage/v1/b";
-
-/// Moves a GCS object's custom time forward: a `PATCH` of its metadata
-/// through the JSON API, `{"customTime": …}`. `object_store` 0.14 has
-/// neither a custom time to put nor a way to update an object's metadata,
-/// so this one request is made here, with the bucket's own credentials.
-///
-/// Each touch is a Class A operation: [`tuile_tile_server::Tiered`] touches
-/// an archive once when it writes it and at most once a day after.
-struct GcsCustomTime {
-    bucket: String,
-    prefix: String,
-    credentials: object_store::gcp::GcpCredentialProvider,
-    http: reqwest::Client,
-    /// Where its requests run: the process's runtime, never a bake's (whose
-    /// end would kill the client's pooled connections under a request).
-    io: tokio::runtime::Handle,
-}
-
-impl std::fmt::Debug for GcsCustomTime {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "GcsCustomTime(gs://{}/{})", self.bucket, self.prefix)
-    }
-}
-
-impl GcsCustomTime {
-    fn new(
-        bucket: &str,
-        prefix: &str,
-        credentials: object_store::gcp::GcpCredentialProvider,
-        io: tokio::runtime::Handle,
-    ) -> Result<Self, String> {
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|e| format!("the global tier's client: {e}"))?;
-        Ok(Self {
-            bucket: bucket.to_string(),
-            prefix: prefix.to_string(),
-            credentials,
-            http,
-            io,
-        })
-    }
-
-    /// The object's URL in the JSON API: its name one path segment,
-    /// slashes and all percent-encoded, and only its custom time answered.
-    fn url(&self, location: &object_store::path::Path) -> Result<url::Url, String> {
-        let name = if self.prefix.is_empty() {
-            location.to_string()
-        } else {
-            format!("{}/{location}", self.prefix)
-        };
-        let mut url = url::Url::parse(GCS_OBJECTS_API).map_err(|e| e.to_string())?;
-        url.path_segments_mut()
-            .map_err(|()| "the API's URL has no path".to_string())?
-            .push(&self.bucket)
-            .push("o")
-            .push(&name);
-        url.query_pairs_mut().append_pair("fields", "customTime");
-        Ok(url)
-    }
-}
-
-/// `at` as RFC 3339, to the millisecond, in UTC: what GCS reads a custom
-/// time as.
-fn rfc3339(at: std::time::SystemTime) -> String {
-    chrono::DateTime::<chrono::Utc>::from(at).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-}
-
-#[async_trait::async_trait]
-impl tuile_tile_server::Touch for GcsCustomTime {
-    async fn touch(
-        &self,
-        location: &object_store::path::Path,
-        at: std::time::SystemTime,
-    ) -> object_store::Result<()> {
-        let failed = |said: String| object_store::Error::Generic {
-            store: "gcs custom time",
-            source: said.into(),
-        };
-        let url = self.url(location).map_err(failed)?;
-        let token = self.credentials.get_credential().await?;
-        let request = self
-            .http
-            .patch(url)
-            .bearer_auth(&token.bearer)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(format!(r#"{{"customTime":"{}"}}"#, rfc3339(at)));
-        // On the process's runtime, as the bucket's own requests are.
-        let answered = self
-            .io
-            .spawn(async move {
-                let answer = request.send().await.map_err(|e| e.to_string())?;
-                let status = answer.status();
-                let body = if status.is_success() {
-                    String::new()
-                } else {
-                    answer.text().await.unwrap_or_default()
-                };
-                Ok::<_, String>((status, body))
-            })
-            .await
-            .map_err(|e| failed(format!("{location}: {e}")))?;
-        let (status, body) = answered.map_err(|e| failed(format!("{location}: {e}")))?;
-        touch_answer(location, status.as_u16(), &body)
-    }
-}
-
-/// What GCS's answer to a touch says. A custom time can only move forward,
-/// so `400 … cannot be decreased` — another machine moved it further first
-/// — and `409`, the object edited by another touch during this one, are a
-/// touch done: [`object_store::Error::NotModified`] and
-/// [`object_store::Error::Precondition`], which a tiered store counts as
-/// touched.
-fn touch_answer(
-    location: &object_store::path::Path,
-    status: u16,
-    body: &str,
-) -> object_store::Result<()> {
-    let said = format!("{location}: {status}: {body}");
-    match status {
-        200..=299 => Ok(()),
-        409 => Err(object_store::Error::Precondition {
-            path: location.to_string(),
-            source: said.into(),
-        }),
-        400 if body.to_ascii_lowercase().contains("cannot be decreased") => {
-            Err(object_store::Error::NotModified {
-                path: location.to_string(),
-                source: said.into(),
-            })
-        }
-        _ => Err(object_store::Error::Generic {
-            store: "gcs custom time",
-            source: said.into(),
-        }),
-    }
+    Ok(objects)
 }
 
 /// One tile store for every bake and converge of a process: opened on first
@@ -1047,8 +892,6 @@ impl Tiles {
                 written = t.written,
                 already_there = t.already_there,
                 ranges_passed = t.ranges_passed,
-                touched = t.touched,
-                touch_failures = t.touch_failures,
                 directory_hits = t.cache.directory.hits,
                 directory_loads = t.cache.directory.loads,
                 directory_joined = t.cache.directory.joined,
@@ -1162,7 +1005,7 @@ mod tier_tests {
         let dir = tempfile::tempdir().expect("dir");
         let url = url::Url::from_directory_path(dir.path()).expect("url");
         let io = tokio::runtime::Runtime::new().expect("io");
-        let (tier, _) =
+        let tier =
             super::global_tier(url.as_str(), io.handle(), &super::TierCacheConfig::default())
             .expect("tier");
         let at = object_store::path::Path::from(
@@ -1309,65 +1152,5 @@ mod runtime_tests {
             matches!(&got, Ok(bytes) if &bytes[..] == b"slow"),
             "the converge, once the bake that opened its connection ended: {got:?}"
         );
-    }
-}
-
-#[cfg(test)]
-mod custom_time_tests {
-    use super::*;
-
-    /// The object's name is one segment of the JSON API's path, under the
-    /// tier's prefix, its slashes encoded; the time is GCS's RFC 3339.
-    #[test]
-    fn a_touch_names_the_object_and_the_time_as_gcs_reads_them() {
-        let credentials: object_store::gcp::GcpCredentialProvider =
-            Arc::new(object_store::StaticCredentialProvider::new(
-                object_store::gcp::GcpCredential { bearer: "t".into() },
-            ));
-        let io = tokio::runtime::Runtime::new().expect("io");
-        let touch = GcsCustomTime::new("tiles-eu", "store", credentials, io.handle().clone())
-            .expect("made");
-        let at = object_store::path::Path::from("imagery/zones/z4/1/2/a b.pmtiles");
-        assert_eq!(
-            touch.url(&at).expect("url").as_str(),
-            "https://storage.googleapis.com/storage/v1/b/tiles-eu/o/store%2Fimagery%2Fzones%2Fz4%2F1%2F2%2Fa%20b.pmtiles?fields=customTime"
-        );
-        let when = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_790_000_000_123);
-        assert_eq!(rfc3339(when), "2026-09-21T14:13:20.123Z");
-    }
-
-    /// A directory as the global tier has no custom time: never touched.
-    #[test]
-    fn a_directory_tier_is_never_touched() {
-        let dir = tempfile::tempdir().expect("dir");
-        let url = url::Url::from_directory_path(dir.path()).expect("url");
-        let io = tokio::runtime::Runtime::new().expect("io");
-        let (_, touch) = global_tier(url.as_str(), io.handle(), &TierCacheConfig::default())
-            .expect("tier");
-        assert!(touch.is_none());
-    }
-
-    /// A custom time another machine moved further first is a touch done,
-    /// as is one edited during the touch; anything else is a failure.
-    #[test]
-    fn a_touch_answered_already_further_is_a_touch_done() {
-        let at = object_store::path::Path::from("a.pmtiles");
-        assert!(touch_answer(&at, 200, "").is_ok());
-        assert!(matches!(
-            touch_answer(&at, 400, r#"{"error":{"message":"The custom time cannot be decreased."}}"#),
-            Err(object_store::Error::NotModified { .. })
-        ));
-        assert!(matches!(
-            touch_answer(&at, 409, "The object was edited during the operation."),
-            Err(object_store::Error::Precondition { .. })
-        ));
-        assert!(matches!(
-            touch_answer(&at, 400, "Invalid argument."),
-            Err(object_store::Error::Generic { .. })
-        ));
-        assert!(matches!(
-            touch_answer(&at, 403, "denied"),
-            Err(object_store::Error::Generic { .. })
-        ));
     }
 }

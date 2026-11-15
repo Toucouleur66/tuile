@@ -34,7 +34,9 @@ pub fn bucket(name: &str) -> Result<Arc<dyn Objects>, Error> {
 /// [`tuile_bake::tiles::Tiers`]): its archives, immutable, are read from
 /// the region's copy, and what the bucket gives is copied there once for
 /// every other instance. The catalog and the manifests always come from
-/// the bucket.
+/// the bucket. They are read through the process's tier cache
+/// ([`tuile_bake::tiles::process_tier_cache`]), the one every store it
+/// opens shares.
 /// The global tier's requests run on `io`, a runtime that outlives every
 /// render (the host's).
 pub fn tile_bucket(name: &str, io: &tokio::runtime::Handle) -> Result<Arc<dyn Objects>, Error> {
@@ -43,15 +45,20 @@ pub fn tile_bucket(name: &str, io: &tokio::runtime::Handle) -> Result<Arc<dyn Ob
         ..BucketConfig::from_env()?
     };
     let store = ObjectRunStore::bucket(&config, Tuning::from_env())?;
+    // The process's tier cache and permits (`TUILE_TILES_*`), shared with
+    // every other store the process opens: not one of its own per render.
     let tiers = tuile_bake::tiles::Tiers::from_env(io)?;
-    Ok(Arc::new(match tiers.global {
+    Ok(Arc::new(match &tiers.global {
         Some(global) => {
             tracing::info!(
                 "tile store: bucket {name}, its archives behind {}",
                 global.name
             );
             store.wrapped(
-                |origin| Arc::new(tuile_tile_server::Tiered::new(origin, vec![global])),
+                |origin| match tiers.tiered(origin.clone()) {
+                    Some(tiered) => Arc::new(tiered),
+                    None => origin,
+                },
                 "behind its global tier",
             )
         }
