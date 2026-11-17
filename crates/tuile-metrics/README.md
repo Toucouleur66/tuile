@@ -30,10 +30,19 @@ a few dozen integers, once a second.
 HTTP listener. Both were briefly written by hand in this file, which was a
 waste and worse than what the crates do.
 
+## Beside the endpoint
+
+`serve_with` installs the endpoint's recorder and a second one beside it
+(a fan-out): `tuile-telemetry`'s, which pushes the same series to a
+collector. `publish` and `describe` copy the engine's numbers into whatever
+recorder a process has — natively on a timer of their own, in a browser on
+the page's — and `buckets` names each histogram's bounds, so the endpoint
+and the push bucket alike.
+
 ## Where it sits
 
 Depends on `tuile-core` (its `metrics` counters). Used by the native hosts:
-`tuile-viewer` and `tuile-bake`.
+`tuile-viewer` and `tuile-bake`; and by `tuile-telemetry`, on every target.
 
 ## Example
 
@@ -49,7 +58,8 @@ A host that already exports metrics of its own calls
 
 ## Features
 
-None. Native only.
+None. The endpoint is native only; `publish`, `describe` and `buckets`
+compile for a browser too.
 
 ## Documentation
 

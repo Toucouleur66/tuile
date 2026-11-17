@@ -44,6 +44,12 @@
 //! | `--hold S` | then keep the view still for `S` seconds more, logged: what a still view costs |
 //!
 //! A run's log flies again in the application: `TUILE_REPLAY=<log>.mcap`.
+//!
+//! The runner sends the application's telemetry when the variables say so,
+//! as the application does (`OTEL_EXPORTER_OTLP_ENDPOINT`,
+//! `TUILE_PROFILING_ENDPOINT`: see `tuile_telemetry`), and prints each run's
+//! frame times (the steps' `took`, p50 and p99) and the process's CPU time:
+//! the same run with and without them is the telemetry's overhead.
 
 mod catalog;
 
@@ -176,6 +182,8 @@ fn read(args: &[String]) -> Result<Option<Asked>, String> {
 
 /// What one pattern came to.
 struct Outcome {
+    /// Frames drawn, and their `took` at the 50th and 99th percentile, ms.
+    frames: (usize, f64, f64),
     verdict: Verdict,
     /// Whether the run came up before its motion, within its time.
     came_up: bool,
@@ -282,13 +290,89 @@ fn play(
             None => eprintln!("  no picture: the eye drew nothing"),
         }
     }
+    let frames = frame_times(run.history());
     let log = run.finish()?;
     Ok(Outcome {
+        frames,
         verdict,
         came_up,
         launch,
         log,
     })
+}
+
+/// The frames drawn and their time, p50 and p99, milliseconds.
+fn frame_times(history: &[State]) -> (usize, f64, f64) {
+    let mut took: Vec<f64> = history
+        .iter()
+        .filter(|s| s.drew)
+        .map(|s| s.took * 1000.0)
+        .collect();
+    took.sort_by(f64::total_cmp);
+    let at = |q: f64| {
+        took.get(((took.len() as f64 - 1.0) * q).round() as usize)
+            .copied()
+            .unwrap_or(0.0)
+    };
+    (took.len(), at(0.5), at(0.99))
+}
+
+/// The process's CPU time so far, user and system, seconds: from `ps`, the
+/// workspace denying the `unsafe` a `getrusage` would take.
+fn cpu_seconds() -> f64 {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "time=", "-p", &std::process::id().to_string()])
+        .output();
+    let text = out
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .unwrap_or_default();
+    // [[dd-]hh:]mm:ss.ss
+    let (days, rest) = text
+        .split_once('-')
+        .map_or((0.0, text.as_str()), |(d, r)| (d.parse().unwrap_or(0.0), r));
+    rest.split(':').fold(0.0, |acc, part| {
+        acc * 60.0 + part.parse::<f64>().unwrap_or(0.0)
+    }) + days * 86400.0
+}
+
+/// Starts the application's telemetry when the variables configure it, on
+/// a runtime of its own kept for the process's life.
+fn telemetry() -> Option<tokio::runtime::Runtime> {
+    let config = match tuile_telemetry::Config::from_vars(|k| std::env::var(k).ok()) {
+        Ok(config) if config.sends_anything() => config,
+        Ok(_) => return None,
+        Err(why) => {
+            eprintln!("telemetry: {why}");
+            std::process::exit(2);
+        }
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("telemetry")
+        .enable_all()
+        .build()
+        .ok()?;
+    let identity = tuile_telemetry::Identity {
+        service_name: "tuile-viewer",
+        version: env!("CARGO_PKG_VERSION"),
+        commit: option_env!("TUILE_GIT_COMMIT"),
+        device_class: "desktop",
+        realm: "native",
+    };
+    let registry = tuile_telemetry::start_native(runtime.handle(), &config, identity);
+    tuile_metrics::serve_with(
+        runtime.handle(),
+        false,
+        registry.map(|r| Box::new(r) as Box<dyn metrics::Recorder + Send + Sync>),
+    );
+    let say = |on: bool| if on { "on" } else { "off" };
+    println!(
+        "telemetry: metrics {}, CPU profiles {}",
+        say(tuile_telemetry::offered().metrics),
+        say(tuile_telemetry::profiling_on())
+    );
+    Some(runtime)
 }
 
 fn device_name(device: Device) -> String {
@@ -319,6 +403,9 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // The application's telemetry, if the variables configure any — on a
+    // runtime of its own, as the application's runs on its own.
+    let _telemetry = telemetry();
     let proxy = match catalog::Proxy::serve() {
         Ok(proxy) => proxy,
         Err(why) => {
@@ -382,9 +469,14 @@ fn main() {
         if let Some(log) = &outcome.log {
             println!("  log: {}", log.display());
         }
+        println!(
+            "  frames: {} drawn, took p50 {:.2} ms, p99 {:.2} ms",
+            outcome.frames.0, outcome.frames.1, outcome.frames.2
+        );
         summaries.push(json!({
             "key": pattern.key,
             "name": pattern.name,
+            "frames": {"drawn": outcome.frames.0, "p50_ms": outcome.frames.1, "p99_ms": outcome.frames.2},
             "device": device_name(pattern.device),
             "size": [pattern.size.0, pattern.size.1],
             "scale": pattern.scale,
@@ -408,10 +500,13 @@ fn main() {
             "obligations VIOLATED"
         }
     );
+    let cpu = cpu_seconds();
+    println!("cpu: {cpu:.1} s of the process (user and system)");
     let summary = json!({
         "version": 1,
         "kept": kept,
         "seconds": seconds,
+        "cpu_seconds": cpu,
         "sessions": {"asset_endpoints": endpoints, "imagery_metadata": metadata},
         "patterns": summaries,
     });

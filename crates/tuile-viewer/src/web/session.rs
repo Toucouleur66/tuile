@@ -51,6 +51,8 @@ pub(crate) struct Plan {
     /// The host's choice of how imagery is held. Off, the session starts at
     /// once; otherwise it waits for the page's device to say what it holds.
     pub compression: tuile_wgpu::ImageryCompression,
+    /// Where the worker sends its numbers, if anywhere.
+    pub telemetry: Option<super::options::TelemetryOptions>,
 }
 
 /// The worker, and the page's ear on it. Dropping the last handle ends both:
@@ -353,15 +355,17 @@ pub(crate) fn start(plan: &Plan) -> Launch {
     *weak_link.borrow_mut() = Rc::downgrade(&link);
     let start = {
         let link = Rc::downgrade(&link);
-        let (sources, profile, device_memory, decode_workers) = (
+        let (sources, profile, device_memory, decode_workers, telemetry) = (
             plan.sources.clone(),
             plan.profile,
             plan.device_memory,
             plan.decode_workers,
+            plan.telemetry.clone(),
         );
         move |imagery: super::imagery::Held| {
             // A start-up given up on in the meantime has dropped its worker.
             if let Some(link) = link.upgrade() {
+                let sends = telemetry.is_some();
                 link.post(&ToWorker::Start {
                     sources,
                     opening: 0,
@@ -369,7 +373,19 @@ pub(crate) fn start(plan: &Plan) -> Launch {
                     device_memory,
                     decode_workers,
                     imagery,
+                    telemetry,
+                    metrics_on: tuile_telemetry::metrics_on(),
                 });
+                if sends {
+                    // The switch as it changes: the page's menu is the
+                    // worker's too.
+                    let weak = Rc::downgrade(&link);
+                    tuile_telemetry::on_switch(Box::new(move |on| {
+                        if let Some(link) = weak.upgrade() {
+                            link.post(&ToWorker::Telemetry { on });
+                        }
+                    }));
+                }
             }
         }
     };

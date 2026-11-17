@@ -213,7 +213,8 @@ fn main() {
     if let Some(mib) = options.gpu_mib {
         budget = budget.with_gpu_bytes(mib * 1024 * 1024);
     }
-    let globe = TuilePlugin::new(GlobeSources::addresses(
+    #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+    let mut globe = TuilePlugin::new(GlobeSources::addresses(
         options.terrain.clone(),
         options.imagery.clone(),
     ))
@@ -226,6 +227,14 @@ fn main() {
     } else {
         "./decode-worker.js?pkg=webgpu"
     });
+    // Performance numbers to a collector, when the standard variables name
+    // one (`OTEL_EXPORTER_OTLP_ENDPOINT`, …): nothing otherwise.
+    #[cfg(not(target_arch = "wasm32"))]
+    match tuile_bevy::TelemetryConfig::from_vars(|k| std::env::var(k).ok()) {
+        Ok(config) if config.sends_anything() => globe = globe.with_telemetry(config),
+        Ok(_) => {}
+        Err(why) => eprintln!("tuile-bevy-viewer: telemetry: {why}; nothing sent"),
+    }
     let mut app = App::new();
     app.add_plugins(
         DefaultPlugins

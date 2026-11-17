@@ -107,6 +107,33 @@ and a diagnosis of a recording. `TUILE_STEER_SCRIPT=<file>` plays steering
 URLs on a timeline (`<seconds> <tuile://…>` or `<seconds> quit`), for a
 session that can be recorded again.
 
+## Telemetry
+
+The viewer can send its performance numbers while it runs — frame time and
+interval percentiles, uploads per frame, the graphics budget's signals, tile
+requests by where they were answered and, on a desktop, sampled CPU profiles
+— to a collector of the host's choosing, over OTLP/HTTP (and to Pyroscope
+for the profiles). **Nothing is sent unless an endpoint is configured**, and
+the menu's *Telemetry* items (`tuile://telemetry?metrics=off&profiling=on`)
+switch each part off and on while it runs.
+
+| platform | configuration |
+|---|---|
+| desktop | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_METRIC_EXPORT_INTERVAL`, `TUILE_PROFILING_ENDPOINT`, `TUILE_PROFILING`, `TUILE_PROFILING_HZ`; else the configuration file's `[telemetry]` |
+| phone | the configuration file's `[telemetry]` (no profiles: the platform has no sampler) |
+| page | `createViewer(…, { telemetry: { endpoint, headers, attributes, intervalSeconds } })` (no profiles; the browser's own request timings instead) |
+| Bevy | `TuilePlugin::with_telemetry(TelemetryConfig { … })` |
+
+What is sent is the program, its version and commit, the OS, the device
+class, the GPU, a random identifier drawn at each launch, and the numbers
+themselves. **Never** a location, the camera or its path, a tile's identity
+or address, a source's URL, or anything about the person: the resource
+attributes and the metric labels go through allow-lists where they leave
+(`tuile_telemetry::resource`). A token is a header — never part of a URL,
+never logged — kept in the system's secure storage when a configuration file
+brings it. A web page's token is visible to whoever reads the page: it must
+be a push-only one the collector limits by origin and rate.
+
 With the `control` feature — tests and debug builds only — `control` runs
 the same application headless, steps it frame by frame and reads it back:
 see that module.
@@ -116,7 +143,8 @@ see that module.
 Depends on `tuile-wgpu`, `tuile-ui`, `tuile-camera`, `tuile-planetary`,
 `tuile-terrain`, `tuile-atmosphere`, `tuile-overlay`, `tuile-tape` and
 `tuile-core`; natively on `tuile-native-fetchers`, `tuile-storage-foyer`,
-`tuile-metrics` and `tuile-cesium-ion`, in a browser on `tuile-web`. Its hosts
+`tuile-metrics` and `tuile-cesium-ion`, in a browser on `tuile-web`; on
+`tuile-telemetry` everywhere. Its hosts
 are `examples/wgpu-viewer` (desktop, phone), the `@lapoule-dev/tuile-viewer`
 package (browser) and any application that embeds it. The example of a host
 is in [`embed`].

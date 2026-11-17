@@ -112,6 +112,8 @@ export async function createViewer(container, options) {
     timeOffset: o.timeOffset,
     timeRate: o.timeRate,
     tilesets: o.tilesets ?? [],
+    // Off unless the host names a collector: nothing is sent by default.
+    telemetry: o.telemetry ?? undefined,
   };
 
   const listeners = new Map(EVENTS.map((kind) => [kind, new Set()]));

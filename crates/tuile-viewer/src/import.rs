@@ -103,6 +103,19 @@ pub(crate) fn session_token() -> Option<&'static config_file::Token> {
     SESSION.get()?.token.as_ref()
 }
 
+/// The key the collector's token is kept under in secure storage: never the
+/// host's credential's.
+pub(crate) const TELEMETRY_TOKEN: &str = "TUILE_TELEMETRY_TOKEN";
+
+/// The collector's token: the session's configuration file's, else what an
+/// import kept in secure storage.
+pub(crate) fn telemetry_token() -> Option<config_file::Token> {
+    if let Some(token) = SESSION.get().and_then(|s| s.telemetry_token.clone()) {
+        return Some(token);
+    }
+    crate::secrets::System.get(TELEMETRY_TOKEN)
+}
+
 /// The settings the process started with.
 pub(crate) fn running() -> Settings {
     RUNNING.get().cloned().unwrap_or_default()
@@ -231,10 +244,23 @@ pub(crate) fn import(
         why,
     };
     // Nothing is written until the whole file has been read and checked.
+    if read.telemetry_token.is_some() && !secrets.keyed() {
+        return Err(fail(
+            "telemetry.token".into(),
+            "this platform keeps one token, the source's: give the collector's \
+             as OTEL_EXPORTER_OTLP_HEADERS instead"
+                .into(),
+        ));
+    }
     if let Some(token) = &read.token {
         secrets
             .put(variable, token)
             .map_err(|why| fail(format!("{section}.token"), why))?;
+    }
+    if let Some(token) = &read.telemetry_token {
+        secrets
+            .put(TELEMETRY_TOKEN, token)
+            .map_err(|why| fail("telemetry.token".into(), why))?;
     }
     if let Some(path) = settings {
         let kept = config_file::settings_text(section, &read.settings);
@@ -454,6 +480,67 @@ mod tests {
         }
     }
 
+    /// The collector's token goes under its own key, never the source's,
+    /// and never into the settings; a store of one token refuses it rather
+    /// than lose the source's.
+    #[test]
+    fn the_collector_s_token_is_kept_apart() {
+        const COLLECTOR: &str = "collector.0123456789abcdef.not-a-real-token";
+        let dir = tempfile::tempdir().expect("a directory");
+        let settings = dir.path().join(SETTINGS_FILE);
+        let text = file(&format!(
+            "[telemetry]\nendpoint = \"https://collector.example/otlp\"\ntoken = \"{COLLECTOR}\"\n"
+        ));
+        let store = Fake::default();
+        import(
+            "mine.tuile",
+            &text,
+            "ion",
+            "SOME_TOKEN",
+            &store,
+            Some(&settings),
+            &Settings::default(),
+        )
+        .expect("imported");
+        assert_eq!(
+            store.get("SOME_TOKEN").as_ref().map(|t| t.expose()),
+            Some(FAKE)
+        );
+        assert_eq!(
+            store.get(TELEMETRY_TOKEN).as_ref().map(|t| t.expose()),
+            Some(COLLECTOR)
+        );
+        let kept = std::fs::read_to_string(&settings).expect("settings kept");
+        assert!(
+            !kept.contains(COLLECTOR),
+            "the settings file holds the token"
+        );
+        assert_eq!(
+            stored_settings(Some(&settings), "ion")
+                .telemetry
+                .and_then(|t| t.endpoint)
+                .as_deref(),
+            Some("https://collector.example/otlp")
+        );
+
+        let single = Fake {
+            single: true,
+            ..Fake::default()
+        };
+        let e = import(
+            "mine.tuile",
+            &text,
+            "ion",
+            "SOME_TOKEN",
+            &single,
+            None,
+            &Settings::default(),
+        )
+        .expect_err("a store of one token");
+        assert_eq!(e.key, "telemetry.token");
+        assert!(single.get("SOME_TOKEN").is_none(), "something was written");
+    }
+
     #[test]
     fn a_wrong_file_changes_nothing() {
         let dir = tempfile::tempdir().expect("a directory");
@@ -623,9 +710,15 @@ mod tests {
                     .unwrap_or(l)
             })
             .collect::<Vec<_>>()
-            .join("\n");
+            .join("\n")
+            .replace("YOUR-INGEST-TOKEN", FAKE);
         let read = config_file::parse("mine.tuile", &all, "ion").expect("every option");
         assert_eq!(read.settings.imagery.len(), 2);
         assert_eq!(read.settings.start.len(), 5);
+        assert!(read.telemetry_token.is_some());
+        assert!(read
+            .settings
+            .telemetry
+            .is_some_and(|t| t.endpoint.is_some()));
     }
 }

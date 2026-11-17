@@ -1,0 +1,71 @@
+[package]
+name = "tuile-telemetry"
+description = "Sends a viewer's performance numbers to a collector of the host's choosing: OTLP metrics from every platform, CPU profiles from a desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The facade the engine's numbers already go through (`tuile-metrics`), and
+# the recorder here that keeps them for the push. Plain Rust on every target.
+metrics = "0.24"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tuile-core = { version = "0.17.1", path = "../tuile-core" }
+tuile-metrics = { version = "0.17.1", path = "../tuile-metrics" }
+
+# A desktop or a phone: the push is a task on the host's runtime, over the
+# HTTP client the native fetchers already bring, with their TLS.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+reqwest = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["time"] }
+
+# CPU profiles: the sampling profiler Pyroscope's own Rust agent ships
+# (pprof-rs, a `SIGPROF` timer), pushed to Pyroscope. A desktop's only — on
+# macOS and Linux, where the signal-based sampler works; not on a phone (no
+# `SIGPROF` sampling the platform allows there) and not in a browser.
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+pyroscope = { version = "2.1.5", optional = true, default-features = false, features = ["backend-pprof-rs", "rustls-tls"] }
+
+# A browser: `fetch` for the push, the Performance API for what each tile
+# request cost and where it came from. The wasm-bindgen project's own crates.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3.76"
+wasm-bindgen = "0.2.99"
+wasm-bindgen-futures = "0.4.49"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+version = "0.3.76"
+features = [
+    "Headers",
+    "Performance",
+    "PerformanceEntry",
+    "PerformanceObserver",
+    "PerformanceObserverEntryList",
+    "PerformanceObserverInit",
+    "PerformanceResourceTiming",
+    "Request",
+    "RequestInit",
+    "Response",
+    "Window",
+    "WorkerGlobalScope",
+]
+
+[features]
+# The push from a native process, on a tokio runtime.
+native = ["dep:reqwest", "dep:tokio"]
+# CPU profiles to Pyroscope (macOS and Linux; nothing elsewhere).
+profiling = ["dep:pyroscope"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "time", "rt-multi-thread", "macros"] }

@@ -38,6 +38,8 @@ impl App {
             return;
         }
         let dt = self.start_the_frame();
+        let began = web_time::Instant::now();
+        let uploads = tuile_core::metrics::metrics().uploads.get();
         // Before anything reads the viewport: the bar decides how much of
         // the frame the view has.
         self.lay_out_the_credits();
@@ -75,6 +77,17 @@ impl App {
             resolution.coarser == 0 && resolution.lost == 0,
         )));
         self.report_once_a_second(rendered, resolution);
+        // The distributions a mean and a peak cannot give: what a frame's
+        // work took, how far apart frames were, what one uploaded. Through
+        // the facade, into the endpoint and the push alike.
+        metrics::histogram!("tuile_frame_time_seconds").record(began.elapsed().as_secs_f64());
+        metrics::histogram!("tuile_frame_interval_seconds").record(dt.as_secs_f64());
+        metrics::histogram!("tuile_frame_uploads").record(
+            tuile_core::metrics::metrics()
+                .uploads
+                .get()
+                .saturating_sub(uploads) as f64,
+        );
     }
 
     /// Closes the previous frame's clock and opens this one's.

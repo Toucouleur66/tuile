@@ -49,3 +49,17 @@ token = "YOUR-ION-TOKEN"
 # altitude = 6000
 # heading = 120
 # pitch = 25
+
+# Optional. Send the application's performance numbers (frame times, the
+# graphics budget, tile requests; CPU profiles on a desktop) to a collector
+# of your choosing, over OTLP/HTTP. Nothing is sent without an endpoint.
+# Never sent: where you look, where you are, anything about you. The
+# Telemetry menu switches it off and on.
+# [telemetry]
+# endpoint = "https://collector.example/otlp"
+# token = "YOUR-INGEST-TOKEN"      # kept in secure storage, sent as a bearer
+# interval = 15                    # seconds between two pushes
+# environment = "beta"
+# profiling_endpoint = "https://collector.example/pyroscope"
+# profiling = "on"                 # or "off": offered in the menu, not started
+# profiling_hz = 100

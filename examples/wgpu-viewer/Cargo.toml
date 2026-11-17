@@ -40,6 +40,11 @@ tokio = { workspace = true, features = ["net"] }
 tracing-subscriber = { workspace = true }
 tuile-cesium-ion = { version = "0.17.1", path = "../../crates/tuile-cesium-ion", features = ["proxy"] }
 tuile-viewer = { version = "0.17.1", path = "../../crates/tuile-viewer", features = ["control"] }
+# The runner's telemetry, as the application's (`OTEL_EXPORTER_OTLP_ENDPOINT`,
+# `TUILE_PROFILING_ENDPOINT`): what measures its own overhead.
+metrics = "0.24"
+tuile-metrics = { version = "0.17.1", path = "../../crates/tuile-metrics" }
+tuile-telemetry = { version = "0.17.1", path = "../../crates/tuile-telemetry", features = ["native", "profiling"] }
 # The sunset sequence (`examples/sunset`) and the discs' acceptance scenes
 # (`examples/discs`): their instants, from the ephemeris.
 tuile-atmosphere = { version = "0.17.1", path = "../../crates/tuile-atmosphere" }

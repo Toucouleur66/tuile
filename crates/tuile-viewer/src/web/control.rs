@@ -36,7 +36,17 @@ pub(crate) enum ToWorker {
         /// can hold it: see [`super::imagery`].
         #[serde(default)]
         imagery: super::imagery::Held,
+        /// Where the worker's own numbers go — the loads, the budget, the
+        /// tile requests — beside the page's frames: the page's options.
+        #[serde(default)]
+        telemetry: Option<super::options::TelemetryOptions>,
+        /// The page's switch when the worker starts: a message sent beside
+        /// the start could arrive before the worker listens again.
+        #[serde(default = "on")]
+        metrics_on: bool,
     },
+    /// The metrics sent, or not: the page's switch, followed.
+    Telemetry { on: bool },
     /// The sampled textures per stage the device reported: how many imagery
     /// tiles one drape may stack (`tuile_planetary::LayerBudget`). A count of
     /// texture slots, not of memory: the memory the session may use is the
@@ -179,6 +189,11 @@ impl Glance {
         s.converged = self.converged;
         s
     }
+}
+
+/// A switch that is on unless said otherwise.
+fn on() -> bool {
+    true
 }
 
 #[cfg(test)]

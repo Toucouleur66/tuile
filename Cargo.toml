@@ -29,6 +29,7 @@ members = [
     "crates/tuile-star-catalogue",
     "crates/tuile-storage-foyer",
     "crates/tuile-tape",
+    "crates/tuile-telemetry",
     "crates/tuile-terrain",
     "crates/tuile-tile-server",
     "crates/tuile-usd",

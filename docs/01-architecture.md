@@ -49,7 +49,8 @@ tuile/
 │   ├── tuile-repository/      # repositories over the buckets; the read API as request → reply
 │   ├── tuile-pack-api/        # a native, read-only HTTP host of that API
 │   ├── tuile-farm/            # a render farm's object storage: ranged reads, multipart writes, film assembly
-│   └── tuile-metrics/         # the core's counters on a Prometheus endpoint
+│   ├── tuile-metrics/         # the core's counters on a Prometheus endpoint
+│   └── tuile-telemetry/       # a viewer's numbers to a configured collector (OTLP, Pyroscope)
 ├── examples/
 │   ├── wgpu-viewer/           # `tuile-wgpu-viewer`: tuile-viewer over the public connectors (see 16-embedding-the-viewer.md)
 │   ├── bevy-viewer/           # a Bevy application over tuile-bevy (native, WebGPU, WebGL2)

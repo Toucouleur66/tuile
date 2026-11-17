@@ -194,6 +194,11 @@ async fn bring_up(
         driver = %info.driver_info,
         "adapter"
     );
+    // The same, on what is sent to a collector, if anything is: the GPU is
+    // what most performance questions are asked by. The profiles waited
+    // for it.
+    tuile_telemetry::describe_gpu(&info.name, &info.backend.to_string());
+    tuile_telemetry::ready();
     // What the GPU costs, asked for only where it is on offer.
     //
     // Nothing was requested here at all, so there was no way to time a

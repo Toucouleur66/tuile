@@ -223,7 +223,7 @@ tuile-b3dm, tuile-overlay, tuile-radiometry, tuile-mp4
 tuile-core
 tuile-atmosphere, tuile-bing, tuile-terrain, tuile-pack, tuile-metrics,
   tuile-camera, tuile-tile-server, tuile-storage-foyer
-tuile-planetary, tuile-tape, tuile-farm, tuile-ui, tuile-wgpu
+tuile-planetary, tuile-tape, tuile-farm, tuile-ui, tuile-wgpu, tuile-telemetry
 tuile-cesium-ion, tuile-usd
 tuile-native-fetchers, tuile-web, tuile-film, tuile-repository
 tuile-bake, tuile-film-gpu, tuile-bevy
