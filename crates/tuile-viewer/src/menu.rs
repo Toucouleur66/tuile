@@ -75,6 +75,10 @@ pub(crate) enum Ask {
         index: usize,
         asset: i64,
     },
+    /// The metrics sent to the configured collector, or not.
+    ToggleMetrics,
+    /// The CPU profiles taken and sent, or not.
+    ToggleProfiling,
 }
 
 /// The rates the clock steps through, scene seconds a second: backwards an
@@ -111,6 +115,10 @@ pub(crate) struct State {
     /// Which of the session's 3D Tiles tilesets are drawn, a bit each by
     /// their order: bit 0 the first.
     pub tilesets: u32,
+    /// Whether the metrics are sent, and the CPU profiles taken: the
+    /// process's switches (`tuile_telemetry`).
+    pub metrics: bool,
+    pub profiling: bool,
 }
 
 impl State {
@@ -124,6 +132,8 @@ impl State {
             clock: snapshot.clock,
             recording: snapshot.recording,
             tilesets: snapshot.tilesets,
+            metrics: tuile_telemetry::metrics_on(),
+            profiling: tuile_telemetry::profiling_on(),
         }
     }
 
@@ -158,6 +168,8 @@ impl Ask {
                 asset,
                 on: !now.tileset_on(index),
             },
+            Self::ToggleMetrics => Command::Metrics(!now.metrics),
+            Self::ToggleProfiling => Command::Profiling(!now.profiling),
             Self::Diagnostic(view) => Command::Diagnostic(view),
             Self::NextDiagnostic => Command::Diagnostic((now.diagnostic + 1) % DIAGNOSTICS.len()),
             Self::Imagery(layer) => Command::Imagery(layer),
@@ -211,6 +223,8 @@ impl Ask {
             Self::Pause => Some(now.clock.rate == 0.0),
             Self::ToggleRecording => Some(now.recording),
             Self::ToggleTileset { index, .. } => Some(now.tileset_on(index)),
+            Self::ToggleMetrics => Some(now.metrics),
+            Self::ToggleProfiling => Some(now.profiling),
             Self::Do(_)
             | Self::NextDiagnostic
             | Self::NextImagery
@@ -367,7 +381,39 @@ pub(crate) fn layout(
             .collect();
         sections.push(("3D Tiles", items));
     }
+    if let Some(section) = telemetry_section(tuile_telemetry::offered()) {
+        sections.push(section);
+    }
     sections
+}
+
+/// The switches of what is sent to a collector: each only when the
+/// configuration names somewhere to send it — a menu offers nothing that
+/// would do nothing.
+#[cfg_attr(
+    not(any(
+        all(target_os = "macos", feature = "application"),
+        target_arch = "wasm32"
+    )),
+    allow(dead_code)
+)]
+fn telemetry_section(offered: tuile_telemetry::Offered) -> Option<(&'static str, Vec<Entry>)> {
+    let mut items = Vec::new();
+    if offered.metrics {
+        items.push(Entry::Item {
+            title: "Send Performance Metrics".to_owned(),
+            ask: Ask::ToggleMetrics,
+            key: None,
+        });
+    }
+    if offered.profiling {
+        items.push(Entry::Item {
+            title: "Send CPU Profiles".to_owned(),
+            ask: Ask::ToggleProfiling,
+            key: None,
+        });
+    }
+    (!items.is_empty()).then_some(("Telemetry", items))
 }
 
 pub(crate) use platform::Installed;
@@ -629,6 +675,8 @@ impl Default for State {
             },
             recording: false,
             tilesets: 0,
+            metrics: false,
+            profiling: false,
         }
     }
 }
@@ -772,6 +820,8 @@ mod tests {
             clock: State::default().clock,
             recording: false,
             tilesets: 0b10,
+            metrics: false,
+            profiling: false,
         };
         let marked: Vec<String> = items(&layers)
             .into_iter()
@@ -864,6 +914,8 @@ mod tests {
             },
             recording: false,
             tilesets: 0b1,
+            metrics: false,
+            profiling: false,
         };
         for (ask, command) in [
             (Ask::ToggleWireframe, Command::Wireframe(true)),
@@ -886,5 +938,45 @@ mod tests {
             assert_eq!(ask.command(&now), command);
             assert_eq!(ask.command(&now), ask.command(&now));
         }
+    }
+
+    /// The telemetry switches are offered only where something is
+    /// configured, and each turns its own switch against the present state.
+    #[test]
+    fn the_telemetry_menu_follows_what_is_configured() {
+        use tuile_telemetry::Offered;
+        assert!(telemetry_section(Offered::default()).is_none());
+        let asks = |offered| -> Vec<Ask> {
+            telemetry_section(offered)
+                .map(|(_, entries)| entries)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|e| match e {
+                    Entry::Item { ask, .. } => Some(ask),
+                    Entry::Separator => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            asks(Offered {
+                metrics: true,
+                profiling: false
+            }),
+            [Ask::ToggleMetrics]
+        );
+        assert_eq!(
+            asks(Offered {
+                metrics: true,
+                profiling: true
+            }),
+            [Ask::ToggleMetrics, Ask::ToggleProfiling]
+        );
+        let on = State {
+            metrics: true,
+            ..State::default()
+        };
+        assert_eq!(Ask::ToggleMetrics.command(&on), Command::Metrics(false));
+        assert_eq!(Ask::ToggleProfiling.command(&on), Command::Profiling(true));
+        assert_eq!(Ask::ToggleMetrics.checked(&on), Some(true));
     }
 }

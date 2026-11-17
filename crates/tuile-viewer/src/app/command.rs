@@ -130,6 +130,8 @@ impl App {
                 }
             }
             Command::Record(on) => self.record(on),
+            Command::Metrics(on) => tuile_telemetry::set_metrics(on),
+            Command::Profiling(on) => tuile_telemetry::set_profiling(on),
             Command::ClockNow => {
                 self.atmosphere.clock.now(super::wall_seconds());
                 self.resume_rate = 1.0;
@@ -226,6 +228,8 @@ impl App {
                 clock: self.clock_state(),
                 recording: self.is_recording(),
                 tilesets: self.tilesets.bits(),
+                metrics: tuile_telemetry::metrics_on(),
+                profiling: tuile_telemetry::profiling_on(),
             },
             |snapshot| crate::menu::State::of(&snapshot, layers),
         )

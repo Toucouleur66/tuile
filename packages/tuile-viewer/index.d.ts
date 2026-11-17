@@ -128,6 +128,31 @@ export interface ViewerOptions {
    * below the picture while they are drawn. None by default.
    */
   tilesets?: TilesetOffer[];
+  /**
+   * Where the viewer's performance numbers are sent, over OTLP/HTTP (JSON):
+   * frame times, uploads, the graphics budget, each tile request's duration
+   * and whether the browser's cache answered. Nothing is sent without it.
+   * Never sent: the view, a location, a tile's address, anything about the
+   * person. The menu's *Telemetry* item switches it off and on.
+   *
+   * A token in `headers` is visible to anyone who reads the page: use one
+   * that can only push, limited by origin and rate on the collector's side.
+   */
+  telemetry?: TelemetryOptions;
+}
+
+/** A collector to send the viewer's performance numbers to. */
+export interface TelemetryOptions {
+  /** The OTLP/HTTP base URL; `/v1/metrics` is appended. No query, no user. */
+  endpoint: string;
+  /** Request headers: typically `{ Authorization: "Bearer <push token>" }`. */
+  headers?: Record<string, string>;
+  /** Resource attributes, kept only if allow-listed (`deployment.environment`). */
+  attributes?: Record<string, string>;
+  /** Seconds between two pushes: 15 by default. */
+  intervalSeconds?: number;
+  /** The service name; `tuile-viewer` by default. */
+  serviceName?: string;
 }
 
 /** A 3D Tiles tileset of the catalog, offered over the globe. */

@@ -1,0 +1,285 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) lapoule.dev
+
+//! A snapshot of the registry as an OTLP `ExportMetricsServiceRequest`, in
+//! OTLP/JSON — the encoding every OTLP/HTTP receiver accepts beside
+//! protobuf, and the one a browser can send without a codec.
+//!
+//! One encoder for every platform, so a desktop and a page send byte for
+//! byte the same shapes: counters as cumulative monotonic sums, gauges as
+//! gauges, histograms as cumulative explicit-bucket histograms, all from the
+//! process's start. Integers that are 64-bit in the protocol are strings, as
+//! its JSON mapping says.
+//!
+//! The allow-lists are applied here, at the last step before the wire:
+//! a series with a label outside [`crate::resource::ALLOWED_LABELS`] is left
+//! out whole.
+
+use serde_json::{json, Value as Json};
+
+use crate::registry::{Point, Value};
+use crate::resource::{allowed_label, Resource};
+
+/// The instrumentation scope every series is filed under.
+pub const SCOPE: &str = "tuile";
+
+/// OTLP's `AGGREGATION_TEMPORALITY_CUMULATIVE`.
+const CUMULATIVE: u8 = 2;
+
+/// What was encoded: the body, and how many series were left out by the
+/// label allow-list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Encoded {
+    pub body: String,
+    pub series: usize,
+    pub withheld: usize,
+}
+
+/// Whether `point` may leave the process: every label key on the list.
+pub fn sendable(point: &Point) -> bool {
+    point.labels.iter().all(|(k, _)| allowed_label(k))
+}
+
+/// `points`, as one request: `start_ns` the process's start, `now_ns` the
+/// instant of the values, both Unix nanoseconds.
+pub fn encode(resource: &Resource, points: &[Point], start_ns: u64, now_ns: u64) -> Encoded {
+    let (start, now) = (start_ns.to_string(), now_ns.to_string());
+    let mut withheld = 0;
+    let mut metrics: Vec<Json> = Vec::new();
+    // Points of one name together, as one metric with several data points.
+    let mut i = 0;
+    while i < points.len() {
+        let name = &points[i].name;
+        let mut j = i;
+        while j < points.len() && points[j].name == *name {
+            j += 1;
+        }
+        let group: Vec<&Point> = points[i..j]
+            .iter()
+            .filter(|p| {
+                let ok = sendable(p);
+                if !ok {
+                    withheld += 1;
+                }
+                ok
+            })
+            .collect();
+        i = j;
+        if let Some(metric) = metric(name, &group, &start, &now) {
+            metrics.push(metric);
+        }
+    }
+    let series = metrics
+        .iter()
+        .map(|m| {
+            ["sum", "gauge", "histogram"]
+                .iter()
+                .filter_map(|k| m.get(*k))
+                .map(|d| d["dataPoints"].as_array().map_or(0, Vec::len))
+                .sum::<usize>()
+        })
+        .sum();
+    let body = json!({
+        "resourceMetrics": [{
+            "resource": { "attributes": attributes(resource.iter()) },
+            "scopeMetrics": [{
+                "scope": { "name": SCOPE, "version": env!("CARGO_PKG_VERSION") },
+                "metrics": metrics,
+            }],
+        }],
+    });
+    Encoded {
+        body: body.to_string(),
+        series,
+        withheld,
+    }
+}
+
+fn attributes<'a>(pairs: impl Iterator<Item = (&'a str, &'a str)>) -> Json {
+    Json::Array(
+        pairs
+            .map(|(k, v)| json!({ "key": k, "value": { "stringValue": v } }))
+            .collect(),
+    )
+}
+
+/// One metric of `name` from its points, all of one kind — the first's;
+/// a point of another kind under the same name is left out.
+fn metric(name: &str, points: &[&Point], start: &str, now: &str) -> Option<Json> {
+    let first = points.first()?;
+    let labels = |p: &Point| attributes(p.labels.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    match &first.value {
+        Value::Counter(_) => {
+            let data: Vec<Json> = points
+                .iter()
+                .filter_map(|p| match p.value {
+                    Value::Counter(v) => Some(json!({
+                        "attributes": labels(p),
+                        "startTimeUnixNano": start,
+                        "timeUnixNano": now,
+                        "asInt": v.to_string(),
+                    })),
+                    _ => None,
+                })
+                .collect();
+            Some(json!({
+                "name": name,
+                "sum": {
+                    "dataPoints": data,
+                    "aggregationTemporality": CUMULATIVE,
+                    "isMonotonic": true,
+                },
+            }))
+        }
+        Value::Gauge(_) => {
+            let data: Vec<Json> = points
+                .iter()
+                .filter_map(|p| match p.value {
+                    Value::Gauge(v) if v.is_finite() => Some(json!({
+                        "attributes": labels(p),
+                        "timeUnixNano": now,
+                        "asDouble": v,
+                    })),
+                    _ => None,
+                })
+                .collect();
+            Some(json!({ "name": name, "gauge": { "dataPoints": data } }))
+        }
+        Value::Histogram { .. } => {
+            let data: Vec<Json> = points
+                .iter()
+                .filter_map(|p| match &p.value {
+                    Value::Histogram {
+                        bounds,
+                        counts,
+                        count,
+                        sum,
+                    } => Some(json!({
+                        "attributes": labels(p),
+                        "startTimeUnixNano": start,
+                        "timeUnixNano": now,
+                        "count": count.to_string(),
+                        "sum": sum,
+                        "bucketCounts": counts.iter().map(u64::to_string).collect::<Vec<_>>(),
+                        "explicitBounds": bounds,
+                    })),
+                    _ => None,
+                })
+                .collect();
+            Some(json!({
+                "name": name,
+                "histogram": {
+                    "dataPoints": data,
+                    "aggregationTemporality": CUMULATIVE,
+                },
+            }))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::Registry;
+
+    fn resource() -> Resource {
+        let mut r = Resource::default();
+        r.set("service.name", "viewer");
+        r.set("service.instance.id", "0123");
+        r
+    }
+
+    /// The mapping: names, kinds, temporality, labels, the 64-bit integers
+    /// as strings, the buckets as the protocol counts them.
+    #[test]
+    fn each_kind_maps_to_its_otlp_shape() {
+        let registry = Registry::new();
+        metrics::with_local_recorder(&registry, || {
+            metrics::counter!("tuile_frames").absolute(42);
+            metrics::gauge!("tuile_budget_bytes", "class" => "terrain_mesh", "state" => "drawable")
+                .set(1024.0);
+            metrics::histogram!("tuile_tiles_fetch_seconds", "source" => "cache", "kind" => "mesh")
+                .record(0.003);
+        });
+        let out = encode(&resource(), &registry.snapshot(), 1_000, 2_000);
+        assert_eq!((out.series, out.withheld), (3, 0));
+        let v: Json = serde_json::from_str(&out.body).expect("JSON");
+        let rm = &v["resourceMetrics"][0];
+        let attrs = rm["resource"]["attributes"].as_array().expect("attributes");
+        assert!(attrs.contains(&json!({"key": "service.name", "value": {"stringValue": "viewer"}})));
+        let metrics = rm["scopeMetrics"][0]["metrics"]
+            .as_array()
+            .expect("metrics");
+        let by = |n: &str| metrics.iter().find(|m| m["name"] == n).expect(n);
+
+        let c = &by("tuile_frames")["sum"];
+        assert_eq!(c["aggregationTemporality"], 2);
+        assert_eq!(c["isMonotonic"], true);
+        assert_eq!(c["dataPoints"][0]["asInt"], "42");
+        assert_eq!(c["dataPoints"][0]["startTimeUnixNano"], "1000");
+        assert_eq!(c["dataPoints"][0]["timeUnixNano"], "2000");
+
+        let g = &by("tuile_budget_bytes")["gauge"]["dataPoints"][0];
+        assert_eq!(g["asDouble"], 1024.0);
+        assert_eq!(
+            g["attributes"],
+            json!([
+                {"key": "class", "value": {"stringValue": "terrain_mesh"}},
+                {"key": "state", "value": {"stringValue": "drawable"}},
+            ])
+        );
+
+        let h = &by("tuile_tiles_fetch_seconds")["histogram"];
+        assert_eq!(h["aggregationTemporality"], 2);
+        let p = &h["dataPoints"][0];
+        assert_eq!(p["count"], "1");
+        assert_eq!(p["sum"], 0.003);
+        let bounds = p["explicitBounds"].as_array().expect("bounds");
+        let counts = p["bucketCounts"].as_array().expect("counts");
+        assert_eq!(counts.len(), bounds.len() + 1);
+        assert_eq!(
+            counts[3], "1",
+            "0.003 is in the bucket up to 0.004: {counts:?}"
+        );
+    }
+
+    /// The privacy guard on labels: a series with a label outside the list
+    /// is not sent; its siblings are.
+    #[test]
+    fn a_label_outside_the_list_withholds_the_series() {
+        let registry = Registry::new();
+        metrics::with_local_recorder(&registry, || {
+            metrics::counter!("tuile_tiles_fetch_total", "source" => "cache", "kind" => "mesh", "outcome" => "hit").increment(1);
+            metrics::counter!("tuile_tiles_fetch_total", "url" => "https://tiles.example/1/2/3.terrain").increment(1);
+            metrics::histogram!("tuile_tiles_zone_listing_seconds", "layer" => "a-layer")
+                .record(1.0);
+        });
+        let out = encode(&resource(), &registry.snapshot(), 0, 1);
+        assert_eq!((out.series, out.withheld), (1, 2));
+        assert!(!out.body.contains("tiles.example"), "{}", out.body);
+        assert!(!out.body.contains("a-layer"), "{}", out.body);
+        assert!(
+            !out.body.contains("tuile_tiles_zone_listing_seconds"),
+            "{}",
+            out.body
+        );
+    }
+
+    /// Every series the engine publishes passes the label guard: a label
+    /// added to the engine without a thought for the list fails here, not
+    /// silently in production.
+    #[test]
+    fn every_engine_series_passes_the_guard() {
+        let registry = Registry::new();
+        let mut signals = tuile_core::budget::BudgetSignals::default();
+        signals.lost_tile_steps_total = 1;
+        tuile_core::metrics::publish_budget(signals);
+        metrics::with_local_recorder(&registry, || {
+            tuile_metrics::publish(tuile_core::metrics::metrics());
+        });
+        let points = registry.snapshot();
+        assert!(points.len() > 100, "only {} series", points.len());
+        let refused: Vec<&Point> = points.iter().filter(|p| !sendable(p)).collect();
+        assert!(refused.is_empty(), "withheld: {refused:?}");
+    }
+}

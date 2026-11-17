@@ -30,6 +30,7 @@
 //! | `tuile://tileset?asset=<n>&show=on\|off` | one of the host's 3D Tiles tilesets drawn over the globe, or not |
 //! | `tuile://imagery?name=<key>` | drapes another of the host's imagery layers; `name=next` takes the one after the present |
 //! | `tuile://import?src=https://…` | fetches a configuration file and imports it, as opening it would (`crate::import`) |
+//! | `tuile://telemetry?metrics=on\|off&profiling=on\|off` | the performance numbers sent to the configured collector, or not: see `tuile_telemetry` (nothing happens where none is configured) |
 //!
 //! ## The scene's clock in a link
 //!
@@ -174,6 +175,12 @@ pub(crate) enum Command {
         asset: i64,
         on: bool,
     },
+    /// The metrics pushed to the configured collector, or not
+    /// (`tuile_telemetry::set_metrics`).
+    Metrics(bool),
+    /// The CPU profiles taken and pushed, or not
+    /// (`tuile_telemetry::set_profiling`).
+    Profiling(bool),
 }
 
 /// Which of `layers` a person, a flag, a URL or a script means by `text`: a
@@ -384,6 +391,28 @@ pub(crate) fn parse_url_among(
                 (Some(asset), Some(on)) => Ok(vec![Command::Tileset { asset, on }]),
                 _ => Err("tileset takes asset= and show=on|off".to_owned()),
             }
+        }
+        "telemetry" => {
+            if pairs.is_empty() {
+                return Err("telemetry changes nothing: give metrics= or profiling=".to_owned());
+            }
+            pairs
+                .iter()
+                .map(|(key, text)| {
+                    let on = match *text {
+                        "on" => true,
+                        "off" => false,
+                        _ => return Err(format!("{key} is on or off, not {text:?}")),
+                    };
+                    match *key {
+                        "metrics" => Ok(Command::Metrics(on)),
+                        "profiling" => Ok(Command::Profiling(on)),
+                        _ => Err(format!(
+                            "telemetry takes metrics= and profiling=, not {key:?}"
+                        )),
+                    }
+                })
+                .collect()
         }
         "view" => {
             if pairs.is_empty() {
@@ -1048,6 +1077,21 @@ mod tests {
 
     /// Everything that is not a command is refused whole — and with the same
     /// bounds as the flags, because it is the same table.
+    #[test]
+    fn the_telemetry_switches_are_urls() {
+        assert_eq!(
+            parse_url("tuile://telemetry?metrics=off&profiling=on"),
+            Ok(vec![Command::Metrics(false), Command::Profiling(true)])
+        );
+        for bad in [
+            "tuile://telemetry",
+            "tuile://telemetry?metrics=maybe",
+            "tuile://telemetry?endpoint=https://elsewhere.example",
+        ] {
+            assert!(parse_url(bad).is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn what_is_malformed_unknown_or_out_of_range_carries_no_command() {
         // A perfectly good longitude, written with six hundred zeros: only

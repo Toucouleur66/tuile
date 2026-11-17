@@ -22,6 +22,15 @@
 //! altitude = 6000
 //! heading = 120
 //! pitch = 25
+//!
+//! [telemetry]                           # optional: performance numbers sent while running
+//! endpoint = "https://collector.example/otlp"   # OTLP/HTTP base; nothing is sent without it
+//! token = "your-ingest-token"           # sent as Authorization: Bearer; secure storage
+//! interval = 15                         # optional: seconds between two pushes
+//! environment = "beta"                  # optional: deployment.environment
+//! profiling_endpoint = "https://collector.example/pyroscope"  # optional: CPU profiles
+//! profiling = "on"                      # optional: on (default) or off — the menu switches it
+//! profiling_hz = 100                    # optional: samples a second
 //! ```
 //!
 //! **The token is read once and handed to secure storage.** It never reaches
@@ -49,6 +58,17 @@ pub(crate) const LONGEST_FILE: usize = 64 * 1024;
 
 /// The view numbers a file may say, in the command line's names and units.
 const START_KEYS: [&str; 5] = ["lon", "lat", "altitude", "heading", "pitch"];
+
+/// The keys of `[telemetry]`.
+const TELEMETRY_KEYS: [&str; 7] = [
+    "endpoint",
+    "token",
+    "interval",
+    "environment",
+    "profiling_endpoint",
+    "profiling",
+    "profiling_hz",
+];
 
 /// An access token. Never printed: no `Display`, a `Debug` that hides it.
 #[derive(Clone, PartialEq, Eq)]
@@ -83,6 +103,23 @@ pub(crate) struct Settings {
     pub imagery: Vec<ImageryChoice>,
     /// Start-view numbers by flag name (`lon`, `lat`, …), already checked.
     pub start: Vec<(String, f64)>,
+    /// Where the performance numbers go (`[telemetry]`), without its token.
+    pub telemetry: Option<TelemetrySettings>,
+}
+
+/// `[telemetry]`, checked: see the module. Its token is kept apart, as the
+/// section's is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TelemetrySettings {
+    /// The OTLP/HTTP base URL, checked by `tuile_telemetry::config::endpoint_url`.
+    pub endpoint: Option<String>,
+    /// Seconds between two pushes.
+    pub interval: Option<u64>,
+    /// `deployment.environment`.
+    pub environment: Option<String>,
+    pub profiling_endpoint: Option<String>,
+    pub profiling: Option<bool>,
+    pub profiling_hz: Option<u32>,
 }
 
 impl Settings {
@@ -100,6 +137,8 @@ impl Settings {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ConfigFile {
     pub token: Option<Token>,
+    /// `[telemetry]`'s token: the collector's, never the section's.
+    pub telemetry_token: Option<Token>,
     pub settings: Settings,
 }
 
@@ -156,6 +195,7 @@ pub(crate) fn parse(file: &str, text: &str, section: &str) -> Result<ConfigFile,
     })?;
 
     let mut token = None;
+    let mut telemetry_token = None;
     let mut settings = Settings::default();
     for (key, value) in &table {
         if key == section {
@@ -169,20 +209,31 @@ pub(crate) fn parse(file: &str, text: &str, section: &str) -> Result<ConfigFile,
                 return Err(fail(key, "must be a table: [start]"));
             };
             settings.start = read_start(start).map_err(|(k, why)| fail(&k, &why))?;
+        } else if key == "telemetry" {
+            let Value::Table(telemetry) = value else {
+                return Err(fail(key, "must be a table: [telemetry]"));
+            };
+            let (read, its_token) = read_telemetry(telemetry).map_err(|(k, why)| fail(&k, &why))?;
+            settings.telemetry = Some(read);
+            telemetry_token = its_token;
         } else {
             return Err(fail(
                 key,
-                &format!("unknown section; this file knows [{section}] and [start]"),
+                &format!("unknown section; this file knows [{section}], [start] and [telemetry]"),
             ));
         }
     }
-    if token.is_none() && settings == Settings::default() {
+    if token.is_none() && telemetry_token.is_none() && settings == Settings::default() {
         return Err(fail(
             section,
             &format!("missing: the file says nothing; it needs at least [{section}] token"),
         ));
     }
-    Ok(ConfigFile { token, settings })
+    Ok(ConfigFile {
+        token,
+        telemetry_token,
+        settings,
+    })
 }
 
 type Problem = (String, String);
@@ -299,6 +350,83 @@ fn read_imagery(section: &str, layers: &[Value]) -> Result<Vec<ImageryChoice>, P
     Ok(out)
 }
 
+fn read_telemetry(table: &Table) -> Result<(TelemetrySettings, Option<Token>), Problem> {
+    let mut out = TelemetrySettings::default();
+    let mut token = None;
+    for (key, value) in table {
+        let at = format!("telemetry.{key}");
+        if !TELEMETRY_KEYS.contains(&key.as_str()) {
+            return Err((
+                at,
+                format!("unknown key; the keys are {}", TELEMETRY_KEYS.join(", ")),
+            ));
+        }
+        let text = || match value {
+            Value::String(s) if !s.trim().is_empty() => Ok(s.trim().to_owned()),
+            _ => Err((
+                at.clone(),
+                "must be a non-empty string in quotes".to_owned(),
+            )),
+        };
+        let whole = |low: i64, high: i64| match value {
+            Value::Integer(n) if (low..=high).contains(n) => Ok(*n),
+            _ => Err((
+                at.clone(),
+                format!("must be a whole number from {low} to {high}"),
+            )),
+        };
+        match key.as_str() {
+            "endpoint" => {
+                out.endpoint = Some(
+                    tuile_telemetry::config::endpoint_url(&text()?)
+                        .map_err(|why| (at.clone(), why))?,
+                );
+            }
+            "profiling_endpoint" => {
+                out.profiling_endpoint = Some(
+                    tuile_telemetry::config::endpoint_url(&text()?)
+                        .map_err(|why| (at.clone(), why))?,
+                );
+            }
+            "token" => {
+                let given = Token::new(&text()?);
+                if given
+                    .expose()
+                    .chars()
+                    .any(|c| c.is_whitespace() || c.is_control())
+                {
+                    return Err((
+                        at,
+                        "holds spaces or line breaks: copy the token again".into(),
+                    ));
+                }
+                if looks_like_placeholder(given.expose()) {
+                    return Err((
+                        at,
+                        "is still the example's placeholder: put your own token there".into(),
+                    ));
+                }
+                token = Some(given);
+            }
+            "interval" => out.interval = Some(whole(1, 3600)? as u64),
+            "environment" => out.environment = Some(text()?),
+            "profiling" => {
+                out.profiling = Some(
+                    tuile_telemetry::config::switch(&text()?).map_err(|why| (at.clone(), why))?,
+                );
+            }
+            "profiling_hz" => {
+                out.profiling_hz = Some(whole(
+                    1,
+                    i64::from(tuile_telemetry::config::HIGHEST_PROFILING_HZ),
+                )? as u32);
+            }
+            _ => unreachable!("checked above"),
+        }
+    }
+    Ok((out, token))
+}
+
 fn read_start(start: &Table) -> Result<Vec<(String, f64)>, Problem> {
     let mut out = Vec::new();
     for (key, value) in start {
@@ -389,6 +517,29 @@ pub(crate) fn settings_text(section: &str, settings: &Settings) -> String {
             .map(|(k, v)| (k.clone(), Value::Float(*v)))
             .collect();
         root.insert("start".into(), Value::Table(start));
+    }
+    if let Some(t) = &settings.telemetry {
+        let mut table = Table::new();
+        let mut text = |key: &str, value: &Option<String>| {
+            if let Some(v) = value {
+                table.insert(key.into(), Value::String(v.clone()));
+            }
+        };
+        text("endpoint", &t.endpoint);
+        text("environment", &t.environment);
+        text("profiling_endpoint", &t.profiling_endpoint);
+        text(
+            "profiling",
+            &t.profiling
+                .map(|on| if on { "on" } else { "off" }.to_owned()),
+        );
+        if let Some(i) = t.interval {
+            table.insert("interval".into(), Value::Integer(i as i64));
+        }
+        if let Some(hz) = t.profiling_hz {
+            table.insert("profiling_hz".into(), Value::Integer(i64::from(hz)));
+        }
+        root.insert("telemetry".into(), Value::Table(table));
     }
     toml::to_string(&root).unwrap_or_default()
 }
@@ -520,5 +671,72 @@ mod tests {
     fn a_huge_file_is_refused_unread() {
         let error = read(&"#".repeat(LONGEST_FILE + 1)).expect_err("too large");
         assert!(error.why.contains("KiB"));
+    }
+
+    /// `[telemetry]`: read and checked, its token kept apart and never
+    /// written back, its errors naming the key and never the value.
+    #[test]
+    fn the_telemetry_section_is_read() {
+        let file = read(&format!(
+            r#"
+            [telemetry]
+            endpoint = "https://collector.example/otlp/"
+            token = "{FAKE}"
+            interval = 30
+            environment = "beta"
+            profiling_endpoint = "https://collector.example/pyroscope"
+            profiling = "off"
+            profiling_hz = 49
+            "#
+        ))
+        .expect("a telemetry file");
+        assert_eq!(
+            file.token, None,
+            "the section's token is not the collector's"
+        );
+        assert_eq!(file.telemetry_token, Some(Token::new(FAKE)));
+        let t = file.settings.telemetry.clone().expect("telemetry");
+        assert_eq!(
+            t.endpoint.as_deref(),
+            Some("https://collector.example/otlp")
+        );
+        assert_eq!(t.interval, Some(30));
+        assert_eq!(t.environment.as_deref(), Some("beta"));
+        assert_eq!(
+            t.profiling_endpoint.as_deref(),
+            Some("https://collector.example/pyroscope")
+        );
+        assert_eq!(t.profiling, Some(false));
+        assert_eq!(t.profiling_hz, Some(49));
+        let kept = settings_text("ion", &file.settings);
+        assert!(!kept.contains(FAKE), "the token was written back: {kept}");
+        let again = read(&kept).expect("the kept settings read back");
+        assert_eq!(again.settings, file.settings);
+    }
+
+    #[test]
+    fn telemetry_errors_name_the_key() {
+        for (text, key) in [
+            (
+                "[telemetry]\nendpoint = \"https://collector.example/otlp?token=s3cret\"",
+                "telemetry.endpoint",
+            ),
+            (
+                "[telemetry]\nendpoint = \"https://me:s3cret@collector.example\"",
+                "telemetry.endpoint",
+            ),
+            ("[telemetry]\ninterval = 0", "telemetry.interval"),
+            ("[telemetry]\nprofiling = \"s3cret\"", "telemetry.profiling"),
+            (
+                "[telemetry]\nprofiling_hz = 100000",
+                "telemetry.profiling_hz",
+            ),
+            ("[telemetry]\nheaders = \"s3cret\"", "telemetry.headers"),
+            ("[telemetry]\ntoken = \"your-token\"", "telemetry.token"),
+        ] {
+            let e = read(text).expect_err(text);
+            assert_eq!(e.key, key, "{e}");
+            assert!(!e.to_string().contains("s3cret"), "the value leaked: {e}");
+        }
     }
 }

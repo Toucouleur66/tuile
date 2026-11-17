@@ -28,6 +28,7 @@ pub use sources::{GlobeSources, ImagerySpec, TerrainSpec, XyzTemplate};
 pub use status::{SessionState, TuileLight, TuileStatus};
 pub use tuile_camera::GlobeCamera;
 pub use tuile_core::texels::ImageryCompression;
+pub use tuile_telemetry::Config as TelemetryConfig;
 pub use tuile_wgpu::compression_named;
 
 /// The globe, in a Bevy application: see the crate.
@@ -43,6 +44,11 @@ pub struct TuilePlugin {
     /// from (`web` (wasm32 only)); `None` decodes on the page's thread. Ignored
     /// elsewhere, where decoding has threads of its own.
     pub decode_workers: Option<String>,
+    /// Where the globe's performance numbers go — metrics over OTLP, and on
+    /// a desktop CPU profiles — if anywhere: `None`, the default, sends
+    /// nothing. See `tuile_telemetry`; `TelemetryConfig::from_vars` reads
+    /// the standard variables.
+    pub telemetry: Option<TelemetryConfig>,
 }
 
 impl TuilePlugin {
@@ -54,7 +60,17 @@ impl TuilePlugin {
             budget: TuileBudget::default(),
             compression: ImageryCompression::Off,
             decode_workers: None,
+            telemetry: None,
         }
+    }
+
+    /// Sends the globe's performance numbers where `config` says: nothing
+    /// without an endpoint. `tuile_telemetry::set_metrics` and
+    /// `set_profiling` switch them at run time.
+    #[must_use]
+    pub fn with_telemetry(mut self, config: TelemetryConfig) -> Self {
+        self.telemetry = Some(config);
+        self
     }
 
     /// In a browser, decode in workers made from the module worker script at
@@ -113,7 +129,20 @@ impl Plugin for TuilePlugin {
             caps,
             decode_workers: self.decode_workers.clone(),
         };
-        let slot = start(app, plan, &shared);
+        let gpu = app
+            .world()
+            .get_resource::<bevy::render::renderer::RenderAdapter>()
+            .map(|adapter| {
+                let info = adapter.get_info();
+                (info.name.clone(), info.backend.to_string())
+            });
+        let slot = start(app, plan, &shared, self.telemetry.as_ref());
+        if self.telemetry.is_some() {
+            if let Some((name, backend)) = gpu {
+                tuile_telemetry::describe_gpu(&name, &backend);
+            }
+            tuile_telemetry::ready();
+        }
         render::add_to(
             app,
             render::GlobeRender::new(slot, self.compression, Arc::clone(&shared.0), ground),
@@ -128,9 +157,19 @@ fn start(
     app: &mut App,
     plan: session::Plan,
     shared: &status::SharedStatus,
+    telemetry: Option<&TelemetryConfig>,
 ) -> session::SessionSlot {
     match session::Runtime::new(plan.budget.runtime_workers) {
         Ok(runtime) => {
+            if let (Some(config), Some(handle)) = (telemetry, runtime.handle()) {
+                let registry = tuile_telemetry::start_native(&handle, config, telemetry_identity());
+                // The push's recorder alone — a Bevy application keeps no
+                // endpoint of the globe's — and the engine's numbers copied
+                // into it.
+                if let Some(registry) = registry {
+                    tuile_metrics::serve_with(&handle, false, Some(Box::new(registry)));
+                }
+            }
             let slot = runtime
                 .handle()
                 .map(|handle| session::launch(&handle, plan))
@@ -153,11 +192,36 @@ fn start(
     _app: &mut App,
     plan: session::Plan,
     _shared: &status::SharedStatus,
+    telemetry: Option<&TelemetryConfig>,
 ) -> session::SessionSlot {
+    if let Some(config) = telemetry {
+        tuile_telemetry::start_web(config, telemetry_identity());
+    }
     if let Some(script) = &plan.decode_workers {
         web::start_decode_workers(script, None);
     }
     session::launch(plan)
+}
+
+/// Who sends: the plugin, on this kind of machine.
+fn telemetry_identity() -> tuile_telemetry::Identity<'static> {
+    tuile_telemetry::Identity {
+        service_name: "tuile-bevy",
+        version: env!("CARGO_PKG_VERSION"),
+        commit: option_env!("TUILE_GIT_COMMIT"),
+        device_class: if cfg!(target_arch = "wasm32") {
+            "browser"
+        } else if cfg!(any(target_os = "ios", target_os = "android")) {
+            "handheld"
+        } else {
+            "desktop"
+        },
+        realm: if cfg!(target_arch = "wasm32") {
+            "page"
+        } else {
+            "native"
+        },
+    }
 }
 
 /// Keeps the plugin's runtime alive for the application's life.

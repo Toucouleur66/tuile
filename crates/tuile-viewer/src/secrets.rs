@@ -21,6 +21,12 @@ pub(crate) trait Secrets {
     fn put(&self, key: &str, value: &Token) -> Result<(), String>;
     /// The value under `key`, if there is one.
     fn get(&self, key: &str) -> Option<Token>;
+    /// Whether values are kept apart by key. A store that keeps one value
+    /// — a desktop's token file — must not be handed a second credential:
+    /// it would replace the first.
+    fn keyed(&self) -> bool {
+        true
+    }
 }
 
 /// The machine's own store.
@@ -79,6 +85,10 @@ impl Secrets for System {
     fn get(&self, _key: &str) -> Option<Token> {
         None
     }
+
+    fn keyed(&self) -> bool {
+        false
+    }
 }
 
 /// Writes `text` to `path`, readable by its owner only, creating the
@@ -113,6 +123,8 @@ pub(crate) mod fake {
     pub(crate) struct Fake {
         pub kept: Mutex<HashMap<String, Token>>,
         pub refuse: bool,
+        /// A store of one value, as a desktop's token file.
+        pub single: bool,
     }
 
     impl Secrets for Fake {
@@ -129,6 +141,10 @@ pub(crate) mod fake {
 
         fn get(&self, key: &str) -> Option<Token> {
             self.kept.lock().expect("the fake's lock").get(key).cloned()
+        }
+
+        fn keyed(&self) -> bool {
+            !self.single
         }
     }
 }

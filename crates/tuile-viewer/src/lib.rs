@@ -36,6 +36,7 @@ mod snapshot;
 mod start;
 mod steer;
 mod surface;
+mod telemetry;
 
 #[cfg(feature = "control")]
 pub mod control;

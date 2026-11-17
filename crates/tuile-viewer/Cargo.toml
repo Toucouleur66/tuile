@@ -38,6 +38,11 @@ serde_json = { workspace = true }
 wgpu = { workspace = true }
 web-time = { workspace = true }
 winit = { workspace = true }
+# The frame's histograms (time, interval, uploads), through the facade the
+# engine's numbers already go through; and where they are sent, if anywhere
+# (`telemetry`): a desktop's, a phone's and a page's alike.
+metrics = "0.24"
+tuile-telemetry = { version = "0.17.1", path = "../tuile-telemetry" }
 
 # The desktop and the phone: an async runtime with threads, the tile store on
 # disk, the counters on a local endpoint, the signals. None of it exists in a
@@ -62,6 +67,9 @@ ctrlc = { version = "3.5", features = ["termination"] }
 # nothing about publishing the engine's counters is specific to a wgpu window:
 # the headless probes and the warm-up job want exactly the same endpoint.
 tuile-metrics = { version = "0.17.1", path = "../tuile-metrics" }
+# The push to a collector, on the viewer's runtime, and the CPU profiles
+# (macOS and Linux only: the feature brings nothing elsewhere).
+tuile-telemetry = { version = "0.17.1", path = "../tuile-telemetry", features = ["native", "profiling"] }
 # The configuration file a tester opens (`config_file`): TOML, read into a
 # table and checked key by key, so an error can name the key without the
 # value.

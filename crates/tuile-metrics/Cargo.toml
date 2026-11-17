@@ -1,6 +1,6 @@
 [package]
 name = "tuile-metrics"
-description = "Publishes tuile-core's counters to a Prometheus endpoint"
+description = "Publishes tuile-core's counters through the metrics facade, and on a Prometheus endpoint"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,10 +15,18 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
-# The recorder and its exposition format, plus an HTTP listener. Both were
-# briefly hand-written, which was a waste and worse than what these do.
+# The facade the engine's numbers are copied into: plain Rust on every
+# target, a browser's included (`tuile-telemetry` publishes through it there).
 metrics = "0.24"
-metrics-exporter-prometheus = { version = "0.17", default-features = false, features = ["http-listener"] }
-tokio = { workspace = true }
 tracing = { workspace = true }
 tuile-core = { version = "0.17.1", path = "../tuile-core" }
+
+# The recorder and its exposition format, plus an HTTP listener — a desktop's
+# and a phone's. Both were briefly hand-written, which was a waste and worse
+# than what these do. `metrics-util` for the fan-out that hands every series
+# to a second recorder beside it (`serve_with`): the same project's, already
+# in the lock file through the exporter.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+metrics-exporter-prometheus = { version = "0.17", default-features = false, features = ["http-listener"] }
+metrics-util = { version = "0.20", default-features = false }
+tokio = { workspace = true }

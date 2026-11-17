@@ -272,6 +272,7 @@ Routing, authentication and limits belong to whoever deploys it.
 | | `tuile-pack-api` | A read-only HTTP API over those buckets |
 | | `tuile-farm` | A render farm's storage: ranged reads, multipart writes, film assembly |
 | | `tuile-metrics` | The core's counters on a metrics endpoint |
+| | `tuile-telemetry` | A viewer's performance numbers to a collector of the host's choosing (OTLP metrics, CPU profiles); nothing without an endpoint |
 
 Programs carry the `tuile-` prefix: `tuile-bake`, `tuile-film-render`,
 `tuile-tape` (`border`, `merge`, `orbit`, `pyrenees`, `zoom`), `tuile-farm`,

@@ -56,7 +56,22 @@ pub fn run_worker(make_decode_worker: Option<js_sys::Function>) {
                     device_memory,
                     decode_workers,
                     imagery,
+                    telemetry,
+                    metrics_on,
                 }) => {
+                    // The worker's numbers, where the page's go.
+                    tuile_telemetry::set_metrics(metrics_on);
+                    if let Some(telemetry) = telemetry {
+                        match telemetry.config() {
+                            Ok(config) => {
+                                tuile_telemetry::start_web(
+                                    &config,
+                                    crate::telemetry::identity("worker"),
+                                );
+                            }
+                            Err(why) => tracing::error!("telemetry: {why}; nothing sent"),
+                        }
+                    }
                     // The page speaks no more until it hears back; nothing else
                     // is listened for until the session decides who listens.
                     scope().set_onmessage(None);
@@ -304,6 +319,7 @@ impl Handles {
                     post(&ToPage::Switched { layer, outcome });
                 });
             }
+            Ok(ToWorker::Telemetry { on }) => tuile_telemetry::set_metrics(on),
             Ok(ToWorker::Start { .. }) => tracing::warn!("a second start was ignored"),
             Err(e) => tracing::error!("the page said something unreadable: {e}"),
         }

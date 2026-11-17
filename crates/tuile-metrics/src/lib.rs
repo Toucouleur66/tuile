@@ -3,9 +3,12 @@
 
 #![doc = include_str!("../README.md")]
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::net::SocketAddr;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
+#[cfg(not(target_arch = "wasm32"))]
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use tuile_core::metrics::{ByLevel, Metrics, Tally, Timer, EYES, LEVELS};
 
@@ -15,6 +18,7 @@ use tuile_core::metrics::{ByLevel, Metrics, Tally, Timer, EYES, LEVELS};
 /// and nothing about them wants to be on a network by accident. 9464 is the
 /// port OpenTelemetry's Prometheus exporter uses, so a default scrape config
 /// finds it without being told.
+#[cfg(not(target_arch = "wasm32"))]
 const DEFAULT_ADDR: &str = "127.0.0.1:9464";
 
 /// How often the atomics are copied into the recorder.
@@ -22,38 +26,148 @@ const DEFAULT_ADDR: &str = "127.0.0.1:9464";
 /// The endpoint answers from whatever was last published, so this is the real
 /// resolution of every series — finer than a scrape interval, and coarse enough
 /// that the copy never shows up in a frame.
+#[cfg(not(target_arch = "wasm32"))]
 const PUBLISH_EVERY: Duration = Duration::from_millis(500);
+
+/// The buckets of `tuile_frame_time_seconds` (the work of one frame, from its
+/// start to its present) and `tuile_frame_interval_seconds` (top of a frame
+/// to the top of the next): two milliseconds to a second, dense around the
+/// refresh intervals a display has (8.3, 11.1, 16.7, 33.3 ms) so that a p99
+/// reads as "missed one vsync" or "missed three".
+pub const FRAME_SECONDS_BUCKETS: [f64; 18] = [
+    0.002, 0.004, 0.006, 0.0083, 0.0111, 0.0139, 0.0167, 0.020, 0.025, 0.0333, 0.040, 0.050,
+    0.0667, 0.100, 0.150, 0.250, 0.500, 1.000,
+];
+
+/// The buckets of `tuile_frame_uploads`: tiles uploaded to the GPU by one
+/// frame. Its upload budget is a few dozen; past it is a stall.
+pub const FRAME_UPLOADS_BUCKETS: [f64; 9] = [0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0];
+
+/// The buckets a histogram named `name` is recorded with, by every recorder
+/// that buckets: the Prometheus endpoint here, the OTLP push of
+/// `tuile-telemetry`. `None`: a histogram this crate does not know, which
+/// such a recorder gives its default.
+pub fn buckets(name: &str) -> Option<&'static [f64]> {
+    match name {
+        "tuile_tiles_fetch_seconds" => Some(&tuile_core::metrics::TILE_FETCH_SECONDS_BUCKETS),
+        "tuile_frame_time_seconds" | "tuile_frame_interval_seconds" => Some(&FRAME_SECONDS_BUCKETS),
+        "tuile_frame_uploads" => Some(&FRAME_UPLOADS_BUCKETS),
+        _ => None,
+    }
+}
+
+/// The histograms [`buckets`] knows, by name.
+pub const HISTOGRAMS: [&str; 4] = [
+    "tuile_tiles_fetch_seconds",
+    "tuile_frame_time_seconds",
+    "tuile_frame_interval_seconds",
+    "tuile_frame_uploads",
+];
 
 /// Starts the exporter and the publishing loop. `TUILE_METRICS_ADDR=off`
 /// disables both; anything else is parsed as an address.
 ///
 /// Failure to bind is reported and ignored. A port already taken — a second
 /// viewer, most likely — is not a reason to refuse to draw a globe.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn serve(handle: &tokio::runtime::Handle) {
-    let setting = std::env::var("TUILE_METRICS_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_owned());
-    if setting.trim().eq_ignore_ascii_case("off") {
-        return;
-    }
-    let addr: SocketAddr = match setting.parse() {
-        Ok(addr) => addr,
-        Err(e) => {
-            tracing::warn!("TUILE_METRICS_ADDR={setting:?} is not an address ({e}); no metrics");
-            return;
+    serve_with(handle, true, None);
+}
+
+/// [`serve`], with a second recorder `also` handed every series beside the
+/// endpoint — the OTLP push of `tuile-telemetry` — and the endpoint itself
+/// only when `endpoint` (a profile that serves one: not a phone's). With
+/// neither, nothing is installed and nothing is published.
+///
+/// A process holds one global recorder; this is the one place it is
+/// installed, so a series reaches the endpoint and the push alike.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn serve_with(
+    handle: &tokio::runtime::Handle,
+    endpoint: bool,
+    also: Option<Box<dyn metrics::Recorder + Send + Sync>>,
+) {
+    let addr = if endpoint { listen_address() } else { None };
+    let _guard = handle.enter();
+    let prometheus = match addr {
+        Some(addr) => match prometheus(addr) {
+            Ok(built) => Some((addr, built)),
+            Err(e) => {
+                tracing::warn!("no metrics endpoint on {addr}: {e}");
+                None
+            }
+        },
+        None => None,
+    };
+    let installed = match (prometheus, also) {
+        (None, None) => return,
+        (Some((addr, (recorder, exporter))), None) => {
+            handle.spawn(exporter);
+            metrics::set_global_recorder(recorder)
+                .map(|()| Some(addr))
+                .map_err(|e| e.to_string())
+        }
+        (None, Some(also)) => metrics::set_global_recorder(also)
+            .map(|()| None)
+            .map_err(|e| e.to_string()),
+        (Some((addr, (recorder, exporter))), Some(also)) => {
+            handle.spawn(exporter);
+            let both = metrics_util::layers::FanoutBuilder::default()
+                .add_recorder(recorder)
+                .add_recorder(also)
+                .build();
+            metrics::set_global_recorder(both)
+                .map(|()| Some(addr))
+                .map_err(|e| e.to_string())
         }
     };
-
-    let _guard = handle.enter();
-    let builder = PrometheusBuilder::new().set_buckets_for_metric(
-        Matcher::Full("tuile_tiles_fetch_seconds".to_owned()),
-        &tuile_core::metrics::TILE_FETCH_SECONDS_BUCKETS,
-    );
-    let installed = builder.and_then(|b| b.with_http_listener(addr).install());
-    if let Err(e) = installed {
-        tracing::warn!("no metrics endpoint on {addr}: {e}");
-        return;
+    match installed {
+        Ok(Some(addr)) => tracing::info!("metrics on http://{addr}/metrics"),
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!("the process already has a metrics recorder ({e}); none installed");
+            return;
+        }
     }
-    tracing::info!("metrics on http://{addr}/metrics");
     publish_every(handle, PUBLISH_EVERY);
+}
+
+/// The address `TUILE_METRICS_ADDR` names, [`DEFAULT_ADDR`] without it;
+/// `None` for `off`, or for what is not an address (said).
+#[cfg(not(target_arch = "wasm32"))]
+fn listen_address() -> Option<SocketAddr> {
+    let setting = std::env::var("TUILE_METRICS_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_owned());
+    if setting.trim().eq_ignore_ascii_case("off") {
+        return None;
+    }
+    match setting.parse() {
+        Ok(addr) => Some(addr),
+        Err(e) => {
+            tracing::warn!("TUILE_METRICS_ADDR={setting:?} is not an address ({e}); no metrics");
+            None
+        }
+    }
+}
+
+/// The endpoint's recorder and the future that serves it, with the buckets
+/// of every histogram [`buckets`] knows. Must run inside the runtime.
+#[cfg(not(target_arch = "wasm32"))]
+fn prometheus(
+    addr: SocketAddr,
+) -> Result<
+    (
+        metrics_exporter_prometheus::PrometheusRecorder,
+        metrics_exporter_prometheus::ExporterFuture,
+    ),
+    metrics_exporter_prometheus::BuildError,
+> {
+    let mut builder = PrometheusBuilder::new();
+    for name in HISTOGRAMS {
+        if let Some(bounds) = buckets(name) {
+            builder = builder.set_buckets_for_metric(Matcher::Full(name.to_owned()), bounds)?;
+        }
+    }
+    builder.with_http_listener(addr).build()
 }
 
 /// Publishes the engine's numbers into whatever recorder the process already
@@ -67,6 +181,7 @@ pub fn serve(handle: &tokio::runtime::Handle) {
 /// Call it after the recorder is installed: a series described or written
 /// before there is one goes nowhere. Called twice it starts two loops, which
 /// write the same values and cost a second copy, nothing more.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn publish_every(handle: &tokio::runtime::Handle, period: Duration) {
     describe();
     handle.spawn(async move {
@@ -100,9 +215,9 @@ fn publish_budget() {
     }
 }
 
-/// The help text, stated once. A series nobody can interpret is a series nobody
-/// reads.
-fn describe() {
+/// The help text, stated once, into the installed recorder. A series nobody
+/// can interpret is a series nobody reads.
+pub fn describe() {
     use metrics::{describe_counter, describe_gauge};
     describe_counter!("tuile_traversals", "Traversal passes run.");
     describe_counter!("tuile_loads_started", "Tile loads begun.");
@@ -272,6 +387,18 @@ fn describe() {
         "tuile_by_level",
         "Per-quadtree-level series; the `series` label says which."
     );
+    metrics::describe_histogram!(
+        "tuile_frame_time_seconds",
+        "The work of one frame, from its start to its present."
+    );
+    metrics::describe_histogram!(
+        "tuile_frame_interval_seconds",
+        "From the top of a frame to the top of the next: idle time included."
+    );
+    metrics::describe_histogram!(
+        "tuile_frame_uploads",
+        "Tiles one frame uploaded to the GPU."
+    );
 }
 
 /// Every [`Timer`], by the name it is published under and what it measures.
@@ -348,13 +475,15 @@ fn tallies(m: &Metrics) -> [(&'static str, &'static str, &Tally); 1] {
     )]
 }
 
-/// Copies every atomic into the recorder.
+/// Copies every atomic into the installed recorder: what [`publish_every`]
+/// does each period, and what a host without a runtime (a page) calls on its
+/// own timer.
 ///
 /// Counters are published with `absolute`, which is exactly right here: both
 /// sides are monotonic, so there is no delta to track and a process restart
 /// resets them together — which is what a counter reset is supposed to look
 /// like to a scraper.
-fn publish(m: &Metrics) {
+pub fn publish(m: &Metrics) {
     use metrics::{counter, gauge};
 
     counter!("tuile_traversals").absolute(m.traversals.get());

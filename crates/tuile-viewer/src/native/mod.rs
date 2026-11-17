@@ -451,10 +451,10 @@ fn session(
 
     // Everything the engine counts, scrapeable, so the log can stop being a
     // wall of numbers and go back to reporting events. Not on a phone: an
-    // HTTP listener is a thread and a socket nobody there can reach.
-    if profile.metrics_endpoint {
-        tuile_metrics::serve(&handle);
-    }
+    // HTTP listener is a thread and a socket nobody there can reach. And,
+    // on a phone too, pushed to a collector when one is configured — and
+    // only then (`telemetry`).
+    crate::telemetry::start(&handle, profile.metrics_endpoint);
 
     // Before the loop: Ctrl-C and `kill` must end the session, not the process,
     // or a recording dies with it. A phone's application is never sent

@@ -24,6 +24,8 @@ tracing = { workspace = true }
 tuile-camera = { version = "0.17.1", path = "../tuile-camera" }
 tuile-core = { version = "0.17.1", path = "../tuile-core" }
 tuile-planetary = { version = "0.17.1", path = "../tuile-planetary" }
+# Where the globe's performance numbers go, when the host configures it.
+tuile-telemetry = { version = "0.17.1", path = "../tuile-telemetry" }
 tuile-terrain = { version = "0.17.1", path = "../tuile-terrain" }
 tuile-wgpu = { version = "0.17.1", path = "../tuile-wgpu" }
 url = { workspace = true }
@@ -35,6 +37,9 @@ wgpu = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 tuile-core = { version = "0.17.1", path = "../tuile-core", features = ["rt-tokio"] }
 tuile-native-fetchers = { version = "0.17.1", path = "../tuile-native-fetchers" }
+# The push on the plugin's runtime, and the engine's numbers copied into it.
+tuile-metrics = { version = "0.17.1", path = "../tuile-metrics" }
+tuile-telemetry = { version = "0.17.1", path = "../tuile-telemetry", features = ["native", "profiling"] }
 
 # A page: fetch for the sources, the decode workers of tuile's web viewer,
 # and the server as a future on the page's thread.

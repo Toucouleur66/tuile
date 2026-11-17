@@ -164,7 +164,14 @@ fn start_viewer_with(
         device_memory: options.device_memory,
         decode_workers: options.decode_workers,
         compression: options.imagery_compression,
+        telemetry: options.telemetry.clone(),
     });
+    // The page's own numbers — the frames, the uploads — when the host
+    // configured a collector; the worker sends its own beside them.
+    if let Some(telemetry) = &options.telemetry {
+        let config = telemetry.config().map_err(|e| JsError::new(&e))?;
+        tuile_telemetry::start_web(&config, crate::telemetry::identity("page"));
+    }
     // A new viewer, whose device has not yet said how it holds imagery.
     super::imagery::begin();
     let launch = session::start(&plan);

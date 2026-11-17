@@ -72,6 +72,73 @@ pub(crate) struct Options {
     /// or on from the start with `on: true`, as `--tileset` is.
     #[serde(default)]
     pub tilesets: Vec<TilesetSpec>,
+    /// Where the viewer's performance numbers go, if anywhere: see
+    /// [`TelemetryOptions`]. Nothing is sent without it.
+    #[serde(default)]
+    pub telemetry: Option<TelemetryOptions>,
+}
+
+/// `telemetry: { endpoint, headers, attributes, intervalSeconds,
+/// serviceName }`: the page's side of `tuile_telemetry::Config`. The
+/// headers carry the collector's credential; a page that holds one in its
+/// source shows it to anyone who opens it, so it must be a push-only token
+/// the collector limits by origin and rate — never one that reads.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TelemetryOptions {
+    /// The OTLP/HTTP base URL; `/v1/metrics` is appended.
+    pub endpoint: String,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+    /// Resource attributes, held to `tuile_telemetry`'s allow-list.
+    #[serde(default)]
+    pub attributes: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub interval_seconds: Option<u64>,
+    #[serde(default)]
+    pub service_name: Option<String>,
+}
+
+impl std::fmt::Debug for TelemetryOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelemetryOptions")
+            .field("endpoint", &self.endpoint)
+            .field("headers", &self.headers.keys().collect::<Vec<_>>())
+            .field("attributes", &self.attributes)
+            .field("interval_seconds", &self.interval_seconds)
+            .field("service_name", &self.service_name)
+            .finish()
+    }
+}
+
+impl TelemetryOptions {
+    /// The configuration these options state, or the sentence that says
+    /// which is wrong — naming the option, never a header's value.
+    pub(crate) fn config(&self) -> Result<tuile_telemetry::Config, String> {
+        let endpoint = tuile_telemetry::config::endpoint_url(&self.endpoint)
+            .map_err(|why| format!("telemetry.endpoint {why}"))?;
+        let mut config = tuile_telemetry::Config {
+            endpoint: Some(endpoint),
+            headers: tuile_telemetry::Headers::new(
+                self.headers
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ),
+            attributes: self
+                .attributes
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            service_name: self.service_name.clone(),
+            ..tuile_telemetry::Config::default()
+        };
+        if let Some(seconds) = self.interval_seconds {
+            config.interval = tuile_telemetry::config::interval_ms(&(seconds * 1000).to_string())
+                .map_err(|why| format!("telemetry.intervalSeconds {why}"))?;
+        }
+        Ok(config)
+    }
 }
 
 /// A 3D Tiles tileset on offer: `{ asset: 2275207, name: "…", on: false }`.
@@ -773,5 +840,50 @@ mod tests {
         assert!(
             options(&page.replacen("\"asset\": 96188", "\"asset\": 96188, \"x\": 1", 1)).is_err()
         );
+    }
+
+    /// A page's telemetry: off unless given, read into the one
+    /// configuration, its headers never printed.
+    #[test]
+    fn telemetry_options() {
+        let o = options(CATALOG).expect("valid");
+        assert!(
+            o.telemetry.is_none(),
+            "nothing is sent unless the page says"
+        );
+        let with = CATALOG.replacen(
+            r#""name": "Atlas","#,
+            r#""name": "Atlas", "telemetry": {
+                "endpoint": "https://collector.example/otlp/",
+                "headers": { "Authorization": "Bearer s3cret" },
+                "attributes": { "deployment.environment": "demo" },
+                "intervalSeconds": 30
+            },"#,
+            1,
+        );
+        let o = options(&with).expect("valid");
+        let t = o.telemetry.expect("telemetry");
+        assert!(!format!("{t:?}").contains("s3cret"));
+        let config = t.config().expect("a configuration");
+        assert_eq!(
+            config.endpoint.as_deref(),
+            Some("https://collector.example/otlp")
+        );
+        assert_eq!(config.interval, std::time::Duration::from_secs(30));
+        assert_eq!(config.headers.expose().len(), 1);
+        let bad = TelemetryOptions {
+            endpoint: "https://collector.example/otlp?token=s3cret".into(),
+            ..t.clone()
+        };
+        let e = bad.config().expect_err("a token in the URL");
+        assert!(
+            e.starts_with("telemetry.endpoint") && !e.contains("s3cret"),
+            "{e}"
+        );
+        let zero = TelemetryOptions {
+            interval_seconds: Some(0),
+            ..t
+        };
+        assert!(zero.config().is_err());
     }
 }
