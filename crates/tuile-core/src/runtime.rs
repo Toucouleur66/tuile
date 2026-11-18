@@ -529,6 +529,19 @@ impl GeometryServer {
         self
     }
 
+    /// Hands every decision step to `observer` too, after the meter: the
+    /// events the budget applied resource by resource (loaded, failed,
+    /// drawable, discarded…), its decisions and its ledger, as the meter
+    /// sees them. For a host that records a session — a loading delay or an
+    /// eviction is to be put beside the camera and the picture, which the
+    /// meter's totals cannot. Watch-only, like the meter, and called on the
+    /// session's task: keep it cheap or hand the record to another thread.
+    #[must_use]
+    pub fn with_observer(mut self, observer: Box<dyn BudgetObserver + Send>) -> Self {
+        self.state.observer = Some(observer);
+        self
+    }
+
     /// The budget's signals, shared: what an executor records its frames
     /// into and what an overlay, a metrics sink or a test reads.
     pub fn meter(&self) -> SharedMeter {
@@ -1012,6 +1025,9 @@ struct State {
     frame: u64,
     steps: u64,
     published_at: Option<Micros>,
+    /// A host's own watcher of every step, beside the meter
+    /// ([`GeometryServer::with_observer`]).
+    observer: Option<Box<dyn BudgetObserver + Send>>,
     /// The platform's signals as last handed to the budget, for its record.
     pressure: crate::budget::Pressure,
     thermal: crate::budget::Thermal,
@@ -1056,6 +1072,7 @@ impl State {
             frame: 0,
             steps: 0,
             published_at: None,
+            observer: None,
             pressure: crate::budget::Pressure::Normal,
             thermal: crate::budget::Thermal::Nominal,
             need_last: None,
@@ -1701,22 +1718,26 @@ impl State {
         let asked = presence.asked.into_inner();
         self.presence = kept.into_inner();
         self.presence.prune(&need);
+        let record = StepRecord {
+            step: self.steps - 1,
+            frame: self.frame,
+            now,
+            views_changed: camera_moved,
+            eyes: self.views.len().min(255) as u8,
+            need: &need,
+            events: &events,
+            presence: &asked,
+            decisions: &d,
+            ledger,
+            pressure: self.pressure,
+            thermal: self.thermal,
+            decide_wall: Some(decide_wall),
+        };
+        if let Some(observer) = self.observer.as_mut() {
+            observer.step(&record);
+        }
         if let Ok(mut meter) = self.meter.lock() {
-            meter.step(&StepRecord {
-                step: self.steps - 1,
-                frame: self.frame,
-                now,
-                views_changed: camera_moved,
-                eyes: self.views.len().min(255) as u8,
-                need: &need,
-                events: &events,
-                presence: &asked,
-                decisions: &d,
-                ledger,
-                pressure: self.pressure,
-                thermal: self.thermal,
-                decide_wall: Some(decide_wall),
-            });
+            meter.step(&record);
             if self
                 .published_at
                 .is_none_or(|at| now.since(at) >= PUBLISH_EVERY)
@@ -3404,6 +3425,54 @@ mod tests {
     /// Once the view has settled, every drawn tile wears a drape of the layer
     /// it needs (I1 extended by D-A1), the drapes were loaded beside the
     /// meshes, and nothing bare is drawn.
+    /// **A host's observer sees every step the meter sees, with its events**:
+    /// each decision step reaches it, in order, and the loads that landed are
+    /// in the events it is handed, one by one. Red with the observer not
+    /// called, or called with the events already taken.
+    #[test]
+    fn an_observer_sees_every_step_with_its_events() {
+        #[derive(Default)]
+        struct Seen {
+            steps: Vec<u64>,
+            loaded: usize,
+        }
+        struct Watch(Arc<Mutex<Seen>>);
+        impl BudgetObserver for Watch {
+            fn step(&mut self, s: &StepRecord<'_>) {
+                let mut seen = self.0.lock().expect("seen");
+                seen.steps.push(s.step);
+                seen.loaded += s
+                    .events
+                    .iter()
+                    .filter(|e| matches!(e, crate::budget::BudgetEvent::Loaded(..)))
+                    .count();
+            }
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut stream, server, _, meshes, _) = draped_session(dir.path());
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let server = server.with_observer(Box::new(Watch(Arc::clone(&seen))));
+        let meter = server.meter();
+        let mut server = Box::pin(server.run());
+        let mut consumer = Consumer::default();
+        look(&stream, near_view(), 1);
+        assert!(settle(&mut server, &mut stream, &mut consumer));
+        let seen = seen.lock().expect("seen");
+        assert!(!seen.steps.is_empty(), "the observer was never called");
+        assert!(
+            seen.steps.windows(2).all(|w| w[1] == w[0] + 1),
+            "steps skipped or out of order: {:?}",
+            seen.steps
+        );
+        let completions = meter.lock().expect("meter").signals().completions_total;
+        assert!(meshes.load(Ordering::SeqCst) > 0);
+        assert!(seen.loaded > 0, "no load reached the observer");
+        assert_eq!(
+            seen.loaded as u64, completions,
+            "the observer's loads and the meter's disagree"
+        );
+    }
+
     #[test]
     fn drapes_are_their_own_loads_and_dress_every_drawn_tile() {
         let dir = tempfile::tempdir().expect("tempdir");
