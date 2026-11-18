@@ -665,18 +665,18 @@ impl App {
             // down divides by it.
             let interval = self.watch.last_log.elapsed().as_secs_f64();
             self.watch.last_log = web_time::Instant::now();
+            // The height over the ground the readout shows, measured once for
+            // the readout and the telemetry's pose alike.
+            let above_ground = self.controller.height_above_ground();
+            // The camera's pose for the next push — the camera between the
+            // eyes, never the device's location: see `crate::telemetry`.
+            crate::telemetry::note_the_camera(&cam, above_ground);
             if let Some(bar) = self.statusbar.as_ref() {
                 bar.refresh();
                 // Where the eye is, and how it is held. The second half is what
                 // a tilt-only bug needs: a position alone cannot reproduce one.
                 let g = tuile_core::geo::ecef_to_geodetic(cam.position);
-                bar.set_camera(
-                    g.lon,
-                    g.lat,
-                    self.controller.height_above_ground(),
-                    cam.heading(),
-                    cam.pitch(),
-                );
+                bar.set_camera(g.lon, g.lat, above_ground, cam.heading(), cam.pitch());
             }
             let s = &active.pump.stats;
             let (_imagery_textures, imagery_bytes) =

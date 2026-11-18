@@ -15,6 +15,15 @@ pub const LATENCY_BUCKETS: usize = 18;
 /// Span of the imagery-over-terrain histogram: index `gap + 8`, clamped.
 pub const GAP_BUCKETS: usize = 17;
 
+/// Levels the per-level breakdowns keep (`0..LEVELS`); a deeper level is
+/// counted in the last, as `tuile-core`'s per-level series fold theirs.
+pub const LEVELS: usize = 25;
+
+/// The slot of `level` in a per-level breakdown: itself, or the last.
+pub fn level_index(level: u32) -> usize {
+    usize::try_from(level).map_or(LEVELS - 1, |l| l.min(LEVELS - 1))
+}
+
 /// Why a load or a delivery was cancelled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CancelReason {
@@ -72,6 +81,12 @@ pub struct BudgetStats {
     /// The part of `gpu` in transit to the GPU (delivered, not yet
     /// acknowledged), per class.
     pub transit: PerClass<Bytes>,
+    /// The drawable part of `gpu` (`gpu` less `transit`), per class, by the
+    /// level the budget files each resource at ([`level_index`]). Kept as
+    /// the copies come and go, never summed over the resources.
+    pub drawable_by_level: PerClass<[Bytes; LEVELS]>,
+    /// `transit`, per class, by level.
+    pub transit_by_level: PerClass<[Bytes; LEVELS]>,
     /// Loads started per class, from a local store (`[0]`) or the network
     /// (`[1]`).
     pub starts: PerClass<[u32; 2]>,
@@ -85,6 +100,8 @@ pub struct BudgetStats {
     pub cancels: [u32; 3],
     /// GPU evictions per class, by reason in [`EvictReason::ALL`]'s order.
     pub evictions: PerClass<[u32; 3]>,
+    /// The same evictions per class, by the evicted resource's level.
+    pub evictions_by_level: PerClass<[u32; LEVELS]>,
     /// Decoded copies released per class.
     pub releases: PerClass<u32>,
     /// Failures per class, transient (`[0]`) and permanent (`[1]`).

@@ -637,6 +637,10 @@ pub struct Metrics {
     pub upsampled_by_level: ByLevel,
     /// What the last pass chose to draw, by level.
     pub selected_by_level: ByLevel,
+    /// What the last frame actually drew, by level: the consumer's drawn
+    /// tiles (exact, its coarser stand-ins, the covering ones), each with
+    /// its mesh on the GPU. Of `selected_by_level`, what reached the screen.
+    pub drawn_by_level: ByLevel,
 }
 
 impl Metrics {

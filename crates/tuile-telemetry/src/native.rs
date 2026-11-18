@@ -75,7 +75,7 @@ pub fn start_native(
             tuile_metrics::publish(tuile_core::metrics::metrics());
             let encoded = crate::otlp::encode(
                 &crate::resource(),
-                &pushed.snapshot(),
+                &crate::points(&pushed),
                 start_ns,
                 crate::unix_nanos(),
             );
@@ -255,9 +255,41 @@ mod tests {
             .iter()
             .any(|m| m["name"] == "tuile_frame_time_seconds"));
         assert!(!req.body.contains("tiles.example"), "{}", req.body);
+        // The camera's pose, from the first push after it is handed over.
+        assert!(
+            !req.body.contains("tuile_camera_"),
+            "a pose before any was set"
+        );
         let attrs = body["resourceMetrics"][0]["resource"]["attributes"].to_string();
         assert!(attrs.contains("\"device.class\""), "{attrs}");
         assert!(!req.body.contains("t0ken"));
+
+        crate::set_camera(crate::CameraPose {
+            altitude_m: 640.5,
+            latitude_deg: 44.25,
+            longitude_deg: 1.5,
+            ..crate::CameraPose::default()
+        });
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let last = heard
+            .lock()
+            .expect("heard")
+            .last()
+            .cloned()
+            .expect("a push");
+        let body: serde_json::Value = serde_json::from_str(&last.body).expect("JSON");
+        let sent = body["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+            .as_array()
+            .expect("metrics")
+            .clone();
+        let gauge = |n: &str| {
+            sent.iter()
+                .find(|m| m["name"] == n)
+                .map(|m| m["gauge"]["dataPoints"][0]["asDouble"].clone())
+        };
+        assert_eq!(gauge("tuile_camera_altitude_meters"), Some(640.5.into()));
+        assert_eq!(gauge("tuile_camera_latitude_degrees"), Some(44.25.into()));
+        assert_eq!(gauge("tuile_camera_longitude_degrees"), Some(1.5.into()));
 
         // Off: nothing more is sent.
         crate::set_metrics(false);

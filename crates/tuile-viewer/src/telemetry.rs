@@ -50,6 +50,24 @@ pub(crate) fn identity(realm: &'static str) -> tuile_telemetry::Identity<'static
     }
 }
 
+/// Hands the camera's pose to the next push, when metrics are sent at all:
+/// `camera` the one between the eyes, `above_ground` the height over the
+/// ground the viewer measured for its readout. The pose is the camera's
+/// alone — the device's location (`crate::location`) never reaches here.
+pub(crate) fn note_the_camera(camera: &tuile_camera::GlobeCamera, above_ground: f64) {
+    if tuile_telemetry::offered().metrics && tuile_telemetry::metrics_on() {
+        tuile_telemetry::set_camera(pose(camera, above_ground));
+    }
+}
+
+/// The pose the push sends for `camera`.
+pub(crate) fn pose(
+    camera: &tuile_camera::GlobeCamera,
+    above_ground: f64,
+) -> tuile_telemetry::CameraPose {
+    tuile_telemetry::CameraPose::of(camera, above_ground)
+}
+
 /// The configuration a file's `[telemetry]` and its token state.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn from_file(
@@ -120,6 +138,38 @@ pub(crate) fn start(handle: &tokio::runtime::Handle, endpoint: bool) {
 mod tests {
     use super::*;
     use crate::config_file::{TelemetrySettings, Token};
+
+    /// What a push of the viewer's carries of where things are: the camera's
+    /// place, wherever it was flown — and nothing of the device's own
+    /// location, even with a fix in hand.
+    #[test]
+    fn the_device_s_location_never_reaches_an_export() {
+        // The device's fix, with digits nothing else here has.
+        let fix = crate::location::Fix {
+            lon: 2.294_481_7,
+            lat: 48.858_370_3,
+            accuracy: 12.0,
+        };
+        // The camera, flown elsewhere.
+        let camera = tuile_camera::GlobeCamera::from_geodetic(
+            45.832_6f64.to_radians(),
+            6.865_2f64.to_radians(),
+            9000.0,
+            0.5,
+            0.6,
+            1.0,
+        );
+        let points = pose(&camera, 4200.0).points();
+        let out =
+            tuile_telemetry::otlp::encode(&tuile_telemetry::Resource::default(), &points, 0, 1);
+        assert_eq!(out.series, 8);
+        assert!(out.body.contains("tuile_camera_latitude_degrees"));
+        for digits in ["2.294481", "48.85837"] {
+            assert!(!out.body.contains(digits), "{digits} in {}", out.body);
+        }
+        assert!(out.body.contains("45.8326"), "{}", out.body);
+        assert!(!out.body.contains(&fix.lat.to_string()[..7]));
+    }
 
     #[test]
     fn a_file_s_section_is_a_configuration() {

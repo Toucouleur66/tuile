@@ -1613,6 +1613,7 @@ impl Budget {
 
         // Statistics.
         st.gpu = self.ledger.gpu;
+        st.drawable_by_level = *self.arena.gpu_by_level();
         st.target = eff.target;
         st.overflow = eff.overflow;
         st.hard_limit = eff.hard;
@@ -1636,6 +1637,8 @@ impl Budget {
                 if let Some(t) = self.arena.transit(s) {
                     let c = self.arena.class(s);
                     st.transit[c] = st.transit[c].plus(t.cost.gpu);
+                    let at = super::stats::level_index(self.arena.level(s));
+                    st.transit_by_level[c][at] = st.transit_by_level[c][at].plus(t.cost.gpu);
                 }
             }
         }
@@ -2020,6 +2023,7 @@ impl Budget {
             d.evict.push(r);
             st.evicted += 1;
             st.evictions[class][EvictReason::Admission as usize] += 1;
+            st.evictions_by_level[class][super::stats::level_index(self.arena.level(s))] += 1;
             self.evicted(r, now);
         }
         self.scratch.room = Some(room);
@@ -2576,6 +2580,7 @@ impl Budget {
             EvictReason::Pressure
         };
         st.evictions[class][why as usize] += 1;
+        st.evictions_by_level[class][super::stats::level_index(self.arena.level(s))] += 1;
         self.evicted(r, now);
     }
 

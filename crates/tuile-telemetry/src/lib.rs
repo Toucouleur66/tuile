@@ -3,6 +3,7 @@
 
 #![doc = include_str!("../README.md")]
 
+pub mod camera;
 pub mod config;
 pub mod otlp;
 pub mod registry;
@@ -16,6 +17,7 @@ mod profiling;
 #[cfg(target_arch = "wasm32")]
 mod web;
 
+pub use camera::{set_camera, CameraPose};
 pub use config::{Config, Headers, Profiling};
 pub use registry::Registry;
 pub use resource::Resource;
@@ -194,6 +196,13 @@ pub fn set_profiling(on: bool) {
         #[cfg(all(feature = "profiling", any(target_os = "macos", target_os = "linux")))]
         profiling::apply();
     }
+}
+
+/// What one push sends: the registry's series, then the camera's pose.
+pub(crate) fn points(registry: &Registry) -> Vec<registry::Point> {
+    let mut points = registry.snapshot();
+    points.extend(camera::points());
+    points
 }
 
 /// Now, Unix nanoseconds: the system's clock natively, the page's in a

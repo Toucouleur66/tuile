@@ -28,7 +28,7 @@ use super::cost::Cost;
 use super::deadline::FrameDeadline;
 use super::decisions::{Decisions, Role};
 use super::need::NeedSet;
-use super::stats::{CancelReason, EvictReason, GAP_BUCKETS, LATENCY_BUCKETS};
+use super::stats::{CancelReason, EvictReason, GAP_BUCKETS, LATENCY_BUCKETS, LEVELS};
 use super::tier::Presence;
 use super::types::{
     Bytes, Class, Failure, Generation, LayerId, Micros, PerClass, Policy, Pressure, ResourceId,
@@ -292,6 +292,17 @@ pub fn check(s: &StepRecord<'_>, cfg: &BudgetConfig, out: &mut Violations) {
 pub struct BudgetSignals {
     /// `bytes{class,state}`: `[drawable, in_transit]` per class.
     pub bytes: PerClass<[u64; 2]>,
+    /// `bytes_by_level{class,state,level}`: `bytes` split by the level the
+    /// budget files each resource at, `[drawable, in_transit]` per level.
+    pub bytes_by_level: PerClass<[[u64; 2]; LEVELS]>,
+    /// The levels of each class that have held bytes since the meter's
+    /// start, one bit each: only these are exposed, and once exposed a level
+    /// stays so (a gauge left behind would keep its last value).
+    pub bytes_levels: PerClass<u32>,
+    /// `evictions_by_level_total{class,level}`: the evictions of
+    /// `evictions_total`'s sweep, pressure and admission, by the evicted
+    /// resource's level. Exposed from a level's first.
+    pub evictions_by_level_total: PerClass<[u64; LEVELS]>,
     /// `decoded_bytes`.
     pub decoded_bytes: u64,
     /// `protected_bytes{class}`.
@@ -454,6 +465,12 @@ pub mod labels {
     pub const SWAP: [&str; 4] = ["refine", "coarsen", "mesh_drape", "layer"];
     /// `eye`.
     pub const EYE: [&str; 4] = ["0", "1", "2", "3"];
+    /// `level`, 0 to 24: a level of the budget's per-level series
+    /// (`stats::level_index`; deeper levels count in the last).
+    pub const LEVEL: [&str; super::LEVELS] = [
+        "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
+        "17", "18", "19", "20", "21", "22", "23", "24",
+    ];
     /// `gap`, −8 to 8.
     pub const GAP: [&str; 17] = [
         "-8", "-7", "-6", "-5", "-4", "-3", "-2", "-1", "0", "1", "2", "3", "4", "5", "6", "7", "8",
@@ -486,6 +503,34 @@ impl BudgetSignals {
                     "bytes",
                     vec![("class", labels::class(c)), ("state", s)],
                     v[i] as f64,
+                ));
+            }
+        }
+        for (c, levels) in self.bytes_by_level.iter() {
+            let seen = self.bytes_levels[c];
+            for (l, v) in levels.iter().enumerate() {
+                if seen & (1 << l) == 0 {
+                    continue;
+                }
+                for (i, s) in labels::STATE.iter().enumerate() {
+                    out.push((
+                        "bytes_by_level",
+                        vec![
+                            ("class", labels::class(c)),
+                            ("state", s),
+                            ("level", labels::LEVEL[l]),
+                        ],
+                        v[i] as f64,
+                    ));
+                }
+            }
+        }
+        for (c, levels) in self.evictions_by_level_total.iter() {
+            for (l, v) in levels.iter().enumerate().filter(|(_, v)| **v > 0) {
+                out.push((
+                    "evictions_by_level_total",
+                    vec![("class", labels::class(c)), ("level", labels::LEVEL[l])],
+                    *v as f64,
                 ));
             }
         }
@@ -862,6 +907,15 @@ impl BudgetObserver for BudgetMeter {
                 s.evictions_total[c][i] += u64::from(st.evictions[c][i]);
             }
             s.releases_total[c] += u64::from(st.releases[c]);
+            for l in 0..LEVELS {
+                let (drawable, transit) =
+                    (st.drawable_by_level[c][l].0, st.transit_by_level[c][l].0);
+                s.bytes_by_level[c][l] = [drawable, transit];
+                if drawable != 0 || transit != 0 {
+                    s.bytes_levels[c] |= 1 << l;
+                }
+                s.evictions_by_level_total[c][l] += u64::from(st.evictions_by_level[c][l]);
+            }
             s.estimate_drift_exceeded_total[c] += u64::from(st.drift_exceeded[c]);
         }
         s.in_flight = st.in_flight;

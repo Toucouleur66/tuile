@@ -49,6 +49,7 @@ fn what_a_frame_drew_is_published_and_a_dropped_pump_takes_its_meshes_back() {
     let _ = pump.resolve(&gpu);
     assert_eq!(m.frame_lost.get(), 1, "the hole is published");
     assert_eq!(m.frame_exact.get(), 0);
+    assert_eq!(m.drawn_by_level.total(), 0, "a hole draws nothing");
     let empty = m.frame_digest.get();
 
     // Its parent arrives, and stands in for it: covered, softly.
@@ -60,6 +61,9 @@ fn what_a_frame_drew_is_published_and_a_dropped_pump_takes_its_meshes_back() {
     let _ = pump.resolve(&gpu);
     assert_eq!(m.frame_lost.get(), 0, "an ancestor covers it");
     assert_eq!(m.frame_coarser.get(), 1);
+    // Drawn per level: the parent, at its own level, not the tile it serves.
+    assert_eq!((m.drawn_by_level.get(2), m.drawn_by_level.get(3)), (1, 0));
+    assert_eq!(m.drawn_by_level.total(), 1);
     let soft = m.frame_digest.get();
     assert_ne!(soft, empty, "drawing a fallback is a different picture");
 
@@ -78,6 +82,7 @@ fn what_a_frame_drew_is_published_and_a_dropped_pump_takes_its_meshes_back() {
     );
     let sharp = m.frame_digest.get();
     assert_ne!(sharp, soft);
+    assert_eq!((m.drawn_by_level.get(2), m.drawn_by_level.get(3)), (0, 1));
 
     // Nothing changes: nothing moves.
     let _ = pump.resolve(&gpu);
@@ -92,4 +97,5 @@ fn what_a_frame_drew_is_published_and_a_dropped_pump_takes_its_meshes_back() {
         "a dropped pump leaves its meshes counted"
     );
     assert_eq!(m.prepared_tiles.get(), 0);
+    assert_eq!(m.drawn_by_level.total(), 0, "a dropped pump still draws");
 }
