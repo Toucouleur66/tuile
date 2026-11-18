@@ -989,3 +989,64 @@ async fn a_zone_the_register_cannot_index_comes_down_by_ranges_not_whole() {
     let plain = TileStore::with_clock(objects, layers(), eager(), clock.clock());
     assert_eq!(got(&store, far + 1).await, got(&plain, far + 1).await);
 }
+
+/// Bing's "no imagery" picture, as it was found stored.
+const PLACEHOLDER: &[u8] =
+    include_bytes!("../../tuile-bing/tests/fixtures/no-imagery-placeholder.png");
+
+/// A bake by reference names tiles by their stamps, and reads no byte: a
+/// tile the register knows by the digest of a picture its source sends for
+/// "no imagery" is stamped as the absence it is — so the bake stands on the
+/// coarser tile — with no archive read, nothing downloaded again.
+#[tokio::test]
+async fn a_stamp_of_what_stands_for_no_imagery_is_an_absence_unread() {
+    use tuile_core::storage::{ContentStore, Stamp as ValueStamp};
+    let clock = TestClock::new();
+    let objects = memory();
+    let mem = Arc::new(Mem::default());
+    // A writer from before, that took the placeholder for a tile.
+    let legacy = Layer {
+        tile_type: TileType::Unknown,
+        ..indexed()
+    };
+    let old = TileStore::with_clock(
+        objects.clone(),
+        vec![legacy.clone(), catalog::absence_of(&legacy)],
+        eager(),
+        clock.clock(),
+    )
+    .with_ledger(mem.clone())
+    .with_absences(mem.clone());
+    let (x, y) = in_zone(5);
+    old.put(IMAGERY, LEVEL, x, y, Bytes::from_static(PLACEHOLDER))
+        .await
+        .expect("put");
+    old.flush_all().await.expect("flush");
+    // And a real tile beside it, stored since.
+    let s = TileStore::with_clock(objects.clone(), layers(), eager(), clock.clock())
+        .with_ledger(mem.clone())
+        .with_absences(mem.clone());
+    let (x6, y6) = in_zone(6);
+    s.put(IMAGERY, LEVEL, x6, y6, png(6, 0)).await.expect("put");
+    s.flush_all().await.expect("flush");
+
+    let counting = Counting::over(objects);
+    let registered = Arc::new(
+        TileStore::with_clock(counting.clone(), layers(), eager(), clock.clock())
+            .with_index_reader(mem.clone())
+            .with_absences(mem),
+    );
+    let dir = tempfile::tempdir().expect("dir");
+    registered
+        .project(&by_index(), dir.path())
+        .await
+        .expect("project");
+    let content = tuile_tile_server::StoreContent::new(registered.clone());
+    let key = |(x, y): (u32, u32)| format!("img/{IMAGERY}/{LEVEL}/{x}/{y}");
+    assert_eq!(content.stamp(&key((x, y))).await, ValueStamp::Absent);
+    assert!(
+        matches!(content.stamp(&key((x6, y6))).await, ValueStamp::Present(_)),
+        "a real tile is named as before"
+    );
+    assert_eq!(counting.archive_gets(), 0, "unread");
+}

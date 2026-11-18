@@ -8,6 +8,7 @@ pub mod content;
 pub mod cover;
 pub mod determinism;
 pub mod drive;
+pub mod empty_imagery;
 pub mod fetch;
 pub mod geo;
 pub mod ground;

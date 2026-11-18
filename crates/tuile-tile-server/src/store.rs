@@ -825,6 +825,21 @@ impl TileStore {
 
     // ── Reading ──────────────────────────────────────────────────────────
 
+    /// Whether `bytes`, a tile of `layer`, stand for no imagery
+    /// ([`index::is_empty_tile`]): what this store never writes as a tile.
+    /// `false` for a layer it does not have.
+    pub fn is_empty_tile(&self, layer: &str, bytes: &[u8]) -> bool {
+        self.layer(layer)
+            .is_ok_and(|l| index::is_empty_tile(l, bytes))
+    }
+
+    /// The same, with nothing decoded ([`index::is_known_empty_tile`]): for
+    /// a tile read back from this store.
+    pub fn is_known_empty_tile(&self, layer: &str, bytes: &[u8]) -> bool {
+        self.layer(layer)
+            .is_ok_and(|l| index::is_known_empty_tile(l, bytes))
+    }
+
     /// The stored bytes of a tile, exactly as they were put.
     pub async fn get(
         &self,
@@ -1292,6 +1307,17 @@ impl TileStore {
         fetched: SystemTime,
     ) -> Result<(), StoreError> {
         let (l, zone, id) = self.locate(layer, level, x, y)?;
+        if index::is_empty_tile(l, &bytes) {
+            // No imagery, sent as a picture: kept as what it says — an
+            // absence, in the layer's absence sibling — and never as a tile.
+            empty_tile_seen(layer, "write");
+            let absence = format!("{layer}{ABSENT_SUFFIX}");
+            if self.layer(&absence).is_err() {
+                return Ok(());
+            }
+            let marker = Bytes::from_static(crate::catalog::ABSENT_MARKER);
+            return Box::pin(self.put_fetched(&absence, level, x, y, marker, fetched)).await;
+        }
         let key = (l.name.clone(), zone);
         let fetched_ms = manifest::now_ms(fetched);
         if let Some((absences, base)) = self.absences_of(layer) {
@@ -1488,7 +1514,53 @@ impl TileStore {
     /// published by a conditional write of the zone's manifest and announced.
     /// Says how many tiles were written. On an error nothing was published
     /// and the batch is the caller's to offer again.
+    ///
+    /// A tile that stands for no imagery ([`index::is_empty_tile`]) is not
+    /// written as one: it is published as an absence, in the layer's absence
+    /// sibling (and dropped when the layer keeps none), and counted with what
+    /// was written.
     pub async fn publish_batch(
+        &self,
+        layer: &str,
+        zone: Zone,
+        tiles: Vec<Fresh>,
+    ) -> Result<usize, StoreError> {
+        let l = self.layer(layer)?.clone();
+        let (empty, tiles): (Vec<Fresh>, Vec<Fresh>) = tiles
+            .into_iter()
+            .partition(|t| index::is_empty_tile(&l, &t.bytes));
+        // Its tiles first: one offered for another zone fails the batch
+        // before anything of it is written.
+        let written = self.publish_fresh(layer, zone, tiles).await?;
+        let mut absences = 0;
+        if !empty.is_empty() {
+            empty_tile_seen(layer, "write");
+            let mut by_zone: BTreeMap<(String, Zone), Vec<Fresh>> = BTreeMap::new();
+            for t in empty {
+                // Checked against this zone as every other tile is.
+                let (_, at, _) = self.locate(layer, t.level, t.x, t.y)?;
+                if at != zone {
+                    return Err(StoreError::Corrupt(format!(
+                        "{layer} {}/{}/{} is not a tile of the zone it was offered for",
+                        t.level, t.x, t.y
+                    )));
+                }
+                if let Some(place) = self.place(layer, t.level, t.x, t.y, true)? {
+                    by_zone.entry(place).or_default().push(Fresh {
+                        bytes: Bytes::from_static(crate::catalog::ABSENT_MARKER),
+                        ..t
+                    });
+                }
+            }
+            for ((absence, at), marked) in by_zone {
+                absences += self.publish_fresh(&absence, at, marked).await?;
+            }
+        }
+        Ok(written + absences)
+    }
+
+    /// [`Self::publish_batch`], once what stands for no imagery is set apart.
+    async fn publish_fresh(
         &self,
         layer: &str,
         zone: Zone,
@@ -2330,6 +2402,13 @@ impl Manifests {
 
 /// A zone as it now is: the local copies of what it was made of before
 /// (merged, expired) go at once, rather than when the disk budget is short.
+/// Counts a tile that stood for no imagery, where it was met: `write` (kept
+/// as an absence instead) or `read` (read as one).
+pub(crate) fn empty_tile_seen(layer: &str, at: &'static str) {
+    metrics::counter!("tuile_tiles_empty_imagery_total", "layer" => layer.to_string(), "at" => at)
+        .increment(1);
+}
+
 fn drop_unnamed(disk: Option<&ArchiveCache>, zone_prefix: &str, m: &Manifest) {
     let Some(disk) = disk else { return };
     let named: Vec<&str> = m.archives.iter().map(|a| a.key.as_str()).collect();

@@ -170,28 +170,29 @@ fn coarse_floor(
     ancestor(floor)
 }
 
-/// Whether a decoded texture is entirely opaque black.
+/// Whether a decoded texture is entirely black — a provider's "no imagery"
+/// sent as a picture.
 ///
-/// Sampled rather than scanned: a 256×256 tile is 65 536 texels and this runs on
-/// every arrival, but a tile that is black at a hundred spread-out points and
-/// not elsewhere does not exist in aerial photography. One false negative in
-/// exchange for a check that costs nothing.
+/// Every texel, as [`tuile_core::empty_imagery::is_black_rgba8`] says — the
+/// same test a store applies to the bytes before it writes or serves them.
+/// Scanning costs nothing on a real picture: the first texel that is not
+/// black ends it. A black tile is not draped: the ground stands on the tile
+/// above instead.
 ///
 /// Read on RGBA8 only: block-compressed texels are encoded after this check
 /// ran on their pixels, and are never called black here.
 pub(crate) fn is_opaque_black(tex: &DecodedTexture) -> bool {
-    const SAMPLES: usize = 100;
-    let Some(rgba8) = tex.rgba8() else {
-        return false;
-    };
-    let texels = rgba8.len() / 4;
-    if texels == 0 {
-        return false;
+    tex.rgba8()
+        .is_some_and(tuile_core::empty_imagery::is_black_rgba8)
+}
+
+/// The imagery tile one level up that covers `c`.
+fn parent_of(c: ImageryCoord) -> ImageryCoord {
+    ImageryCoord {
+        level: c.level - 1,
+        x: c.x / 2,
+        y: c.y / 2,
     }
-    let step = (texels / SAMPLES).max(1);
-    (0..texels)
-        .step_by(step)
-        .all(|i| rgba8[i * 4] == 0 && rgba8[i * 4 + 1] == 0 && rgba8[i * 4 + 2] == 0)
 }
 
 /// What shows under a mosaic wherever no layer reaches.
@@ -944,6 +945,14 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         let scheme = self.imagery.tiling_scheme();
         if self.opts.imagery_by_stamp {
             match self.imagery.fetch_tile_stamp(c).await {
+                // The digest of a picture the provider sends for "no
+                // imagery": the absence it stands for, as below.
+                tuile_core::storage::Stamp::Present(stamp)
+                    if c.level > scheme.minimum_level
+                        && tuile_bing::is_empty_digest(stamp.digest) =>
+                {
+                    return Box::pin(self.fetch_imagery(parent_of(c))).await;
+                }
                 tuile_core::storage::Stamp::Present(stamp) => {
                     self.provenance.stamped_imagery(c, stamp.digest);
                     // The size the bytes would have decoded to — reprojection
@@ -963,12 +972,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                 // `NotFound` below would. At the coarsest level the bytes
                 // path says what it says.
                 tuile_core::storage::Stamp::Absent if c.level > scheme.minimum_level => {
-                    let parent = ImageryCoord {
-                        level: c.level - 1,
-                        x: c.x / 2,
-                        y: c.y / 2,
-                    };
-                    return Box::pin(self.fetch_imagery(parent)).await;
+                    return Box::pin(self.fetch_imagery(parent_of(c))).await;
                 }
                 _ => {}
             }
@@ -984,7 +988,21 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
         // thread together with the resampling below, in one hop.
         let fetched = self.imagery_bytes(&scheme, c).await;
         drop(outstanding);
+        // Below the coarsest level, what stands for no imagery is stood over:
+        // never draped, never a hole — the ancestor's picture of the same
+        // ground. At the coarsest level there is nothing above to stand on,
+        // and a black tile is still better than none.
+        let stands_over = c.level > scheme.minimum_level;
         match fetched {
+            Ok(fetched) if stands_over && tuile_bing::is_placeholder(&fetched.value) => {
+                tracing::debug!(
+                    z = c.level,
+                    x = c.x,
+                    y = c.y,
+                    "the provider's no-imagery picture, standing on parent"
+                );
+                Box::pin(self.fetch_imagery(parent_of(c))).await
+            }
             Ok(fetched) => {
                 tracing::debug!(z = c.level, x = c.x, y = c.y, "imagery tile");
                 self.provenance.fetched_imagery(c, &fetched.value);
@@ -1019,6 +1037,9 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                         "BLACK IMAGERY: the provider returned an opaque black tile"
                     );
                     tuile_core::metrics::metrics().black_textures.inc();
+                    if stands_over {
+                        return Box::pin(self.fetch_imagery(parent_of(c))).await;
+                    }
                 }
                 {
                     let mut cache = self.decoded();
@@ -1031,19 +1052,14 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
             // Absent at this zoom: stand on the parent. Recursing returns the
             // ancestor's own coord, so it is cached and shared under that coord
             // rather than copied once per descendant that wanted it.
-            Err(RasterError::Fetch(FetchError::NotFound(_))) if c.level > scheme.minimum_level => {
-                let parent = ImageryCoord {
-                    level: c.level - 1,
-                    x: c.x / 2,
-                    y: c.y / 2,
-                };
+            Err(RasterError::Fetch(FetchError::NotFound(_))) if stands_over => {
                 tracing::debug!(
                     z = c.level,
                     x = c.x,
                     y = c.y,
                     "imagery absent, standing on parent"
                 );
-                Box::pin(self.fetch_imagery(parent)).await
+                Box::pin(self.fetch_imagery(parent_of(c))).await
             }
             Err(e) => Err(LoadError::Failed(format!("imagery {c:?}: {e}"))),
         }
@@ -2943,5 +2959,174 @@ mod tests {
         let seen = loader.store_events();
         loader.keep_imagery(&mut loader.decoded(), &imagery, tile, tex());
         assert_eq!(loader.store_events(), seen, "its floor is held");
+    }
+
+    /// Bing's "no imagery" picture, as it was found stored in a JPEG layer.
+    const PLACEHOLDER: &[u8] =
+        include_bytes!("../../tuile-bing/tests/fixtures/no-imagery-placeholder.png");
+    /// Bing's black tile, as it was found stored.
+    const BLACK: &[u8] = include_bytes!("../../tuile-bing/tests/fixtures/black-tile.jpg");
+
+    fn jpeg(picture: image::RgbImage) -> bytes::Bytes {
+        let mut out = std::io::Cursor::new(Vec::new());
+        picture
+            .write_to(&mut out, image::ImageFormat::Jpeg)
+            .expect("a jpeg");
+        bytes::Bytes::from(out.into_inner())
+    }
+
+    /// Water at dusk: dark, and a picture all the same.
+    fn dark() -> bytes::Bytes {
+        jpeg(image::RgbImage::from_fn(64, 64, |x, y| {
+            let n = ((x * 7 + y * 13) % 9) as u8;
+            image::Rgb([n, n + 2, n + 5])
+        }))
+    }
+
+    /// A bay: the imagery at level `from` and below is `finest` — what a
+    /// store holds there — and every coarser level a real picture. Stamped
+    /// as a store's index stamps when `stamped`.
+    struct Bay {
+        finest: bytes::Bytes,
+        stamped: bool,
+        from: u32,
+    }
+
+    const BAY_LEVEL: u32 = 5;
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl raster::ImageryProvider for Bay {
+        fn tiling_scheme(&self) -> raster::TilingScheme {
+            raster::TilingScheme::geographic()
+        }
+
+        async fn fetch_tile_bytes(
+            &self,
+            coord: ImageryCoord,
+        ) -> Result<tuile_core::fetch::Fetched<bytes::Bytes>, raster::RasterError> {
+            if coord.level >= self.from {
+                return Ok(tuile_core::fetch::Fetched::undated(self.finest.clone()));
+            }
+            Painted(40).fetch_tile_bytes(coord).await
+        }
+
+        async fn fetch_tile_stamp(&self, coord: ImageryCoord) -> tuile_core::storage::Stamp {
+            if !self.stamped {
+                return tuile_core::storage::Stamp::Unknown;
+            }
+            let bytes = match self.fetch_tile_bytes(coord).await {
+                Ok(f) => f.value,
+                Err(_) => return tuile_core::storage::Stamp::Absent,
+            };
+            tuile_core::storage::Stamp::Present(tuile_core::storage::ValueStamp {
+                digest: tuile_core::empty_imagery::digest(&bytes),
+                width: 256,
+                height: 256,
+            })
+        }
+    }
+
+    fn bay_loader(finest: &[u8], stamped: bool) -> PlanetaryLoader<NoTerrain, Bay> {
+        bay_from(finest, stamped, BAY_LEVEL)
+    }
+
+    fn bay_from(finest: &[u8], stamped: bool, from: u32) -> PlanetaryLoader<NoTerrain, Bay> {
+        let scheme = GeographicTilingScheme::default();
+        PlanetaryLoader {
+            terrain: NoTerrain,
+            imagery: Bay {
+                finest: bytes::Bytes::copy_from_slice(finest),
+                stamped,
+                from,
+            },
+            scheme,
+            opts: GlobeOptions {
+                imagery_by_stamp: stamped,
+                ..GlobeOptions::default()
+            },
+            cache: Mutex::new(ImageryCache::new(8)),
+            meshes: Mutex::new(MeshCache::new(8)),
+            fetching: ImageryInFlight::default(),
+            building: TerrainInFlight::default(),
+            changes: store_log::StoreLog::default(),
+            availability: Arc::new(tuile_terrain::Availability::default()),
+            provenance: Arc::default(),
+            heights: Arc::new(TerrainHeights::new(scheme)),
+            offload: offload::inline(),
+        }
+    }
+
+    /// The tile asked for in the bay, and the one above it.
+    const IN_THE_BAY: ImageryCoord = ImageryCoord {
+        level: BAY_LEVEL,
+        x: 33,
+        y: 9,
+    };
+
+    fn served(loader: &PlanetaryLoader<NoTerrain, Bay>, c: ImageryCoord) -> ImageryCoord {
+        let (at, tex) = futures_executor::block_on(loader.fetch_imagery(c))
+            .expect("never nothing: a picture of the ground is served");
+        // Never black ground: what is served covers the tile, and has texels.
+        assert!(tex.width > 0 && tex.height > 0, "{c:?}: an empty texture");
+        let side = 1u64 << (c.level - at.level);
+        assert_eq!((c.x / side, c.y / side), (at.x, at.y), "it covers {c:?}");
+        at
+    }
+
+    /// **What stands for no imagery is stood over**: the provider's
+    /// placeholder or a black tile, by their bytes, are not draped; the
+    /// ground stands on the tile above, as for any absence.
+    #[test]
+    fn the_placeholder_and_a_black_tile_are_stood_over_for_the_parent() {
+        for (what, finest) in [
+            ("placeholder", PLACEHOLDER.to_vec()),
+            ("bing black", BLACK.to_vec()),
+            (
+                "other black",
+                jpeg(image::RgbImage::from_pixel(64, 64, image::Rgb([0, 0, 0]))).to_vec(),
+            ),
+        ] {
+            let loader = bay_loader(&finest, false);
+            assert_eq!(
+                served(&loader, IN_THE_BAY),
+                parent_of(IN_THE_BAY),
+                "{what}: the parent's picture"
+            );
+        }
+    }
+
+    /// The same by reference: the stamp of the placeholder or of the black
+    /// tile, a digest and no bytes, is the absence it stands for.
+    #[test]
+    fn the_stamp_of_what_stands_for_no_imagery_is_stood_over() {
+        for finest in [PLACEHOLDER, BLACK] {
+            let loader = bay_loader(finest, true);
+            assert_eq!(served(&loader, IN_THE_BAY), parent_of(IN_THE_BAY));
+        }
+    }
+
+    /// A dark picture is a picture: kept where it is, by bytes and by stamp.
+    #[test]
+    fn dark_ground_is_draped() {
+        for stamped in [false, true] {
+            let loader = bay_loader(&dark(), stamped);
+            assert_eq!(served(&loader, IN_THE_BAY), IN_THE_BAY, "stamped {stamped}");
+        }
+    }
+
+    /// At the coarsest level there is nothing above to stand on: a black
+    /// tile is drawn rather than nothing.
+    #[test]
+    fn at_the_coarsest_level_black_is_kept_rather_than_nothing() {
+        // Black from the top down: nothing anywhere to stand on.
+        let loader = bay_from(BLACK, false, 0);
+        let top = ImageryCoord {
+            level: 0,
+            x: 1,
+            y: 0,
+        };
+        assert_eq!(served(&loader, top), top);
+        // And below it, black stands on black up to the top: still ground.
+        assert_eq!(served(&loader, IN_THE_BAY), top);
     }
 }

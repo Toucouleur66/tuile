@@ -95,6 +95,32 @@ pub fn holds_images(layer: &Layer) -> bool {
     )
 }
 
+/// Whether `bytes`, a tile of `layer`, stand for **no imagery** — a source's
+/// "nothing here" sent as a picture: one of its known placeholders, a uniform
+/// black image, a PNG in a JPEG layer ([`tuile_bing::is_empty_tile`]).
+///
+/// Such a tile is an absence: the store records it as one, never as content,
+/// and reads one it already holds as one, so the ground stands on the
+/// coarser tile above. Only an image layer's tiles are looked at.
+///
+/// Decodes a small tile to look at its pixels: for what is about to be
+/// written. What is read back from the store is looked at by
+/// [`is_known_empty_tile`].
+pub fn is_empty_tile(layer: &Layer, bytes: &[u8]) -> bool {
+    holds_images(layer)
+        && tuile_bing::is_empty_tile(bytes, layer.tile_type == pmtiles::TileType::Jpeg)
+}
+
+/// [`is_empty_tile`] with nothing decoded ([`tuile_bing::is_known_empty_tile`]):
+/// for what the store already holds — read, served, indexed — where a decode
+/// per small tile would cost every read. What it holds from before anything
+/// was refused is the known pictures; what it holds since was refused by
+/// [`is_empty_tile`] on its way in.
+pub fn is_known_empty_tile(layer: &Layer, bytes: &[u8]) -> bool {
+    holds_images(layer)
+        && tuile_bing::is_known_empty_tile(bytes, layer.tile_type == pmtiles::TileType::Jpeg)
+}
+
 /// One archive's index, read.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ArchiveIndex {
@@ -162,7 +188,11 @@ where
                 ))
             })?;
             out.ids.push(tid.value());
-            out.stamps.push(Stamp::of(&bytes, images));
+            // A tile that stands for no imagery is indexed without a size:
+            // a stamp then says nothing of it, and whoever asks reads the
+            // bytes — which the store reads as an absence.
+            let sized = images && !is_known_empty_tile(layer, &bytes);
+            out.stamps.push(Stamp::of(&bytes, sized));
         }
     }
     // The directory lists ids in order; an index says so rather than trusts it.

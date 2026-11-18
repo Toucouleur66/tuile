@@ -42,6 +42,8 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "fs", "io-util", "time", "rt"] }
 tracing = { workspace = true }
 tuile-core = { version = "0.17.1", path = "../tuile-core" }
+# What a source sends for "no imagery" (`index::is_empty_tile`).
+tuile-bing = { version = "0.17.1", path = "../tuile-bing" }
 url = { workspace = true }
 
 [dev-dependencies]

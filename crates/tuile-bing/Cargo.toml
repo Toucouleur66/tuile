@@ -10,6 +10,9 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
+# The provider's own pictures, kept to test their recognition only: never
+# shipped.
+exclude = ["tests/fixtures/"]
 
 [lints]
 workspace = true
