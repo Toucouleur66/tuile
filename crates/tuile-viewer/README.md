@@ -126,8 +126,16 @@ switch each part off and on while it runs.
 
 What is sent is the program, its version and commit, the OS, the device
 class, the GPU, a random identifier drawn at each launch, and the numbers
-themselves. **Never** a location, the camera or its path, a tile's identity
-or address, a source's URL, or anything about the person: the resource
+themselves, among them the per-level counts (`tuile_by_level{series, level}`,
+`drawn` the tiles the frame actually drew) and the budget's bytes per level
+(`tuile_budget_bytes_by_level{class, state, level}`). **When telemetry is on,
+the camera's pose — position, height, orientation, field of view — is
+sent** (`tuile_camera_*`, sampled once a second from the camera between the
+eyes, its altitude the one the status readout shows); **nothing about the
+device's location**: what *centre on my location* asks the system for moves
+the camera and goes nowhere else — though a camera moved there is then where
+the device is, and its pose says so. **Never** a tile's identity or address,
+a source's URL, or anything about the person: the resource
 attributes and the metric labels go through allow-lists where they leave
 (`tuile_telemetry::resource`). A token is a header — never part of a URL,
 never logged — kept in the system's secure storage when a configuration file

@@ -21,6 +21,8 @@ metrics = "0.24"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The camera's pose, read off the engine's own camera type.
+tuile-camera = { version = "0.17.1", path = "../tuile-camera" }
 tuile-core = { version = "0.17.1", path = "../tuile-core" }
 tuile-metrics = { version = "0.17.1", path = "../tuile-metrics" }
 

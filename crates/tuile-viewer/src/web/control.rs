@@ -44,6 +44,11 @@ pub(crate) enum ToWorker {
         /// the start could arrive before the worker listens again.
         #[serde(default = "on")]
         metrics_on: bool,
+        /// The page's launch identifier (`service.instance.id`): the worker
+        /// files its numbers under the same launch, told apart from the
+        /// page's by `tuile.realm`.
+        #[serde(default)]
+        instance: Option<String>,
     },
     /// The metrics sent, or not: the page's switch, followed.
     Telemetry { on: bool },

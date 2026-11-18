@@ -45,7 +45,7 @@ pub use observe::{
     Histogram, StepRecord, Violations,
 };
 pub use priority::{PriorityKey, Quantised, Urgency};
-pub use stats::{BudgetStats, CancelReason, EvictReason};
+pub use stats::{level_index, BudgetStats, CancelReason, EvictReason, LEVELS};
 pub use tier::{NoStore, Presence, PresenceOracle, Source, Tier};
 pub use types::{
     Bytes, Class, Failure, Generation, LayerId, Micros, PerClass, Policy, Pressure, ResourceId,

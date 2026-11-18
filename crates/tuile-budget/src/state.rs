@@ -69,6 +69,7 @@ use hashbrown::HashTable;
 use super::cost::Cost;
 use super::priority::{PriorityKey, Urgency};
 use super::sorted::SortedMap;
+use super::stats::{level_index, LEVELS};
 use super::tier::Tier;
 use super::tier::{Presence, Source};
 use super::types::ResourceId;
@@ -446,6 +447,11 @@ pub(super) struct Arena {
     /// few, so kept apart rather than in two columns.
     ranks: SortedMap<u32, (Urgency, Rank)>,
     cold: Vec<Cold>,
+    /// The bytes of the GPU copies, per class, by level
+    /// (`stats::level_index` of each slot's level): kept as `put_gpu` and
+    /// `take_gpu` charge and credit the ledger, so a step reads it without
+    /// a walk.
+    gpu_by_level: PerClass<[Bytes; LEVELS]>,
     /// The drapes with a GPU copy, in resource order: a tile's drawable
     /// drapes of one layer are a range of it, by level.
     gpu_drapes: BTreeSet<ResourceId>,
@@ -520,6 +526,7 @@ impl Default for Arena {
             load: SortedMap::default(),
             ranks: SortedMap::default(),
             cold: Vec::new(),
+            gpu_by_level: PerClass::splat([Bytes::ZERO; LEVELS]),
             gpu_drapes: BTreeSet::new(),
             pinned: None,
             evict: EvictIndex::default(),
@@ -1634,9 +1641,11 @@ impl Arena {
         let before = self.protection_bytes(s);
         self.unfile(s);
         let class = self.class(s);
+        let at = level_index(self.level(s));
         match self.gpu(s) {
             Some(old) => {
                 l.gpu[class] = l.gpu[class].minus(old.bytes);
+                self.gpu_by_level[class][at] = self.gpu_by_level[class][at].minus(old.bytes);
                 self.count_epoch(s, old.epoch, false);
             }
             None => {
@@ -1646,11 +1655,17 @@ impl Arena {
             }
         }
         l.gpu[class] = l.gpu[class].plus(g.bytes);
+        self.gpu_by_level[class][at] = self.gpu_by_level[class][at].plus(g.bytes);
         self.gpu[s.i()] = g;
         self.set(s, GPU, true);
         self.count_epoch(s, g.epoch, true);
         self.file(s);
         self.reprotect(s, before);
+    }
+
+    /// The bytes of the GPU copies, per class, by level.
+    pub fn gpu_by_level(&self) -> &PerClass<[Bytes; LEVELS]> {
+        &self.gpu_by_level
     }
 
     pub fn take_gpu(&mut self, s: Slot, l: &mut Ledger) -> Option<Gpu> {
@@ -1659,6 +1674,8 @@ impl Arena {
         self.unfile(s);
         let class = self.class(s);
         l.gpu[class] = l.gpu[class].minus(g.bytes);
+        let at = level_index(self.level(s));
+        self.gpu_by_level[class][at] = self.gpu_by_level[class][at].minus(g.bytes);
         self.set(s, GPU, false);
         self.count_epoch(s, g.epoch, false);
         if let r @ ResourceId::Drape { .. } = self.id(s) {

@@ -1008,6 +1008,10 @@ impl ContentPump {
                 .chain(covering_fallback.iter())
                 .filter(|t| self.prepared.contains_key(t)),
         );
+        m.drawn_by_level.clear();
+        for t in &self.drawn_tiles {
+            m.drawn_by_level.inc(level_of(t));
+        }
         let surfaces = |ids: &[TileId]| -> Vec<&PreparedTile> {
             ids.iter().filter_map(|id| self.prepared.get(id)).collect()
         };
@@ -1192,6 +1196,7 @@ impl Drop for ContentPump {
         // nothing this pump held is held.
         m.textures_by_level.clear();
         m.texture_bytes_by_level.clear();
+        m.drawn_by_level.clear();
         m.prepared_tiles.set(0);
         m.pending_uploads.set(0);
     }

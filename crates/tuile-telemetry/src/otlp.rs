@@ -13,7 +13,8 @@
 //!
 //! The allow-lists are applied here, at the last step before the wire:
 //! a series with a label outside [`crate::resource::ALLOWED_LABELS`] is left
-//! out whole.
+//! out whole, and so is a `tuile_camera_*` series that is not one of the
+//! camera's ([`crate::camera::CAMERA_METRICS`]).
 
 use serde_json::{json, Value as Json};
 
@@ -35,9 +36,11 @@ pub struct Encoded {
     pub withheld: usize,
 }
 
-/// Whether `point` may leave the process: every label key on the list.
+/// Whether `point` may leave the process: every label key on the list,
+/// and, for a camera series, a name on the camera's
+/// ([`crate::camera::CAMERA_METRICS`]).
 pub fn sendable(point: &Point) -> bool {
-    point.labels.iter().all(|(k, _)| allowed_label(k))
+    crate::camera::allowed_name(&point.name) && point.labels.iter().all(|(k, _)| allowed_label(k))
 }
 
 /// `points`, as one request: `start_ns` the process's start, `now_ns` the
@@ -263,6 +266,50 @@ mod tests {
             "{}",
             out.body
         );
+    }
+
+    /// The camera's pose goes out as plain gauges, its values as they are;
+    /// a series under the camera's prefix that is not on its list does not.
+    #[test]
+    fn the_camera_s_gauges_go_and_nothing_else_of_its_kind() {
+        let pose = crate::camera::CameraPose {
+            altitude_m: 812.75,
+            height_ellipsoid_m: 2950.5,
+            heading_deg: 271.0,
+            pitch_deg: 18.0,
+            roll_deg: 1.5,
+            fov_deg: 45.0,
+            latitude_deg: 45.8326,
+            longitude_deg: 6.8652,
+        };
+        let registry = Registry::new();
+        metrics::with_local_recorder(&registry, || {
+            metrics::gauge!("tuile_camera_device_latitude_degrees").set(48.1234);
+        });
+        let mut points = registry.snapshot();
+        points.extend(pose.points());
+        let out = encode(&resource(), &points, 0, 1);
+        assert_eq!((out.series, out.withheld), (8, 1));
+        assert!(!out.body.contains("device_latitude"), "{}", out.body);
+        assert!(!out.body.contains("48.1234"), "{}", out.body);
+        let v: Json = serde_json::from_str(&out.body).expect("JSON");
+        let metrics = v["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+            .as_array()
+            .expect("metrics");
+        let value = |n: &str| {
+            let m = metrics.iter().find(|m| m["name"] == n).expect(n);
+            let p = &m["gauge"]["dataPoints"][0];
+            assert_eq!(p["attributes"], json!([]), "{n} carries labels");
+            p["asDouble"].as_f64().expect("a double")
+        };
+        assert_eq!(value("tuile_camera_altitude_meters"), 812.75);
+        assert_eq!(value("tuile_camera_height_ellipsoid_meters"), 2950.5);
+        assert_eq!(value("tuile_camera_heading_degrees"), 271.0);
+        assert_eq!(value("tuile_camera_pitch_degrees"), 18.0);
+        assert_eq!(value("tuile_camera_roll_degrees"), 1.5);
+        assert_eq!(value("tuile_camera_fov_degrees"), 45.0);
+        assert_eq!(value("tuile_camera_latitude_degrees"), 45.8326);
+        assert_eq!(value("tuile_camera_longitude_degrees"), 6.8652);
     }
 
     /// Every series the engine publishes passes the label guard: a label

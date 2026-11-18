@@ -268,6 +268,27 @@ impl GlobeCamera {
             .asin()
     }
 
+    /// Roll about the view direction, radians in `(-π, π]`: `0` keeps the
+    /// horizon level, positive turns the camera's up to its right (the view
+    /// turned clockwise as seen from behind the eye). Measured against the
+    /// local geodetic vertical, as [`Self::level`] removes it; `0` at the
+    /// nadir and the zenith, where roll is heading.
+    pub fn roll(&self) -> f64 {
+        let right = self.direction.cross(self.up_axis());
+        if right.length_squared() < 1e-12 {
+            return 0.0;
+        }
+        let right = right.normalize();
+        let level_up = right.cross(self.direction).normalize();
+        self.up.dot(right).atan2(self.up.dot(level_up))
+    }
+
+    /// The eye's geodetic position: longitude and latitude in radians,
+    /// height above the ellipsoid in metres.
+    pub fn geodetic(&self) -> Geodetic {
+        ecef_to_geodetic(self.position)
+    }
+
     /// How far the view is outside the usable pitch band, in radians; `0` when
     /// it is inside. Aiming above the horizon and diving past nadir are both
     /// violations, and both are measured the same way so a gesture can be told
@@ -974,6 +995,40 @@ mod tests {
     use super::*;
     use glam::dvec2;
     use std::f64::consts::FRAC_PI_2;
+
+    /// A level view reads no roll; turned about its direction, it reads the
+    /// turn, its sign the side the up went to.
+    #[test]
+    fn roll_is_the_turn_about_the_view() {
+        let cam = GlobeCamera::from_geodetic(
+            45f64.to_radians(),
+            6f64.to_radians(),
+            3000.0,
+            1.0,
+            0.4,
+            1.0,
+        );
+        assert!(cam.roll().abs() < 1e-9, "{}", cam.roll());
+        let turned = |angle: f64| {
+            let q = DQuat::from_axis_angle(cam.direction, angle);
+            GlobeCamera {
+                up: q * cam.up,
+                ..cam
+            }
+        };
+        // About the direction, positive turns up from level-up toward
+        // `direction × up`, the camera's right: positive roll.
+        let r = turned(0.3);
+        assert!((r.roll() - 0.3).abs() < 1e-9, "{}", r.roll());
+        assert!(r.up.dot(cam.right()) > 0.0);
+        assert!((turned(-0.7).roll() + 0.7).abs() < 1e-9);
+        // Heading and pitch are untouched by a roll.
+        assert!((r.heading() - cam.heading()).abs() < 1e-9);
+        assert!((r.pitch() - cam.pitch()).abs() < 1e-9);
+        let g = cam.geodetic();
+        assert!((g.lat.to_degrees() - 45.0).abs() < 1e-9);
+        assert!((g.height - 3000.0).abs() < 1e-6);
+    }
 
     fn nadir_over(lat: f64, lon: f64, alt: f64) -> CameraController {
         let cam = GlobeCamera::from_geodetic(lat, lon, alt, 0.0, FRAC_PI_2, 60f64.to_radians());

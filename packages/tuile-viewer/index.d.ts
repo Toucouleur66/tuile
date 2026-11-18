@@ -131,9 +131,11 @@ export interface ViewerOptions {
   /**
    * Where the viewer's performance numbers are sent, over OTLP/HTTP (JSON):
    * frame times, uploads, the graphics budget, each tile request's duration
-   * and whether the browser's cache answered. Nothing is sent without it.
-   * Never sent: the view, a location, a tile's address, anything about the
-   * person. The menu's *Telemetry* item switches it off and on.
+   * and whether the browser's cache answered, and the camera's pose
+   * (position, height, orientation, field of view). Nothing is sent without
+   * it. Never sent: the device's own location (the browser's geolocation),
+   * a tile's address, anything about the person. The menu's *Telemetry*
+   * item switches it off and on.
    *
    * A token in `headers` is visible to anyone who reads the page: use one
    * that can only push, limited by origin and rate on the collector's side.

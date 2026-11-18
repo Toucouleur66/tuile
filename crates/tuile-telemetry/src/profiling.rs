@@ -100,6 +100,9 @@ fn tags() -> Vec<(String, String)> {
         ("gpu.adapter", "gpu_adapter"),
         ("gpu.backend", "gpu_backend"),
         ("deployment.environment", "environment"),
+        // The launch, as the metrics' `instance`: one launch's profiles
+        // beside its metrics.
+        ("service.instance.id", "instance"),
     ]
     .into_iter()
     .filter_map(|(key, tag)| Some((tag.to_owned(), tag_value(resource.get(key)?))))

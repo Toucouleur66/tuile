@@ -416,6 +416,78 @@ fn the_evictions_signal_names_its_reason() {
     assert_eq!(quiet.s().evictions_total[Class::TerrainMesh], [0; 4]);
 }
 
+/// `bytes_by_level{class,state,level}` splits `bytes` by the level of each
+/// resource and sums back to it; `evictions_by_level_total{class,level}`
+/// counts the sweep's, the pressure's and the admission's evictions at the
+/// evicted resource's level, and sums back to theirs.
+#[test]
+fn the_per_level_signals_split_the_bytes_and_the_evictions() {
+    let coarse: Vec<_> = (0..3).map(|x| t(3, x, 0)).collect();
+    let fine: Vec<_> = (0..4).map(|x| t(5, x, 9)).collect();
+    let mut c = Rig::interactive_config();
+    c.target[Class::TerrainMesh] = Bytes(MESH.0 * 4);
+    c.overflow[Class::TerrainMesh] = Bytes::ZERO;
+    let mut m = Metered::new(c);
+    let mut both = coarse.clone();
+    both.extend(&fine[..1]);
+    m.settle(&drawn(&both), 30);
+    let s = m.s();
+    let mesh = s.bytes_by_level[Class::TerrainMesh];
+    assert_eq!(mesh[3][0], MESH.0 * 3, "{RED}: three meshes at level 3");
+    assert_eq!(mesh[5][0], MESH.0, "{RED}: one at level 5");
+    let total = |s: &BudgetSignals, c: Class, i: usize| -> u64 {
+        s.bytes_by_level[c].iter().map(|v| v[i]).sum()
+    };
+    for c in Class::ALL {
+        assert_eq!(total(&s, c, 0), s.bytes[c][0], "{c:?} drawable");
+        assert_eq!(total(&s, c, 1), s.bytes[c][1], "{c:?} in transit");
+    }
+    assert_eq!(s.evictions_by_level_total[Class::TerrainMesh], [0; 25]);
+    // Only the levels that have held bytes are exposed, for the classes
+    // that held them.
+    let named: Vec<String> = s
+        .series()
+        .into_iter()
+        .filter(|(n, _, _)| *n == "bytes_by_level")
+        .map(|(_, l, _)| format!("{l:?}"))
+        .collect();
+    assert_eq!(named.len(), 4, "{named:?}");
+    assert!(
+        named.iter().all(|l| l.contains("terrain_mesh")),
+        "{named:?}"
+    );
+
+    // The fine tiles push the coarse ones out: evictions at level 3.
+    m.settle(&drawn(&fine), 30);
+    let s = m.s();
+    let by_level = s.evictions_by_level_total[Class::TerrainMesh];
+    let by_reason = s.evictions_total[Class::TerrainMesh];
+    assert!(by_level[3] > 0, "{RED}: evictions at level 3: {by_level:?}");
+    assert_eq!(
+        by_level.iter().sum::<u64>(),
+        by_reason[0] + by_reason[1] + by_reason[2],
+        "every eviction counted at one level"
+    );
+    assert_eq!(s.bytes_by_level[Class::TerrainMesh][5][0], MESH.0 * 4);
+    // Level 3, emptied, is still exposed — at zero, not at its last value.
+    let at3 = s
+        .series()
+        .into_iter()
+        .find(|(n, l, _)| {
+            *n == "bytes_by_level"
+                && l.contains(&("level", "3"))
+                && l.contains(&("state", "drawable"))
+        })
+        .expect("level 3 still exposed");
+    assert_eq!(at3.2, (s.bytes_by_level[Class::TerrainMesh][3][0]) as f64);
+    assert!(s
+        .series()
+        .iter()
+        .any(|(n, l, v)| *n == "evictions_by_level_total"
+            && l.contains(&("level", "3"))
+            && *v > 0.0));
+}
+
 /// I9: `swaps_total{kind}` counts refinements and coarsenings, and
 /// `swap_gaps_total` stays still — and moves only for ground covered one
 /// step and not the next.
@@ -726,6 +798,7 @@ fn labels_stay_within_their_closed_sets() {
                 .copied()
                 .collect(),
             "gap" => labels::GAP.to_vec(),
+            "level" => labels::LEVEL.to_vec(),
             "eye" => labels::EYE.to_vec(),
             "invariant" => labels::INVARIANT.to_vec(),
             _ => Vec::new(),

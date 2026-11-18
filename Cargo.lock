@@ -9603,6 +9603,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "tuile-camera",
  "tuile-core",
  "tuile-metrics",
  "wasm-bindgen",

@@ -21,9 +21,12 @@ use wasm_bindgen::JsCast;
 use crate::timing::{kind, source};
 use crate::{Config, Identity, Registry};
 
+/// Who is told of the switch.
+type Listeners = RefCell<Vec<Box<dyn Fn(bool)>>>;
+
 thread_local! {
     /// Told when the metrics are switched: a page passes it on to its worker.
-    static LISTENERS: RefCell<Vec<Box<dyn Fn(bool)>>> = RefCell::new(Vec::new());
+    static LISTENERS: Listeners = RefCell::new(Vec::new());
 }
 
 /// Calls `listener` whenever [`crate::set_metrics`] is called in this realm:
@@ -106,7 +109,7 @@ pub fn start_web(config: &Config, identity: Identity<'_>) -> bool {
         tuile_metrics::publish(tuile_core::metrics::metrics());
         let encoded = crate::otlp::encode(
             &crate::resource(),
-            &registry.snapshot(),
+            &crate::points(&registry),
             start_ns,
             crate::unix_nanos(),
         );

@@ -25,20 +25,36 @@ switched off and on again while the program runs ([`set_metrics`],
   per frame (`tuile_frame_uploads`). In a browser, each tile request's
   duration and bytes from the Performance API, `source="cache"` when the
   browser's cache answered.
+- **The camera's pose**, at each push, from the last frame's camera (for a
+  pair of eyes, the camera between them): one gauge each, no label —
+  `tuile_camera_latitude_degrees`, `tuile_camera_longitude_degrees`,
+  `tuile_camera_height_ellipsoid_meters`, `tuile_camera_altitude_meters`
+  (above the ground under it, as the engine knows the ground),
+  `tuile_camera_heading_degrees`, `tuile_camera_pitch_degrees`,
+  `tuile_camera_roll_degrees`, `tuile_camera_fov_degrees` (vertical). The
+  host hands it over with [`set_camera`] ([`CameraPose::of`] reads it off a
+  `GlobeCamera`). **When telemetry is on, the camera's pose — position,
+  height, orientation, field of view — is sent; nothing about the device's
+  location.**
 - **CPU profiles** (macOS and Linux, the `profiling` feature): pprof-rs
   samples at the configured rate, per thread, pushed to Pyroscope every ten
-  seconds, tagged with the version, the OS, the device class and the GPU.
+  seconds, tagged with the version, the OS, the device class, the GPU and
+  the launch's random identifier (`instance`, the metrics' too).
   Not on a phone, not in a browser.
 
 ## What is never sent
 
-No location, no camera position or path, no tile identifier or address, no
-source URL, no user data. Two allow-lists are applied where the data leaves:
+**The device's own location is never sent**: a phone's or a browser's
+geolocation, which a viewer may ask for to move the camera there, has no way
+into a push — the pose is the camera's, wherever a person flew it. Nor any
+tile identifier or address, source URL or user data. Two allow-lists are applied where the data leaves:
 the resource attributes ([`resource::ALLOWED`]: service name and version,
 commit, OS, architecture, device class, GPU adapter and backend, a random
 identifier drawn at each launch) and the metric labels
-([`resource::ALLOWED_LABELS`], the engine's closed sets). A series with any
-other label is withheld whole; an attribute off the list is dropped.
+([`resource::ALLOWED_LABELS`], the engine's closed sets), and the camera's
+series names ([`camera::CAMERA_METRICS`]: a `tuile_camera_*` series off it
+is withheld). A series with any other label is withheld whole; an attribute
+off the list is dropped.
 
 ## Configuration
 

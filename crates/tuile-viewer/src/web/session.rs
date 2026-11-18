@@ -375,6 +375,9 @@ pub(crate) fn start(plan: &Plan) -> Launch {
                     imagery,
                     telemetry,
                     metrics_on: tuile_telemetry::metrics_on(),
+                    instance: tuile_telemetry::resource()
+                        .get("service.instance.id")
+                        .map(str::to_owned),
                 });
                 if sends {
                     // The switch as it changes: the page's menu is the

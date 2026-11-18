@@ -563,7 +563,7 @@ pub fn publish(m: &Metrics) {
     // One series name, two labels. The alternative — eight series names each
     // carrying a level label — makes `sum by (level)` across them impossible
     // without naming all eight.
-    let series: [(&str, &ByLevel); 8] = [
+    let series: [(&str, &ByLevel); 9] = [
         ("meshes", &m.meshes_by_level),
         ("mesh_bytes", &m.mesh_bytes_by_level),
         ("textures", &m.textures_by_level),
@@ -572,6 +572,7 @@ pub fn publish(m: &Metrics) {
         ("loads", &m.loads_by_level),
         ("upsampled", &m.upsampled_by_level),
         ("selected", &m.selected_by_level),
+        ("drawn", &m.drawn_by_level),
     ];
     for (name, values) in series {
         for level in 0..LEVELS as u32 {
@@ -614,6 +615,25 @@ mod tests {
             text.contains("tuile_arrival_wait_seconds_peak 1.5"),
             "peak not in seconds:\n{text}"
         );
+    }
+
+    /// What a frame drew, by level, is one more `series` of `tuile_by_level`,
+    /// beside what the pass selected.
+    #[test]
+    fn the_drawn_tiles_are_published_by_level() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let m = tuile_core::metrics::metrics();
+        m.drawn_by_level.set(17, 41);
+        m.selected_by_level.set(17, 43);
+        metrics::with_local_recorder(&recorder, || publish(m));
+        let text = handle.render();
+        for line in [
+            "tuile_by_level{series=\"drawn\",level=\"17\"} 41",
+            "tuile_by_level{series=\"selected\",level=\"17\"} 43",
+        ] {
+            assert!(text.contains(line), "{line} missing from:\n{text}");
+        }
     }
 
     /// A host's recorder — installed by the host, not by [`serve`] — gets the

@@ -58,6 +58,7 @@ pub fn run_worker(make_decode_worker: Option<js_sys::Function>) {
                     imagery,
                     telemetry,
                     metrics_on,
+                    instance,
                 }) => {
                     // The worker's numbers, where the page's go.
                     tuile_telemetry::set_metrics(metrics_on);
@@ -68,6 +69,12 @@ pub fn run_worker(make_decode_worker: Option<js_sys::Function>) {
                                     &config,
                                     crate::telemetry::identity("worker"),
                                 );
+                                // One launch, two realms: the page's
+                                // identifier, so a launch's numbers are one
+                                // instance's.
+                                if let Some(id) = &instance {
+                                    tuile_telemetry::set_attribute("service.instance.id", id);
+                                }
                             }
                             Err(why) => tracing::error!("telemetry: {why}; nothing sent"),
                         }

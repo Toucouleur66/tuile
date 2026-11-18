@@ -142,6 +142,7 @@ impl Plugin for TuilePlugin {
                 tuile_telemetry::describe_gpu(&name, &backend);
             }
             tuile_telemetry::ready();
+            app.add_systems(Last, note_the_camera);
         }
         render::add_to(
             app,
@@ -201,6 +202,38 @@ fn start(
         web::start_decode_workers(script, None);
     }
     session::launch(plan)
+}
+
+/// The camera's pose for the telemetry's next push, once a second: the
+/// host's [`TuileCamera`], its height over the ground drawn under it. The
+/// camera's alone — never the device's location.
+fn note_the_camera(
+    time: Res<Time>,
+    mut last: Local<Option<f64>>,
+    cameras: Query<&TuileCamera>,
+    ground: Option<Res<TuileGround>>,
+) {
+    let now = time.elapsed_secs_f64();
+    if last.is_some_and(|t| now - t < 1.0) {
+        return;
+    }
+    if !(tuile_telemetry::offered().metrics && tuile_telemetry::metrics_on()) {
+        return;
+    }
+    let Some(camera) = cameras.iter().next() else {
+        return;
+    };
+    *last = Some(now);
+    let g = camera.pose.geodetic();
+    let under = ground
+        .map(|ground| {
+            ground.ground_heights(&[LonLat::new(g.lon.to_degrees(), g.lat.to_degrees())])[0].height
+        })
+        .unwrap_or(0.0);
+    tuile_telemetry::set_camera(tuile_telemetry::CameraPose::of(
+        &camera.pose,
+        g.height - under,
+    ));
 }
 
 /// Who sends: the plugin, on this kind of machine.

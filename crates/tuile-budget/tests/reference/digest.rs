@@ -258,11 +258,25 @@ impl Feed for ResourceState {
 
 impl Feed for BudgetStats {
     /// Every statistic but `work`, the cost counter the optimisations
-    /// exist to lower: by its `Debug`, with `work` zeroed.
+    /// exist to lower, and the per-level splits — the ledger's bytes and the
+    /// evictions by level, a breakdown of what the chains already digest,
+    /// checked against their totals by the signals' tests: by its `Debug`,
+    /// with those zeroed.
     fn feed(&self, h: &mut Fnv) {
         let mut s = self.clone();
         s.work = 0;
-        h.bytes(format!("{s:?}").as_bytes());
+        s.drawable_by_level = PerClass::default();
+        s.transit_by_level = PerClass::default();
+        s.evictions_by_level = PerClass::default();
+        // Out of the text too, so the encoding is the one the reference was
+        // recorded with.
+        let bytes = format!("{:?}", s.drawable_by_level);
+        let counts = format!("{:?}", s.evictions_by_level);
+        let text = format!("{s:?}")
+            .replace(&format!(", drawable_by_level: {bytes}"), "")
+            .replace(&format!(", transit_by_level: {bytes}"), "")
+            .replace(&format!(", evictions_by_level: {counts}"), "");
+        h.bytes(text.as_bytes());
     }
 }
 
