@@ -65,10 +65,10 @@ fn parse(key: &str) -> Option<(&str, u8, u32, u32)> {
     parts.next().is_none().then_some((layer, z, x, y))
 }
 
-#[async_trait]
-impl ContentStore for StoreContent {
-    async fn get(&self, key: &str) -> Option<Bytes> {
-        let (layer, z, x, y) = parse(key)?;
+impl StoreContent {
+    /// [`ContentStore::get`] as the store has it, before what stands for no
+    /// imagery is read as an absence.
+    async fn stored(&self, key: &str, (layer, z, x, y): (&str, u8, u32, u32)) -> Option<Bytes> {
         let absent = format!("{layer}{ABSENT_SUFFIX}");
         let read = |e: crate::StoreError| {
             tracing::debug!(key, error = %e, "tile store read failed; treated as a miss");
@@ -111,6 +111,23 @@ impl ContentStore for StoreContent {
             _ => None,
         }
     }
+}
+
+#[async_trait]
+impl ContentStore for StoreContent {
+    /// A tile held that stands for no imagery ([`crate::index::is_known_empty_tile`])
+    /// is answered as the absence it is: the engine stands on the coarser
+    /// tile above, as it does for any absence. The archives keep their bytes;
+    /// nothing is purged.
+    async fn get(&self, key: &str) -> Option<Bytes> {
+        let (layer, z, x, y) = parse(key)?;
+        let found = self.stored(key, (layer, z, x, y)).await?;
+        if !is_absent(&found) && self.store.is_known_empty_tile(layer, &found) {
+            crate::store::empty_tile_seen(layer, "read");
+            return Some(ABSENT);
+        }
+        Some(found)
+    }
 
     /// From the zones projected by their indexes: the layer first, then its
     /// absence sibling — the order of [`ContentStore::get`] here, so a stamp
@@ -125,6 +142,18 @@ impl ContentStore for StoreContent {
                 .increment(1);
         };
         match self.store.indexed(layer, z, x, y) {
+            // The digest of a picture its source sends for "no imagery": the
+            // absence `get` would read it as, with no byte downloaded.
+            Ok(Lookup::Held(stamp))
+                if tuile_bing::is_empty_digest(stamp.digest)
+                    && self
+                        .store
+                        .layer(layer)
+                        .is_ok_and(crate::index::holds_images) =>
+            {
+                outcome("empty_imagery");
+                return Stamp::Absent;
+            }
             Ok(Lookup::Held(stamp)) if stamp.has_size() => {
                 outcome("present");
                 return Stamp::Present(ValueStamp {

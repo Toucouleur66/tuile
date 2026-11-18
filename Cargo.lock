@@ -9486,6 +9486,7 @@ dependencies = [
  "serde",
  "texcomp",
  "tracing",
+ "tuile-bing",
  "tuile-core",
  "tuile-terrain",
  "url",
@@ -9652,6 +9653,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tuile-bing",
  "tuile-core",
  "url",
 ]

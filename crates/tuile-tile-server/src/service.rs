@@ -338,6 +338,17 @@ impl TileService {
             self.hot_put(key, None);
             return Ok(None);
         }
+        // What the store holds and stands for no imagery is read as the
+        // absence it is: the client stands on the coarser tile.
+        if stored
+            .as_ref()
+            .is_some_and(|bytes| self.store.is_known_empty_tile(layer, bytes))
+        {
+            crate::store::empty_tile_seen(layer, "read");
+            self.counters.absent.fetch_add(1, Ordering::Relaxed);
+            self.hot_put(key, None);
+            return Ok(None);
+        }
         if let Some(bytes) = stored {
             self.counters.store.fetch_add(1, Ordering::Relaxed);
             let etag = etag_of(&bytes);
@@ -357,6 +368,9 @@ impl TileService {
         }
 
         let (fetched, source) = self.fetch_once(layer, level, x, y).await?;
+        // Fetched here it was looked at already; shared by an instance from
+        // before, perhaps not.
+        let fetched = fetched.filter(|bytes| !self.store.is_known_empty_tile(layer, bytes));
         // A tile another instance fetched is one the source was not asked
         // for: a hit, from here.
         let hit = source == Source::Shared;
@@ -516,6 +530,15 @@ async fn fetch(
         .fetch(k.1, k.2, k.3)
         .await
         .map_err(|e| ServiceError::Upstream(e.0))?;
+    // A source's "no imagery" sent as a picture is its "no such tile": served,
+    // shared and stored as that, never as the picture.
+    let got = got.filter(|bytes| {
+        let empty = store.is_empty_tile(&k.0, bytes);
+        if empty {
+            crate::store::empty_tile_seen(&k.0, "upstream");
+        }
+        !empty
+    });
     let fetched = store.now();
     let fetched_ms = fetched
         .duration_since(std::time::UNIX_EPOCH)

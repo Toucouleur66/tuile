@@ -287,8 +287,93 @@ pub const TILE_INFO_HEADER: &str = "x-ve-tile-info";
 /// Here, once, for every host that fetches Bing's tiles itself instead of
 /// through [`BingImageryProvider`]: a host that did not ask this stored the
 /// placeholder as tiles, and a film was drawn with them over the sea.
+///
+/// Nor is the header always there: the placeholder and a uniform black tile
+/// were stored without it. Whatever the header, a body
+/// [`is_empty_imagery`] recognises is no tile either.
 pub fn is_no_tile(tile_info: Option<&str>, body: &[u8]) -> bool {
-    body.is_empty() || tile_info.is_some_and(|info| info.trim().eq_ignore_ascii_case("no-tile"))
+    tile_info.is_some_and(|info| info.trim().eq_ignore_ascii_case("no-tile"))
+        || is_empty_imagery(body)
+}
+
+/// A picture Bing answers with where it has no imagery, known by its exact
+/// bytes: their length and their FNV-1a digest
+/// ([`tuile_core::empty_imagery::digest`], the digest a store's index keeps
+/// of each tile).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnownEmpty {
+    pub len: usize,
+    pub digest: u64,
+    /// What it shows.
+    pub what: &'static str,
+}
+
+/// Every picture Bing is known to answer with in place of imagery.
+///
+/// Both were found stored as tiles of its aerial layer, at sea, where Bing
+/// has no level past 13 or so and these became the finest tiles there were:
+/// a film drew the camera icon across a bay, and black water.
+pub const KNOWN_EMPTY: &[KnownEmpty] = &[
+    // A PNG, wherever it is stored: sha256 45d35034…ab05.
+    KnownEmpty {
+        len: 1033,
+        digest: 0x5cc1_36d7_528c_e891,
+        what: "the pale square with a crossed-out camera (\"no imagery\")",
+    },
+    // A JPEG: sha256 53dc8617…555b.
+    KnownEmpty {
+        len: 1651,
+        digest: 0x7a6f_e998_2816_f01a,
+        what: "a uniform black 256 × 256 JPEG",
+    },
+];
+
+/// Whether `body` is one of Bing's [`KNOWN_EMPTY`] pictures. The digest is
+/// taken only of a body of one of their lengths.
+pub fn is_placeholder(body: &[u8]) -> bool {
+    KNOWN_EMPTY.iter().any(|k| k.len == body.len())
+        && is_empty_digest(tuile_core::empty_imagery::digest(body))
+}
+
+/// Whether a tile's digest — as a store's index keeps it, with no bytes at
+/// hand — is that of one of Bing's [`KNOWN_EMPTY`] pictures.
+pub fn is_empty_digest(digest: u64) -> bool {
+    KNOWN_EMPTY.iter().any(|k| k.digest == digest)
+}
+
+/// Whether an imagery tile's bytes stand for **no imagery**, and are to be
+/// kept and read as an absence — the ground standing on the coarser tile
+/// above — rather than drawn: an empty body, one of Bing's
+/// [`KNOWN_EMPTY`] pictures, or a uniform black image
+/// ([`tuile_core::empty_imagery::is_uniform_black`]).
+///
+/// The one recogniser: what a store refuses to write and what a reader of a
+/// store or of the provider refuses to draw. A dark picture is not black:
+/// only one whose every texel is.
+pub fn is_empty_imagery(body: &[u8]) -> bool {
+    body.is_empty() || is_placeholder(body) || tuile_core::empty_imagery::is_uniform_black(body)
+}
+
+/// [`is_empty_imagery`], for a tile of a layer whose format is known: a PNG
+/// in a JPEG layer is not a picture of that layer either — a source's
+/// placeholder, stored where its pictures go.
+pub fn is_empty_tile(body: &[u8], jpeg_layer: bool) -> bool {
+    (jpeg_layer && tuile_core::empty_imagery::is_png(body)) || is_empty_imagery(body)
+}
+
+/// [`is_empty_tile`] without decoding anything: an empty body, a PNG in a
+/// JPEG layer, one of the [`KNOWN_EMPTY`] pictures — a length compared, and
+/// a digest taken of a body of one of their lengths only.
+///
+/// For a path that reads what is already stored, where a decode per small
+/// tile is not affordable (on a stretch of sea, two tiles in five are small
+/// enough to be looked at, at some 300 µs each): what was stored before
+/// nothing was refused, as found in the archives, is the known pictures
+/// and nothing else; what is stored since went through [`is_empty_tile`].
+pub fn is_known_empty_tile(body: &[u8], jpeg_layer: bool) -> bool {
+    body.is_empty()
+        || (jpeg_layer && tuile_core::empty_imagery::is_png(body))
+        || is_placeholder(body)
 }
 
 #[cfg(test)]
@@ -309,6 +394,85 @@ mod missing_tile_tests {
         assert!(!is_no_tile(None, b"\xff\xd8\xff a photograph"));
         assert!(!is_no_tile(Some("tile"), b"\xff\xd8\xff a photograph"));
         assert_eq!(TILE_INFO_HEADER, "x-ve-tile-info");
+    }
+
+    /// Bing's "no imagery" picture as it was found stored, in a JPEG layer.
+    const PLACEHOLDER: &[u8] = include_bytes!("../tests/fixtures/no-imagery-placeholder.png");
+    /// Bing's black tile as it was found stored, and is still being answered.
+    const BLACK: &[u8] = include_bytes!("../tests/fixtures/black-tile.jpg");
+
+    #[test]
+    fn the_pictures_bing_answers_with_no_imagery_are_no_tile_without_a_header() {
+        assert_eq!(PLACEHOLDER.len(), 1033);
+        assert!(is_placeholder(PLACEHOLDER));
+        assert!(is_empty_imagery(PLACEHOLDER));
+        assert!(is_no_tile(None, PLACEHOLDER));
+        assert!(is_empty_digest(tuile_core::empty_imagery::digest(
+            PLACEHOLDER
+        )));
+
+        assert_eq!(BLACK.len(), 1651);
+        assert!(is_placeholder(BLACK));
+        assert!(is_no_tile(None, BLACK));
+        assert!(is_empty_digest(tuile_core::empty_imagery::digest(BLACK)));
+    }
+
+    #[test]
+    fn a_black_tile_bing_has_not_been_seen_answering_is_no_imagery_all_the_same() {
+        let black = image::RgbImage::from_pixel(256, 256, image::Rgb([0, 0, 0]));
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        black
+            .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+            .expect("a jpeg");
+        let jpeg = jpeg.into_inner();
+        assert!(!is_placeholder(&jpeg), "not one of the known bytes");
+        assert!(is_empty_imagery(&jpeg));
+        assert!(is_no_tile(None, &jpeg));
+    }
+
+    #[test]
+    fn a_picture_of_the_ground_is_kept_however_dark() {
+        // Dark water, with the texture of water: not one colour.
+        let dark = image::RgbImage::from_fn(256, 256, |x, y| {
+            let n = ((x * 7 + y * 13) % 9) as u8;
+            image::Rgb([n, n + 2, n + 5])
+        });
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        dark.write_to(&mut jpeg, image::ImageFormat::Jpeg)
+            .expect("a jpeg");
+        let jpeg = jpeg.into_inner();
+        assert!(!is_empty_imagery(&jpeg));
+        assert!(!is_empty_tile(&jpeg, true));
+        assert!(!is_no_tile(None, &jpeg));
+    }
+
+    #[test]
+    fn a_png_in_a_jpeg_layer_is_not_a_tile_of_it() {
+        let flat = image::RgbaImage::from_pixel(256, 256, image::Rgba([240, 240, 235, 255]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        flat.write_to(&mut png, image::ImageFormat::Png)
+            .expect("a png");
+        let png = png.into_inner();
+        assert!(is_empty_tile(&png, true));
+        assert!(!is_empty_tile(&png, false), "a PNG layer's own tile");
+        assert!(is_empty_tile(PLACEHOLDER, false), "known wherever it is");
+        assert!(is_known_empty_tile(&png, true));
+        assert!(!is_known_empty_tile(&png, false));
+    }
+
+    #[test]
+    fn what_is_known_needs_no_decode_and_what_is_not_is_left_to_the_writer() {
+        assert!(is_known_empty_tile(PLACEHOLDER, false));
+        assert!(is_known_empty_tile(BLACK, true));
+        assert!(is_known_empty_tile(b"", true));
+        // A black tile of other bytes is told by its pixels only: not here.
+        let black = image::RgbImage::from_pixel(256, 256, image::Rgb([0, 0, 0]));
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        black
+            .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+            .expect("a jpeg");
+        assert!(!is_known_empty_tile(jpeg.get_ref(), true));
+        assert!(is_empty_tile(jpeg.get_ref(), true));
     }
 
     fn metadata(template: &str) -> BingMetadata {
