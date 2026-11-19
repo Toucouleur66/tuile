@@ -185,6 +185,8 @@ pub(super) const PLACE: u8 = 1;
 pub(super) const MESH: u8 = 1 << 1;
 pub(super) const DRAPES: u8 = 1 << 2;
 pub(super) const WORN: u8 = 1 << 3;
+/// How long no drawn tile's floats move before the view counts as still.
+pub(super) const STILL_AFTER: Micros = Micros::from_millis(250);
 
 impl Reach {
     /// It read `what` of `t`.
@@ -712,11 +714,17 @@ impl Budget {
     /// then hold for this step only.
     ///
     /// The level follows the texel footprint (relaxed with the LOD, with
-    /// hysteresis). When that level is held nowhere locally, a level already
-    /// held (GPU, decoded, store) is taken instead if it lies within one
-    /// level of the window between the relaxed and the unrelaxed need: a
-    /// relaxation never sends to the network what a local tier can show
-    /// (I14, I15). Batch takes the exact level, a function of the frame.
+    /// hysteresis). Under a relaxation, when that level is held nowhere
+    /// locally, a level already held (GPU, decoded, store) is taken instead
+    /// if it lies within one level of the window between the relaxed and
+    /// the unrelaxed need: a relaxation never sends to the network what a
+    /// local tier can show (I14, I15). At rest (scale 1) the level is the
+    /// need's own, and is fetched: a held neighbour of it dresses the tile
+    /// meanwhile, as for any load, and never settles in its place — else a
+    /// tile stood in for during a relaxation stayed a level coarser than its
+    /// neighbours for good, the stand-in remembered as its level and within
+    /// the step's tolerance. Batch takes the exact level, a function of the
+    /// frame.
     pub(super) fn drape_levels(
         &self,
         t: TileId,
@@ -753,7 +761,7 @@ impl Budget {
             let tier = |r: ResourceId, asked: &mut bool| {
                 self.tier_asked(r, self.arena.find(r), Class::Drape, presence, asked)
             };
-            if tier(drape(relaxed), asked) == Tier::Remote {
+            if self.scale > 1_000 && tier(drape(relaxed), asked) == Tier::Remote {
                 let full = needed_level(prev, img.footprint, clamp);
                 let ceiling = tn.need.level.saturating_add(cap).min(reach.max_level);
                 let lo = relaxed.min(full).saturating_sub(1).max(floor);
@@ -1215,14 +1223,18 @@ impl Budget {
                     Membership::Blocker => Some(Urgency::Blocker),
                     _ if !mesh_drawable => Some(urgency),
                     _ => {
+                        // Whether the drape worn serves the need, or the
+                        // need's own is asked for (`drape_fits`). A drape a
+                        // level off either way reads the regime (the
+                        // pressure, the stillness): a change of it reads
+                        // the want again.
                         let worn = item.and_then(|i| i.drape(layer).copied());
                         let off = match worn {
                             None => true,
                             Some(w) if batch => w.resource != drape,
-                            Some(w) if w.level.abs_diff(n) > 1 => true,
                             Some(w) => {
-                                reads_pressure |= w.level > n;
-                                self.pressure != Pressure::Normal && w.level > n
+                                reads_pressure |= w.level.abs_diff(n) == 1;
+                                !self.drape_fits(t, drape, w.level, n)
                             }
                         };
                         off.then_some(if floor {
@@ -1251,6 +1263,39 @@ impl Budget {
         out.sort_unstable_by_key(|(r, seq, w)| (*r, w.urgency, Reverse(w.q), *seq));
         out.dedup_by_key(|e| e.0);
         reads_pressure
+    }
+
+    /// Whether a drape worn at level `worn` serves tile `t`'s need at level
+    /// `n` without the need's own (`exact`) being asked for. The need's own
+    /// always serves. A level finer is kept, unless something presses (the
+    /// downgrade is asked for then). A level coarser is kept in motion —
+    /// the need moves a level at a time as the camera comes closer, and
+    /// the tile would be fetched at every level on the way — and under a
+    /// relaxation or a pressure; once the view is still and nothing
+    /// presses, the need's own is asked for, a few tiles a step
+    /// (`caught_up`), and an ask whose load started is kept through the
+    /// motion that follows. Without that, a tile left a level under its
+    /// need stayed so for good, a level coarser than its neighbours.
+    /// Further off either way, the need's own is asked for.
+    pub(super) fn drape_fits(&self, t: TileId, exact: ResourceId, worn: u32, n: u32) -> bool {
+        match worn.cmp(&n) {
+            std::cmp::Ordering::Equal => true,
+            std::cmp::Ordering::Greater => worn - n == 1 && self.pressure == Pressure::Normal,
+            std::cmp::Ordering::Less => {
+                if n - worn != 1 {
+                    return false;
+                }
+                let at_rest = self.still
+                    && self.scale == 1_000
+                    && self.pressure == Pressure::Normal
+                    && self.caught_up(t);
+                let started = self
+                    .arena
+                    .find(exact)
+                    .is_some_and(|s| self.arena.loading(s));
+                !at_rest && !started
+            }
+        }
     }
 
     /// Whether Batch may want drapes this step: every mesh the frame draws
@@ -1443,6 +1488,19 @@ impl Budget {
         let tiles = need.tiles();
         let named = need.named();
         let full = self.cfg.policy == Policy::Batch;
+        // The view is still once no tile's floats have moved for a while:
+        // a camera that moves names every drawn tile for its floats alone
+        // (distance, error, texel footprint); a view refining as its tiles
+        // arrive names tiles entering, leaving or changing shape, which is
+        // not motion. Batch has no stillness: a frame is exact.
+        let moving = named.iter().any(|x| !x.shaped() && !x.moved());
+        self.still = if !moving && !full {
+            let since = *self.quiet_since.get_or_insert(now);
+            now.since(since) >= STILL_AFTER
+        } else {
+            self.quiet_since = None;
+            false
+        };
 
         // 2–3. Drape levels, the floor, the selection, the draw set, the
         // wants: what may have changed read again (`downstream`).
@@ -1591,6 +1649,7 @@ impl Budget {
             d.frame_ready = complete && self.fatal.is_none();
         }
         d.fatal = self.fatal.clone();
+        st.still = self.still;
         st.converged = if eff.batch {
             d.frame_ready
         } else {
