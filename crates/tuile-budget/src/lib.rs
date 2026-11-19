@@ -294,6 +294,11 @@ pub struct Budget {
     /// Since when no drawn tile's floats have moved: the view holding
     /// still.
     quiet_since: Option<Micros>,
+    /// The pressure the last relaxation step saw, and whether a pressure
+    /// was lifted since the scale last stood at one: the relaxation it drove
+    /// comes down fast ([`engine`]'s `relax`).
+    pressure_relaxed: Pressure,
+    relax_lifted: bool,
     /// Whether the view is still: no tile's floats moved for
     /// [`engine::STILL_AFTER`]. A drape worn a level under its need is
     /// asked for then, and then only, when nothing presses.
@@ -338,6 +343,8 @@ impl Budget {
             scale: 1_000,
             scale_fine: 1_000_000_000,
             quiet_since: None,
+            pressure_relaxed: Pressure::Normal,
+            relax_lifted: false,
             still: false,
             ledger: Ledger::default(),
             in_flight: PerClass::splat(0),
