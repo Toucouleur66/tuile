@@ -570,12 +570,14 @@ impl Writer {
             resource,
             layer,
             level,
+            need,
             uv,
         } in drapes
         {
             self.resource(resource);
             self.u32(u32::from(layer.0));
             self.u32(*level);
+            self.u32(*need);
             for v in uv.scale.iter().chain(&uv.offset) {
                 self.f64(*v);
             }
@@ -919,6 +921,7 @@ impl<'a> Reader<'a> {
                 resource: self.resource()?,
                 layer: self.layer_id()?,
                 level: self.u32()?,
+                need: self.u32()?,
                 uv: UvTransform {
                     scale: [self.f64()?, self.f64()?],
                     offset: [self.f64()?, self.f64()?],
@@ -1375,6 +1378,7 @@ mod tests {
                         resource: drape,
                         layer: LayerId(0),
                         level: 6,
+                        need: 8,
                         uv: UvTransform {
                             scale: [0.5, 0.25],
                             offset: [0.5, 1.0 / 3.0],

@@ -20,7 +20,7 @@
 
 use crate::compress::EncodePace;
 use crate::context::GpuContext;
-use crate::prepare::{prepare, prepare_drape, PreparedDrape, PreparedTile};
+use crate::prepare::{prepare, prepare_drape, Levels, PreparedDrape, PreparedTile};
 use glam::DVec3;
 use std::collections::{BTreeMap, HashMap};
 use std::task::{Context, Poll};
@@ -868,9 +868,27 @@ impl ContentPump {
                     None => counts.bare += 1,
                 }
             }
-            mesh.dress(gpu, &wear);
-            dressed.insert(tile);
             let level = self.ancestry.get(&tile).map_or(0, |a| a.level);
+            // The base layer's choice: the picture of the ground, which the
+            // level views colour the tile by.
+            let base = item
+                .drapes
+                .iter()
+                .filter(|c| self.drapes.contains_key(&c.resource))
+                .min_by_key(|c| c.layer);
+            let levels = Levels {
+                worn: base.map_or(0, |c| c.level),
+                asked: base.map_or(0, |c| c.need),
+                tile: level,
+                role: match item.role {
+                    Role::Exact => 0,
+                    Role::Held => 1,
+                    Role::Fallback => 2,
+                },
+            };
+            mesh.dress(gpu, &wear, levels);
+            counts.count_levels(levels);
+            dressed.insert(tile);
             let (exact, fallback) = if covers {
                 (&mut covering, &mut covering_fallback)
             } else {
@@ -950,8 +968,16 @@ impl ContentPump {
                         own.into_values()
                             .map(|(r, d)| (r, d, tuile_core::budget::UvTransform::IDENTITY))
                             .collect();
+                    // The backdrop asks nothing: it wears what it holds.
+                    let worn = wear.iter().map(|(_, d, _)| d.level).min().unwrap_or(0);
+                    let levels = Levels {
+                        worn,
+                        asked: worn,
+                        tile: level,
+                        role: 2,
+                    };
                     if let Some(mesh) = self.prepared.get_mut(&tile) {
-                        mesh.dress(gpu, &wear);
+                        mesh.dress(gpu, &wear, levels);
                     }
                     dressed.insert(tile);
                 }
@@ -1263,12 +1289,61 @@ pub struct Resolution {
     /// The level actually drawn, and the level asked for, at that worst gap.
     pub worst_gap_drawn: u32,
     pub worst_gap_wanted: u32,
+    /// Drawn meshes whose base imagery is coarser than they asked for this
+    /// step — a stand-in drape, their own at a coarser level or an
+    /// ancestor's, worn while the one asked for loads — and the most
+    /// levels any of them is under. The numbers behind the lag view.
+    pub under_draped: usize,
+    pub worst_under: u32,
+    /// How many drawn meshes wear base imagery at each level, by level, up
+    /// to [`LEVELS_COUNTED`]: the numbers behind the level view. A mesh
+    /// wearing nothing is counted at 0.
+    pub worn_by_level: [u32; LEVELS_COUNTED],
 }
+
+/// How many imagery levels [`Resolution::worn_by_level`] counts: deeper
+/// than any imagery source serves.
+pub const LEVELS_COUNTED: usize = 32;
 
 impl Resolution {
     /// Whether any ground was drawn by nothing.
     pub fn has_holes(&self) -> bool {
         self.lost > 0
+    }
+
+    /// Counts a drawn mesh told `levels`.
+    fn count_levels(&mut self, levels: Levels) {
+        let slot = (levels.worn as usize).min(LEVELS_COUNTED - 1);
+        self.worn_by_level[slot] += 1;
+        if levels.worn > 0 && levels.asked > levels.worn {
+            self.under_draped += 1;
+            self.worst_under = self.worst_under.max(levels.asked - levels.worn);
+        }
+    }
+
+    /// The imagery levels drawn, in a few words for a status line: how many
+    /// meshes wear each level, and how many wear less than they asked for.
+    /// `imagery 12×3 13×41 14×310, 12 under asked (worst 5)`, or `imagery
+    /// 14×310` when every mesh wears what it asked for.
+    pub fn levels_line(&self) -> String {
+        use std::fmt::Write as _;
+        let mut line = String::from("imagery");
+        for (level, n) in self.worn_by_level.iter().enumerate().skip(1) {
+            if *n > 0 {
+                let _ = write!(line, " {level}×{n}");
+            }
+        }
+        if self.worn_by_level[0] > 0 {
+            let _ = write!(line, " none×{}", self.worn_by_level[0]);
+        }
+        if self.under_draped > 0 {
+            let _ = write!(
+                line,
+                ", {} under asked (worst {})",
+                self.under_draped, self.worst_under
+            );
+        }
+        line
     }
 }
 
@@ -1473,6 +1548,7 @@ mod tests {
                 resource: ResourceId::drape(TileId(1), LayerId(0), 3),
                 layer: LayerId(0),
                 level: 3,
+                need: 3,
                 uv: quarter,
             },
             DrawItem {

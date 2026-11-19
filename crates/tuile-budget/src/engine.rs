@@ -932,6 +932,7 @@ impl Budget {
                 resource: own,
                 layer,
                 level: need,
+                need,
                 uv: UvTransform::IDENTITY,
             });
         }
@@ -966,6 +967,7 @@ impl Budget {
             resource,
             layer,
             level: c.level,
+            need,
             uv,
         })
     }

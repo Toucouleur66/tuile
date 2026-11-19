@@ -240,6 +240,7 @@ fn dressed(
             resource,
             layer: drape.layer,
             level: drape.level,
+            need: drape.level,
             uv: UvTransform::IDENTITY,
         }]
         .into_iter()

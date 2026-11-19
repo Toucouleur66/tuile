@@ -241,6 +241,8 @@ struct Active {
 /// | unlit | not the sun and not the air — they are switched off |
 /// | coverage | never black: magenta = no imagery reached this pixel |
 /// | geometry | nothing was drawn at all — a mesh is missing |
+/// | levels | never black: each tile coloured by the imagery level it wears |
+/// | lag | never black: each tile coloured by how far under the level it asked for it wears |
 ///
 /// So: black in *normal* that turns to picture in *unlit* is a lighting or
 /// atmosphere fault. Black that survives *unlit* and shows magenta in
@@ -248,7 +250,21 @@ struct Active {
 /// *coverage*, and is lit in *geometry* is imagery that is genuinely black —
 /// look for the `BLACK IMAGERY` warning. Black that stays black in *geometry*
 /// is no mesh at all, and belongs to traversal or upload, never to texturing.
-pub(crate) const DIAGNOSTICS: [(&str, &str); 4] = [
+///
+/// The last two answer "why is this soft" rather than "why is this black".
+/// *levels* gives each tile one hue a level round a wheel of eight — red at
+/// 8 and 16, orange 9, yellow 10, green 11, cyan 12, blue 13, violet 14,
+/// magenta 15 — so a coarse patch is read as a number: the step between two
+/// tiles, or between the foreground and the far top of a tilted view. *lag*
+/// sets each tile against the level it asked for this step: green at it,
+/// yellow one under, orange two, red three or more, blue finer than asked.
+/// Red is a tile wearing an ancestor's picture while its own loads; a lag
+/// that stays once the loads land is the budget asking for less than the
+/// eye needs. In both, tiles are edged dark so they can be counted, and a
+/// mesh drawn in another's place (held, standing in) is hatched. The log
+/// line gives the same numbers: how many meshes wear each level, how many
+/// wear less than they asked for.
+pub(crate) const DIAGNOSTICS: [(&str, &str); 6] = [
     ("normal", "the real picture"),
     ("unlit", "imagery only; sun and air off"),
     (
@@ -256,6 +272,14 @@ pub(crate) const DIAGNOSTICS: [(&str, &str); 4] = [
         "magenta = no imagery here, green = one layer, blue = several",
     ),
     ("geometry", "flat lit surface; black = no mesh drawn"),
+    (
+        "levels",
+        "imagery level worn: red 8/16, orange 9, yellow 10, green 11, cyan 12, blue 13, violet 14, magenta 15",
+    ),
+    (
+        "lag",
+        "imagery against the level asked: green at it, yellow 1 under, orange 2, red 3+, blue finer",
+    ),
 ];
 
 pub struct App {
