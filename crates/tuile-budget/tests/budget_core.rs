@@ -3591,6 +3591,36 @@ mod dirty_sets {
         );
     }
 
+    /// A choice says what the wearer asked for beside what it wears: the
+    /// two agree on the tile's own drape at its need, and differ by the
+    /// levels a stand-in is under it — what a diagnostic view colours.
+    #[test]
+    fn a_choice_says_the_level_the_wearer_asked_for() {
+        let mut r = Rig::interactive();
+        let root = t(0, 0, 0);
+        r.settle(&drawn_draped(&[root], 0), 10);
+        let own = r.step(&drawn_draped(&[root], 0));
+        let c = own.draw.get(mesh(root)).and_then(base_drape);
+        assert_eq!(c.map(|c| (c.level, c.need)), Some((0, 0)));
+        let p = children(root)[0];
+        let k = children(p)[0];
+        let mut ask = drawn_draped(&[k], 2);
+        ask.blockers.push((p, draped(p, 1)));
+        r.step(&ask);
+        r.load_where(|x| x == mesh(k));
+        for _ in 0..4 {
+            let d = r.step(&ask);
+            r.upload(&d);
+        }
+        let d = r.step(&ask);
+        let c = d.draw.get(mesh(k)).and_then(base_drape);
+        assert_eq!(
+            c.map(|c| (c.resource, c.level, c.need)),
+            Some((dr(root, 0), 0, 2)),
+            "the root's drape worn, two levels under the one asked for"
+        );
+    }
+
     /// The place's rule: a mesh wearing an ancestor's drape is read again
     /// when that ancestor's place in the tree changes (here its footprint),
     /// and maps the drape into the new footprint. The ancestor is a

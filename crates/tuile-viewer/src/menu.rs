@@ -38,7 +38,8 @@ use crate::steer::Command;
 
 /// The diagnostic views, in the order `D` cycles them, as a menu names them.
 /// The same order as `app::DIAGNOSTICS`; a test holds the two together.
-pub(crate) const DIAGNOSTICS: [&str; 4] = ["Normal", "Unlit", "Coverage", "Geometry"];
+pub(crate) const DIAGNOSTICS: [&str; 6] =
+    ["Normal", "Unlit", "Coverage", "Geometry", "Levels", "Lag"];
 
 /// What a key or a menu item asks for, before it is a command: relative
 /// where a person thinks relatively.
@@ -970,7 +971,8 @@ mod tests {
         let now = State {
             wireframe: false,
             frozen: true,
-            diagnostic: 3,
+            // On the last diagnostic view, so the next is the first again.
+            diagnostic: crate::app::DIAGNOSTICS.len() - 1,
             layer: 2,
             layers: 3,
             clock: Clock {
