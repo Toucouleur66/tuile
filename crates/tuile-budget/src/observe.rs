@@ -69,6 +69,9 @@ pub enum BudgetEvent {
     Specify(crate::spec::SpecKind, u64, bool),
     /// `measure`: the samples given.
     Measured(crate::inputs::Measured),
+    /// A fallback specification put in force: its digest
+    /// ([`crate::FallbackSpec::digest`]).
+    Fallbacks(u64),
 }
 
 /// One decision step, as the host saw it.

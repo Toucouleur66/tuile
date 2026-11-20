@@ -16,6 +16,7 @@ pub mod decisions;
 mod downstream;
 mod engine;
 pub mod error;
+pub mod fallback;
 mod held;
 pub mod imagery;
 pub mod inputs;
@@ -42,6 +43,7 @@ pub use decisions::{
 };
 pub use error::{AuditError, ConfigError, SessionError};
 pub use inputs::{Measured, Prediction, Smoothed, TierSample};
+pub use fallback::{FallbackContext, FallbackReport, FallbackRule, FallbackSpec, FallbackState};
 pub use imagery::{DrapeCandidate, GeoRect, LevelClamp, TexelFootprint, UvTransform};
 pub use need::{ImageryNeed, LayerReach, Membership, Need, NeedDelta, NeedSet};
 pub use observe::{
