@@ -121,10 +121,11 @@ struct MaterialUniform {
     // with untextured ground.
     // `pass` would be the name; WGSL reserves it.
     flags: vec4f,
-    // The imagery levels the tile is told, for the two views that colour
+    // The imagery levels the tile is told, for the three views that colour
     // tiles by them: x = the level its base layer wears (0 for none), y =
     // the level that layer asked for this step (0 for nothing), z = the
-    // tile's own level, w = its role (0 itself, 1 held, 2 standing in).
+    // tile's own level, w = its role (0 itself, 1 held, 2 standing in) plus
+    // four times the levels the terrain's level denied it.
     levels: vec4f,
 }
 @group(2) @binding(0) var<uniform> material: MaterialUniform;
@@ -230,6 +231,13 @@ const DIAGNOSTIC_LEVELS: f32 = 4.0;
 // that smears — and a lag that stays once the loads land is the budget
 // asking for less than the eye needs.
 const DIAGNOSTIC_LAG: f32 = 5.0;
+// Cap: each tile by the levels its terrain's level denies its imagery —
+// the screen asks finer than the tile's terrain level plus the imagery cap
+// allows, so the tile wears what it asked for (green in the lag view) and
+// is soft all the same. Green none, yellow one level denied, orange two,
+// red three or more; grey wearing nothing. A band of it across the far top
+// of a tilted view is the cap, not the loads.
+const DIAGNOSTIC_CAP: f32 = 6.0;
 
 // The level view's hue for `level`.
 fn level_hue(level: f32) -> vec3f {
@@ -257,7 +265,13 @@ fn lag_colour(worn: f32, asked: f32) -> vec3f {
     return vec3f(0.95, 0.1, 0.1);
 }
 
-// What both level views draw over a tile's colour: the relief, faintly,
+// The cap view's colour for a tile wearing `worn` denied `capped` levels.
+fn cap_colour(worn: f32, capped: f32) -> vec3f {
+    if (worn < 0.5) { return vec3f(0.35); }
+    return lag_colour(1.0, 1.0 + capped);
+}
+
+// What the level views draw over a tile's colour: the relief, faintly,
 // so the ground stays readable; a dark edge round the tile, so tiles can
 // be counted; hatching on a mesh drawn in another's place (held, or
 // standing in). `uv_px` is the uv a pixel spans, for an edge a pixel and
@@ -318,14 +332,21 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     // The uv a pixel spans: taken here, in uniform control flow, for the
     // level views' tile edges.
     let uv_px = max(fwidth(in.uv).x, fwidth(in.uv).y);
+    // The role and the capped levels share the last lane.
+    let role = material.levels.w % 4.0;
+    let capped = floor(material.levels.w / 4.0);
     if (mode == DIAGNOSTIC_LEVELS) {
         var c = vec3f(0.25);
         if (material.levels.x > 0.5) { c = level_hue(material.levels.x); }
-        return vec4f(tile_marks(c, in.uv, material.levels.w, lambert, uv_px), first);
+        return vec4f(tile_marks(c, in.uv, role, lambert, uv_px), first);
     }
     if (mode == DIAGNOSTIC_LAG) {
         let c = lag_colour(material.levels.x, material.levels.y);
-        return vec4f(tile_marks(c, in.uv, material.levels.w, lambert, uv_px), first);
+        return vec4f(tile_marks(c, in.uv, role, lambert, uv_px), first);
+    }
+    if (mode == DIAGNOSTIC_CAP) {
+        let c = cap_colour(material.levels.x, capped);
+        return vec4f(tile_marks(c, in.uv, role, lambert, uv_px), first);
     }
     // Geometry: a flat lit surface, imagery and air removed. Anything visible
     // here IS a mesh. Black here means nothing was drawn at all, which is a

@@ -227,9 +227,10 @@ class Viewer {
   /**
    * Draws a diagnostic view until another is asked: `"normal"` (the
    * picture), `"unlit"`, `"coverage"`, `"geometry"`, `"levels"` (each tile
-   * coloured by the imagery level it wears) or `"lag"` (each tile coloured
-   * by how far under the level it asked for it wears). The `D` key cycles
-   * the same views.
+   * coloured by the imagery level it wears), `"lag"` (each tile coloured
+   * by how far under the level it asked for it wears) or `"cap"` (each
+   * tile coloured by the levels its terrain's level denies its imagery).
+   * The `D` key cycles the same views.
    */
   diagnostic(view) {
     this.#live().diagnostic(String(view));
