@@ -184,7 +184,7 @@ export interface ViewerEvents {
 }
 
 /** The diagnostic views, in the order the `D` key cycles them. */
-export type DiagnosticView = "normal" | "unlit" | "coverage" | "geometry" | "levels" | "lag";
+export type DiagnosticView = "normal" | "unlit" | "coverage" | "geometry" | "levels" | "lag" | "cap";
 
 export interface Viewer {
   /** What the viewer draws through. */

@@ -63,6 +63,14 @@ pub struct DrapeChoice {
     /// it holds ranks before fetching. A diagnostic view colours each tile
     /// by the gap; nothing else reads it.
     pub need: u32,
+    /// The levels the terrain's level denied the wearer's imagery: how far
+    /// the level the footprint alone would ask — the coarsest sharp enough
+    /// for the screen, the source's deepest at most — lies above the
+    /// ceiling of the tile's terrain level plus the imagery cap; 0 when the
+    /// ceiling was not reached. `need` is already the capped level, so a
+    /// tile told this still wears what it asked for; a diagnostic view and
+    /// a status line count it. Nothing else reads it.
+    pub capped: u32,
     /// The mapping of the mesh's UV square into it.
     pub uv: UvTransform,
 }

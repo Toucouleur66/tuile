@@ -254,6 +254,7 @@ pub fn wearing(mut item: DrawItem, drape: ResourceId, level: u32, uv: UvTransfor
         layer,
         level,
         need: level,
+        capped: 0,
         uv,
     });
     item

@@ -885,6 +885,7 @@ impl ContentPump {
                     Role::Held => 1,
                     Role::Fallback => 2,
                 },
+                capped: base.map_or(0, |c| c.capped),
             };
             mesh.dress(gpu, &wear, levels);
             counts.count_levels(levels);
@@ -975,6 +976,7 @@ impl ContentPump {
                         asked: worn,
                         tile: level,
                         role: 2,
+                        capped: 0,
                     };
                     if let Some(mesh) = self.prepared.get_mut(&tile) {
                         mesh.dress(gpu, &wear, levels);
@@ -1295,6 +1297,13 @@ pub struct Resolution {
     /// levels any of them is under. The numbers behind the lag view.
     pub under_draped: usize,
     pub worst_under: u32,
+    /// Drawn meshes whose base imagery the terrain's level caps — the
+    /// screen asks a finer level than the tile's terrain level plus the
+    /// imagery cap allows, so they wear what they asked for and are still
+    /// soft — and the most levels any of them is denied. The numbers
+    /// behind the cap view.
+    pub capped: usize,
+    pub worst_capped: u32,
     /// How many drawn meshes wear base imagery at each level, by level, up
     /// to [`LEVELS_COUNTED`]: the numbers behind the level view. A mesh
     /// wearing nothing is counted at 0.
@@ -1319,12 +1328,17 @@ impl Resolution {
             self.under_draped += 1;
             self.worst_under = self.worst_under.max(levels.asked - levels.worn);
         }
+        if levels.worn > 0 && levels.capped > 0 {
+            self.capped += 1;
+            self.worst_capped = self.worst_capped.max(levels.capped);
+        }
     }
 
     /// The imagery levels drawn, in a few words for a status line: how many
-    /// meshes wear each level, and how many wear less than they asked for.
-    /// `imagery 12×3 13×41 14×310, 12 under asked (worst 5)`, or `imagery
-    /// 14×310` when every mesh wears what it asked for.
+    /// meshes wear each level, how many wear less than they asked for, and
+    /// how many are capped by their terrain's level. `imagery 12×3 13×41
+    /// 14×310, 12 under asked (worst 5), 40 capped by terrain (up to 2)`,
+    /// or `imagery 14×310` when every mesh wears what the screen asks.
     pub fn levels_line(&self) -> String {
         use std::fmt::Write as _;
         let mut line = String::from("imagery");
@@ -1341,6 +1355,13 @@ impl Resolution {
                 line,
                 ", {} under asked (worst {})",
                 self.under_draped, self.worst_under
+            );
+        }
+        if self.capped > 0 {
+            let _ = write!(
+                line,
+                ", {} capped by terrain (up to {})",
+                self.capped, self.worst_capped
             );
         }
         line
@@ -1549,6 +1570,7 @@ mod tests {
                 layer: LayerId(0),
                 level: 3,
                 need: 3,
+                capped: 0,
                 uv: quarter,
             },
             DrawItem {

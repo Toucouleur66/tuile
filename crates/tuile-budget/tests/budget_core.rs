@@ -3621,6 +3621,30 @@ mod dirty_sets {
         );
     }
 
+    /// A choice counts the levels the terrain's level denies: a root tile
+    /// whose screen asks level 5 wears level 3 — the cap over its level 0 —
+    /// and is told the two it was refused; one whose screen asks level 2
+    /// is told none.
+    #[test]
+    fn a_choice_counts_the_levels_the_terrain_denies() {
+        let told = |level: u32| {
+            let mut r = Rig::interactive();
+            let root = t(0, 0, 0);
+            r.settle(&drawn_draped(&[root], level), 10);
+            let d = r.step(&drawn_draped(&[root], level));
+            d.draw
+                .get(mesh(root))
+                .and_then(base_drape)
+                .map(|c| (c.level, c.need, c.capped))
+        };
+        assert_eq!(told(5), Some((3, 3, 2)), "asked 5 over terrain 0, cap 3");
+        assert_eq!(
+            told(2),
+            Some((2, 2, 0)),
+            "asked 2 over terrain 0: under the cap"
+        );
+    }
+
     /// The place's rule: a mesh wearing an ancestor's drape is read again
     /// when that ancestor's place in the tree changes (here its footprint),
     /// and maps the drape into the new footprint. The ancestor is a

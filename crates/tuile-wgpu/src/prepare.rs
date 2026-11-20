@@ -97,9 +97,10 @@ struct MaterialUniform {
 const LEVELS_AT: u64 = 32;
 
 /// The imagery levels a drawn tile is told, for the diagnostic views that
-/// colour tiles by them (`DIAGNOSTIC_LEVELS` and `DIAGNOSTIC_LAG` in
-/// `shader.wgsl`): what its base layer wears and what that layer asked for
-/// this step, the tile's own level, and the role it is drawn in. They
+/// colour tiles by them (`DIAGNOSTIC_LEVELS`, `DIAGNOSTIC_LAG` and
+/// `DIAGNOSTIC_CAP` in `shader.wgsl`): what its base layer wears and what
+/// that layer asked for this step, the tile's own level, the role it is
+/// drawn in and the levels the terrain denied it. They
 /// change without the dressing changing — the budget asks for a finer
 /// level as the eye comes down while the tile wears the same drape — so a
 /// tile dressed as it was is told them again, in place.
@@ -115,6 +116,10 @@ pub struct Levels {
     /// How the mesh is drawn: 0 as itself, 1 held in a coarser tile's
     /// place, 2 standing in for finer ones (a fallback, or the backdrop).
     pub role: u32,
+    /// The levels the terrain's level denied the base layer: how far the
+    /// level the screen alone asks lies above the tile's terrain level plus
+    /// the imagery cap ([`tuile_core::budget::DrapeChoice::capped`]).
+    pub capped: u32,
 }
 
 impl Levels {
@@ -124,7 +129,9 @@ impl Levels {
             self.worn as f32,
             self.asked as f32,
             self.tile as f32,
-            self.role as f32,
+            // One lane for two small numbers: the role in the low two
+            // bits, the capped levels above them.
+            (self.role.min(3) + 4 * self.capped.min(1 << 20)) as f32,
         ]
     }
 }

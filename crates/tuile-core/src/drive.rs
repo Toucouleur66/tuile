@@ -422,6 +422,7 @@ mod tests {
                 layer: drape.layer,
                 level: drape.level,
                 need: drape.level,
+                capped: 0,
                 uv: crate::budget::UvTransform::IDENTITY,
             }]
             .into_iter()
@@ -559,6 +560,7 @@ mod tests {
                 layer: drape.layer,
                 level: drape.level,
                 need: drape.level,
+                capped: 0,
                 uv: UvTransform::IDENTITY,
             }]
             .into_iter()
