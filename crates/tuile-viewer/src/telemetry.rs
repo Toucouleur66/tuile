@@ -24,10 +24,6 @@
 /// another.
 pub(crate) const SERVICE: &str = "tuile-viewer";
 
-/// The commit this build was made from, when the build said
-/// (`TUILE_GIT_COMMIT=$(git rev-parse HEAD) cargo build …`).
-pub(crate) const COMMIT: Option<&str> = option_env!("TUILE_GIT_COMMIT");
-
 /// The kind of machine, as dashboards group it: the profile's own split.
 pub(crate) fn device_class() -> &'static str {
     if cfg!(target_arch = "wasm32") {
@@ -44,7 +40,8 @@ pub(crate) fn identity(realm: &'static str) -> tuile_telemetry::Identity<'static
     tuile_telemetry::Identity {
         service_name: SERVICE,
         version: env!("CARGO_PKG_VERSION"),
-        commit: COMMIT,
+        commit: tuile_telemetry::build::REVISION,
+        ref_name: tuile_telemetry::build::REF_NAME,
         device_class: device_class(),
         realm,
     }

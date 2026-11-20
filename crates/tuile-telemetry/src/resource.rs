@@ -24,13 +24,16 @@
 use std::collections::BTreeMap;
 
 /// The resource attributes a process may send.
-pub const ALLOWED: [&str; 15] = [
+pub const ALLOWED: [&str; 16] = [
     "service.name",
     "service.version",
     // A random identifier drawn at each launch: tells two sessions' counters
     // apart, says nothing about who ran them.
     "service.instance.id",
+    // The build: its commit, and its `git describe` (the tag and the way
+    // from it).
     "vcs.ref.head.revision",
+    "vcs.ref.head.name",
     "deployment.environment",
     "os.type",
     "host.arch",
@@ -187,11 +190,21 @@ mod tests {
             ("enduser.id", "x"),
             ("camera.position", "1,2,3"),
             ("gpu.adapter", "Apple M2 Pro"),
+            ("vcs.ref.head.revision", "abc123def456"),
+            ("vcs.ref.head.name", "v0.17.1-12-gabc123def456"),
         ] {
             r.set(k, v);
         }
         let keys: Vec<&str> = r.iter().map(|(k, _)| k).collect();
-        assert_eq!(keys, ["gpu.adapter", "service.name"]);
+        assert_eq!(
+            keys,
+            [
+                "gpu.adapter",
+                "service.name",
+                "vcs.ref.head.name",
+                "vcs.ref.head.revision"
+            ]
+        );
         assert!(r.iter().all(|(k, _)| allowed(k)));
     }
 

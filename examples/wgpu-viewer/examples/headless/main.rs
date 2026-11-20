@@ -356,7 +356,8 @@ fn telemetry() -> Option<tokio::runtime::Runtime> {
     let identity = tuile_telemetry::Identity {
         service_name: "tuile-viewer",
         version: env!("CARGO_PKG_VERSION"),
-        commit: option_env!("TUILE_GIT_COMMIT"),
+        commit: tuile_telemetry::build::REVISION,
+        ref_name: tuile_telemetry::build::REF_NAME,
         device_class: "desktop",
         realm: "native",
     };

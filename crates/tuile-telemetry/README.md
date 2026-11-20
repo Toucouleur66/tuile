@@ -38,8 +38,8 @@ switched off and on again while the program runs ([`set_metrics`],
   location.**
 - **CPU profiles** (macOS and Linux, the `profiling` feature): pprof-rs
   samples at the configured rate, per thread, pushed to Pyroscope every ten
-  seconds, tagged with the version, the OS, the device class, the GPU and
-  the launch's random identifier (`instance`, the metrics' too).
+  seconds, tagged with the version, the commit and tag, the OS, the device
+  class, the GPU and the launch's random identifier (`instance`, the metrics' too).
   Not on a phone, not in a browser.
 
 ## What is never sent
@@ -49,7 +49,7 @@ geolocation, which a viewer may ask for to move the camera there, has no way
 into a push — the pose is the camera's, wherever a person flew it. Nor any
 tile identifier or address, source URL or user data. Two allow-lists are applied where the data leaves:
 the resource attributes ([`resource::ALLOWED`]: service name and version,
-commit, OS, architecture, device class, GPU adapter and backend, a random
+commit and tag (`vcs.ref.head.revision`, `vcs.ref.head.name`), OS, architecture, device class, GPU adapter and backend, a random
 identifier drawn at each launch) and the metric labels
 ([`resource::ALLOWED_LABELS`], the engine's closed sets), and the camera's
 series names ([`camera::CAMERA_METRICS`]: a `tuile_camera_*` series off it
@@ -87,7 +87,8 @@ fn start(runtime: &tokio::runtime::Handle) {
     let identity = tuile_telemetry::Identity {
         service_name: "my-viewer",
         version: env!("CARGO_PKG_VERSION"),
-        commit: None,
+        commit: tuile_telemetry::build::REVISION,
+        ref_name: tuile_telemetry::build::REF_NAME,
         device_class: "desktop",
         realm: "native",
     };

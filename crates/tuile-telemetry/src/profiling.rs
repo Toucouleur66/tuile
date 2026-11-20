@@ -7,8 +7,9 @@
 //! Sampled at the configured rate (a `SIGPROF` timer on the process's CPU
 //! time, each sample a walk of the running thread's stack, the thread's
 //! name kept) and pushed every ten seconds as the service's name, tagged
-//! with the version, the OS, the device class, the realm and the GPU. Not
-//! the session's identifier: a profile is read across sessions.
+//! with the version, the commit and tag, the OS, the device class, the
+//! realm and the GPU. Not the session's identifier: a profile is read
+//! across sessions.
 //!
 //! Starting waits for [`ready`] — the host has said which GPU it draws with
 //! — so the very first profile carries it. Starting and stopping happen on
@@ -90,9 +91,16 @@ fn tag_value(value: &str) -> String {
 
 /// The tags every profile carries, from the resource.
 fn tags() -> Vec<(String, String)> {
-    let resource = crate::resource();
+    tags_of(&crate::resource())
+}
+
+/// The tags a profile carries for `resource`.
+fn tags_of(resource: &crate::Resource) -> Vec<(String, String)> {
     [
         ("service.version", "version"),
+        // The build, under the names the metrics' labels have.
+        ("vcs.ref.head.revision", "vcs_ref_head_revision"),
+        ("vcs.ref.head.name", "vcs_ref_head_name"),
         ("os.type", "os"),
         ("host.arch", "arch"),
         ("device.class", "device_class"),
@@ -175,5 +183,25 @@ mod tests {
         assert_eq!(tag_value("Apple M2 Pro"), "Apple_M2_Pro");
         assert_eq!(tag_value("NVIDIA L4 (Vulkan)"), "NVIDIA_L4__Vulkan_");
         assert_eq!(tag_value("0.17.1"), "0.17.1");
+    }
+
+    #[test]
+    fn profiles_carry_the_build() {
+        let mut resource = crate::Resource::default();
+        resource.set("service.version", "0.17.1");
+        resource.set("vcs.ref.head.revision", "abc123def456");
+        resource.set("vcs.ref.head.name", "v0.17.1-12-gabc123def456-dirty");
+        let tags = tags_of(&resource);
+        let tag = |name: &str| {
+            tags.iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(tag("vcs_ref_head_revision"), Some("abc123def456"));
+        assert_eq!(
+            tag("vcs_ref_head_name"),
+            Some("v0.17.1-12-gabc123def456-dirty")
+        );
+        assert_eq!(tag("version"), Some("0.17.1"));
     }
 }
