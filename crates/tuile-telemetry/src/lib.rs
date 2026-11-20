@@ -9,6 +9,9 @@ pub mod otlp;
 pub mod registry;
 pub mod resource;
 mod timing;
+#[cfg(test)]
+#[allow(dead_code)]
+mod vcs;
 
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 mod native;
@@ -27,6 +30,18 @@ pub use native::start_native;
 #[cfg(target_arch = "wasm32")]
 pub use web::{on_switch, start_web};
 
+/// The build of tuile this crate was compiled from, as its build script
+/// found it: from git in a checkout of tuile, else from `TUILE_GIT_COMMIT`
+/// and `TUILE_GIT_DESCRIBE` (a CI or release build, a tarball), else
+/// absent. A host passes them on in its [`Identity`].
+pub mod build {
+    /// The commit, twelve hex digits (`git rev-parse --short=12 HEAD`).
+    pub const REVISION: Option<&str> = option_env!("TUILE_BUILD_REVISION");
+    /// The nearest tag and the way from it
+    /// (`git describe --tags --always --dirty`: `v0.17.1-12-gabc1234`).
+    pub const REF_NAME: Option<&str> = option_env!("TUILE_BUILD_REF_NAME");
+}
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -41,6 +56,9 @@ pub struct Identity<'a> {
     pub version: &'a str,
     /// `vcs.ref.head.revision`: the commit it was built from, when known.
     pub commit: Option<&'a str>,
+    /// `vcs.ref.head.name`: the tag it was built from and the way from it
+    /// (a `git describe`: `v0.17.1-12-gabc1234`), when known.
+    pub ref_name: Option<&'a str>,
     /// `device.class`: the profile the session runs under — `desktop`,
     /// `handheld`, `browser`.
     pub device_class: &'a str,
@@ -117,6 +135,9 @@ pub fn describe(config: &Config, identity: &Identity<'_>) -> Resource {
     r.set("service.instance.id", &resource::session_id());
     if let Some(commit) = identity.commit {
         r.set("vcs.ref.head.revision", commit);
+    }
+    if let Some(name) = identity.ref_name {
+        r.set("vcs.ref.head.name", name);
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -238,14 +259,19 @@ mod tests {
         let identity = Identity {
             service_name: "tuile-viewer",
             version: "0.17.1",
-            commit: Some("abc123"),
+            commit: Some("abc123def456"),
+            ref_name: Some("v0.17.1-12-gabc123def456"),
             device_class: "desktop",
             realm: "native",
         };
         let r = describe(&config, &identity);
         assert_eq!(r.get("service.name"), Some("tuile-viewer"));
         assert_eq!(r.get("service.version"), Some("0.17.1"));
-        assert_eq!(r.get("vcs.ref.head.revision"), Some("abc123"));
+        assert_eq!(r.get("vcs.ref.head.revision"), Some("abc123def456"));
+        assert_eq!(
+            r.get("vcs.ref.head.name"),
+            Some("v0.17.1-12-gabc123def456")
+        );
         assert_eq!(r.get("device.class"), Some("desktop"));
         assert_eq!(r.get("deployment.environment"), Some("test"));
         assert_ne!(r.get("service.instance.id"), Some("fixed"));

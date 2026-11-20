@@ -196,6 +196,7 @@ mod tests {
             service_name: "tuile-viewer",
             version: "0.0.0-test",
             commit: None,
+            ref_name: None,
             device_class: "desktop",
             realm: "native",
         }

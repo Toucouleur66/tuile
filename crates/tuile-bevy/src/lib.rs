@@ -241,7 +241,8 @@ fn telemetry_identity() -> tuile_telemetry::Identity<'static> {
     tuile_telemetry::Identity {
         service_name: "tuile-bevy",
         version: env!("CARGO_PKG_VERSION"),
-        commit: option_env!("TUILE_GIT_COMMIT"),
+        commit: tuile_telemetry::build::REVISION,
+        ref_name: tuile_telemetry::build::REF_NAME,
         device_class: if cfg!(target_arch = "wasm32") {
             "browser"
         } else if cfg!(any(target_os = "ios", target_os = "android")) {
