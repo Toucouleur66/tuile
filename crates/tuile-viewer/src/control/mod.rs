@@ -561,7 +561,6 @@ impl Headless {
                 None,
             ))
             .1,
-            tilesets: start.tilesets.clone(),
         };
         let launch = crate::native::launch::start(&handle, plan.clone());
         let launch = if profile.hold_window_until_warm {

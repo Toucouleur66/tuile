@@ -469,6 +469,17 @@ pub struct Metrics {
     pub store_bytes_served: Counter,
     /// Bytes fetched from the origin and written to the store.
     pub store_bytes_fetched: Counter,
+
+    // --- Reach of the origins ---
+    /// 1 while the terrain's origin is out of reach: its endpoint could not
+    /// be resolved, or its last fetch failed for a reason other than "no such
+    /// tile". The store still serves; only what it lacks waits. 0 when it
+    /// answers, and before anything was asked of it.
+    pub terrain_offline: Gauge,
+    /// The same, for the imagery layer being draped.
+    pub imagery_offline: Gauge,
+    /// Times an origin went from reachable to out of reach, or back.
+    pub source_transitions: Counter,
     /// The loader's presence index asked (`TileLoader::holds`), by the
     /// session for the budget: each one costs a loader its index lookups
     /// and, for a drape, the imagery mosaic it would stack.

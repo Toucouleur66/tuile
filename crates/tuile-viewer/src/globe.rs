@@ -18,9 +18,10 @@ use tuile_core::raster::{CachedImagery, ImageryProvider};
 use tuile_core::source::{TileLoader, TileTree};
 use tuile_core::storage::ContentStore;
 use tuile_planetary::{
-    globe_on, GlobeOptions, Held, ImageryPlanHandle, LayerBudget, Sources, SwitchableImagery,
+    globe_on, DeferredImagery, DeferredTerrain, GlobeOptions, Held, ImageryPlanHandle,
+    LayerBudget, Memory, Sources, SwitchableImagery,
 };
-use tuile_terrain::{CachedTerrain, TerrainSource};
+use tuile_terrain::{CachedTerrain, LayerJson, TerrainSource};
 
 use crate::embed::{ImageryChoice, TerrainChoice};
 
@@ -92,7 +93,7 @@ impl Layers {
             .and_then(|r| r.get(&layer).cloned());
         let provider = match known {
             Some(provider) => provider,
-            None => imagery(self.sources.as_ref(), choice, self.store.as_ref())
+            None => imagery(&self.sources, choice, self.store.as_ref())
                 .await
                 .map_err(|e| e.to_string())?,
         };
@@ -102,7 +103,7 @@ impl Layers {
         // The layer's substitute first: its drapes are only asked for once
         // the fallback specification that names it is sent, after this.
         if let (Some(lane), Some(sub)) = (&self.substitute, choice.substitute_layer()) {
-            let provider = imagery(self.sources.as_ref(), &sub, self.store.as_ref())
+            let provider = imagery(&self.sources, &sub, self.store.as_ref())
                 .await
                 .map_err(|e| e.to_string())?;
             lane.switch_to(provider);
@@ -117,15 +118,38 @@ impl Layers {
 /// two layers under one namespace would serve whichever was stored first —
 /// silently, and looking exactly like a working session showing the wrong
 /// picture.
+///
+/// A layer whose tiling scheme the store remembers is not resolved here: it
+/// is drawn from the store at once and its origin resolved when it answers
+/// (see [`tuile_planetary::reach`]), so a session starts with no network. One
+/// never resolved before is resolved now, and its scheme remembered.
 pub(crate) async fn imagery(
-    sources: &dyn Sources,
+    sources: &Arc<dyn Sources>,
     choice: &ImageryChoice,
     store: Option<&Arc<dyn ContentStore>>,
 ) -> anyhow::Result<Arc<dyn ImageryProvider>> {
-    let provider = sources
-        .imagery(choice.asset)
-        .await
-        .map_err(|why| anyhow::anyhow!("imagery {:?}: {why}", choice.name))?;
+    let memory = store.map(|store| Memory::imagery(Arc::clone(store), &choice.cache));
+    let remembered = match &memory {
+        Some(memory) => memory.scheme().await,
+        None => None,
+    };
+    let provider = match remembered {
+        Some(scheme) => {
+            tracing::info!(layer = %choice.name, "imagery on its remembered grid");
+            DeferredImagery::pending(Arc::clone(sources), choice.asset, scheme, memory)
+        }
+        None => {
+            let provider = sources
+                .imagery(choice.asset)
+                .await
+                .map_err(|why| anyhow::anyhow!("imagery {:?}: {why}", choice.name))?;
+            if let Some(memory) = &memory {
+                memory.keep_scheme(&provider.tiling_scheme()).await;
+            }
+            DeferredImagery::resolved(Arc::clone(sources), choice.asset, provider, memory)
+        }
+    };
+    let provider: Arc<dyn ImageryProvider> = Arc::new(provider);
     Ok(match store {
         Some(store) => Arc::new(CachedImagery::new(
             Held(provider),
@@ -133,6 +157,49 @@ pub(crate) async fn imagery(
             choice.cache.clone(),
         )),
         None => provider,
+    })
+}
+
+/// The host's terrain: its `layer.json` and its tiles, through the store when
+/// there is one — on the description the store remembers, when it does, with
+/// the origin resolved when it answers; resolved now otherwise. See
+/// [`imagery`].
+async fn terrain_of(
+    sources: &Arc<dyn Sources>,
+    terrain: &TerrainChoice,
+    store: Option<&Arc<dyn ContentStore>>,
+) -> anyhow::Result<(LayerJson, Arc<dyn TerrainSource>)> {
+    let memory = store.map(|store| Memory::terrain(Arc::clone(store), &terrain.cache));
+    let remembered = match &memory {
+        Some(memory) => memory.layer().await,
+        None => None,
+    };
+    let (layer, ground) = match remembered {
+        Some(layer) => {
+            tracing::info!("terrain on its remembered description");
+            let ground = DeferredTerrain::pending(Arc::clone(sources), terrain.asset, memory);
+            (layer, ground)
+        }
+        None => {
+            let (layer, ground) = sources
+                .terrain(terrain.asset)
+                .await
+                .map_err(|why| anyhow::anyhow!("terrain: {why}"))?;
+            if let Some(memory) = &memory {
+                memory.keep_layer(&layer).await;
+            }
+            let ground = DeferredTerrain::resolved(Arc::clone(sources), terrain.asset, ground, memory);
+            (layer, ground)
+        }
+    };
+    let ground: Arc<dyn TerrainSource> = Arc::new(ground);
+    Ok(match store {
+        Some(store) => {
+            let namespace = terrain.namespace_for(&layer);
+            let cached = CachedTerrain::new(Held(ground), Arc::clone(store), namespace);
+            (layer, Arc::new(cached))
+        }
+        None => (layer, ground),
     })
 }
 
@@ -163,21 +230,8 @@ pub(crate) async fn assemble(
     let opening_layer = layers
         .get(opening)
         .ok_or_else(|| anyhow::anyhow!("the host offers no imagery layer"))?;
-    let (sources_kept, sources) = (Arc::clone(&sources), sources.as_ref());
-
-    let (layer, ground) = sources
-        .terrain(terrain.asset)
-        .await
-        .map_err(|why| anyhow::anyhow!("terrain: {why}"))?;
-    let ground: Arc<dyn TerrainSource> = match &store {
-        Some(store) => Arc::new(CachedTerrain::new(
-            Held(ground),
-            Arc::clone(store),
-            terrain.namespace_for(&layer),
-        )),
-        None => ground,
-    };
-    let picture = imagery(sources, opening_layer, store.as_ref()).await?;
+    let (layer, ground) = terrain_of(&sources, terrain, store.as_ref()).await?;
+    let picture = imagery(&sources, opening_layer, store.as_ref()).await?;
     tracing::info!(layer = %opening_layer.name, "imagery");
     let deepest = picture.tiling_scheme().maximum_level;
     // The globe is built over a switch, not over the layer: the layer can
@@ -189,7 +243,7 @@ pub(crate) async fn assemble(
     // of it until a fallback specification names it.
     let substitute = if layers.iter().any(|l| l.substitute.is_some()) {
         let first = match opening_layer.substitute_layer() {
-            Some(sub) => imagery(sources, &sub, store.as_ref()).await?,
+            Some(sub) => imagery(&sources, &sub, store.as_ref()).await?,
             None => Arc::clone(&picture),
         };
         Some(SwitchableImagery::new(first))
@@ -231,7 +285,7 @@ pub(crate) async fn assemble(
         budget,
         plan,
         layers: Layers {
-            sources: sources_kept,
+            sources,
             store,
             switch,
             resolved: Arc::new(Mutex::new(HashMap::from([(opening, picture)]))),
@@ -295,7 +349,8 @@ mod tests {
         assert_eq!(refused.to_string(), "terrain: no terrain here");
         assert_eq!(*asked.0.lock().expect("asked"), ["terrain 41"]);
 
-        let refused = futures_executor::block_on(imagery(asked.as_ref(), &layer, None))
+        let asked_sources = Arc::clone(&asked) as Arc<dyn Sources>;
+        let refused = futures_executor::block_on(imagery(&asked_sources, &layer, None))
             .err()
             .expect("there is no imagery");
         assert_eq!(refused.to_string(), "imagery \"Survey\": no imagery here");
@@ -303,5 +358,220 @@ mod tests {
             *asked.0.lock().expect("asked"),
             ["terrain 41", "imagery 77"]
         );
+    }
+
+    /// An origin that serves, never answers, or refuses — as it is told —
+    /// and counts what it is asked.
+    struct Origin {
+        mode: std::sync::atomic::AtomicU8,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    const SERVES: u8 = 0;
+    const HANGS: u8 = 1;
+    const REFUSES: u8 = 2;
+
+    impl Origin {
+        fn set(&self, mode: u8) {
+            self.mode.store(mode, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn asked(&self) -> usize {
+            self.asked.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        async fn answer(&self) -> Result<(), String> {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match self.mode.load(std::sync::atomic::Ordering::SeqCst) {
+                HANGS => std::future::pending().await,
+                REFUSES => Err("dns error: no such host".into()),
+                _ => Ok(()),
+            }
+        }
+    }
+
+    /// The origin's tiles, once it is resolved.
+    struct Served;
+
+    #[async_trait::async_trait]
+    impl TerrainSource for Served {
+        async fn fetch_tile(
+            &self,
+            _coord: tuile_terrain::TileCoord,
+        ) -> Result<tuile_core::fetch::Fetched<Vec<u8>>, tuile_terrain::TerrainSourceError>
+        {
+            Ok(tuile_core::fetch::Fetched::undated(b"mesh".to_vec()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ImageryProvider for Served {
+        fn tiling_scheme(&self) -> tuile_core::raster::TilingScheme {
+            tuile_core::raster::TilingScheme::web_mercator()
+        }
+        async fn fetch_tile_bytes(
+            &self,
+            _coord: tuile_core::raster::ImageryCoord,
+        ) -> Result<tuile_core::fetch::Fetched<bytes::Bytes>, tuile_core::raster::RasterError>
+        {
+            Ok(tuile_core::fetch::Fetched::undated(bytes::Bytes::from_static(b"jpeg")))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Sources for Origin {
+        async fn terrain(
+            &self,
+            _asset: i64,
+        ) -> Result<(tuile_terrain::LayerJson, Arc<dyn TerrainSource>), String> {
+            self.answer().await?;
+            let layer = tuile_terrain::LayerJson::from_slice(
+                br#"{"format":"quantized-mesh-1.0","tiles":["{z}/{x}/{y}.terrain"],"maxzoom":12}"#,
+            )
+            .map_err(|e| e.to_string())?;
+            Ok((layer, Arc::new(Served)))
+        }
+        async fn imagery(&self, _asset: i64) -> Result<Arc<dyn ImageryProvider>, String> {
+            self.answer().await?;
+            Ok(Arc::new(Served))
+        }
+    }
+
+    /// A store in memory, as the disk's is between two sessions.
+    #[derive(Default)]
+    struct Kept(Mutex<HashMap<String, bytes::Bytes>>);
+
+    #[async_trait::async_trait]
+    impl ContentStore for Kept {
+        async fn get(&self, key: &str) -> Option<bytes::Bytes> {
+            self.0.lock().expect("kept").get(key).cloned()
+        }
+        async fn put(&self, key: &str, value: bytes::Bytes, _ttl: Option<std::time::Duration>) {
+            self.0.lock().expect("kept").insert(key.to_owned(), value);
+        }
+        fn holds(&self, key: &str) -> bool {
+            self.0.lock().expect("kept").contains_key(key)
+        }
+    }
+
+    /// `work`, on a thread of its own, or `None` if it has not finished
+    /// within `patience` — a test that waits on a network that never
+    /// answers must fail, not hang.
+    fn within<T: Send + 'static>(
+        patience: std::time::Duration,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(work());
+        });
+        rx.recv_timeout(patience).ok()
+    }
+
+    const TILE: tuile_terrain::TileCoord = tuile_terrain::TileCoord {
+        level: 2,
+        x: 1,
+        y: 1,
+    };
+    const ELSEWHERE: tuile_terrain::TileCoord = tuile_terrain::TileCoord {
+        level: 2,
+        x: 3,
+        y: 0,
+    };
+    const PICTURE: tuile_core::raster::ImageryCoord = tuile_core::raster::ImageryCoord {
+        level: 2,
+        x: 1,
+        y: 1,
+    };
+
+    /// **A session whose origins are out of reach starts at once on what the
+    /// store holds, draws it, and goes back online by itself when the origin
+    /// answers again** — the path a desktop and a page both assemble their
+    /// globe on. Red before the descriptions were remembered: the second
+    /// globe waited on the origin for ever.
+    #[test]
+    fn a_globe_starts_offline_on_its_store_and_comes_back_online() {
+        let origin = Arc::new(Origin {
+            mode: std::sync::atomic::AtomicU8::new(SERVES),
+            asked: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let sources = Arc::clone(&origin) as Arc<dyn Sources>;
+        let store: Arc<dyn ContentStore> = Arc::new(Kept::default());
+        let terrain = TerrainChoice {
+            asset: 1,
+            cache: "t".into(),
+        };
+        let layer = ImageryChoice::new("aerial", "Aerial", 2, "©");
+        let layers = vec![layer.clone()];
+
+        // Online: a session that saw one tile of each.
+        let (_, ground) =
+            futures_executor::block_on(terrain_of(&sources, &terrain, Some(&store))).expect("up");
+        let picture =
+            futures_executor::block_on(imagery(&sources, &layer, Some(&store))).expect("up");
+        futures_executor::block_on(ground.fetch_tile(TILE)).expect("a tile");
+        futures_executor::block_on(picture.fetch_tile_bytes(PICTURE)).expect("a picture");
+        assert_eq!(origin.asked(), 2);
+
+        // The network goes; a new session starts on the store, within a
+        // breath, asking the origin nothing.
+        origin.set(HANGS);
+        let (s, k, t, l) = (
+            Arc::clone(&sources),
+            Arc::clone(&store),
+            terrain.clone(),
+            layers.clone(),
+        );
+        let globe = within(std::time::Duration::from_secs(2), move || {
+            futures_executor::block_on(assemble(
+                s,
+                Some(k),
+                &t,
+                &l,
+                0,
+                Arc::new(tuile_core::offload::Inline),
+                tuile_core::texels::StoredPlan::OFF,
+            ))
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        })
+        .expect("the globe waited on an origin out of reach");
+        globe.expect("the globe came up");
+        assert_eq!(origin.asked(), 2, "the origin was asked at start-up");
+
+        // What the store holds is drawn, with the origin still hanging.
+        let (s, k, t) = (Arc::clone(&sources), Arc::clone(&store), terrain.clone());
+        let (l2, k2, s2) = (layer.clone(), Arc::clone(&store), Arc::clone(&sources));
+        let served = within(std::time::Duration::from_secs(2), move || {
+            futures_executor::block_on(async move {
+                let (_, ground) = terrain_of(&s, &t, Some(&k)).await.expect("up");
+                let picture = imagery(&s2, &l2, Some(&k2)).await.expect("up");
+                (
+                    ground.fetch_tile(TILE).await.map(|f| f.value),
+                    picture.fetch_tile_bytes(PICTURE).await.map(|f| f.value),
+                )
+            })
+        })
+        .expect("a stored tile waited on the origin");
+        assert_eq!(served.0.expect("the stored mesh"), b"mesh".to_vec());
+        assert_eq!(&served.1.expect("the stored picture")[..], b"jpeg");
+
+        // Refused: what the store lacks fails at once — a failure, never an
+        // absence, so it is not remembered as a hole — and the origin is not
+        // asked again before its wait is over.
+        origin.set(REFUSES);
+        let (_, ground) =
+            futures_executor::block_on(terrain_of(&sources, &terrain, Some(&store))).expect("up");
+        let before = origin.asked();
+        let first = futures_executor::block_on(ground.fetch_tile(ELSEWHERE));
+        assert!(!first.expect_err("refused").is_absence());
+        assert!(futures_executor::block_on(ground.fetch_tile(ELSEWHERE)).is_err());
+        assert_eq!(origin.asked(), before + 1, "asked during its wait");
+
+        // The network comes back: the next request after the wait resolves
+        // the origin, with no new session, and gets its tile.
+        origin.set(SERVES);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let back = futures_executor::block_on(ground.fetch_tile(ELSEWHERE)).expect("back online");
+        assert_eq!(back.value, b"mesh".to_vec());
+        assert_eq!(origin.asked(), before + 2);
     }
 }

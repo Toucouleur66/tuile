@@ -9723,6 +9723,7 @@ dependencies = [
  "android_log-sys",
  "anyhow",
  "async-trait",
+ "bytes",
  "console_error_panic_hook",
  "ctrlc",
  "futures-executor",

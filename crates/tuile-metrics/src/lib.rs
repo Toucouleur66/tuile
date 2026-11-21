@@ -288,6 +288,18 @@ pub fn describe() {
     describe_gauge!("tuile_tiles_culled", "Nodes no view could see.");
     describe_gauge!("tuile_tiles_selected", "Tiles the last pass chose to draw.");
     describe_gauge!("tuile_gaps", "Ground drawn by nothing. Zero on a globe.");
+    describe_gauge!(
+        "tuile_terrain_offline",
+        "1 while the terrain's origin is out of reach: the store serves alone."
+    );
+    describe_gauge!(
+        "tuile_imagery_offline",
+        "1 while the imagery's origin is out of reach: the store serves alone."
+    );
+    describe_counter!(
+        "tuile_source_transitions",
+        "Times an origin went out of reach, or came back."
+    );
     describe_gauge!("tuile_loads_in_flight", "Loads outstanding.");
     describe_gauge!("tuile_meshes_in_flight", "Terrain fetches outstanding.");
     describe_gauge!("tuile_textures_in_flight", "Imagery fetches outstanding.");
@@ -511,11 +523,14 @@ pub fn publish(m: &Metrics) {
     counter!("tuile_drapes_withheld").absolute(m.drapes_withheld.get());
     counter!("tuile_height_queries").absolute(m.height_queries.get());
     counter!("tuile_ground_tiles").absolute(m.ground_tiles.get());
+    counter!("tuile_source_transitions").absolute(m.source_transitions.get());
 
     gauge!("tuile_tiles_visited").set(m.tiles_visited.get() as f64);
     gauge!("tuile_tiles_culled").set(m.tiles_culled.get() as f64);
     gauge!("tuile_tiles_selected").set(m.tiles_selected.get() as f64);
     gauge!("tuile_gaps").set(m.gaps.get() as f64);
+    gauge!("tuile_terrain_offline").set(m.terrain_offline.get() as f64);
+    gauge!("tuile_imagery_offline").set(m.imagery_offline.get() as f64);
     gauge!("tuile_loads_in_flight").set(m.loads_in_flight.get() as f64);
     gauge!("tuile_meshes_in_flight").set(m.meshes_in_flight.get() as f64);
     gauge!("tuile_textures_in_flight").set(m.textures_in_flight.get() as f64);

@@ -51,10 +51,6 @@ pub(crate) struct Started {
     pub gate: Gate,
     /// The runtime the store is flushed on.
     pub runtime: tokio::runtime::Handle,
-    /// The 3D Tiles drawn over the globe, until the window takes them.
-    pub surfaces: Vec<crate::surface::Surface>,
-    /// Why a tileset asked for is not among them: its asset, and a sentence.
-    pub surface_failures: Vec<(i64, String)>,
     /// The session's scene: the globe, and each tileset switched on.
     pub scene: tuile_core::Composite,
     /// What a tileset switched on later is opened with: the host's sources,
@@ -64,13 +60,12 @@ pub(crate) struct Started {
 }
 
 impl Started {
-    /// The 3D Tiles drawn over the globe, and why any asked for is not, for
-    /// the window to take once.
+    /// The 3D Tiles drawn over the globe, from the start: none — the window
+    /// opens each switched on once the session is up ([`Self::open_tileset`]),
+    /// as a page does. Opening one is a round trip to its origin, and a
+    /// session must not wait on an origin to start.
     pub(crate) fn take_surfaces(&mut self) -> (Vec<crate::surface::Surface>, Vec<(i64, String)>) {
-        (
-            std::mem::take(&mut self.surfaces),
-            std::mem::take(&mut self.surface_failures),
-        )
+        (Vec::new(), Vec::new())
     }
 
     /// Opens the host's tileset `asset` again, after the session is up — a
@@ -113,12 +108,8 @@ impl Started {
             server,
             store,
             runtime,
-            surfaces,
             ..
         } = self;
-        // The tilesets leave the scene, then the session ends with its
-        // stream.
-        drop(surfaces);
         drop(stream);
         crate::native::store::close(store, &runtime, patience);
         if join_the_server {
@@ -214,9 +205,6 @@ pub(crate) struct Plan {
     /// What the same choice does with imagery stored already compressed:
     /// fixed for the session, as the globe is built with it.
     pub stored_imagery: tuile_core::texels::StoredPlan,
-    /// The host's 3D Tiles tilesets drawn over the globe, by asset number:
-    /// see [`crate::surface`].
-    pub tilesets: Vec<i64>,
 }
 
 /// Starts the launch on `runtime` and returns at once.
@@ -302,22 +290,6 @@ async fn bring_up_now(plan: Plan, runtime: tokio::runtime::Handle) -> Outcome {
         .name("geometry-server".into())
         .spawn(move || server_runtime.block_on(server.run()))
         .map_err(|e| format!("the geometry server could not start: {e}"))?;
-    // The 3D Tiles over it. One that cannot be opened is said and left out:
-    // the globe stands without it.
-    let mut surfaces = Vec::new();
-    let mut surface_failures = Vec::new();
-    for &asset in &plan.tilesets {
-        match open_surface(sources.as_ref(), asset, &plan.config, &scene, &gate).await {
-            Ok(surface) => {
-                tracing::info!(asset, "3D Tiles tileset up");
-                surfaces.push(surface);
-            }
-            Err(why) => {
-                tracing::error!(asset, "3D Tiles tileset not opened: {why}");
-                surface_failures.push((asset, format!("3D Tiles asset {asset}: {why}")));
-            }
-        }
-    }
     Ok(Started {
         stream,
         server: Some(server),
@@ -333,8 +305,6 @@ async fn bring_up_now(plan: Plan, runtime: tokio::runtime::Handle) -> Outcome {
         store,
         gate,
         runtime,
-        surfaces,
-        surface_failures,
         scene,
         sources,
         plan,
@@ -518,7 +488,6 @@ mod tests {
             timeout: crate::launch::START_TIMEOUT,
             imagery_plan: tuile_core::texels::ImageryPlan::RGBA8,
             stored_imagery: tuile_core::texels::StoredPlan::OFF,
-            tilesets: Vec::new(),
         }
     }
 
@@ -597,5 +566,117 @@ mod tests {
                 .as_deref(),
             Some("there is no key")
         );
+    }
+
+    /// A host whose origin can be told to answer or not.
+    struct Switchable(Arc<std::sync::atomic::AtomicBool>);
+
+    struct Origin(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Origin {
+        async fn reachable(&self) -> Result<(), String> {
+            if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                Ok(())
+            } else {
+                std::future::pending().await
+            }
+        }
+    }
+
+    struct Tiles;
+
+    #[async_trait::async_trait]
+    impl tuile_terrain::TerrainSource for Tiles {
+        async fn fetch_tile(
+            &self,
+            _coord: tuile_terrain::TileCoord,
+        ) -> Result<tuile_core::fetch::Fetched<Vec<u8>>, tuile_terrain::TerrainSourceError>
+        {
+            Err(tuile_terrain::TerrainSourceError::no_such_tile("none here"))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::embed::Sources for Origin {
+        async fn terrain(
+            &self,
+            _asset: i64,
+        ) -> Result<
+            (
+                tuile_terrain::LayerJson,
+                Arc<dyn tuile_terrain::TerrainSource>,
+            ),
+            String,
+        > {
+            self.reachable().await?;
+            let layer = tuile_terrain::LayerJson::from_slice(
+                br#"{"format":"quantized-mesh-1.0","tiles":["{z}/{x}/{y}.terrain"],"maxzoom":10}"#,
+            )
+            .map_err(|e| e.to_string())?;
+            Ok((layer, Arc::new(Tiles)))
+        }
+        async fn imagery(
+            &self,
+            _asset: i64,
+        ) -> Result<Arc<dyn tuile_core::raster::ImageryProvider>, String> {
+            self.reachable().await?;
+            Ok(Arc::new(tuile_core::raster::TemplateProvider::new(
+                "https://tiles.invalid/{z}/{x}/{y}.png",
+                Arc::new(tuile_core::fetch::FsFetcher),
+                tuile_core::raster::TilingScheme::web_mercator(),
+            )))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ViewerHost for Switchable {
+        fn identity(&self) -> crate::embed::Identity {
+            crate::embed::Identity::default()
+        }
+        fn terrain(&self) -> TerrainChoice {
+            Stalled.terrain()
+        }
+        fn imagery(&self) -> Vec<ImageryChoice> {
+            Stalled.imagery()
+        }
+        async fn connect(&self) -> Result<Arc<dyn crate::embed::Sources>, String> {
+            Ok(Arc::new(Origin(Arc::clone(&self.0))))
+        }
+    }
+
+    /// **A desktop or a phone started with its origins out of reach comes up
+    /// at once on the store a session before it left**, and its window is
+    /// never kept waiting for the network. Red before the descriptions were
+    /// remembered: the start-up waited on the origin until it was called off.
+    #[test]
+    fn a_session_starts_with_its_origins_out_of_reach() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let reachable = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut online = plan(Arc::new(Switchable(Arc::clone(&reachable))));
+        online.store = dir.path().join("store");
+        online.profile.store_memory_bytes = 1 << 20;
+        online.profile.store_disk_bytes = 64 << 20;
+        online.timeout = Duration::from_secs(5);
+        // Once with the network, which leaves the store its descriptions.
+        let started = start(runtime.handle(), online.clone())
+            .wait()
+            .expect("an online start");
+        started.close(Duration::from_secs(10), true);
+
+        // Then without it.
+        reachable.store(false, std::sync::atomic::Ordering::SeqCst);
+        let began = Instant::now();
+        let started = start(runtime.handle(), online)
+            .wait()
+            .expect("an offline start");
+        let took = began.elapsed();
+        assert!(took < Duration::from_secs(2), "the start-up took {took:?}");
+        started.close(Duration::from_secs(10), true);
+        runtime.shutdown_background();
     }
 }

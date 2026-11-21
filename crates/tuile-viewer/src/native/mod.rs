@@ -352,9 +352,6 @@ fn session(
         timeout: crate::launch::START_TIMEOUT,
         imagery_plan,
         stored_imagery,
-        // Only those on: one switched off costs nothing, its root not even
-        // asked for.
-        tilesets: on.clone(),
     };
     let launch = launch::start(&handle, plan.clone());
     // A phone tries again by itself; a desktop says why and stops, as it

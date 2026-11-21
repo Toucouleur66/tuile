@@ -5,11 +5,13 @@
 
 pub mod jobs;
 mod provenance;
+pub mod reach;
 mod sources;
 mod store_log;
 mod switch;
 
 pub use provenance::{digest, Provenance, TerrainOrigin};
+pub use reach::{DeferredImagery, DeferredTerrain, Memory, Patience};
 pub use sources::{Credit, Held, Sources, TilesetSource};
 pub use switch::SwitchableImagery;
 
