@@ -280,6 +280,16 @@ impl Picture {
     }
 }
 
+/// Where a pass of its own draws: the frame's colour attachment, the
+/// view it resolves to when multisampled, the attachment's size and where
+/// the picture sits in it.
+struct Target<'a> {
+    colour: &'a wgpu::TextureView,
+    resolve: Option<&'a wgpu::TextureView>,
+    size: (u32, u32),
+    picture: Picture,
+}
+
 /// Draws `tuile_overlay::OverlayMesh` in the world, through the frame's
 /// camera.
 ///
@@ -575,7 +585,13 @@ impl WorldOverlayRenderer {
         if !self.needs_own_depth() && !self.has_always() {
             return;
         }
-        self.own_pass(gpu, encoder, colour, resolve, size, picture, |p| {
+        let target = Target {
+            colour,
+            resolve,
+            size,
+            picture,
+        };
+        self.own_pass(gpu, encoder, target, |p| {
             p == Pass::OverlaysOnly || p == Pass::InFrame(InFrame::Always)
         });
     }
@@ -625,23 +641,30 @@ impl WorldOverlayRenderer {
         if !self.needs_own_depth() {
             return;
         }
-        self.own_pass(gpu, encoder, colour, resolve, size, picture, |p| {
-            p == Pass::OverlaysOnly
-        });
+        let target = Target {
+            colour,
+            resolve,
+            size,
+            picture,
+        };
+        self.own_pass(gpu, encoder, target, |p| p == Pass::OverlaysOnly);
     }
 
     /// The pass with a depth of its own, cleared to the far plane, drawing
-    /// the batches `wanted`.
+    /// the batches `wanted` into `target`.
     fn own_pass(
         &mut self,
         gpu: &GpuContext,
         encoder: &mut wgpu::CommandEncoder,
-        colour: &wgpu::TextureView,
-        resolve: Option<&wgpu::TextureView>,
-        size: (u32, u32),
-        picture: Picture,
+        target: Target<'_>,
         wanted: impl Fn(Pass) -> bool,
     ) {
+        let Target {
+            colour,
+            resolve,
+            size,
+            picture,
+        } = target;
         let size = (size.0.max(1), size.1.max(1));
         let depth = match &self.own_depth {
             Some((view, had)) if *had == size => view,
