@@ -28,7 +28,9 @@ use super::cost::Cost;
 use super::deadline::FrameDeadline;
 use super::decisions::{Decisions, Role};
 use super::need::NeedSet;
-use super::stats::{CancelReason, EvictReason, GAP_BUCKETS, LATENCY_BUCKETS, LEVELS};
+use super::stats::{
+    CancelReason, EvictReason, LayerStats, LevelStats, GAP_BUCKETS, LATENCY_BUCKETS, LAYERS, LEVELS,
+};
 use super::tier::Presence;
 use super::types::{
     Bytes, Class, Failure, Generation, LayerId, Micros, PerClass, Policy, Pressure, ResourceId,
@@ -309,6 +311,33 @@ pub struct BudgetSignals {
     /// `evictions_total`'s sweep, pressure and admission, by the evicted
     /// resource's level. Exposed from a level's first.
     pub evictions_by_level_total: PerClass<[u64; LEVELS]>,
+    /// The last step per level ([`LevelStats`]): the gauges
+    /// `copies_by_level{class,tier,level}` (gpu, decoded),
+    /// `decoded_bytes_by_level{class,level}`,
+    /// `tiles_by_level{class,state,level}` (drawn, selected, under_need) and
+    /// `loads_by_level{class,state,kind,level}` (in_flight, queued × need,
+    /// prefetch), each exposed from the level's first non-zero value, as
+    /// `bytes_by_level` is.
+    pub levels: LevelStats,
+    /// The levels of each class [`Self::levels`] has named since the
+    /// meter's start, one bit each.
+    pub levels_seen: PerClass<u32>,
+    /// `level_events_total{class,kind,level}`, the sums of
+    /// [`Self::levels`]' counters: `[start, completion, wasted, release]`.
+    pub level_events_total: PerClass<[[u64; 4]; LEVELS]>,
+    /// The last step's drapes per imagery layer ([`LayerStats`]), by the
+    /// layer's index and never its name: `drapes_by_layer{layer,state}`
+    /// (gpu, drawn, in_flight) and `drape_bytes_by_layer{layer}`, exposed
+    /// from the layer's first.
+    pub layers: LayerStats,
+    /// The layers named since the meter's start, one bit each.
+    pub layers_seen: u32,
+    /// The floor's last level (`BudgetConfig::pinned_level`): the levels
+    /// up to it are protected ground.
+    pub floor_level: Option<u32>,
+    /// `layer_loads_total{layer,kind}`: `[store, network, ram, completion,
+    /// failure]` — requests by source, RAM hits, completions, failures.
+    pub layer_loads_total: [[u64; 5]; LAYERS],
     /// `decoded_bytes`.
     pub decoded_bytes: u64,
     /// `protected_bytes{class}`.
@@ -497,6 +526,26 @@ pub mod labels {
     pub const EYE: [&str; 4] = ["0", "1", "2", "3"];
     /// `level`, 0 to 24: a level of the budget's per-level series
     /// (`stats::level_index`; deeper levels count in the last).
+    /// A copy's tier in `copies_by_level`.
+    pub const TIER: [&str; 2] = ["gpu", "decoded"];
+    /// The states of `tiles_by_level`, `loads_by_level` and
+    /// `drapes_by_layer`.
+    pub const LEVEL_STATE: [&str; 6] = [
+        "drawn",
+        "selected",
+        "under_need",
+        "in_flight",
+        "queued",
+        "gpu",
+    ];
+    /// An imagery layer's index (`stats::layer_index`): never its name.
+    pub const LAYER: [&str; super::LAYERS] = ["0", "1", "2", "3"];
+    /// `layer_loads_total`'s kinds, in its order.
+    pub const LAYER_LOAD: [&str; 5] = ["store", "network", "ram", "completion", "failure"];
+    /// A load's kind (`stats::prefetch_index`).
+    pub const LOAD_KIND: [&str; 2] = ["need", "prefetch"];
+    /// The per-level counters, in `level_events_total`'s order.
+    pub const LEVEL_EVENT: [&str; 4] = ["start", "completion", "wasted", "release"];
     pub const LEVEL: [&str; super::LEVELS] = [
         "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
         "17", "18", "19", "20", "21", "22", "23", "24",
@@ -561,6 +610,88 @@ impl BudgetSignals {
                     "evictions_by_level_total",
                     vec![("class", labels::class(c)), ("level", labels::LEVEL[l])],
                     *v as f64,
+                ));
+            }
+        }
+        let v = &self.levels;
+        for c in Class::ALL {
+            let seen = self.levels_seen[c];
+            for l in (0..LEVELS).filter(|l| seen & (1 << l) != 0) {
+                let at = |more: Vec<(&'static str, &'static str)>| {
+                    let mut k = vec![("class", labels::class(c)), ("level", labels::LEVEL[l])];
+                    k.extend(more);
+                    k
+                };
+                for (tier, n) in [
+                    ("gpu", v.gpu_tiles[c][l]),
+                    ("decoded", v.decoded_tiles[c][l]),
+                ] {
+                    out.push(("copies_by_level", at(vec![("tier", tier)]), f64::from(n)));
+                }
+                out.push((
+                    "decoded_bytes_by_level",
+                    at(vec![]),
+                    v.decoded[c][l].0 as f64,
+                ));
+                for (state, n) in [
+                    ("drawn", v.drawn[c][l]),
+                    ("selected", v.selected[c][l]),
+                    ("under_need", v.under_need[c][l]),
+                ] {
+                    out.push(("tiles_by_level", at(vec![("state", state)]), f64::from(n)));
+                }
+                for (state, n) in [("in_flight", v.in_flight[c][l]), ("queued", v.queued[c][l])] {
+                    for (i, kind) in labels::LOAD_KIND.iter().enumerate() {
+                        out.push((
+                            "loads_by_level",
+                            at(vec![("state", state), ("kind", kind)]),
+                            f64::from(n[i]),
+                        ));
+                    }
+                }
+            }
+            for (l, e) in self.level_events_total[c].iter().enumerate() {
+                for (i, kind) in labels::LEVEL_EVENT
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| e[*i] > 0)
+                {
+                    out.push((
+                        "level_events_total",
+                        vec![
+                            ("class", labels::class(c)),
+                            ("kind", kind),
+                            ("level", labels::LEVEL[l]),
+                        ],
+                        e[i] as f64,
+                    ));
+                }
+            }
+        }
+        let y = &self.layers;
+        for i in (0..LAYERS).filter(|i| self.layers_seen & (1 << i) != 0) {
+            let layer = labels::LAYER[i];
+            for (state, n) in [
+                ("gpu", y.gpu_tiles[i]),
+                ("drawn", y.drawn[i]),
+                ("in_flight", y.in_flight[i]),
+            ] {
+                out.push((
+                    "drapes_by_layer",
+                    vec![("layer", layer), ("state", state)],
+                    f64::from(n),
+                ));
+            }
+            out.push((
+                "drape_bytes_by_layer",
+                vec![("layer", layer)],
+                y.gpu_bytes[i].0 as f64,
+            ));
+            for (k, kind) in labels::LAYER_LOAD.iter().enumerate() {
+                out.push((
+                    "layer_loads_total",
+                    vec![("layer", layer), ("kind", kind)],
+                    self.layer_loads_total[i][k] as f64,
                 ));
             }
         }
@@ -882,6 +1013,7 @@ impl BudgetMeter {
             ..BudgetMeter::default()
         };
         m.s.spec = crate::spec::Specification::for_policy(cfg.policy).kind;
+        m.s.floor_level = cfg.pinned_level;
         m
     }
 
@@ -972,8 +1104,45 @@ impl BudgetObserver for BudgetMeter {
                     s.bytes_levels[c] |= 1 << l;
                 }
                 s.evictions_by_level_total[c][l] += u64::from(st.evictions_by_level[c][l]);
+                let v = &st.levels;
+                let events = [
+                    v.starts[c][l],
+                    v.completions[c][l],
+                    v.wasted[c][l],
+                    v.releases[c][l],
+                ];
+                for (t, n) in s.level_events_total[c][l].iter_mut().zip(events) {
+                    *t += u64::from(n);
+                }
+                let named = v.gpu_tiles[c][l] != 0
+                    || v.decoded_tiles[c][l] != 0
+                    || v.drawn[c][l] != 0
+                    || v.selected[c][l] != 0
+                    || v.in_flight[c][l] != [0, 0]
+                    || v.queued[c][l] != [0, 0];
+                if named {
+                    s.levels_seen[c] |= 1 << l;
+                }
             }
             s.estimate_drift_exceeded_total[c] += u64::from(st.drift_exceeded[c]);
+        }
+        s.levels = st.levels;
+        let y = &st.layers;
+        s.layers = *y;
+        for i in 0..LAYERS {
+            let events = [
+                y.requests[i][0],
+                y.requests[i][1],
+                y.ram_hits[i],
+                y.completions[i],
+                y.failures[i],
+            ];
+            for (t, n) in s.layer_loads_total[i].iter_mut().zip(events) {
+                *t += u64::from(n);
+            }
+            if y.gpu_tiles[i] != 0 || y.drawn[i] != 0 || y.in_flight[i] != 0 || events != [0; 5] {
+                s.layers_seen |= 1 << i;
+            }
         }
         s.in_flight = st.in_flight;
         s.local_reads = st.local_reads;

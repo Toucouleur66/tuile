@@ -862,7 +862,13 @@ fn labels_stay_within_their_closed_sets() {
     let allowed = |key: &str, value: &str| -> bool {
         let set: Vec<&str> = match key {
             "class" => classes.clone(),
-            "state" => labels::STATE.to_vec(),
+            "state" => labels::STATE
+                .iter()
+                .chain(&labels::LEVEL_STATE)
+                .copied()
+                .collect(),
+            "tier" => labels::TIER.to_vec(),
+            "layer" => labels::LAYER.to_vec(),
             "source" => labels::SOURCE
                 .iter()
                 .chain(&labels::SPEC_SOURCE)
@@ -880,6 +886,9 @@ fn labels_stay_within_their_closed_sets() {
                 .chain(&labels::FLAP)
                 .chain(&labels::SWAP)
                 .chain(&labels::DEFICIT)
+                .chain(&labels::LOAD_KIND)
+                .chain(&labels::LEVEL_EVENT)
+                .chain(&labels::LAYER_LOAD)
                 .copied()
                 .collect(),
             "gap" => labels::GAP.to_vec(),
@@ -899,4 +908,115 @@ fn labels_stay_within_their_closed_sets() {
         }
     }
     let _ = LayerId(0);
+}
+
+/// The step per level (`levels`, `copies_by_level`, `tiles_by_level`,
+/// `loads_by_level`, `level_events_total`): each count is at the level of
+/// what it counts and sums back to the total the other signals give — the
+/// copies to the ledger, the loads in flight to `in_flight`, the starts and
+/// completions to theirs; a wanted tile drawn by its parent is under its
+/// need at its own level; a load ranked past the slots is queued.
+#[test]
+fn the_step_per_level_sums_back_to_the_totals() {
+    let coarse: Vec<_> = (0..3).map(|x| t(3, x, 0)).collect();
+    let fine = t(5, 1, 9);
+    let mut all = coarse.clone();
+    all.push(fine);
+    let mut c = Rig::interactive_config();
+    c.max_in_flight[Class::TerrainMesh] = 2;
+    let mut m = Metered::new(c);
+    m.settle(&drawn_draped(&all, 4), 40);
+    let s = m.s();
+    let v = s.levels;
+    let mesh = Class::TerrainMesh;
+    assert_eq!(v.gpu_tiles[mesh][3], 3, "{RED}: three meshes at level 3");
+    assert_eq!(v.gpu_tiles[mesh][5], 1, "{RED}: one at level 5");
+    assert_eq!(v.drawn[mesh][3], 3, "{RED}: drawn at level 3");
+    assert_eq!(v.selected[mesh][3], 3, "{RED}: selected at level 3");
+    assert_eq!(v.selected[mesh][5], 1);
+    let worn: u32 = v.drawn[Class::Drape].iter().sum();
+    assert_eq!(worn, 4, "{RED}: a drape worn on each tile");
+    let decoded: u64 = Class::ALL
+        .iter()
+        .flat_map(|c| v.decoded[*c].iter())
+        .map(|b| b.0)
+        .sum();
+    assert_eq!(decoded, s.decoded_bytes, "{RED}: decoded bytes by level");
+    for c in Class::ALL {
+        let gpu: u64 = (0..25).map(|l| u64::from(v.gpu_tiles[c][l])).sum();
+        assert_eq!(gpu > 0, s.bytes[c][0] > 0, "{c:?}");
+    }
+    let events = |s: &BudgetSignals, c: Class, k: usize| -> u64 {
+        s.level_events_total[c].iter().map(|e| e[k]).sum()
+    };
+    for c in Class::ALL {
+        assert_eq!(
+            events(&s, c, 0),
+            s.starts_total[c][0] + s.starts_total[c][1],
+            "{c:?} starts"
+        );
+    }
+    assert_eq!(
+        Class::ALL.iter().map(|c| events(&s, *c, 1)).sum::<u64>(),
+        s.completions_total,
+        "{RED}: completions by level"
+    );
+    assert!(s.series().iter().any(|(n, l, v)| *n == "copies_by_level"
+        && l.contains(&("level", "3"))
+        && l.contains(&("tier", "gpu"))
+        && *v == 3.0));
+
+    // Four children of a drawn tile wanted at once: two slots, so two in
+    // flight and two queued, and each child drawn by its parent meanwhile.
+    let kids = children(coarse[0]);
+    let mut need = drawn_draped(&kids, 4);
+    need.ancestors.push((coarse[0], draped(coarse[0], 4)));
+    m.step(&need);
+    let s = m.s();
+    let v = s.levels;
+    let flying: u32 = (0..25)
+        .map(|l| v.in_flight[mesh][l][0] + v.in_flight[mesh][l][1])
+        .sum();
+    assert_eq!(flying, s.in_flight[mesh], "{RED}: in flight by level");
+    assert_eq!(
+        v.in_flight[mesh][4][0], 2,
+        "{RED}: the two started, as needs"
+    );
+    assert_eq!(v.queued[mesh][4][0], 2, "{RED}: the two waiting for a slot");
+    assert_eq!(v.under_need[mesh][4], 4, "{RED}: drawn by their parent");
+}
+
+/// The drapes per imagery layer (`layers`, `drapes_by_layer`,
+/// `layer_loads_total`): two layers on the same tiles, each counted under
+/// its own index — its GPU copies and bytes, the drapes worn, its requests
+/// and completions — and the series name the index, never a name.
+#[test]
+fn the_drapes_are_counted_per_layer() {
+    let tiles: Vec<_> = (0..3).map(|x| t(3, x, 0)).collect();
+    let mut m = Metered::interactive();
+    m.settle(&drawn_layered(&tiles, 4, &[0, 1]), 40);
+    let s = m.s();
+    let y = s.layers;
+    assert_eq!(y.gpu_tiles[0], 3, "{RED}: layer 0 resident");
+    assert_eq!(y.gpu_tiles[1], 3, "{RED}: layer 1 resident");
+    assert_eq!(y.drawn[0], 3);
+    assert_eq!(y.drawn[1], 3);
+    assert_eq!(
+        y.gpu_bytes[0].0 + y.gpu_bytes[1].0,
+        s.bytes[Class::Drape][0],
+        "{RED}: the layers' bytes are the drapes'"
+    );
+    for i in 0..2 {
+        let [store, network, _, completion, _] = s.layer_loads_total[i];
+        assert_eq!(store + network, 3, "{RED}: layer {i} requested its three");
+        assert_eq!(completion, 3, "{RED}: and they came");
+    }
+    let named: Vec<_> = s
+        .series()
+        .into_iter()
+        .filter(|(n, _, _)| *n == "drapes_by_layer")
+        .flat_map(|(_, l, _)| l.into_iter().filter(|(k, _)| *k == "layer").map(|(_, v)| v))
+        .collect();
+    assert!(named.iter().all(|v| *v == "0" || *v == "1"), "{named:?}");
+    assert!(!named.is_empty(), "{RED}: exposed");
 }

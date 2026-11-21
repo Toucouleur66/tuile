@@ -5,6 +5,7 @@
 //! pixel gestures to the render-agnostic [`tuile_camera::CameraController`] and
 //! drives the geometry stream through the [`ContentPump`].
 
+mod budget_window;
 mod command;
 mod credits;
 mod demand;
@@ -351,6 +352,8 @@ pub struct App {
     /// The diagnostic override of the budget's specification in force
     /// (`steer::BudgetAsk`; none: the context's).
     budget_ask: crate::steer::BudgetAsk,
+    /// The budget window over the view (`budget_window`).
+    budget_window: budget_window::BudgetWindow,
     recording: tape::Recording,
     warmup: warmup::Warmup,
     pacing: pacing::Pacing,
@@ -514,6 +517,7 @@ impl App {
             pointer: input::Pointer::default(),
             views: input::Views::default(),
             budget_ask: crate::steer::BudgetAsk::default(),
+            budget_window: budget_window::BudgetWindow::default(),
             recording: tape::Recording {
                 tape: crate::recording::open_tape(config.record.path.as_deref()),
                 trace: crate::recording::open_trace(),

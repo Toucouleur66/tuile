@@ -5,6 +5,7 @@
 
 mod credits;
 mod nav;
+mod panel;
 mod spinner;
 #[cfg(feature = "statusbar")]
 mod statusbar;
@@ -12,6 +13,7 @@ mod text;
 
 pub use credits::{BarLayout, CreditBar};
 pub use nav::{NavWidget, Part};
+pub use panel::{Panel, PanelLayout};
 pub use spinner::{Spinner, SPOKES};
 pub use text::{Fitted, Font, Label, Mask};
 

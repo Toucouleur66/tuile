@@ -10,8 +10,8 @@
 //! without either crate learning about the other: the widget hands over
 //! triangles, this uploads them.
 //!
-//! One texture, for one thing triangles draw badly: a line of text. It comes
-//! as a coverage mask ([`OverlayMask`], what `tuile_ui::Label` holds), is
+//! Textures, for one thing triangles draw badly: text. Each comes as a
+//! coverage mask ([`OverlayMask`], what `tuile_ui::Label` holds), is
 //! uploaded only when it changes, and is drawn as one quad over the
 //! triangles, a mask pixel to a screen pixel.
 
@@ -67,6 +67,7 @@ struct MaskUniform {
 struct MaskDraw {
     size: (u32, u32),
     coverage: Vec<u8>,
+    uniform: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
 }
 
@@ -80,10 +81,9 @@ pub struct OverlayRenderer {
     capacity: u32,
     mask_pipeline: wgpu::RenderPipeline,
     mask_layout: wgpu::BindGroupLayout,
-    mask_uniform: wgpu::Buffer,
     sampler: wgpu::Sampler,
-    /// The mask drawn, if any.
-    mask: Option<MaskDraw>,
+    /// The masks drawn, in order.
+    masks: Vec<MaskDraw>,
 }
 
 impl OverlayRenderer {
@@ -188,12 +188,6 @@ impl OverlayRenderer {
         });
 
         let (mask_pipeline, mask_layout) = mask_pipeline(gpu, &bgl, target_format, depth_format);
-        let mask_uniform = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("tuile overlay mask"),
-            size: std::mem::size_of::<MaskUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         // A mask pixel to a screen pixel: nothing to filter, and a
         // non-filtering sampler is what every backend (WebGL2 included)
         // takes for any format.
@@ -212,48 +206,64 @@ impl OverlayRenderer {
             capacity: 0,
             mask_pipeline,
             mask_layout,
-            mask_uniform,
             sampler,
-            mask: None,
+            masks: Vec::new(),
         }
     }
 
     /// Replaces the mask drawn over the triangles; `None` draws none.
-    ///
-    /// The texture is made again only when the mask's pixels change: a line
-    /// that stays the same from frame to frame costs a 32-byte write for
-    /// where it goes and in which colour.
     pub fn set_mask(&mut self, gpu: &GpuContext, mask: Option<OverlayMask<'_>>) {
-        let Some(mask) = mask else {
-            self.mask = None;
-            return;
-        };
-        let (w, h) = (mask.width, mask.height);
-        if w == 0 || h == 0 || mask.coverage.len() < (w * h) as usize {
-            self.mask = None;
-            return;
+        self.set_masks(gpu, mask.as_slice());
+    }
+
+    /// Replaces the masks drawn over the triangles, drawn in order; an
+    /// empty slice draws none.
+    ///
+    /// A mask's texture is made again only when its pixels change: one that
+    /// stays the same from frame to frame — at the same place in the list,
+    /// or anywhere in it — costs a 32-byte write for where it goes and in
+    /// which colour.
+    pub fn set_masks(&mut self, gpu: &GpuContext, masks: &[OverlayMask<'_>]) {
+        let mut old = std::mem::take(&mut self.masks);
+        for mask in masks {
+            let (w, h) = (mask.width, mask.height);
+            if w == 0 || h == 0 || mask.coverage.len() < (w * h) as usize {
+                continue;
+            }
+            let coverage = &mask.coverage[..(w * h) as usize];
+            let kept = old
+                .iter()
+                .position(|m| m.size == (w, h) && m.coverage == coverage)
+                .map(|i| old.swap_remove(i));
+            let draw = match kept {
+                Some(draw) => draw,
+                None => self.upload(gpu, (w, h), coverage),
+            };
+            gpu.queue.write_buffer(
+                &draw.uniform,
+                0,
+                bytemuck::bytes_of(&MaskUniform {
+                    rect: [
+                        mask.position[0].round(),
+                        mask.position[1].round(),
+                        w as f32,
+                        h as f32,
+                    ],
+                    color: mask.color,
+                }),
+            );
+            self.masks.push(draw);
         }
-        let coverage = &mask.coverage[..(w * h) as usize];
-        gpu.queue.write_buffer(
-            &self.mask_uniform,
-            0,
-            bytemuck::bytes_of(&MaskUniform {
-                rect: [
-                    mask.position[0].round(),
-                    mask.position[1].round(),
-                    w as f32,
-                    h as f32,
-                ],
-                color: mask.color,
-            }),
-        );
-        if self
-            .mask
-            .as_ref()
-            .is_some_and(|m| m.size == (w, h) && m.coverage == coverage)
-        {
-            return;
-        }
+    }
+
+    /// One mask's texture, uniform and bind group.
+    fn upload(&self, gpu: &GpuContext, (w, h): (u32, u32), coverage: &[u8]) -> MaskDraw {
+        let uniform = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tuile overlay mask"),
+            size: std::mem::size_of::<MaskUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let size = wgpu::Extent3d {
             width: w,
             height: h,
@@ -291,7 +301,7 @@ impl OverlayRenderer {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: self.mask_uniform.as_entire_binding(),
+                    resource: uniform.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -303,11 +313,12 @@ impl OverlayRenderer {
                 },
             ],
         });
-        self.mask = Some(MaskDraw {
+        MaskDraw {
             size: (w, h),
             coverage: coverage.to_vec(),
+            uniform,
             bind_group,
-        });
+        }
     }
 
     /// Replaces the geometry to draw. Pass an empty slice to draw nothing.
@@ -362,11 +373,13 @@ impl OverlayRenderer {
             pass.set_vertex_buffer(0, buf.slice(..));
             pass.draw(0..*count, 0..1);
         }
-        if let Some(mask) = &self.mask {
+        if !self.masks.is_empty() {
             pass.set_pipeline(&self.mask_pipeline);
             pass.set_bind_group(0, &self.screen_bg, &[]);
-            pass.set_bind_group(1, &mask.bind_group, &[]);
-            pass.draw(0..6, 0..1);
+            for mask in &self.masks {
+                pass.set_bind_group(1, &mask.bind_group, &[]);
+                pass.draw(0..6, 0..1);
+            }
         }
     }
 }

@@ -461,6 +461,11 @@ pub(super) struct Arena {
     /// `take_gpu` charge and credit the ledger, so a step reads it without
     /// a walk.
     gpu_by_level: PerClass<[Bytes; LEVELS]>,
+    /// The GPU copies, the decoded copies and their bytes, per class, by
+    /// level: kept with the ledger as `gpu_by_level` is.
+    gpu_tiles_by_level: PerClass<[u32; LEVELS]>,
+    cpu_by_level: PerClass<[Bytes; LEVELS]>,
+    cpu_tiles_by_level: PerClass<[u32; LEVELS]>,
     /// The drapes with a GPU copy, in resource order: a tile's drawable
     /// drapes of one layer are a range of it, by level.
     gpu_drapes: BTreeSet<ResourceId>,
@@ -538,6 +543,9 @@ impl Default for Arena {
             ranks: SortedMap::default(),
             cold: Vec::new(),
             gpu_by_level: PerClass::splat([Bytes::ZERO; LEVELS]),
+            gpu_tiles_by_level: PerClass::splat([0; LEVELS]),
+            cpu_by_level: PerClass::splat([Bytes::ZERO; LEVELS]),
+            cpu_tiles_by_level: PerClass::splat([0; LEVELS]),
             gpu_drapes: BTreeSet::new(),
             pinned: None,
             valuation: super::value::Valuation::default(),
@@ -1273,17 +1281,32 @@ impl Arena {
         idle == self.evict.idle
     }
 
-    /// The protected bytes and the GPU copies by epoch are those a scan
-    /// finds: checked by `audit` in debug builds.
+    /// The protected bytes, the GPU copies by epoch and the copies by
+    /// level are those a scan finds: checked by `audit` in debug builds.
     pub fn sums_consistent(&self) -> bool {
         let mut protected = PerClass::splat(Bytes::ZERO);
         let mut epochs: BTreeMap<(Class, Option<LayerId>, u64), u32> = BTreeMap::new();
+        let mut gpu_tiles = PerClass::splat([0u32; LEVELS]);
+        let mut cpu = PerClass::splat([Bytes::ZERO; LEVELS]);
+        let mut cpu_tiles = PerClass::splat([0u32; LEVELS]);
         for s in self.iter() {
             let c = self.class(s);
+            let at = level_index(self.level(s));
             protected[c] = protected[c].plus(self.protection_bytes(s));
             if let Some(g) = self.gpu(s) {
                 *epochs.entry(self.epoch_key(s, g.epoch)).or_insert(0) += 1;
+                gpu_tiles[c][at] += 1;
             }
+            if let Some(k) = self.cpu(s) {
+                cpu[c][at] = cpu[c][at].plus(k.cost.gpu);
+                cpu_tiles[c][at] += 1;
+            }
+        }
+        if gpu_tiles != self.gpu_tiles_by_level
+            || cpu != self.cpu_by_level
+            || cpu_tiles != self.cpu_tiles_by_level
+        {
+            return false;
         }
         let transits = self.iter().filter(|&s| self.has_transit(s)).map(|s| s.0);
         let loads = self.iter().filter(|&s| self.loading(s)).map(|s| s.0);
@@ -1633,6 +1656,9 @@ impl Arena {
         self.unfile(s);
         self.drop_cpu(s, l);
         l.decoded = l.decoded.plus(c.cost.gpu);
+        let (class, at) = (self.class(s), level_index(self.level(s)));
+        self.cpu_by_level[class][at] = self.cpu_by_level[class][at].plus(c.cost.gpu);
+        self.cpu_tiles_by_level[class][at] += 1;
         self.cpu[s.i()] = CpuPayload {
             gen: c.gen,
             cost: c.cost,
@@ -1657,6 +1683,9 @@ impl Arena {
     fn drop_cpu(&mut self, s: Slot, l: &mut Ledger) -> Option<CpuCopy> {
         let c = self.cpu(s)?;
         l.decoded = l.decoded.minus(c.cost.gpu);
+        let (class, at) = (self.class(s), level_index(self.level(s)));
+        self.cpu_by_level[class][at] = self.cpu_by_level[class][at].minus(c.cost.gpu);
+        self.cpu_tiles_by_level[class][at] = self.cpu_tiles_by_level[class][at].saturating_sub(1);
         self.set(s, CPU, false);
         self.set(s, DELIVERED, false);
         Some(c)
@@ -1710,6 +1739,7 @@ impl Arena {
                 if let r @ ResourceId::Drape { .. } = self.id(s) {
                     self.gpu_drapes.insert(r);
                 }
+                self.gpu_tiles_by_level[class][at] += 1;
             }
         }
         l.gpu[class] = l.gpu[class].plus(g.bytes);
@@ -1726,6 +1756,16 @@ impl Arena {
         &self.gpu_by_level
     }
 
+    /// How many GPU copies, per class, by level.
+    pub fn gpu_tiles_by_level(&self) -> &PerClass<[u32; LEVELS]> {
+        &self.gpu_tiles_by_level
+    }
+
+    /// The decoded copies' bytes and count, per class, by level.
+    pub fn cpu_by_level(&self) -> (&PerClass<[Bytes; LEVELS]>, &PerClass<[u32; LEVELS]>) {
+        (&self.cpu_by_level, &self.cpu_tiles_by_level)
+    }
+
     pub fn take_gpu(&mut self, s: Slot, l: &mut Ledger) -> Option<Gpu> {
         let g = self.gpu(s)?;
         let before = self.protection_bytes(s);
@@ -1734,6 +1774,7 @@ impl Arena {
         l.gpu[class] = l.gpu[class].minus(g.bytes);
         let at = level_index(self.level(s));
         self.gpu_by_level[class][at] = self.gpu_by_level[class][at].minus(g.bytes);
+        self.gpu_tiles_by_level[class][at] = self.gpu_tiles_by_level[class][at].saturating_sub(1);
         self.set(s, GPU, false);
         self.count_epoch(s, g.epoch, false);
         if let r @ ResourceId::Drape { .. } = self.id(s) {

@@ -155,6 +155,10 @@ pub(crate) struct Glance {
     pub spec: u8,
     #[serde(default)]
     pub spec_overridden: bool,
+    /// What the budget window reads besides (`window_numbers`), in one
+    /// flat list.
+    #[serde(default)]
+    pub window: Vec<u64>,
 }
 
 impl Glance {
@@ -186,6 +190,11 @@ impl Glance {
                 .and_then(|i| u8::try_from(i).ok())
                 .unwrap_or(0),
             spec_overridden: s.spec_overridden,
+            window: {
+                let mut out = Vec::new();
+                window_numbers(&mut s.clone(), &mut |v| out.push(*v));
+                out
+            },
         }
     }
 
@@ -217,8 +226,82 @@ impl Glance {
             .copied()
             .unwrap_or_default();
         s.spec_overridden = self.spec_overridden;
+        // A list of another length is another build's: left out whole.
+        let mut probe = 0usize;
+        window_numbers(&mut s.clone(), &mut |_| probe += 1);
+        if self.window.len() == probe {
+            let mut from = self.window.iter();
+            window_numbers(&mut s, &mut |v| *v = from.next().copied().unwrap_or(0));
+        }
         s
     }
+}
+
+/// Every number of `s` the budget window reads that the glance's own
+/// fields do not carry, each handed to `f` in one fixed order: read to send
+/// them, written to take them back.
+fn window_numbers(s: &mut tuile_core::budget::BudgetSignals, f: &mut dyn FnMut(&mut u64)) {
+    use tuile_core::budget::{Class, LAYERS, LEVELS};
+    let mut small = |v: &mut u32, f: &mut dyn FnMut(&mut u64)| {
+        let mut x = u64::from(*v);
+        f(&mut x);
+        *v = u32::try_from(x).unwrap_or(u32::MAX);
+    };
+    for c in Class::ALL {
+        for l in 0..LEVELS {
+            let v = &mut s.levels;
+            small(&mut v.gpu_tiles[c][l], f);
+            small(&mut v.decoded_tiles[c][l], f);
+            f(&mut v.decoded[c][l].0);
+            small(&mut v.drawn[c][l], f);
+            small(&mut v.selected[c][l], f);
+            small(&mut v.under_need[c][l], f);
+            for k in 0..2 {
+                small(&mut v.in_flight[c][l][k], f);
+                small(&mut v.queued[c][l][k], f);
+            }
+            for k in 0..2 {
+                f(&mut s.bytes_by_level[c][l][k]);
+            }
+            for k in 0..4 {
+                f(&mut s.level_events_total[c][l][k]);
+            }
+            f(&mut s.evictions_by_level_total[c][l]);
+        }
+        small(&mut s.levels_seen[c], f);
+        small(&mut s.bytes_levels[c], f);
+        f(&mut s.protected_bytes[c]);
+        f(&mut s.upload_bytes_total[c]);
+        f(&mut s.wasted_starts_total[c]);
+    }
+    let y = &mut s.layers;
+    for i in 0..LAYERS {
+        small(&mut y.gpu_tiles[i], f);
+        f(&mut y.gpu_bytes[i].0);
+        small(&mut y.drawn[i], f);
+        small(&mut y.in_flight[i], f);
+        for k in 0..2 {
+            small(&mut y.requests[i][k], f);
+        }
+        small(&mut y.ram_hits[i], f);
+        small(&mut y.completions[i], f);
+        small(&mut y.failures[i], f);
+        for k in 0..5 {
+            f(&mut s.layer_loads_total[i][k]);
+        }
+    }
+    small(&mut s.layers_seen, f);
+    f(&mut s.decoded_bytes);
+    f(&mut s.decide_micros.sum);
+    f(&mut s.decide_micros.count);
+    f(&mut s.decide_peak_micros);
+    small(&mut s.decide_work, f);
+    f(&mut s.decide_work_total);
+    f(&mut s.completions_total);
+    // The floor's level, plus one; nought for none.
+    let mut floor = s.floor_level.map_or(0, |l| u64::from(l) + 1);
+    f(&mut floor);
+    s.floor_level = floor.checked_sub(1).and_then(|l| u32::try_from(l).ok());
 }
 
 /// A switch that is on unless said otherwise.
@@ -241,9 +324,22 @@ mod tests {
         s.evictions_total.0[2][1] = 3;
         s.sse_scale_milli = 1250;
         s.converged = true;
+        // And what the budget window reads, per level and per layer.
+        use tuile_core::budget::Class;
+        s.levels.queued[Class::Drape][14] = [3, 2];
+        s.levels_seen[Class::Drape] = 1 << 14;
+        s.layer_loads_total[1] = [1, 2, 3, 4, 5];
+        s.layers_seen = 0b11;
+        s.decide_micros.count = 9;
+        s.floor_level = Some(0);
         let glance = Glance::of(&s);
         assert_eq!(Glance::of(&glance.signals()), glance);
         assert_eq!(glance.signals().bytes, s.bytes);
+        let back = glance.signals();
+        assert_eq!(back.levels, s.levels);
+        assert_eq!(back.layer_loads_total, s.layer_loads_total);
+        assert_eq!((back.layers_seen, back.floor_level), (0b11, Some(0)));
+        assert_eq!(back.decide_micros.count, 9);
         assert!(glance.signals().converged);
     }
 }

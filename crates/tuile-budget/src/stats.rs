@@ -64,6 +64,78 @@ impl EvictReason {
     ];
 }
 
+/// One step's statistics per level ([`level_index`]), per class: the
+/// copies held, what is drawn and wanted, the loads going and waiting, and
+/// this step's starts, completions, wasted starts and releases. A need
+/// (`[0]`) is a load the picture waits on — the floor, a hole, a blocker, a
+/// drawn tile's drape; a prefetch (`[1]`) is the ring, a preloaded ancestor
+/// or a refresh.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LevelStats {
+    /// GPU copies (drawable).
+    pub gpu_tiles: PerClass<[u32; LEVELS]>,
+    /// Decoded copies, and their bytes.
+    pub decoded_tiles: PerClass<[u32; LEVELS]>,
+    pub decoded: PerClass<[Bytes; LEVELS]>,
+    /// Drawn: meshes at their level, drapes worn at theirs.
+    pub drawn: PerClass<[u32; LEVELS]>,
+    /// Selected: meshes wanted on screen; drapes wanted for the tiles on
+    /// screen, at the urgency of a need.
+    pub selected: PerClass<[u32; LEVELS]>,
+    /// Under their need: wanted meshes drawn by an ancestor, at the wanted
+    /// level; exactly drawn tiles wearing a drape under the level needed,
+    /// in the drape class at the tile's level.
+    pub under_need: PerClass<[u32; LEVELS]>,
+    /// Loads in flight and loads ranked but not started, need and prefetch.
+    pub in_flight: PerClass<[[u32; 2]; LEVELS]>,
+    pub queued: PerClass<[[u32; 2]; LEVELS]>,
+    /// This step's loads started, completed, cancelled unneeded (wasted),
+    /// and decoded copies released.
+    pub starts: PerClass<[u32; LEVELS]>,
+    pub completions: PerClass<[u32; LEVELS]>,
+    pub wasted: PerClass<[u32; LEVELS]>,
+    pub releases: PerClass<[u32; LEVELS]>,
+}
+
+/// The imagery layers a breakdown names, the last standing for every
+/// layer from it on.
+pub const LAYERS: usize = 4;
+
+/// The slot of `layer` in a per-layer breakdown: itself, or the last.
+pub fn layer_index(layer: crate::types::LayerId) -> usize {
+    usize::from(layer.0).min(LAYERS - 1)
+}
+
+/// One step's drapes per imagery layer ([`layer_index`]): what is held and
+/// drawn, and how its loads went — a request is a load started, from the
+/// store (`[0]`) or the network (`[1]`); a RAM hit is a delivery of a
+/// decoded copy kept from before, which no load had to make.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LayerStats {
+    /// GPU copies, and their bytes.
+    pub gpu_tiles: [u32; LAYERS],
+    pub gpu_bytes: [Bytes; LAYERS],
+    /// Drapes worn by the meshes drawn.
+    pub drawn: [u32; LAYERS],
+    /// Loads in flight.
+    pub in_flight: [u32; LAYERS],
+    /// This step's requests by source, RAM hits, completions and failures.
+    pub requests: [[u32; 2]; LAYERS],
+    pub ram_hits: [u32; LAYERS],
+    pub completions: [u32; LAYERS],
+    pub failures: [u32; LAYERS],
+}
+
+/// Whether a load at `urgency` is a prefetch (`1`) or a need (`0`): see
+/// [`LevelStats`].
+pub fn prefetch_index(urgency: Option<crate::priority::Urgency>) -> usize {
+    use crate::priority::Urgency;
+    match urgency {
+        Some(Urgency::Floor | Urgency::Hole | Urgency::Blocker | Urgency::Drape) => 0,
+        _ => 1,
+    }
+}
+
 /// One step's statistics. Counters count this step only.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -102,6 +174,11 @@ pub struct BudgetStats {
     pub evictions: PerClass<[u32; 3]>,
     /// The same evictions per class, by the evicted resource's level.
     pub evictions_by_level: PerClass<[u32; LEVELS]>,
+    /// The step per level, per class: what the budget window and the
+    /// telemetry's per-level series read.
+    pub levels: LevelStats,
+    /// The step's drapes per imagery layer: as `levels`.
+    pub layers: LayerStats,
     /// Decoded copies released per class.
     pub releases: PerClass<u32>,
     /// Failures per class, transient (`[0]`) and permanent (`[1]`).

@@ -271,10 +271,14 @@ impl Feed for BudgetStats {
         s.drawable_by_level = PerClass::default();
         s.transit_by_level = PerClass::default();
         s.evictions_by_level = PerClass::default();
+        s.levels = Default::default();
+        s.layers = Default::default();
         // Out of the text too, so the encoding is the one the reference was
         // recorded with.
         let bytes = format!("{:?}", s.drawable_by_level);
         let counts = format!("{:?}", s.evictions_by_level);
+        let levels = format!("{:?}", s.levels);
+        let layers = format!("{:?}", s.layers);
         // The quality deficit, a measure of the decisions recorded after
         // the reference was: out of it, as a breakdown is.
         let deficit = format!("{:?}", s.deficit);
@@ -284,7 +288,9 @@ impl Feed for BudgetStats {
             .replace(&format!(", deficit: {deficit}"), "")
             .replace(&format!(", drawable_by_level: {bytes}"), "")
             .replace(&format!(", transit_by_level: {bytes}"), "")
-            .replace(&format!(", evictions_by_level: {counts}"), "");
+            .replace(&format!(", evictions_by_level: {counts}"), "")
+            .replace(&format!(", levels: {levels}"), "")
+            .replace(&format!(", layers: {layers}"), "");
         h.bytes(text.as_bytes());
     }
 }

@@ -53,7 +53,10 @@ pub use spec::{
     Anticipation, Band, Facts, Params, Predicate, RestoreCosts, Rule, SpecError, SpecKind, Specification,
     Speculation, Term,
 };
-pub use stats::{level_index, BudgetStats, CancelReason, Deficit, EvictReason, LEVELS};
+pub use stats::{
+    layer_index, level_index, prefetch_index, BudgetStats, CancelReason, Deficit, EvictReason,
+    LayerStats, LevelStats, LAYERS, LEVELS,
+};
 pub use tier::{NoStore, Presence, PresenceOracle, Source, Tier};
 pub use types::{
     Bytes, Class, Failure, Generation, LayerId, Micros, PerClass, Policy, Pressure, ResourceId,

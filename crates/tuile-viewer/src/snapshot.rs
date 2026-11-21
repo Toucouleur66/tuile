@@ -76,6 +76,9 @@ pub(crate) struct Snapshot {
     /// diagnostic override forces (`None`: the context's).
     pub budget_line: bool,
     pub budget_spec: Option<tuile_core::budget::SpecKind>,
+    /// Whether the budget window is shown, and on its cumulative view.
+    pub budget_window: bool,
+    pub budget_window_cumulative: bool,
 }
 
 impl Snapshot {
@@ -118,6 +121,8 @@ impl Snapshot {
             tilesets: 0,
             budget_line: false,
             budget_spec: None,
+            budget_window: false,
+            budget_window_cumulative: false,
         }
     }
 }

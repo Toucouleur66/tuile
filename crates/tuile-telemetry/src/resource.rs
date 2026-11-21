@@ -55,10 +55,13 @@ pub const ALLOWED: [&str; 16] = [
 ];
 
 /// The metric label keys a series may carry.
-pub const ALLOWED_LABELS: [&str; 18] = [
+pub const ALLOWED_LABELS: [&str; 19] = [
     // tuile_core::metrics: the per-level and per-eye series.
     "series",
     "level",
+    // An imagery layer's index in the host's list (`tuile_budget`'s
+    // per-layer series): a number, never the layer's name.
+    "layer",
     "eye",
     // The tile reads by place (`tuile_tiles_fetch_*`).
     "source",

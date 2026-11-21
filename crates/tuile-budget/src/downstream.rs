@@ -147,6 +147,11 @@ impl Item {
         self.first.iter().chain(self.more.iter())
     }
 
+    /// What the item was read to be: its statistics.
+    pub fn item_stats(&self) -> &ItemStats {
+        &self.stats
+    }
+
     /// The drape it wears for `layer`, if any.
     pub fn drape(&self, layer: LayerId) -> Option<&DrapeChoice> {
         self.drapes().find(|d| d.layer == layer)

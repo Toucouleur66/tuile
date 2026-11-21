@@ -124,6 +124,21 @@ impl App {
             return;
         };
         let (size, safe, scale) = (active.size, active.safe, active.scale.max(1.0));
+        // The budget window, when shown, in the safe area's top-left corner,
+        // clear of the on-screen control on the right.
+        let names: Vec<String> = self
+            .imagery
+            .layers
+            .get(self.imagery.layer)
+            .map(|l| vec![l.name.clone()])
+            .unwrap_or_default();
+        self.budget_window.lay_out(
+            tuile_core::metrics::budget().as_ref(),
+            size,
+            (safe.0 + 8.0 * scale, safe.1 + 8.0 * scale),
+            scale,
+            &names,
+        );
         let before = self.credits.height();
         self.credits.lay_out(&text, size, safe, scale);
         // A phone's and a page's caption stand above the bar.

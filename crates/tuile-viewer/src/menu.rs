@@ -57,6 +57,9 @@ pub(crate) enum Ask {
     ToggleFreeze,
     /// The budget's line over the view.
     ToggleBudgetLine,
+    /// The budget window over the view, and its cumulative view.
+    ToggleBudgetWindow,
+    ToggleBudgetWindowCumulative,
     /// A diagnostic override of the budget's specification; `None` back to
     /// the context's.
     BudgetSpec(Option<tuile_core::budget::SpecKind>),
@@ -127,6 +130,9 @@ pub(crate) struct State {
     /// The budget's line shown; the specification an override forces.
     pub budget_line: bool,
     pub budget_spec: Option<tuile_core::budget::SpecKind>,
+    /// The budget window shown, and on its cumulative view.
+    pub budget_window: bool,
+    pub budget_window_cumulative: bool,
 }
 
 impl State {
@@ -144,6 +150,8 @@ impl State {
             profiling: tuile_telemetry::profiling_on(),
             budget_line: snapshot.budget_line,
             budget_spec: snapshot.budget_spec,
+            budget_window: snapshot.budget_window,
+            budget_window_cumulative: snapshot.budget_window_cumulative,
         }
     }
 
@@ -174,6 +182,12 @@ impl Ask {
             Self::ToggleWireframe => Command::Wireframe(!now.wireframe),
             Self::ToggleFreeze => Command::Freeze(!now.frozen),
             Self::ToggleBudgetLine => Command::BudgetLine(!now.budget_line),
+            Self::ToggleBudgetWindow => {
+                Command::BudgetWindow(crate::steer::WindowAsk::Show(!now.budget_window))
+            }
+            Self::ToggleBudgetWindowCumulative => Command::BudgetWindow(
+                crate::steer::WindowAsk::Cumulative(!now.budget_window_cumulative),
+            ),
             Self::BudgetSpec(kind) => Command::Budget(crate::steer::BudgetAsk {
                 kind,
                 ..Default::default()
@@ -234,6 +248,8 @@ impl Ask {
             Self::ToggleWireframe => Some(now.wireframe),
             Self::ToggleFreeze => Some(now.frozen),
             Self::ToggleBudgetLine => Some(now.budget_line),
+            Self::ToggleBudgetWindow => Some(now.budget_window),
+            Self::ToggleBudgetWindowCumulative => Some(now.budget_window_cumulative),
             Self::BudgetSpec(kind) => Some(now.budget_spec == kind),
             Self::Diagnostic(view) => Some(now.diagnostic == view),
             Self::Imagery(layer) => Some(now.layer == layer),
@@ -380,6 +396,15 @@ pub(crate) fn layout(
     // specification the context selects (spec §3.3) — to compare them live.
     let mut budget = vec![
         item("Budget Line", Ask::ToggleBudgetLine),
+        item("Budget Window", Ask::ToggleBudgetWindow),
+        item(
+            "Budget Window: Cumulative",
+            Ask::ToggleBudgetWindowCumulative,
+        ),
+        item(
+            "Budget Window: Sum From Now",
+            Ask::Do(Command::BudgetWindow(crate::steer::WindowAsk::Reset)),
+        ),
         Entry::Separator,
         item("Specification of the Context", Ask::BudgetSpec(None)),
     ];
@@ -712,6 +737,8 @@ impl Default for State {
             profiling: false,
             budget_line: false,
             budget_spec: None,
+            budget_window: false,
+            budget_window_cumulative: false,
         }
     }
 }
@@ -859,6 +886,8 @@ mod tests {
             profiling: false,
             budget_line: false,
             budget_spec: None,
+            budget_window: false,
+            budget_window_cumulative: false,
         };
         let marked: Vec<String> = items(&layers)
             .into_iter()
@@ -956,6 +985,8 @@ mod tests {
             profiling: false,
             budget_line: false,
             budget_spec: None,
+            budget_window: false,
+            budget_window_cumulative: false,
         };
         for (ask, command) in [
             (Ask::ToggleWireframe, Command::Wireframe(true)),

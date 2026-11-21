@@ -112,6 +112,7 @@ impl App {
                 );
             }
             Command::BudgetLine(on) => self.views.budget_line = on,
+            Command::BudgetWindow(ask) => self.budget_window.ask(ask),
             Command::Diagnostic(view) => {
                 let view = view % DIAGNOSTICS.len();
                 if self.views.diagnostic != view {
@@ -245,6 +246,8 @@ impl App {
                 profiling: tuile_telemetry::profiling_on(),
                 budget_line: self.views.budget_line,
                 budget_spec: self.budget_ask.kind,
+                budget_window: self.budget_window.shown(),
+                budget_window_cumulative: self.budget_window.cumulative(),
             },
             |snapshot| crate::menu::State::of(&snapshot, layers),
         )
@@ -279,6 +282,8 @@ impl App {
             tilesets: self.tilesets.bits(),
             budget_line: self.views.budget_line,
             budget_spec: self.budget_ask.kind,
+            budget_window: self.budget_window.shown(),
+            budget_window_cumulative: self.budget_window.cumulative(),
             ..Snapshot::of(&self.controller, size)
         };
         crate::snapshot::publish(snapshot);
