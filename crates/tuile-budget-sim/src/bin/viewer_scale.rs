@@ -70,6 +70,13 @@ fn main() {
         c
     };
     sim.run(warm, &tour);
+    // `--pause-after-warm s`: a pause once warmed, to attach a profiler to
+    // the sequence alone.
+    let settle = arg("--pause-after-warm", 0.0);
+    if settle > 0.0 {
+        eprintln!("warmed, pid {}", std::process::id());
+        std::thread::sleep(std::time::Duration::from_secs_f64(settle));
+    }
     let s = named("aggressive-sequence").expect("in the catalogue");
     let start = sim.now;
     let first = sim.decide_us.len();
