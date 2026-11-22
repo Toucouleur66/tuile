@@ -36,7 +36,6 @@
 #![deny(clippy::float_arithmetic)]
 
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
 use std::sync::atomic::Ordering::Relaxed;
 
 use super::config::FailurePolicy;
@@ -191,13 +190,16 @@ pub(super) const MESH: u8 = 1 << 1;
 pub(super) const DRAPES: u8 = 1 << 2;
 pub(super) const WORN: u8 = 1 << 3;
 
+/// A map by (tile, layer) of what a step keeps about each drape level: the
+/// level chosen, a stand-in's own, a gap, a dwell's start. Sorted blocks —
+/// the passes read it tile by tile in key order — whose upkeep is not
+/// counted into `work` (see `Budget::imagery_prev`).
+pub(super) type LevelMap<V> = super::sorted::SortedMap<(TileId, LayerId), V>;
+
 /// The imagery levels kept from the step before: the level chosen, and,
 /// where a stand-in was worn in its place, the level the hysteresis carries
 /// (`Budget::drape_levels`).
-pub(super) type KeptLevels<'a> = (
-    &'a BTreeMap<(TileId, LayerId), DrapeLevel>,
-    &'a BTreeMap<(TileId, LayerId), u32>,
-);
+pub(super) type KeptLevels<'a> = (&'a LevelMap<DrapeLevel>, &'a LevelMap<u32>);
 
 impl Reach {
     /// It read `what` of `t`.

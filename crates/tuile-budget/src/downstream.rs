@@ -3023,8 +3023,8 @@ impl Budget {
         &self,
         tiles: &SortedMap<TileId, TileNeed>,
         presence: &dyn PresenceOracle,
-        last: &std::collections::BTreeMap<(TileId, LayerId), DrapeLevel>,
-        stood_in: &std::collections::BTreeMap<(TileId, LayerId), u32>,
+        last: &super::engine::LevelMap<DrapeLevel>,
+        stood_in: &super::engine::LevelMap<u32>,
     ) {
         /// Asked, it answers nothing and says so.
         struct Silent(std::cell::Cell<bool>);

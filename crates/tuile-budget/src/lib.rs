@@ -268,26 +268,29 @@ pub struct Budget {
     /// it by what changed.
     need: need_state::NeedState,
     /// Each drawn or blocking tile's imagery level per layer, as last
-    /// chosen (the hysteresis reads it), and those of the tiles held. An
-    /// ordered map of the standard library: on the sorted blocks its upkeep,
-    /// counted into `work`, put P6.4 over its bound on the tour's big zoom
-    /// (115 978 against 113 728) and on a still step by one unit (O1.5).
-    imagery_prev: std::collections::BTreeMap<(TileId, LayerId), engine::DrapeLevel>,
+    /// chosen (the hysteresis reads it), and those of the tiles held. Its
+    /// upkeep is not counted into `work` (on the sorted blocks it put P6.4
+    /// over its bound on the tour's big zoom, 115 978 against 113 728, and
+    /// on a still step by one unit, O1.5, when it was): as when it was an
+    /// ordered map of the standard library, whose upkeep went uncounted.
+    /// Sorted blocks: the passes read it tile by tile in order, the block
+    /// the last lookup found answering the next.
+    imagery_prev: engine::LevelMap<engine::DrapeLevel>,
     /// Where a stand-in is worn in place of the level the footprint gave
     /// (`engine`'s `drape_levels`, under a relaxation), that level: the
     /// one the hysteresis reads, never the stand-in, so a tile back at
     /// scale one re-levels to its need. Sparse: the stand-ins only.
-    imagery_stood_in: std::collections::BTreeMap<(TileId, LayerId), u32>,
+    imagery_stood_in: engine::LevelMap<u32>,
     /// By how many levels the drape level chosen is coarser than the level
     /// the picture needs at scale 1, where it is (a stand-in, a
     /// relaxation): the quality deficit reads them. Few entries; none at
     /// rest once every tile wears its need.
-    imagery_short: std::collections::BTreeMap<(TileId, LayerId), u32>,
+    imagery_short: engine::LevelMap<u32>,
     /// `imagery_short`'s entries and their gaps, summed.
     short_sums: (u32, u32),
     /// When each drape level in `imagery_prev` came to be: the dwell the
     /// deficit want weighs (`Budget::deficit_due`).
-    level_since: std::collections::BTreeMap<(TileId, LayerId), Micros>,
+    level_since: engine::LevelMap<Micros>,
     /// The time of the step being taken.
     now: Micros,
     /// The tiles whose meshes were drawn last step as themselves or held
@@ -762,6 +765,12 @@ impl Budget {
         self.scratch = Default::default();
         self.need.release_scratch();
         self.down.release_scratch();
+        // The drape levels' blocks, kept near half full through removals,
+        // packed again: the room a shrunk view no longer needs given back.
+        self.imagery_prev.compact();
+        self.imagery_stood_in.compact();
+        self.imagery_short.compact();
+        self.level_since.compact();
     }
 }
 

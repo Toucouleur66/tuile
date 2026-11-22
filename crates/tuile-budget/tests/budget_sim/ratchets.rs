@@ -81,6 +81,14 @@ fn still() -> (u64, u64, u32, u64) {
 /// 467 -> 455 and 244 216 -> 236 688; against `main` before O1.4 (#170),
 /// 470 -> 455 and 340 096 -> 236 688.
 ///
+/// `scratch-bytes-after-tour` went up once more with the drape levels'
+/// maps on sorted blocks: 229 584 -> 236 624 B. Not more held: the room
+/// those blocks keep through removals is given back by `release_scratch`
+/// (their compaction), where the standard maps' nodes were the budget's
+/// own — the budget alone fell 453 -> 451 B per tracked resource, 858 ->
+/// 850 after shrinking, and the two together after the tour 1 555 968 ->
+/// 1 557 152 B (+0.08 %), with fewer blocks per step (p99 26 -> 24).
+///
 /// `bytes-per-tracked-resource-after-shrinking` went up once, by a
 /// decision (O1.5 part 2, Laurent's): 870 -> 872. The wants map keyed
 /// tile-first ends the shrink flight with the one emptied block its pool

@@ -669,6 +669,20 @@ impl<K: Ord + Copy, V> SortedMap<K, V> {
         self.pool.truncate(room);
     }
 
+    /// The same entries in as few blocks as they fill, newly allocated: the
+    /// room a map kept through removals (blocks near half full, the pool)
+    /// given back. A pass over every entry.
+    pub fn compact(&mut self)
+    where
+        V: Copy,
+    {
+        let mut packed = SortedMap::default();
+        packed.rebuild(self.iter().map(|(k, v)| (*k, *v)));
+        packed.pool.clear();
+        packed.upkeep = self.upkeep.saturating_add(packed.upkeep);
+        *self = packed;
+    }
+
     /// Every key replaced by `f`'s, which keeps their order (a key's
     /// renumbering): in place, a pass over every entry.
     pub fn rekey(&mut self, mut f: impl FnMut(&K) -> K) {
