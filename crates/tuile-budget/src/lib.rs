@@ -270,7 +270,7 @@ pub struct Budget {
     /// ordered map of the standard library: on the sorted blocks its upkeep,
     /// counted into `work`, put P6.4 over its bound on the tour's big zoom
     /// (115 978 against 113 728) and on a still step by one unit (O1.5).
-    imagery_prev: std::collections::BTreeMap<(TileId, LayerId), u32>,
+    imagery_prev: std::collections::BTreeMap<(TileId, LayerId), engine::DrapeLevel>,
     /// Where a stand-in is worn in place of the level the footprint gave
     /// (`engine`'s `drape_levels`, under a relaxation), that level: the
     /// one the hysteresis reads, never the stand-in, so a tile back at
@@ -677,7 +677,11 @@ impl Budget {
                 .iter()
                 .map(|(t, i)| (*t, i.parent(), i.level, i.rect().map(snapshot::rect_bits)))
                 .collect(),
-            imagery_prev: self.imagery_prev.iter().map(|(k, v)| (*k, *v)).collect(),
+            imagery_prev: self
+                .imagery_prev
+                .iter()
+                .map(|(k, v)| (*k, v.level))
+                .collect(),
             imagery_stood_in: self
                 .imagery_stood_in
                 .iter()

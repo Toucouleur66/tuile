@@ -99,6 +99,7 @@ impl App {
                 tracing::info!("traversal freeze: {on}");
             }
             Command::Wireframe(on) => self.views.wireframe = on,
+            Command::TileLabels(on) => self.tile_labels.forced = on,
             Command::Budget(ask) => {
                 // The viewer's ordinary navigation runs the interactive
                 // specification: that is its context. An override is a
