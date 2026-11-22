@@ -242,7 +242,7 @@ impl Glance {
 /// them, written to take them back.
 fn window_numbers(s: &mut tuile_core::budget::BudgetSignals, f: &mut dyn FnMut(&mut u64)) {
     use tuile_core::budget::{Class, LAYERS, LEVELS};
-    let mut small = |v: &mut u32, f: &mut dyn FnMut(&mut u64)| {
+    let small = |v: &mut u32, f: &mut dyn FnMut(&mut u64)| {
         let mut x = u64::from(*v);
         f(&mut x);
         *v = u32::try_from(x).unwrap_or(u32::MAX);

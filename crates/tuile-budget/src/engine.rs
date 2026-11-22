@@ -249,10 +249,28 @@ pub(super) struct ItemStats {
     pub tile_level: u32,
 }
 
+/// What `Budget::level_stats` walks for: kept from one step to the next.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct WalkedLevels {
+    selected: PerClass<[u32; super::stats::LEVELS]>,
+    drawn: PerClass<[u32; super::stats::LEVELS]>,
+    under_need: PerClass<[u32; super::stats::LEVELS]>,
+    layer_drawn: [u32; super::stats::LAYERS],
+    layer_gpu_tiles: [u32; super::stats::LAYERS],
+    layer_gpu_bytes: [Bytes; super::stats::LAYERS],
+}
+
 /// A step's buffers, kept across steps so that a step allocates nothing
 /// once they have grown to the view.
 #[derive(Debug, Default)]
 pub(super) struct Scratch {
+    /// The walked part of the last step's statistics per level and
+    /// layer (`level_stats`), kept for the still steps that read it again.
+    walked_levels: Option<WalkedLevels>,
+    walked_scale: u32,
+    /// A drawn tile's chosen drape levels, for the step per level
+    /// (`level_stats`).
+    chosen: Vec<(LayerId, u32)>,
     /// The work ranked: each job's key (its resource in it), what it is,
     /// its want.
     jobs: Vec<(PriorityKey, Job, Want)>,
@@ -1566,6 +1584,7 @@ impl Budget {
         self.ranked_last = ranked;
         self.steps += 1;
 
+        let arrivals = self.events.len();
         self.apply_events(now, &mut st);
         let mut need = std::mem::take(&mut self.need);
         self.read_need(&mut need, &input, &mut st);
@@ -1748,7 +1767,19 @@ impl Budget {
         picked.clear();
         self.scratch.picked = picked;
         self.down.draw_set_into(&mut d.draw);
-        self.level_stats(tiles, wants, d, &mut st);
+        // A step that changed nothing the walk reads: no need named, no
+        // arrival, no decision, the same scale.
+        let quiet = named.is_empty()
+            && arrivals == 0
+            && d.start.is_empty()
+            && d.deliver.is_empty()
+            && d.evict.is_empty()
+            && d.release.is_empty()
+            && d.cancel.is_empty()
+            && d.upload_plan.items.is_empty()
+            && d.sse_scale_milli == self.scratch.walked_scale;
+        self.scratch.walked_scale = d.sse_scale_milli;
+        self.level_stats(tiles, quiet, d, &mut st);
         self.put_back(taken);
         self.need = need;
 
@@ -1791,44 +1822,77 @@ impl Budget {
         d.stats = st;
     }
 
-    /// The step's [`LevelStats`] that are read off its results: the copies
-    /// held (kept with the ledger), what is drawn and selected, what is
-    /// under its need, and the loads in flight. Statistics only: not the
-    /// step's work.
+    /// The step's [`LevelStats`] and [`super::stats::LayerStats`] that are
+    /// read off its results: the copies held (kept with the ledger), the
+    /// loads in flight, and — walked over the selection, the draw set and
+    /// the GPU drapes — what is drawn and selected, what is under its need,
+    /// and the layers' copies and drapes worn. The walk is taken again only
+    /// when the step may have changed it (`quiet` false): a still view's
+    /// step reads the last one's. Statistics only: not the step's work.
     fn level_stats(
-        &self,
+        &mut self,
         tiles: &SortedMap<TileId, TileNeed>,
-        wants: Wants<'_>,
+        quiet: bool,
         d: &Decisions,
         st: &mut BudgetStats,
     ) {
+        if !(quiet && self.scratch.walked_levels.is_some()) {
+            let walked = self.walk_levels(tiles, d);
+            self.scratch.walked_levels = Some(walked);
+        }
+        let Some(w) = self.scratch.walked_levels.as_ref() else {
+            return;
+        };
         let a = &self.arena;
         let l = &mut st.levels;
         l.gpu_tiles = *a.gpu_tiles_by_level();
         let (bytes, count) = a.cpu_by_level();
         l.decoded = *bytes;
         l.decoded_tiles = *count;
-        for (_, n) in tiles.iter() {
-            if n.membership == Membership::Drawn {
-                l.selected[n.need.class][level_index(n.need.level)] += 1;
+        l.selected = w.selected;
+        l.drawn = w.drawn;
+        l.under_need = w.under_need;
+        let y = &mut st.layers;
+        y.drawn = w.layer_drawn;
+        y.gpu_tiles = w.layer_gpu_tiles;
+        y.gpu_bytes = w.layer_gpu_bytes;
+        for &s in a.active() {
+            if a.loading(s) {
+                l.in_flight[a.class(s)][level_index(a.level(s))][prefetch_index(a.urgency(s))] += 1;
+                if let Some(x) = a.id(s).layer() {
+                    y.in_flight[layer_index(x)] += 1;
+                }
             }
         }
-        for (_, w) in wants.iter() {
-            if w.class == Class::Drape && prefetch_index(Some(w.urgency)) == 0 {
-                l.selected[Class::Drape][level_index(w.level)] += 1;
+    }
+
+    /// The walked part of [`Self::level_stats`].
+    fn walk_levels(&mut self, tiles: &SortedMap<TileId, TileNeed>, d: &Decisions) -> WalkedLevels {
+        let mut chosen = std::mem::take(&mut self.scratch.chosen);
+        let mut w = WalkedLevels::default();
+        let a = &self.arena;
+        for (t, n) in tiles.iter() {
+            if n.membership == Membership::Drawn {
+                w.selected[n.need.class][level_index(n.need.level)] += 1;
+                // The drape level the selection chose for each layer.
+                self.drapes_of(*t, n, &mut chosen);
+                for (_, level) in &chosen {
+                    w.selected[Class::Drape][level_index(*level)] += 1;
+                }
             }
         }
         for item in &d.draw.items {
             if let Some(s) = a.find(item.mesh) {
-                l.drawn[a.class(s)][level_index(a.level(s))] += 1;
+                w.drawn[a.class(s)][level_index(a.level(s))] += 1;
             }
             for x in &item.drapes {
-                l.drawn[Class::Drape][level_index(x.level)] += 1;
+                w.drawn[Class::Drape][level_index(x.level)] += 1;
+                w.layer_drawn[layer_index(x.layer)] += 1;
             }
             if item.role == Role::Fallback {
                 for t in item.serves.iter() {
                     if let Some(n) = tiles.get(t) {
-                        l.under_need[n.need.class][level_index(n.need.level)] += 1;
+                        w.under_need[n.need.class][level_index(n.need.level)] += 1;
                     }
                 }
             }
@@ -1836,21 +1900,7 @@ impl Budget {
         for (_, i) in self.down.items() {
             let stats = i.item_stats();
             if i.role == Role::Exact && stats.under_levels > 0 {
-                l.under_need[Class::Drape][level_index(stats.tile_level)] += 1;
-            }
-        }
-        for &s in a.active() {
-            if a.loading(s) {
-                l.in_flight[a.class(s)][level_index(a.level(s))][prefetch_index(a.urgency(s))] += 1;
-                if let Some(x) = a.id(s).layer() {
-                    st.layers.in_flight[layer_index(x)] += 1;
-                }
-            }
-        }
-        let y = &mut st.layers;
-        for item in &d.draw.items {
-            for x in &item.drapes {
-                y.drawn[layer_index(x.layer)] += 1;
+                w.under_need[Class::Drape][level_index(stats.tile_level)] += 1;
             }
         }
         let every = ResourceId::Drape {
@@ -1868,10 +1918,12 @@ impl Budget {
             };
             if let Some(g) = a.gpu(s) {
                 let i = layer_index(x);
-                y.gpu_tiles[i] += 1;
-                y.gpu_bytes[i] = y.gpu_bytes[i].plus(g.bytes);
+                w.layer_gpu_tiles[i] += 1;
+                w.layer_gpu_bytes[i] = w.layer_gpu_bytes[i].plus(g.bytes);
             }
         }
+        self.scratch.chosen = chosen;
+        w
     }
 
     fn protected_bytes(&self) -> PerClass<Bytes> {

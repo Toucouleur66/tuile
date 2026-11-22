@@ -936,6 +936,11 @@ fn the_step_per_level_sums_back_to_the_totals() {
     assert_eq!(v.selected[mesh][5], 1);
     let worn: u32 = v.drawn[Class::Drape].iter().sum();
     assert_eq!(worn, 4, "{RED}: a drape worn on each tile");
+    assert_eq!(
+        v.selected[Class::Drape],
+        v.drawn[Class::Drape],
+        "{RED}: at rest, the drapes worn are the ones selected"
+    );
     let decoded: u64 = Class::ALL
         .iter()
         .flat_map(|c| v.decoded[*c].iter())

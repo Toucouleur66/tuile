@@ -79,8 +79,8 @@ pub struct LevelStats {
     pub decoded: PerClass<[Bytes; LEVELS]>,
     /// Drawn: meshes at their level, drapes worn at theirs.
     pub drawn: PerClass<[u32; LEVELS]>,
-    /// Selected: meshes wanted on screen; drapes wanted for the tiles on
-    /// screen, at the urgency of a need.
+    /// Selected: meshes wanted on screen, at their level; for each layer
+    /// they wear, the drape level the selection chose for them.
     pub selected: PerClass<[u32; LEVELS]>,
     /// Under their need: wanted meshes drawn by an ancestor, at the wanted
     /// level; exactly drawn tiles wearing a drape under the level needed,
