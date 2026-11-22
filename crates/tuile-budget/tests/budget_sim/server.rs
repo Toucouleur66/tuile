@@ -229,6 +229,45 @@ impl Residency for BudgetResidency<'_> {
     }
 }
 
+/// The calling thread's CPU time, µs; 0 where the platform has no thread
+/// clock.
+fn thread_cpu_us() -> f64 {
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn clock_gettime_nsec_np(clock: u32) -> u64;
+        }
+        const CLOCK_THREAD_CPUTIME_ID: u32 = 16;
+        // SAFETY: a libc call with a valid clock id and no pointer.
+        let ns = unsafe { clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) };
+        ns as f64 / 1e3
+    }
+    #[cfg(target_os = "linux")]
+    {
+        #[repr(C)]
+        struct Timespec {
+            sec: i64,
+            nsec: i64,
+        }
+        extern "C" {
+            fn clock_gettime(clock: i32, ts: *mut Timespec) -> i32;
+        }
+        const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
+        let mut ts = Timespec { sec: 0, nsec: 0 };
+        // SAFETY: a libc call writing the `timespec` it is given.
+        let ok = unsafe { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mut ts) } == 0;
+        if ok {
+            ts.sec as f64 * 1e6 + ts.nsec as f64 / 1e3
+        } else {
+            0.0
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        0.0
+    }
+}
+
 /// The simulation.
 pub struct Sim {
     /// The profile.
@@ -270,6 +309,11 @@ pub struct Sim {
     pub waits: Vec<(Micros, f64)>,
     /// Wall time of each `decide` call alone, µs, with the step's time.
     pub decide_us: Vec<(Micros, f64)>,
+    /// The calling thread's CPU time over each `decide` call, µs, with the
+    /// step's time: what the call computed, without the time the thread
+    /// waited for a core (a loaded machine inflates the wall time alone).
+    /// 0 where the platform gives no thread clock.
+    pub decide_cpu_us: Vec<(Micros, f64)>,
     /// What the heap saw during each `decide` call, with the step's time.
     pub decide_allocs: Vec<DecideAllocs>,
     /// The host's side of a delta step (O1.3): wall time of building the
@@ -346,6 +390,7 @@ impl Sim {
             wanted_at: BTreeMap::new(),
             waits: Vec::new(),
             decide_us: Vec::new(),
+            decide_cpu_us: Vec::new(),
             diff_us: Vec::new(),
             decide_allocs: Vec::new(),
             count_output: false,
@@ -449,14 +494,17 @@ impl Sim {
         // keeps them); its digests are folded after it, and compared with
         // the recorded reference.
         let mut out = std::mem::take(&mut self.out);
-        let (heap, us) = self
+        let (heap, us, cpu) = self
             .budget
             .decide_into_with(input, &need, &mut out, |b, i, o| {
+                let cpu = thread_cpu_us();
                 let clock = std::time::Instant::now();
                 let ((), heap) = super::alloc::counted(|| b.decide_into(i, o));
-                (heap, clock.elapsed().as_secs_f64() * 1e6)
+                let us = clock.elapsed().as_secs_f64() * 1e6;
+                (heap, us, thread_cpu_us() - cpu)
             });
         self.decide_us.push((self.now, us));
+        self.decide_cpu_us.push((self.now, cpu));
         // Outside the counted region, deliberately: what a fresh copy of
         // the output takes (`count_output`), and the copy the simulation
         // keeps for its log and its callers — the host's buffer goes back
