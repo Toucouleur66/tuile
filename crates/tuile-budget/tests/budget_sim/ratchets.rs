@@ -89,6 +89,11 @@ fn still() -> (u64, u64, u32, u64) {
 /// 850 after shrinking, and the two together after the tour 1 555 968 ->
 /// 1 557 152 B (+0.08 %), with fewer blocks per step (p99 26 -> 24).
 ///
+/// Then by 64 B (236 624 -> 236 688), the place of each want a tile's
+/// pass reads (`wants_pass`'s `old_wants`, 16 B an entry), which spares
+/// the search that wrote back every changed want: 2.3 % of decide's
+/// instructions at 16 k and 40 k tracked.
+///
 /// `bytes-per-tracked-resource-after-shrinking` went up once, by a
 /// decision (O1.5 part 2, Laurent's): 870 -> 872. The wants map keyed
 /// tile-first ends the shrink flight with the one emptied block its pool

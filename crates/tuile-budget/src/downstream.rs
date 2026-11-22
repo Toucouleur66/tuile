@@ -452,7 +452,7 @@ struct StepLists {
     old_reach: Vec<(TileId, u8)>,
     bufs: ItemBufs,
     tile_wants: Vec<(ResourceId, u32, Want)>,
-    old_wants: Vec<(ResourceId, Want)>,
+    old_wants: Vec<(ResourceId, Want, super::sorted::Place)>,
     drapes: Vec<(LayerId, u32)>,
     chain: Vec<(TileId, u32)>,
     chain_now: Vec<(TileId, u32)>,
@@ -1752,39 +1752,52 @@ impl Budget {
                 _ => 0,
             };
             self.walk(shifted);
+            // The tile's wants as kept, each with its place: one search for
+            // the tile, none for a want that changes (written where it is;
+            // the map's insertions and removals wait for the pass's end, so
+            // the places hold).
             l.old_wants.clear();
-            l.old_wants
-                .extend(of_tile(&self.down.wants, t).map(|(r, w)| (r, *w)));
+            let lo = ByTile(ResourceId::Mesh(t));
+            let hi = ByTile(ResourceId::drape(t, LayerId(u16::MAX), u32::MAX));
+            l.old_wants.extend(
+                self.down
+                    .wants
+                    .range_placed(lo..=hi)
+                    .map(|(p, k, w)| (k.0, *w, p)),
+            );
             self.walk(l.old_wants.len());
             // Both lists by resource: a merge.
             let (old, new) = (&l.old_wants, &l.tile_wants);
             let wants = &mut self.down.wants;
             let (mut i, mut j) = (0, 0);
             while i < old.len() || j < new.len() {
-                let (r, w) = match (old.get(i), new.get(j)) {
+                let r = match (old.get(i), new.get(j)) {
                     (Some(a), Some(b)) if a.0 == b.0 => {
                         i += 1;
                         j += 1;
                         if a.1 == b.2 {
                             continue;
                         }
-                        (b.0, Some(b.2))
+                        *wants.at_mut(a.2) = b.2;
+                        b.0
                     }
                     (Some(a), Some(b)) if a.0 < b.0 => {
                         i += 1;
-                        (a.0, None)
+                        l.c_wants.push((ByTile(a.0), None));
+                        a.0
                     }
                     (Some(a), None) => {
                         i += 1;
-                        (a.0, None)
+                        l.c_wants.push((ByTile(a.0), None));
+                        a.0
                     }
                     (_, Some(b)) => {
                         j += 1;
-                        (b.0, Some(b.2))
+                        l.c_wants.push((ByTile(b.0), Some(b.2)));
+                        b.0
                     }
                     (None, None) => break,
                 };
-                put(wants, &mut l.c_wants, ByTile(r), w);
                 l.wants.push(r);
             }
         }
