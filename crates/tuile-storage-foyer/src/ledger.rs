@@ -122,11 +122,6 @@ impl Ledger {
         }
     }
 
-    /// `key` removed from the store.
-    pub(crate) fn forget(&self, key: &str) {
-        self.inner().forget(key);
-    }
-
     /// `key` let go of by the memory tier: on the disk still, or not.
     pub(crate) fn suspect_key(&self, key: &str) {
         let mut i = self.inner();

@@ -1663,7 +1663,18 @@ impl<P: ImageryProvider> ImageryProvider for CachedImagery<P> {
                     .await;
                 Err(RasterError::Fetch(FetchError::NotFound(url)))
             }
-            Err(e) => Err(e),
+            // The origin could not answer (offline, a timeout, a 5xx): the
+            // copy past its lifetime, if the store kept one, is the picture
+            // there is. Served as is; the next fetch that reaches the origin
+            // replaces it.
+            Err(e) => match self.store.get_stale(&key).await {
+                Some(bytes) if !crate::storage::is_absent(&bytes) => {
+                    m.store_hits.inc();
+                    m.store_bytes_served.add(bytes.len() as u64);
+                    Ok(Fetched::undated(bytes))
+                }
+                _ => Err(e),
+            },
         }
     }
 }
@@ -2817,6 +2828,8 @@ mod tests {
     struct MemStore {
         entries: Mutex<HashMap<String, Bytes>>,
         writes: Mutex<Vec<(String, Option<std::time::Duration>)>>,
+        /// Entries past their lifetime: a miss for `get`, kept for `get_stale`.
+        expired: Mutex<HashMap<String, Bytes>>,
     }
 
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -2824,6 +2837,10 @@ mod tests {
     impl ContentStore for MemStore {
         async fn get(&self, key: &str) -> Option<Bytes> {
             self.entries.lock().expect("lock").get(key).cloned()
+        }
+        async fn get_stale(&self, key: &str) -> Option<Bytes> {
+            let fresh = self.entries.lock().expect("lock").get(key).cloned();
+            fresh.or_else(|| self.expired.lock().expect("lock").get(key).cloned())
         }
         async fn put(&self, key: &str, value: Bytes, ttl: Option<std::time::Duration>) {
             self.entries
@@ -2860,6 +2877,48 @@ mod tests {
 
     fn coord(level: u32, x: u64, y: u64) -> ImageryCoord {
         ImageryCoord { level, x, y }
+    }
+
+    /// An origin that cannot answer: offline.
+    struct OfflineImagery;
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    impl ImageryProvider for OfflineImagery {
+        fn tiling_scheme(&self) -> TilingScheme {
+            TilingScheme::web_mercator()
+        }
+        async fn fetch_tile_bytes(&self, _c: ImageryCoord) -> Result<Fetched<Bytes>, RasterError> {
+            Err(RasterError::Fetch(FetchError::Io {
+                url: Url::parse("https://imagery.invalid/3/4/5").expect("url"),
+                message: "offline".to_owned(),
+            }))
+        }
+    }
+
+    /// Offline, a tile the store holds past its lifetime is served rather
+    /// than failed: stale imagery, never a bare tile. A remembered absence is
+    /// never served as a picture.
+    #[test]
+    fn offline_an_expired_imagery_tile_is_served_stale() {
+        let store = Arc::new(MemStore::default());
+        let provider = CachedImagery::new(OfflineImagery, store.clone(), "test");
+        let (old, absent) = (coord(3, 4, 5), coord(3, 4, 6));
+        for (c, v) in [
+            (old, Bytes::from_static(b"old-picture")),
+            (absent, crate::storage::ABSENT),
+        ] {
+            store
+                .expired
+                .lock()
+                .expect("lock")
+                .insert(provider.key(c), v);
+        }
+        let got =
+            futures_executor::block_on(provider.fetch_tile_bytes(old)).expect("the stale tile");
+        assert_eq!(got.value, Bytes::from_static(b"old-picture"));
+        assert!(futures_executor::block_on(provider.fetch_tile_bytes(absent)).is_err());
+        assert!(futures_executor::block_on(provider.fetch_tile_bytes(coord(3, 0, 0))).is_err());
     }
 
     #[test]

@@ -281,18 +281,24 @@ impl ContentStore for FoyerStore {
             Some((deadline, payload)) if !deadline.has_passed(now_millis()) => {
                 Some(Bytes::copy_from_slice(payload))
             }
-            // Expired: drop it now rather than re-reading it every frame until
-            // capacity happens to reclaim it.
-            Some(_) => {
-                self.cache.remove(&key.to_owned());
-                self.ledger.forget(key);
-                None
-            }
+            // Expired: a miss for `get`, which sends the caller to the origin
+            // — but kept, never dropped on read: when the origin cannot answer
+            // (offline), `get_stale` serves it. Capacity reclaims it in time,
+            // as it reclaims anything else, and a fresh copy replaces it.
+            Some(_) => None,
             None => {
                 tracing::debug!(key, "malformed store entry, treating as miss");
                 None
             }
         }
+    }
+
+    async fn get_stale(&self, key: &str) -> Option<Bytes> {
+        let stored = match self.cache.get(&key.to_owned()).await {
+            Ok(Some(entry)) => entry.value().clone(),
+            _ => return None,
+        };
+        Stamped::split(&stored).map(|(_, payload)| Bytes::copy_from_slice(payload))
     }
 
     async fn put(&self, key: &str, value: Bytes, ttl: Option<Duration>) {
@@ -398,6 +404,10 @@ impl SuspendableStore {
 impl ContentStore for SuspendableStore {
     async fn get(&self, key: &str) -> Option<Bytes> {
         self.current()?.get(key).await
+    }
+
+    async fn get_stale(&self, key: &str) -> Option<Bytes> {
+        self.current()?.get_stale(key).await
     }
 
     async fn put(&self, key: &str, value: Bytes, ttl: Option<Duration>) {
@@ -708,6 +718,30 @@ mod tests {
         // The origin said nothing, so the store's own policy applies.
         store.put("silent", Bytes::from_static(b"x"), None).await;
         assert!(store.get("silent").await.is_none());
+    }
+
+    /// An entry past its lifetime is a miss for `get` — the caller asks the
+    /// origin — but is never dropped by the read: offline, the origin cannot
+    /// answer, and the expired copy is the ground there is. Dropping it on
+    /// read destroyed tiles the disk held the moment the network went away.
+    #[tokio::test]
+    async fn an_expired_entry_is_kept_for_when_the_origin_cannot_answer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FoyerStore::with_config(StoreConfig {
+            default_ttl: Some(Duration::ZERO),
+            ..config(dir.path())
+        })
+        .await
+        .expect("store");
+        store.put("old", Bytes::from_static(b"ground"), None).await;
+        assert!(store.get("old").await.is_none(), "expired, so a miss");
+        assert!(store.get("old").await.is_none(), "still a miss");
+        assert_eq!(
+            store.get_stale("old").await.as_deref(),
+            Some(&b"ground"[..]),
+            "the read dropped the expired copy"
+        );
+        assert!(store.holds("old"), "the index forgot it");
     }
 
     #[test]

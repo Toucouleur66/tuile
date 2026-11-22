@@ -171,7 +171,24 @@ impl<T: TerrainSource> TerrainSource for CachedTerrain<T> {
                     .await;
                 Err(e)
             }
-            Err(e) => Err(e),
+            // The origin could not answer (offline, a timeout, a 5xx): the
+            // copy past its lifetime, if the store kept one, is the ground
+            // there is. Served as is; the next fetch that reaches the origin
+            // replaces it.
+            Err(e) => match self.store.get_stale(&key).await {
+                Some(bytes) if !tuile_core::storage::is_absent(&bytes) => {
+                    m.store_hits.inc();
+                    m.store_bytes_served.add(bytes.len() as u64);
+                    tracing::debug!(
+                        z = coord.level,
+                        x = coord.x,
+                        y = coord.y,
+                        "origin failed, stale tile served"
+                    );
+                    Ok(Fetched::undated(bytes.to_vec()))
+                }
+                _ => Err(e),
+            },
         }
     }
 }
@@ -187,12 +204,18 @@ mod tests {
     struct MemStore {
         entries: Mutex<HashMap<String, Bytes>>,
         writes: Mutex<Vec<(String, Option<std::time::Duration>)>>,
+        /// Entries past their lifetime: a miss for `get`, kept for `get_stale`.
+        expired: Mutex<HashMap<String, Bytes>>,
     }
 
     #[async_trait]
     impl ContentStore for MemStore {
         async fn get(&self, key: &str) -> Option<Bytes> {
             self.entries.lock().expect("lock").get(key).cloned()
+        }
+        async fn get_stale(&self, key: &str) -> Option<Bytes> {
+            let fresh = self.entries.lock().expect("lock").get(key).cloned();
+            fresh.or_else(|| self.expired.lock().expect("lock").get(key).cloned())
         }
         async fn put(&self, key: &str, value: Bytes, ttl: Option<std::time::Duration>) {
             self.entries
@@ -234,6 +257,35 @@ mod tests {
             store,
             "test",
         )
+    }
+
+    /// An origin that cannot answer: offline.
+    struct Offline;
+
+    #[async_trait]
+    impl TerrainSource for Offline {
+        async fn fetch_tile(&self, _c: TileCoord) -> Result<Fetched<Vec<u8>>, TerrainSourceError> {
+            Err(TerrainSourceError::failed("offline".to_owned()))
+        }
+    }
+
+    /// Offline, a tile the store holds past its lifetime is served rather
+    /// than failed: stale ground, never a hole.
+    #[test]
+    fn offline_an_expired_tile_is_served_stale() {
+        let store = Arc::new(MemStore::default());
+        let source =
+            CachedTerrain::new(Offline, Arc::clone(&store) as Arc<dyn ContentStore>, "test");
+        let c = TileCoord::new(3, 4, 5);
+        store
+            .expired
+            .lock()
+            .expect("lock")
+            .insert(source.key(c), Bytes::from_static(b"old-mesh"));
+        let got = futures_executor::block_on(source.fetch_tile(c)).expect("the stale tile");
+        assert_eq!(got.value, b"old-mesh".to_vec());
+        // And a tile the store never held is still the origin's failure.
+        assert!(futures_executor::block_on(source.fetch_tile(TileCoord::new(3, 0, 0))).is_err());
     }
 
     #[test]
