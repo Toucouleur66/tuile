@@ -330,7 +330,7 @@ mod tests {
         metrics::with_local_recorder(&registry, || {
             metrics::counter!("tuile_tiles_fetch_total", "source" => "cache", "kind" => "mesh", "outcome" => "hit").increment(1);
             metrics::counter!("tuile_tiles_fetch_total", "url" => "https://tiles.example/1/2/3.terrain").increment(1);
-            metrics::histogram!("tuile_tiles_zone_listing_seconds", "layer" => "a-layer")
+            metrics::histogram!("tuile_tiles_zone_listing_seconds", "layer_name" => "a-layer")
                 .record(1.0);
         });
         let out = encode(&resource(), &registry.snapshot(), 0, 1);
