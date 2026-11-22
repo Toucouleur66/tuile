@@ -1852,14 +1852,34 @@ impl Budget {
             Err(_) => self.tiles.get(&t).copied(),
         };
         l.held.clear();
+        // The held tiles whose walk passed a named tile: the geometric ones
+        // from each named tile's interval, the others each walked once
+        // against the named list (`held_under`'s union, not one walk of
+        // every irregular held tile per named tile).
+        l.named.clear();
         for &Named { tile: x, .. } in named {
             if self.held_last.contains_key(&x) {
                 l.held.push(x);
             }
-            l.held.extend(self.held_under(x, before).map(|(h, _)| h));
+            l.held.extend(self.held_regular_under(x).map(|(h, _)| h));
+            l.named.push(x);
         }
+        self.irregular_reaching(&l.named, before, &mut l.held);
         l.held.sort_unstable();
         l.held.dedup();
+        #[cfg(debug_assertions)]
+        {
+            let mut all: Vec<TileId> = Vec::new();
+            for &Named { tile: x, .. } in named {
+                if self.held_last.contains_key(&x) {
+                    all.push(x);
+                }
+                all.extend(self.held_under(x, before).map(|(h, _)| h));
+            }
+            all.sort_unstable();
+            all.dedup();
+            assert_eq!(all, l.held, "the held tiles to walk again, one walk each");
+        }
         for i in 0..l.held.len() {
             let h = l.held[i];
             Self::chain_of(h, before, &mut l.chain);

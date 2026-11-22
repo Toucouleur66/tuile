@@ -158,11 +158,26 @@ impl Budget {
     where
         F: Fn(TileId) -> Option<TileInfo> + Copy + 'a,
     {
+        let irregular = self
+            .down
+            .held_irregular()
+            .keys()
+            .filter_map(move |h| self.reaches(*h, of, info).map(|p| (*h, p)));
+        self.held_regular_under(of).chain(irregular)
+    }
+
+    /// [`Budget::held_under`]'s geometric part: the held tiles of `of`'s
+    /// Morton interval whose walk reaches it, with the lowest level each
+    /// passed before it.
+    pub(super) fn held_regular_under(
+        &self,
+        of: TileId,
+    ) -> impl Iterator<Item = (TileId, u32)> + '_ {
         // A geometric walk passes the levels of the quadtree: from `h`
         // to `of`, the lowest before `of`'s child is the level below it
         // (none when `h` is its child).
         let level = morton(of).map(|m| m.level);
-        let regular = subtree(of).into_iter().flat_map(move |r| {
+        subtree(of).into_iter().flat_map(move |r| {
             self.down
                 .held_regular()
                 .range(r)
@@ -178,13 +193,36 @@ impl Budget {
                         (*h, passed)
                     })
                 })
-        });
-        let irregular = self
-            .down
-            .held_irregular()
-            .keys()
-            .filter_map(move |h| self.reaches(*h, of, info).map(|p| (*h, p)));
-        regular.chain(irregular)
+        })
+    }
+
+    /// The irregular held tiles whose walk reaches any tile of `of` (sorted),
+    /// into `out`: the union of [`Budget::held_under`]'s irregular part over
+    /// `of`, each held tile walked once — its walk read against the sorted
+    /// list — instead of once per tile of `of`. The walk is
+    /// [`Budget::reaches`]' own, step for step: a held tile is in when one
+    /// of the parents that walk visits is in `of`.
+    pub(super) fn irregular_reaching<F>(&self, of: &[TileId], info: F, out: &mut Vec<TileId>)
+    where
+        F: Fn(TileId) -> Option<TileInfo>,
+    {
+        if of.is_empty() {
+            return;
+        }
+        for h in self.down.held_irregular().keys() {
+            let mut t = *h;
+            for _ in 0..64 {
+                self.walk(1);
+                let Some(p) = info(t).and_then(|i| i.parent()) else {
+                    break;
+                };
+                if of.binary_search(&p).is_ok() {
+                    out.push(*h);
+                    break;
+                }
+                t = p;
+            }
+        }
     }
 }
 
