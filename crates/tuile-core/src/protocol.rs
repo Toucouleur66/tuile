@@ -92,6 +92,12 @@ pub enum ClientMessage {
     /// force kept (`docs/explorations/budget-eviction-prefetch-spec.md`
     /// §3.3).
     Specify { query: String, overridden: bool },
+    /// The fallback specification in force from the next step: which
+    /// imagery layers are drawn from a substitute, and where
+    /// ([`crate::budget::fallback`]). Empty, the default, is none: the
+    /// session substitutes nothing. Replaces the one given before; a tile
+    /// changing layer swaps new before old, never bare.
+    Fallbacks(crate::budget::FallbackSpec),
 }
 
 /// What the tree knows about a tile, travelling with every message that names

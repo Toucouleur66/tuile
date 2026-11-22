@@ -55,7 +55,7 @@ pub const ALLOWED: [&str; 16] = [
 ];
 
 /// The metric label keys a series may carry.
-pub const ALLOWED_LABELS: [&str; 19] = [
+pub const ALLOWED_LABELS: [&str; 20] = [
     // tuile_core::metrics: the per-level and per-eye series.
     "series",
     "level",
@@ -63,6 +63,10 @@ pub const ALLOWED_LABELS: [&str; 19] = [
     // per-layer series): a number, never the layer's name.
     "layer",
     "eye",
+    // The role of an imagery layer, `source` or `substitute` — never its
+    // name: the tile reads label their layers by name, and that stays home
+    // (`tuile_layer_*`, docs/explorations/imagery-layer-substitution.md).
+    "layer_role",
     // The tile reads by place (`tuile_tiles_fetch_*`).
     "source",
     "kind",
