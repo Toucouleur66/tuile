@@ -370,6 +370,23 @@ impl App {
     /// so the needle agrees with the frame it is drawn over.
     fn upload_the_control(&mut self, indicator: Option<tuile_ui::Spinner>) {
         let ui = self.ui_frame();
+        // The tiles' labels, placed for the camera as it now stands.
+        if self.tile_labels.tiles.is_empty() {
+            self.tile_labels.placed.clear();
+            self.tile_labels.background.clear();
+        } else {
+            let cam = self.controller.camera;
+            let clearance = self.controller.height_above_ground();
+            let view_proj = glam::Mat4::from_cols_array(&cam.view_proj_with_clearance(
+                cam.position,
+                self.aspect(),
+                clearance,
+            ));
+            let scale = self.active.as_ref().map_or(1.0, |a| a.scale);
+            let view = self.viewport();
+            self.tile_labels
+                .place(&view_proj, cam.position, view, scale);
+        }
         let Some(active) = self.active.as_mut() else {
             return;
         };
@@ -396,6 +413,11 @@ impl App {
             position: ui.from(v.position),
             color: v.color,
         }));
+        // The tiles' labels' backgrounds, over the view.
+        nav_mesh.extend(self.tile_labels.background.iter().map(|v| OverlayVertex {
+            position: v.position,
+            color: v.color,
+        }));
         // The budget window's background, over the view and the control.
         if let Some(panel) = self.budget_window.layout() {
             nav_mesh.extend(panel.background.iter().map(|v| OverlayVertex {
@@ -418,6 +440,7 @@ impl App {
         let masks: Vec<tuile_wgpu::OverlayMask<'_>> = bar
             .and_then(|bar| bar.label.as_ref())
             .into_iter()
+            .chain(self.tile_labels.placed.iter())
             .chain(self.budget_window.layout().and_then(|p| p.label.as_ref()))
             .map(|label| tuile_wgpu::OverlayMask {
                 width: label.mask.width,
@@ -450,6 +473,8 @@ impl App {
         // Whether this frame is due a picture of the recording, and the
         // frame index it carries.
         let snap = self.picture_due();
+        let labels_on = self.tile_labels.forced
+            || super::tile_labels::WITH_LEVEL_VIEWS.contains(&self.views.diagnostic);
         let active = self.active.as_mut()?;
         // For any selected tile not yet uploaded, fall back to its nearest ready
         // ancestor so refinement never flashes the background.
@@ -462,6 +487,19 @@ impl App {
         // the black square. The tree is the only thing that can answer, so the
         // server sends it and the pump reads it. Nothing here to get wrong.
         let (drawn, resolution) = active.pump.resolve(&active.gpu);
+        // The tiles the levels are written on, read off what is drawn:
+        // the tiles drawn as themselves. An ancestor standing in fills only
+        // the ground nothing finer covers, and its centre is most often
+        // under the finer tiles, where its label would mislead.
+        self.tile_labels.tiles.clear();
+        if labels_on {
+            self.tile_labels.tiles.extend(
+                drawn
+                    .exact
+                    .iter()
+                    .map(|t| (t.origin_ecef(), t.levels())),
+            );
+        }
         // The 3D Tiles over the globe, from the same pump, and what their
         // tiles drawn credit, for the caption.
         let replacing = &drawn.covering;

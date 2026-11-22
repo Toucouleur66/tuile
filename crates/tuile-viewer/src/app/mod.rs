@@ -35,6 +35,7 @@ mod setup;
 pub(crate) use setup::backend_named;
 mod stall;
 mod tape;
+mod tile_labels;
 mod tilesets;
 mod touch;
 mod warmup;
@@ -387,6 +388,8 @@ pub struct App {
     budget_ask: crate::steer::BudgetAsk,
     /// The budget window over the view (`budget_window`).
     budget_window: budget_window::BudgetWindow,
+    /// The levels written on each tile on screen (`tile_labels`).
+    tile_labels: tile_labels::TileLabels,
     recording: tape::Recording,
     warmup: warmup::Warmup,
     pacing: pacing::Pacing,
@@ -551,6 +554,7 @@ impl App {
             views: input::Views::default(),
             budget_ask: crate::steer::BudgetAsk::default(),
             budget_window: budget_window::BudgetWindow::default(),
+            tile_labels: tile_labels::TileLabels::default(),
             recording: tape::Recording {
                 tape: crate::recording::open_tape(config.record.path.as_deref()),
                 trace: crate::recording::open_trace(),

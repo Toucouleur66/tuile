@@ -18,7 +18,8 @@
 //! window over the view: `<out>/window.png` (this step),
 //! `<out>/window-cumulative.png` (since the start) and
 //! `<out>/window-since-reset.png` (since `window=reset`, back to the first
-//! view). The credential comes
+//! view); then each tile's levels written on it, `<out>/labels-lag.png`
+//! (the lag view) and `<out>/labels.png` (`tuile://view?labels=on`). The credential comes
 //! as for the window (`CESIUM_ION_TOKEN`, the token file, …); give it in
 //! the environment to keep a build outside the signed bundle away from the
 //! keychain.
@@ -146,6 +147,16 @@ fn run(asked: &Asked) -> Result<(), String> {
     run.act(&Action::Go(asked.view));
     run.run_for(asked.seconds);
     save(&run, asked, "window-since-reset")?;
+    // Each tile's levels written on it: with the lag view, then alone.
+    run.act(&Action::Url("tuile://budget?window=off".to_owned()));
+    run.act(&Action::Url("tuile://view?diagnostic=lag".to_owned()));
+    run.run_for(1.0);
+    save(&run, asked, "labels-lag")?;
+    run.act(&Action::Url(
+        "tuile://view?diagnostic=normal&labels=on".to_owned(),
+    ));
+    run.run_for(1.0);
+    save(&run, asked, "labels")?;
     run.finish().map(|_| ())
 }
 

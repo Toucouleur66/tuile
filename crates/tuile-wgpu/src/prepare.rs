@@ -324,6 +324,17 @@ impl PreparedTile {
         self.dressing.iter().any(|(r, _)| *r == drape)
     }
 
+    /// Where the tile stands: the origin its vertices are relative to, in
+    /// ECEF metres.
+    pub fn origin_ecef(&self) -> DVec3 {
+        self.origin_ecef
+    }
+
+    /// The levels the tile was last told ([`Self::dress`]).
+    pub fn levels(&self) -> Levels {
+        self.levels
+    }
+
     /// Dresses the tile with `drapes`, each worn through its uv transform:
     /// the layers of each, placed in this tile's uv square, in stacking
     /// order, and tells it `levels`. Nothing is uploaded — the drapes'

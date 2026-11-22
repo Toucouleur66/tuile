@@ -26,7 +26,7 @@
 //! | `tuile://goto?…&time=&timeOffset=&timeRate=` | also sets the scene's clock, as `--time`, `--time-offset` and `--time-rate` do: see below |
 //! | `tuile://north` | north up, about the point at the centre of the view |
 //! | `tuile://here` | centres on the current location (the system still asks the person) |
-//! | `tuile://view?freeze=on\|off&wireframe=on\|off&diagnostic=normal\|unlit\|coverage\|geometry\|levels\|lag\|cap` | the display switches, and the diagnostic view `D` cycles |
+//! | `tuile://view?freeze=on\|off&wireframe=on\|off&labels=on\|off&diagnostic=normal\|unlit\|coverage\|geometry\|levels\|lag\|cap` | the display switches, and the diagnostic view `D` cycles; `labels` writes each tile's terrain and imagery levels on it (`T12 · I11→13`), as the level views `levels`, `lag` and `cap` do |
 //! | `tuile://tileset?asset=<n>&show=on\|off` | one of the host's 3D Tiles tilesets drawn over the globe, or not |
 //! | `tuile://imagery?name=<key>` | drapes another of the host's imagery layers; `name=next` takes the one after the present |
 //! | `tuile://import?src=https://…` | fetches a configuration file and imports it, as opening it would (`crate::import`) |
@@ -186,6 +186,9 @@ pub(crate) enum Command {
     Here,
     Freeze(bool),
     Wireframe(bool),
+    /// Each tile's terrain and imagery levels written on it, without a
+    /// level view (`app::tile_labels`); the level views show them anyway.
+    TileLabels(bool),
     /// Drape the host's imagery layer of this index — see
     /// [`crate::embed::ViewerHost::imagery`]. An index and not a name, so the
     /// command is checked once, where it is read, against the list.
@@ -572,6 +575,7 @@ pub(crate) fn parse_url_among(
                     match *key {
                         "freeze" => Ok(Command::Freeze(on)),
                         "wireframe" => Ok(Command::Wireframe(on)),
+                        "labels" => Ok(Command::TileLabels(on)),
                         _ => Err(format!("unknown switch {key:?}")),
                     }
                 })
@@ -1200,6 +1204,10 @@ mod tests {
         assert_eq!(one("tuile://north"), Command::NorthUp);
         assert_eq!(one("tuile://north/"), Command::NorthUp);
         assert_eq!(one("tuile://here"), Command::Here);
+        assert_eq!(
+            parse_url("tuile://view?labels=on"),
+            Ok(vec![Command::TileLabels(true)])
+        );
         assert_eq!(
             parse_url("tuile://view?freeze=on&wireframe=off"),
             Ok(vec![Command::Freeze(true), Command::Wireframe(false)])
