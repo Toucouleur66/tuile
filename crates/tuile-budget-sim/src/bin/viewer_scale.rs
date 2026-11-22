@@ -145,6 +145,27 @@ fn main() {
         pct(&a, 99),
         a.last().copied().unwrap_or(0),
     );
+    // Instructions retired and cycles per step, where counted: what a
+    // loaded machine does not inflate.
+    let mut ins: Vec<u64> = sim.decide_instructions[first..]
+        .iter()
+        .map(|x| x.1)
+        .collect();
+    let cyc: u64 = sim.decide_instructions[first..].iter().map(|x| x.2).sum();
+    if ins.iter().any(|i| *i > 0) {
+        let total: u64 = ins.iter().sum();
+        ins.sort_unstable();
+        println!(
+            "instructions per decide: mean {:.0} k, p50 {} k, p99 {} k, max {} k; \
+             total {:.2} G instructions, {:.2} G cycles",
+            total as f64 / ins.len().max(1) as f64 / 1e3,
+            pct(&ins, 50) / 1000,
+            pct(&ins, 99) / 1000,
+            ins.last().copied().unwrap_or(0) / 1000,
+            total as f64 / 1e9,
+            cyc as f64 / 1e9,
+        );
+    }
     if flag("--digest") {
         // FNV-1a over every step's digest, warm-up included.
         let d = sim.log.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, l| {
