@@ -271,8 +271,6 @@ pub(super) struct WalkedLevels {
     drawn: PerClass<[u32; super::stats::LEVELS]>,
     under_need: PerClass<[u32; super::stats::LEVELS]>,
     layer_drawn: [u32; super::stats::LAYERS],
-    layer_gpu_tiles: [u32; super::stats::LAYERS],
-    layer_gpu_bytes: [Bytes; super::stats::LAYERS],
 }
 
 /// A step's buffers, kept across steps so that a step allocates nothing
@@ -1950,8 +1948,9 @@ impl Budget {
         l.under_need = w.under_need;
         let y = &mut st.layers;
         y.drawn = w.layer_drawn;
-        y.gpu_tiles = w.layer_gpu_tiles;
-        y.gpu_bytes = w.layer_gpu_bytes;
+        let (layer_tiles, layer_bytes) = a.gpu_by_layer();
+        y.gpu_tiles = *layer_tiles;
+        y.gpu_bytes = *layer_bytes;
         for &s in a.active() {
             if a.loading(s) {
                 l.in_flight[a.class(s)][level_index(a.level(s))][prefetch_index(a.urgency(s))] += 1;
@@ -1999,25 +1998,8 @@ impl Budget {
                 w.under_need[Class::Drape][level_index(stats.tile_level)] += 1;
             }
         }
-        let every = ResourceId::Drape {
-            tile: TileId(0),
-            layer: LayerId(0),
-            level: 0,
-        }..=ResourceId::Drape {
-            tile: TileId(u64::MAX),
-            layer: LayerId(u16::MAX),
-            level: u32::MAX,
-        };
-        for r in a.gpu_drapes(every) {
-            let (Some(x), Some(s)) = (r.layer(), a.find(r)) else {
-                continue;
-            };
-            if let Some(g) = a.gpu(s) {
-                let i = layer_index(x);
-                w.layer_gpu_tiles[i] += 1;
-                w.layer_gpu_bytes[i] = w.layer_gpu_bytes[i].plus(g.bytes);
-            }
-        }
+        // The layers' GPU copies: kept by the arena (`gpu_by_layer`).
+
         self.scratch.chosen = chosen;
         w
     }
