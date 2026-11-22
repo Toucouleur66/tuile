@@ -1676,8 +1676,12 @@ impl Budget {
         // sets; the eviction order's newest group.
         self.mark(now, tiles, named, wants);
 
-        // 5. Cancellations: grace and timeouts.
+        // 5. Cancellations: grace and timeouts; then what an epoch left
+        // behind.
         self.cancel(now, &eff, d, &mut st);
+        if !eff.batch {
+            self.recycle(now, d, &mut st);
+        }
 
         // 6. Rank the work: the wanted resources with a load or a delivery
         // to start, kept up to date.
@@ -1998,6 +2002,76 @@ impl Budget {
         }
         self.scratch.chosen = chosen;
         w
+    }
+
+    /// What a new epoch left of the old content, let go: the drape loads
+    /// still in flight for it cancelled, its decoded copies released, and its GPU
+    /// copies evicted — but those drawn or in a swap this step, which stay
+    /// worn until their refresh is drawable (new before old), and those of
+    /// the floor, which are wanted and refreshed in place. Looks at every
+    /// slot on the step after an epoch moved, then, while some GPU copy is
+    /// still of an older epoch, at those the step no longer keeps.
+    fn recycle(&mut self, now: Micros, d: &mut Decisions, st: &mut BudgetStats) {
+        let first = std::mem::take(&mut self.recycle);
+        if !first && !self.any_stale() {
+            return;
+        }
+        let a = &self.arena;
+        let mut old: Vec<(ResourceId, Slot)> = a
+            .iter()
+            .filter(|&s| {
+                let epoch = self.epoch(a.id(s), a.class(s));
+                let loading = matches!(a.load(s), Load::Loading { epoch: e, .. } if e < epoch)
+                    && a.class(s) == Class::Drape;
+                let cpu = a.cpu(s).is_some_and(|c| c.epoch < epoch) && !a.has_transit(s);
+                (first && (loading || cpu)) || a.stale_gpu(s, epoch)
+            })
+            .map(|s| (a.id(s), s))
+            .collect();
+        self.walk(self.arena.len());
+        // By resource: the order the consumer is told in.
+        old.sort_unstable();
+        for (r, s) in old {
+            let class = self.arena.class(s);
+            let epoch = self.epoch(r, class);
+            if let Load::Loading {
+                gen,
+                source,
+                epoch: e,
+                ..
+            } = self.arena.load(s)
+            {
+                // A drape's only: what a mesh load answers across a mesh
+                // epoch is refreshed like any copy, and its slot is kept.
+                if e < epoch && class == Class::Drape {
+                    self.arena.set_load(s, Load::Idle);
+                    match source {
+                        Source::Network => {
+                            release(&mut self.in_flight[class], &mut self.underflows)
+                        }
+                        Source::Local => release(&mut self.local_reads, &mut self.underflows),
+                    }
+                    d.cancel.push((r, gen));
+                    st.cancelled += 1;
+                    st.recycled[class][0] += 1;
+                    st.wasted_starts[class] += 1;
+                }
+            }
+            let keep = self.kept(s) || self.is_floor(class, self.arena.level(s));
+            if self.arena.stale_gpu(s, epoch) && !self.arena.has_transit(s) && !keep {
+                let r = self.arena.id(s);
+                self.arena.take_gpu(s, &mut self.ledger);
+                d.evict.push(r);
+                st.evicted += 1;
+                st.recycled[class][1] += 1;
+                st.evictions_by_level[class][super::stats::level_index(self.arena.level(s))] += 1;
+                self.evicted(r, now);
+            }
+            if self.arena.cpu(s).is_some_and(|c| c.epoch < epoch) && !self.arena.has_transit(s) {
+                self.release_one(s, d, st);
+                st.recycled[class][2] += 1;
+            }
+        }
     }
 
     fn protected_bytes(&self) -> PerClass<Bytes> {
@@ -2561,17 +2635,20 @@ impl Budget {
             }
         }
         let reused = c.delivered_before;
-        // A stale GPU copy on its way again leaves the step's room.
-        let in_room = self.scratch.room.is_some() && {
-            let a = &self.arena;
-            a.grouped(s) && a.has_gpu(s) && !self.kept(s) && !self.is_floor(a.class(s), a.level(s))
-        };
-        if let (true, Some(room), Some(g)) =
-            (in_room, self.scratch.room.as_mut(), self.arena.gpu(s))
-        {
-            let i = want_bucket(wants.get(&r));
-            room.bytes[class][i] = room.bytes[class][i].minus(g.bytes);
-        }
+        // A copy on its way again was on the GPU only if stale, and a stale
+        // copy the step's room could count — not drawn, not in a swap, not
+        // of the floor — was evicted by this step's recycle (`recycle`,
+        // before the deliveries): none of the room's bytes leaves with it.
+        debug_assert!(
+            self.scratch.room.is_none() || {
+                let a = &self.arena;
+                !(a.grouped(s)
+                    && a.has_gpu(s)
+                    && !self.kept(s)
+                    && !self.is_floor(a.class(s), a.level(s)))
+            },
+            "{r:?}: a stale copy the room counts is delivered again"
+        );
         // `make_room` frees no slot: `s` is still `r`'s.
         self.arena.list_active(s);
         self.arena.put_transit(
@@ -3237,20 +3314,23 @@ mod tests {
         assert_eq!(b.audit(), Err(AuditError::SlotUnderflow { count: 1 }));
     }
 
-    /// O1.2's debt: a stale GPU copy redelivered in a step whose room is
-    /// built leaves the room, its bytes taken off its bucket. Here a ring
-    /// resident `r`, stale after an epoch, is redelivered after a fresher
-    /// ring tile's delivery built the room (evicting an idle resident):
-    /// without the bucket's update, the room counts `r`'s bytes as
-    /// evictable while they are on their way, and a later `make_room` of
-    /// the step would free bytes that are not there. The check is
-    /// `evict`'s debug assertion of the room against a recount.
+    /// O1.2's debt, closed by the recycle: a stale GPU copy redelivered in
+    /// a step whose room is built would leave the room, its bytes still
+    /// counted as evictable while on their way, and a later `make_room` of
+    /// the step would free bytes that are not there. Since an epoch's
+    /// recycle evicts every stale copy the room can count before the
+    /// deliveries, it never happens. Here a ring resident `r` and an idle
+    /// one `v`, both stale after an epoch, are evicted on the epoch's step,
+    /// and `r` is delivered again fresh. Without the recycle this is the
+    /// old scenario — `r1`'s delivery builds the room evicting `v`, then
+    /// `r`'s stale copy is delivered again — and `deliver_one`'s debug
+    /// assertion fires on `r`.
     #[test]
     #[cfg_attr(
         not(debug_assertions),
         ignore = "the room is checked by a debug assertion"
     )]
-    fn a_stale_copy_redelivered_leaves_the_steps_room() {
+    fn a_stale_copy_never_reaches_the_steps_room() {
         let t3d = Class::Tiles3dMesh;
         let mut cfg = BudgetConfig::interactive(Bytes::mib(64));
         cfg.pinned_level = None;
@@ -3296,18 +3376,25 @@ mod tests {
         ack(&mut b, &d, v, 3);
         step(&mut b, &ring);
         step(&mut b, &ring);
-        // A new epoch: `r`'s copy is stale; `r` and a fresher `r1` load.
+        // A new epoch: the copies of `r` (ring) and `v` (left) are stale,
+        // and neither is drawn: both recycled on the step that sees the
+        // epoch; `r` and a fresher `r1` load.
         b.new_epoch(t3d, None);
         let both = need(&[], &[(r, 0.0), (r1, 3.0)]);
         let d = step(&mut b, &both);
+        assert!(d.evict.contains(&ResourceId::Mesh(r)), "{d:?}");
+        assert!(d.evict.contains(&ResourceId::Mesh(v)), "{d:?}");
+        assert_eq!(d.stats.recycled[t3d][1], 2);
         load(&mut b, &d, r, 1);
         load(&mut b, &d, r1, 1);
+        // Both delivered, `r` fresh: no stale copy of it left to be on its
+        // way again (`deliver_one`'s assertion holds).
         let d = step(&mut b, &both);
-        // `r1` first: room built, `v` evicted; then `r`, redelivered.
-        assert!(d.evict.contains(&ResourceId::Mesh(v)), "{d:?}");
-        let order: Vec<_> = d.deliver.iter().map(|x| x.0).collect();
-        assert_eq!(order, [ResourceId::Mesh(r1), ResourceId::Mesh(r)]);
-        // `evict` asserts the room against a recount, which counted `r`'s
-        // stale copy, on its way again, without the update.
+        let mut delivered: Vec<_> = d.deliver.iter().map(|x| x.0).collect();
+        delivered.sort_unstable();
+        assert_eq!(delivered, [ResourceId::Mesh(r), ResourceId::Mesh(r1)]);
+        assert!(b
+            .resource(ResourceId::Mesh(r))
+            .is_some_and(|x| x.gpu == Bytes::ZERO));
     }
 }

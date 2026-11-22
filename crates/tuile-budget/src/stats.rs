@@ -179,6 +179,11 @@ pub struct BudgetStats {
     pub levels: LevelStats,
     /// The step's drapes per imagery layer: as `levels`.
     pub layers: LayerStats,
+    /// What an epoch's change let go of its old content, per class: loads
+    /// cancelled (`[0]`), GPU copies evicted (`[1]`) and decoded copies
+    /// released (`[2]`) — also counted in `cancelled`, `evicted` and
+    /// `released`, outside the reasons above.
+    pub recycled: PerClass<[u32; 3]>,
     /// Decoded copies released per class.
     pub releases: PerClass<u32>,
     /// Failures per class, transient (`[0]`) and permanent (`[1]`).

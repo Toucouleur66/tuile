@@ -1902,7 +1902,15 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
     /// on, and a warm-up that starves the first frame has defeated itself.
     /// The imagery being served: a switch of imagery is a change of what
     /// every tile's content is, which is exactly what an epoch says.
+    ///
+    /// Read by the server every step, so it is also where the decoded tiles
+    /// of an imagery switched away from — the source's or the substitute's —
+    /// are let go: at once, not at the next drape asked for.
     fn epoch(&self) -> u64 {
+        drop(self.decoded_of(Lane::Source));
+        if self.substitute.is_some() {
+            drop(self.decoded_of(Lane::Substitute));
+        }
         // A switch of the substitute is a change of what its drapes are too.
         self.imagery.generation().wrapping_add(
             self.substitute
@@ -2716,11 +2724,22 @@ mod tests {
             .all(|(source, _, shade)| (*source, *shade) == (0, 10)));
         assert_eq!(TileLoader::epoch(&loader), 0);
 
+        assert!(
+            !loader.cache.lock().unwrap().map.is_empty(),
+            "the first drape decoded its tiles"
+        );
         assert_eq!(switch.switch_to(Arc::new(Painted(200))), 1);
         assert_eq!(
             TileLoader::epoch(&loader),
             1,
             "the loader's epoch is the imagery's"
+        );
+        // The server reads the epoch every step: from then on nothing of
+        // the old imagery is kept decoded, whether or not a drape is asked.
+        assert_eq!(
+            loader.cache.lock().unwrap().map.len(),
+            0,
+            "the old imagery's decoded tiles outlived the switch"
         );
         let after = drape();
         // The same ground, so the same tile addresses — and none of the old
