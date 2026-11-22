@@ -689,12 +689,20 @@ fn put<K: Ord + Copy, V>(m: &mut SortedMap<K, V>, c: &mut Changes<K, V>, k: K, v
 
 /// Adds `items` to `v`, a list read as a set: when it is full it is sorted
 /// and deduplicated before it grows, so it holds about twice its distinct
-/// members at most, whatever was added twice.
+/// members at most, whatever was added twice. A compaction that frees less
+/// than an eighth of it makes a quarter more room: otherwise a list of
+/// distinct members with a few repeats sorted itself whole at nearly every
+/// push (a quadratic step: 235 ms of the viewer-scale run's slowest step,
+/// adding a view's wants into `marks`), where now each sort of `n` is paid
+/// by `n / 8` pushes at least.
 fn add<T: Ord + Copy>(v: &mut Vec<T>, items: impl IntoIterator<Item = T>) {
     for x in items {
         if v.len() == v.capacity() && v.len() >= 64 {
             v.sort_unstable();
             v.dedup();
+            if 8 * (v.capacity() - v.len()) < v.capacity() {
+                v.reserve_exact(v.len() / 4);
+            }
         }
         v.push(x);
     }
@@ -3315,6 +3323,51 @@ mod tests {
     use super::*;
     use crate::state::{SHRINK_BELOW, SHRINK_FLOOR, SHRINK_TO};
     use crate::{Budget, BudgetConfig, Bytes, Class, ResourceId, TileId};
+
+    /// A key that counts its comparisons, on this thread.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct Counted(u32);
+
+    thread_local! {
+        static COMPARED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    impl Ord for Counted {
+        fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+            COMPARED.with(|c| c.set(c.get() + 1));
+            self.0.cmp(&o.0)
+        }
+    }
+
+    impl PartialOrd for Counted {
+        fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(o))
+        }
+    }
+
+    /// `add` costs O(log n) a push, amortised, whatever is added twice: a
+    /// list of distinct members with a repeat between each two (a view's
+    /// wants added again for its named tiles) once sorted itself whole at
+    /// nearly every push, n² log n — 235 ms of one step at the viewer's
+    /// scale.
+    #[test]
+    fn adding_to_a_set_list_sorts_it_amortised() {
+        let n = 65_536u32;
+        let mut v: Vec<Counted> = Vec::with_capacity(64);
+        COMPARED.with(|c| c.set(0));
+        for i in 0..n {
+            add(&mut v, [Counted(i), Counted(0)]);
+        }
+        let compared = COMPARED.with(std::cell::Cell::get);
+        v.sort_unstable();
+        v.dedup();
+        assert_eq!(v.len(), n as usize, "a set: every member once");
+        let bound = 12 * u64::from(n) * u64::from(n.ilog2());
+        assert!(
+            compared <= bound,
+            "{compared} comparisons for {n} pushes, over {bound}"
+        );
+    }
 
     /// The budget's prune-side compaction, driven directly: `n` tracked
     /// slots added or taken (empty ones, as a prune frees them).
