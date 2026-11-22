@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! cargo run --release -p tuile-budget-sim --bin tuile-budget-viewer-scale -- \
-//!     [--gib 8] [--warm 300] [--loops 3] [--top 0] [--digest]
+//!     [--gib 8] [--warm 300] [--loops 3] [--top 0] [--digest] [--wide]
 //! ```
 //!
 //! Prints the tracked resources, then `decide` mean / p50 / p99 / max (µs,
@@ -55,7 +55,20 @@ fn main() {
     let mut cfg = BudgetConfig::interactive(Bytes::gib(gib));
     cfg.decoded_target = Bytes::gib(gib / 2);
     let mut sim = Sim::unchecked(desktop_on(cfg), 7);
-    let tour = tuile_budget_sim::catalogue::tour;
+    // `--wide`: each four-minute loop of the tour 48 km further on, so the
+    // warm-up keeps finding new ground and the tracked set grows to the real
+    // viewer's tens of thousands; the plain tour loops over the same ground
+    // and saturates near 22 k.
+    let wide = flag("--wide");
+    let tour = move |t: f64| {
+        let mut c = tuile_budget_sim::catalogue::tour(t);
+        if wide {
+            let k = (t / 240.0).floor();
+            c.x += 48_000.0 * k;
+            c.y += 24_000.0 * k;
+        }
+        c
+    };
     sim.run(warm, &tour);
     let s = named("aggressive-sequence").expect("in the catalogue");
     let start = sim.now;
