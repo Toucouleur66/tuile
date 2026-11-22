@@ -31,7 +31,7 @@
 //! | `tuile://imagery?name=<key>` | drapes another of the host's imagery layers; `name=next` takes the one after the present |
 //! | `tuile://import?src=https://…` | fetches a configuration file and imports it, as opening it would (`crate::import`) |
 //! | `tuile://telemetry?metrics=on\|off&profiling=on\|off` | the performance numbers sent to the configured collector, or not: see `tuile_telemetry` (nothing happens where none is configured) |
-//! | `tuile://budget?spec=auto\|interactive\|fpv\|known_path\|film\|fpv_film&margin=&horizon_ms=&speculation_slots=&line=on\|off` | **a diagnostic**: forces the budget's specification (the context chooses it otherwise: ordinary navigation runs `interactive`), a few of its numbers, and the budget's line over the view; `spec=auto` gives the choice back to the context (`docs/explorations/budget-eviction-prefetch-spec.md` §3.3) |
+//! | `tuile://budget?spec=auto\|interactive\|fpv\|known_path\|film\|fpv_film&margin=&horizon_ms=&speculation_slots=&line=on\|off&window=on\|off\|instant\|cumulative\|reset` | **a diagnostic**: forces the budget's specification (the context chooses it otherwise: ordinary navigation runs `interactive`), a few of its numbers, the budget's line over the view, and the budget window (per level and per layer, this step or summed since its start, `reset` summing from now); `spec=auto` gives the choice back to the context (`docs/explorations/budget-eviction-prefetch-spec.md` §3.3) |
 //!
 //! ## The scene's clock in a link
 //!
@@ -157,6 +157,19 @@ impl BudgetAsk {
     }
 }
 
+/// What the budget window is asked: shown or not, which of its views, and
+/// whether its cumulative view starts again from now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowAsk {
+    /// Shown, or not.
+    Show(bool),
+    /// Shown, on this step's numbers (`false`) or the numbers summed since
+    /// its start (`true`).
+    Cumulative(bool),
+    /// Shown, cumulative, summed from now.
+    Reset,
+}
+
 /// One thing the view can be told to do, whoever is telling it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Command {
@@ -165,6 +178,8 @@ pub(crate) enum Command {
     /// The budget's line over the view (its specification, the tiles under
     /// their need), shown or not.
     BudgetLine(bool),
+    /// The budget window over the view (`crate::app`'s `budget_window`).
+    BudgetWindow(WindowAsk),
     Goto(Goto),
     NorthUp,
     /// Centre on the current location.
@@ -501,10 +516,22 @@ pub(crate) fn parse_url_among(
                         "off" => false,
                         _ => return Err(format!("line is on or off, not {text:?}")),
                     })),
+                    "window" => out.push(Command::BudgetWindow(match *text {
+                        "on" => WindowAsk::Show(true),
+                        "off" => WindowAsk::Show(false),
+                        "instant" => WindowAsk::Cumulative(false),
+                        "cumulative" => WindowAsk::Cumulative(true),
+                        "reset" => WindowAsk::Reset,
+                        _ => {
+                            return Err(format!(
+                                "window is on, off, instant, cumulative or reset, not {text:?}"
+                            ))
+                        }
+                    })),
                     _ => {
                         return Err(format!(
-                            "budget takes spec=, margin=, horizon_ms=, speculation_slots= \
-                             and line=, not {key:?}"
+                            "budget takes spec=, margin=, horizon_ms=, speculation_slots=, \
+                             line= and window=, not {key:?}"
                         ))
                     }
                 }
@@ -1229,6 +1256,19 @@ mod tests {
             parse_url("tuile://budget?line=off"),
             Ok(vec![Command::BudgetLine(false)])
         );
+        for (text, ask) in [
+            ("on", WindowAsk::Show(true)),
+            ("off", WindowAsk::Show(false)),
+            ("instant", WindowAsk::Cumulative(false)),
+            ("cumulative", WindowAsk::Cumulative(true)),
+            ("reset", WindowAsk::Reset),
+        ] {
+            assert_eq!(
+                parse_url(&format!("tuile://budget?window={text}")),
+                Ok(vec![Command::BudgetWindow(ask)])
+            );
+        }
+        assert!(parse_url("tuile://budget?window=maybe").is_err());
         for bad in [
             "tuile://budget",
             "tuile://budget?spec=warp",

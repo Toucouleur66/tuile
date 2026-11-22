@@ -14,7 +14,11 @@
 //! Writes `<out>/interactive.png` (settled, the context's specification),
 //! `<out>/fpv.png` (the FPV specification forced, `tuile://budget?spec=fpv`)
 //! and `<out>/approach.png` (the eye a fifth lower, then still for
-//! `--seconds`), and prints the budget's line at each. The credential comes
+//! `--seconds`), and prints the budget's line at each; then the budget
+//! window over the view: `<out>/window.png` (this step),
+//! `<out>/window-cumulative.png` (since the start) and
+//! `<out>/window-since-reset.png` (since `window=reset`, back to the first
+//! view). The credential comes
 //! as for the window (`CESIUM_ION_TOKEN`, the token file, …); give it in
 //! the environment to keep a build outside the signed bundle away from the
 //! keychain.
@@ -130,6 +134,18 @@ fn run(asked: &Asked) -> Result<(), String> {
     run.act(&Action::Go(closer));
     run.run_for(asked.seconds);
     save(&run, asked, "approach")?;
+    // The budget window over the same view: this step's numbers, then the
+    // sums since its start, then since a reset a few seconds back.
+    run.act(&Action::Url("tuile://budget?line=off&window=on".to_owned()));
+    run.run_for(asked.seconds);
+    save(&run, asked, "window")?;
+    run.act(&Action::Url("tuile://budget?window=cumulative".to_owned()));
+    run.run_for(1.0);
+    save(&run, asked, "window-cumulative")?;
+    run.act(&Action::Url("tuile://budget?window=reset".to_owned()));
+    run.act(&Action::Go(asked.view));
+    run.run_for(asked.seconds);
+    save(&run, asked, "window-since-reset")?;
     run.finish().map(|_| ())
 }
 

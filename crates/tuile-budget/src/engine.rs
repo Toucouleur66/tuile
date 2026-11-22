@@ -50,7 +50,10 @@ use super::need_state::{NeedState, TileNeed, WantedImagery};
 use super::priority::{score, PriorityKey, Quantised, Urgency};
 use super::sorted::SortedMap;
 use super::state::{Arena, CpuCopy, EvictKey, Gpu, Held, Load, Mark, Rank, Slot, Transit};
-use super::stats::{BudgetStats, CancelReason, EvictReason, LATENCY_BUCKETS};
+use super::stats::{
+    layer_index, level_index, prefetch_index, BudgetStats, CancelReason, EvictReason,
+    LATENCY_BUCKETS,
+};
 use super::tier::{Presence, PresenceOracle, Source, Tier};
 use super::types::{
     sat_u32, Bytes, Class, Failure, Generation, LayerId, Micros, PerClass, Policy, Pressure,
@@ -246,10 +249,28 @@ pub(super) struct ItemStats {
     pub tile_level: u32,
 }
 
+/// What `Budget::level_stats` walks for: kept from one step to the next.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct WalkedLevels {
+    selected: PerClass<[u32; super::stats::LEVELS]>,
+    drawn: PerClass<[u32; super::stats::LEVELS]>,
+    under_need: PerClass<[u32; super::stats::LEVELS]>,
+    layer_drawn: [u32; super::stats::LAYERS],
+    layer_gpu_tiles: [u32; super::stats::LAYERS],
+    layer_gpu_bytes: [Bytes; super::stats::LAYERS],
+}
+
 /// A step's buffers, kept across steps so that a step allocates nothing
 /// once they have grown to the view.
 #[derive(Debug, Default)]
 pub(super) struct Scratch {
+    /// The walked part of the last step's statistics per level and
+    /// layer (`level_stats`), kept for the still steps that read it again.
+    walked_levels: Option<WalkedLevels>,
+    walked_scale: u32,
+    /// A drawn tile's chosen drape levels, for the step per level
+    /// (`level_stats`).
+    chosen: Vec<(LayerId, u32)>,
     /// The work ranked: each job's key (its resource in it), what it is,
     /// its want.
     jobs: Vec<(PriorityKey, Job, Want)>,
@@ -577,6 +598,11 @@ impl Budget {
                             cold.failures = 0;
                             cold.store_missed = false;
                             st.completed += 1;
+                            let (c, at) = (self.arena.class(s), level_index(self.arena.level(s)));
+                            st.levels.completions[c][at] += 1;
+                            if let Some(l) = self.arena.id(s).layer() {
+                                st.layers.completions[layer_index(l)] += 1;
+                            }
                             st.latency_ms[latency_bucket(now.since(started))] += 1;
                         }
                         _ => st.stale += 1,
@@ -600,6 +626,9 @@ impl Budget {
                             }
                             st.failed += 1;
                             st.failures[class][usize::from(why == Failure::Permanent)] += 1;
+                            if let Some(l) = r.layer() {
+                                st.layers.failures[layer_index(l)] += 1;
+                            }
                             if self.cfg.policy == Policy::Batch {
                                 self.fatal.get_or_insert(SessionError::LoadFailed(r));
                             } else {
@@ -1555,6 +1584,7 @@ impl Budget {
         self.ranked_last = ranked;
         self.steps += 1;
 
+        let arrivals = self.events.len();
         self.apply_events(now, &mut st);
         let mut need = std::mem::take(&mut self.need);
         self.read_need(&mut need, &input, &mut st);
@@ -1645,6 +1675,17 @@ impl Budget {
             d,
             &mut st,
         );
+        // The loads ranked and not started: the queue, by level.
+        for (k, job, w) in &jobs {
+            let loading = self
+                .arena
+                .find(k.resource)
+                .is_some_and(|s| self.arena.loading(s));
+            if *job == Job::Load && !loading {
+                st.levels.queued[w.class][level_index(w.level)][prefetch_index(Some(w.urgency))] +=
+                    1;
+            }
+        }
 
         // 7. Deliveries.
         picked.clear();
@@ -1726,6 +1767,19 @@ impl Budget {
         picked.clear();
         self.scratch.picked = picked;
         self.down.draw_set_into(&mut d.draw);
+        // A step that changed nothing the walk reads: no need named, no
+        // arrival, no decision, the same scale.
+        let quiet = named.is_empty()
+            && arrivals == 0
+            && d.start.is_empty()
+            && d.deliver.is_empty()
+            && d.evict.is_empty()
+            && d.release.is_empty()
+            && d.cancel.is_empty()
+            && d.upload_plan.items.is_empty()
+            && d.sse_scale_milli == self.scratch.walked_scale;
+        self.scratch.walked_scale = d.sse_scale_milli;
+        self.level_stats(tiles, quiet, d, &mut st);
         self.put_back(taken);
         self.need = need;
 
@@ -1766,6 +1820,110 @@ impl Budget {
         self.walk_upkeep();
         st.work = st.work.saturating_add(self.scratch.walked.swap(0, Relaxed));
         d.stats = st;
+    }
+
+    /// The step's [`LevelStats`] and [`super::stats::LayerStats`] that are
+    /// read off its results: the copies held (kept with the ledger), the
+    /// loads in flight, and — walked over the selection, the draw set and
+    /// the GPU drapes — what is drawn and selected, what is under its need,
+    /// and the layers' copies and drapes worn. The walk is taken again only
+    /// when the step may have changed it (`quiet` false): a still view's
+    /// step reads the last one's. Statistics only: not the step's work.
+    fn level_stats(
+        &mut self,
+        tiles: &SortedMap<TileId, TileNeed>,
+        quiet: bool,
+        d: &Decisions,
+        st: &mut BudgetStats,
+    ) {
+        if !(quiet && self.scratch.walked_levels.is_some()) {
+            let walked = self.walk_levels(tiles, d);
+            self.scratch.walked_levels = Some(walked);
+        }
+        let Some(w) = self.scratch.walked_levels.as_ref() else {
+            return;
+        };
+        let a = &self.arena;
+        let l = &mut st.levels;
+        l.gpu_tiles = *a.gpu_tiles_by_level();
+        let (bytes, count) = a.cpu_by_level();
+        l.decoded = *bytes;
+        l.decoded_tiles = *count;
+        l.selected = w.selected;
+        l.drawn = w.drawn;
+        l.under_need = w.under_need;
+        let y = &mut st.layers;
+        y.drawn = w.layer_drawn;
+        y.gpu_tiles = w.layer_gpu_tiles;
+        y.gpu_bytes = w.layer_gpu_bytes;
+        for &s in a.active() {
+            if a.loading(s) {
+                l.in_flight[a.class(s)][level_index(a.level(s))][prefetch_index(a.urgency(s))] += 1;
+                if let Some(x) = a.id(s).layer() {
+                    y.in_flight[layer_index(x)] += 1;
+                }
+            }
+        }
+    }
+
+    /// The walked part of [`Self::level_stats`].
+    fn walk_levels(&mut self, tiles: &SortedMap<TileId, TileNeed>, d: &Decisions) -> WalkedLevels {
+        let mut chosen = std::mem::take(&mut self.scratch.chosen);
+        let mut w = WalkedLevels::default();
+        let a = &self.arena;
+        for (t, n) in tiles.iter() {
+            if n.membership == Membership::Drawn {
+                w.selected[n.need.class][level_index(n.need.level)] += 1;
+                // The drape level the selection chose for each layer.
+                self.drapes_of(*t, n, &mut chosen);
+                for (_, level) in &chosen {
+                    w.selected[Class::Drape][level_index(*level)] += 1;
+                }
+            }
+        }
+        for item in &d.draw.items {
+            if let Some(s) = a.find(item.mesh) {
+                w.drawn[a.class(s)][level_index(a.level(s))] += 1;
+            }
+            for x in &item.drapes {
+                w.drawn[Class::Drape][level_index(x.level)] += 1;
+                w.layer_drawn[layer_index(x.layer)] += 1;
+            }
+            if item.role == Role::Fallback {
+                for t in item.serves.iter() {
+                    if let Some(n) = tiles.get(t) {
+                        w.under_need[n.need.class][level_index(n.need.level)] += 1;
+                    }
+                }
+            }
+        }
+        for (_, i) in self.down.items() {
+            let stats = i.item_stats();
+            if i.role == Role::Exact && stats.under_levels > 0 {
+                w.under_need[Class::Drape][level_index(stats.tile_level)] += 1;
+            }
+        }
+        let every = ResourceId::Drape {
+            tile: TileId(0),
+            layer: LayerId(0),
+            level: 0,
+        }..=ResourceId::Drape {
+            tile: TileId(u64::MAX),
+            layer: LayerId(u16::MAX),
+            level: u32::MAX,
+        };
+        for r in a.gpu_drapes(every) {
+            let (Some(x), Some(s)) = (r.layer(), a.find(r)) else {
+                continue;
+            };
+            if let Some(g) = a.gpu(s) {
+                let i = layer_index(x);
+                w.layer_gpu_tiles[i] += 1;
+                w.layer_gpu_bytes[i] = w.layer_gpu_bytes[i].plus(g.bytes);
+            }
+        }
+        self.scratch.chosen = chosen;
+        w
     }
 
     fn protected_bytes(&self) -> PerClass<Bytes> {
@@ -1860,6 +2018,7 @@ impl Budget {
                     if unneeded && !batch {
                         st.cancels[CancelReason::Grace as usize] += 1;
                         st.wasted_starts[class] += 1;
+                        st.levels.wasted[class][level_index(self.arena.level(s))] += 1;
                     } else {
                         st.cancels[CancelReason::Timeout as usize] += 1;
                     }
@@ -2025,6 +2184,10 @@ impl Budget {
                 self.arena.mark(s, Mark::FloorSet, true);
             }
             self.arena.list_active(s);
+            st.levels.starts[class][level_index(w.level)] += 1;
+            if let Some(l) = r.layer() {
+                st.layers.requests[layer_index(l)][usize::from(source == Source::Network)] += 1;
+            }
             self.deadline(now.plus(self.cfg.load_timeout), *r);
             match source {
                 Source::Network => {
@@ -2348,6 +2511,9 @@ impl Budget {
         );
         if reused {
             st.network_bytes_avoided = st.network_bytes_avoided.plus(c.cost.gpu);
+            if let Some(l) = r.layer() {
+                st.layers.ram_hits[layer_index(l)] += 1;
+            }
         }
         st.delivered += 1;
         d.deliver.push((r, c.gen));
@@ -2584,6 +2750,7 @@ impl Budget {
         d.release.push(self.arena.id(s));
         st.released += 1;
         st.releases[self.arena.class(s)] += 1;
+        st.levels.releases[self.arena.class(s)][level_index(self.arena.level(s))] += 1;
     }
 
     /// D-A3: one sweep over the pool's members, in the one eviction order,

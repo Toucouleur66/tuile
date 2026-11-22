@@ -396,6 +396,13 @@ impl App {
             position: ui.from(v.position),
             color: v.color,
         }));
+        // The budget window's background, over the view and the control.
+        if let Some(panel) = self.budget_window.layout() {
+            nav_mesh.extend(panel.background.iter().map(|v| OverlayVertex {
+                position: v.position,
+                color: v.color,
+            }));
+        }
         // The loading indicator over everything, already in device pixels.
         if let Some(spinner) = indicator {
             nav_mesh.extend(spinner.mesh().into_iter().map(|v| OverlayVertex {
@@ -406,17 +413,21 @@ impl App {
         active
             .overlay
             .set_geometry(&active.gpu, &nav_mesh, active.size);
-        // And its line, over its background.
-        let line = bar
+        // And their text over their backgrounds: the bar's line, the
+        // budget window's table.
+        let masks: Vec<tuile_wgpu::OverlayMask<'_>> = bar
             .and_then(|bar| bar.label.as_ref())
+            .into_iter()
+            .chain(self.budget_window.layout().and_then(|p| p.label.as_ref()))
             .map(|label| tuile_wgpu::OverlayMask {
                 width: label.mask.width,
                 height: label.mask.height,
                 coverage: &label.mask.coverage,
                 position: label.position,
                 color: label.color,
-            });
-        active.overlay.set_mask(&active.gpu, line);
+            })
+            .collect();
+        active.overlay.set_masks(&active.gpu, &masks);
     }
 
     /// Resolves what to draw, draws it, and hands the frame to the compositor.
