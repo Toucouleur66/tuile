@@ -2396,14 +2396,14 @@ impl Budget {
         self.walk(l.marks.len());
         for &r in &l.marks {
             let w = wants.get(&r);
-            let (job, wait) = match w {
-                Some(w) => self.job_of(r, w, now),
-                None => (None, None),
+            // The slot looked up once for the work and the flight.
+            let e = w.map(|_| self.arena.find(r));
+            let (job, wait) = match (w, e) {
+                (Some(w), Some(e)) => self.job_of_at(r, w, now, e),
+                _ => (None, None),
             };
             let flying = w.is_some_and(|w| w.urgency <= Urgency::Drape)
-                && self
-                    .arena
-                    .find(r)
+                && e.flatten()
                     .is_some_and(|s| self.arena.has_transit(s) || self.arena.loading(s));
             let d = &self.down;
             let set = |m: &Set<ResourceId>, c: &mut Changes<ResourceId, ()>, on: bool| {
@@ -2438,7 +2438,7 @@ impl Budget {
             let mut waiting = Vec::new();
             let mut inflight = Vec::new();
             for (r, w) in wants.iter() {
-                let (job, wait) = self.job_of(r, w, now);
+                let (job, wait) = self.job_of_at(r, w, now, self.arena.find(r));
                 if job.is_some() {
                     jobs.push(r);
                 }

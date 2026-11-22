@@ -1564,17 +1564,19 @@ impl Budget {
 
     /// The work `r`, wanted as `w`, asks for now — a load or a delivery —
     /// and, asking for none, the time it waits on (a delivery's backoff or a
-    /// retry's) that will change that.
-    pub(super) fn job_of(
+    /// retry's) that will change that. `e` is `r`'s slot, found by the
+    /// caller: one that reads the slot again looks it up once.
+    pub(super) fn job_of_at(
         &self,
         r: ResourceId,
         w: &Want,
         now: Micros,
+        e: Option<Slot>,
     ) -> (Option<Job>, Option<Micros>) {
         let class = self.class_of(r, w.class);
         let epoch = self.epoch(r, class);
         let a = &self.arena;
-        match a.find(r) {
+        match e {
             Some(s) if a.gpu(s).is_some_and(|g| g.epoch == epoch) => (None, None),
             Some(s) if a.has_transit(s) => (None, None),
             Some(s) if a.fresh_cpu(s, epoch).is_some() => {
@@ -1601,10 +1603,22 @@ impl Budget {
         coarsening: &dyn Fn(TileId) -> bool,
         presence: &dyn PresenceOracle,
     ) -> PriorityKey {
+        self.key_of_at(r, w, now, coarsening, presence, self.arena.find(r))
+    }
+
+    /// [`Budget::key_of`], `r`'s slot found already (`e`).
+    fn key_of_at(
+        &self,
+        r: ResourceId,
+        w: &Want,
+        now: Micros,
+        coarsening: &dyn Fn(TileId) -> bool,
+        presence: &dyn PresenceOracle,
+        e: Option<Slot>,
+    ) -> PriorityKey {
         let class = self.class_of(r, w.class);
         let epoch = self.epoch(r, class);
         let a = &self.arena;
-        let e = a.find(r);
         let mut urgency = w.urgency;
         if e.is_some_and(|s| a.stale_gpu(s, epoch)) {
             urgency = Urgency::Refresh;
@@ -1698,10 +1712,12 @@ impl Budget {
             let Some(w) = wants.get(&r) else {
                 continue;
             };
-            let (Some(job), _) = self.job_of(r, w, now) else {
+            // The slot looked up once for both.
+            let e = self.arena.find(r);
+            let (Some(job), _) = self.job_of_at(r, w, now, e) else {
                 continue;
             };
-            let key = self.key_of(r, w, now, &is_coarsening, input.presence);
+            let key = self.key_of_at(r, w, now, &is_coarsening, input.presence, e);
             jobs.push((
                 key,
                 job,
