@@ -185,6 +185,11 @@ mod tests {
     use super::*;
     use crate::registry::Registry;
 
+    /// The engine's budget signals are one process-wide value: the tests
+    /// that publish them and read them back take turns, or one reads the
+    /// other's.
+    static BUDGET_SIGNALS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn resource() -> Resource {
         let mut r = Resource::default();
         r.set("service.name", "viewer");
@@ -197,6 +202,7 @@ mod tests {
     /// specification in force, with whether a diagnostic override set it.
     #[test]
     fn the_budget_decider_s_series_reach_the_collector() {
+        let _turn = BUDGET_SIGNALS.lock().unwrap_or_else(|e| e.into_inner());
         let registry = Registry::new();
         let mut s = tuile_core::budget::BudgetSignals::default();
         s.under_need_tiles = [1, 2];
@@ -393,6 +399,7 @@ mod tests {
     /// silently in production.
     #[test]
     fn every_engine_series_passes_the_guard() {
+        let _turn = BUDGET_SIGNALS.lock().unwrap_or_else(|e| e.into_inner());
         let registry = Registry::new();
         let mut signals = tuile_core::budget::BudgetSignals::default();
         signals.lost_tile_steps_total = 1;
