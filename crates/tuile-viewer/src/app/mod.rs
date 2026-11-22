@@ -672,7 +672,13 @@ impl App {
     /// What the caption says while the session is not up and is being tried
     /// again: the explicit "offline, retrying" state.
     fn waiting_note(&self, now: web_time::Instant) -> Option<String> {
-        self.failed.as_ref()?;
+        // Up, with an origin out of reach: what is stored is drawn, and the
+        // rest follows when it answers again.
+        if self.failed.is_none() {
+            let m = tuile_core::metrics::metrics();
+            let offline = m.terrain_offline.get() + m.imagery_offline.get() > 0;
+            return offline.then(|| "offline — showing what is stored".to_owned());
+        }
         let retries = self.retries.as_ref()?;
         Some(match retries.next() {
             Some(next) => format!(

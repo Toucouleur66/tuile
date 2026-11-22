@@ -781,10 +781,18 @@ impl App {
             // numbers a soft picture is read by, beside the counts that say
             // whether it is complete.
             let levels = resolution.levels_line();
+            // Which origins are out of reach: the store serves alone there,
+            // and only what it lacks waits for them to answer.
+            let offline = match (m.terrain_offline.get() > 0, m.imagery_offline.get() > 0) {
+                (false, false) => "",
+                (true, false) => " | offline: terrain",
+                (false, true) => " | offline: imagery",
+                (true, true) => " | offline: terrain, imagery",
+            };
             tracing::info!(
                 "alt {:.0} km | ground {:.0} m | {} tiles, {complete}, {sharpness} | \
                  {} bare | {} loading | {:.0} MiB | {budget} | {levels} | \
-                 near {:.0} m far {:.0} km{pacing}{view}",
+                 near {:.0} m far {:.0} km{pacing}{offline}{view}",
                 cam.altitude() / 1000.0,
                 self.controller.height_above_ground(),
                 rendered,
