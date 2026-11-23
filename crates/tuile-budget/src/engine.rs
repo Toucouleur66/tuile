@@ -3221,10 +3221,12 @@ impl Budget {
         let mut after: Option<(EvictKey, Slot)> = None;
         let mut low: Vec<(Slot, Class)> = Vec::new();
         let visits = self.spec.params.release_visits;
+        let mut looked = 0u32;
         for _ in 0..visits {
             let Some(e) = self.arena.next_filed(after.as_ref(), |_| true, &Held::GPU) else {
                 break;
             };
+            looked += 1;
             after = Some(e);
             let s = e.1;
             let a = &self.arena;
@@ -3250,6 +3252,7 @@ impl Budget {
             let Some(e) = self.arena.next_filed(after.as_ref(), |_| true, &[Held::Cpu]) else {
                 break;
             };
+            looked += 1;
             after = Some(e);
             let s = e.1;
             let a = &self.arena;
@@ -3262,7 +3265,7 @@ impl Budget {
                 low_cpu.push(s);
             }
         }
-        st.work = st.work.saturating_add(u32::from(visits) * 2);
+        st.work = st.work.saturating_add(looked);
         for s in low_cpu {
             d.scores
                 .push(self.held_event(s, Side::Decoded, Reason::BelowFloorValue));
