@@ -118,6 +118,10 @@ impl TerrainSource for Held<dyn TerrainSource> {
     fn holds(&self, coord: tuile_terrain::TileCoord) -> bool {
         self.0.holds(coord)
     }
+
+    fn stored(&self, out: &mut tuile_core::budget::ByLevel) -> bool {
+        self.0.stored(out)
+    }
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -140,6 +144,10 @@ impl ImageryProvider for Held<dyn ImageryProvider> {
 
     fn holds(&self, coord: tuile_core::raster::ImageryCoord) -> bool {
         self.0.holds(coord)
+    }
+
+    fn stored(&self, out: &mut tuile_core::budget::ByLevel) -> bool {
+        self.0.stored(out)
     }
 
     async fn fetch_tile_bytes(

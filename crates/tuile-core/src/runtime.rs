@@ -1025,6 +1025,9 @@ struct State {
     frame: u64,
     steps: u64,
     published_at: Option<Micros>,
+    /// The levels the disk tier has held, by class: exported from their
+    /// first (`DiskTiers::seen`).
+    disk_seen: crate::budget::PerClass<u32>,
     /// A host's own watcher of every step, beside the meter
     /// ([`GeometryServer::with_observer`]).
     observer: Option<Box<dyn BudgetObserver + Send>>,
@@ -1078,6 +1081,7 @@ impl State {
             frame: 0,
             steps: 0,
             published_at: None,
+            disk_seen: Default::default(),
             observer: None,
             pressure: crate::budget::Pressure::Normal,
             thermal: crate::budget::Thermal::Nominal,
@@ -1824,7 +1828,14 @@ impl State {
                 .is_none_or(|at| now.since(at) >= PUBLISH_EVERY)
             {
                 self.published_at = Some(now);
-                crate::metrics::publish_budget(meter.publish());
+                let mut signals = meter.publish();
+                // The disk tier, from the loader's stores' ledgers: no I/O.
+                let mut disk = crate::budget::DiskTiers::default();
+                disk.known = host.loader.stored(&mut disk);
+                disk.mark_seen(&self.disk_seen);
+                self.disk_seen = disk.seen;
+                signals.disk = disk;
+                crate::metrics::publish_budget(signals);
             }
         }
         // The loads in flight, in the budget's order of this step; those it

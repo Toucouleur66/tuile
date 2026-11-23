@@ -1508,6 +1508,14 @@ pub trait ImageryProvider: Send + Sync {
         false
     }
 
+    /// What a local store holds of this provider's tiles, by level, added
+    /// into `out`: see [`ContentStore::stored`]. The default knows of no
+    /// store.
+    fn stored(&self, out: &mut crate::budget::ByLevel) -> bool {
+        let _ = out;
+        false
+    }
+
     /// The decoded tile. Provided: every provider decodes the same way.
     async fn fetch_tile(
         &self,
@@ -1607,6 +1615,10 @@ impl<P: ImageryProvider> ImageryProvider for CachedImagery<P> {
 
     fn holds(&self, coord: ImageryCoord) -> bool {
         self.store.holds(&self.key(coord))
+    }
+
+    fn stored(&self, out: &mut crate::budget::ByLevel) -> bool {
+        self.store.stored(&format!("img/{}", self.namespace), out)
     }
 
     async fn fetch_tile_bytes(&self, coord: ImageryCoord) -> Result<Fetched<Bytes>, RasterError> {

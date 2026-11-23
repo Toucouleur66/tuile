@@ -213,12 +213,26 @@ fn publish_budget() {
             metrics::gauge!(full, labels).set(value);
         }
     }
+    // Where the tiles are, by tier, class and level: `tuile_tier_tiles`
+    // and `tuile_tier_bytes`, read off the same signals.
+    for (name, labels, value) in tuile_core::budget::tiers::series(&signals) {
+        let labels: Vec<metrics::Label> = labels
+            .into_iter()
+            .map(|(k, v)| metrics::Label::new(k, v))
+            .collect();
+        metrics::gauge!(format!("tuile_{name}"), labels).set(value);
+    }
 }
 
 /// The help text, stated once, into the installed recorder. A series nobody
 /// can interpret is a series nobody reads.
 pub fn describe() {
     use metrics::{describe_counter, describe_gauge};
+    describe_gauge!(
+        "tuile_tier_tiles",
+        "Tiles by tier (disk: the local store; ram: decoded; gpu: resident), class and level."
+    );
+    describe_gauge!("tuile_tier_bytes", "Their bytes, by tier, class and level.");
     describe_counter!("tuile_traversals", "Traversal passes run.");
     describe_counter!("tuile_loads_started", "Tile loads begun.");
     describe_counter!("tuile_loads_completed", "Tile loads that produced content.");

@@ -3,14 +3,18 @@
 
 #![doc = include_str!("../README.md")]
 
+mod ledger;
+
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use foyer::{
-    BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder,
-    PsyncIoEngineConfig,
+    BlockEngineConfig, DeviceBuilder, Event, EventListener, FsDeviceBuilder, HybridCache,
+    HybridCacheBuilder, PsyncIoEngineConfig, Statistics, StorageFilter, StorageFilterCondition,
+    StorageFilterResult,
 };
 use tuile_core::storage::ContentStore;
 
@@ -117,6 +121,41 @@ impl StoreConfig {
 pub struct FoyerStore {
     cache: HybridCache<String, Vec<u8>>,
     default_ttl: Option<Duration>,
+    /// What it holds of the tiles, by group and level (`ledger`).
+    ledger: Arc<ledger::Ledger>,
+    dir: PathBuf,
+}
+
+/// The memory tier's word to the ledger: an entry let go of may be on the
+/// disk, or gone.
+struct LetGo(Arc<ledger::Ledger>);
+
+impl EventListener for LetGo {
+    type Key = String;
+    type Value = Vec<u8>;
+
+    fn on_leave(&self, reason: Event, key: &String, _value: &Vec<u8>) {
+        if reason != Event::Replace {
+            self.0.suspect_key(key);
+        }
+    }
+}
+
+/// The disk tier's reinsertion filter: rejects every entry of a block
+/// being reclaimed — foyer's own default — and tells the ledger of each.
+struct Reclaimed(Arc<ledger::Ledger>);
+
+impl std::fmt::Debug for Reclaimed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Reclaimed")
+    }
+}
+
+impl StorageFilterCondition for Reclaimed {
+    fn filter(&self, _: &Arc<Statistics>, hash: u64, _: usize) -> StorageFilterResult {
+        self.0.suspect_hash(hash);
+        StorageFilterResult::Reject
+    }
 }
 
 impl FoyerStore {
@@ -138,10 +177,20 @@ impl FoyerStore {
     /// process killed without calling this keeps none of its cache, however
     /// long it ran. Hosts should call it on their way out.
     pub async fn close(&self) -> Result<(), StoreError> {
+        // The ledger first, settled: what the next process opens with.
+        self.settle();
+        if let Err(e) = self.ledger.save(&self.dir) {
+            tracing::warn!(error = %e, "the store's ledger was not written");
+        }
         self.cache
             .close()
             .await
             .map_err(|e| StoreError::from_error(&e))
+    }
+
+    /// The ledger's suspects asked of the index.
+    fn settle(&self) {
+        self.ledger.settle(|key| self.cache.contains(key));
     }
 
     /// Builds a store with an explicit configuration.
@@ -181,7 +230,13 @@ impl FoyerStore {
                 .with_submit_queue_size_threshold(usize::MAX / 2),
             foyer::HybridCachePolicy::WriteOnEviction => BlockEngineConfig::new(device),
         };
+        // The ledger's ears: built before the cache, filled once it opens.
+        let heard = Arc::new(ledger::Ledger::default());
+        let engine = engine.with_reinsertion_filter(
+            StorageFilter::new().with_condition(Reclaimed(Arc::clone(&heard))),
+        );
         let cache = HybridCacheBuilder::new()
+            .with_event_listener(Arc::new(LetGo(Arc::clone(&heard))))
             .with_policy(policy)
             .memory(cfg.memory_bytes)
             // Capacity is in bytes: weigh each entry by its payload length,
@@ -193,9 +248,17 @@ impl FoyerStore {
             .build()
             .await
             .map_err(|e| StoreError::from_error(&e))?;
+        // What the last process left, still held.
+        heard.take(ledger::Ledger::load(
+            &cfg.dir,
+            |key| cache.contains(key),
+            |key| cache.memory().hash(key),
+        ));
         Ok(Self {
             cache,
             default_ttl: cfg.default_ttl,
+            ledger: heard,
+            dir: cfg.dir,
         })
     }
 }
@@ -222,6 +285,7 @@ impl ContentStore for FoyerStore {
             // capacity happens to reclaim it.
             Some(_) => {
                 self.cache.remove(&key.to_owned());
+                self.ledger.forget(key);
                 None
             }
             None => {
@@ -233,8 +297,14 @@ impl ContentStore for FoyerStore {
 
     async fn put(&self, key: &str, value: Bytes, ttl: Option<Duration>) {
         let deadline = Deadline::in_(ttl.or(self.default_ttl), now_millis());
-        self.cache
-            .insert(key.to_owned(), Stamped::join(deadline, &value));
+        let key = key.to_owned();
+        self.ledger.put(
+            &key,
+            self.cache.memory().hash(&key),
+            value.len() as u64,
+            tuile_core::storage::is_absent(&value),
+        );
+        self.cache.insert(key, Stamped::join(deadline, &value));
     }
 
     /// The memory tier and the disk tier's index, without a read: an entry
@@ -242,6 +312,13 @@ impl ContentStore for FoyerStore {
     /// yes — a hint, as the contract allows, and a `get` then misses.
     fn holds(&self, key: &str) -> bool {
         self.cache.contains(key)
+    }
+
+    /// From the ledger, its suspects asked of the index first.
+    fn stored(&self, group: &str, out: &mut tuile_core::budget::ByLevel) -> bool {
+        self.settle();
+        self.ledger.add_group(group, out);
+        true
     }
 }
 
@@ -331,6 +408,11 @@ impl ContentStore for SuspendableStore {
 
     fn holds(&self, key: &str) -> bool {
         self.current().is_some_and(|store| store.holds(key))
+    }
+
+    /// Suspended, the store is not known: nothing is read or written.
+    fn stored(&self, group: &str, out: &mut tuile_core::budget::ByLevel) -> bool {
+        self.current().is_some_and(|store| store.stored(group, out))
     }
 }
 
@@ -737,6 +819,73 @@ mod tests {
             None,
             "if this now survives a kill, foyer writes as it goes and close() is optional"
         );
+    }
+
+    /// The disk tier's count follows the store: a tile put is counted at
+    /// its level; a tile whose disk block is reclaimed leaves the count —
+    /// which is, once settled, exactly what the index holds.
+    #[tokio::test]
+    async fn a_tile_reclaimed_from_the_disk_leaves_the_count() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = FoyerStore::keeping(StoreConfig {
+            dir: dir.path().to_path_buf(),
+            memory_bytes: 1 << 20,
+            disk_bytes: 64 << 20,
+            default_ttl: None,
+        })
+        .await
+        .expect("store");
+        const TILES: usize = 150;
+        let key = |i: usize| format!("img/t/10/{i}/0");
+        for i in 0..TILES {
+            store
+                .put(&key(i), Bytes::from(vec![i as u8; 1 << 20]), None)
+                .await;
+        }
+        store.put("img/t/11/0/0", tuile_core::storage::ABSENT, None).await;
+        let counted = || {
+            let mut by = tuile_core::budget::ByLevel::default();
+            assert!(store.stored("img/t", &mut by), "a store with a ledger");
+            (by[10][0] as usize, by[10][1], by[11][0])
+        };
+        let held = || (0..TILES).filter(|i| store.holds(&key(*i))).count();
+        let mut last = (TILES, 0, 0);
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            last = counted();
+            if last.0 < TILES && last.0 == held() {
+                break;
+            }
+        }
+        assert!(last.0 < TILES, "the disk let go of nothing? {last:?}");
+        assert!(last.0 > 0, "nothing counted");
+        assert_eq!(last.0, held(), "the count is what the index holds");
+        assert_eq!(last.1, last.0 as u64 * (1 << 20), "and their bytes");
+        assert_eq!(last.2, 0, "an absence is not a tile");
+    }
+
+    /// The count survives the store being closed and opened again.
+    #[tokio::test]
+    async fn the_count_is_kept_between_runs() {
+        let dir = tempfile::tempdir().expect("dir");
+        let cfg = || StoreConfig {
+            dir: dir.path().to_path_buf(),
+            memory_bytes: 1 << 20,
+            disk_bytes: 256 << 20,
+            default_ttl: None,
+        };
+        let first = FoyerStore::keeping(cfg()).await.expect("store");
+        for i in 0..10 {
+            first
+                .put(&format!("mesh/m/7/{i}/0"), Bytes::from(vec![1u8; 4096]), None)
+                .await;
+        }
+        first.close().await.expect("closed");
+        drop(first);
+        let second = FoyerStore::keeping(cfg()).await.expect("reopened");
+        let mut by = tuile_core::budget::ByLevel::default();
+        second.stored("mesh/m", &mut by);
+        assert_eq!(by[7], [10, 10 * 4096]);
     }
 
     #[test]

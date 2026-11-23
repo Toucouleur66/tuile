@@ -36,6 +36,14 @@ pub trait TerrainSource: Send + Sync {
         let _ = coord;
         false
     }
+
+    /// What a local store holds of this source's tiles, by level, added
+    /// into `out`: see [`ContentStore::stored`]. The default knows of no
+    /// store.
+    fn stored(&self, out: &mut tuile_core::budget::ByLevel) -> bool {
+        let _ = out;
+        false
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -115,6 +123,10 @@ impl<T: TerrainSource> CachedTerrain<T> {
 impl<T: TerrainSource> TerrainSource for CachedTerrain<T> {
     fn holds(&self, coord: TileCoord) -> bool {
         self.store.holds(&self.key(coord))
+    }
+
+    fn stored(&self, out: &mut tuile_core::budget::ByLevel) -> bool {
+        self.store.stored(&format!("mesh/{}", self.namespace), out)
     }
 
     async fn fetch_tile(&self, coord: TileCoord) -> Result<Fetched<Vec<u8>>, TerrainSourceError> {

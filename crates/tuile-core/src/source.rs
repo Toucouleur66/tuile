@@ -292,6 +292,16 @@ pub trait TileLoader: Send + Sync {
         self.store_events()
     }
 
+    /// What this loader's local stores hold, by class, imagery layer and
+    /// level, added into `out` — the disk tier of the budget window and of
+    /// `tuile_tier_*`. **Synchronous, and never any I/O**: from the stores'
+    /// own ledgers ([`ContentStore::stored`](crate::storage::ContentStore::stored)).
+    /// `false` (the default) for a loader with no store that keeps one.
+    fn stored(&self, out: &mut crate::budget::DiskTiers) -> bool {
+        let _ = out;
+        false
+    }
+
     /// Fetches everything down to `through_level` into whatever store sits
     /// behind this loader, before anything asks for it.
     ///
@@ -972,6 +982,14 @@ impl TileLoader for CompositeLoader {
         sources.loaders().fold(sources.events_base, |n, (_, l)| {
             n.wrapping_add(l.store_events())
         })
+    }
+
+    /// Every sub-loader's stores, summed; known when one of them is.
+    fn stored(&self, out: &mut crate::budget::DiskTiers) -> bool {
+        let sources = self.shared.read();
+        sources
+            .loaders()
+            .fold(false, |known, (_, l)| l.stored(out) | known)
     }
 
     /// Each sub-loader asked about its own resources, since the count it

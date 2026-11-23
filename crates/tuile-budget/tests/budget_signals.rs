@@ -519,6 +519,20 @@ fn the_swaps_signal_counts_refines_and_coarsenings_and_never_a_gap() {
     assert_eq!(meter.signals().swap_gaps_total, 1, "{RED}: gap");
 }
 
+/// The deficit by level and the deficit are one count: the drapes under
+/// their need summed over the levels are the tiles the header counts, the
+/// meshes under theirs the tiles drawn by an ancestor — on every step,
+/// still ones included.
+fn per_level_is_the_deficit(d: &Decisions) {
+    let l = &d.stats.levels;
+    let q = &d.stats.deficit;
+    let drapes: u32 = l.under_need[Class::Drape].iter().sum();
+    let meshes: u32 = l.under_need[Class::TerrainMesh].iter().sum::<u32>()
+        + l.under_need[Class::Tiles3dMesh].iter().sum::<u32>();
+    assert_eq!(drapes, q.imagery_under_tiles, "drapes under need by level");
+    assert_eq!(meshes, q.mesh_under_tiles, "meshes under need by level");
+}
+
 /// The quality deficit (eviction/prefetch spec §1, §7.1): a drape worn
 /// under the level the step needs counts its tile once and its levels, as
 /// the `under_need_tiles{kind="imagery"}` and `deficit_levels` signals.
@@ -530,6 +544,7 @@ fn the_deficit_signals_count_the_drapes_worn_under_their_need() {
     assert_eq!(m.s().under_need_tiles, [0, 0]);
     assert_eq!(m.s().deficit_levels, [0, 0]);
     let d = m.step(&drawn_draped(&[a], 6));
+    per_level_is_the_deficit(&d);
     assert_eq!(d.stats.deficit.imagery_under(), 1, "{RED}");
     assert_eq!(d.stats.deficit.under_levels(), 3, "three levels short");
     assert_eq!(m.s().under_need_tiles, [0, 1], "{RED}");
@@ -540,7 +555,12 @@ fn the_deficit_signals_count_the_drapes_worn_under_their_need() {
         m.s().deficit_level_micros_total[1] > before,
         "the deficit integrates over time"
     );
-    m.settle(&drawn_draped(&[a], 6), 20);
+    let d = m.settle(&drawn_draped(&[a], 6), 20);
+    per_level_is_the_deficit(&d);
+    // Still steps after: the walk read again only when the deficit moves.
+    for _ in 0..3 {
+        per_level_is_the_deficit(&m.step(&drawn_draped(&[a], 6)));
+    }
     assert_eq!(m.s().under_need_tiles, [0, 0], "worn at its need");
     assert_eq!(m.s().deficit_levels, [0, 0]);
 }
@@ -591,10 +611,13 @@ fn the_deficit_counts_a_tile_drawn_by_its_ancestor() {
     let mut m = Metered::interactive();
     m.settle(&drawn(&[p]), 20);
     let d = m.step(&drawn(&[c]));
+    per_level_is_the_deficit(&d);
     assert_eq!(d.stats.deficit.mesh_under_tiles, 1, "{RED}");
     assert_eq!(d.stats.deficit.mesh_under_levels, 1);
     assert_eq!(m.s().under_need_tiles, [1, 0]);
-    m.settle(&drawn(&[c]), 20);
+    let d = m.settle(&drawn(&[c]), 20);
+    per_level_is_the_deficit(&d);
+    per_level_is_the_deficit(&m.step(&drawn(&[c])));
     assert_eq!(m.s().under_need_tiles, [0, 0]);
 }
 
