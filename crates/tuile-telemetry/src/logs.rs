@@ -10,8 +10,10 @@
 //!
 //! Rate-limited at the source (`tuile_core::metrics::SCORE_RECORDS_KEPT` a
 //! push), the drops counted in a record of their own. A tile's address is
-//! an attribute of a log record here, never a metric label: the metrics'
-//! closed label sets stay as they are (`crate::resource::ALLOWED_LABELS`).
+//! an attribute of a log record here — it reveals the place viewed, and is
+//! sent, by Laurent's decision (2026-11-23), only when a collector endpoint
+//! is configured — never a metric label: the metrics' closed label sets
+//! stay as they are (`crate::resource::ALLOWED_LABELS`).
 
 use serde_json::{json, Value as Json};
 use tuile_core::budget::score::{HeldTile, ScoreEvent, Terms, DISTANCE_BANDS, DISTANCE_BAND_LABELS};

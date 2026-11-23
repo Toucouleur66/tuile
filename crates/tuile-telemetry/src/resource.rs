@@ -16,10 +16,13 @@
 //!   tile's address or a layer's URL in it is stopped here rather than
 //!   shipped.
 //!
-//! What is never sent, by construction: the device's location, a tile's
-//! identity, a source's address, anything a person typed. The camera's pose
-//! is sent as gauges of its own (`crate::camera`), never as a label or an
-//! attribute.
+//! What is never sent, by construction: the device's location, a source's
+//! address, anything a person typed. The camera's pose is sent as gauges of
+//! its own (`crate::camera`), never as a label or an attribute. One
+//! exception, by Laurent's decision (2026-11-23): the graphics budget's
+//! decision log records (`crate::logs`) carry the address of the tile each
+//! decision is about (`level/x/y`), which reveals the place viewed — sent
+//! only when a collector endpoint is configured, and never a metric label.
 
 use std::collections::BTreeMap;
 

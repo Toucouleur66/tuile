@@ -47,7 +47,12 @@ switched off and on again while the program runs ([`set_metrics`],
 **The device's own location is never sent**: a phone's or a browser's
 geolocation, which a viewer may ask for to move the camera there, has no way
 into a push — the pose is the camera's, wherever a person flew it. Nor any
-tile identifier or address, source URL or user data. Two allow-lists are applied where the data leaves:
+source URL or user data. **One exception, by Laurent's decision (2026-11-23):
+the graphics budget's decision log records (`/v1/logs`, `crate::logs`) carry
+the address of the tile each decision is about (`tile` = `level/x/y`), which
+reveals the place viewed**; they are sent only when a collector endpoint is
+configured, as every push is, and a tile's address is never a metric label.
+Two allow-lists are applied where the metrics leave:
 the resource attributes ([`resource::ALLOWED`]: service name and version,
 commit and tag (`vcs.ref.head.revision`, `vcs.ref.head.name`), OS, architecture, device class, GPU adapter and backend, a random
 identifier drawn at each launch) and the metric labels
@@ -63,7 +68,7 @@ variables:
 
 | variable | meaning |
 |---|---|
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | the collector's base URL (`/v1/metrics` is appended); unset: no metrics |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | the collector's base URL (`/v1/metrics` and `/v1/logs` are appended); unset: nothing sent |
 | `OTEL_EXPORTER_OTLP_HEADERS` | `Authorization=Bearer%20<token>`: the credential, as a header |
 | `OTEL_RESOURCE_ATTRIBUTES` | extra attributes, allow-listed (`deployment.environment=…`) |
 | `OTEL_SERVICE_NAME` | the service name, else the host's |
