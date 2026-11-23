@@ -3003,6 +3003,101 @@ mod stats {
         }
     }
 
+    /// A draped need of `tiles` at the footprint ratio `ratio`: the ideal
+    /// level is `ceil(log2 ratio)`.
+    fn drawn_at_ratio(tiles: &[tuile_budget::TileId], ratio: f64) -> NeedSet {
+        let fp = tuile_budget::TexelFootprint::new(1.0e6 / ratio, 1.0, 1.0e6, 1.0, 1.0)
+            .expect("a valid footprint");
+        NeedSet {
+            drawn: tiles
+                .iter()
+                .map(|&a| (a, need(a).with_imagery(tuile_budget::ImageryNeed::base(fp, 22))))
+                .collect(),
+            ..NeedSet::default()
+        }
+    }
+
+    /// The mirror of the approach above, on a zoom-out (`T11 · I12→11` on
+    /// the viewer's labels): a tile whose need moved down one level while
+    /// it wore the level before — the hysteresis gives the coarser level
+    /// only once the camera is past it — wears a drape one level finer than
+    /// its need. The imagery being another acquisition per level, that is a
+    /// patch of another colour: far under every memory limit, its own level
+    /// is loaded within two seconds of rest, and it stays there.
+    #[test]
+    fn a_tile_worn_a_level_over_its_need_comes_back_to_its_own_level_after_rest() {
+        let mut r = Rig::interactive();
+        let a = t(3, 2, 2);
+        r.settle(&drawn_draped(&[a], 4), 20);
+        // Ratio 5: ideal level 3, under level 4's hysteresis (2^3/√2 ≈ 5.66).
+        let need = drawn_at_ratio(&[a], 5.0);
+        let rest = r.now;
+        let mut d = r.step(&need);
+        while r.now.since(rest) < Micros::from_secs(2) {
+            r.complete(&d);
+            d = r.step(&need);
+        }
+        let worn = d.draw.get(mesh(a)).and_then(base_drape).map(|w| w.resource);
+        assert_eq!(
+            d.stats.deficit.imagery_over_tiles,
+            0,
+            "{RED}: the tile still wears {worn:?}, a level over its need, two seconds after rest"
+        );
+        assert_eq!(worn, Some(dr(a, 3)), "it wears its own level");
+        for _ in 0..120 {
+            r.complete(&d);
+            d = r.step(&need);
+            assert_eq!(d.stats.deficit.imagery_over_tiles, 0, "it stays at its need");
+            assert_eq!(d.stats.deficit.under_tiles(), 0, "and not under it");
+        }
+    }
+
+    /// The switch from the finer drape to the tile's own level never leaves
+    /// a step without a drawable drape (I1, never black ground): the finer
+    /// one is worn until the own level is drawable, the own level from the
+    /// first step it is. Its load is a drape refinement's, never a hole's.
+    #[test]
+    fn the_switch_from_a_finer_drape_to_its_own_level_never_leaves_the_tile_bare() {
+        let mut r = Rig::interactive();
+        let a = t(3, 2, 2);
+        r.settle(&drawn_draped(&[a], 4), 20);
+        let need = drawn_at_ratio(&[a], 5.0);
+        let rest = r.now;
+        let (mut wore_finer, mut wore_own) = (false, false);
+        let mut d = r.step(&need);
+        let mut before: Option<Decisions> = None;
+        while r.now.since(rest) < Micros::from_secs(4) {
+            assert_eq!(d.stats.bare, 0, "{RED}: drawn bare");
+            let worn = d.draw.get(mesh(a)).and_then(base_drape).map(|w| w.resource);
+            let own_drawable = r
+                .b
+                .resource(dr(a, 3))
+                .is_some_and(|v| v.state == ResourceState::Drawable);
+            if let Some(u) = r.b.resource(dr(a, 3)).and_then(|v| v.urgency) {
+                assert_eq!(u, Urgency::Drape, "{RED}: a refinement's urgency");
+            }
+            match worn {
+                Some(w) if w == dr(a, 4) => {
+                    assert!(!wore_own, "{RED}: back to the finer drape");
+                    assert!(!own_drawable, "{RED}: the own level drawable, not worn");
+                    wore_finer = true;
+                }
+                Some(w) if w == dr(a, 3) => wore_own = true,
+                other => panic!("{RED}: the tile wears {other:?}"),
+            }
+            // Loads complete at once, uploads a step late: the finer drape
+            // is worn in between.
+            r.load(&d);
+            if let Some(b) = before.take() {
+                r.upload(&b);
+            }
+            before = Some(d);
+            d = r.step(&need);
+        }
+        assert!(wore_finer, "{RED}: the finer drape was never worn");
+        assert!(wore_own, "{RED}: the own level was never worn");
+    }
+
     /// C28, audit: completed loads land in the latency histogram.
     #[test]
     fn completed_loads_land_in_the_latency_histogram() {

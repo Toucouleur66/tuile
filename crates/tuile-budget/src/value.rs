@@ -9,7 +9,7 @@
 //!   and copies held, so the arena's held-side index reads a resource's
 //!   value without evaluating predicates; the restore-cost credit of
 //!   GreedyDual-Size (the tier a release sends it back to, per byte).
-//! - [`deficit_due`]: when a drawn tile's own level, a level or more over
+//! - [`deficit_due`]: when a drawn tile's own level, a level or more from
 //!   the one it wears, becomes worth its restore cost with the margin.
 //!
 //! The currency is the **flouz** (spec §1b): one level of detail gained
@@ -179,14 +179,29 @@ pub struct DeficitInput {
     pub centrality: i32,
     /// Levels between the drape worn and the level needed.
     pub gap: u32,
+    /// Whether the drape worn is finer than the level needed: a gap that
+    /// costs colour consistency, not detail, weighed
+    /// [`FINER_GAP_PERMILLE`] of an under-need gap of the same size.
+    pub finer: bool,
     /// When the tile's need last changed.
     pub since: Micros,
     /// The facts a predicate reads (membership, band).
     pub facts: Facts,
 }
 
+/// What a gap of levels over the need weighs against a gap under it, ‰.
+///
+/// A drape worn finer than its need — kept from a zoom-out because it was
+/// resident — shows more detail than the need, but another acquisition of
+/// the imagery than its neighbours, which wear their own level: a patch of
+/// another colour. Colour consistency comes before extra detail, so the gap
+/// is a want; it weighs less than a gap of detail missing, so an under-need
+/// tile falls due first.
+pub const FINER_GAP_PERMILLE: u64 = 500;
+
 /// When tile `d.tile`'s own drape becomes worth loading while it wears one
-/// `d.gap` levels under its need (spec §5.3, law 7): once `w × gap × dwell ≥
+/// `d.gap` levels under its need, or over it (`d.finer`, weighed
+/// [`FINER_GAP_PERMILLE`]) (spec §5.3, law 7): once `w × gap × dwell ≥
 /// cost × (1 + margin)`, the dwell counted from the last change of the
 /// tile's need (a moving camera is not expected to keep the level), `w` the
 /// place's screen weight times the specification's deficit weight, `cost`
@@ -199,7 +214,10 @@ pub fn deficit_due(spec: &Specification, d: &DeficitInput) -> Option<Micros> {
     // The screen weight, ‰: half for a tile at the edge, all at the centre
     // (the priority's own weighting).
     let screen = 500 + u64::try_from(d.centrality.clamp(0, 1_000)).unwrap_or(0) / 2;
-    let per_us = weight * screen * u64::from(d.gap.max(1)) / 1_000;
+    let mut per_us = weight * screen * u64::from(d.gap.max(1)) / 1_000;
+    if d.finer {
+        per_us = per_us * FINER_GAP_PERMILLE / 1_000;
+    }
     if per_us == 0 {
         return None;
     }
@@ -221,6 +239,7 @@ mod tests {
             tile: TileId(0),
             centrality,
             gap,
+            finer: false,
             since: Micros::from_secs(10),
             facts: Facts {
                 class: Class::Drape,
@@ -277,5 +296,24 @@ mod tests {
         let mut none = s.clone();
         none.set_weight(Term::Deficit, 0);
         assert_eq!(deficit_due(&none, &input(1, 0)), None);
+    }
+
+    /// Colour consistency before detail: a drape worn finer than its need
+    /// falls due — a gap over the need is a want — but after an under-need
+    /// gap of the same size: two levels over weigh as one under.
+    #[test]
+    fn a_finer_gap_falls_due_after_an_under_gap_of_the_same_size() {
+        let s = Specification::interactive();
+        let at = |gap, finer| {
+            let d = DeficitInput {
+                finer,
+                ..input(gap, 0)
+            };
+            deficit_due(&s, &d).map(|t| t.since(Micros::from_secs(10)))
+        };
+        assert_eq!(at(1, true), Some(Micros::from_millis(750)));
+        assert!(at(1, false) < at(1, true));
+        assert!(at(2, false) < at(2, true));
+        assert_eq!(at(2, true), at(1, false));
     }
 }
