@@ -31,7 +31,7 @@
 //! | `tuile://imagery?name=<key>` | drapes another of the host's imagery layers; `name=next` takes the one after the present |
 //! | `tuile://import?src=https://…` | fetches a configuration file and imports it, as opening it would (`crate::import`) |
 //! | `tuile://telemetry?metrics=on\|off&profiling=on\|off` | the performance numbers sent to the configured collector, or not: see `tuile_telemetry` (nothing happens where none is configured) |
-//! | `tuile://budget?spec=auto\|interactive\|fpv\|known_path\|film\|fpv_film&margin=&horizon_ms=&speculation_slots=&line=on\|off&window=on\|off\|instant\|cumulative\|reset\|graph\|table` | **a diagnostic**: forces the budget's specification (the context chooses it otherwise: ordinary navigation runs `interactive`), a few of its numbers, the budget's line over the view, and the budget window — a window of its own on a desktop and on a page (a browser window the page opens), over the view on a phone (per level and per layer, drawn as gauges and bars coloured by what deserves a look — `graph`, the default — or as tables, `table`; this step or summed since its start, `reset` summing from now); `spec=auto` gives the choice back to the context (`docs/explorations/budget-eviction-prefetch-spec.md` §3.3) |
+//! | `tuile://budget?spec=auto\|interactive\|fpv\|known_path\|film\|fpv_film&margin=&horizon_ms=&speculation_slots=&line=on\|off&window=on\|off\|instant\|cumulative\|reset\|graph\|table&window_levels=all\|issues` | **a diagnostic**: forces the budget's specification (the context chooses it otherwise: ordinary navigation runs `interactive`), a few of its numbers, the budget's line over the view, and the budget window — a window of its own on a desktop and on a page (a browser window the page opens), over the view on a phone (per level and per layer, drawn as gauges and bars coloured by what deserves a look — `graph`, the default — or as tables, `table`; this step or summed since its start, `reset` summing from now); `spec=auto` gives the choice back to the context (`docs/explorations/budget-eviction-prefetch-spec.md` §3.3) |
 //!
 //! ## The scene's clock in a link
 //!
@@ -170,6 +170,9 @@ pub(crate) enum WindowAsk {
     Reset,
     /// Shown, as tables (`true`) or as the board (`false`).
     Tables(bool),
+    /// Shown, listing only the levels with an issue (`true`) or every
+    /// level (`false`).
+    Levels(bool),
 }
 
 /// One thing the view can be told to do, whoever is telling it.
@@ -541,6 +544,11 @@ pub(crate) fn parse_url_among(
                         "off" => false,
                         _ => return Err(format!("line is on or off, not {text:?}")),
                     })),
+                    "window_levels" => out.push(Command::BudgetWindow(WindowAsk::Levels(match *text {
+                        "all" => false,
+                        "issues" => true,
+                        _ => return Err(format!("window_levels is all or issues, not {text:?}")),
+                    }))),
                     "window" => out.push(Command::BudgetWindow(match *text {
                         "on" => WindowAsk::Show(true),
                         "off" => WindowAsk::Show(false),
@@ -559,7 +567,7 @@ pub(crate) fn parse_url_among(
                     _ => {
                         return Err(format!(
                             "budget takes spec=, margin=, horizon_ms=, speculation_slots=, \
-                             line= and window=, not {key:?}"
+                             line=, window= and window_levels=, not {key:?}"
                         ))
                     }
                 }
@@ -1321,6 +1329,15 @@ mod tests {
             );
         }
         assert!(parse_url("tuile://budget?window=maybe").is_err());
+        assert_eq!(
+            parse_url("tuile://budget?window_levels=issues"),
+            Ok(vec![Command::BudgetWindow(WindowAsk::Levels(true))])
+        );
+        assert_eq!(
+            parse_url("tuile://budget?window_levels=all"),
+            Ok(vec![Command::BudgetWindow(WindowAsk::Levels(false))])
+        );
+        assert!(parse_url("tuile://budget?window_levels=some").is_err());
         for bad in [
             "tuile://budget",
             "tuile://budget?spec=warp",

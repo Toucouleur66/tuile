@@ -117,6 +117,8 @@ features = [
     "HtmlElement",
     "ImageData",
     "KeyboardEvent",
+    "MouseEvent",
+    "WheelEvent",
     "MessageEvent",
     "Navigator",
     "Node",
