@@ -836,8 +836,27 @@ mod tests {
         .await
         .expect("store");
         const TILES: usize = 150;
+        const FIRST: usize = 30;
         let key = |i: usize| format!("img/t/10/{i}/0");
-        for i in 0..TILES {
+        let settle_all = || {
+            for _ in 0..10 {
+                let mut by = tuile_core::budget::ByLevel::default();
+                store.stored("img/t", &mut by);
+            }
+        };
+        // A first lot, on the disk and settled: the memory tier's word
+        // about them is spent, so only the disk's reclaim can tell when
+        // they go.
+        for i in 0..FIRST {
+            store
+                .put(&key(i), Bytes::from(vec![i as u8; 1 << 20]), None)
+                .await;
+        }
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            settle_all();
+        }
+        for i in FIRST..TILES {
             store
                 .put(&key(i), Bytes::from(vec![i as u8; 1 << 20]), None)
                 .await;
@@ -858,6 +877,10 @@ mod tests {
             }
         }
         assert!(last.0 < TILES, "the disk let go of nothing? {last:?}");
+        assert!(
+            (0..FIRST).any(|i| !store.holds(&key(i))),
+            "the first lot was reclaimed"
+        );
         assert!(last.0 > 0, "nothing counted");
         assert_eq!(last.0, held(), "the count is what the index holds");
         assert_eq!(last.1, last.0 as u64 * (1 << 20), "and their bytes");

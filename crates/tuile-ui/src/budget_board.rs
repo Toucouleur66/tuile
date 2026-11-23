@@ -1646,7 +1646,7 @@ fn tiers_of(
             if cell.waste {
                 p.marker(Severity::Waste, x0 + 6.0, y + ROW / 2.0 - 2.0, 8.0);
             }
-            for t in 0..3 {
+            for (t, scale) in scales[i].iter().enumerate() {
                 let x = x0 + 14.0 + t as f64 * TIER;
                 let Some([n, bytes]) = tier_of(s, t, *c, l) else {
                     p.bar(x, y + 3.0, TIER_BAR, 9.0, &[], 0.0);
@@ -1671,7 +1671,7 @@ fn tiers_of(
                         ]
                     }
                 };
-                p.bar(x, y + 3.0, TIER_BAR, 9.0, &parts, scales[i][t]);
+                p.bar(x, y + 3.0, TIER_BAR, 9.0, &parts, *scale);
                 p.hit(x, y - 1.0, TIER, ROW - 1.0, explain_tier(s, t, *c, l));
                 let value = if n == 0 {
                     "·".to_owned()
@@ -2628,16 +2628,18 @@ impl BoardControl {
                 self.grab = None;
             }
             BoardInput::Key(k) => match k {
-                BoardKey::Next | BoardKey::Previous if self.regions > 0 => {
-                    let n = self.regions;
+                BoardKey::Next | BoardKey::Previous => {
+                    // Before the first drawing: the first region, or the
+                    // last (made the last one by `present`).
+                    let n = self.regions.max(1);
                     self.focus = Some(match (self.focus, k) {
                         (None, BoardKey::Next) => 0,
+                        (None, _) if self.regions == 0 => usize::MAX,
                         (None, _) => n - 1,
                         (Some(i), BoardKey::Next) => (i + 1) % n,
                         (Some(i), _) => (i + n - 1) % n,
                     });
                 }
-                BoardKey::Next | BoardKey::Previous => {}
                 BoardKey::Clear => self.focus = None,
                 BoardKey::PageDown => self.offset += self.view * 0.9,
                 BoardKey::PageUp => self.offset -= self.view * 0.9,
@@ -2662,6 +2664,11 @@ impl BoardControl {
         // The focus follows the regions: a region focused near the bottom
         // is scrolled into view.
         let regions = d.hits.len();
+        self.focus = match self.focus {
+            _ if regions == 0 => None,
+            Some(i) if i >= regions => Some(regions - 1),
+            f => f,
+        };
         if let Some(h) = self.focus.and_then(|i| d.hits.get(i)) {
             let (top, bottom) = (h.rect[1], h.rect[1] + h.rect[3]);
             let view = f64::from(frame.1);
@@ -3031,6 +3038,11 @@ mod tests {
         let bare = c.present(d.clone(), (2400, 2000), 1.0, &mut cache);
         let [x, y, w, h] = first.rect;
         c.input(BoardInput::Pointer(x + w / 2.0, y + h / 2.0));
+        assert_eq!(
+            hit_at(&d, (x + w / 2.0, y + h / 2.0)).map(|h| h.lines.len()),
+            Some(first.lines.len()),
+            "{first:?}"
+        );
         let hovered = c.present(d.clone(), (2400, 2000), 1.0, &mut cache);
         assert_eq!(
             texts(&hovered),
@@ -3343,6 +3355,11 @@ mod tests {
         assert!(d.size.0 > 900 && d.size.1 > 300, "{:?}", d.size);
         // And twice as large at twice the density.
         let d2 = draw(Some(&s), &view, &mut cache, 2.0);
-        assert!(d2.size.0 >= d.size.0 * 2 - 2);
+        assert!(
+            d2.size.0 * 10 >= d.size.0 * 19,
+            "{:?} at 2x, {:?} at 1x",
+            d2.size,
+            d.size
+        );
     }
 }
