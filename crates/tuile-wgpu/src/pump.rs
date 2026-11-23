@@ -216,6 +216,9 @@ pub struct ContentPump {
     /// The encode lane's carry from frame to frame (CB6): refilled each
     /// frame by its share, taken by its encodes, into debt by one tile.
     encode_bucket: EncodeBucket,
+    /// The encode lane's share of the last frame, blocks (`u64::MAX`: no
+    /// lane), for its record.
+    encode_share: u64,
     /// Drapes part-encoded: the imagery tiles encoded for them so far,
     /// held (and in the shared pool) until the rest are, frames later —
     /// a drape of many tiles never encodes in one frame. The drape it
@@ -290,6 +293,7 @@ impl ContentPump {
             meter: None,
             undress_wearers: Vec::new(),
             encode_bucket: EncodeBucket::default(),
+            encode_share: u64::MAX,
             progress: HashMap::new(),
             contents: None,
             drawn_tiles: std::collections::HashSet::new(),
@@ -812,6 +816,8 @@ impl ContentPump {
                     encoded_tiles,
                     encode_blocks,
                     encode_gpu: tuile_core::budget::Micros(encode_gpu_micros),
+                    encode_share: self.encode_share,
+                    encode_carry: self.encode_bucket.carry,
                     upload_wall: tuile_core::budget::Micros(wall.as_micros() as u64),
                     eyes: &[EyeCoverage {
                         lost: self.lost,
@@ -854,6 +860,7 @@ impl ContentPump {
             return (taken, 0, Vec::new());
         };
         let share = encode_share(deadline, ns);
+        self.encode_share = share;
         self.encode_bucket.refill(share);
         let Ok(pool) = gpu.imagery.lock() else {
             return (taken, 0, Vec::new());

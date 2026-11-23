@@ -138,6 +138,10 @@ pub struct FrameRecord<'a> {
     /// blocks times its measured cost of a block). Zero when nothing is
     /// encoded.
     pub encode_gpu: Micros,
+    /// The encode lane's share this frame, blocks (`u64::MAX`: no lane),
+    /// and its carry after the frame's encodes — negative, the debt.
+    pub encode_share: u64,
+    pub encode_carry: i64,
     /// The wall time its uploads took.
     pub upload_wall: Micros,
     /// Per eye, at most four.
@@ -479,6 +483,23 @@ pub struct BudgetSignals {
     /// `frame_encode_seconds`: a frame's encodes' GPU time, µs, for the
     /// frames that encoded something.
     pub frame_encode_micros: Histogram,
+    /// The last frame's encodes: `frame_encoded_tiles`,
+    /// `frame_encode_blocks`, `frame_encode_gpu_seconds` (µs).
+    pub frame_encoded_tiles: u32,
+    pub frame_encode_blocks: u64,
+    pub frame_encode_gpu_micros: u64,
+    /// The last frame's deferrals by lane: `frame_deferred{lane}`.
+    pub frame_deferred: [u32; 2],
+    /// The encode lane: `encode_share_blocks` (`u64::MAX` without a
+    /// lane) and `encode_carry_blocks` (negative: in debt) after the last
+    /// frame.
+    pub encode_share_blocks: u64,
+    pub encode_carry_blocks: i64,
+    /// `transient_bytes{class}`: of the bytes in transit, what encodes on
+    /// the GPU hold beside the blocks until they have run.
+    pub transient_bytes: PerClass<u64>,
+    /// `transfer_bytes{class}`: what the copies in transit cross in.
+    pub transfer_bytes: PerClass<u64>,
     /// `frame_upload_seconds`, wall clock, µs.
     pub frame_upload_micros: Histogram,
     /// `estimate_drift_exceeded_total{class}`.
@@ -618,6 +639,12 @@ impl BudgetSignals {
         self.encoded_tiles_total = frames.encoded_tiles_total;
         self.encode_blocks_total = frames.encode_blocks_total;
         self.frame_encode_micros = frames.frame_encode_micros.clone();
+        self.frame_encoded_tiles = frames.frame_encoded_tiles;
+        self.frame_encode_blocks = frames.frame_encode_blocks;
+        self.frame_encode_gpu_micros = frames.frame_encode_gpu_micros;
+        self.frame_deferred = frames.frame_deferred;
+        self.encode_share_blocks = frames.encode_share_blocks;
+        self.encode_carry_blocks = frames.encode_carry_blocks;
         self.frame_upload_micros = frames.frame_upload_micros.clone();
         self.eye_lost_tiles = frames.eye_lost_tiles;
         self.eye_bare_items = frames.eye_bare_items;
@@ -996,6 +1023,35 @@ impl BudgetSignals {
             &self.encode_fallbacks_total,
         );
         per(&mut out, "reserved_bytes", &self.reserved_bytes);
+        per(&mut out, "transient_bytes", &self.transient_bytes);
+        per(&mut out, "transfer_bytes", &self.transfer_bytes);
+        for (i, l) in labels::LANE.iter().enumerate() {
+            out.push((
+                "frame_deferred",
+                vec![("lane", l)],
+                f64::from(self.frame_deferred[i]),
+            ));
+        }
+        let lane: [(&'static str, f64); 5] = [
+            ("frame_encoded_tiles", f64::from(self.frame_encoded_tiles)),
+            ("frame_encode_blocks", self.frame_encode_blocks as f64),
+            (
+                "frame_encode_gpu_seconds",
+                secs(self.frame_encode_gpu_micros),
+            ),
+            (
+                "encode_share_blocks",
+                if self.encode_share_blocks == u64::MAX {
+                    -1.0
+                } else {
+                    self.encode_share_blocks as f64
+                },
+            ),
+            ("encode_carry_blocks", self.encode_carry_blocks as f64),
+        ];
+        for (n, v) in lane {
+            out.push((n, vec![], v));
+        }
         out.push((
             "decoded_reserved_bytes",
             vec![],
@@ -1220,6 +1276,8 @@ impl BudgetObserver for BudgetMeter {
             }
             s.estimate_drift_exceeded_total[c] += u64::from(st.drift_exceeded[c]);
             s.encode_fallbacks_total[c] += u64::from(st.fallbacks[c]);
+            s.transient_bytes[c] = st.transient[c].0;
+            s.transfer_bytes[c] = st.transfer[c].0;
         }
         s.levels = st.levels;
         let y = &st.layers;
@@ -1511,6 +1569,12 @@ impl BudgetObserver for BudgetMeter {
         if f.encode_blocks > 0 {
             s.frame_encode_micros.record(f.encode_gpu.0);
         }
+        s.frame_encoded_tiles = f.encoded_tiles;
+        s.frame_encode_blocks = f.encode_blocks;
+        s.frame_encode_gpu_micros = f.encode_gpu.0;
+        s.frame_deferred = [f.deferred, f.deferred_encode];
+        s.encode_share_blocks = f.encode_share;
+        s.encode_carry_blocks = f.encode_carry;
         s.frame_upload_micros.record(f.upload_wall.0);
         s.eye_lost_tiles = [0; 4];
         s.eye_bare_items = [0; 4];

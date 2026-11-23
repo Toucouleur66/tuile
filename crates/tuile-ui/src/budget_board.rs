@@ -847,6 +847,7 @@ pub fn draw(
             y = header(&mut p, s, view, y);
             y = issues(&mut p, s, view, y);
             y = gauges(&mut p, s, view, y);
+            y = compression(&mut p, s, view, y);
             y = levels(&mut p, s, view, y);
             y = tiers(&mut p, s, view, y);
             y = scores(&mut p, s, view, y);
@@ -1189,6 +1190,317 @@ fn gauges(p: &mut Painter<'_>, s: &BudgetSignals, view: &BoardView<'_>, y: f64) 
         y += ROW;
     }
     y + 8.0
+}
+
+/// What encodes on the GPU hold beside the blocks until they have run:
+/// Okabe and Ito's orange.
+const ENCODE: u32 = 0xE69F00;
+/// Reserved off the limits, outside any resource: their reddish purple.
+const RESERVED: u32 = 0xCC79A7;
+
+/// Whether `s` has anything compressed to show: an encode, a reservation,
+/// a transient peak, a fallback, an encode deferred.
+pub fn compressing(s: &BudgetSignals) -> bool {
+    s.encode_blocks_total > 0
+        || s.upload_deferred_total[1] > 0
+        || s.decoded_reserved_bytes > 0
+        || Class::ALL.iter().any(|c| {
+            s.reserved_bytes[*c] > 0
+                || s.transient_bytes[*c] > 0
+                || s.encode_fallbacks_total[*c] > 0
+        })
+}
+
+/// The compression section: per class, what is held against what crosses,
+/// the transient peak in flight and the encoder's reservation; the last
+/// frame's encodes against the encode lane; the deferrals by lane and the
+/// fallbacks to RGBA8. One dim line when nothing is compressed.
+fn compression(p: &mut Painter<'_>, s: &BudgetSignals, view: &BoardView<'_>, y: f64) -> f64 {
+    let text = srgb(TEXT, 1.0);
+    let dim = srgb(DIM, 1.0);
+    let mut y = y;
+    if !compressing(s) {
+        let line = "Compression — none: imagery crosses and is held as it is";
+        p.hit(
+            MARGIN,
+            y - 1.0,
+            p.width(line, EM),
+            ROW - 1.0,
+            explain_compression_off(),
+        );
+        p.text(MARGIN, y, line, EM, dim);
+        return y + ROW + 8.0;
+    }
+    p.text(MARGIN, y, "Compression", 12.0, text);
+    y += ROW;
+    let from = view.from.map(|(f, _)| f);
+    const BAR: f64 = 260.0;
+    for (c, short, name) in CLASSES {
+        let [drawable, transit] = s.bytes[c];
+        let held = drawable + transit;
+        let (transient, transfer, reserved) = (
+            s.transient_bytes[c],
+            s.transfer_bytes[c],
+            s.reserved_bytes[c],
+        );
+        let fell = fallbacks_since(s, from, c);
+        if c != Class::Drape && transient + reserved + fell == 0 {
+            continue;
+        }
+        let x0 = MARGIN + 74.0;
+        p.hit(
+            MARGIN,
+            y - 1.0,
+            74.0 + BAR,
+            ROW - 1.0,
+            explain_compression_class(s, from, c),
+        );
+        p.text(MARGIN + 14.0, y, &format!("{short} {name}"), EM, text);
+        let max = (held + reserved).max(transfer) as f64 * 1.05;
+        p.bar(
+            x0,
+            y + 3.0,
+            BAR,
+            9.0,
+            &[
+                (held.saturating_sub(transient) as f64, srgb(DRAWN, 0.9)),
+                (transient as f64, srgb(ENCODE, 0.9)),
+                (reserved as f64, srgb(RESERVED, 0.9)),
+            ],
+            max,
+        );
+        if transfer > 0 && max > 0.0 {
+            let tx = x0 + transfer as f64 / max * BAR;
+            p.rect(tx - 1.0, y + 1.0, 2.0, 13.0, srgb(LOADS, 1.0));
+        }
+        let numbers = format!(
+            "held {} MiB · crossing {} MiB, +{} MiB until encoded · reserved {} MiB · fallbacks {fell}",
+            mib(held),
+            mib(transfer),
+            mib(transient),
+            mib(reserved),
+        );
+        if fits(view, 74.0 + BAR + 10.0 + p.width(&numbers, EM)) {
+            p.text(x0 + BAR + 10.0, y, &numbers, EM, text);
+        } else {
+            y += ROW;
+            p.text(x0, y, &numbers, EM, text);
+        }
+        y += ROW;
+    }
+    // The encodes against the lane.
+    let debt = s.encode_carry_blocks < 0;
+    let sev = if debt { Severity::Warn } else { Severity::Ok };
+    let lane = if s.encode_share_blocks == u64::MAX {
+        "no encode lane".to_owned()
+    } else {
+        format!(
+            "lane {} blocks a frame, carry {}",
+            s.encode_share_blocks, s.encode_carry_blocks
+        )
+    };
+    let encodes = format!(
+        "encodes: last frame {} tiles, {} blocks, {:.2} ms GPU · {}",
+        s.frame_encoded_tiles,
+        s.frame_encode_blocks,
+        s.frame_encode_gpu_micros as f64 / 1000.0,
+        lane
+    );
+    p.hit(
+        MARGIN,
+        y - 1.0,
+        14.0 + p.width(&encodes, EM),
+        ROW - 1.0,
+        explain_encodes(s, from),
+    );
+    p.marker(sev, MARGIN + 5.0, y + ROW / 2.0 - 2.0, 9.0);
+    p.text(MARGIN + 14.0, y, &encodes, EM, text);
+    y += ROW;
+    let since = |cur: u64, old: u64| cur.saturating_sub(from.map_or(0, |_| old));
+    let (b, e) = (
+        since(
+            s.upload_deferred_total[0],
+            from.map_or(0, |f| f.upload_deferred_total[0]),
+        ),
+        since(
+            s.upload_deferred_total[1],
+            from.map_or(0, |f| f.upload_deferred_total[1]),
+        ),
+    );
+    let deferred = format!(
+        "deferred: last frame {} by bytes, {} by encodes · {} / {} in all · decoded tier reserved {} MiB",
+        s.frame_deferred[0],
+        s.frame_deferred[1],
+        b,
+        e,
+        mib(s.decoded_reserved_bytes)
+    );
+    p.hit(
+        MARGIN,
+        y - 1.0,
+        14.0 + p.width(&deferred, EM),
+        ROW - 1.0,
+        explain_deferrals(s, from),
+    );
+    p.text(MARGIN + 14.0, y, &deferred, EM, text);
+    y += ROW;
+    y + 8.0
+}
+
+/// The fallbacks to RGBA8 of class `c`, since `from` when given.
+fn fallbacks_since(s: &BudgetSignals, from: Option<&BudgetSignals>, c: Class) -> u64 {
+    s.encode_fallbacks_total[c].saturating_sub(from.map_or(0, |f| f.encode_fallbacks_total[c]))
+}
+
+/// The legend of the compression line when nothing is compressed.
+pub fn explain_compression_off() -> Vec<Legend> {
+    vec![
+        line(Swatch::None, "Compression".to_owned()),
+        line(
+            Swatch::None,
+            "none: no encode, no reservation, nothing held beside a texture".to_owned(),
+        ),
+    ]
+}
+
+/// The legend of a class's compression row: one line per colour and mark,
+/// each with its value now.
+pub fn explain_compression_class(
+    s: &BudgetSignals,
+    from: Option<&BudgetSignals>,
+    c: Class,
+) -> Vec<Legend> {
+    let [drawable, transit] = s.bytes[c];
+    let held = drawable + transit;
+    let transient = s.transient_bytes[c];
+    vec![
+        line(Swatch::None, format!("{}, compressed", class_title(c))),
+        line(
+            Swatch::Fill(srgb(DRAWN, 0.9)),
+            format!(
+                "blue = held on the GPU, resident and in transit: {} MiB",
+                mib(held.saturating_sub(transient))
+            ),
+        ),
+        line(
+            Swatch::Fill(srgb(ENCODE, 0.9)),
+            format!(
+                "orange = the transient peak in flight, the RGBA8 held beside the blocks until their encode has run: {} MiB",
+                mib(transient)
+            ),
+        ),
+        line(
+            Swatch::Fill(srgb(RESERVED, 0.9)),
+            format!(
+                "purple = reserved off the limits, the encoder's scratch: {} MiB",
+                mib(s.reserved_bytes[c])
+            ),
+        ),
+        line(
+            Swatch::Tick(srgb(LOADS, 1.0)),
+            format!(
+                "sky-blue mark = what the copies in transit cross in: {} MiB",
+                mib(s.transfer_bytes[c])
+            ),
+        ),
+        line(
+            Swatch::None,
+            format!(
+                "fallbacks to RGBA8 (an encode that could not be done): {}",
+                fallbacks_since(s, from, c)
+            ),
+        ),
+    ]
+}
+
+/// The legend of the encodes line.
+pub fn explain_encodes(s: &BudgetSignals, from: Option<&BudgetSignals>) -> Vec<Legend> {
+    let h = &s.frame_encode_micros;
+    let (sum, count) = match from {
+        Some(f) => (
+            h.sum.saturating_sub(f.frame_encode_micros.sum),
+            h.count.saturating_sub(f.frame_encode_micros.count),
+        ),
+        None => (h.sum, h.count),
+    };
+    let tiles = s
+        .encoded_tiles_total
+        .saturating_sub(from.map_or(0, |f| f.encoded_tiles_total));
+    let blocks = s
+        .encode_blocks_total
+        .saturating_sub(from.map_or(0, |f| f.encode_blocks_total));
+    let debt = s.encode_carry_blocks < 0;
+    vec![
+        line(Swatch::None, "Encodes on the GPU".to_owned()),
+        line(
+            Swatch::None,
+            format!(
+                "last frame: {} tiles, {} blocks, {:.2} ms of GPU",
+                s.frame_encoded_tiles,
+                s.frame_encode_blocks,
+                s.frame_encode_gpu_micros as f64 / 1000.0
+            ),
+        ),
+        line(
+            Swatch::None,
+            format!(
+                "in all: {tiles} tiles, {blocks} blocks; {:.2} ms a frame that encodes, over {count} frames",
+                sum as f64 / count.max(1) as f64 / 1000.0
+            ),
+        ),
+        line(
+            Swatch::None,
+            if s.encode_share_blocks == u64::MAX {
+                "the lane: none (an unbounded frame encodes what it has)".to_owned()
+            } else {
+                format!(
+                    "the lane: {} blocks a frame, carry {} after the last",
+                    s.encode_share_blocks, s.encode_carry_blocks
+                )
+            },
+        ),
+        marker_line(
+            if debt { Severity::Warn } else { Severity::Ok },
+            if debt {
+                "in debt: the last tile crossed the share, the next frames wait"
+            } else {
+                "within its share"
+            },
+        ),
+    ]
+}
+
+/// The legend of the deferrals line.
+pub fn explain_deferrals(s: &BudgetSignals, from: Option<&BudgetSignals>) -> Vec<Legend> {
+    let since = |i: usize| {
+        s.upload_deferred_total[i].saturating_sub(from.map_or(0, |f| f.upload_deferred_total[i]))
+    };
+    vec![
+        line(Swatch::None, "Uploads deferred, by lane".to_owned()),
+        line(
+            Swatch::None,
+            format!(
+                "bytes: what did not fit the frame's deadline — last frame {}, {} in all",
+                s.frame_deferred[0],
+                since(0)
+            ),
+        ),
+        line(
+            Swatch::None,
+            format!(
+                "encodes: what did not fit the encode lane, whole swap groups — last frame {}, {} in all",
+                s.frame_deferred[1],
+                since(1)
+            ),
+        ),
+        line(
+            Swatch::None,
+            format!(
+                "decoded tier reserved for the decode workers' encodes: {} MiB",
+                mib(s.decoded_reserved_bytes)
+            ),
+        ),
+    ]
 }
 
 /// The chart by level: for each class, side by side, the copies held
@@ -2863,6 +3175,87 @@ pub mod fixtures {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The compression section, explained** (Laurent's addition to CB8):
+    /// none of it without compression, one dim line; with it, per class
+    /// what is held against what crosses, the transient peak and the
+    /// reservation, the encodes against the lane, the deferrals by lane and
+    /// the fallbacks — each region's legend with its live values.
+    #[test]
+    fn the_compression_section_explains_each_mark() {
+        let stalls = StallWatch::at_once();
+        let mut cache = TextCache::default();
+        let mut s = fixtures::healthy();
+        let legends = |s: &BudgetSignals, cache: &mut TextCache| -> Vec<String> {
+            let d = draw(Some(s), &view(&stalls, Some(2400.0), false), cache, 1.0);
+            d.hits
+                .iter()
+                .map(|h| {
+                    h.lines
+                        .iter()
+                        .map(|l| l.text.clone())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .collect()
+        };
+        let off = legends(&s, &mut cache);
+        assert!(
+            off.iter().any(|l| l.starts_with("Compression\nnone")),
+            "{off:?}"
+        );
+        assert!(!compressing(&s));
+        s.transient_bytes[Class::Drape] = 3 * 349_524;
+        s.transfer_bytes[Class::Drape] = 5 * 349_524;
+        s.reserved_bytes[Class::Drape] = 442_196;
+        s.decoded_reserved_bytes = 4 * 524_340;
+        s.encode_fallbacks_total[Class::Drape] = 2;
+        s.encoded_tiles_total = 40;
+        s.encode_blocks_total = 40 * 5_463;
+        s.frame_encoded_tiles = 1;
+        s.frame_encode_blocks = 5_463;
+        s.frame_encode_gpu_micros = 9_500;
+        s.frame_encode_micros.record(9_500);
+        s.frame_deferred = [2, 3];
+        s.upload_deferred_total = [10, 30];
+        s.encode_share_blocks = 2_396;
+        s.encode_carry_blocks = -3_067;
+        assert!(compressing(&s));
+        let on = legends(&s, &mut cache);
+        let find = |head: &str| {
+            on.iter()
+                .find(|l| l.starts_with(head))
+                .unwrap_or_else(|| panic!("no legend {head}: {on:?}"))
+                .clone()
+        };
+        let imagery = find("Imagery, compressed");
+        for want in [
+            "orange = the transient peak in flight",
+            ": 1.0 MiB",
+            "purple = reserved off the limits, the encoder's scratch: 0.4 MiB",
+            "sky-blue mark = what the copies in transit cross in: 1.7 MiB",
+            "fallbacks to RGBA8 (an encode that could not be done): 2",
+        ] {
+            assert!(imagery.contains(want), "{want} in {imagery}");
+        }
+        let encodes = find("Encodes on the GPU");
+        for want in [
+            "last frame: 1 tiles, 5463 blocks, 9.50 ms of GPU",
+            "in all: 40 tiles",
+            "the lane: 2396 blocks a frame, carry -3067 after the last",
+            "in debt",
+        ] {
+            assert!(encodes.contains(want), "{want} in {encodes}");
+        }
+        let deferred = find("Uploads deferred, by lane");
+        for want in [
+            "last frame 2, 10 in all",
+            "last frame 3, 30 in all",
+            "2.0 MiB",
+        ] {
+            assert!(deferred.contains(want), "{want} in {deferred}");
+        }
+    }
 
     fn view<'a>(stalls: &'a StallWatch, width: Option<f64>, issues_only: bool) -> BoardView<'a> {
         BoardView {

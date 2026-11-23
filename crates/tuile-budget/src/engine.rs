@@ -2040,6 +2040,8 @@ impl Budget {
                 if let Some(t) = self.arena.transit(s) {
                     let c = self.arena.class(s);
                     st.transit[c] = st.transit[c].plus(t.held());
+                    st.transient[c] = st.transient[c].plus(t.cost.transient);
+                    st.transfer[c] = st.transfer[c].plus(t.cost.transfer);
                     let at = super::stats::level_index(self.arena.level(s));
                     st.transit_by_level[c][at] = st.transit_by_level[c][at].plus(t.held());
                 }
