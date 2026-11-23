@@ -219,7 +219,7 @@ mod tests {
 
     #[test]
     fn the_copy_kept_longest_goes_first() {
-        let mut v = vec![(1u64, drape(1)), (9, drape(2)), (9, drape(0)), (5, drape(3))];
+        let mut v = [(1u64, drape(1)), (9, drape(2)), (9, drape(0)), (5, drape(3))];
         v.sort_by(|a, b| ranks_before((&a.0, a.1), (&b.0, b.1)));
         assert_eq!(
             v.iter().map(|x| x.1).collect::<Vec<_>>(),

@@ -468,7 +468,11 @@ impl DecodedTexture {
                 pixels,
                 resident: ImageryFormat::Rgba8,
             } => pixels.len() * 4 / 3,
-            Texels::Rgba8 { .. } => self.cost().gpu.0 as usize,
+            // Once the GPU has compressed it in place (CB9).
+            Texels::Rgba8 { .. } => {
+                let c = self.cost();
+                c.compresses_to().unwrap_or(c.gpu).0 as usize
+            }
             Texels::Blocks { .. } => self.texels.byte_len(),
         }
     }
@@ -1249,7 +1253,8 @@ pub(crate) mod tests {
         );
         let bc7 = rgba().planned(ImageryCompression::Auto.plan(apple));
         assert_eq!(bc7.resident_format(), ImageryFormat::Bc7);
-        assert_eq!(bc7.cost().gpu.0, 87_408);
+        assert_eq!(bc7.cost().gpu.0, 349_524, "uploaded as RGBA8 (CB9)");
+        assert_eq!(bc7.cost().compresses_to().map(|b| b.0), Some(87_408));
         assert_eq!(
             bc7.rgba8().map(<[u8]>::len),
             Some(256 * 256 * 4),

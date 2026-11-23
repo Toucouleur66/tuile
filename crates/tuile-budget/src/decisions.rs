@@ -297,7 +297,7 @@ impl Decisions {
         // Only when something is compressed (CB9): a digest without
         // compression is the one it was.
         if !self.compress.is_empty() {
-            h.u64(0xc0_4d_9e55);
+            h.u64(0xc04d_9e55);
             h.u64(self.compress.len() as u64);
             for (r, g) in &self.compress {
                 h.resource(*r);
