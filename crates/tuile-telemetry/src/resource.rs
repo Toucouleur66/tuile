@@ -58,7 +58,7 @@ pub const ALLOWED: [&str; 16] = [
 ];
 
 /// The metric label keys a series may carry.
-pub const ALLOWED_LABELS: [&str; 24] = [
+pub const ALLOWED_LABELS: [&str; 25] = [
     // tuile_core::metrics: the per-level and per-eye series.
     "series",
     "level",
@@ -94,6 +94,8 @@ pub const ALLOWED_LABELS: [&str; 24] = [
     "side",
     "term",
     "name",
+    // A score quantile's rank (`0.1`, `0.5`, `0.9`).
+    "q",
     "step",
     "quantile",
     // Histograms' bucket bound, where a recorder writes one as a label.

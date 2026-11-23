@@ -2073,6 +2073,30 @@ pub struct LevelWaste {
 
 /// See [`LevelWaste`].
 pub fn level_waste(s: &BudgetSignals, c: Class, l: usize) -> LevelWaste {
+    // Scored: the held copies under λ are the waste — the bytes of the
+    // level's held score histogram's share under λ (all classes counted
+    // together in the boards, prorated to this class's bytes).
+    if let (Some(lambda), Some(h)) = (s.score_lambda, s.score_held.as_ref()) {
+        use tuile_core::budget::score::{score_bucket, Cell, Side, DISTANCE_BANDS};
+        let mut cell = Cell::default();
+        for b in 0..DISTANCE_BANDS {
+            cell.add(h.board.cell(l, b, Side::Held));
+        }
+        if cell.count > 0 {
+            let under: u64 = cell.histogram[..score_bucket(lambda)]
+                .iter()
+                .map(|n| u64::from(*n))
+                .sum();
+            let [drawable, transit] = s.bytes_by_level[c][l];
+            let bytes = drawable + transit;
+            let below = bytes * under / u64::from(cell.count);
+            return LevelWaste {
+                under: [below, 0],
+                over: [bytes - below, 0],
+                scored: true,
+            };
+        }
+    }
     let v = &s.levels;
     let (gpu, drawn, selected) = (v.gpu_tiles[c][l], v.drawn[c][l], v.selected[c][l]);
     let held = gpu.saturating_sub(drawn);
@@ -2103,8 +2127,33 @@ pub struct LevelScores {
 /// The scores of level `l` of `c`, once the budget publishes them; none
 /// before. The one place that reads them: the box plots follow.
 pub fn level_scores(s: &BudgetSignals, c: Class, l: usize) -> Option<LevelScores> {
-    let _ = (s, c, l);
-    None
+    use tuile_core::budget::score::{quantiles, Cell, Side, DISTANCE_BANDS};
+    // The score boards count every class together: a level's scores are
+    // the same under each class's row.
+    let _ = c;
+    let sum = |board: &tuile_core::budget::score::ScoreBoard, side: Side| {
+        let mut cell = Cell::default();
+        for b in 0..DISTANCE_BANDS {
+            cell.add(board.cell(l, b, side));
+        }
+        cell
+    };
+    let f = |q: Option<[u64; 3]>| q.map(|v| v.map(|x| x as f64));
+    let held = s
+        .score_held
+        .as_ref()
+        .and_then(|h| quantiles(&sum(&h.board, Side::Held)));
+    let preload = quantiles(&sum(&s.score_recent, Side::Preload));
+    let evicted = quantiles(&sum(&s.score_recent, Side::Evict));
+    if held.is_none() && preload.is_none() && evicted.is_none() {
+        return None;
+    }
+    Some(LevelScores {
+        preload: f(preload),
+        held: f(held),
+        evicted: f(evicted),
+        lambda: s.score_lambda.map(|v| v as f64),
+    })
 }
 
 /// The legend of a level's box plots.
@@ -3781,5 +3830,36 @@ mod tests {
             d2.size,
             d.size
         );
+    }
+
+    /// The scores the budget publishes reach the box plots and the waste:
+    /// the held copies under λ are the waste, by the held histogram's share.
+    #[test]
+    fn level_scores_and_waste_read_the_published_scores() {
+        use tuile_core::budget::score::{HeldReport, Side, Terms};
+        let mut s = BudgetSignals::default();
+        assert!(level_scores(&s, Class::Drape, 12).is_none());
+        let mut held = HeldReport::default();
+        for score in [10u64, 10, 10, 1_000] {
+            held.board.put(
+                12,
+                1,
+                Side::Held,
+                &Terms {
+                    score,
+                    ..Terms::default()
+                },
+            );
+        }
+        s.score_held = Some(held);
+        s.score_lambda = Some(100);
+        s.bytes_by_level[Class::Drape][12] = [4_000, 0];
+        let x = level_scores(&s, Class::Drape, 12).expect("scores");
+        assert_eq!(x.lambda, Some(100.0));
+        assert_eq!(x.held, Some([8.0, 8.0, 512.0]));
+        let w = level_waste(&s, Class::Drape, 12);
+        assert!(w.scored);
+        assert_eq!(w.under, [3_000, 0], "three of four held under λ");
+        assert_eq!(w.over, [1_000, 0]);
     }
 }

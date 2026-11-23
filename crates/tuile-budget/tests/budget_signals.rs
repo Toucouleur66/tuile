@@ -593,7 +593,11 @@ fn the_spec_signals_follow_the_recorded_specifications() {
         decide_wall: None,
     });
     let s = m.s();
-    assert_eq!((s.spec, s.spec_overridden, s.spec_changes_total), (SpecKind::Fpv, true, 1), "{RED}");
+    assert_eq!(
+        (s.spec, s.spec_overridden, s.spec_changes_total),
+        (SpecKind::Fpv, true, 1),
+        "{RED}"
+    );
     let info: Vec<_> = s
         .series()
         .into_iter()
@@ -1002,6 +1006,7 @@ fn labels_stay_within_their_closed_sets() {
             "distance" => labels::DISTANCE.to_vec(),
             "side" => labels::SIDE.to_vec(),
             "term" => labels::TERM.to_vec(),
+            "q" => labels::QUANTILE.to_vec(),
             _ => Vec::new(),
         };
         set.contains(&value)
@@ -1152,10 +1157,8 @@ fn the_score_series_are_the_decisions_terms() {
         let k = 1u64 << (l - 2);
         for x in 0..3 {
             let id = t(l, 5 * k + x, 7 * k);
-            need.ring.push((
-                id,
-                need_of(id).with_proximity(6, x as f32 * 1.5),
-            ));
+            need.ring
+                .push((id, need_of(id).with_proximity(6, x as f32 * 1.5)));
         }
     }
     let mut events = Vec::new();
@@ -1176,7 +1179,10 @@ fn the_score_series_are_the_decisions_terms() {
         series
             .iter()
             .filter(|(n, l, _)| {
-                *n == name && want.iter().all(|w| l.iter().any(|x| x.0 == w.0 && x.1 == w.1))
+                *n == name
+                    && want
+                        .iter()
+                        .all(|w| l.iter().any(|x| x.0 == w.0 && x.1 == w.1))
             })
             .map(|(_, _, v)| *v)
             .sum()
@@ -1202,6 +1208,17 @@ fn the_score_series_are_the_decisions_terms() {
         }
     }
     let _ = distance_band(0);
+    // λ: the highest score released for room since the last publish.
+    let lambda = events
+        .iter()
+        .filter(|e| e.side == Side::Evict)
+        .map(|e| e.terms.score)
+        .max();
+    assert_eq!(m.meter.signals().score_lambda, lambda);
+    if let Some(l) = lambda {
+        assert_eq!(find("exchange_threshold", &[]), l as f64);
+    }
+    assert!(series.iter().any(|(n, _, _)| *n == "score_quantile"));
     assert_eq!(find("param", &[("name", "rho_tiles")]), 3.0);
     assert_eq!(find("param", &[("name", "floor_level")]), 1.0);
     assert_eq!(find("need_level", &[]), 6.0);

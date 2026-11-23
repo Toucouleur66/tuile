@@ -542,6 +542,12 @@ pub struct BudgetSignals {
     pub score_total: crate::score::ScoreBoard,
     /// `score_min{…}` and `score_max{…}`: the same since the last publish.
     pub score_recent: crate::score::ScoreBoard,
+    /// `exchange_threshold`: λ, the score at the memory boundary since
+    /// the last publish — the highest score released to make room or keep
+    /// the target (sweep, pressure, admission, swap): what is held under it
+    /// would be released, a candidate over it loaded. `None` without
+    /// pressure.
+    pub score_lambda: Option<u64>,
     /// The decisions since the last publish, each with its terms, at most
     /// [`SCORE_EVENTS_KEPT`]: the log records' source.
     pub score_events: Vec<crate::score::ScoreEvent>,
@@ -643,6 +649,8 @@ pub mod labels {
     pub const SIDE: [&str; 4] = ["preload", "evict", "held", "decoded"];
     /// `term` of the score.
     pub const TERM: [&str; 5] = crate::score::TERM_LABELS;
+    /// `q` of `score_quantile`.
+    pub const QUANTILE: [&str; 3] = ["0.1", "0.5", "0.9"];
     /// `tier` of `restore_cost_seconds`.
     pub const RESTORE_TIER: [&str; 4] = crate::score::RESTORE_TIERS;
     /// `level`, 0 to 24: a level of the budget's per-level series
@@ -1155,6 +1163,22 @@ impl BudgetSignals {
         if let Some(n) = self.score_params.need_level {
             out.push(("need_level", vec![], f64::from(n)));
         }
+        if let Some(l) = self.score_lambda {
+            out.push(("exchange_threshold", vec![], l as f64));
+        }
+        // The score's quantiles per level and side, from the histograms:
+        // `score_quantile{side,q,level}`.
+        let qs = |out: &mut Vec<Series>, side: Side, l: usize, c: &crate::score::Cell| {
+            if let Some(q) = crate::score::quantiles(c) {
+                for (name, v) in labels::QUANTILE.iter().zip(q) {
+                    out.push((
+                        "score_quantile",
+                        vec![("side", side.label()), ("q", name), ("level", labels::LEVEL[l])],
+                        v as f64,
+                    ));
+                }
+            }
+        };
         for (tier, us) in crate::score::RESTORE_TIERS
             .iter()
             .zip(self.score_params.restore_us)
@@ -1230,6 +1254,20 @@ impl BudgetSignals {
                     }
                 }
             }
+        }
+        for l in 0..LEVELS {
+            let mut held = crate::score::Cell::default();
+            let (mut pre, mut ev) = (crate::score::Cell::default(), crate::score::Cell::default());
+            for b in 0..DISTANCE_BANDS {
+                if let Some(h) = &self.score_held {
+                    held.add(h.board.cell(l, b, Side::Held));
+                }
+                pre.add(self.score_recent.cell(l, b, Side::Preload));
+                ev.add(self.score_recent.cell(l, b, Side::Evict));
+            }
+            qs(out, Side::Held, l, &held);
+            qs(out, Side::Preload, l, &pre);
+            qs(out, Side::Evict, l, &ev);
         }
         out.push((
             "score_events_dropped_total",
@@ -1344,6 +1382,7 @@ impl BudgetMeter {
         self.s.decide_peak_micros = 0;
         self.s.fallback_depth_max = 0;
         self.s.score_recent = crate::score::ScoreBoard::default();
+        self.s.score_lambda = None;
         self.s.score_events.clear();
         s
     }
@@ -1398,6 +1437,18 @@ impl BudgetObserver for BudgetMeter {
         }
         crate::score::board_of(&d.scores, &mut s.score_total);
         crate::score::board_of(&d.scores, &mut s.score_recent);
+        for e in d.scores.iter().filter(|e| {
+            e.side == crate::score::Side::Evict
+                && matches!(
+                    e.reason,
+                    crate::score::Reason::Sweep
+                        | crate::score::Reason::Pressure
+                        | crate::score::Reason::Admission
+                        | crate::score::Reason::Swap
+                )
+        }) {
+            s.score_lambda = Some(s.score_lambda.map_or(e.terms.score, |l| l.max(e.terms.score)));
+        }
         for e in &d.scores {
             if s.score_events.len() < SCORE_EVENTS_KEPT {
                 s.score_events.push(*e);

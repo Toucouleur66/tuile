@@ -264,6 +264,8 @@ Metrics (`tuile_budget_` prefix; labels `level`, `distance` ∈ {0, 1, 2, 3, 4+}
 | `score_held_tiles{level,distance,side="held"}` | gauge | GPU copies held |
 | `score_held_sum`, `score_held_min`, `score_held_max{level,distance,side,term}` | gauge | their terms |
 | `score_events_dropped_total` | counter | decisions beyond the log records' rate limit |
+| `exchange_threshold` | gauge | λ: the highest score released to make room or keep the target since the last publish — held under it would go, a candidate over it would load |
+| `score_quantile{side,q,level}` | gauge | the 10th, 50th, 90th percentiles of the scores of the preloads started and the copies evicted since the last publish, and of the copies held (`side` preload, evict, held; `q` 0.1, 0.5, 0.9), from the cells' doubling histograms: no sort |
 
 Log records (OTLP `/v1/logs` → Loki), one per decision (`body` `tuile.budget.decision`) and
 one per listed held copy (`tuile.budget.held`, `end` lowest | highest, `rank`), attributes
@@ -272,7 +274,9 @@ one per listed held copy (`tuile.budget.held`, `end` lowest | highest, `rank`), 
 **A tile's address leaves the process here and only here**, as a log attribute, at
 Laurent's request (2026-11-23); it is never a metric label.
 
-The window prints the formula with its parameters in its header, the level × band table
+The board's box plots (`tuile-ui` `level_scores`) draw those quantiles per level with λ
+marked, and its waste (`level_waste`) is, once scores are published, the held bytes under λ
+(the level's held histogram's share). The window prints the formula with its parameters in its header, the level × band table
 (preloads in flight / evicted, or started / evicted since the cumulative view's start), the
 terms per level and side, and the two held lists.
 

@@ -114,6 +114,28 @@ pub fn score_bucket(score: u64) -> usize {
     b.min(SCORE_BUCKETS - 1)
 }
 
+/// The 10th, 50th and 90th percentiles of a cell's scores, from its
+/// histogram ([`SCORE_BUCKETS`], doubling): each the lower bound of the
+/// bucket it falls in — no sort, deterministic. `None` for an empty cell.
+pub fn quantiles(c: &Cell) -> Option<[u64; 3]> {
+    let total: u64 = c.histogram.iter().map(|n| u64::from(*n)).sum();
+    if total == 0 {
+        return None;
+    }
+    let at = |q: u64| {
+        let rank = (total * q).div_ceil(100).max(1);
+        let mut seen = 0u64;
+        for (i, n) in c.histogram.iter().enumerate() {
+            seen += u64::from(*n);
+            if seen >= rank {
+                return if i == 0 { 0 } else { 1u64 << (i - 1) };
+            }
+        }
+        0
+    };
+    Some([at(10), at(50), at(90)])
+}
+
 /// The count, sum, least and greatest of one term over a cell.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Agg {
@@ -566,6 +588,31 @@ mod tests {
         assert_eq!(score_bucket(0), 0);
         assert_eq!(score_bucket(1), 1);
         assert_eq!(score_bucket(u64::MAX), SCORE_BUCKETS - 1);
+    }
+
+    /// Quantiles from the histogram: the lower bound of the bucket each
+    /// rank falls in.
+    #[test]
+    fn quantiles_read_the_histogram() {
+        let mut c = Cell::default();
+        assert_eq!(quantiles(&c), None);
+        for score in [1u64, 3, 3, 3, 3, 3, 3, 3, 3, 1_000] {
+            c.put(&Terms {
+                score,
+                ..Terms::default()
+            });
+        }
+        // 1 in [1, 2), the 3s in [2, 4), 1 000 in [512, 1 024).
+        assert_eq!(quantiles(&c), Some([1, 2, 2]));
+        c.put(&Terms {
+            score: 1_000,
+            ..Terms::default()
+        });
+        let [_, _, p90] = quantiles(&c).unwrap_or_default();
+        assert_eq!(
+            p90, 512,
+            "two of eleven at 1 000: the 90th (the 10th of 11) is one of them"
+        );
     }
 
     #[test]
