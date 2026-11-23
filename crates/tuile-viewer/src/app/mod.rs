@@ -29,6 +29,7 @@ pub(crate) mod offscreen;
 mod pacing;
 #[cfg(not(target_arch = "wasm32"))]
 mod pictures;
+mod predicting;
 mod readout;
 mod screen;
 mod script;
@@ -463,6 +464,8 @@ pub struct App {
     requests: std::sync::mpsc::Receiver<crate::steer::Request>,
     /// A glide under way, which any gesture ends.
     flight: Option<flight::Flight>,
+    /// Where the camera will be: the views ahead sent each frame.
+    predicting: predicting::Predicting,
     /// An embedding application that owns the frame: it is asked for the
     /// camera before each one, and sees events before the controls do.
     ///
@@ -546,6 +549,7 @@ impl App {
             located: false,
             requests,
             flight: None,
+            predicting: predicting::Predicting::default(),
             frame_host: config.frame_host.take(),
             preload: Vec::new(),
             overlays: crate::frame_host::OverlayLayers::default(),
@@ -977,7 +981,12 @@ impl App {
         // are asked for, and never drawn — nothing downstream reads past the
         // eyes. They are added after, so an empty list leaves the selection
         // exactly as it was and a session without a host is untouched.
-        views.extend(self.preload.iter().map(|view| {
+        // A view ahead is not one of them: it is announced as one
+        // (`predicting`), loaded behind the present view.
+        let preload = self.preload.iter().filter(|view| {
+            !matches!(view.priority, crate::frame_host::Priority::Ahead { .. })
+        });
+        views.extend(preload.map(|view| {
             // The height is the drawn frame's; only the shape differs, and a
             // view's need is counted in pixels.
             let size = glam::DVec2::new(height * view.aspect.max(1e-6), height);

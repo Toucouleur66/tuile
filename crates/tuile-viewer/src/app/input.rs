@@ -117,9 +117,17 @@ impl App {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
-                // A hand on the globe ends any glide.
+                // A hand on the globe ends any glide, and any coast; let go,
+                // the camera coasts on what the hand was doing.
                 if pressed {
                     self.flight = None;
+                }
+                if matches!(button, MouseButton::Left | MouseButton::Right) {
+                    if pressed {
+                        self.controller.press();
+                    } else {
+                        self.controller.let_go();
+                    }
                 }
                 match button {
                     MouseButton::Left if pressed => {

@@ -55,8 +55,17 @@ impl App {
     /// One finger event, in device pixels: through the recognizer, then
     /// carried out.
     pub(crate) fn finger(&mut self, id: u64, phase: Phase, at: (f64, f64)) {
+        // A hand on the glass holds the globe from its first finger to its
+        // last: a pinch after a drag is the same hand, and only lifting it
+        // flings.
+        let was = self.touches.any();
         for gesture in self.touches.on(Instant::now(), id, phase, at) {
             self.gesture(gesture);
+        }
+        match (was, self.touches.any()) {
+            (false, true) => self.controller.press(),
+            (true, false) => self.controller.let_go(),
+            _ => {}
         }
         self.demand.poke();
     }

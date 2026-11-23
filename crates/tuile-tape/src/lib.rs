@@ -593,6 +593,17 @@ impl Tape {
         Some(frame)
     }
 
+    /// The recorded frame `k` frames after the one [`Self::next_frame`]
+    /// returned last (`k = 1` is the next one), without flying to it: the
+    /// known future a replay announces. `None` past the end, and while
+    /// recording.
+    pub fn peek(&self, k: usize) -> Option<Frame> {
+        let Inner::Replaying { frames, at } = &self.0 else {
+            return None;
+        };
+        frames.get((*at + k).checked_sub(1)?).copied()
+    }
+
     /// How far a replay has got, as `(flown, total)`.
     pub fn progress(&self) -> (usize, usize) {
         match &self.0 {
@@ -1421,6 +1432,27 @@ mod tests {
         assert!(tape.next_frame().is_some());
         assert!(tape.next_frame().is_none(), "the end must be reported");
         assert_eq!(tape.progress(), (2, 2));
+    }
+
+    /// A replay's future can be read without flying it: the frames a viewer
+    /// announces as its views ahead.
+    #[test]
+    fn a_replay_peeks_ahead_without_flying() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("three.mcap");
+        let mut tape = Tape::recording(&path).expect("open");
+        for x in [0.0, 1.0, 2.0] {
+            tape.push(frame(x));
+        }
+        tape.finish().expect("close");
+        let mut tape = Tape::replaying(&path).expect("open");
+        let first = tape.next_frame().expect("a frame");
+        assert_eq!(tape.peek(0).map(|f| f.position), Some(first.position));
+        let second = tape.peek(1).expect("the next");
+        assert_eq!(tape.peek(2).map(|f| f.position), Some(frame(2.0).position));
+        assert!(tape.peek(3).is_none());
+        assert_eq!(tape.next_frame().map(|f| f.position), Some(second.position));
+        assert_eq!(tape.progress(), (2, 3));
     }
 
     /// The case the journal exists for: the process dies without ever calling
