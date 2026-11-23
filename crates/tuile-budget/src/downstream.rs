@@ -452,7 +452,7 @@ struct StepLists {
     old_reach: Vec<(TileId, u8)>,
     bufs: ItemBufs,
     tile_wants: Vec<(ResourceId, u32, Want)>,
-    old_wants: Vec<(ResourceId, Want)>,
+    old_wants: Vec<(ResourceId, Want, super::sorted::Place)>,
     drapes: Vec<(LayerId, u32)>,
     chain: Vec<(TileId, u32)>,
     chain_now: Vec<(TileId, u32)>,
@@ -689,12 +689,20 @@ fn put<K: Ord + Copy, V>(m: &mut SortedMap<K, V>, c: &mut Changes<K, V>, k: K, v
 
 /// Adds `items` to `v`, a list read as a set: when it is full it is sorted
 /// and deduplicated before it grows, so it holds about twice its distinct
-/// members at most, whatever was added twice.
+/// members at most, whatever was added twice. A compaction that frees less
+/// than an eighth of it makes a quarter more room: otherwise a list of
+/// distinct members with a few repeats sorted itself whole at nearly every
+/// push (a quadratic step: 235 ms of the viewer-scale run's slowest step,
+/// adding a view's wants into `marks`), where now each sort of `n` is paid
+/// by `n / 8` pushes at least.
 fn add<T: Ord + Copy>(v: &mut Vec<T>, items: impl IntoIterator<Item = T>) {
     for x in items {
         if v.len() == v.capacity() && v.len() >= 64 {
             v.sort_unstable();
             v.dedup();
+            if 8 * (v.capacity() - v.len()) < v.capacity() {
+                v.reserve_exact(v.len() / 4);
+            }
         }
         v.push(x);
     }
@@ -1744,39 +1752,52 @@ impl Budget {
                 _ => 0,
             };
             self.walk(shifted);
+            // The tile's wants as kept, each with its place: one search for
+            // the tile, none for a want that changes (written where it is;
+            // the map's insertions and removals wait for the pass's end, so
+            // the places hold).
             l.old_wants.clear();
-            l.old_wants
-                .extend(of_tile(&self.down.wants, t).map(|(r, w)| (r, *w)));
+            let lo = ByTile(ResourceId::Mesh(t));
+            let hi = ByTile(ResourceId::drape(t, LayerId(u16::MAX), u32::MAX));
+            l.old_wants.extend(
+                self.down
+                    .wants
+                    .range_placed(lo..=hi)
+                    .map(|(p, k, w)| (k.0, *w, p)),
+            );
             self.walk(l.old_wants.len());
             // Both lists by resource: a merge.
             let (old, new) = (&l.old_wants, &l.tile_wants);
             let wants = &mut self.down.wants;
             let (mut i, mut j) = (0, 0);
             while i < old.len() || j < new.len() {
-                let (r, w) = match (old.get(i), new.get(j)) {
+                let r = match (old.get(i), new.get(j)) {
                     (Some(a), Some(b)) if a.0 == b.0 => {
                         i += 1;
                         j += 1;
                         if a.1 == b.2 {
                             continue;
                         }
-                        (b.0, Some(b.2))
+                        *wants.at_mut(a.2) = b.2;
+                        b.0
                     }
                     (Some(a), Some(b)) if a.0 < b.0 => {
                         i += 1;
-                        (a.0, None)
+                        l.c_wants.push((ByTile(a.0), None));
+                        a.0
                     }
                     (Some(a), None) => {
                         i += 1;
-                        (a.0, None)
+                        l.c_wants.push((ByTile(a.0), None));
+                        a.0
                     }
                     (_, Some(b)) => {
                         j += 1;
-                        (b.0, Some(b.2))
+                        l.c_wants.push((ByTile(b.0), Some(b.2)));
+                        b.0
                     }
                     (None, None) => break,
                 };
-                put(wants, &mut l.c_wants, ByTile(r), w);
                 l.wants.push(r);
             }
         }
@@ -1852,14 +1873,34 @@ impl Budget {
             Err(_) => self.tiles.get(&t).copied(),
         };
         l.held.clear();
+        // The held tiles whose walk passed a named tile: the geometric ones
+        // from each named tile's interval, the others each walked once
+        // against the named list (`held_under`'s union, not one walk of
+        // every irregular held tile per named tile).
+        l.named.clear();
         for &Named { tile: x, .. } in named {
             if self.held_last.contains_key(&x) {
                 l.held.push(x);
             }
-            l.held.extend(self.held_under(x, before).map(|(h, _)| h));
+            l.held.extend(self.held_regular_under(x).map(|(h, _)| h));
+            l.named.push(x);
         }
+        self.irregular_reaching(&l.named, before, &mut l.held);
         l.held.sort_unstable();
         l.held.dedup();
+        #[cfg(debug_assertions)]
+        {
+            let mut all: Vec<TileId> = Vec::new();
+            for &Named { tile: x, .. } in named {
+                if self.held_last.contains_key(&x) {
+                    all.push(x);
+                }
+                all.extend(self.held_under(x, before).map(|(h, _)| h));
+            }
+            all.sort_unstable();
+            all.dedup();
+            assert_eq!(all, l.held, "the held tiles to walk again, one walk each");
+        }
         for i in 0..l.held.len() {
             let h = l.held[i];
             Self::chain_of(h, before, &mut l.chain);
@@ -2368,14 +2409,14 @@ impl Budget {
         self.walk(l.marks.len());
         for &r in &l.marks {
             let w = wants.get(&r);
-            let (job, wait) = match w {
-                Some(w) => self.job_of(r, w, now),
-                None => (None, None),
+            // The slot looked up once for the work and the flight.
+            let e = w.map(|_| self.arena.find(r));
+            let (job, wait) = match (w, e) {
+                (Some(w), Some(e)) => self.job_of_at(r, w, now, e),
+                _ => (None, None),
             };
             let flying = w.is_some_and(|w| w.urgency <= Urgency::Drape)
-                && self
-                    .arena
-                    .find(r)
+                && e.flatten()
                     .is_some_and(|s| self.arena.has_transit(s) || self.arena.loading(s));
             let d = &self.down;
             let set = |m: &Set<ResourceId>, c: &mut Changes<ResourceId, ()>, on: bool| {
@@ -2410,7 +2451,7 @@ impl Budget {
             let mut waiting = Vec::new();
             let mut inflight = Vec::new();
             for (r, w) in wants.iter() {
-                let (job, wait) = self.job_of(r, w, now);
+                let (job, wait) = self.job_of_at(r, w, now, self.arena.find(r));
                 if job.is_some() {
                     jobs.push(r);
                 }
@@ -2995,8 +3036,8 @@ impl Budget {
         &self,
         tiles: &SortedMap<TileId, TileNeed>,
         presence: &dyn PresenceOracle,
-        last: &std::collections::BTreeMap<(TileId, LayerId), DrapeLevel>,
-        stood_in: &std::collections::BTreeMap<(TileId, LayerId), u32>,
+        last: &super::engine::LevelMap<DrapeLevel>,
+        stood_in: &super::engine::LevelMap<u32>,
     ) {
         /// Asked, it answers nothing and says so.
         struct Silent(std::cell::Cell<bool>);
@@ -3295,6 +3336,51 @@ mod tests {
     use super::*;
     use crate::state::{SHRINK_BELOW, SHRINK_FLOOR, SHRINK_TO};
     use crate::{Budget, BudgetConfig, Bytes, Class, ResourceId, TileId};
+
+    /// A key that counts its comparisons, on this thread.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct Counted(u32);
+
+    thread_local! {
+        static COMPARED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    impl Ord for Counted {
+        fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+            COMPARED.with(|c| c.set(c.get() + 1));
+            self.0.cmp(&o.0)
+        }
+    }
+
+    impl PartialOrd for Counted {
+        fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(o))
+        }
+    }
+
+    /// `add` costs O(log n) a push, amortised, whatever is added twice: a
+    /// list of distinct members with a repeat between each two (a view's
+    /// wants added again for its named tiles) once sorted itself whole at
+    /// nearly every push, n² log n — 235 ms of one step at the viewer's
+    /// scale.
+    #[test]
+    fn adding_to_a_set_list_sorts_it_amortised() {
+        let n = 65_536u32;
+        let mut v: Vec<Counted> = Vec::with_capacity(64);
+        COMPARED.with(|c| c.set(0));
+        for i in 0..n {
+            add(&mut v, [Counted(i), Counted(0)]);
+        }
+        let compared = COMPARED.with(std::cell::Cell::get);
+        v.sort_unstable();
+        v.dedup();
+        assert_eq!(v.len(), n as usize, "a set: every member once");
+        let bound = 12 * u64::from(n) * u64::from(n.ilog2());
+        assert!(
+            compared <= bound,
+            "{compared} comparisons for {n} pushes, over {bound}"
+        );
+    }
 
     /// The budget's prune-side compaction, driven directly: `n` tracked
     /// slots added or taken (empty ones, as a prune frees them).

@@ -69,7 +69,7 @@ use hashbrown::HashTable;
 use super::cost::Cost;
 use super::priority::{PriorityKey, Urgency};
 use super::sorted::SortedMap;
-use super::stats::{level_index, LEVELS};
+use super::stats::{layer_index, level_index, LAYERS, LEVELS};
 use super::tier::Tier;
 use super::tier::{Presence, Source};
 use super::types::ResourceId;
@@ -469,6 +469,11 @@ pub(super) struct Arena {
     /// The drapes with a GPU copy, in resource order: a tile's drawable
     /// drapes of one layer are a range of it, by level.
     gpu_drapes: BTreeSet<ResourceId>,
+    /// The drapes' GPU copies and their bytes, by layer
+    /// (`stats::layer_index`): kept as `gpu_by_level` is, so the step's
+    /// layer statistics read them without a walk of `gpu_drapes`.
+    gpu_layer_tiles: [u32; LAYERS],
+    gpu_layer_bytes: [Bytes; LAYERS],
     /// The floor's last level (`BudgetConfig::pinned_level`).
     pinned: Option<u32>,
     /// The specification's terms the eviction key reads.
@@ -547,6 +552,8 @@ impl Default for Arena {
             cpu_by_level: PerClass::splat([Bytes::ZERO; LEVELS]),
             cpu_tiles_by_level: PerClass::splat([0; LEVELS]),
             gpu_drapes: BTreeSet::new(),
+            gpu_layer_tiles: [0; LAYERS],
+            gpu_layer_bytes: [Bytes::ZERO; LAYERS],
             pinned: None,
             valuation: super::value::Valuation::default(),
             evict: EvictIndex::default(),
@@ -1287,6 +1294,8 @@ impl Arena {
         let mut protected = PerClass::splat(Bytes::ZERO);
         let mut epochs: BTreeMap<(Class, Option<LayerId>, u64), u32> = BTreeMap::new();
         let mut gpu_tiles = PerClass::splat([0u32; LEVELS]);
+        let mut layer_tiles = [0u32; LAYERS];
+        let mut layer_bytes = [Bytes::ZERO; LAYERS];
         let mut cpu = PerClass::splat([Bytes::ZERO; LEVELS]);
         let mut cpu_tiles = PerClass::splat([0u32; LEVELS]);
         for s in self.iter() {
@@ -1296,6 +1305,11 @@ impl Arena {
             if let Some(g) = self.gpu(s) {
                 *epochs.entry(self.epoch_key(s, g.epoch)).or_insert(0) += 1;
                 gpu_tiles[c][at] += 1;
+                if let Some(x) = self.id(s).layer() {
+                    let i = layer_index(x);
+                    layer_tiles[i] += 1;
+                    layer_bytes[i] = layer_bytes[i].plus(g.bytes);
+                }
             }
             if let Some(k) = self.cpu(s) {
                 cpu[c][at] = cpu[c][at].plus(k.cost.gpu);
@@ -1303,6 +1317,8 @@ impl Arena {
             }
         }
         if gpu_tiles != self.gpu_tiles_by_level
+            || layer_tiles != self.gpu_layer_tiles
+            || layer_bytes != self.gpu_layer_bytes
             || cpu != self.cpu_by_level
             || cpu_tiles != self.cpu_tiles_by_level
         {
@@ -1729,21 +1745,31 @@ impl Arena {
         self.unfile(s);
         let class = self.class(s);
         let at = level_index(self.level(s));
+        let layer = self.id(s).layer().map(layer_index);
         match self.gpu(s) {
             Some(old) => {
                 l.gpu[class] = l.gpu[class].minus(old.bytes);
                 self.gpu_by_level[class][at] = self.gpu_by_level[class][at].minus(old.bytes);
+                if let Some(i) = layer {
+                    self.gpu_layer_bytes[i] = self.gpu_layer_bytes[i].minus(old.bytes);
+                }
                 self.count_epoch(s, old.epoch, false);
             }
             None => {
                 if let r @ ResourceId::Drape { .. } = self.id(s) {
                     self.gpu_drapes.insert(r);
                 }
+                if let Some(i) = layer {
+                    self.gpu_layer_tiles[i] += 1;
+                }
                 self.gpu_tiles_by_level[class][at] += 1;
             }
         }
         l.gpu[class] = l.gpu[class].plus(g.bytes);
         self.gpu_by_level[class][at] = self.gpu_by_level[class][at].plus(g.bytes);
+        if let Some(i) = layer {
+            self.gpu_layer_bytes[i] = self.gpu_layer_bytes[i].plus(g.bytes);
+        }
         self.gpu[s.i()] = g;
         self.set(s, GPU, true);
         self.count_epoch(s, g.epoch, true);
@@ -1759,6 +1785,11 @@ impl Arena {
     /// How many GPU copies, per class, by level.
     pub fn gpu_tiles_by_level(&self) -> &PerClass<[u32; LEVELS]> {
         &self.gpu_tiles_by_level
+    }
+
+    /// The drapes' GPU copies and their bytes, by layer.
+    pub fn gpu_by_layer(&self) -> (&[u32; LAYERS], &[Bytes; LAYERS]) {
+        (&self.gpu_layer_tiles, &self.gpu_layer_bytes)
     }
 
     /// The decoded copies' bytes and count, per class, by level.
@@ -1777,8 +1808,11 @@ impl Arena {
         self.gpu_tiles_by_level[class][at] = self.gpu_tiles_by_level[class][at].saturating_sub(1);
         self.set(s, GPU, false);
         self.count_epoch(s, g.epoch, false);
-        if let r @ ResourceId::Drape { .. } = self.id(s) {
+        if let r @ ResourceId::Drape { layer, .. } = self.id(s) {
             self.gpu_drapes.remove(&r);
+            let i = layer_index(layer);
+            self.gpu_layer_tiles[i] = self.gpu_layer_tiles[i].saturating_sub(1);
+            self.gpu_layer_bytes[i] = self.gpu_layer_bytes[i].minus(g.bytes);
         }
         self.file(s);
         self.reprotect(s, before);

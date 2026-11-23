@@ -38,6 +38,8 @@ mod reference;
 mod rng;
 #[path = "../../tuile-budget/tests/budget_sim/server.rs"]
 mod server;
+#[path = "../../tuile-budget/tests/budget_sim/soak.rs"]
+mod soak;
 #[path = "../../tuile-budget/tests/budget_sim/world.rs"]
 mod world;
 
@@ -45,5 +47,7 @@ pub mod catalogue;
 pub mod objective;
 pub mod table;
 
+pub use alloc::Counting;
 pub use catalogue::{Device, Network, Scenario, CATALOGUE_VERSION};
 pub use objective::{run, Outcome};
+pub use server::{Profile, Sim};

@@ -36,7 +36,6 @@
 #![deny(clippy::float_arithmetic)]
 
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
 use std::sync::atomic::Ordering::Relaxed;
 
 use super::config::FailurePolicy;
@@ -191,13 +190,16 @@ pub(super) const MESH: u8 = 1 << 1;
 pub(super) const DRAPES: u8 = 1 << 2;
 pub(super) const WORN: u8 = 1 << 3;
 
+/// A map by (tile, layer) of what a step keeps about each drape level: the
+/// level chosen, a stand-in's own, a gap, a dwell's start. Sorted blocks —
+/// the passes read it tile by tile in key order — whose upkeep is not
+/// counted into `work` (see `Budget::imagery_prev`).
+pub(super) type LevelMap<V> = super::sorted::SortedMap<(TileId, LayerId), V>;
+
 /// The imagery levels kept from the step before: the level chosen, and,
 /// where a stand-in was worn in its place, the level the hysteresis carries
 /// (`Budget::drape_levels`).
-pub(super) type KeptLevels<'a> = (
-    &'a BTreeMap<(TileId, LayerId), DrapeLevel>,
-    &'a BTreeMap<(TileId, LayerId), u32>,
-);
+pub(super) type KeptLevels<'a> = (&'a LevelMap<DrapeLevel>, &'a LevelMap<u32>);
 
 impl Reach {
     /// It read `what` of `t`.
@@ -269,8 +271,6 @@ pub(super) struct WalkedLevels {
     drawn: PerClass<[u32; super::stats::LEVELS]>,
     under_need: PerClass<[u32; super::stats::LEVELS]>,
     layer_drawn: [u32; super::stats::LAYERS],
-    layer_gpu_tiles: [u32; super::stats::LAYERS],
-    layer_gpu_bytes: [Bytes; super::stats::LAYERS],
 }
 
 /// A step's buffers, kept across steps so that a step allocates nothing
@@ -1562,17 +1562,19 @@ impl Budget {
 
     /// The work `r`, wanted as `w`, asks for now — a load or a delivery —
     /// and, asking for none, the time it waits on (a delivery's backoff or a
-    /// retry's) that will change that.
-    pub(super) fn job_of(
+    /// retry's) that will change that. `e` is `r`'s slot, found by the
+    /// caller: one that reads the slot again looks it up once.
+    pub(super) fn job_of_at(
         &self,
         r: ResourceId,
         w: &Want,
         now: Micros,
+        e: Option<Slot>,
     ) -> (Option<Job>, Option<Micros>) {
         let class = self.class_of(r, w.class);
         let epoch = self.epoch(r, class);
         let a = &self.arena;
-        match a.find(r) {
+        match e {
             Some(s) if a.gpu(s).is_some_and(|g| g.epoch == epoch) => (None, None),
             Some(s) if a.has_transit(s) => (None, None),
             Some(s) if a.fresh_cpu(s, epoch).is_some() => {
@@ -1599,10 +1601,22 @@ impl Budget {
         coarsening: &dyn Fn(TileId) -> bool,
         presence: &dyn PresenceOracle,
     ) -> PriorityKey {
+        self.key_of_at(r, w, now, coarsening, presence, self.arena.find(r))
+    }
+
+    /// [`Budget::key_of`], `r`'s slot found already (`e`).
+    fn key_of_at(
+        &self,
+        r: ResourceId,
+        w: &Want,
+        now: Micros,
+        coarsening: &dyn Fn(TileId) -> bool,
+        presence: &dyn PresenceOracle,
+        e: Option<Slot>,
+    ) -> PriorityKey {
         let class = self.class_of(r, w.class);
         let epoch = self.epoch(r, class);
         let a = &self.arena;
-        let e = a.find(r);
         let mut urgency = w.urgency;
         if e.is_some_and(|s| a.stale_gpu(s, epoch)) {
             urgency = Urgency::Refresh;
@@ -1696,10 +1710,12 @@ impl Budget {
             let Some(w) = wants.get(&r) else {
                 continue;
             };
-            let (Some(job), _) = self.job_of(r, w, now) else {
+            // The slot looked up once for both.
+            let e = self.arena.find(r);
+            let (Some(job), _) = self.job_of_at(r, w, now, e) else {
                 continue;
             };
-            let key = self.key_of(r, w, now, &is_coarsening, input.presence);
+            let key = self.key_of_at(r, w, now, &is_coarsening, input.presence, e);
             jobs.push((
                 key,
                 job,
@@ -1932,8 +1948,9 @@ impl Budget {
         l.under_need = w.under_need;
         let y = &mut st.layers;
         y.drawn = w.layer_drawn;
-        y.gpu_tiles = w.layer_gpu_tiles;
-        y.gpu_bytes = w.layer_gpu_bytes;
+        let (layer_tiles, layer_bytes) = a.gpu_by_layer();
+        y.gpu_tiles = *layer_tiles;
+        y.gpu_bytes = *layer_bytes;
         for &s in a.active() {
             if a.loading(s) {
                 l.in_flight[a.class(s)][level_index(a.level(s))][prefetch_index(a.urgency(s))] += 1;
@@ -1981,25 +1998,8 @@ impl Budget {
                 w.under_need[Class::Drape][level_index(stats.tile_level)] += 1;
             }
         }
-        let every = ResourceId::Drape {
-            tile: TileId(0),
-            layer: LayerId(0),
-            level: 0,
-        }..=ResourceId::Drape {
-            tile: TileId(u64::MAX),
-            layer: LayerId(u16::MAX),
-            level: u32::MAX,
-        };
-        for r in a.gpu_drapes(every) {
-            let (Some(x), Some(s)) = (r.layer(), a.find(r)) else {
-                continue;
-            };
-            if let Some(g) = a.gpu(s) {
-                let i = layer_index(x);
-                w.layer_gpu_tiles[i] += 1;
-                w.layer_gpu_bytes[i] = w.layer_gpu_bytes[i].plus(g.bytes);
-            }
-        }
+        // The layers' GPU copies: kept by the arena (`gpu_by_layer`).
+
         self.scratch.chosen = chosen;
         w
     }

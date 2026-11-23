@@ -209,6 +209,39 @@ impl<'a, K: Ord + Copy, V> Iterator for Range<'a, K, V> {
     }
 }
 
+/// A map's entries from a place on, up to a last key, each with its place
+/// ([`SortedMap::range_placed`]).
+pub(super) struct PlacedRange<'a, K, V> {
+    blocks: &'a [Block<K, V>],
+    b: usize,
+    i: usize,
+    hi: K,
+}
+
+impl<'a, K: Ord + Copy, V> Iterator for PlacedRange<'a, K, V> {
+    type Item = (Place, &'a K, &'a V);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let blk = self.blocks.get(self.b)?;
+            if let Some(k) = blk.keys.get(self.i) {
+                if *k > self.hi {
+                    return None;
+                }
+                let p = Place {
+                    b: self.b,
+                    i: self.i,
+                };
+                self.i += 1;
+                return Some((p, k, &blk.vals[p.i]));
+            }
+            self.b += 1;
+            self.i = 0;
+        }
+    }
+}
+
 /// Where an entry is in a map: its block, its place in the block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Place {
@@ -393,6 +426,14 @@ impl<K: Ord + Copy, V> SortedMap<K, V> {
             i,
             hi,
         }
+    }
+
+    /// [`SortedMap::range`], each entry with its place: for
+    /// [`SortedMap::at_mut`], until the map's next insertion or removal.
+    #[inline]
+    pub fn range_placed(&self, r: std::ops::RangeInclusive<K>) -> PlacedRange<'_, K, V> {
+        let Range { blocks, b, i, hi } = self.range(r);
+        PlacedRange { blocks, b, i, hi }
     }
 
     /// Moves `c` on to the first entry whose key is not before `k`, giving
@@ -667,6 +708,20 @@ impl<K: Ord + Copy, V> SortedMap<K, V> {
         }
         let room = POOL;
         self.pool.truncate(room);
+    }
+
+    /// The same entries in as few blocks as they fill, newly allocated: the
+    /// room a map kept through removals (blocks near half full, the pool)
+    /// given back. A pass over every entry.
+    pub fn compact(&mut self)
+    where
+        V: Copy,
+    {
+        let mut packed = SortedMap::default();
+        packed.rebuild(self.iter().map(|(k, v)| (*k, *v)));
+        packed.pool.clear();
+        packed.upkeep = self.upkeep.saturating_add(packed.upkeep);
+        *self = packed;
     }
 
     /// Every key replaced by `f`'s, which keeps their order (a key's
