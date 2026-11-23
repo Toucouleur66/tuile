@@ -308,7 +308,7 @@ pub const HEADROOM: u16 = 0;
 /// The probability under which a copy no longer wanted goes, ‰.
 pub const FLOOR_VALUE: u16 = 10;
 /// The copies the floor value's release looks at a step.
-pub const RELEASE_VISITS: u16 = 32;
+pub const RELEASE_VISITS: u16 = 16;
 /// An over-need gap weighs half an under-need one.
 pub const FINER_GAP: u16 = 500;
 

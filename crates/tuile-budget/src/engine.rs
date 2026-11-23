@@ -2619,8 +2619,13 @@ impl Budget {
         if self.ledger.gpu[class].minus(freeable).plus(bytes) > limit {
             if urgency >= Urgency::Ring && prob > 0 {
                 let a = &self.arena;
-                let extra = room
+                // The bottom of the order only: the lowest scores are the
+                // swap's candidates, and a step's work stays bounded.
+                let looked = room
                     .grouped
+                    .len()
+                    .min(usize::from(self.spec.params.release_visits));
+                let extra = room.grouped[..looked]
                     .iter()
                     .filter(|&&((.., r), s)| {
                         a.class(s) == class
@@ -2634,7 +2639,7 @@ impl Budget {
                     .fold(Bytes::ZERO, |acc, &(_, s)| {
                         acc.plus(a.gpu(s).map_or(Bytes::ZERO, |g| g.bytes))
                     });
-                st.work = st.work.saturating_add(sat_u32(room.grouped.len()));
+                st.work = st.work.saturating_add(sat_u32(looked));
                 swapping = self.ledger.gpu[class]
                     .minus(freeable)
                     .minus(extra)

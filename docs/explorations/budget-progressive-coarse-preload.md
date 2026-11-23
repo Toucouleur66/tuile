@@ -141,7 +141,7 @@ The score orders the value band only. Before it, in this order and whatever the 
   fine levels. Laurent's Bordeaux capture scripted (a
   dive to level 19, out to 12, still): levels 14–19 held 406 tiles → 0 after 11 s, decoded
   124 MB → 76 MB (`at_rest_the_fine_levels_left_behind_are_released_in_both_tiers`). The pass
-  looks at `release_visits` (32) copies a step per tier from the bottom of the release
+  looks at `release_visits` (16) copies a step per tier from the bottom of the release
   order: a frame's releases stay small.
 - **Relaxed, between the watermarks.** A relaxed picture comes back to full detail only once
   every class is under its low watermark. Laurent's stall (the drapes at 97–99 % of target,
