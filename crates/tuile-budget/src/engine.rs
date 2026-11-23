@@ -538,6 +538,32 @@ impl Budget {
             }
             p
         });
+        // What the executor holds outside any resource (the encoder's
+        // scratch) is off the limits it would otherwise count against —
+        // the pool's included, for its members'. Nothing is taken when
+        // nothing is reserved: limits as they were.
+        let reserved = self.cfg.reserved;
+        let off = |b: Bytes, r: Bytes| if b == Bytes::MAX { b } else { b.minus(r) };
+        let mut pool = pool;
+        if let Some(p) = pool.as_mut() {
+            let members = Class::ALL
+                .iter()
+                .filter(|c| p.members[**c])
+                .fold(Bytes::ZERO, |a, c| a.plus(reserved[*c]));
+            p.target = off(p.target, members);
+            p.overflow = off(p.overflow, members);
+            p.hard = off(p.hard, members);
+            for c in Class::ALL {
+                p.ceil_target[c] = off(p.ceil_target[c], reserved[c]);
+                p.ceil_overflow[c] = off(p.ceil_overflow[c], reserved[c]);
+                p.ceil_hard[c] = off(p.ceil_hard[c], reserved[c]);
+            }
+        }
+        for c in Class::ALL {
+            target[c] = off(target[c], reserved[c]);
+            overflow[c] = off(overflow[c], reserved[c]);
+            hard[c] = off(hard[c], reserved[c]);
+        }
         Eff {
             pool,
             target,
@@ -553,7 +579,10 @@ impl Budget {
             // The decoded tier is a target like the GPU's: retargeted with
             // them and scaled by pressure. The copies an eviction demotes
             // to are tracked state, bounded by this.
-            decoded: scale(self.cfg.decoded_target, pct),
+            decoded: off(
+                scale(self.cfg.decoded_target, pct),
+                self.cfg.decoded_reserved,
+            ),
             quota: PerClass::from_fn(|c| (self.cfg.max_in_flight[c] / thermal_div).max(1)),
             local: self.cfg.max_local_reads,
             upload: if self.cfg.upload_bytes_per_frame == Bytes::MAX {
@@ -1921,9 +1950,9 @@ impl Budget {
             if let Some(s) = self.arena.find(r) {
                 if let Some(t) = self.arena.transit(s) {
                     let c = self.arena.class(s);
-                    st.transit[c] = st.transit[c].plus(t.cost.gpu);
+                    st.transit[c] = st.transit[c].plus(t.held());
                     let at = super::stats::level_index(self.arena.level(s));
-                    st.transit_by_level[c][at] = st.transit_by_level[c][at].plus(t.cost.gpu);
+                    st.transit_by_level[c][at] = st.transit_by_level[c][at].plus(t.held());
                 }
             }
         }
@@ -2632,10 +2661,12 @@ impl Budget {
                 return;
             }
             let mut strain = false;
+            // Room for its peak: resident, and what an encode on the GPU
+            // holds beside it until it has run.
             let ok = self.make_room(
                 now,
                 class,
-                c.cost.gpu,
+                c.cost.gpu.plus(c.cost.transient),
                 limit,
                 w.urgency,
                 wants,
@@ -3273,7 +3304,7 @@ impl Budget {
                 l.gpu[class] = l.gpu[class].plus(g.bytes);
             }
             if let Some(t) = a.transit(s) {
-                l.gpu[class] = l.gpu[class].plus(t.cost.gpu);
+                l.gpu[class] = l.gpu[class].plus(t.held());
                 l.in_transit = l.in_transit.plus(t.cost.staging);
             }
             if let Some(c) = a.cpu(s) {

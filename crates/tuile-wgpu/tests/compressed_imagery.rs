@@ -35,6 +35,16 @@ fn acked(stream: &Scripted, resource: ResourceId) -> Option<u64> {
         })
 }
 
+/// The GPU's work so far finished, and every acknowledgement it held back
+/// sent: what a host's next frames do.
+fn acks_landed(pump: &mut ContentPump, stream: &mut Scripted, gpu: &GpuContext) {
+    pump.acknowledge(stream, gpu);
+    gpu.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+    pump.acknowledge(stream, gpu);
+}
+
 /// One drape of `size`² over a tile of its own, uploaded at once, and the
 /// pump that holds it.
 fn upload_one(gpu: &GpuContext, size: u32) -> (Scripted, ContentPump, ResourceId) {
@@ -46,6 +56,7 @@ fn upload_one(gpu: &GpuContext, size: u32) -> (Scripted, ContentPump, ResourceId
     let mut pump = ContentPump::new(glam::DVec3::ZERO);
     pump.pump(&mut stream, gpu, FrameDeadline::UNBOUNDED);
     assert_eq!(pump.pending_uploads(), 0);
+    acks_landed(&mut pump, &mut stream, gpu);
     (stream, pump, ResourceId::drape(tile, LayerId(0), 4))
 }
 
@@ -185,6 +196,7 @@ fn encode_pacing_never_splits_a_swap_group() {
         let mut pump = ContentPump::new(glam::DVec3::ZERO);
         pump.set_encode_pace(EncodePace { share_micros: 1 });
         pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
+        acks_landed(&mut pump, &mut stream, &gpu);
         let first_frame = (acked(&stream, m).is_some(), acked(&stream, d).is_some());
         let uploads = pump.last_uploads();
         if gpu.imagery_plan().target == ImageryFormat::Rgba8 {
@@ -204,6 +216,7 @@ fn encode_pacing_never_splits_a_swap_group() {
         assert_eq!(uploads.deferred_encode, 2, "{plan}: the whole group waits");
         assert_eq!(uploads.deferred, 0, "{plan}: not the byte lane's");
         pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
+        acks_landed(&mut pump, &mut stream, &gpu);
         assert!(
             acked(&stream, m).is_some() && acked(&stream, d).is_some(),
             "{plan}: the group goes whole the next frame"
@@ -257,5 +270,66 @@ fn a_frames_encodes_and_deferrals_are_counted_by_lane() {
             (u64::from(want.2), want.4),
             "{plan}"
         );
+    }
+}
+
+/// **A GPU-encoded acknowledgement waits for the GPU** (CB4): until the
+/// GPU has run the encode, the encoder's RGBA8 is held beside the blocks,
+/// and the budget must go on charging both. So the pump that uploads a
+/// drape it encodes does not acknowledge it; once the frame is submitted
+/// and the GPU has finished, the next acknowledgement round does. Off is
+/// acknowledged in the frame that uploads it, as always.
+#[test]
+fn a_gpu_encoded_ack_waits_for_the_gpu() {
+    for (plan, compression) in PLANS {
+        let Some(gpu) = gpu_with(compression) else {
+            continue;
+        };
+        let tile = TileId::from_terrain(4, 3, 2);
+        let texture = painted(&gpu, 256, 256, |x, y| [x as u8, 90, y as u8, 255]);
+        let mut stream = Scripted::new([drape(tile, 1, whole_drape(tile, 4, texture))]);
+        let mut pump = ContentPump::new(glam::DVec3::ZERO);
+        pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
+        let resource = ResourceId::drape(tile, LayerId(0), 4);
+        let encoded = gpu.imagery_plan().target != ImageryFormat::Rgba8;
+        assert_eq!(
+            acked(&stream, resource).is_some(),
+            !encoded,
+            "{plan}: acknowledged before the GPU ran its encode"
+        );
+        assert_eq!(
+            pump.acks_waiting_for_the_gpu(),
+            usize::from(encoded),
+            "{plan}"
+        );
+        acks_landed(&mut pump, &mut stream, &gpu);
+        assert!(
+            acked(&stream, resource).is_some(),
+            "{plan}: never acknowledged"
+        );
+        assert_eq!(pump.acks_waiting_for_the_gpu(), 0, "{plan}");
+    }
+}
+
+/// **The reservation covers the encoder's scratch** (CB4): what a host
+/// takes off the drapes' limits at setup is no less than what the scratch
+/// holds for one tile, and no more than its jobs' alignment over it.
+/// Nothing for a plan that does not encode on the GPU.
+#[test]
+fn the_reservation_covers_the_encoders_scratch() {
+    for (plan, compression) in PLANS {
+        let Some(gpu) = gpu_with(compression) else {
+            continue;
+        };
+        let reserved = tuile_wgpu::encode_reservation(gpu.imagery_plan(), 1).0;
+        match gpu.imagery_scratch_bytes() {
+            None => assert_eq!(reserved, 0, "{plan}"),
+            Some(held) => {
+                assert!(
+                    held <= reserved && reserved - held <= 9 * 256,
+                    "{plan}: the scratch holds {held}, {reserved} reserved"
+                );
+            }
+        }
     }
 }

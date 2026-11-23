@@ -361,6 +361,11 @@ pub struct BudgetSignals {
     pub overflow_bytes: PerClass<u64>,
     /// `hard_limit_bytes{class}`, effective.
     pub hard_limit_bytes: PerClass<u64>,
+    /// `reserved_bytes{class}`: held by the executor outside any resource
+    /// (the encoder's scratch), off the class's limits.
+    pub reserved_bytes: PerClass<u64>,
+    /// `decoded_reserved_bytes`: off the decoded tier's target.
+    pub decoded_reserved_bytes: u64,
     /// `over_target_seconds_total{class}`, in microseconds.
     pub over_target_micros_total: PerClass<u64>,
     /// `lost_tiles`: wanted tiles with no cover, once the floor is in.
@@ -985,6 +990,12 @@ impl BudgetSignals {
             "encode_fallbacks_total",
             &self.encode_fallbacks_total,
         );
+        per(&mut out, "reserved_bytes", &self.reserved_bytes);
+        out.push((
+            "decoded_reserved_bytes",
+            vec![],
+            self.decoded_reserved_bytes as f64,
+        ));
         for (i, k) in labels::SWAP.iter().enumerate() {
             out.push(("swaps_total", vec![("kind", k)], self.swaps_total[i] as f64));
         }
@@ -1090,6 +1101,8 @@ impl BudgetMeter {
         };
         m.s.spec = crate::spec::Specification::for_policy(cfg.policy).kind;
         m.s.floor_level = cfg.pinned_level;
+        m.s.reserved_bytes = PerClass::from_fn(|c| cfg.reserved[c].0);
+        m.s.decoded_reserved_bytes = cfg.decoded_reserved.0;
         m
     }
 

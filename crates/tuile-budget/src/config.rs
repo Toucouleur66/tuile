@@ -169,6 +169,14 @@ pub struct BudgetConfig {
     /// The pooled ledger (D-A3): the ground's terrain and imagery, in a
     /// viewer.
     pub pool: Pool,
+    /// GPU bytes held per class by the executor outside any resource — the
+    /// GPU encoder's scratch, for the drapes — taken off the class's (and
+    /// its pool's) target, overflow and hard limit. Set by the host from
+    /// its executor once at setup. Zero by default.
+    pub reserved: PerClass<Bytes>,
+    /// CPU bytes held outside the decoded copies — the web decode workers'
+    /// encodes in flight — taken off `decoded_target`. Zero by default.
+    pub decoded_reserved: Bytes,
 }
 
 impl BudgetConfig {
@@ -250,6 +258,8 @@ impl BudgetConfig {
             },
             age_full: Micros::from_secs(2),
             pool,
+            reserved: PerClass::splat(Bytes::ZERO),
+            decoded_reserved: Bytes::ZERO,
         }
     }
 
@@ -290,6 +300,8 @@ impl BudgetConfig {
             failure: FailurePolicy::EndSession,
             age_full: Micros::from_secs(2),
             pool: Pool::NONE,
+            reserved: PerClass::splat(Bytes::ZERO),
+            decoded_reserved: Bytes::ZERO,
         }
     }
 
@@ -323,6 +335,9 @@ impl BudgetConfig {
             }
             if self.hard_limit[c] < self.target[c] {
                 return Err(ConfigError::HardBelowTarget(c));
+            }
+            if self.reserved[c] > self.hard_limit[c] {
+                return Err(ConfigError::Reserved(c));
             }
         }
         if self.hard_reserve_percent > 50 {

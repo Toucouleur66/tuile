@@ -54,6 +54,12 @@ impl Eye {
     }
 }
 
+/// The GPU encoder's scratch for one 256² tile with its chain, as
+/// `tuile_wgpu::encode_reservation` counts it: the RGBA8 it reads
+/// (349,524), the blocks it writes with rows aligned for the copy (90,368)
+/// and a job per level (9 × 256).
+pub const ENCODER_SCRATCH: Bytes = Bytes(442_196);
+
 /// A device profile: the budget, the network, the frame rate, the eyes.
 #[derive(Clone, Debug)]
 pub struct Profile {
@@ -204,6 +210,10 @@ impl Profile {
         self.name = name;
         self.plan = plan;
         self.fallback_permille = if plan == SimPlan::Gpu { 10 } else { 0 };
+        if plan == SimPlan::Gpu {
+            // The encoder's scratch, reserved off the drapes (CB4).
+            self.budget.reserved[Class::Drape] = ENCODER_SCRATCH;
+        }
         self
     }
 
@@ -760,26 +770,35 @@ impl Sim {
     /// holds, each resource once — its drawable bytes plus what it was
     /// handed and has not uploaded yet, class by class.
     ///
-    /// An upload acknowledged this frame is charged its estimate until the
-    /// budget reads the acknowledgement: an encode that fell back holds
-    /// more than that until then (CB3), its excess not yet the budget's.
+    /// An upload acknowledged this frame is charged its estimate's peak
+    /// until the budget reads the acknowledgement.
     fn check_executor(&self, d: &Decisions, acks: &[(ResourceId, Generation, Bytes)]) {
         for c in Class::ALL {
-            let unread = acks
-                .iter()
-                .filter(|(r, _, _)| class_of(*r) == c)
-                .fold(Bytes::ZERO, |a, (r, _, b)| {
-                    a.plus(b.minus(super::world::cost_for(*r, self.profile.plan).gpu))
-                });
-            let pending = self
-                .gpu
-                .pending
-                .keys()
-                .filter(|r| class_of(**r) == c)
-                .fold(Bytes::ZERO, |a, r| {
-                    a.plus(super::world::cost_for(*r, self.profile.plan).gpu)
-                });
-            let held = self.gpu.bytes[c].plus(pending).minus(unread);
+            // Uploaded this frame, its acknowledgement not read yet: the
+            // budget still charges its estimate's peak (resident, and what
+            // an encode on the GPU holds beside it, CB4), the executor what
+            // it acknowledged — a fallback's RGBA8 included (CB3).
+            let (estimated, acknowledged) = acks.iter().filter(|(r, _, _)| class_of(*r) == c).fold(
+                (Bytes::ZERO, Bytes::ZERO),
+                |(e, a), (r, _, b)| {
+                    let c = super::world::cost_for(*r, self.profile.plan);
+                    (e.plus(c.gpu.plus(c.transient)), a.plus(*b))
+                },
+            );
+            let pending =
+                self.gpu
+                    .pending
+                    .keys()
+                    .filter(|r| class_of(**r) == c)
+                    .fold(Bytes::ZERO, |a, r| {
+                        // Delivered, not uploaded: charged at its peak (CB4).
+                        let c = super::world::cost_for(*r, self.profile.plan);
+                        a.plus(c.gpu.plus(c.transient))
+                    });
+            let held = self.gpu.bytes[c]
+                .plus(pending)
+                .plus(estimated)
+                .minus(acknowledged);
             if d.stats.gpu[c] != held {
                 self.fail(&format!(
                     "I16: the budget charges {c:?} {} bytes, the executor holds {}",
@@ -847,6 +866,18 @@ impl Sim {
                         }
                     }
                 }
+            }
+        }
+        // CB4: the peak — resident, and in transit at its peak — plus what
+        // the executor reserves never crosses a class's configured hard
+        // limit.
+        for c in Class::ALL {
+            let hard = cfg.hard_limit[c];
+            if hard != Bytes::MAX && s.gpu[c].plus(cfg.reserved[c]) > hard {
+                self.fail(&format!(
+                    "CB4: {c:?} peak {} + reserved {} over its hard limit {}",
+                    s.gpu[c].0, cfg.reserved[c].0, hard.0
+                ));
             }
         }
         // CB3: under compression, the ledger is the sum of the states, the

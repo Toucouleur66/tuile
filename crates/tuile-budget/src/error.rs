@@ -45,6 +45,10 @@ pub enum ConfigError {
     /// floors add up to more than the whole.
     #[error("the pool's hard limit is below its target, or its floors exceed 100 %")]
     Pool,
+    /// A class's reservation is more than its hard limit: nothing would
+    /// be left to load.
+    #[error("class {0:?} reserves more than its hard limit")]
+    Reserved(Class),
 }
 
 /// A condition that ends a session (Batch only).

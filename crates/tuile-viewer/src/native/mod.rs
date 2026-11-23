@@ -324,6 +324,10 @@ fn session(
     // (`TUILE_PIN_LEVEL` tunes it) is loaded first and never evicted.
     let mut budget = profile.budget();
     budget.pinned_level = settings::pinned_level(profile.pinned_level);
+    // The GPU encoder's scratch, off the drapes' limits (CB4): nothing when
+    // the plan does not encode on the GPU.
+    budget.reserved[tuile_core::budget::Class::Drape] =
+        tuile_wgpu::encode_reservation(imagery_plan, 1);
     let config = Config {
         // TUILE_NO_CULL=1 keeps every tile the traversal reaches, however far
         // off screen. Expensive and not a mode anyone should run in — it exists

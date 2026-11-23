@@ -478,6 +478,13 @@ impl GpuContext {
             .and_then(|c| c.lock().ok().map(|c| c.stats()))
     }
 
+    /// The GPU bytes the encoder's scratch holds, when there is an encoder.
+    pub fn imagery_scratch_bytes(&self) -> Option<u64> {
+        self.compressor
+            .as_ref()
+            .and_then(|c| c.lock().ok().map(|c| c.scratch_bytes()))
+    }
+
     /// The GPU encoder's cost of a block, nanoseconds: measured by
     /// timestamps where the device has them, assumed until then. `None`
     /// without an encoder.

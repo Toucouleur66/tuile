@@ -106,6 +106,15 @@ pub(super) struct Transit {
     pub epoch: u64,
 }
 
+impl Transit {
+    /// The GPU bytes it holds until acknowledged: resident, and, for a
+    /// texture the GPU encodes, the RGBA8 the encoder reads beside it —
+    /// the peak, until the GPU has finished.
+    pub fn held(&self) -> Bytes {
+        self.cost.gpu.plus(self.cost.transient)
+    }
+}
+
 /// A copy on the GPU, acknowledged.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Gpu {
@@ -1498,7 +1507,7 @@ impl Arena {
             Bytes::ZERO
         };
         let transit = if f & TRANSIT != 0 {
-            self.transit.get(&s.0).map_or(Bytes::ZERO, |t| t.cost.gpu)
+            self.transit.get(&s.0).map_or(Bytes::ZERO, Transit::held)
         } else {
             Bytes::ZERO
         };
@@ -1783,7 +1792,7 @@ impl Arena {
         self.unfile(s);
         self.drop_transit(s, l);
         let class = self.class(s);
-        l.gpu[class] = l.gpu[class].plus(t.cost.gpu);
+        l.gpu[class] = l.gpu[class].plus(t.held());
         l.in_transit = l.in_transit.plus(t.cost.staging);
         self.transit.insert(s.0, t);
         self.set(s, TRANSIT, true);
@@ -1802,7 +1811,7 @@ impl Arena {
     fn drop_transit(&mut self, s: Slot, l: &mut Ledger) -> Option<Transit> {
         let t = self.transit(s)?;
         let class = self.class(s);
-        l.gpu[class] = l.gpu[class].minus(t.cost.gpu);
+        l.gpu[class] = l.gpu[class].minus(t.held());
         l.in_transit = l.in_transit.minus(t.cost.staging);
         self.set(s, TRANSIT, false);
         self.transit.remove(&s.0);

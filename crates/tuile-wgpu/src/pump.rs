@@ -226,6 +226,17 @@ pub struct ContentPump {
     totals: PumpTotals,
     /// See [`Self::last_uploads`].
     last_uploads: FrameUploads,
+    /// The acknowledgements of the deliveries whose textures this frame
+    /// encodes on the GPU: sent once the GPU has finished the frame's
+    /// work, not before — until then the encoder's input is held beside
+    /// the blocks, and the budget charges both (CB4).
+    encode_acks: Vec<ClientMessage>,
+    /// Those of earlier frames, submitted: each batch is sent when its
+    /// flag says the GPU finished it.
+    acks_in_flight: Vec<(
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        Vec<ClientMessage>,
+    )>,
     /// Deliveries dropped from the queue unuploaded — cancelled, evicted or
     /// replaced — whose chains the next upload step lets go of.
     dropped: Vec<ResourceContent>,
@@ -279,6 +290,8 @@ impl ContentPump {
             drawn_tiles: std::collections::HashSet::new(),
             totals: PumpTotals::default(),
             last_uploads: FrameUploads::default(),
+            encode_acks: Vec::new(),
+            acks_in_flight: Vec::new(),
             dropped: Vec::new(),
         }
     }
@@ -568,6 +581,8 @@ impl ContentPump {
         // a host that pumps several times a frame does not hold every
         // copy until it draws.
         gpu.flush_uploads();
+        self.await_encode_acks(gpu);
+        self.send_finished_acks(stream, gpu);
         let uploaded = self.upload(stream, gpu, deadline);
         // What is drawn may have changed — a draw set, an upload: the tiles
         // are stitched for this frame before anyone draws it.
@@ -949,12 +964,18 @@ impl ContentPump {
                 let _ = bytes;
             }
         }
-        // Best effort: a closed stream just means the session is over.
-        let _ = stream.send(ClientMessage::Ack {
+        let ack = ClientMessage::Ack {
             resource: r,
             gen: q.gen,
             bytes,
-        });
+        };
+        if encodes_on_gpu(gpu, &q.content) {
+            // Held at its peak until the GPU has run the encode: told then.
+            self.encode_acks.push(ack);
+        } else {
+            // Best effort: a closed stream just means the session is over.
+            let _ = stream.send(ack);
+        }
         let waited = arrived.elapsed().as_micros() as u64;
         let frames = self.frame.saturating_sub(arrived_frame);
         let t = &mut self.totals;
@@ -1360,7 +1381,66 @@ impl ContentPump {
         // lands before the host's draw: one submit, or none when nothing
         // moved.
         gpu.flush_uploads();
+        // The frame's GPU-encoded acknowledgements wait on this submit:
+        // registered at the next pump's start, after it.
         (drawn, counts)
+    }
+
+    /// The acknowledgements of this frame's GPU encodes, submitted: they
+    /// wait for the GPU to finish the work submitted so far — one callback
+    /// for the frame's batch, never a blocking wait.
+    fn await_encode_acks(&mut self, gpu: &GpuContext) {
+        if self.encode_acks.is_empty() {
+            return;
+        }
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&done);
+        gpu.queue.on_submitted_work_done(move || {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        });
+        self.acks_in_flight
+            .push((done, std::mem::take(&mut self.encode_acks)));
+    }
+
+    /// Sends the acknowledgements whose encodes the GPU has finished, in
+    /// the order they were made. A non-blocking poll lets a finished
+    /// frame's callback run.
+    fn send_finished_acks<S: GeometryStream>(&mut self, stream: &mut S, gpu: &GpuContext) {
+        if self.acks_in_flight.is_empty() {
+            return;
+        }
+        let _ = gpu.device.poll(wgpu::PollType::Poll);
+        while self
+            .acks_in_flight
+            .first()
+            .is_some_and(|(done, _)| done.load(std::sync::atomic::Ordering::Acquire))
+        {
+            let (_, acks) = self.acks_in_flight.remove(0);
+            for ack in acks {
+                // Best effort: a closed stream just means the session is over.
+                let _ = stream.send(ack);
+            }
+        }
+    }
+
+    /// Between frames: submits what is recorded and sends every
+    /// acknowledgement whose GPU encode has finished — what [`Self::pump`]
+    /// does first each frame. For a host that waits on the GPU itself, or
+    /// a test.
+    pub fn acknowledge<S: GeometryStream>(&mut self, stream: &mut S, gpu: &GpuContext) {
+        gpu.flush_uploads();
+        self.await_encode_acks(gpu);
+        self.send_finished_acks(stream, gpu);
+    }
+
+    /// Acknowledgements waiting for the GPU to finish their encodes.
+    pub fn acks_waiting_for_the_gpu(&self) -> usize {
+        self.encode_acks.len()
+            + self
+                .acks_in_flight
+                .iter()
+                .map(|(_, a)| a.len())
+                .sum::<usize>()
     }
 
     /// The draw set the pump is drawing: the last step's.
@@ -1445,6 +1525,26 @@ fn encodes(
     t: &tuile_core::content::DecodedTexture,
 ) -> bool {
     t.resident_format().block() == Some(format) && t.rgba8().is_some()
+}
+
+/// Whether `content` names a texture this context encodes on the GPU: RGBA8
+/// headed for the encoder's block format. Never without an encoder (`Off`).
+fn encodes_on_gpu(gpu: &GpuContext, content: &ResourceContent) -> bool {
+    let Some(format) = gpu
+        .compressor
+        .as_ref()
+        .and_then(|c| c.lock().ok().map(|c| c.format()))
+    else {
+        return false;
+    };
+    let owned = match content {
+        ResourceContent::Mesh(m) => m.textures.iter().any(|t| encodes(format, t)),
+        ResourceContent::Drape(_) => false,
+    };
+    owned
+        || imagery_of(content)
+            .iter()
+            .any(|l| encodes(format, &l.texture))
 }
 
 /// The blocks encoding the textures `content` owns would write — a mesh's

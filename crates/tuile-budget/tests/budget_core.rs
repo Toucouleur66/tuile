@@ -3985,7 +3985,7 @@ mod cost_per_path {
     use tuile_budget::cost::{chain_blocks, drape_cost, Cost, TextureFormat};
 
     /// A 256² drape headed for BC7 or ASTC 4×4, encoded on the GPU.
-    fn gpu_encoded() -> Cost {
+    pub(crate) fn gpu_encoded() -> Cost {
         let blocks = drape_cost(256, 256, TextureFormat::Block16);
         let rgba8 = drape_cost(256, 256, TextureFormat::Rgba8);
         Cost {
@@ -4112,5 +4112,78 @@ mod cost_per_path {
             assert_eq!(seen, (fallbacks, drift), "ack {actual:?}: {RED}");
             r.b.audit().expect("consistent");
         }
+    }
+}
+
+/// CB4: the transient peak and the reservations. A delivery the GPU will
+/// encode holds its blocks and the RGBA8 the encoder reads until it is
+/// acknowledged; what the executor holds outside any resource is off the
+/// limits.
+mod reservations {
+    use super::cost_per_path::gpu_encoded;
+    use super::*;
+
+    /// Delivered, a GPU-encoded drape is charged its peak — 87,408 resident
+    /// and 349,524 transient — until its acknowledgement, then what it holds.
+    #[test]
+    fn transit_holds_gpu_plus_transient() {
+        let mut r = Rig::interactive();
+        let need = drawn_draped(&[t(4, 0, 0)], 4);
+        let mut d = r.step(&need);
+        let mut delivered = None;
+        for _ in 0..6 {
+            for s in &d.start {
+                let cost = match s.resource {
+                    ResourceId::Drape { .. } => gpu_encoded(),
+                    _ => est(s.resource),
+                };
+                r.b.on_loaded(s.resource, s.gen, cost);
+            }
+            d = r.step(&need);
+            for (m, g) in &d.deliver {
+                match m {
+                    ResourceId::Drape { .. } => delivered = Some((*m, *g)),
+                    _ => r.b.on_drawable(*m, *g, est(*m).gpu),
+                }
+            }
+            if delivered.is_some() {
+                break;
+            }
+        }
+        let (drape, gen) = delivered.expect("the drape delivered");
+        let peak = Bytes(87_408 + 349_524);
+        assert_eq!(r.b.ledger().gpu[Class::Drape], peak, "{RED}");
+        r.b.audit().expect("the recount agrees");
+        r.b.on_drawable(drape, gen, Bytes(87_408));
+        r.step(&need);
+        assert_eq!(r.b.ledger().gpu[Class::Drape], Bytes(87_408));
+        r.b.audit().expect("consistent");
+    }
+
+    /// A class's reservation is off its target, overflow and hard limit
+    /// (and its pool's); another class keeps its own; a reservation past
+    /// the hard limit is refused.
+    #[test]
+    fn the_limits_subtract_the_reservations() {
+        let need = drawn(&[t(3, 0, 0)]);
+        let plain = Rig::interactive().step(&need).stats;
+        let mut c = Rig::interactive_config();
+        let r = Bytes::mib(3);
+        c.reserved[Class::Drape] = r;
+        let mut rig = Rig::new(c.clone());
+        let held = rig.step(&need).stats;
+        assert_eq!(
+            held.hard_limit[Class::Drape],
+            plain.hard_limit[Class::Drape].minus(r),
+            "{RED}"
+        );
+        assert!(held.target[Class::Drape] < plain.target[Class::Drape]);
+        assert_eq!(
+            held.hard_limit[Class::TerrainMesh],
+            plain.hard_limit[Class::TerrainMesh],
+            "another class keeps its own"
+        );
+        c.reserved[Class::Drape] = c.hard_limit[Class::Drape].plus(Bytes(1));
+        assert!(c.validate().is_err(), "a reservation past the hard limit");
     }
 }
