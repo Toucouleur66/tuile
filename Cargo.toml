@@ -186,6 +186,12 @@ split-debuginfo = "packed"
 # dropped once the same change is released upstream.
 [patch.crates-io]
 pmtiles = { git = "https://github.com/lapoule-dev/pmtiles-rs.git", branch = "tuile-accessors" }
+# `pyroscope` 2.1.5 with a SIGPROF handler that does not call `pthread_self()`
+# on Apple arm64 (lapoule-dev fork, one commit on top of lib-2.1.5). The
+# profiling timer can land on a GCD workqueue thread whose pthread signature is
+# not signed yet; `pthread_self()` then traps on pointer authentication and the
+# viewer dies with SIGTRAP. To be dropped once the fix is released upstream.
+pyroscope = { git = "https://github.com/lapoule-dev/pyroscope-rs.git", rev = "19a3ffe17bcc45c70e62dc96e2e907a4a597e61c" }
 
 # The atmosphere's tables are built by a few hundred million ray-march steps
 # on the CPU: unoptimised, a test or a debug film waits half a minute for

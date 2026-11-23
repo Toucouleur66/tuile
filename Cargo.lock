@@ -7128,8 +7128,7 @@ checksum = "e0c5ccf5294c6ccd63a74f1565028353830a9c2f5eb0c682c355c471726a6e3f"
 [[package]]
 name = "pyroscope"
 version = "2.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47fac6c830e2cdcbaed360392220c9258e771d8630701a5fb4251a73dce257ca"
+source = "git+https://github.com/lapoule-dev/pyroscope-rs.git?rev=19a3ffe17bcc45c70e62dc96e2e907a4a597e61c#19a3ffe17bcc45c70e62dc96e2e907a4a597e61c"
 dependencies = [
  "aligned-vec",
  "backtrace",
