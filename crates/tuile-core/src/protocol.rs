@@ -94,7 +94,15 @@ pub enum ClientMessage {
     /// so a [`ClientMessage::ReleaseBeyond`] keeps them. What a frame
     /// selects is the same with or without them; only when its tiles
     /// arrive changes. Replaces the views ahead given before; empty, none.
-    Ahead { views: Vec<ViewState> },
+    ///
+    /// Each view says when it is due and how likely it is: a film's frames
+    /// are certain, a glide's or a replay's likely until a hand interrupts
+    /// them, an interactive camera's predicted ones less likely the further
+    /// out they are. The ring's tiles carry the earliest and likeliest of
+    /// the views that see them (`tuile_budget::AheadUse`). `reach` is how
+    /// far the fastest gestures could carry the camera, whatever the views
+    /// say.
+    Ahead { views: Vec<AheadView>, reach: Reach },
     /// The budget's specification from the next step on, as its query
     /// (`tuile_budget::Specification::to_query`, the `tuile://budget?…`
     /// grammar): the host's, chosen by its use context, or — `overridden` —
@@ -119,6 +127,40 @@ pub enum ClientMessage {
         class: crate::budget::Class,
         bytes: u64,
     },
+}
+
+/// One view ahead ([`ClientMessage::Ahead`]): where the camera is expected,
+/// when, and how likely.
+#[derive(Debug, Clone, Copy)]
+pub struct AheadView {
+    /// The view.
+    pub view: ViewState,
+    /// How long from now it is due, microseconds.
+    pub in_us: u64,
+    /// How likely the camera is to be there then, thousandths.
+    pub p_permille: u16,
+}
+
+impl AheadView {
+    /// A view certain to be reached `in_us` from now: a film's frame.
+    pub fn certain(view: ViewState, in_us: u64) -> Self {
+        AheadView {
+            view,
+            in_us,
+            p_permille: 1_000,
+        }
+    }
+}
+
+/// How far the fastest gestures could carry the camera
+/// ([`ClientMessage::Ahead`]): the reachable envelope around the view.
+/// Zero, the default: no envelope given.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Reach {
+    /// The fastest pan over the ground at the current height, m/s.
+    pub ground_mps: f64,
+    /// The fastest zoom out: the height's ratio per second (1: none).
+    pub zoom_out_per_s: f64,
 }
 
 /// What the tree knows about a tile, travelling with every message that names

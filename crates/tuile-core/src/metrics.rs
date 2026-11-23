@@ -485,6 +485,14 @@ pub struct Metrics {
     /// and, for a drape, the imagery mosaic it would stack.
     pub presence_answers: Counter,
 
+    // --- Prediction ---
+    /// Ring tiles a view ahead named (`ClientMessage::Ahead`) and drawn
+    /// before their predicted time was past by a second: predictions used.
+    pub ahead_used: Counter,
+    /// Ring tiles a view ahead named and not drawn by then: predictions
+    /// unused, the prefetch they asked for wasted.
+    pub ahead_unused: Counter,
+
     // --- Residency ---
     pub tiles_evicted: Counter,
     pub resident_bytes: Gauge,

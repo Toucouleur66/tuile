@@ -1114,6 +1114,13 @@ struct State {
     /// its own memo, reading the current pass's hysteresis memory and
     /// writing nothing the current pass reads.
     ahead: Vec<ViewState>,
+    /// Each view ahead's delay and probability, in their order.
+    ahead_when: Vec<(Micros, u16)>,
+    /// The reachable envelope the consumer gave with them.
+    reach: crate::protocol::Reach,
+    /// The ring tiles a prediction named and when it expects them, until
+    /// they are drawn (a prediction used) or their time is past (unused).
+    predicted: BTreeMap<TileId, Micros>,
     ahead_out: TraversalOutput,
     ahead_near: NearestContent,
     /// Set when the views ahead changed since the pass over them.
@@ -1189,6 +1196,9 @@ impl State {
             view_moved: false,
             out: TraversalOutput::default(),
             ahead: Vec::new(),
+            ahead_when: Vec::new(),
+            reach: crate::protocol::Reach::default(),
+            predicted: BTreeMap::new(),
             ahead_out: TraversalOutput::default(),
             ahead_near: NearestContent::default(),
             ahead_moved: false,
@@ -1224,8 +1234,13 @@ impl State {
                 self.view_generation = generation;
                 self.view_moved = true;
             }
-            ClientMessage::Ahead { views } => {
-                self.ahead = views;
+            ClientMessage::Ahead { views, reach } => {
+                self.ahead_when = views
+                    .iter()
+                    .map(|a| (Micros(a.in_us), a.p_permille.min(1_000)))
+                    .collect();
+                self.ahead = views.into_iter().map(|a| a.view).collect();
+                self.reach = reach;
                 self.ahead_moved = true;
             }
             // From the next step. An invalid one is refused here, with a
@@ -1672,6 +1687,36 @@ impl State {
         let mut ancestors = list(&ancestors, views);
         let ring_set = ring;
         let mut ring = list(&ring_set, &self.ahead);
+        // Each ring tile's predicted use: the views ahead that see it, the
+        // earliest and the likeliest of them; a tile none of them sees (an
+        // ancestor their pass asked for) the likeliest of all. Only the
+        // views ahead's own tiles: the neighbourhood's are no prediction.
+        for (t, need) in &mut ring {
+            let volume = &tree.properties(*t).bounding_volume;
+            let seeing = self
+                .ahead
+                .iter()
+                .zip(&self.ahead_when)
+                .filter(|(v, _)| volume.intersects_frustum(v.frustum()))
+                .map(|(_, w)| *w);
+            let (mut when, mut p) = (None::<Micros>, 0u16);
+            for (w, q) in seeing {
+                when = Some(when.map_or(w, |x| x.min(w)));
+                p = p.max(q);
+            }
+            let (when, p) = match when {
+                Some(w) => (w, p),
+                None => self.ahead_when.iter().fold((Micros(u64::MAX), 0), |(w, p), (x, q)| {
+                    (w.min(*x), p.max(*q))
+                }),
+            };
+            if p > 0 {
+                need.ahead = Some(crate::budget::AheadUse {
+                    next_use_in: when,
+                    probability: p,
+                });
+            }
+        }
         let hood: BTreeSet<TileId> = hood.difference(&ring_set).copied().collect();
         ring.extend(list(&hood, views));
         // Each preload's place against the present need: the level the view
@@ -1692,11 +1737,45 @@ impl State {
                 }
             }
         }
-        NeedSet {
+        let set = NeedSet {
             drawn: list(&drawn, views),
             blockers: list(&blockers, views),
             ancestors,
             ring,
+        };
+        self.score_predictions(&drawn, &set.ring);
+        set
+    }
+
+    /// Scores the predictions against what came: a ring tile a prediction
+    /// named counts as used when it is drawn before its time is past by the
+    /// horizon's slack, unused when it is not. Counted in the process's
+    /// metrics (`ahead_used`, `ahead_unused`).
+    fn score_predictions(&mut self, drawn: &BTreeSet<TileId>, ring: &[(TileId, Need)]) {
+        /// How long past its predicted time a tile may still be drawn and
+        /// count as a prediction used.
+        const SLACK: Micros = Micros::from_millis(1_000);
+        let now = self.last_now;
+        let m = crate::metrics::metrics();
+        self.predicted.retain(|t, due| {
+            if drawn.contains(t) {
+                m.ahead_used.inc();
+                false
+            } else if now.since(*due) > SLACK && now.0 > due.0 {
+                m.ahead_unused.inc();
+                false
+            } else {
+                true
+            }
+        });
+        for (t, need) in ring {
+            if let Some(a) = need.ahead {
+                let due = Micros(now.0.saturating_add(a.next_use_in.0));
+                self.predicted
+                    .entry(*t)
+                    .and_modify(|d| *d = (*d).max(due))
+                    .or_insert(due);
+            }
         }
     }
 
@@ -1925,8 +2004,8 @@ impl State {
             in_flight = self.in_flight.len(),
             camera_moved = camera_moved,
         );
-        let mut need = self.need(host);
         self.last_now = now;
+        let mut need = self.need(host);
         // The layer each tile's imagery is drawn from, where a fallback
         // specification is in force: an input to the want, before the budget
         // reads the need. None in force, nothing read.
@@ -3167,6 +3246,56 @@ mod tests {
 
     /// **A release between frames is announced** as any eviction, and takes
     /// nothing the last step drew.
+    /// **The ring carries its predicted use**: a ring tile the views ahead
+    /// select is listed with the earliest time and the likeliest
+    /// probability of the views that see it, in the need every step
+    /// records — what a replay feeds back. Red with the ring listed bare.
+    #[test]
+    fn the_ring_carries_the_views_aheads_time_and_probability() {
+        struct Watch(Arc<Mutex<Vec<crate::budget::AheadUse>>>);
+        impl BudgetObserver for Watch {
+            fn step(&mut self, s: &StepRecord<'_>) {
+                let mut seen = self.0.lock().expect("seen");
+                seen.extend(s.need.ring.iter().filter_map(|(_, n)| n.ahead));
+            }
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tileset = deep_tileset(dir.path());
+        let mut batch = BudgetConfig::batch();
+        batch.pinned_level = None;
+        let (mut stream, server) =
+            in_process(tileset, Arc::new(FsFetcher), Config::default(), batch).expect("budget");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let server = server.with_observer(Box::new(Watch(Arc::clone(&seen))));
+        let mut server = Box::pin(server.run());
+        let mut consumer = Consumer::default();
+        stream
+            .send(ClientMessage::Ahead {
+                views: vec![
+                    crate::protocol::AheadView {
+                        view: near_view(),
+                        in_us: 500_000,
+                        p_permille: 769,
+                    },
+                    crate::protocol::AheadView {
+                        view: near_view(),
+                        in_us: 2_000_000,
+                        p_permille: 349,
+                    },
+                ],
+                reach: crate::protocol::Reach::default(),
+            })
+            .expect("send");
+        look(&stream, far_view(), 1);
+        assert!(settle(&mut server, &mut stream, &mut consumer));
+        let seen = seen.lock().expect("seen");
+        assert!(!seen.is_empty(), "no ring tile carried a predicted use");
+        for a in seen.iter() {
+            assert_eq!(a.next_use_in, Micros(500_000), "the earliest view's time");
+            assert_eq!(a.probability, 769, "the likeliest view's probability");
+        }
+    }
+
     /// A batch session told the frames ahead loads their tiles beside the
     /// frame it converges — with the slots that frame leaves, never drawn,
     /// never waited on — and the frame draws what it draws without them; a
@@ -3186,7 +3315,8 @@ mod tests {
             if ahead {
                 stream
                     .send(ClientMessage::Ahead {
-                        views: vec![near_view()],
+                        views: vec![crate::protocol::AheadView::certain(near_view(), 1)],
+                        reach: crate::protocol::Reach::default(),
                     })
                     .expect("send");
             }

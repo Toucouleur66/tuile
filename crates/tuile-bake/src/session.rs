@@ -17,7 +17,7 @@ use tuile_core::budget::{BudgetConfig, DrawItem, Generation, ResourceId, Role};
 use tuile_core::content::{DecodedMesh, DecodedTileContent, DrapeContent};
 use tuile_core::drive::SceneState;
 use tuile_core::protocol::{
-    ClientMessage, GeometryStream, ResourceContent, ServerMessage, StreamError,
+    AheadView, ClientMessage, GeometryStream, Reach, ResourceContent, ServerMessage, StreamError,
 };
 use tuile_core::runtime::in_process_with;
 use tuile_core::source::{TileId, TileLoader, TileTree};
@@ -939,9 +939,18 @@ impl Session {
         let Source::Live(live) = &mut self.0 else {
             return Ok(());
         };
-        let views: Vec<ViewState> = views.into_iter().map(Into::into).collect();
+        // Certain, every one; a batch has no clock, so each is due in its
+        // order, a microsecond after the one before.
+        let views: Vec<AheadView> = views
+            .into_iter()
+            .zip(1u64..)
+            .map(|(v, order)| AheadView::certain(v.into(), order))
+            .collect();
         live.stream
-            .send(ClientMessage::Ahead { views })
+            .send(ClientMessage::Ahead {
+                views,
+                reach: Reach::default(),
+            })
             .map_err(|_| FrameError::ServerGone)
     }
 }

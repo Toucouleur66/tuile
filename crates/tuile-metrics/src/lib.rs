@@ -249,6 +249,14 @@ pub fn describe() {
     );
     describe_counter!("tuile_tiles_evicted", "Tiles the budget reclaimed.");
     describe_counter!(
+        "tuile_ahead_used",
+        "Ring tiles a view ahead named, drawn in time: predictions used."
+    );
+    describe_counter!(
+        "tuile_ahead_unused",
+        "Ring tiles a view ahead named, not drawn in time: predictions unused."
+    );
+    describe_counter!(
         "tuile_tiles_without_imagery",
         "Tiles drawn with no imagery covering them."
     );
@@ -530,6 +538,8 @@ pub fn publish(m: &Metrics) {
     counter!("tuile_texture_fetches").absolute(m.texture_fetches.get());
     counter!("tuile_tiles_upsampled").absolute(m.tiles_upsampled.get());
     counter!("tuile_tiles_evicted").absolute(m.tiles_evicted.get());
+    counter!("tuile_ahead_used").absolute(m.ahead_used.get());
+    counter!("tuile_ahead_unused").absolute(m.ahead_unused.get());
     counter!("tuile_tiles_without_imagery").absolute(m.tiles_without_imagery.get());
     counter!("tuile_imagery_absent").absolute(m.imagery_absent.get());
     counter!("tuile_terrain_absent").absolute(m.terrain_absent.get());

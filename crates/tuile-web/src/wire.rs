@@ -31,7 +31,9 @@ use tuile_core::budget::{
 use tuile_core::content::{
     DecodedMesh, DecodedTexture, DecodedTileContent, DrapeContent, MaterialDesc,
 };
-use tuile_core::protocol::{Ancestry, ClientMessage, Priming, ResourceContent, ServerMessage};
+use tuile_core::protocol::{
+    AheadView, Ancestry, ClientMessage, Priming, Reach, ResourceContent, ServerMessage,
+};
 use tuile_core::raster::{ImageryCoord, ImageryLayer};
 use tuile_core::source::TileId;
 use tuile_core::traversal::{Fov, TraversalStats, ViewState, ViewStateParams};
@@ -99,9 +101,16 @@ pub fn encode_client(message: &ClientMessage) -> Vec<u8> {
             w.u8(6);
             w.u64(*bytes);
         }
-        ClientMessage::Ahead { views } => {
+        ClientMessage::Ahead { views, reach } => {
             w.u8(7);
-            write_views(&mut w, views);
+            let plain: Vec<ViewState> = views.iter().map(|a| a.view).collect();
+            write_views(&mut w, &plain);
+            for a in views {
+                w.u64(a.in_us);
+                w.u32(u32::from(a.p_permille));
+            }
+            w.f64(reach.ground_mps);
+            w.f64(reach.zoom_out_per_s);
         }
         ClientMessage::Specify { query, overridden } => {
             w.u8(8);
@@ -243,9 +252,24 @@ pub fn decode_client(bytes: &[u8]) -> Result<ClientMessage, WireError> {
             total_bytes: r.u64()?,
         },
         6 => ClientMessage::ReleaseBeyond { bytes: r.u64()? },
-        7 => ClientMessage::Ahead {
-            views: read_views(&mut r)?,
-        },
+        7 => {
+            let plain = read_views(&mut r)?;
+            let mut views = Vec::with_capacity(plain.len());
+            for view in plain {
+                let in_us = r.u64()?;
+                let p_permille = u16::try_from(r.u32()?.min(1_000)).unwrap_or(1_000);
+                views.push(AheadView {
+                    view,
+                    in_us,
+                    p_permille,
+                });
+            }
+            let reach = Reach {
+                ground_mps: r.f64()?,
+                zoom_out_per_s: r.f64()?,
+            };
+            ClientMessage::Ahead { views, reach }
+        }
         8 => ClientMessage::Specify {
             query: String::from_utf8_lossy(r.bytes()?).into_owned(),
             overridden: r.u8()? != 0,
@@ -1646,12 +1670,35 @@ mod tests {
         };
         same(&views);
         // The frames ahead cross the same way.
-        let ClientMessage::Ahead { views } = decode_client(&encode_client(&ClientMessage::Ahead {
-            views: vec![view, eye],
-        }))
-        .expect("reads back") else {
+        let reach = Reach {
+            ground_mps: 1234.5,
+            zoom_out_per_s: 3.25,
+        };
+        let ClientMessage::Ahead { views, reach: got } =
+            decode_client(&encode_client(&ClientMessage::Ahead {
+                views: vec![
+                    AheadView {
+                        view,
+                        in_us: 250_000,
+                        p_permille: 900,
+                    },
+                    AheadView::certain(eye, 2_000_000),
+                ],
+                reach,
+            }))
+            .expect("reads back")
+        else {
             panic!("not the views ahead");
         };
+        assert_eq!(got, reach);
+        assert_eq!(
+            views
+                .iter()
+                .map(|a| (a.in_us, a.p_permille))
+                .collect::<Vec<_>>(),
+            vec![(250_000, 900), (2_000_000, 1_000)]
+        );
+        let views: Vec<ViewState> = views.iter().map(|a| a.view).collect();
         same(&views);
         let drape = ResourceId::drape(TileId(4), LayerId(3), 12);
         let mut messages = vec![
