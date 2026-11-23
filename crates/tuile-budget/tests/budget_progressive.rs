@@ -26,8 +26,9 @@ use tuile_budget::{
     BudgetConfig, Bytes, Class, Decisions, Need, NeedSet, ResourceId, TileId, CERTAIN,
 };
 
-/// The floor of these tests: levels `0..=3`, as the viewer's.
-const FLOOR: u32 = 3;
+/// The pinned floor of these tests: levels `0..=2`, as the viewer's; level
+/// 3 and up are graded by the score (`coarse_from`, `coarse_boost`).
+const FLOOR: u32 = 2;
 
 /// The tiles listed per level at radius `rho`.
 fn per_level(rho: u32) -> usize {
@@ -183,10 +184,11 @@ fn settle(r: &mut Rig, need: &NeedSet, max: usize) -> Decisions {
     r.settle(need, max)
 }
 
-/// 1. Levels 1 to 3 stay resident under pressure: the floor is loaded
-/// first, and the pressure that evicts the neighbourhood never takes it.
+/// 1. The pinned floor (levels 0 to 2) stays resident under pressure: it is
+/// loaded first, and the pressure that evicts the neighbourhood never takes
+/// it; the graded coarse levels go last, level 4 before level 3.
 #[test]
-fn the_floor_through_level_three_stays_under_pressure() {
+fn the_pinned_floor_stays_under_pressure_and_the_coarse_levels_go_last() {
     let mut r = Rig::new(config(Bytes::mib(256), 4));
     let v = View::at(0.37, 0.61, 13);
     let need = v.need(4);
@@ -205,6 +207,11 @@ fn the_floor_through_level_three_stays_under_pressure() {
         r.complete(&d);
     }
     assert!(evicted > 0, "the pressure evicted nothing: the test proves nothing");
+    // The graded coarse levels outrank everything finer but the need.
+    let p = tuile_budget::spec::PROGRESSIVE;
+    let a = |l| tuile_budget::progressive_terms(&p, l, 13, 0, 4).0;
+    assert!(a(3) > a(4) && a(4) > a(5) && a(5) > a(8) && a(12) > a(9));
+    assert!(a(3) > a(12) && a(3) > a(14), "level 3 is released after the levels by the need");
     for l in 0..=FLOOR {
         for x in 0..(1u64 << l) {
             for y in 0..(1u64 << l) {
@@ -658,7 +665,9 @@ fn a_still_view_keeps_its_pools_under_the_headroom() {
 }
 
 /// After a zoom-out, the preloads left behind — the finer level the old
-/// view anticipated — are released within a few steps, room or not.
+/// view anticipated — are released, room or not, once out of the need for
+/// the thrash window (10 s: a turn and back finds them still): within a
+/// bounded number of steps.
 #[test]
 fn the_fine_preloads_left_behind_by_a_zoom_out_are_released() {
     let mut r = Rig::new(config(Bytes::mib(512), 4));
@@ -669,10 +678,109 @@ fn the_fine_preloads_left_behind_by_a_zoom_out_are_released() {
     assert!(finer.iter().any(|t| gpu(&r, *t)), "level 14 never preloaded");
     let high = View::at(fx, fy, 9);
     let need = high.need(4);
-    for _ in 0..20 {
+    for _ in 0..30 {
+        let d = r.step(&need);
+        r.complete(&d);
+    }
+    assert!(
+        finer.iter().any(|t| gpu(&r, *t)),
+        "released inside the thrash window"
+    );
+    // 10 s at 60 steps a second, and a few steps for the 64 looked at each.
+    for _ in 0..640 {
         let d = r.step(&need);
         r.complete(&d);
     }
     let left = finer.iter().filter(|t| gpu(&r, **t)).count();
-    assert_eq!(left, 0, "{left} level-14 preloads still held 20 steps after the zoom-out");
+    assert_eq!(left, 0, "{left} level-14 preloads still held 11 s after the zoom-out");
+}
+
+/// Every number of the score is the specification's: re-specified at run
+/// time (the query `tuile://budget?…` carries), the next step reads it —
+/// its statistics carry the parameters in force, and its order follows.
+#[test]
+fn a_re_specification_changes_the_next_steps_order() {
+    use tuile_budget::Specification;
+    let first_preload = |query: Option<&str>| {
+        let mut c = config(Bytes::mib(512), 4);
+        c.max_in_flight = tuile_budget::PerClass::splat(1);
+        let mut r = Rig::new(c);
+        if let Some(q) = query {
+            r.b.specify(Specification::from_query(q).unwrap()).unwrap();
+        }
+        let v = View::at(0.45, 0.55, 12);
+        let need = v.need(4);
+        let drawn: BTreeSet<TileId> = v.drawn().into_iter().collect();
+        for _ in 0..400 {
+            let d = r.step(&need);
+            if let Some(e) = d.scores.iter().find(|e| {
+                e.side == Side::Preload
+                    && matches!(e.resource, ResourceId::Mesh(t) if !drawn.contains(&t))
+            }) {
+                return (e.level, d.stats.score.params);
+            }
+            r.complete(&d);
+        }
+        panic!("no preload");
+    };
+    let (level_default, params) = first_preload(None);
+    assert_eq!(params.a0_permille, 800);
+    // Levels above the need worth nothing more than the floor: the first
+    // preload is no longer the level above the need.
+    let (level_flat, params) = first_preload(Some("spec=interactive&a0=10&a_desc=1000"));
+    assert_eq!(params.a0_permille, 10);
+    assert_eq!(params.descend_permille, 1000);
+    assert_ne!(level_default, level_flat, "the order did not follow the specification");
+}
+
+/// Laurent's stall (Tuile.app on main 9a5ee85e, 2026-11-23, twice): the
+/// drapes' class at 97–99 % of its target, the picture relaxed, imagery
+/// under its need and nothing loading or even queued. The level of detail
+/// comes back only once every class is under its low watermark, and nothing
+/// evicted between the watermarks: a relaxed budget whose class sits
+/// between them stays relaxed for ever. Relaxed, the lowest scores go down
+/// to the low watermark: the detail comes back, the needs load.
+#[test]
+fn a_relaxed_budget_between_its_watermarks_comes_back_to_full_detail() {
+    use tuile_budget::Pressure;
+    let mut c = config(Bytes::mib(64), 4);
+    c.pinned_level = None;
+    let mut r = Rig::new(c);
+    // Zoomed in: fine drapes filling their class.
+    let fine: Vec<TileId> = (0..9u64).flat_map(|x| (0..9u64).map(move |y| t(14, 9_000 + x, 5_000 + y))).collect();
+    let zoomed = NeedSet {
+        drawn: fine.iter().map(|&id| (id, draped(id, 16))).collect(),
+        ..NeedSet::default()
+    };
+    let d = settle(&mut r, &zoomed, 600);
+    let ratio = |d: &Decisions| {
+        d.stats.gpu[Class::Drape].0 as f64 / d.stats.target[Class::Drape].0.max(1) as f64
+    };
+    eprintln!("zoomed in: {:.3} of the drapes' target", ratio(&d));
+    // Out to a few tiles elsewhere, under a memory warning that relaxes
+    // the picture, then normal again: the fine drapes, drawn by nobody,
+    // still hold their class between its watermarks.
+    let wide: Vec<TileId> = (0..3u64).flat_map(|x| (0..3u64).map(move |y| t(12, 700 + x, 300 + y))).collect();
+    let out = NeedSet {
+        drawn: wide.iter().map(|&id| (id, draped(id, 14))).collect(),
+        ..NeedSet::default()
+    };
+    r.b.set_pressure(Pressure::Warning);
+    for _ in 0..30 {
+        let d = r.step(&zoomed);
+        r.complete(&d);
+    }
+    r.b.set_pressure(Pressure::Normal);
+    let d = r.step(&zoomed);
+    r.complete(&d);
+    let mut last = r.step(&out);
+    eprintln!("relaxed: {:.3} of the target, scale {}", ratio(&last), last.sse_scale_milli);
+    assert!(last.sse_scale_milli > 1_000, "the warning relaxed nothing: the test proves nothing");
+    for _ in 0..600 {
+        r.complete(&last);
+        last = r.step(&out);
+    }
+    eprintln!("after: {:.3} of the target, scale {}", ratio(&last), last.sse_scale_milli);
+    assert_eq!(last.sse_scale_milli, 1_000, "still relaxed: the detail never came back");
+    assert_eq!(last.stats.deficit.imagery_under(), 0, "imagery still under its need");
 }

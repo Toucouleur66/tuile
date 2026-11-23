@@ -1582,8 +1582,7 @@ impl State {
         // eye's, the tiles nearest the view's footprint, preloaded by the
         // progressive score.
         if let Some(eye) = self.views.first().map(ViewState::position) {
-            let cfg = self.budget.config();
-            let (rho, pinned) = (cfg.reach_tiles, cfg.pinned_level);
+            let (rho, pinned) = (self.budget.reach_tiles(), self.budget.config().pinned_level);
             self.hood
                 .update(tree, drawn.iter().copied(), eye, rho, pinned);
         }

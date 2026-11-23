@@ -622,7 +622,7 @@ pub mod labels {
     pub const EYE: [&str; 4] = ["0", "1", "2", "3"];
     /// `name` of a `param`: the progressive score's parameters
     /// (`crate::score::ScoreParams::pairs`).
-    pub const PARAM: [&str; 9] = [
+    pub const PARAM: [&str; 11] = [
         "a0_permille",
         "a_desc_permille",
         "rho_tiles",
@@ -632,6 +632,8 @@ pub mod labels {
         "need_level",
         "headroom_permille",
         "floor_value_permille",
+        "coarse_from",
+        "coarse_boost_permille",
     ];
     /// `reason` of `released_by_level_distance`.
     pub const RELEASE: [&str; 3] = crate::score::RELEASE_REASONS;

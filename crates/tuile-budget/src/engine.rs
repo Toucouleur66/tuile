@@ -336,10 +336,6 @@ pub(super) struct Room {
     bytes: PerClass<[Bytes; WANT_BUCKETS]>,
 }
 
-/// The filed GPU copies the floor value's release looks at a step, from
-/// the bottom of the release order.
-const FLOOR_VALUE_VISITS: usize = 64;
-
 /// Not wanted, then one bucket per urgency.
 const WANT_BUCKETS: usize = 8;
 
@@ -1770,7 +1766,7 @@ impl Budget {
             // arrival on.
             let p = super::value::probability(
                 &self.spec,
-                self.cfg.reach_tiles,
+                self.reach_tiles(),
                 urgency,
                 w.level,
                 &w.q,
@@ -2393,30 +2389,6 @@ impl Budget {
         st: &mut BudgetStats,
     ) {
         let decoded_full = self.ledger.decoded >= eff.decoded;
-        // Preloads hold at most the specification's share of each class's
-        // network slots, one at least
-        // (`docs/explorations/budget-progressive-coarse-preload.md` §2): the
-        // rest stays free for the present need, which starts at once.
-        let mut preloads: PerClass<u32> = PerClass::splat(0);
-        for &vs in self.arena.active() {
-            let a = &self.arena;
-            if matches!(
-                a.load(vs),
-                Load::Loading {
-                    source: Source::Network,
-                    ..
-                }
-            ) && wants
-                .get(&a.id(vs))
-                .is_some_and(|w| w.urgency >= Urgency::Ring)
-            {
-                preloads[a.class(vs)] += 1;
-            }
-        }
-        self.walk(self.arena.active().len());
-        let share = u32::from(self.spec.params.speculation.slots_permille);
-        let preload_slots =
-            |c: Class| (eff.quota[c].saturating_mul(share) / 1_000).max(1);
         // Stored resources left unstarted for any reason but their own
         // quota: a network load of lower priority starting after them is a
         // local wait (I15).
@@ -2445,12 +2417,6 @@ impl Budget {
                 }
                 Source::Network => {
                     if self.origin_holds_back(*r, class, now) {
-                        continue;
-                    }
-                    if !eff.batch
-                        && w.urgency >= Urgency::Ring
-                        && preloads[class] >= preload_slots(class)
-                    {
                         continue;
                     }
                     if self.in_flight[class] >= eff.quota[class] {
@@ -2549,9 +2515,6 @@ impl Budget {
                 Self::load_timeout_after(self.cfg.load_timeout, self.arena.cold(s).failures);
             self.deadline(now.plus(timeout), *r);
             if w.urgency >= Urgency::Ring {
-                if source == Source::Network {
-                    preloads[class] += 1;
-                }
                 d.scores.push(self.load_event(*r, class, w, key.tier));
             }
             match source {
@@ -2883,7 +2846,7 @@ impl Budget {
             let mut strain = false;
             let prob = super::value::probability(
                 &self.spec,
-                self.cfg.reach_tiles,
+                self.reach_tiles(),
                 w.urgency,
                 w.level,
                 &w.q,
@@ -3106,14 +3069,17 @@ impl Budget {
                 continue;
             }
             let used = self.ledger.gpu[class];
-            // Under the headroom: the lowest scores go every step, not only
-            // over the target.
-            let kept = self.headroom(eff.target[class]);
-            let high = kept.scaled(u64::from(w.high_percent), 100);
-            if used <= high {
+            let high = eff.target[class].scaled(u64::from(w.high_percent), 100);
+            let low = eff.target[class].scaled(u64::from(w.low_percent), 100);
+            // Relaxed, the level of detail comes back only once every class
+            // is under its low watermark (`relax`): a class held between
+            // the watermarks by copies nobody draws would keep the picture
+            // coarse, and nothing loading, for ever — the lowest scores go
+            // down to the low watermark then too.
+            let stuck = self.relaxing() && used > low;
+            if used <= high && !stuck {
                 continue;
             }
-            let low = kept.scaled(u64::from(w.low_percent), 100);
             let room = match self.scratch.room.take() {
                 Some(room) => room,
                 None => self.room(wants, st),
@@ -3142,8 +3108,12 @@ impl Budget {
         // Only a step under pressure built one: nothing kept across steps.
         self.scratch.room = None;
         self.release_below_floor_value(now, d, st);
-        let decoded = self.headroom(eff.decoded);
-        if self.ledger.decoded > decoded {
+        // The decoded tier: over its target, down to the headroom under it
+        // — a copy demoted from the GPU is what a turn back finds without
+        // the network, so it is not released below the target for room's
+        // sake alone.
+        if self.ledger.decoded > eff.decoded {
+            let decoded = self.headroom(eff.decoded);
             self.release_decoded(decoded, d, st);
         }
     }
@@ -3211,7 +3181,8 @@ impl Budget {
     /// Releases, from the bottom of the release order, the GPU copies no
     /// longer wanted whose probability of use fell under the
     /// specification's floor value, room or not: far, fine, out of the ring.
-    /// At most [`FLOOR_VALUE_VISITS`] copies looked at a step: a frame's
+    /// At most the specification's `release_visits` copies looked at a
+    /// step: a frame's
     /// releases stay small; the next step goes on.
     fn release_below_floor_value(&mut self, now: Micros, d: &mut Decisions, st: &mut BudgetStats) {
         let floor = super::value::CERTAIN / 1_000
@@ -3221,7 +3192,8 @@ impl Budget {
         }
         let mut after: Option<(EvictKey, Slot)> = None;
         let mut low: Vec<(Slot, Class)> = Vec::new();
-        for _ in 0..FLOOR_VALUE_VISITS {
+        let visits = self.spec.params.release_visits;
+        for _ in 0..visits {
             let Some(e) = self.arena.next_filed(after.as_ref(), |_| true, &Held::GPU) else {
                 break;
             };
@@ -3229,7 +3201,12 @@ impl Budget {
             let s = e.1;
             let a = &self.arena;
             let (_, p, _) = a.place(s);
+            let long_gone = a
+                .cold(s)
+                .unneeded_since()
+                .is_some_and(|t| now.since(t) >= super::THRASH_WINDOW);
             if p < floor
+                && long_gone
                 && a.has_gpu(s)
                 && !a.has_transit(s)
                 && !self.kept(s)
@@ -3238,7 +3215,7 @@ impl Budget {
                 low.push((s, a.class(s)));
             }
         }
-        st.work = st.work.saturating_add(FLOOR_VALUE_VISITS as u32);
+        st.work = st.work.saturating_add(u32::from(visits));
         for (s, class) in low {
             d.scores
                 .push(self.held_event(s, Side::Evict, Reason::BelowFloorValue));
@@ -3289,12 +3266,15 @@ impl Budget {
         let ceiling_low = |c: Class| pct(p.ceil_target[c], w.low_percent);
         let mut over: PerClass<bool> =
             PerClass::from_fn(|c| p.members[c] && self.ledger.gpu[c] > ceiling_high(c));
-        let high = pct(self.headroom(p.target), w.high_percent);
-        let pool_over = used(&self.ledger) > high;
+        let high = pct(p.target, w.high_percent);
+        // Relaxed and between the watermarks: down to the low one, so the
+        // detail can come back (`relax`).
+        let pool_over = used(&self.ledger) > high
+            || (self.relaxing() && used(&self.ledger) > pct(p.target, w.low_percent));
         if !pool_over && Class::ALL.iter().all(|c| !over[*c]) {
             return;
         }
-        let low = pct(self.headroom(p.target), w.low_percent);
+        let low = pct(p.target, w.low_percent);
         // I2 (Laurent, 2026-10-21): what is not protected fits in the
         // member's target. The sweep evicts only unprotected residents, so
         // the protected bytes do not move while it runs; the target does, as
@@ -3690,7 +3670,7 @@ impl Budget {
                     a.level(s),
                     n,
                     0,
-                    self.cfg.reach_tiles,
+                    self.reach_tiles(),
                 )
                 .0
             }
@@ -3731,7 +3711,7 @@ impl Budget {
     ) -> ScoreEvent {
         let (pa, pd) = super::value::probability_terms(
             &self.spec,
-            self.cfg.reach_tiles,
+            self.reach_tiles(),
             w.urgency,
             w.level,
             &w.q,
@@ -3766,7 +3746,9 @@ impl Budget {
         super::score::ScoreParams {
             a0_permille: u32::from(p.progressive.a0_permille),
             descend_permille: u32::from(p.progressive.descend_permille),
-            rho: self.cfg.reach_tiles,
+            coarse_from: u32::from(p.progressive.coarse_from),
+            coarse_boost_permille: u32::from(p.progressive.coarse_boost_permille),
+            rho: self.reach_tiles(),
             margin_permille: p.margin_permille,
             floor_level: self.cfg.pinned_level,
             preload_slots_permille: u32::from(p.speculation.slots_permille),

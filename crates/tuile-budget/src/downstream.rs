@@ -2227,6 +2227,7 @@ impl Budget {
         self.walk(l.marks.len());
         l.slots.clear();
         let grace = self.cfg.cancel_grace;
+        let rho = self.reach_tiles();
         for &r in &l.marks {
             let Some(s) = self.arena.find(r) else {
                 continue;
@@ -2244,8 +2245,15 @@ impl Budget {
                 if let Some(w) = wants.get(&r) {
                     // The progressive score's place: what the release key
                     // weighs the restore credit by.
-                    let rho = self.cfg.reach_tiles;
-                    let p = super::value::probability(&self.spec, rho, w.urgency, w.level, &w.q);
+                    // A preload the traversal did not place (the views
+                    // ahead without a probability, a refresh) keeps the
+                    // release order's full credit: its flat anticipation
+                    // orders loads only.
+                    let p = if w.q.placed() {
+                        super::value::probability(&self.spec, rho, w.urgency, w.level, &w.q)
+                    } else {
+                        super::value::CERTAIN
+                    };
                     let placed = w.q.placed().then_some(u32::from(w.q.need_level));
                     a.set_place(s, placed, p, super::score::distance_band(w.q.away));
                     self.places = self.places.saturating_add(1);
@@ -2254,6 +2262,10 @@ impl Budget {
                     }
                 }
             } else if in_drawn {
+                // Drawn (a stand-in for another tile) without being wanted:
+                // in use, of a certain probability.
+                let (need, _, band) = a.place(s);
+                a.set_place(s, need, super::value::CERTAIN, band);
                 let cold = a.cold_mut(s);
                 cold.set_unneeded_since(None);
                 cold.set_first_wanted(None);

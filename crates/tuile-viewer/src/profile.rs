@@ -54,13 +54,15 @@ impl DeviceMemory {
     }
 }
 
-/// The budget's floor on every profile: levels `0..=3`, mesh and drape,
-/// loaded first and never evicted (Laurent, 2026-11-23: "z1, z2, z3 toujours
-/// résidents"; `docs/explorations/budget-progressive-coarse-preload.md`). At
-/// or under it the backdrop's level ([`crate::backdrop::BASE_LEVEL`]), so
-/// what the backdrop draws stays protected. 85 tiles on a 4ˡ pyramid, about
-/// 28 MiB of imagery; `TUILE_PIN_LEVEL` sets another.
-pub(crate) const FLOOR_LEVEL: u32 = 3;
+/// The budget's pinned floor on every profile: levels `0..=2`, mesh and
+/// drape, loaded first and never evicted — the backdrop's level
+/// ([`crate::backdrop::BASE_LEVEL`]). Level 3 and up are graded inside the
+/// progressive score (Laurent, 2026-11-23): level 3 weighs 0.95 of a tile of
+/// the present need, level 4 half that, halving finer, so under pressure the
+/// fine go first, then the intermediate levels, level 4, level 3 last
+/// (`docs/explorations/budget-progressive-coarse-preload.md`).
+/// `TUILE_PIN_LEVEL` sets another floor.
+pub(crate) const FLOOR_LEVEL: u32 = 2;
 const _: () = assert!(FLOOR_LEVEL >= crate::backdrop::BASE_LEVEL);
 
 /// The numbers a session runs with. See the module.

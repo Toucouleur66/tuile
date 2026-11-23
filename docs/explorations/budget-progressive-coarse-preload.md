@@ -39,6 +39,7 @@ P(ℓ, n, d) = A(ℓ, n) × D(d)                          the probability of use
 A(ℓ, n) = 1                       ℓ = n   (the present need)
         = a0 × 2^−(n−1−ℓ)         ℓ < n   (n−1: a0, n−2: a0/2, then halving per level up)
         = a↓ × 2^−(ℓ−n−1)         ℓ > n   (n+1: a↓; only n+1 is listed)
+  and at least  c × 2^−(ℓ−ℓc)     ℓ ≥ ℓc  (the graded coarse levels: ℓc = 3, c = 0.95)
 
 D(d)    = ρ² / (ρ + d)²                                (1 at F, ¼ at d = ρ)
 ```
@@ -81,7 +82,8 @@ notebook's finding: with quarters, `(1 + 1/8)²` = 1.27 at ρ = 2 exceeded it).
 
 | Constant | Value | Where |
 |---|---|---|
-| floor `F` | levels `0..=3`, mesh and drape, loaded first, never released | `Profile::pinned_level` (`TUILE_PIN_LEVEL` overrides) |
+| pinned floor `F` | levels `0..=2`, mesh and drape, loaded first, never released (absolute law) | `Profile::pinned_level` (`TUILE_PIN_LEVEL` overrides) |
+| graded coarse | from `ℓc` = 3, `A` ≥ 0.95 × 2^−(ℓ−3): level 3 0.95, level 4 0.475, level 5 0.24…: under pressure the fine go first, then the intermediate levels, level 4, level 3 last | `Params::progressive.coarse_from`, `coarse_boost_permille` (`coarse_from=`, `coarse_boost=`) |
 | `a0` | 800 ‰ | `Params::progressive.a0_permille` (`a0=` in a query) |
 | `a↓` | 200 ‰ | `Params::progressive.descend_permille` (`a_desc=`) |
 | `ρ` | desktop and desktop page 4, phone and phone page 2, film 0 | `BudgetConfig::reach_tiles` |
@@ -113,20 +115,37 @@ The score orders the value band only. Before it, in this order and whatever the 
    `Precedence::Anticipation`);
 5. **the hard limit**.
 
-**Release is proactive, in both tiers.** Every step, the release of the lowest scores keeps
-each GPU class (and the pool) and the decoded tier under `target × (1 − headroom)`
-(`headroom` 12.5 %, `Params::headroom_permille`), not only when a load needs room nor only
-over the target; preloads are delivered only under that line. A copy that leaves the need
-keeps a 64th of its probability of use; a copy no longer wanted whose probability is under
-the **floor value** (1 %, `Params::floor_value_permille`) goes even with room left — a preload
-left behind by a zoom-out goes within a few steps, a copy drawn a moment ago (1/64 ≈ 1.6 %)
-stays as cache until room is needed. That pass looks at 64 copies a step from the bottom of
-the release order (frame spikes stay small); the headroom sweep is not bounded, so need never
-waits while low scores hold the pools. Never released: what is drawn, a swap, the floor, the
-chain of what is drawn, what is in transit. The window and the metrics count the releases
-per step by reason — `headroom`, `below_floor_value`, `make_room` — by level × distance
-(`released_by_level_distance{level,distance,reason}`, `released_total{reason}`), GPU and
-decoded (`side` evict | decoded).
+**Release keeps a headroom, and lets go of what is no longer worth holding.**
+
+- Preloads are delivered only under `target × (1 − headroom)` (`headroom` 12.5 %,
+  `Params::headroom_permille`): the room above it is the present need's. The decoded tier,
+  once over its target, is released down to the headroom under it. A GPU class (or the pool)
+  over its target is swept down to its low watermark, lowest scores first, not bounded per
+  step, so need never waits while low scores hold the pools.
+- A copy that leaves the need keeps a 64th of its probability of use (a copy drawn without
+  being wanted — a stand-in for another tile — counts as certain while drawn). A copy no
+  longer wanted whose probability is under the **floor value** (1 %,
+  `Params::floor_value_permille`) goes even with room left, once out of the need for the
+  thrash window (10 s: a turn and back finds it still) — a preload left behind by a zoom-out
+  goes 10 s later; a copy drawn a moment ago (1/64 ≈ 1.6 %) stays as the cache a turn back or
+  a tour's revisit finds. That pass looks at `release_visits` (64) copies a step from the
+  bottom of the release order: a frame's releases stay small.
+- Measured on the simulation and not kept: a sweep running under the target every step took
+  that cache (the five-minute soak's revisits waited 183–267 ms at p95 instead of 33 ms), and
+  a sweep down to the headroom under the target slowed a slow zoom-in's convergence past its
+  2 s bound.
+- Never released: what is drawn, a swap, the floor, the chain of what is drawn, what is in
+  transit. The window and the metrics count the releases per step by reason — `headroom`,
+  `below_floor_value`, `make_room` — by level × distance
+  (`released_by_level_distance{level,distance,reason}`, `released_total{reason}`), GPU and
+  decoded (`side` evict | decoded).
+
+Every number here is the specification's (`Params`, bounded, in the digest, recorded with
+the step, re-specifiable at run time by `tuile://budget?…` and the config file): `a0`,
+`a_desc`, `rho` (0: the profile's), `margin`, `headroom`, `floor_value`, `release_visits`,
+`finer_gap` (#277's over-need weight), `restore_*_ms` (until measured), `horizon_ms`. The
+floor level stays the profile's (`BudgetConfig::pinned_level`, `TUILE_PIN_LEVEL`): the
+geometry server lists the floor from it.
 
 A preload never displaces anything the present need wants; it displaces another preload only
 when `P(new) > P(old) × (1 + m)` (hysteresis: two tiles of nearly equal score do not trade

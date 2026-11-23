@@ -508,6 +508,15 @@ impl Budget {
         self.origins.down()
     }
 
+    /// The neighbourhood's radius `ρ` in force, tiles: the specification's
+    /// when it sets one, the configuration's (the profile's) otherwise.
+    pub fn reach_tiles(&self) -> u32 {
+        match self.spec.params.rho_tiles {
+            0 => self.cfg.reach_tiles,
+            r => u32::from(r),
+        }
+    }
+
     /// The GPU-held set by the progressive score
     /// (`docs/explorations/budget-progressive-coarse-preload.md` §7): its
     /// aggregates by level and distance band, and the lowest and highest

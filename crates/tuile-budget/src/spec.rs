@@ -283,6 +283,13 @@ pub struct Progressive {
     pub a0_permille: u16,
     /// `a↓`: the level just below it (a zoom-in anticipated).
     pub descend_permille: u16,
+    /// The graded coarse levels: from `coarse_from` (the first level over
+    /// the pinned floor) a level weighs at least `coarse_boost`, halving per
+    /// level finer — under pressure the fine go first, then the
+    /// intermediate levels, then `coarse_from + 1`, `coarse_from` last.
+    pub coarse_from: u16,
+    /// `A` at `coarse_from`, ‰.
+    pub coarse_boost_permille: u16,
 }
 
 /// The defaults: the level above the need's at four fifths of it, halving
@@ -290,12 +297,20 @@ pub struct Progressive {
 pub const PROGRESSIVE: Progressive = Progressive {
     a0_permille: 800,
     descend_permille: 200,
+    coarse_from: 3,
+    coarse_boost_permille: 950,
 };
 
-/// The room kept free under each target by default, ‰ (12.5 %).
-pub const HEADROOM: u16 = 125;
+/// The room kept free under each target by default, ‰: none until a value
+/// is chosen — 12.5 % was measured to cost the soak's revisits (the
+/// cache it keeps out), `tuile://budget?headroom=125` tries it.
+pub const HEADROOM: u16 = 0;
 /// The probability under which a copy no longer wanted goes, ‰.
 pub const FLOOR_VALUE: u16 = 10;
+/// The copies the floor value's release looks at a step.
+pub const RELEASE_VISITS: u16 = 64;
+/// An over-need gap weighs half an under-need one.
+pub const FINER_GAP: u16 = 500;
 
 /// The defaults: the ring before the ancestors, as the tiers were.
 const ANTICIPATION: Anticipation = Anticipation {
@@ -337,6 +352,15 @@ pub struct Params {
     /// wanted is released even with room left: the pools hold what is
     /// useful, not what is old.
     pub floor_value_permille: u16,
+    /// The copies the floor value's release looks at a step: the bound of
+    /// a frame's proactive releases.
+    pub release_visits: u16,
+    /// The neighbourhood's radius `ρ`, tiles, when not 0: overrides the
+    /// profile's (`BudgetConfig::reach_tiles`).
+    pub rho_tiles: u16,
+    /// What a drape worn finer than its need weighs against one worn as
+    /// much coarser, ‰ (#277's over-need deficit).
+    pub finer_gap_permille: u16,
 }
 
 /// The policy of the decider: rules and numbers. See the [module
@@ -424,6 +448,9 @@ impl Specification {
                 progressive: PROGRESSIVE,
                 headroom_permille: HEADROOM,
                 floor_value_permille: FLOOR_VALUE,
+                release_visits: RELEASE_VISITS,
+                rho_tiles: 0,
+                finer_gap_permille: FINER_GAP,
             },
         }
     }
@@ -476,6 +503,9 @@ impl Specification {
                 progressive: PROGRESSIVE,
                 headroom_permille: HEADROOM,
                 floor_value_permille: FLOOR_VALUE,
+                release_visits: RELEASE_VISITS,
+                rho_tiles: 0,
+                finer_gap_permille: FINER_GAP,
             },
         }
     }
@@ -535,6 +565,9 @@ impl Specification {
                 progressive: PROGRESSIVE,
                 headroom_permille: HEADROOM,
                 floor_value_permille: FLOOR_VALUE,
+                release_visits: RELEASE_VISITS,
+                rho_tiles: 0,
+                finer_gap_permille: FINER_GAP,
             },
         }
     }
@@ -637,8 +670,13 @@ impl Specification {
             ("p_ancestor", u64::from(p.anticipation.ancestor_permille), 1_000),
             ("a0", u64::from(p.progressive.a0_permille), 1_000),
             ("a_desc", u64::from(p.progressive.descend_permille), 1_000),
+            ("coarse_from", u64::from(p.progressive.coarse_from), 30),
+            ("coarse_boost", u64::from(p.progressive.coarse_boost_permille), 1_000),
             ("headroom", u64::from(p.headroom_permille), 500),
             ("floor_value", u64::from(p.floor_value_permille), 1_000),
+            ("release_visits", u64::from(p.release_visits), 4_096),
+            ("rho", u64::from(p.rho_tiles), 16),
+            ("finer_gap", u64::from(p.finer_gap_permille), 1_000),
         ];
         if let Some((name, ..)) = bounded.iter().find(|(_, v, max)| v > max) {
             return Err(SpecError::OutOfBounds(name));
@@ -673,7 +711,8 @@ impl Specification {
             "spec={}&margin={}&min_dwell_ms={}&horizon_ms={}&blend_ms={}\
              &speculation_slots={}&speculation_memory={}&coarse_through={}\
              &restore_decoded_ms={}&restore_stored_ms={}&restore_http_cache_ms={}\
-             &restore_remote_ms={}&p_ring={}&p_ancestor={}&a0={}&a_desc={}&headroom={}&floor_value={}",
+             &restore_remote_ms={}&p_ring={}&p_ancestor={}&a0={}&a_desc={}&headroom={}&floor_value={}\
+             &release_visits={}&rho={}&finer_gap={}&coarse_from={}&coarse_boost={}",
             self.kind.label(),
             p.margin_permille,
             ms(p.min_dwell),
@@ -692,6 +731,11 @@ impl Specification {
             p.progressive.descend_permille,
             p.headroom_permille,
             p.floor_value_permille,
+            p.release_visits,
+            p.rho_tiles,
+            p.finer_gap_permille,
+            p.progressive.coarse_from,
+            p.progressive.coarse_boost_permille,
         );
         // A term's weight when all its rules share one; a term weighed
         // differently by predicate (FPV's recency) keeps its kind's rules.
@@ -749,6 +793,11 @@ impl Specification {
                 "a_desc" => p.progressive.descend_permille = n16,
                 "headroom" => p.headroom_permille = n16,
                 "floor_value" => p.floor_value_permille = n16,
+                "release_visits" => p.release_visits = n16,
+                "rho" => p.rho_tiles = n16,
+                "finer_gap" => p.finer_gap_permille = n16,
+                "coarse_from" => p.progressive.coarse_from = n16,
+                "coarse_boost" => p.progressive.coarse_boost_permille = n16,
                 _ => match k
                     .strip_prefix("w_")
                     .and_then(|t| Term::ALL.into_iter().find(|x| term_key(*x) == t))

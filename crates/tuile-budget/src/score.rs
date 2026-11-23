@@ -394,6 +394,9 @@ pub struct ScoreParams {
     pub a0_permille: u32,
     /// `a↓`, ‰.
     pub descend_permille: u32,
+    /// The first graded coarse level, and its `A`, ‰.
+    pub coarse_from: u32,
+    pub coarse_boost_permille: u32,
     /// `ρ`, tiles.
     pub rho: u32,
     /// The margin `m`, ‰.
@@ -422,7 +425,7 @@ pub const RESTORE_TIERS: [&str; 4] = ["decoded", "stored", "http_cache", "networ
 
 impl ScoreParams {
     /// `name=value` pairs, as the gauges and the header print them.
-    pub fn pairs(&self) -> [(&'static str, i64); 9] {
+    pub fn pairs(&self) -> [(&'static str, i64); 11] {
         let opt = |v: Option<u32>| v.map_or(-1, i64::from);
         [
             ("a0_permille", i64::from(self.a0_permille)),
@@ -434,6 +437,8 @@ impl ScoreParams {
             ("need_level", opt(self.need_level)),
             ("headroom_permille", i64::from(self.headroom_permille)),
             ("floor_value_permille", i64::from(self.floor_value_permille)),
+            ("coarse_from", i64::from(self.coarse_from)),
+            ("coarse_boost_permille", i64::from(self.coarse_boost_permille)),
         ]
     }
 
@@ -456,7 +461,7 @@ impl ScoreParams {
             .floor_level
             .map_or_else(|| "none".to_owned(), |f| format!("≤{f}"));
         format!(
-            "score = A·D·R/bytes · A=a0·2^−(n−1−ℓ) a0={:.2} a↓={:.2} · D=ρ²/(ρ+d)² ρ={} · m={}% · floor {} · preload ≤{}% slots · headroom {:.1}% · floor value P<{:.3}",
+            "score = A·D·R/bytes · A=a0·2^−(n−1−ℓ) a0={:.2} a↓={:.2} · D=ρ²/(ρ+d)² ρ={} · m={}% · floor {} · preload ≤{}% slots · headroom {:.1}% · floor value P<{:.3} · coarse A≥{:.2}·2^−(ℓ−{})",
             f64::from(self.a0_permille) / 1000.0,
             f64::from(self.descend_permille) / 1000.0,
             self.rho,
@@ -465,6 +470,8 @@ impl ScoreParams {
             self.preload_slots_permille / 10,
             f64::from(self.headroom_permille) / 10.0,
             f64::from(self.floor_value_permille) / 1000.0,
+            f64::from(self.coarse_boost_permille) / 1000.0,
+            self.coarse_from,
         )
     }
 }

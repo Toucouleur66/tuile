@@ -219,6 +219,14 @@ pub fn progressive_terms(
             (c * u64::from(p.descend_permille) / 1_000) >> (level - need_level - 1).min(63)
         }
     };
+    // The graded coarse levels: at least the boost at `coarse_from`, halving
+    // per level finer.
+    let from = u32::from(p.coarse_from);
+    let a = if level >= from {
+        a.max((c * u64::from(p.coarse_boost_permille) / 1_000) >> (level - from).min(63))
+    } else {
+        a
+    };
     let r = u64::from(rho) * 16;
     let d = u64::from(away);
     let near = if r == 0 {
@@ -332,8 +340,9 @@ pub struct DeficitInput {
 /// the imagery than its neighbours, which wear their own level: a patch of
 /// another colour. Colour consistency comes before extra detail, so the gap
 /// is a want; it weighs less than a gap of detail missing, so an under-need
-/// tile falls due first.
-pub const FINER_GAP_PERMILLE: u64 = 500;
+/// tile falls due first. The specification's
+/// [`crate::spec::Params::finer_gap_permille`], by default this.
+pub const FINER_GAP_PERMILLE: u64 = crate::spec::FINER_GAP as u64;
 
 /// When tile `d.tile`'s own drape becomes worth loading while it wears one
 /// `d.gap` levels under its need, or over it (`d.finer`, weighed
@@ -352,7 +361,7 @@ pub fn deficit_due(spec: &Specification, d: &DeficitInput) -> Option<Micros> {
     let screen = 500 + u64::try_from(d.centrality.clamp(0, 1_000)).unwrap_or(0) / 2;
     let mut per_us = weight * screen * u64::from(d.gap.max(1)) / 1_000;
     if d.finer {
-        per_us = per_us * FINER_GAP_PERMILLE / 1_000;
+        per_us = per_us * u64::from(spec.params.finer_gap_permille) / 1_000;
     }
     if per_us == 0 {
         return None;
