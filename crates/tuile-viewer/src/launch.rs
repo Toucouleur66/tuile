@@ -73,6 +73,8 @@ impl Launch {
 /// How long a start-up may take before it is called off and tried again: the
 /// host's service, its layer descriptions and the store, end to end. A
 /// network that answers nothing must not keep a spinner turning for ever.
+/// The host's credentials are found before it starts: that may wait on the
+/// person (a Keychain dialog), and the person is not the network.
 pub(crate) const START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Starting again after a start-up that failed — where there is no command

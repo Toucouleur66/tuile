@@ -220,8 +220,16 @@ pub(crate) fn start(runtime: &tokio::runtime::Handle, plan: Plan) -> Launch {
 }
 
 async fn bring_up(plan: Plan, runtime: tokio::runtime::Handle) -> Outcome {
+    // The host's credentials first, and outside the window: finding them asks
+    // nothing of the network, and it may wait on the person. On a Mac, a
+    // build whose signature the Keychain has not seen asks whether it may
+    // read the token, and the minute spent answering is not the tile
+    // service's to account for — counted against it, an answered dialog
+    // failed the start-up as a service that "did not answer", with not one
+    // request sent.
+    let sources = plan.host.connect().await?;
     let timeout = plan.timeout;
-    tokio::time::timeout(timeout, bring_up_now(plan, runtime))
+    tokio::time::timeout(timeout, bring_up_now(plan, sources, runtime))
         .await
         .unwrap_or_else(|_| {
             Err(format!(
@@ -231,8 +239,11 @@ async fn bring_up(plan: Plan, runtime: tokio::runtime::Handle) -> Outcome {
         })
 }
 
-async fn bring_up_now(plan: Plan, runtime: tokio::runtime::Handle) -> Outcome {
-    let sources = plan.host.connect().await?;
+async fn bring_up_now(
+    plan: Plan,
+    sources: Arc<dyn crate::embed::Sources>,
+    runtime: tokio::runtime::Handle,
+) -> Outcome {
     let store = crate::native::store::open_at(
         &plan.store,
         plan.profile.store_memory_bytes,
@@ -433,7 +444,8 @@ mod tests {
     }
 
     /// A host whose service never answers — the network a phone has in a
-    /// lift, or a captive portal.
+    /// lift, or a captive portal. Its credentials are at hand: what stalls
+    /// is the service they are for.
     struct Stalled;
 
     #[async_trait::async_trait]
@@ -451,7 +463,32 @@ mod tests {
             vec![ImageryChoice::new("a", "A", 2, "©")]
         }
         async fn connect(&self) -> Result<Arc<dyn crate::embed::Sources>, String> {
-            std::future::pending().await
+            Ok(Arc::new(Origin(Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ))))
+        }
+    }
+
+    /// One that takes `0` to find its credentials: the Keychain asking the
+    /// person whether this build may read the token.
+    struct Asking(Duration);
+
+    #[async_trait::async_trait]
+    impl ViewerHost for Asking {
+        fn identity(&self) -> crate::embed::Identity {
+            crate::embed::Identity::default()
+        }
+        fn terrain(&self) -> TerrainChoice {
+            Stalled.terrain()
+        }
+        fn imagery(&self) -> Vec<ImageryChoice> {
+            Stalled.imagery()
+        }
+        async fn connect(&self) -> Result<Arc<dyn crate::embed::Sources>, String> {
+            tokio::time::sleep(self.0).await;
+            Ok(Arc::new(Origin(Arc::new(
+                std::sync::atomic::AtomicBool::new(true),
+            ))))
         }
     }
 
@@ -538,6 +575,33 @@ mod tests {
                 .is_some_and(|why| why.contains("did not answer")),
             "a stalled start-up was not called off"
         );
+        runtime.shutdown_background();
+    }
+
+    /// **The time a person takes to let the application read its token is
+    /// not the network's.** A host that finds its credentials after longer
+    /// than the start-up's window, with a service that answers at once,
+    /// starts. Red with the credentials looked for inside the window: the
+    /// start-up was called off as a service that "did not answer", before a
+    /// single request — Tuile.app on 22 November, its Keychain dialog
+    /// answered twenty seconds after it opened.
+    #[test]
+    fn the_time_spent_finding_the_credentials_is_not_the_network_s() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut asking = plan(Arc::new(Asking(Duration::from_millis(2500))));
+        asking.store = dir.path().join("store");
+        asking.profile.store_memory_bytes = 1 << 20;
+        asking.profile.store_disk_bytes = 64 << 20;
+        asking.timeout = Duration::from_secs(2);
+        let started = start(runtime.handle(), asking)
+            .wait()
+            .expect("a start-up whose credentials took their time");
+        started.close(Duration::from_secs(10), true);
         runtime.shutdown_background();
     }
 
