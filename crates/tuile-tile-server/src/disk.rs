@@ -83,6 +83,12 @@ pub struct DiskCacheConfig {
     /// A read waits for the copy of an archive up to this size rather than
     /// reading it by ranges alongside the copy. `0`: never wait.
     pub await_copy_bytes: u64,
+    /// Reads of a zone from the bucket before its archives are copied whole:
+    /// `1` copies a zone on its first read. Where most zones are read once
+    /// (a server whose clients spread over the globe, a walk over a layer),
+    /// a copy per read downloads whole archives for one tile each; a zone
+    /// read again is the one worth holding. `0` is taken as `1`.
+    pub copy_after_reads: u32,
 }
 
 impl DiskCacheConfig {
@@ -94,6 +100,7 @@ impl DiskCacheConfig {
             max_archive_bytes: DEFAULT_MAX_ARCHIVE_BYTES,
             prefetch_neighbours: false,
             await_copy_bytes: DEFAULT_AWAIT_COPY_BYTES,
+            copy_after_reads: 1,
         }
     }
 }

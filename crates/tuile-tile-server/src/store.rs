@@ -305,6 +305,10 @@ struct Manifests {
 /// Zones remembered as already prefetched, so a busy zone does not schedule
 /// its neighbours on every read.
 const PREFETCHED_ZONES: u64 = 100_000;
+/// Zones whose reads from the bucket are counted towards their copy
+/// ([`crate::DiskCacheConfig::copy_after_reads`]); past it the least recently
+/// read start again from zero.
+const COUNTED_ZONES: u64 = 100_000;
 /// Tiles of one publication checked against the store at once, unless
 /// `TUILE_DEDUP` says.
 const DEDUP_IN_FLIGHT: usize = 32;
@@ -327,6 +331,8 @@ pub struct TileStore {
     /// Whole archives copied to local disk, if configured.
     disk: Option<Arc<ArchiveCache>>,
     prefetched: Mutex<Lru<ZoneKey, ()>>,
+    /// Reads from the bucket of each zone not yet copied.
+    zone_reads: Mutex<Lru<ZoneKey, u32>>,
     zone_locks: Mutex<HashMap<ZoneKey, Arc<tokio::sync::Mutex<()>>>>,
     fault: AtomicU8,
     gate: Mutex<Option<Arc<Gate>>>,
@@ -417,6 +423,7 @@ impl TileStore {
             readers: Mutex::new(Lru::new(reader_cache)),
             disk: None,
             prefetched: Mutex::new(Lru::new(PREFETCHED_ZONES)),
+            zone_reads: Mutex::new(Lru::new(COUNTED_ZONES)),
             zone_locks: Mutex::default(),
             fault: AtomicU8::new(Fault::None as u8),
             gate: Mutex::default(),
@@ -1001,7 +1008,7 @@ impl TileStore {
             .rev()
             .filter(|a| !l.is_expired(&a.epoch, now))
             .collect();
-        if !live.iter().all(|a| self.disk_reader(&a.key).is_some()) {
+        if !live.iter().all(|a| self.disk_reader(&a.key).is_some()) && self.read_enough(&key) {
             // A read of this zone from the bucket: copy it whole, so the next
             // read of any of its tiles is local — and this one too, when the
             // archives are small enough to be worth waiting for.
@@ -1081,6 +1088,30 @@ impl TileStore {
             return Ok((local.get_tile(pmtiles::TileId::new(id)?).await?, true));
         }
         Ok((self.read_tile(archive_key, id).await?, false))
+    }
+
+    /// Counts a read of a zone from the bucket, and says whether the zone has
+    /// now been read often enough to be copied
+    /// ([`crate::DiskCacheConfig::copy_after_reads`]).
+    fn read_enough(&self, key: &ZoneKey) -> bool {
+        let Some(disk) = &self.disk else {
+            return false;
+        };
+        let after = disk.cfg.copy_after_reads.max(1);
+        if after == 1 {
+            return true;
+        }
+        let Ok(mut reads) = self.zone_reads.lock() else {
+            return true;
+        };
+        // Kept once reached: a read while the copy is in flight joins it, and
+        // a zone evicted from disk is copied again on its next read.
+        let n = reads.get(key).unwrap_or(0).saturating_add(1).min(after);
+        reads.insert(key.clone(), n, 1);
+        if n < after {
+            metrics::counter!("tuile_tiles_archive_copies_deferred_total").increment(1);
+        }
+        n >= after
     }
 
     /// Starts local copies of a zone's archives and, if configured, of the

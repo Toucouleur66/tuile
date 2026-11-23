@@ -405,6 +405,52 @@ async fn a_zone_s_second_tile_is_read_from_local_disk() {
     assert_eq!(s.stats().remote, 2);
 }
 
+/// A zone read once is read by ranges and never copied; its second read
+/// copies it, and the reads after that are local.
+#[tokio::test]
+async fn a_zone_is_copied_only_once_read_often_enough() {
+    let clock = TestClock::new();
+    let objects = memory();
+    two_zones(objects.clone(), &clock, 16).await;
+    let dir = tempfile::tempdir().expect("dir");
+    let counted = Counting::over(objects);
+    let s = with_disk(
+        counted.clone(),
+        &clock,
+        DiskCacheConfig {
+            copy_after_reads: 2,
+            ..DiskCacheConfig::new(dir.path())
+        },
+    )
+    .await;
+
+    // The zone east, read once: never copied.
+    let (x, y) = in_zone(0);
+    assert_eq!(
+        s.get(IMAGERY, LEVEL, x + ZONE_SIDE, y).await.expect("get"),
+        Some(body(LEVEL, x + ZONE_SIDE, y, 1))
+    );
+    s.settle().await;
+    assert_eq!(count_files(dir.path()), 0, "a zone read once is not copied");
+    assert_eq!((s.stats().disk, s.stats().remote), (0, 1));
+
+    // The test zone, read twice: the second read copies it, and waits for
+    // the copy as any read of a small zone does.
+    s.get(IMAGERY, LEVEL, x, y).await.expect("get");
+    assert_eq!(count_files(dir.path()), 0, "nor on its first read");
+    let (x1, y1) = in_zone(1);
+    assert_eq!(
+        s.get(IMAGERY, LEVEL, x1, y1).await.expect("get"),
+        Some(body(LEVEL, x1, y1, 1))
+    );
+    assert_eq!(count_files(dir.path()), 1, "copied on its second read");
+    let before = s.stats();
+    let (x2, y2) = in_zone(2);
+    s.get(IMAGERY, LEVEL, x2, y2).await.expect("get");
+    assert_eq!(s.stats().disk, before.disk + 1, "and local from then on");
+    assert_eq!(s.stats().remote, before.remote);
+}
+
 #[tokio::test]
 async fn the_disk_budget_evicts_the_least_recently_read_zone() {
     let clock = TestClock::new();
