@@ -49,6 +49,11 @@ url = { workspace = true }
 # encoder, built from its C sources (no system library): lossy WebP, which
 # image's own encoder does not write.
 webp = { version = "0.3", default-features = false }
+# A parent layer's JPEG children, decoded straight into RGB: the decoder
+# `image` already uses for JPEG (same versions as its own), without its
+# second header pass and its copy. SIMD (AVX2, NEON) chosen at run time.
+zune-core = "0.5"
+zune-jpeg = "0.5.15"
 
 [dev-dependencies]
 # Counters read back in the tests, from a recorder of the test's own thread.

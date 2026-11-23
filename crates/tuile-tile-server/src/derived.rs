@@ -37,7 +37,22 @@
 //! served until it does.
 //!
 //! **Deterministic.** The same four children give the same bytes: an
-//! integer downsample, and libwebp's encoder on one thread.
+//! integer downsample, and libwebp's encoder on one thread — the same bytes
+//! on x86-64 (SSE2) and aarch64 (NEON), measured.
+//!
+//! **Fast.** A build is decode ×4, downsample, encode, on a blocking
+//! thread. The codecs are the fastest measured for it (`lab/derived-codecs`,
+//! real imagery, one 256² parent tile, AVX2 server core / Apple M2):
+//!
+//! - JPEG children: zune-jpeg (pure Rust, AVX2/NEON chosen at run time),
+//!   straight into RGB — a third less than through `image`, which parses the
+//!   headers twice and copies the picture. libjpeg-turbo is a further ~15 %
+//!   of the decode (≈ 0.1 ms a tile), not worth a C build and `nasm`;
+//! - WebP: libwebp, the reference and the fastest lossy encoder. Its SSE2
+//!   code is always built on x86-64 and chosen at run time; SSE4.1 and AVX2
+//!   builds gain nothing measurable on lossy encoding, so none is asked for;
+//! - the encoder's effort ([`DEFAULT_WEBP_METHOD`]) is what costs: method 2
+//!   takes half the time of libwebp's default 4 for 0.9 % more bytes.
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, Weak};
@@ -54,6 +69,11 @@ use crate::StoreError;
 
 /// Default for [`ParentConfig::webp_quality`]: libwebp's lossy quality.
 pub const DEFAULT_WEBP_QUALITY: f32 = 85.0;
+/// Default for [`ParentConfig::webp_method`]: libwebp's method 2, half the
+/// encoding time of its default 4 for 0.9 % more bytes (PSNR −0.3 dB), on
+/// aerial imagery at quality 85. Method 3 costs what 4 does; 0 and 1 save
+/// another third for 4–5 % more bytes.
+pub const DEFAULT_WEBP_METHOD: u8 = 2;
 /// Default for [`ParentConfig::builds`].
 pub const DEFAULT_BUILDS: usize = 8;
 
@@ -62,6 +82,8 @@ pub const DEFAULT_BUILDS: usize = 8;
 pub struct ParentConfig {
     /// libwebp's lossy quality, 0 to 100.
     pub webp_quality: f32,
+    /// libwebp's effort, 0 (fastest) to 6 (smallest): its `method`.
+    pub webp_method: u8,
     /// Tiles being made at once, per parent layer: what bounds the memory
     /// of the builds (each holds four children and their pictures), and the
     /// children asked of the source at once (four a build).
@@ -72,6 +94,7 @@ impl Default for ParentConfig {
     fn default() -> Self {
         Self {
             webp_quality: DEFAULT_WEBP_QUALITY,
+            webp_method: DEFAULT_WEBP_METHOD,
             builds: DEFAULT_BUILDS,
         }
     }
@@ -156,31 +179,46 @@ pub fn downsample(children: [&[u8]; 4], side: usize) -> Vec<u8> {
     }
     let to_srgb = linear_to_srgb_table();
     let half = side / 2;
-    let mut out = vec![0u8; side * side * 3];
-    for py in 0..side {
-        for px in 0..side {
-            let child = children[usize::from(px >= half) + 2 * usize::from(py >= half)];
-            let (cx, cy) = (2 * (px % half), 2 * (py % half));
-            for ch in 0..3 {
-                let at = |x: usize, y: usize| {
-                    u32::from(SRGB_TO_LINEAR[usize::from(child[(y * side + x) * 3 + ch])])
-                };
-                let sum = at(cx, cy) + at(cx + 1, cy) + at(cx, cy + 1) + at(cx + 1, cy + 1);
-                out[(py * side + px) * 3 + ch] = to_srgb[((sum + 2) / 4) as usize];
+    let row = side * 3;
+    let mut out = vec![0u8; side * row];
+    // Row by row: each pair of child rows summed in linear light, channel
+    // by channel, then each pair of columns of that sum. Each child pixel
+    // is read once, in order, and the inner loops have no index to check.
+    let mut pair = vec![0u32; row];
+    for (q, child) in children.iter().enumerate() {
+        let (ox, oy) = ((q & 1) * half, (q >> 1) * half);
+        for r in 0..half {
+            let above = &child[2 * r * row..][..row];
+            let below = &child[(2 * r + 1) * row..][..row];
+            for ((sum, &a), &b) in pair.iter_mut().zip(above).zip(below) {
+                *sum = u32::from(SRGB_TO_LINEAR[usize::from(a)])
+                    + u32::from(SRGB_TO_LINEAR[usize::from(b)]);
+            }
+            let parent = &mut out[((oy + r) * side + ox) * 3..][..half * 3];
+            for (px, sums) in parent
+                .as_chunks_mut::<3>()
+                .0
+                .iter_mut()
+                .zip(pair.as_chunks::<6>().0)
+            {
+                for ch in 0..3 {
+                    px[ch] = to_srgb[((sums[ch] + sums[3 + ch] + 2) / 4) as usize];
+                }
             }
         }
     }
     out
 }
 
-/// A picture as WebP, lossy, at `quality`, on one thread: the same bytes
-/// for the same picture.
-pub fn encode_webp(rgb: &[u8], side: u32, quality: f32) -> Result<Vec<u8>, String> {
+/// A picture as WebP, lossy, at `quality` and libwebp's `method` (0–6), on
+/// one thread: the same bytes for the same picture.
+pub fn encode_webp(rgb: &[u8], side: u32, quality: f32, method: u8) -> Result<Vec<u8>, String> {
     let mut config =
         webp::WebPConfig::new().map_err(|()| "libwebp: no default configuration".to_string())?;
     config.lossless = 0;
     config.quality = quality;
     config.thread_level = 0;
+    config.method = i32::from(method.min(6));
     let encoded = webp::Encoder::from_rgb(rgb, side, side)
         .encode_advanced(&config)
         .map_err(|e| format!("libwebp: {e:?}"))?;
@@ -217,6 +255,7 @@ pub struct ParentLayer {
     is_empty: IsEmpty,
     builds: Semaphore,
     webp_quality: f32,
+    webp_method: u8,
 }
 
 impl ParentLayer {
@@ -232,6 +271,7 @@ impl ParentLayer {
             is_empty,
             builds: Semaphore::new(cfg.builds.max(1)),
             webp_quality: cfg.webp_quality,
+            webp_method: cfg.webp_method,
         }
     }
 
@@ -279,36 +319,63 @@ impl Drop for InFlight {
     }
 }
 
+/// A child's picture: width, height, and its pixels as RGB, row by row.
+///
+/// A JPEG — what imagery sources send — goes straight from zune-jpeg into
+/// RGB: the decoder `image` itself uses, without its second pass over the
+/// headers and its copy of the picture, so the same pixels. Any other
+/// format, or a JPEG that is not colour (greyscale, CMYK), goes through
+/// `image`.
+fn decode_rgb(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
+    use zune_core::colorspace::ColorSpace;
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        let options = zune_core::options::DecoderOptions::default()
+            .set_strict_mode(false)
+            .jpeg_set_out_colorspace(ColorSpace::RGB);
+        let mut decoder = zune_jpeg::JpegDecoder::new_with_options(
+            zune_core::bytestream::ZCursor::new(bytes),
+            options,
+        );
+        decoder.decode_headers().map_err(|e| e.to_string())?;
+        if matches!(
+            decoder.input_colorspace(),
+            Some(ColorSpace::YCbCr | ColorSpace::RGB)
+        ) {
+            let (w, h) = decoder.dimensions().ok_or("a JPEG without dimensions")?;
+            let mut rgb = vec![0u8; w * h * 3];
+            decoder.decode_into(&mut rgb).map_err(|e| e.to_string())?;
+            return Ok((w as u32, h as u32, rgb));
+        }
+    }
+    let picture = image::load_from_memory(bytes)
+        .map_err(|e| e.to_string())?
+        .into_rgb8();
+    Ok((picture.width(), picture.height(), picture.into_raw()))
+}
+
 /// Decodes four children, checks they are one size, and makes the parent.
-fn make(children: &[Bytes], quality: f32) -> Result<Vec<u8>, String> {
+fn make(children: &[Bytes], quality: f32, method: u8) -> Result<Vec<u8>, String> {
     let mut pictures = Vec::with_capacity(4);
     for (i, bytes) in children.iter().enumerate() {
-        let picture = image::load_from_memory(bytes)
-            .map_err(|e| format!("child {i}: {e}"))?
-            .to_rgb8();
-        pictures.push(picture);
+        pictures.push(decode_rgb(bytes).map_err(|e| format!("child {i}: {e}"))?);
     }
-    let side = pictures[0].width();
-    if !side.is_multiple_of(2)
-        || pictures
-            .iter()
-            .any(|p| p.width() != side || p.height() != side)
-    {
-        let sizes: Vec<_> = pictures.iter().map(|p| (p.width(), p.height())).collect();
+    let side = pictures[0].0;
+    if !side.is_multiple_of(2) || pictures.iter().any(|p| p.0 != side || p.1 != side) {
+        let sizes: Vec<_> = pictures.iter().map(|p| (p.0, p.1)).collect();
         return Err(format!(
             "children are not four squares of one even side: {sizes:?}"
         ));
     }
     let rgb = downsample(
         [
-            pictures[0].as_raw(),
-            pictures[1].as_raw(),
-            pictures[2].as_raw(),
-            pictures[3].as_raw(),
+            &pictures[0].2,
+            &pictures[1].2,
+            &pictures[2].2,
+            &pictures[3].2,
         ],
         side as usize,
     );
-    encode_webp(&rgb, side, quality)
+    encode_webp(&rgb, side, quality, method)
 }
 
 #[async_trait]
@@ -354,8 +421,8 @@ impl Upstream for ParentLayer {
         if bytes.iter().any(|b| (self.is_empty)(b)) {
             return self.empty(EmptyCause::ChildEmptyImagery);
         }
-        let quality = self.webp_quality;
-        let made = tokio::task::spawn_blocking(move || make(&bytes, quality))
+        let (quality, method) = (self.webp_quality, self.webp_method);
+        let made = tokio::task::spawn_blocking(move || make(&bytes, quality, method))
             .await
             .map_err(|e| UpstreamError(format!("a build: {e}")))
             .and_then(|r| r.map_err(|e| UpstreamError(format!("{}: {e}", self.layer))));
@@ -561,6 +628,102 @@ mod tests {
         assert!(
             SRGB_TO_LINEAR.windows(2).all(|w| w[0] < w[1]),
             "strictly increasing"
+        );
+    }
+
+    /// A child as a source sends it: a JPEG of `side × side`, made from a
+    /// seeded mix of gradients and grain, so it compresses like imagery and
+    /// every build of every platform makes the same bytes.
+    fn jpeg_child(seed: u32, side: u32) -> Bytes {
+        let mut state = seed.wrapping_mul(2_654_435_761).max(1);
+        let mut grain = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state >> 24) as u8 / 8
+        };
+        let mut rgb = Vec::with_capacity((side * side * 3) as usize);
+        for y in 0..side {
+            for x in 0..side {
+                let base = [
+                    (x * 255 / side) as u8,
+                    (y * 255 / side) as u8,
+                    ((x + y + seed * 37) % 256) as u8,
+                ];
+                rgb.extend(base.map(|c| c.saturating_add(grain())));
+            }
+        }
+        let mut out = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85)
+            .encode(&rgb, side, side, image::ExtendedColorType::Rgb8)
+            .expect("a JPEG");
+        Bytes::from(out)
+    }
+
+    fn sha256(bytes: &[u8]) -> String {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    fn four_children() -> Vec<Bytes> {
+        (1..=4).map(|seed| jpeg_child(seed, 256)).collect()
+    }
+
+    /// The parent of `children`, made as a default parent layer makes it.
+    fn made(children: &[Bytes]) -> Vec<u8> {
+        make(children, DEFAULT_WEBP_QUALITY, DEFAULT_WEBP_METHOD).expect("a parent")
+    }
+
+    #[test]
+    fn the_same_children_make_the_same_bytes_twice_and_across_threads() {
+        let children = Arc::new(four_children());
+        let first = made(&children);
+        assert_eq!(made(&children), first, "twice");
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let children = Arc::clone(&children);
+                std::thread::spawn(move || made(&children))
+            })
+            .collect();
+        for t in threads {
+            assert_eq!(t.join().expect("a thread"), first, "across threads");
+        }
+    }
+
+    /// The downsample of four known children, pinned: a faster downsample
+    /// must give the same pictures, pixel for pixel.
+    #[test]
+    fn the_downsample_is_pinned() {
+        let pictures: Vec<Vec<u8>> = four_children()
+            .iter()
+            .map(|b| {
+                image::load_from_memory(b)
+                    .expect("a child")
+                    .into_rgb8()
+                    .into_raw()
+            })
+            .collect();
+        let parent = downsample(
+            [&pictures[0], &pictures[1], &pictures[2], &pictures[3]],
+            256,
+        );
+        assert_eq!(
+            sha256(&parent),
+            "fd8d4d0cf528a0dc784fef2dd6c018f96fc6b93fd267a73f3e7ee51f8dd4793a"
+        );
+    }
+
+    /// The tile four known children make, pinned: what changes these bytes
+    /// changes every parent tile made from now on (the old ones are kept
+    /// until a child changes).
+    #[test]
+    fn the_parent_tile_is_pinned() {
+        assert_eq!(
+            sha256(&made(&four_children())),
+            "a26f741f8b9c2e918202bf4250d45c88c831f2b639cc90ab445420012ee4434f"
         );
     }
 
