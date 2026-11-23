@@ -717,7 +717,18 @@ pub(crate) fn upload_texture(gpu: &GpuContext, t: &DecodedTexture) -> GpuImagery
         Texels::Blocks { format, levels } => upload_blocks(gpu, t, *format, levels)
             .unwrap_or_else(|| upload_rgba8(gpu, &DecodedTexture::stand_in(), &[])),
         Texels::Rgba8 { resident, .. } => {
-            let mips = raster::mip_chain(t);
+            // Built off the render thread when it could be (`crate::chains`):
+            // the same chain either way.
+            let mips = match gpu.chains.take(t) {
+                Some(mips) => {
+                    crate::ops::OpCounters::add(&gpu.ops.chains_ready, 1);
+                    mips
+                }
+                None => {
+                    crate::ops::OpCounters::add(&gpu.ops.chains_inline, 1);
+                    raster::mip_chain(t)
+                }
+            };
             if let Some(format) = resident.block() {
                 if let Some(encoded) = encode(gpu, t, &mips, format) {
                     return encoded;

@@ -187,6 +187,9 @@ pub struct GpuContext {
     /// What the upload and release path asked of the device: see
     /// [`Self::upload_ops`].
     pub(crate) ops: crate::ops::OpCounters,
+    /// The CPU mip chains of what is about to be uploaded, built off the
+    /// render thread: see [`crate::chains`].
+    pub(crate) chains: crate::chains::Chains,
 }
 
 impl GpuContext {
@@ -320,6 +323,7 @@ impl GpuContext {
             imagery_plan: ImageryPlan::RGBA8,
             compressor: None,
             ops: crate::ops::OpCounters::default(),
+            chains: crate::chains::Chains::default(),
         }
     }
 

@@ -101,6 +101,10 @@ ops! {
     readbacks,
     /// `device.poll` calls on the upload path.
     polls,
+    /// CPU mip chains an upload had to build on the render thread, and
+    /// those it found built off it (`crate::chains`).
+    chains_inline,
+    chains_ready,
 }
 
 impl OpCounters {

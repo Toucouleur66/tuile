@@ -3,6 +3,7 @@
 
 #![doc = include_str!("../README.md")]
 
+mod chains;
 mod compress;
 mod context;
 mod encode;

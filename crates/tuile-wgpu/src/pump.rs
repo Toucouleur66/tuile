@@ -186,6 +186,9 @@ pub struct ContentPump {
     drawn_tiles: std::collections::HashSet<TileId>,
     /// See [`Self::totals`].
     totals: PumpTotals,
+    /// Deliveries dropped from the queue unuploaded — cancelled, evicted or
+    /// replaced — whose chains the next upload step lets go of.
+    dropped: Vec<ResourceContent>,
 }
 
 /// Frames a tile takes to slide to its new edge when what is drawn beside it
@@ -235,6 +238,14 @@ impl ContentPump {
             contents: None,
             drawn_tiles: std::collections::HashSet::new(),
             totals: PumpTotals::default(),
+            dropped: Vec::new(),
+        }
+    }
+
+    /// Lets go of the chains built for deliveries that left the queue.
+    fn forget_dropped(&mut self, gpu: &GpuContext) {
+        for content in self.dropped.drain(..) {
+            gpu.chains.forget(&content);
         }
     }
 
@@ -570,6 +581,24 @@ impl ContentPump {
             .to_vec();
         let mut deferred = (order.len() - taken.len()) as u32;
         let began = web_time::Instant::now();
+        // The chains of what this frame takes, built across threads; those
+        // of what waits behind it, in the background for its frame.
+        self.forget_dropped(gpu);
+        {
+            let now: Vec<&ResourceContent> = taken
+                .iter()
+                .filter_map(|r| self.queue.get(r).map(|q| &q.content))
+                .collect();
+            gpu.chains.build_now(&now);
+            let next: std::collections::HashSet<ResourceId> = taken.iter().copied().collect();
+            gpu.chains.ahead(
+                order
+                    .iter()
+                    .filter(|r| !next.contains(r))
+                    .take(crate::chains::AHEAD)
+                    .filter_map(|r| self.queue.get(r).map(|q| &q.content)),
+            );
+        }
         let mut uploaded: Vec<(ResourceId, Bytes)> = Vec::with_capacity(taken.len());
         let mut moved = 0u64;
         // The GPU encodes have a share of their own: the blocks this frame
@@ -601,9 +630,13 @@ impl ContentPump {
                 ResourceContent::Mesh(m) => m.cost().staging.0,
                 ResourceContent::Drape(d) => d.cost().staging.0,
             };
+            // Whatever was built for it and not used goes with it.
+            let content = q.content.clone();
             // Recorded as what the upload moved: the frame's deadline is in
             // those bytes (I18).
-            if self.upload_one(stream, gpu, r, q).is_some() {
+            let done = self.upload_one(stream, gpu, r, q);
+            gpu.chains.forget(&content);
+            if done.is_some() {
                 uploaded.push((r, Bytes(staging)));
                 moved += staging;
                 self.totals.upload_bytes += staging;
@@ -825,7 +858,7 @@ impl ContentPump {
                 content,
             } => {
                 self.ancestry.insert(resource.tile(), ancestry);
-                self.queue.insert(
+                if let Some(was) = self.queue.insert(
                     resource,
                     Queued {
                         gen,
@@ -834,7 +867,9 @@ impl ContentPump {
                         arrived: web_time::Instant::now(),
                         arrived_frame: self.frame,
                     },
-                );
+                ) {
+                    self.dropped.push(was.content);
+                }
                 tuile_core::metrics::metrics()
                     .pending_uploads
                     .set(self.queue.len() as u64);
@@ -844,7 +879,9 @@ impl ContentPump {
             ServerMessage::Cancel { resources } => {
                 for (r, g) in resources {
                     if self.queue.get(&r).is_some_and(|q| q.gen == g) {
-                        self.queue.remove(&r);
+                        if let Some(was) = self.queue.remove(&r) {
+                            self.dropped.push(was.content);
+                        }
                     }
                 }
             }
@@ -879,7 +916,9 @@ impl ContentPump {
                     // A copy still queued goes too: uploaded after its own
                     // eviction it would be held for ever, the server no
                     // longer counting it.
-                    self.queue.remove(r);
+                    if let Some(was) = self.queue.remove(r) {
+                        self.dropped.push(was.content);
+                    }
                 }
                 // A mesh dressed with an evicted drape lets go of its
                 // textures: it is dressed again when it is next drawn.
