@@ -2107,6 +2107,19 @@ impl Budget {
         self.arena.protected()
     }
 
+    /// How long a load of `failures` timed-out attempts before may take: the
+    /// configured timeout, doubled for each attempt it already lost to the
+    /// timeout, up to eight times. An origin slower than the timeout is
+    /// otherwise cancelled at the same instant on every retry, and what it
+    /// would have served never lands: the drape loads stay in flight, cancelled
+    /// and restarted, and the ground is never dressed. Doubling bounds the
+    /// waste — the same attempt restarted at most three times before it is
+    /// given eight times as long — and leaves a healthy origin's timeout as
+    /// it was (no failure, no change).
+    fn load_timeout_after(timeout: Micros, failures: u32) -> Micros {
+        Micros(timeout.0.saturating_mul(1u64 << failures.min(3)))
+    }
+
     fn cancel(&mut self, now: Micros, eff: &Eff, d: &mut Decisions, st: &mut BudgetStats) {
         let grace = self.cfg.cancel_grace;
         let timeout = self.cfg.load_timeout;
@@ -2134,7 +2147,8 @@ impl Budget {
                 for &s in self.arena.active() {
                     let r = self.arena.id(s);
                     if let Load::Loading { started, .. } = self.arena.load(s) {
-                        self.down.deadline(started.plus(timeout), r);
+                        let t = Self::load_timeout_after(timeout, self.arena.cold(s).failures);
+                        self.down.deadline(started.plus(t), r);
                     }
                     if let Some(u) = self.arena.cold(s).unneeded_since() {
                         self.down.deadline(u.plus(grace), r);
@@ -2155,7 +2169,8 @@ impl Budget {
                         continue;
                     };
                     if let Load::Loading { started, .. } = self.arena.load(s) {
-                        self.down.deadline(started.plus(timeout), *r);
+                        let t = Self::load_timeout_after(timeout, self.arena.cold(s).failures);
+                        self.down.deadline(started.plus(t), *r);
                     }
                     if let Some(u) = self.arena.cold(s).unneeded_since() {
                         self.down.deadline(u.plus(grace), *r);
@@ -2181,7 +2196,8 @@ impl Budget {
                     .cold(s)
                     .unneeded_since()
                     .is_some_and(|u| now.since(u) >= grace);
-                let timed_out = now.since(started) >= timeout;
+                let timed_out = now.since(started)
+                    >= Self::load_timeout_after(timeout, self.arena.cold(s).failures);
                 if (unneeded && !batch) || timed_out {
                     self.arena.set_load(s, Load::Idle);
                     match source {
@@ -2365,7 +2381,9 @@ impl Budget {
             if let Some(l) = r.layer() {
                 st.layers.requests[layer_index(l)][usize::from(source == Source::Network)] += 1;
             }
-            self.deadline(now.plus(self.cfg.load_timeout), *r);
+            let timeout =
+                Self::load_timeout_after(self.cfg.load_timeout, self.arena.cold(s).failures);
+            self.deadline(now.plus(timeout), *r);
             match source {
                 Source::Network => {
                     self.in_flight[class] += 1;

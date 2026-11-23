@@ -1007,3 +1007,36 @@ fn the_globe_and_a_city_share_one_budget() {
         gib(with.peak[Class::Tiles3dMesh])
     );
 }
+
+/// An imagery origin slower than the load timeout still delivers. Every
+/// drape here takes 5 s, the desktop's timeout is 4 s: a load cancelled on
+/// its timeout and restarted with the same timeout never lands, and the
+/// ground is never dressed — what a throttled or distant origin did to the
+/// viewer (16 drape loads in flight for ever, the imagery under its need).
+#[test]
+fn an_origin_slower_than_the_load_timeout_still_delivers() {
+    let mut profile = Profile::desktop();
+    profile.net.imagery.base_ms = 5_000.0;
+    profile.net.imagery.jitter_ms = 0.0;
+    profile.net.imagery.fail_permille = 0;
+    profile.net.imagery.stall_permille = 0;
+    profile.net.meshes.stall_permille = 0;
+    assert!(profile.budget.load_timeout < Micros::from_secs(5));
+    let mut sim = Sim::unchecked(profile, 3);
+    let cam = Camera {
+        x: 0.6 * SIDE,
+        y: 0.5 * SIDE,
+        h: 2_000.0,
+        heading: 0.0,
+        pitch: 20f64.to_radians(),
+    };
+    let mut dressed = 0usize;
+    while sim.now < Micros::from_secs(60) {
+        let (_, d) = sim.step(cam);
+        dressed = d.draw.items.iter().filter(|i| !i.drapes.is_empty()).count();
+    }
+    assert!(
+        dressed > 0,
+        "{RED}: after 60 s of a still view, no drawn tile wears any drape"
+    );
+}
