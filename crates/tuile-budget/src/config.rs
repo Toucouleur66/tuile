@@ -22,6 +22,38 @@ pub enum FailurePolicy {
     },
 }
 
+/// The numbers of the origins' reachability: when an origin whose loads
+/// keep failing is held to one probe at a time, and how far apart its probes
+/// are (`origin`, the budget's reachability module).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct OriginBackoff {
+    /// Failed network loads of one origin in a row, with no answer between
+    /// them, after which it is down.
+    pub down_after: u32,
+    /// The delay before the second probe of a down origin (the first goes
+    /// at once); it doubles from there.
+    pub probe_first: Micros,
+    /// The ceiling of the doubling. Jitter adds up to as much again, so two
+    /// probes of a down origin are never more than twice this apart.
+    pub probe_max: Micros,
+}
+
+impl OriginBackoff {
+    /// Three failures in a row; probes from 500 ms, doubling to 2 s (4 s
+    /// apart at most, with the jitter): a network back is seen within 4 s,
+    /// for one request every 2 to 4 s per origin while it is out.
+    pub const DEFAULT: Self = OriginBackoff {
+        down_after: 3,
+        probe_first: Micros::from_millis(500),
+        probe_max: Micros::from_secs(2),
+    };
+
+    /// Whether the numbers can run.
+    pub fn is_valid(&self) -> bool {
+        self.down_after > 0 && self.probe_first > Micros::ZERO && self.probe_first <= self.probe_max
+    }
+}
+
 /// Time-based LOD relaxation (`sse_scale`), in thousandths per second, so it
 /// behaves the same at 30 and at 120 frames per second.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -164,6 +196,9 @@ pub struct BudgetConfig {
     pub imagery_tile_px: u32,
     /// What a failed load does.
     pub failure: FailurePolicy,
+    /// When an origin is down, and how it is probed until it answers.
+    /// Interactive only: a batch ends on its first failure.
+    pub origin: OriginBackoff,
     /// A load that has waited this long gets the full age bonus.
     pub age_full: Micros,
     /// The pooled ledger (D-A3): the ground's terrain and imagery, in a
@@ -256,6 +291,7 @@ impl BudgetConfig {
                 first: Micros::from_millis(500),
                 max: Micros::from_secs(30),
             },
+            origin: OriginBackoff::DEFAULT,
             age_full: Micros::from_secs(2),
             pool,
             reserved: PerClass::splat(Bytes::ZERO),
@@ -298,6 +334,7 @@ impl BudgetConfig {
             max_drape_side: 2_048,
             imagery_tile_px: 256,
             failure: FailurePolicy::EndSession,
+            origin: OriginBackoff::DEFAULT,
             age_full: Micros::from_secs(2),
             pool: Pool::NONE,
             reserved: PerClass::splat(Bytes::ZERO),
@@ -353,6 +390,9 @@ impl BudgetConfig {
             if first > max || first == Micros::ZERO {
                 return Err(ConfigError::Backoff);
             }
+        }
+        if !self.origin.is_valid() {
+            return Err(ConfigError::OriginBackoff);
         }
         if self.policy == Policy::Batch && self.failure != FailurePolicy::EndSession {
             return Err(ConfigError::BatchMustEndOnFailure);

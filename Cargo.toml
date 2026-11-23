@@ -101,6 +101,9 @@ libm = "0.2.16"
 # The budget's resource index (`tuile-budget`'s arena): the hash table std's
 # own map is built on, keyed by an index into the arena's columns, hashed with
 # a fixed seed — probed, never iterated. no_std, wasm-clean.
+# Capped exponential backoff with jitter, seeded (the budget's origin probes):
+# no_std without its default features, no runtime, builds for wasm.
+backon = { version = "1.6.0", default-features = false }
 hashbrown = { version = "0.16.1", default-features = false, features = ["inline-more"] }
 foldhash = { version = "0.2.0", default-features = false }
 bytes = "1.11.1"

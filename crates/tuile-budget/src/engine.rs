@@ -48,6 +48,7 @@ use super::imagery::{
 };
 use super::need::{LayerReach, Membership};
 use super::need_state::{NeedState, TileNeed, WantedImagery};
+use super::origin::Origin;
 use super::priority::{score, PriorityKey, Quantised, Urgency};
 use super::sorted::SortedMap;
 use super::state::{Arena, CpuCopy, EvictKey, Gpu, Held, Load, Mark, Rank, Slot, Transit};
@@ -285,6 +286,8 @@ pub(super) struct WalkedLevels {
 /// once they have grown to the view.
 #[derive(Debug, Default)]
 pub(super) struct Scratch {
+    /// The slots of an origin that came back, read by `retry_origin`.
+    pub(super) origin_due: Vec<Slot>,
     /// The walked part of the last step's statistics per level and
     /// layer (`level_stats`), kept for the still steps that read it again.
     walked_levels: Option<WalkedLevels>,
@@ -613,6 +616,8 @@ impl Budget {
         // Events are compared whole: equal ones are identical, and an
         // unstable sort orders them as a stable one would.
         events.sort_unstable();
+        // The origins that answered after they were down.
+        let mut back: Vec<Origin> = Vec::new();
         for &ev in &events {
             match ev {
                 Event::Loaded(r, g, cost) => {
@@ -627,6 +632,16 @@ impl Budget {
                             started,
                             epoch,
                         } if gen == g => {
+                            // The answer of a down origin: its resources
+                            // that back off are retried (`origin`). Not an
+                            // expired copy's load, which the store may have
+                            // served for an origin that cannot answer.
+                            if source == Source::Network
+                                && !self.arena.cold(s).store_missed
+                                && self.origins.answered(Origin::of(r, self.arena.class(s)))
+                            {
+                                back.push(Origin::of(r, self.arena.class(s)));
+                            }
                             self.arena.set_load(s, Load::Idle);
                             match source {
                                 Source::Network => release(
@@ -687,6 +702,13 @@ impl Budget {
                             if self.cfg.policy == Policy::Batch {
                                 self.fatal.get_or_insert(SessionError::LoadFailed(r));
                             } else {
+                                if source == Source::Network {
+                                    self.origins.failed(
+                                        Origin::of(r, class),
+                                        now,
+                                        &self.cfg.origin,
+                                    );
+                                }
                                 let cold = self.arena.cold_mut(s);
                                 cold.failures += 1;
                                 cold.retry_at =
@@ -779,6 +801,41 @@ impl Budget {
         }
         events.clear();
         self.events = events;
+        for o in back {
+            self.retry_origin(o, now);
+        }
+    }
+
+    /// `o` answered after it was down: every resource of it backing off is
+    /// due at `now` — wanted now or not yet (a drape whose tile's mesh is
+    /// still on its way) — its work read again this step, and the prune
+    /// free to let go of the ones the view left. Its failure count stays
+    /// (the load timeout it earned, the next backoff). A walk of every
+    /// slot, once per origin that comes back.
+    fn retry_origin(&mut self, o: Origin, now: Micros) {
+        let mut due = std::mem::take(&mut self.scratch.origin_due);
+        due.clear();
+        due.extend(self.arena.iter().filter(|&s| {
+            self.arena.backing_off(s, now) && Origin::of(self.arena.id(s), self.arena.class(s)) == o
+        }));
+        self.walk(self.arena.len());
+        for &s in &due {
+            self.arena.cold_mut(s).retry_at = now;
+            self.arena.note_work(s);
+        }
+        self.scratch.origin_due = due;
+    }
+
+    /// Whether `r`'s load waits for its origin, down and between two probes
+    /// (`origin`). A resource whose stored copy expired is never held back:
+    /// its load serves that copy when the origin cannot answer.
+    fn origin_holds_back(&self, r: ResourceId, class: Class, now: Micros) -> bool {
+        self.origins.any_down()
+            && self.origins.blocks(Origin::of(r, class), now)
+            && !self
+                .arena
+                .find(r)
+                .is_some_and(|s| self.arena.cold(s).store_missed)
     }
 
     // 2. The need: the one kept, changed by what the step is told.
@@ -1809,10 +1866,20 @@ impl Budget {
         picked.clear();
         // Places: a `u32` each, as many as the jobs.
         let place = |i: usize| u32::try_from(i).unwrap_or(u32::MAX);
+        // A load whose origin is down waits for its probe, out of the
+        // heap, so that it holds no place work of another origin could take.
         picked.extend(
             jobs.iter()
                 .enumerate()
-                .filter(|(_, j)| j.1 == Job::Load)
+                .filter(|(_, j)| {
+                    j.1 == Job::Load
+                        && !(j.0.tier != Tier::Stored
+                            && self.origin_holds_back(
+                                j.0.resource,
+                                self.class_of(j.0.resource, j.2.class),
+                                now,
+                            ))
+                })
                 .take(self.cfg.request_heap as usize)
                 .map(|(i, _)| place(i)),
         );
@@ -2326,6 +2393,9 @@ impl Budget {
                     }
                 }
                 Source::Network => {
+                    if self.origin_holds_back(*r, class, now) {
+                        continue;
+                    }
                     if self.in_flight[class] >= eff.quota[class] {
                         if w.urgency > Urgency::Hole {
                             if key.tier == Tier::Stored {
@@ -2369,6 +2439,9 @@ impl Budget {
                             }
                         }
                     }
+                    // A down origin's probe: the next waits for its delay.
+                    self.origins
+                        .started(Origin::of(*r, class), now, &self.cfg.origin);
                 }
             }
             let gen = Generation(self.next_gen);
