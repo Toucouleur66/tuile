@@ -17,9 +17,9 @@ use glam::{DVec3, Mat4, Vec3};
 use std::sync::Arc;
 use tuile_core::budget::{LayerId, ResourceId, UvTransform};
 use tuile_core::content::{DecodedMesh, DecodedTexture, DecodedTileContent, DrapeContent};
+use tuile_core::protocol::ResourceContent;
 use tuile_core::raster::{self, ImageryCoord, Placement};
 use tuile_core::texels::{BlockFormat, ImageryFormat, Texels};
-use wgpu::util::DeviceExt;
 
 /// Bytes per texel in [`TEXTURE_FORMAT`].
 const BYTES_PER_TEXEL: u32 = 4;
@@ -268,20 +268,15 @@ impl PreparedTile {
         };
         let (now, was) = (rows(plan), rows(&self.stitching.told));
         let at_once = fresh || slide == 0;
-        let strips = (STITCH_ROWS * 16) as u64;
-        gpu.ops.staged(&gpu.ops.write_buffer, strips);
-        gpu.ops.staged(&gpu.ops.write_buffer, strips);
-        gpu.ops.staged(&gpu.ops.write_buffer, 16);
-        gpu.queue
-            .write_buffer(&self.tile_buf, STRIPS_AT, bytemuck::cast_slice(&now));
-        gpu.queue.write_buffer(
+        gpu.write_buffer(&self.tile_buf, STRIPS_AT, bytemuck::cast_slice(&now));
+        gpu.write_buffer(
             &self.tile_buf,
             STRIPS_AT + (STITCH_ROWS * 16) as u64,
             bytemuck::cast_slice(if at_once { &now } else { &was }),
         );
         let any = f32::from(!(plan.is_nothing() && (at_once || self.stitching.told.is_nothing())));
         let slid = if at_once { 1.0 } else { 0.0 };
-        gpu.queue.write_buffer(
+        gpu.write_buffer(
             &self.tile_buf,
             STITCH_AT,
             bytemuck::cast_slice(&[slid, any, 0.0, 0.0]),
@@ -294,7 +289,6 @@ impl PreparedTile {
     /// Moves a sliding tile on to where `frame` has it. Returns whether it
     /// is still on its way.
     pub(crate) fn slide(&mut self, gpu: &GpuContext, frame: u64, slide: u32) -> bool {
-        let queue = &gpu.queue;
         let Some(since) = self.stitching.sliding_since else {
             return false;
         };
@@ -302,8 +296,7 @@ impl PreparedTile {
         // Eased at both ends: an edge sets off and arrives without a jerk.
         let eased = slid * slid * (3.0 - 2.0 * slid);
         let any = f32::from(!self.stitching.told.is_nothing() || slid < 1.0);
-        gpu.ops.staged(&gpu.ops.write_buffer, 16);
-        queue.write_buffer(
+        gpu.write_buffer(
             &self.tile_buf,
             STITCH_AT,
             bytemuck::cast_slice(&[eased, any, 0.0, 0.0]),
@@ -352,6 +345,17 @@ impl PreparedTile {
         drapes: &[(ResourceId, &PreparedDrape, UvTransform)],
         levels: Levels,
     ) {
+        self.dress_in(gpu, drapes, levels);
+        gpu.flush_uploads();
+    }
+
+    /// [`Self::dress`], its writes left in the frame's uploads.
+    pub(crate) fn dress_in(
+        &mut self,
+        gpu: &GpuContext,
+        drapes: &[(ResourceId, &PreparedDrape, UvTransform)],
+        levels: Levels,
+    ) {
         let key: Vec<(ResourceId, [u64; 4])> =
             drapes.iter().map(|(r, _, uv)| (*r, uv_bits(*uv))).collect();
         if key == self.dressing && !self._imagery.is_empty() {
@@ -359,9 +363,7 @@ impl PreparedTile {
                 self.levels = levels;
                 let row = levels.row();
                 for buf in self.meshes.iter().flat_map(|m| &m._material_bufs) {
-                    gpu.ops.staged(&gpu.ops.write_buffer, 16);
-                    gpu.queue
-                        .write_buffer(buf, LEVELS_AT, bytemuck::cast_slice(&row));
+                    gpu.write_buffer(buf, LEVELS_AT, bytemuck::cast_slice(&row));
                 }
             }
             return;
@@ -400,10 +402,16 @@ impl PreparedTile {
     /// textures it owns) until it is dressed again. What an evicted drape's
     /// wearers are left in, so its textures are let go of with it.
     pub fn undress(&mut self, gpu: &GpuContext) {
+        self.undress_in(gpu);
+        gpu.flush_uploads();
+    }
+
+    /// [`Self::undress`], its writes left in the frame's uploads.
+    pub(crate) fn undress_in(&mut self, gpu: &GpuContext) {
         if self.dressing.is_empty() {
             return;
         }
-        self.dress(gpu, &[], Levels::default());
+        self.dress_in(gpu, &[], Levels::default());
         self.dressing.clear();
     }
 
@@ -421,16 +429,21 @@ impl PreparedTile {
     /// MOVING camera: keep the render origin near the eye so the f32 the GPU
     /// sees stays small (sub-meter precise), even at planetary ECEF scale.
     pub fn rebase(&self, queue: &wgpu::Queue, render_origin: DVec3) {
-        self.rebase_counted(queue, None, render_origin);
+        if let Some(model) = self.rebased(render_origin) {
+            queue.write_buffer(&self.tile_buf, 0, bytemuck::cast_slice(&model));
+        }
     }
 
-    /// [`Self::rebase`], counting the write it makes, if any, in `ops`.
-    pub(crate) fn rebase_counted(
-        &self,
-        queue: &wgpu::Queue,
-        ops: Option<&crate::ops::OpCounters>,
-        render_origin: DVec3,
-    ) {
+    /// [`Self::rebase`], its write left in the frame's uploads.
+    pub(crate) fn rebase_in(&self, gpu: &GpuContext, render_origin: DVec3) {
+        if let Some(model) = self.rebased(render_origin) {
+            gpu.write_buffer(&self.tile_buf, 0, bytemuck::cast_slice(&model));
+        }
+    }
+
+    /// The model matrix against `render_origin`, when the uniform is not
+    /// close enough to it already.
+    fn rebased(&self, render_origin: DVec3) -> Option<[f32; 16]> {
         // Already there, to within a metre. The threshold used to live on the
         // caller, which meant it was asked once for the whole resident set: if
         // the eye had moved, *every* tile was rewritten. Asking per tile is what
@@ -441,19 +454,12 @@ impl PreparedTile {
         // tens of kilometres it is allowed to drift costs no precision at all.
         const CLOSE_ENOUGH_METRES: f64 = 1.0;
         if (render_origin - self.rebased_to.get()).length() < CLOSE_ENOUGH_METRES {
-            return;
+            return None;
         }
         self.rebased_to.set(render_origin);
-        if let Some(ops) = ops {
-            ops.staged(&ops.write_buffer, 64);
-        }
         let model =
             tuile_core::geo::rebased_model(self.origin_ecef, self.transform_local, render_origin);
-        queue.write_buffer(
-            &self.tile_buf,
-            0,
-            bytemuck::cast_slice(&model.to_cols_array()),
-        );
+        Some(model.to_cols_array())
     }
 }
 
@@ -466,25 +472,36 @@ pub fn prepare(
     content: &DecodedTileContent,
     render_origin: DVec3,
 ) -> PreparedTile {
+    let tile = prepare_in(gpu, content, render_origin);
+    gpu.flush_uploads();
+    tile
+}
+
+/// [`prepare`], its writes left in the frame's uploads.
+pub(crate) fn prepare_in(
+    gpu: &GpuContext,
+    content: &DecodedTileContent,
+    render_origin: DVec3,
+) -> PreparedTile {
     let model = tuile_core::geo::rebased_model(
         content.local_origin_ecef,
         content.transform_local,
         render_origin,
     );
 
-    // The model, and no stitching: zeros say a tile has none.
-    let mut uniform = vec![0u8; TILE_UNIFORM_BYTES];
-    uniform[..64].copy_from_slice(bytemuck::cast_slice(&model.to_cols_array()));
-    gpu.ops.buffer_init(TILE_UNIFORM_BYTES as u64);
+    // The model, and no stitching: zeros say a tile has none. Only the
+    // model is written; the device gives a new buffer's every other byte as
+    // zero, and the eight kilobytes of strips cost no copy.
+    crate::ops::OpCounters::add(&gpu.ops.buffers_created, 1);
     crate::ops::OpCounters::add(&gpu.ops.bind_groups_created, 1);
-    let tile_buf = gpu
-        .device
-        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("tuile tile uniform"),
-            contents: &uniform,
-            // COPY_DST so the model can be rewritten on rebase (moving camera).
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
+    let tile_buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("tuile tile uniform"),
+        size: TILE_UNIFORM_BYTES as u64,
+        // COPY_DST so the model can be rewritten on rebase (moving camera).
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    gpu.write_buffer(&tile_buf, 0, bytemuck::cast_slice(&model.to_cols_array()));
     let tile_bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("tuile tile"),
         layout: &gpu.tile_bgl,
@@ -498,7 +515,7 @@ pub fn prepare(
     let textures: Vec<GpuImagery> = content
         .textures
         .iter()
-        .map(|t| upload_texture(gpu, t))
+        .map(|t| upload_texture_in(gpu, t))
         .collect();
     let mut gpu_bytes: usize = textures.iter().map(|t| t.bytes).sum();
 
@@ -512,7 +529,7 @@ pub fn prepare(
         .filter(|l| l.is_visible())
         .map(|l| DrapedLayer {
             placement: l.placement(),
-            texture: gpu.shared_imagery(l.source, l.coord, || upload_texture(gpu, &l.texture)),
+            texture: gpu.shared_imagery(l.source, l.coord, || upload_texture_in(gpu, &l.texture)),
             coord: l.coord,
             source: l.source,
         })
@@ -608,6 +625,13 @@ pub struct PreparedDrape {
 /// resident in: what [`DrapeContent::cost`] says wherever the plan was
 /// followed, and RGBA8's share for a tile that had to stay RGBA8.
 pub fn prepare_drape(gpu: &GpuContext, drape: &DrapeContent) -> PreparedDrape {
+    let prepared = prepare_drape_in(gpu, drape);
+    gpu.flush_uploads();
+    prepared
+}
+
+/// [`prepare_drape`], its writes left in the frame's uploads.
+pub(crate) fn prepare_drape_in(gpu: &GpuContext, drape: &DrapeContent) -> PreparedDrape {
     let mut held: Vec<Option<ImageryFormat>> = Vec::with_capacity(drape.tiles.len());
     let mut layers = Vec::with_capacity(drape.tiles.len());
     for l in &drape.tiles {
@@ -615,7 +639,7 @@ pub fn prepare_drape(gpu: &GpuContext, drape: &DrapeContent) -> PreparedDrape {
             held.push(None);
             continue;
         }
-        let texture = gpu.shared_imagery(l.source, l.coord, || upload_texture(gpu, &l.texture));
+        let texture = gpu.shared_imagery(l.source, l.coord, || upload_texture_in(gpu, &l.texture));
         held.push(Some(texture.format));
         layers.push(DrapedLayer {
             placement: l.placement(),
@@ -656,16 +680,14 @@ fn passes(
 ) -> Vec<ImageryPass> {
     let slots = gpu.imagery_slots as usize;
     let table = |batch: &[(Placement, &Arc<GpuImagery>, ImageryCoord, u32)]| {
-        gpu.ops.buffer_init(u64::from(gpu.imagery_slots) * 2 * 16);
-        gpu.device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("tuile imagery layers"),
-                contents: bytemuck::cast_slice(&raster::placement_table(
-                    batch.iter().map(|l| l.0),
-                    gpu.imagery_slots,
-                )),
-                usage: wgpu::BufferUsages::UNIFORM,
-            })
+        gpu.buffer_with(
+            "tuile imagery layers",
+            wgpu::BufferUsages::UNIFORM,
+            bytemuck::cast_slice(&raster::placement_table(
+                batch.iter().map(|l| l.0),
+                gpu.imagery_slots,
+            )),
+        )
     };
     let passes: Vec<ImageryPass> = layers
         .chunks(slots.max(1))
@@ -712,7 +734,153 @@ fn passes(
 /// frame, enough to exhaust the driver in minutes and take the machine down
 /// with it. Filtering on the CPU costs zero render passes; the encoder is one
 /// compute pass per tile, which that leak does not concern.
+#[cfg(test)]
 pub(crate) fn upload_texture(gpu: &GpuContext, t: &DecodedTexture) -> GpuImagery {
+    let imagery = upload_texture_in(gpu, t);
+    gpu.flush_uploads();
+    imagery
+}
+
+/// What the frame's encode pass made of one texture: its texture, or the
+/// chain to upload as RGBA8 when the encoder refused it.
+pub(crate) enum Encoded {
+    Texture(GpuImagery),
+    Refused(Vec<DecodedTexture>),
+}
+
+/// A texture's address: what the frame's encode pass files its result by.
+fn texels_key(t: &DecodedTexture) -> usize {
+    t as *const DecodedTexture as usize
+}
+
+/// Encodes every texture of `contents` the frame will encode in **one**
+/// compute pass, recorded in the frame's uploads: what `upload_texture`
+/// then takes instead of encoding each texture on its own — one pass and
+/// one submit a frame instead of one per texture. Imagery the GPU already
+/// holds is not encoded, nor imagery named twice. Returns the tiles encoded.
+pub(crate) fn encode_frame(gpu: &GpuContext, contents: &[&ResourceContent]) -> usize {
+    let Some(compressor) = gpu.compressor.as_ref() else {
+        return 0;
+    };
+    let Some(format) = compressor.lock().ok().map(|c| c.format()) else {
+        return 0;
+    };
+    let wanted =
+        |t: &DecodedTexture| t.resident_format().block() == Some(format) && t.rgba8().is_some();
+    let mut picked: Vec<&DecodedTexture> = Vec::new();
+    {
+        let Ok(pool) = gpu.imagery.lock() else {
+            return 0;
+        };
+        let mut named: std::collections::HashSet<(u32, ImageryCoord)> =
+            std::collections::HashSet::new();
+        for content in contents {
+            let layers: &[raster::ImageryLayer] = match content {
+                ResourceContent::Mesh(m) => {
+                    picked.extend(m.textures.iter().filter(|t| wanted(t)));
+                    &m.imagery
+                }
+                ResourceContent::Drape(d) => &d.tiles,
+            };
+            for l in layers {
+                if l.is_visible()
+                    && wanted(&l.texture)
+                    && !pool.holds(l.source, l.coord)
+                    && named.insert((l.source, l.coord))
+                {
+                    picked.push(&l.texture);
+                }
+            }
+        }
+    }
+    if picked.len() < 2 {
+        // One texture is encoded where it would have been.
+        return 0;
+    }
+    let chains: Vec<Vec<DecodedTexture>> = picked
+        .iter()
+        .map(|t| match gpu.chains.take(t) {
+            Some(mips) => {
+                crate::ops::OpCounters::add(&gpu.ops.chains_ready, 1);
+                mips
+            }
+            None => {
+                crate::ops::OpCounters::add(&gpu.ops.chains_inline, 1);
+                raster::mip_chain(t)
+            }
+        })
+        .collect();
+    // The scratch must not hold a record not yet submitted.
+    if compressor.lock().is_ok_and(|c| c.busy()) {
+        gpu.flush_uploads();
+    }
+    let Ok(mut c) = compressor.lock() else {
+        return 0;
+    };
+    let tiles: Vec<(&DecodedTexture, &[DecodedTexture])> = picked
+        .iter()
+        .zip(&chains)
+        .map(|(t, mips)| (*t, mips.as_slice()))
+        .collect();
+    let results = gpu.record(|cmd| c.record(&gpu.device, &gpu.queue, &gpu.ops, cmd, &tiles));
+    drop(c);
+    let mut encoded = 0;
+    let Ok(mut filed) = gpu.encoded.lock() else {
+        return 0;
+    };
+    for ((t, mips), result) in picked.iter().zip(chains).zip(results) {
+        let entry = match result {
+            Ok(texture) => {
+                encoded += 1;
+                Encoded::Texture(encoded_imagery(texture, t, &mips, format))
+            }
+            Err(_) => Encoded::Refused(mips),
+        };
+        filed.insert(texels_key(t), entry);
+    }
+    encoded
+}
+
+/// Lets go of what the frame's encode pass made and no upload took: a
+/// delivery refused at its class's hard limit.
+pub(crate) fn forget_encoded(gpu: &GpuContext) {
+    if let Ok(mut filed) = gpu.encoded.lock() {
+        filed.clear();
+    }
+}
+
+/// The texture an encode made, as the imagery it is.
+fn encoded_imagery(
+    texture: wgpu::Texture,
+    t: &DecodedTexture,
+    mips: &[DecodedTexture],
+    format: BlockFormat,
+) -> GpuImagery {
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let bytes = BlockFormat::level_bytes(t.width, t.height)
+        + mips
+            .iter()
+            .map(|m| BlockFormat::level_bytes(m.width, m.height))
+            .sum::<usize>();
+    GpuImagery::new(texture, view, bytes, format.into())
+}
+
+/// What the frame's encode pass made of `t`, if it took it.
+fn take_encoded(gpu: &GpuContext, t: &DecodedTexture) -> Option<Encoded> {
+    gpu.encoded.lock().ok()?.remove(&texels_key(t))
+}
+
+/// Uploads a texture: the frame's encode of it when there was one.
+fn upload_texture_in(gpu: &GpuContext, t: &DecodedTexture) -> GpuImagery {
+    match take_encoded(gpu, t) {
+        Some(Encoded::Texture(imagery)) => imagery,
+        Some(Encoded::Refused(mips)) => upload_rgba8(gpu, t, &mips),
+        None => upload_texture_one(gpu, t),
+    }
+}
+
+/// [`upload_texture`] when nothing was encoded for it ahead.
+fn upload_texture_one(gpu: &GpuContext, t: &DecodedTexture) -> GpuImagery {
     match &t.texels {
         Texels::Blocks { format, levels } => upload_blocks(gpu, t, *format, levels)
             .unwrap_or_else(|| upload_rgba8(gpu, &DecodedTexture::stand_in(), &[])),
@@ -751,16 +919,19 @@ fn encode(
     if compressor.format() != format {
         return None;
     }
-    let texture = compressor
-        .encode(&gpu.device, &gpu.queue, &gpu.ops, t, mips)
-        .ok()?;
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    let bytes = BlockFormat::level_bytes(t.width, t.height)
-        + mips
-            .iter()
-            .map(|m| BlockFormat::level_bytes(m.width, m.height))
-            .sum::<usize>();
-    Some(GpuImagery::new(texture, view, bytes, format.into()))
+    // One texture on its own, in the frame's uploads: a record still
+    // waiting for its submit is submitted first, before this one reuses
+    // the scratch.
+    if compressor.busy() {
+        drop(compressor);
+        gpu.flush_uploads();
+        compressor = gpu.compressor.as_ref()?.lock().ok()?;
+    }
+    let texture = gpu
+        .record(|cmd| compressor.record(&gpu.device, &gpu.queue, &gpu.ops, cmd, &[(t, mips)]))
+        .pop()?
+        .ok();
+    Some(encoded_imagery(texture?, t, mips, format))
 }
 
 /// Blocks, uploaded as they are, level by level: `None` where the device was
@@ -816,20 +987,12 @@ fn upload_blocks(
     for (level, bytes) in levels.iter().enumerate() {
         let (w, h) = size(level as u32);
         let (across, down) = (w.div_ceil(side), h.div_ceil(side));
-        gpu.ops.staged(&gpu.ops.write_texture, bytes.len() as u64);
-        gpu.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: level as u32,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
+        gpu.write_texture(
+            &texture,
+            level as u32,
             bytes,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(across * BlockFormat::BLOCK_BYTES as u32),
-                rows_per_image: Some(down),
-            },
+            across * BlockFormat::BLOCK_BYTES as u32,
+            down,
             // A level smaller than a block is copied as the whole block it
             // is stored in: its physical size.
             wgpu::Extent3d {
@@ -865,21 +1028,12 @@ fn upload_rgba8(gpu: &GpuContext, t: &DecodedTexture, mips: &[DecodedTexture]) -
     crate::ops::OpCounters::add(&gpu.ops.textures_created, 1);
     let mut bytes = 0usize;
     for (level, image) in std::iter::once(t).chain(mips.iter()).enumerate() {
-        gpu.ops
-            .staged(&gpu.ops.write_texture, image.texels.byte_len() as u64);
-        gpu.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: level as u32,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
+        gpu.write_texture(
+            &texture,
+            level as u32,
             image.rgba8().unwrap_or_default(),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(image.width * BYTES_PER_TEXEL),
-                rows_per_image: Some(image.height),
-            },
+            image.width * BYTES_PER_TEXEL,
+            image.height,
             wgpu::Extent3d {
                 width: image.width,
                 height: image.height,
@@ -939,16 +1093,12 @@ fn materials(
             levels: levels.row(),
         };
         // Written to when the levels move under an unchanged dressing.
-        gpu.ops
-            .buffer_init(std::mem::size_of::<MaterialUniform>() as u64);
         crate::ops::OpCounters::add(&gpu.ops.bind_groups_created, 1);
-        let material_buf = gpu
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("tuile material"),
-                contents: bytemuck::bytes_of(&uniform),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
+        let material_buf = gpu.buffer_with(
+            "tuile material",
+            wgpu::BufferUsages::UNIFORM,
+            bytemuck::bytes_of(&uniform),
+        );
         // Every slot is bound, always. An unused one reads the 1×1 white texture
         // and is masked out by an empty coverage rectangle, so the shader needs
         // no count and no branch — see `raster::imagery_layer_table`.
@@ -1013,24 +1163,16 @@ fn mesh_buffers(gpu: &GpuContext, mesh: &DecodedMesh) -> (wgpu::Buffer, wgpu::Bu
                 .unwrap_or([0.0, 0.0]),
         })
         .collect();
-    gpu.ops
-        .buffer_init(std::mem::size_of_val(vertices.as_slice()) as u64);
-    gpu.ops
-        .buffer_init(std::mem::size_of_val(mesh.indices.as_slice()) as u64);
-    let vertex_buf = gpu
-        .device
-        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("tuile vertices"),
-            contents: bytemuck::cast_slice(&vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-    let index_buf = gpu
-        .device
-        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("tuile indices"),
-            contents: bytemuck::cast_slice(&mesh.indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
+    let vertex_buf = gpu.buffer_with(
+        "tuile vertices",
+        wgpu::BufferUsages::VERTEX,
+        bytemuck::cast_slice(&vertices),
+    );
+    let index_buf = gpu.buffer_with(
+        "tuile indices",
+        wgpu::BufferUsages::INDEX,
+        bytemuck::cast_slice(&mesh.indices),
+    );
     let bytes = vertices.len() * std::mem::size_of::<Vertex>() + mesh.indices.len() * 4;
     (vertex_buf, index_buf, bytes)
 }

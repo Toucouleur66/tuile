@@ -17,6 +17,7 @@ mod renderer;
 mod sky;
 mod surface;
 mod targets;
+mod upload;
 #[cfg(test)]
 mod webgl2;
 mod world_overlay;

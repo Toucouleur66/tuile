@@ -234,6 +234,8 @@ pub(crate) struct Compressor {
     scratch: EncoderScratch,
     timing: Option<Timing>,
     stats: EncodeStats,
+    /// See [`Self::busy`].
+    busy: bool,
 }
 
 /// One timestamp pair in flight at a time: the pass's start and end,
@@ -242,7 +244,7 @@ struct Timing {
     set: wgpu::QuerySet,
     resolve: wgpu::Buffer,
     readback: wgpu::Buffer,
-    /// [`IDLE`], [`MAPPING`] or [`READY`].
+    /// [`IDLE`], [`RECORDED`], [`MAPPING`] or [`READY`].
     state: Arc<AtomicU8>,
     /// The blocks the measured pass wrote.
     blocks: u64,
@@ -252,6 +254,8 @@ struct Timing {
 const IDLE: u8 = 0;
 const MAPPING: u8 = 1;
 const READY: u8 = 2;
+/// Written by a recorded pass not yet submitted.
+const RECORDED: u8 = 3;
 
 impl Compressor {
     pub(crate) fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: BlockFormat) -> Self {
@@ -289,6 +293,7 @@ impl Compressor {
             scratch,
             timing,
             stats: EncodeStats::default(),
+            busy: false,
         }
     }
 
@@ -307,31 +312,37 @@ impl Compressor {
             .unwrap_or_else(|| assumed_ns_per_block(self.format))
     }
 
-    /// Encodes `base` and its `mips` into a texture of the plan's format,
-    /// submitted on `queue` before this returns. An error is a tile to upload
-    /// as RGBA8.
-    pub(crate) fn encode(
+    /// Records the encode of each tile — a base and its mips — into `cmd`:
+    /// one compute pass for them all, and the copies into their textures.
+    /// The texels land with `cmd`'s submit, which must come before the next
+    /// record ([`Self::busy`]); [`Self::submitted`] is told of it. An error
+    /// is a tile to upload as RGBA8.
+    ///
+    /// The pass is timed when the stopwatch is free: one measure per pass,
+    /// whatever it holds.
+    pub(crate) fn record(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         ops: &OpCounters,
-        base: &DecodedTexture,
-        mips: &[DecodedTexture],
-    ) -> Result<wgpu::Texture, EncodeError> {
-        self.collect(device, ops);
-        let levels: Vec<Level<'_>> = std::iter::once(base)
-            .chain(mips.iter())
-            .map(|t| Level {
-                width: t.width,
-                height: t.height,
-                rgba8: t.rgba8().unwrap_or_default(),
+        cmd: &mut wgpu::CommandEncoder,
+        tiles: &[(&DecodedTexture, &[DecodedTexture])],
+    ) -> Vec<Result<wgpu::Texture, EncodeError>> {
+        self.collect();
+        let levels: Vec<Vec<Level<'_>>> = tiles
+            .iter()
+            .map(|(base, mips)| {
+                std::iter::once(*base)
+                    .chain(mips.iter())
+                    .map(|t| Level {
+                        width: t.width,
+                        height: t.height,
+                        rgba8: t.rgba8().unwrap_or_default(),
+                    })
+                    .collect()
             })
             .collect();
-        OpCounters::add(&ops.encoders, 1);
-        let mut cmd = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("tuile imagery encode"),
-        });
-        // Timed when the stopwatch is free; the others go untimed.
+        let chains: Vec<&[Level<'_>]> = levels.iter().map(Vec::as_slice).collect();
         let timed = self
             .timing
             .as_ref()
@@ -341,72 +352,82 @@ impl Compressor {
             beginning_of_pass_write_index: Some(0),
             end_of_pass_write_index: Some(1),
         });
-        let result = self
-            .encoder
-            .encode_with(
-                &mut self.scratch,
-                device,
-                queue,
-                &mut cmd,
-                &[&levels],
-                true,
-                writes,
-            )
-            .pop()
-            .unwrap_or(Err(EncodeError::Empty));
-        let measuring = timed.is_some() && result.is_ok();
-        if measuring {
-            if let Some(t) = &self.timing {
-                cmd.resolve_query_set(&t.set, 0..2, &t.resolve, 0);
-                cmd.copy_buffer_to_buffer(&t.resolve, 0, &t.readback, 0, 16);
-            }
-        }
-        // Submitted now, before the next call rewrites the scratch.
-        OpCounters::add(&ops.submits, 1);
-        queue.submit([cmd.finish()]);
-        match &result {
-            Ok(_) => {
-                self.stats.encoded += 1;
-                // The encoder's texture, its pass, and its writes: one per
-                // level of texels and one for the jobs.
-                OpCounters::add(&ops.textures_created, 1);
-                OpCounters::add(&ops.encode_passes, 1);
-                OpCounters::add(&ops.encoded_tiles, 1);
-                for level in &levels {
-                    ops.staged(&ops.write_buffer, level.rgba8.len() as u64);
+        let results =
+            self.encoder
+                .encode_with(&mut self.scratch, device, queue, cmd, &chains, true, writes);
+        let mut blocks = 0;
+        let mut any = false;
+        for ((base, _), (result, chain)) in tiles.iter().zip(results.iter().zip(&chains)) {
+            match result {
+                Ok(_) => {
+                    any = true;
+                    self.stats.encoded += 1;
+                    blocks += tile_blocks(self.format, base.width, base.height);
+                    // The encoder's texture, and its writes: one per level
+                    // of texels.
+                    OpCounters::add(&ops.textures_created, 1);
+                    OpCounters::add(&ops.encoded_tiles, 1);
+                    for level in chain.iter() {
+                        ops.staged(&ops.write_buffer, level.rgba8.len() as u64);
+                    }
                 }
-                ops.staged(&ops.write_buffer, 256 * levels.len() as u64);
-            }
-            Err(_) => self.stats.fell_back += 1,
-        }
-        if measuring {
-            if let Some(t) = &mut self.timing {
-                t.blocks = tile_blocks(self.format, base.width, base.height);
-                t.state.store(MAPPING, Ordering::Release);
-                let state = Arc::clone(&t.state);
-                OpCounters::add(&ops.readbacks, 1);
-                t.readback
-                    .slice(..)
-                    .map_async(wgpu::MapMode::Read, move |done| {
-                        state.store(if done.is_ok() { READY } else { IDLE }, Ordering::Release);
-                    });
+                Err(_) => self.stats.fell_back += 1,
             }
         }
-        result
+        if any {
+            // The pass, and the encoder's table of jobs.
+            OpCounters::add(&ops.encode_passes, 1);
+            ops.staged(&ops.write_buffer, 256 * chains.len() as u64);
+            self.busy = true;
+            if timed.is_some() {
+                if let Some(t) = &mut self.timing {
+                    cmd.resolve_query_set(&t.set, 0..2, &t.resolve, 0);
+                    cmd.copy_buffer_to_buffer(&t.resolve, 0, &t.readback, 0, 16);
+                    t.blocks = blocks;
+                    t.state.store(RECORDED, Ordering::Release);
+                }
+            }
+        }
+        results
+    }
+
+    /// Whether a record is waiting for its submit: the scratch holds its
+    /// texels, and the next record would overwrite them.
+    pub(crate) fn busy(&self) -> bool {
+        self.busy
+    }
+
+    /// The encoder the last record went into was submitted: the scratch is
+    /// free, and a timed pass's stopwatch is read back once the GPU is done
+    /// — without waiting for it.
+    pub(crate) fn submitted(&mut self, ops: &OpCounters) {
+        self.busy = false;
+        let Some(t) = &mut self.timing else {
+            return;
+        };
+        if t.state.load(Ordering::Acquire) != RECORDED {
+            return;
+        }
+        t.state.store(MAPPING, Ordering::Release);
+        let state = Arc::clone(&t.state);
+        OpCounters::add(&ops.readbacks, 1);
+        t.readback
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |done| {
+                state.store(if done.is_ok() { READY } else { IDLE }, Ordering::Release);
+            });
     }
 
     /// Reads the last measured pass, if the GPU has finished it, into the
     /// cost per block: a moving average, so one slow pass does not halve the
     /// next frame's share.
-    pub(crate) fn collect(&mut self, device: &wgpu::Device, ops: &OpCounters) {
+    ///
+    /// Nothing is polled here: a submit lets a finished map call back, and
+    /// the frames submit.
+    pub(crate) fn collect(&mut self) {
         let Some(t) = &mut self.timing else {
             return;
         };
-        if t.state.load(Ordering::Acquire) == MAPPING {
-            // Lets a finished map call back; waits for nothing.
-            OpCounters::add(&ops.polls, 1);
-            let _ = device.poll(wgpu::PollType::Poll);
-        }
         if t.state.load(Ordering::Acquire) != READY {
             return;
         }

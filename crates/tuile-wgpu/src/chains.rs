@@ -122,6 +122,21 @@ impl Chains {
         }
     }
 
+    /// Keeps only the chains of `contents` — what goes this frame and what
+    /// is asked ahead — so what is held stays bounded however long the
+    /// queue grows: a delivery that fell back in the order is asked again
+    /// when it comes forward.
+    pub(crate) fn keep_only<'a>(&self, contents: impl IntoIterator<Item = &'a ResourceContent>) {
+        let kept: std::collections::HashSet<usize> = contents
+            .into_iter()
+            .flat_map(needing)
+            .map(|k| key(k.texture()))
+            .collect();
+        if let Ok(mut slots) = self.slots.lock() {
+            slots.retain(|k, _| kept.contains(k));
+        }
+    }
+
     /// Builds now, across threads, the chains of `contents` not built yet:
     /// this frame's uploads. Returns how many were built.
     #[cfg(not(target_arch = "wasm32"))]

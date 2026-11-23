@@ -119,11 +119,4 @@ impl OpCounters {
         Self::add(&self.staging_allocs, 1);
         Self::add(&self.staging_bytes, bytes);
     }
-
-    /// A buffer created with its contents: the buffer, and its staging.
-    pub(crate) fn buffer_init(&self, bytes: u64) {
-        Self::add(&self.buffers_created, 1);
-        Self::add(&self.staging_allocs, 1);
-        Self::add(&self.staging_bytes, bytes);
-    }
 }
