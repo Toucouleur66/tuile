@@ -456,6 +456,11 @@ pub struct Sim {
     pub pressure_set: Pressure,
     /// The city's tileset is drawn beside the globe (`world::CITY`).
     pub city: bool,
+    /// The views ahead for the next step (`ClientMessage::Ahead`): each
+    /// camera, when it is due and how likely, thousandths. Their tiles join
+    /// the ring with their predicted use, as the runtime lists them. Empty,
+    /// the default: no prediction, the need exactly as without one.
+    pub ahead: Vec<(Camera, Micros, u16)>,
 }
 
 impl Sim {
@@ -525,8 +530,53 @@ impl Sim {
             out: Decisions::default(),
             pressure_set: Pressure::Normal,
             city: false,
+            ahead: Vec::new(),
             profile,
         }
+    }
+
+    /// The views ahead's tiles the present need does not list, in its ring,
+    /// each with the earliest and likeliest of the views that select it —
+    /// the runtime's pass over the views ahead.
+    fn add_the_ring_ahead(&self, need: &mut NeedSet, drawn_last: &BTreeSet<TileId>) {
+        let listed: BTreeSet<TileId> = need
+            .drawn
+            .iter()
+            .chain(&need.blockers)
+            .chain(&need.ancestors)
+            .chain(&need.ring)
+            .map(|(t, _)| *t)
+            .collect();
+        let mut ring: BTreeMap<TileId, tuile_budget::Need> = BTreeMap::new();
+        for (cam, when, p) in &self.ahead {
+            let views = self.views(*cam);
+            let ahead = traverse(
+                &views,
+                &BudgetResidency(&self.budget),
+                self.sse_scale,
+                drawn_last,
+                self.pinned(),
+                self.city,
+            );
+            for (t, n) in ahead.drawn.into_iter().chain(ahead.blockers) {
+                if listed.contains(&t) {
+                    continue;
+                }
+                let e = ring.entry(t).or_insert(n);
+                let use_ = match e.ahead {
+                    Some(a) => tuile_budget::AheadUse {
+                        next_use_in: a.next_use_in.min(*when),
+                        probability: a.probability.max(*p),
+                    },
+                    None => tuile_budget::AheadUse {
+                        next_use_in: *when,
+                        probability: *p,
+                    },
+                };
+                e.ahead = Some(use_);
+            }
+        }
+        need.ring.extend(ring);
     }
 
     fn pinned(&self) -> u32 {
@@ -588,7 +638,7 @@ impl Sim {
             Policy::Interactive => &self.drawn_last,
         };
         let views = self.views(cam);
-        let need = traverse(
+        let mut need = traverse(
             &views,
             &BudgetResidency(&self.budget),
             self.sse_scale,
@@ -596,6 +646,9 @@ impl Sim {
             self.pinned(),
             self.city,
         );
+        if !self.ahead.is_empty() {
+            self.add_the_ring_ahead(&mut need, drawn_last);
+        }
         // The first step reads the whole need; every later one what changed
         // since the step before (built outside what is timed and counted).
         let input = match &self.need_last {

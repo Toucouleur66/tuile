@@ -49,5 +49,5 @@ pub mod table;
 
 pub use alloc::Counting;
 pub use catalogue::{Device, Network, Scenario, CATALOGUE_VERSION};
-pub use objective::{run, Outcome};
+pub use objective::{run, run_ahead, Ahead, HorizonError, Outcome};
 pub use server::{Profile, Sim};
