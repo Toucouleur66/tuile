@@ -152,6 +152,30 @@ pub(crate) fn copy(text: &str) -> bool {
     true
 }
 
+/// Hands `bytes` to the browser as a download called `name`: a snapshot,
+/// saved where the browser saves what it downloads. `false` when the page
+/// could not.
+pub(crate) fn download(name: &str, mime: &str, bytes: &[u8]) -> bool {
+    use wasm_bindgen::JsCast;
+    let made = (|| -> Option<()> {
+        let document = web_sys::window()?.document()?;
+        let parts = js_sys::Array::of1(&js_sys::Uint8Array::from(bytes));
+        let options = web_sys::BlobPropertyBag::new();
+        options.set_type(mime);
+        let blob = web_sys::Blob::new_with_u8_array_sequence_and_options(&parts, &options).ok()?;
+        let url = web_sys::Url::create_object_url_with_blob(&blob).ok()?;
+        let link: web_sys::HtmlAnchorElement =
+            document.create_element("a").ok()?.dyn_into().ok()?;
+        link.set_href(&url);
+        link.set_download(name);
+        link.click();
+        // The click has begun the download, which holds its own reference.
+        let _ = web_sys::Url::revoke_object_url(&url);
+        Some(())
+    })();
+    made.is_some()
+}
+
 /// Asks the browser for the clipboard's text, which it gives once it has
 /// asked the person; the text arrives on the steering queue.
 pub(crate) fn paste() -> Pasted {

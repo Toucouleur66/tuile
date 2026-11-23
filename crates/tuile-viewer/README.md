@@ -36,6 +36,13 @@ an example, and `docs/16-embedding-the-viewer.md` for the walk-through;
 Drag: orbit. Right-drag: pan. Wheel: zoom. W: wireframe. F: freeze. Esc: quit.
 N, or a click on the compass ring: north up, about the point at the centre
 of the view. L: centre on the current location, at the present altitude.
+S (or *View › Save Snapshot*, or `tuile://snapshot`): the picture drawn —
+the globe without the controls — saved as a JPEG whose EXIF carries the
+eye's position and height, the heading, the time and, in its user comment,
+the whole view as JSON (`src/photo.rs`); into `~/Pictures/Tuile` on a
+desktop, as a download on a page. `[snapshot]` of the configuration file
+sets the folder, the format (`jpeg` at quality 95, or a lossless `png`) and
+the layers drawn over the globe (`shapes`, `hud`, `controls`).
 
 The session opens straight down on France from 2 000 km. These flags move
 that, and are the only flags there are (`--help` lists them with the keys):

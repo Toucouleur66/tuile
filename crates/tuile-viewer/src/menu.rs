@@ -288,7 +288,7 @@ impl Ask {
 
 /// The letter keys. Lower case; the window reads a key without regard to
 /// case.
-pub(crate) const KEYS: [(char, Ask); 17] = [
+pub(crate) const KEYS: [(char, Ask); 18] = [
     ('w', Ask::ToggleWireframe),
     ('f', Ask::ToggleFreeze),
     ('d', Ask::NextDiagnostic),
@@ -296,6 +296,8 @@ pub(crate) const KEYS: [(char, Ask); 17] = [
     ('l', Ask::Do(Command::Here)),
     ('c', Ask::Do(Command::CopyLink)),
     ('v', Ask::Do(Command::PasteLink)),
+    // S, as in snapshot.
+    ('s', Ask::Do(Command::Snapshot)),
     ('i', Ask::NextImagery),
     // The scene's clock: J and K, then Y and U, side by side on every
     // layout that has letters where these are.
@@ -375,6 +377,7 @@ pub(crate) fn layout(
     );
     view.push(item("Next Diagnostic View", Ask::NextDiagnostic));
     view.push(Entry::Separator);
+    view.push(item("Save Snapshot", Ask::Do(Command::Snapshot)));
     view.push(item("Record Session", Ask::ToggleRecording));
 
     let go = vec![
@@ -873,6 +876,7 @@ mod tests {
             Command::Here,
             Command::CopyLink,
             Command::PasteLink,
+            Command::Snapshot,
         ];
         wanted.extend((0..DIAGNOSTICS.len()).map(Command::Diagnostic));
         wanted.extend((0..layers.len()).map(Command::Imagery));
