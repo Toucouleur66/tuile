@@ -20,7 +20,7 @@
 
 use crate::compress::EncodePace;
 use crate::context::GpuContext;
-use crate::prepare::{prepare, prepare_drape, Levels, PreparedDrape, PreparedTile};
+use crate::prepare::{Levels, PreparedDrape, PreparedTile};
 use glam::DVec3;
 use std::collections::{BTreeMap, HashMap};
 use std::task::{Context, Poll};
@@ -44,6 +44,58 @@ struct Queued {
     gen: Generation,
     class: Class,
     content: ResourceContent,
+    /// When, and at which frame, the delivery reached the pump: what its
+    /// time from delivered to drawable is measured from.
+    arrived: web_time::Instant,
+    arrived_frame: u64,
+    /// The blocks encoding the textures the content owns would write:
+    /// worked out once, the first frame it is paced.
+    owned_blocks: Option<u64>,
+}
+
+/// What the pump has done since it was made, summed: uploads and their
+/// bytes, acknowledgements, releases, and how long deliveries waited for
+/// their upload. Two snapshots subtract into what happened between them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PumpTotals {
+    /// Resources uploaded, and the bytes their uploads moved.
+    pub uploads: u64,
+    pub upload_bytes: u64,
+    /// Messages sent to the server acknowledging or refusing an upload.
+    pub ack_messages: u64,
+    /// Resources released, and the bytes they were acknowledged with.
+    pub releases: u64,
+    pub released_bytes: u64,
+    /// `Evict` messages applied.
+    pub evict_messages: u64,
+    /// From delivered to drawable: summed over the uploads, and the
+    /// longest, in microseconds and in frames.
+    pub wait_micros: u64,
+    pub wait_micros_max: u64,
+    pub wait_frames: u64,
+    pub wait_frames_max: u64,
+    /// Wall time spent in the frames' uploads, microseconds.
+    pub upload_micros: u64,
+}
+
+impl std::ops::Sub for PumpTotals {
+    type Output = PumpTotals;
+    /// What happened between `earlier` and `self`; the maxima are `self`'s.
+    fn sub(self, earlier: PumpTotals) -> PumpTotals {
+        PumpTotals {
+            uploads: self.uploads - earlier.uploads,
+            upload_bytes: self.upload_bytes - earlier.upload_bytes,
+            ack_messages: self.ack_messages - earlier.ack_messages,
+            releases: self.releases - earlier.releases,
+            released_bytes: self.released_bytes - earlier.released_bytes,
+            evict_messages: self.evict_messages - earlier.evict_messages,
+            wait_micros: self.wait_micros - earlier.wait_micros,
+            wait_micros_max: self.wait_micros_max,
+            wait_frames: self.wait_frames - earlier.wait_frames,
+            wait_frames_max: self.wait_frames_max,
+            upload_micros: self.upload_micros - earlier.upload_micros,
+        }
+    }
 }
 
 /// What an upload is charged, and to which class, for the refund when it
@@ -135,6 +187,11 @@ pub struct ContentPump {
     contents: Option<HashMap<TileId, std::sync::Arc<tuile_core::DecodedTileContent>>>,
     /// The meshes the last [`Self::resolve`] drew: exact, held and fallback.
     drawn_tiles: std::collections::HashSet<TileId>,
+    /// See [`Self::totals`].
+    totals: PumpTotals,
+    /// Deliveries dropped from the queue unuploaded — cancelled, evicted or
+    /// replaced — whose chains the next upload step lets go of.
+    dropped: Vec<ResourceContent>,
 }
 
 /// Frames a tile takes to slide to its new edge when what is drawn beside it
@@ -183,7 +240,21 @@ impl ContentPump {
             encode_pace: EncodePace::DEFAULT,
             contents: None,
             drawn_tiles: std::collections::HashSet::new(),
+            totals: PumpTotals::default(),
+            dropped: Vec::new(),
         }
+    }
+
+    /// Lets go of the chains built for deliveries that left the queue.
+    fn forget_dropped(&mut self, gpu: &GpuContext) {
+        for content in self.dropped.drain(..) {
+            gpu.chains.forget(&content);
+        }
+    }
+
+    /// What this pump has done since it was made: see [`PumpTotals`].
+    pub fn totals(&self) -> PumpTotals {
+        self.totals
     }
 
     /// Keeps each resident mesh's decoded content beside its GPU copy, for a
@@ -359,7 +430,7 @@ impl ContentPump {
             self.sliding.retain(|id| {
                 prepared
                     .get_mut(id)
-                    .is_some_and(|tile| tile.slide(&gpu.queue, frame, slide))
+                    .is_some_and(|tile| tile.slide(gpu, frame, slide))
             });
         }
     }
@@ -439,6 +510,10 @@ impl ContentPump {
     /// bytes (or refuses one that would cross its class's hard limit), and
     /// stitches the tiles about to be drawn. Returns how many resources
     /// reached the GPU.
+    ///
+    /// The frame's copies are recorded, not submitted: they go in one
+    /// submit with what [`Self::resolve`] writes, before the host draws
+    /// (`crate::upload`).
     pub fn pump<S: GeometryStream>(
         &mut self,
         stream: &mut S,
@@ -446,10 +521,17 @@ impl ContentPump {
         deadline: FrameDeadline,
     ) -> usize {
         self.drain(stream);
+        // A batch a pump left without a resolve after it is submitted now:
+        // a host that pumps several times a frame does not hold every
+        // copy until it draws.
+        gpu.flush_uploads();
         let uploaded = self.upload(stream, gpu, deadline);
         // What is drawn may have changed — a draw set, an upload: the tiles
         // are stitched for this frame before anyone draws it.
         self.restitch(gpu);
+        // The frame's uploads, encodes and stitches wait in its batch for
+        // what resolving writes: the frame is one submit, at the end of
+        // [`Self::resolve`], before the host's draw.
         uploaded
     }
 
@@ -513,30 +595,47 @@ impl ContentPump {
             .to_vec();
         let mut deferred = (order.len() - taken.len()) as u32;
         let began = web_time::Instant::now();
-        let mut uploaded: Vec<(ResourceId, Bytes)> = Vec::with_capacity(taken.len());
-        let mut moved = 0u64;
         // The GPU encodes have a share of their own: the blocks this frame
-        // may still write, when the plan encodes on the GPU at all.
-        let mut encodes_left = gpu.compressor.as_ref().and_then(|c| {
-            let ns = c.lock().ok()?.ns_per_block();
-            Some(self.encode_pace.blocks_per_frame(ns))
-        });
-        let mut encoded_any = false;
-        for r in taken {
-            if let (Some(left), Some(q)) = (encodes_left.as_mut(), self.queue.get(&r)) {
-                let blocks = blocks_to_encode(gpu, &q.content);
-                if blocks > 0 {
-                    // The first encode of a frame always goes, however large:
-                    // nothing waits for ever. The rest wait for a frame with
-                    // room, in the plan's order, as a deadline's do.
-                    if encoded_any && blocks > *left {
-                        deferred += 1;
-                        continue;
-                    }
-                    *left = left.saturating_sub(blocks);
-                    encoded_any = true;
-                }
-            }
+        // may still write, when the plan encodes on the GPU at all. Decided
+        // for the whole frame first, with one look at the encoder and one
+        // at the imagery the GPU holds — not two locks per delivery — and
+        // as uploading one by one would: imagery an earlier upload of the
+        // frame brings is not encoded again.
+        let (going, paced) = self.pace_encodes(gpu, taken);
+        deferred += paced;
+        // The chains of what goes this frame, built across threads; those
+        // of what waits behind it, in the background for its frame. Paced
+        // first: a delivery the encodes' share defers has its chain built
+        // off the render thread, not on it.
+        self.forget_dropped(gpu);
+        {
+            let now: Vec<&ResourceContent> = going
+                .iter()
+                .filter_map(|r| self.queue.get(r).map(|q| &q.content))
+                .collect();
+            gpu.chains.build_now(&now);
+            let next: std::collections::HashSet<ResourceId> = going.iter().copied().collect();
+            let ahead: Vec<&ResourceContent> = order
+                .iter()
+                .filter(|r| !next.contains(r))
+                .take(crate::chains::AHEAD)
+                .filter_map(|r| self.queue.get(r).map(|q| &q.content))
+                .collect();
+            gpu.chains.ahead(ahead.iter().copied());
+            gpu.chains
+                .keep_only(now.iter().copied().chain(ahead.iter().copied()));
+        }
+        // Every encode of the frame in one pass, in the frame's uploads.
+        {
+            let contents: Vec<&ResourceContent> = going
+                .iter()
+                .filter_map(|r| self.queue.get(r).map(|q| &q.content))
+                .collect();
+            crate::prepare::encode_frame(gpu, &contents);
+        }
+        let mut uploaded: Vec<(ResourceId, Bytes)> = Vec::with_capacity(going.len());
+        let mut moved = 0u64;
+        for r in going {
             let Some(q) = self.queue.remove(&r) else {
                 continue;
             };
@@ -544,15 +643,29 @@ impl ContentPump {
                 ResourceContent::Mesh(m) => m.cost().staging.0,
                 ResourceContent::Drape(d) => d.cost().staging.0,
             };
+            // Whatever was built for it and not used goes with it.
+            let content = q.content.clone();
             // Recorded as what the upload moved: the frame's deadline is in
             // those bytes (I18).
-            if self.upload_one(stream, gpu, r, q).is_some() {
+            let done = self.upload_one(stream, gpu, r, q);
+            gpu.chains.forget(&content);
+            if done.is_some() {
                 uploaded.push((r, Bytes(staging)));
                 moved += staging;
+                self.totals.upload_bytes += staging;
             }
         }
+        // An encode no upload took — its delivery refused at the hard
+        // limit — goes now.
+        crate::prepare::forget_encoded(gpu);
         let wall = began.elapsed();
-        // The throughput is of what the uploads moved.
+        self.totals.upload_micros += wall.as_micros() as u64;
+        // The throughput is of what the uploads moved, over all the render
+        // thread spent on them: the chains it still built and the encodes it
+        // recorded included. Measured over the copies alone, the deadline
+        // let twice the bytes into a frame and frame p99 rose by half — the
+        // work it left out is the frame's too. With the chains off the
+        // render thread, what is left is mostly the copy.
         let bytes = moved;
         // The throughput a frame's deadline is made of, measured: a moving
         // average, so one slow upload does not halve the next frame's share.
@@ -583,6 +696,68 @@ impl ContentPump {
         uploaded.len()
     }
 
+    /// Of `taken`, what goes this frame under the encodes' share, in order,
+    /// and how many wait for a frame with room. The first encode of a frame
+    /// always goes, however large: nothing waits for ever. The rest wait
+    /// for a frame with room, in the plan's order, as a deadline's do.
+    fn pace_encodes(&mut self, gpu: &GpuContext, taken: Vec<ResourceId>) -> (Vec<ResourceId>, u32) {
+        let Some(compressor) = gpu.compressor.as_ref() else {
+            return (taken, 0);
+        };
+        let Some((format, ns)) = compressor
+            .lock()
+            .ok()
+            .map(|c| (c.format(), c.ns_per_block()))
+        else {
+            return (taken, 0);
+        };
+        let mut left = self.encode_pace.blocks_per_frame(ns);
+        let Ok(pool) = gpu.imagery.lock() else {
+            return (taken, 0);
+        };
+        let mut brought: std::collections::HashSet<(u32, tuile_core::raster::ImageryCoord)> =
+            std::collections::HashSet::new();
+        let mut going = Vec::with_capacity(taken.len());
+        let mut deferred = 0;
+        let mut encoded_any = false;
+        for r in taken {
+            let Some(q) = self.queue.get_mut(&r) else {
+                going.push(r);
+                continue;
+            };
+            let owned = *q
+                .owned_blocks
+                .get_or_insert_with(|| owned_blocks(format, &q.content));
+            let layers = imagery_of(&q.content);
+            let imagery: u64 = layers
+                .iter()
+                .filter(|l| {
+                    encodes(format, &l.texture)
+                        && !pool.holds(l.source, l.coord)
+                        && !brought.contains(&(l.source, l.coord))
+                })
+                .map(|l| crate::compress::tile_blocks(format, l.texture.width, l.texture.height))
+                .sum();
+            let blocks = owned + imagery;
+            if blocks > 0 {
+                if encoded_any && blocks > left {
+                    deferred += 1;
+                    continue;
+                }
+                left = left.saturating_sub(blocks);
+                encoded_any = true;
+            }
+            brought.extend(
+                layers
+                    .iter()
+                    .filter(|l| l.is_visible())
+                    .map(|l| (l.source, l.coord)),
+            );
+            going.push(r);
+        }
+        (going, deferred)
+    }
+
     /// Uploads one delivery and acknowledges it with its actual bytes —
     /// or, when it would cross its class's hard limit, refuses it
     /// (`Discarded`). Returns the bytes acknowledged.
@@ -595,6 +770,7 @@ impl ContentPump {
     ) -> Option<u64> {
         let m = tuile_core::metrics::metrics();
         let started = web_time::Instant::now();
+        let (arrived, arrived_frame) = (q.arrived, q.arrived_frame);
         // What this would replace leaves with it: a redelivery after a change
         // of epoch is new before old, in place.
         let replaced = self.held.get(&r).map_or(0, |h| h.bytes);
@@ -602,7 +778,7 @@ impl ContentPump {
         let (bytes, store): (u64, Keep) = match &q.content {
             ResourceContent::Mesh(content) => {
                 let tile = r.tile();
-                let mut prepared = prepare(gpu, content, self.render_origin);
+                let mut prepared = crate::prepare::prepare_in(gpu, content, self.render_origin);
                 // Only the ground is stitched: a 3D Tiles mesh keeps no copy.
                 if !q.class.is_ground() {
                     prepared.forget_source();
@@ -631,7 +807,7 @@ impl ContentPump {
                 )
             }
             ResourceContent::Drape(drape) => {
-                let prepared = prepare_drape(gpu, drape);
+                let prepared = crate::prepare::prepare_drape_in(gpu, drape);
                 let bytes = prepared.gpu_bytes;
                 (
                     bytes,
@@ -651,6 +827,7 @@ impl ContentPump {
                 resource: r,
                 gen: q.gen,
             });
+            self.totals.ack_messages += 1;
             return None;
         }
         store(self);
@@ -684,6 +861,15 @@ impl ContentPump {
             gen: q.gen,
             bytes,
         });
+        let waited = arrived.elapsed().as_micros() as u64;
+        let frames = self.frame.saturating_sub(arrived_frame);
+        let t = &mut self.totals;
+        t.ack_messages += 1;
+        t.uploads += 1;
+        t.wait_micros += waited;
+        t.wait_micros_max = t.wait_micros_max.max(waited);
+        t.wait_frames += frames;
+        t.wait_frames_max = t.wait_frames_max.max(frames);
         Some(bytes)
     }
 
@@ -755,14 +941,19 @@ impl ContentPump {
                 content,
             } => {
                 self.ancestry.insert(resource.tile(), ancestry);
-                self.queue.insert(
+                if let Some(was) = self.queue.insert(
                     resource,
                     Queued {
                         gen,
                         class,
                         content,
+                        arrived: web_time::Instant::now(),
+                        arrived_frame: self.frame,
+                        owned_blocks: None,
                     },
-                );
+                ) {
+                    self.dropped.push(was.content);
+                }
                 tuile_core::metrics::metrics()
                     .pending_uploads
                     .set(self.queue.len() as u64);
@@ -772,16 +963,21 @@ impl ContentPump {
             ServerMessage::Cancel { resources } => {
                 for (r, g) in resources {
                     if self.queue.get(&r).is_some_and(|q| q.gen == g) {
-                        self.queue.remove(&r);
+                        if let Some(was) = self.queue.remove(&r) {
+                            self.dropped.push(was.content);
+                        }
                     }
                 }
             }
             ServerMessage::Evict { resources } => {
                 let m = tuile_core::metrics::metrics();
                 let mut drapes_gone = Vec::new();
+                self.totals.evict_messages += 1;
                 for r in &resources {
                     if let Some(h) = self.held.remove(r) {
                         self.held_bytes[h.class] = self.held_bytes[h.class].saturating_sub(h.bytes);
+                        self.totals.releases += 1;
+                        self.totals.released_bytes += h.bytes;
                     }
                     match r {
                         ResourceId::Mesh(tile) => {
@@ -804,7 +1000,9 @@ impl ContentPump {
                     // A copy still queued goes too: uploaded after its own
                     // eviction it would be held for ever, the server no
                     // longer counting it.
-                    self.queue.remove(r);
+                    if let Some(was) = self.queue.remove(r) {
+                        self.dropped.push(was.content);
+                    }
                 }
                 // A mesh dressed with an evicted drape lets go of its
                 // textures: it is dressed again when it is next drawn.
@@ -887,7 +1085,7 @@ impl ContentPump {
                 },
                 capped: base.map_or(0, |c| c.capped),
             };
-            mesh.dress(gpu, &wear, levels);
+            mesh.dress_in(gpu, &wear, levels);
             counts.count_levels(levels);
             dressed.insert(tile);
             let (exact, fallback) = if covers {
@@ -981,7 +1179,7 @@ impl ContentPump {
                         capped: 0,
                     };
                     if let Some(mesh) = self.prepared.get_mut(&tile) {
-                        mesh.dress(gpu, &wear, levels);
+                        mesh.dress_in(gpu, &wear, levels);
                     }
                     dressed.insert(tile);
                 }
@@ -994,7 +1192,7 @@ impl ContentPump {
             let gone = std::mem::take(&mut self.undress_wearers);
             for (tile, mesh) in self.prepared.iter_mut() {
                 if !dressed.contains(tile) && gone.iter().any(|r| mesh.wears(*r)) {
-                    mesh.undress(gpu);
+                    mesh.undress_in(gpu);
                 }
             }
         }
@@ -1052,17 +1250,22 @@ impl ContentPump {
             covering: surfaces(&covering),
             covering_fallback: surfaces(&covering_fallback),
         };
-        self.rebase_for_drawing(
-            &gpu.queue,
-            drawn
-                .exact
-                .iter()
-                .chain(drawn.fallback.iter())
-                .chain(drawn.backdrop.iter())
-                .chain(drawn.covering.iter())
-                .chain(drawn.covering_fallback.iter())
-                .copied(),
-        );
+        let origin = self.render_origin;
+        for tile in drawn
+            .exact
+            .iter()
+            .chain(drawn.fallback.iter())
+            .chain(drawn.backdrop.iter())
+            .chain(drawn.covering.iter())
+            .chain(drawn.covering_fallback.iter())
+        {
+            tile.rebase_in(gpu, origin);
+        }
+        // The frame's batch — the uploads, encodes and stitches of
+        // [`Self::pump`], and what resolving wrote: dressings, rebases —
+        // lands before the host's draw: one submit, or none when nothing
+        // moved.
+        gpu.flush_uploads();
         (drawn, counts)
     }
 
@@ -1142,50 +1345,39 @@ impl ContentPump {
     }
 }
 
-/// What one mesh holds once uploaded, by the measure its estimate uses:
-/// its buffers and uniform, the textures it owns, and the CPU copy kept for
-/// stitching (which unified memory pays for).
-/// The blocks uploading `content` would have the GPU encode: its textures
-/// marked for the encoder's format, and of its imagery those not already on
-/// the GPU. Zero without an encoder, so a context that did not choose
-/// compression paces nothing.
-fn blocks_to_encode(gpu: &GpuContext, content: &ResourceContent) -> u64 {
-    let Some(format) = gpu
-        .compressor
-        .as_ref()
-        .and_then(|c| c.lock().ok().map(|c| c.format()))
-    else {
-        return 0;
-    };
-    let encodes = |t: &tuile_core::content::DecodedTexture| {
-        t.resident_format().block() == Some(format) && t.rgba8().is_some()
-    };
-    let blocks = |t: &tuile_core::content::DecodedTexture| {
-        crate::compress::tile_blocks(format, t.width, t.height)
-    };
-    let Ok(pool) = gpu.imagery.lock() else {
-        return 0;
-    };
-    let imagery = |layers: &[tuile_core::raster::ImageryLayer]| -> u64 {
-        layers
-            .iter()
-            .filter(|l| l.is_visible() && encodes(&l.texture) && !pool.holds(l.source, l.coord))
-            .map(|l| blocks(&l.texture))
-            .sum()
-    };
+/// Whether `t` is encoded at upload into `format`: RGBA8 marked for it.
+fn encodes(
+    format: tuile_core::texels::BlockFormat,
+    t: &tuile_core::content::DecodedTexture,
+) -> bool {
+    t.resident_format().block() == Some(format) && t.rgba8().is_some()
+}
+
+/// The blocks encoding the textures `content` owns would write — a mesh's
+/// own textures; a drape owns none. Zero for any texture not encoded.
+fn owned_blocks(format: tuile_core::texels::BlockFormat, content: &ResourceContent) -> u64 {
     match content {
-        ResourceContent::Mesh(m) => {
-            m.textures
-                .iter()
-                .filter(|t| encodes(t))
-                .map(blocks)
-                .sum::<u64>()
-                + imagery(&m.imagery)
-        }
-        ResourceContent::Drape(d) => imagery(&d.tiles),
+        ResourceContent::Mesh(m) => m
+            .textures
+            .iter()
+            .filter(|t| encodes(format, t))
+            .map(|t| crate::compress::tile_blocks(format, t.width, t.height))
+            .sum(),
+        ResourceContent::Drape(_) => 0,
     }
 }
 
+/// The visible imagery `content` names: a mesh's own, or a drape's tiles.
+fn imagery_of(content: &ResourceContent) -> Vec<&tuile_core::raster::ImageryLayer> {
+    match content {
+        ResourceContent::Mesh(m) => m.imagery.iter().filter(|l| l.is_visible()).collect(),
+        ResourceContent::Drape(d) => d.tiles.iter().filter(|l| l.is_visible()).collect(),
+    }
+}
+
+/// What one mesh holds once uploaded, by the measure its estimate uses:
+/// its buffers and uniform, the textures it owns, and the CPU copy kept for
+/// stitching (which unified memory pays for).
 fn mesh_bytes(prepared: &PreparedTile, content: &tuile_core::DecodedTileContent) -> u64 {
     // The copy kept to stitch the tile, if it keeps one.
     let copy: u64 = if prepared.keeps_source() {

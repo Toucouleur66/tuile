@@ -184,6 +184,19 @@ pub struct GpuContext {
     imagery_plan: ImageryPlan,
     /// The GPU encoder, when the plan encodes on the GPU.
     pub(crate) compressor: Option<Mutex<Compressor>>,
+    /// What the upload and release path asked of the device: see
+    /// [`Self::upload_ops`].
+    pub(crate) ops: crate::ops::OpCounters,
+    /// The CPU mip chains of what is about to be uploaded, built off the
+    /// render thread: see [`crate::chains`].
+    pub(crate) chains: crate::chains::Chains,
+    /// The frame's uploads, recorded and not yet submitted: see
+    /// [`crate::upload`].
+    uploads: Mutex<crate::upload::Uploads>,
+    /// Textures the frame's encode pass made, by the address of the texels
+    /// they were made from, for the uploads that follow it to take: see
+    /// [`crate::prepare::encode_frame`].
+    pub(crate) encoded: Mutex<std::collections::HashMap<usize, crate::prepare::Encoded>>,
 }
 
 impl GpuContext {
@@ -304,6 +317,7 @@ impl GpuContext {
             &[255, 255, 255, 255],
         );
         let white_view = white.create_view(&wgpu::TextureViewDescriptor::default());
+        let uploads = crate::upload::Uploads::new(&device);
         Self {
             device,
             queue,
@@ -316,6 +330,10 @@ impl GpuContext {
             imagery_slots,
             imagery_plan: ImageryPlan::RGBA8,
             compressor: None,
+            ops: crate::ops::OpCounters::default(),
+            chains: crate::chains::Chains::default(),
+            uploads: Mutex::new(uploads),
+            encoded: Mutex::default(),
         }
     }
 
@@ -348,6 +366,109 @@ impl GpuContext {
     /// How this context holds imagery: what the consumer's loader is told.
     pub fn imagery_plan(&self) -> ImageryPlan {
         self.imagery_plan
+    }
+
+    /// What the upload and release path has asked of the device since this
+    /// context was made: buffers, textures and bind groups created, writes,
+    /// staging, encoders, submits, encodes and readbacks. Two snapshots
+    /// subtract into one frame's.
+    pub fn upload_ops(&self) -> crate::ops::UploadOps {
+        self.ops.snapshot()
+    }
+
+    /// `bytes` into `target` at `offset`, in the frame's uploads: lands at
+    /// the next [`Self::flush_uploads`].
+    pub(crate) fn write_buffer(&self, target: &wgpu::Buffer, offset: u64, bytes: &[u8]) {
+        self.uploads.lock().expect("uploads").write_buffer(
+            &self.device,
+            &self.queue,
+            &self.ops,
+            target,
+            offset,
+            bytes,
+        );
+    }
+
+    /// A buffer holding `bytes`, written in the frame's uploads: what
+    /// `create_buffer_init` made, without a staging buffer of its own.
+    pub(crate) fn buffer_with(
+        &self,
+        label: &str,
+        usage: wgpu::BufferUsages,
+        bytes: &[u8],
+    ) -> wgpu::Buffer {
+        crate::ops::OpCounters::add(&self.ops.buffers_created, 1);
+        // The size `create_buffer_init` gives it: padded to a whole copy
+        // unit, none for nothing.
+        let size = if bytes.is_empty() {
+            0
+        } else {
+            (bytes.len() as u64).next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT)
+        };
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size,
+            usage: usage | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        if size as usize == bytes.len() {
+            self.write_buffer(&buffer, 0, bytes);
+        } else if !bytes.is_empty() {
+            let mut padded = bytes.to_vec();
+            padded.resize(size as usize, 0);
+            self.write_buffer(&buffer, 0, &padded);
+        }
+        buffer
+    }
+
+    /// One mip level of `texture`, in the frame's uploads: `rows` rows of
+    /// `row_bytes` packed in `bytes`, copied to `extent`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_texture(
+        &self,
+        texture: &wgpu::Texture,
+        mip_level: u32,
+        bytes: &[u8],
+        row_bytes: u32,
+        rows: u32,
+        extent: wgpu::Extent3d,
+    ) {
+        self.uploads.lock().expect("uploads").write_texture(
+            &self.device,
+            &self.queue,
+            &self.ops,
+            texture,
+            mip_level,
+            bytes,
+            row_bytes,
+            rows,
+            extent,
+        );
+    }
+
+    /// Runs `record` on the frame's encoder: what lands with the frame's
+    /// uploads, in order with them.
+    pub(crate) fn record<R>(&self, record: impl FnOnce(&mut wgpu::CommandEncoder) -> R) -> R {
+        let mut uploads = self.uploads.lock().expect("uploads");
+        record(uploads.encoder(&self.device, &self.ops))
+    }
+
+    /// Submits everything the frame's uploads recorded: one submit, or
+    /// none when nothing was. Then reads the encoder's stopwatch, if a
+    /// measured pass went with it.
+    pub(crate) fn flush_uploads(&self) {
+        let submitted = self
+            .uploads
+            .lock()
+            .expect("uploads")
+            .flush(&self.queue, &self.ops);
+        if submitted {
+            if let Some(compressor) = &self.compressor {
+                if let Ok(mut c) = compressor.lock() {
+                    c.submitted(&self.ops);
+                }
+            }
+        }
     }
 
     /// What the GPU encoder has done, when there is one.
