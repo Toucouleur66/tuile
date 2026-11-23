@@ -318,7 +318,17 @@ impl App {
     fn imagery_held(&self) -> Option<String> {
         let active = self.active.as_ref()?;
         let mut held = active.gpu.imagery.lock().ok()?.live_textures_by_format();
-        Some(held_line(active.gpu.imagery_plan().target, &mut held))
+        let line = held_line(active.gpu.imagery_plan().target, &mut held);
+        // And, where the GPU encodes, what its encodes have done.
+        let encodes = encode_line(
+            active.gpu.imagery_encode_stats(),
+            active.gpu.imagery_ns_per_block(),
+            active.pump.last_uploads().deferred_encode,
+        );
+        Some(match encodes {
+            Some(encodes) => format!("{line} · {encodes}"),
+            None => line,
+        })
     }
 
     /// The title bar: the application, where the eye is, and — for a few
@@ -428,6 +438,24 @@ fn held_line(
     format!("imagery {}", parts.join(" + "))
 }
 
+/// `encoded 412 (3 RGBA8), 1.8 µs/block, 2 waiting`: the GPU encoder's
+/// tiles since the session began (and those that had to stay RGBA8), its
+/// cost of a block, and the uploads the last frame's encode lane left for a
+/// later one. `None` without an encoder.
+fn encode_line(
+    stats: Option<tuile_wgpu::EncodeStats>,
+    ns_per_block: Option<f64>,
+    waiting: u32,
+) -> Option<String> {
+    let stats = stats?;
+    Some(format!(
+        "encoded {} ({} RGBA8), {:.1} µs/block, {waiting} waiting",
+        stats.encoded,
+        stats.fell_back,
+        ns_per_block.unwrap_or(0.0) / 1_000.0
+    ))
+}
+
 /// `2026-06-21 19:42 UTC · solar 19:43 · ×60`: the instant drawn, the local
 /// apparent solar time under the eye, and the rate when it is not real time.
 pub(crate) fn clock_line(instant: f64, rate: f64, lon: f64) -> String {
@@ -451,7 +479,24 @@ pub(crate) fn clock_line(instant: f64, rate: f64, lon: f64) -> String {
 
 #[cfg(test)]
 mod held_tests {
-    use super::held_line;
+    use super::{encode_line, held_line};
+
+    /// The encodes' line: nothing without an encoder, else its counts, its
+    /// cost of a block and what waits.
+    #[test]
+    fn the_encode_line_says_what_the_encoder_did() {
+        assert_eq!(encode_line(None, None, 0), None);
+        let stats = tuile_wgpu::EncodeStats {
+            encoded: 412,
+            fell_back: 3,
+            blocks: 412 * 5_463,
+            measured_ns_per_block: Some(1_812.0),
+        };
+        assert_eq!(
+            encode_line(Some(stats), Some(1_812.0), 2).as_deref(),
+            Some("encoded 412 (3 RGBA8), 1.8 µs/block, 2 waiting")
+        );
+    }
     use tuile_core::texels::ImageryFormat;
 
     /// The plan's format leads, the others follow, sizes in whole MiB.

@@ -222,6 +222,8 @@ impl Default for EncodePace {
 pub struct EncodeStats {
     pub encoded: u64,
     pub fell_back: u64,
+    /// The 4×4 blocks the encoded tiles wrote, mip chains included.
+    pub blocks: u64,
     /// Nanoseconds per block from timestamps, `None` until measured.
     pub measured_ns_per_block: Option<f64>,
 }
@@ -374,6 +376,7 @@ impl Compressor {
                 Err(_) => self.stats.fell_back += 1,
             }
         }
+        self.stats.blocks += blocks;
         if any {
             // The pass, and the encoder's table of jobs.
             OpCounters::add(&ops.encode_passes, 1);

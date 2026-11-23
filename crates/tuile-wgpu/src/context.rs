@@ -478,6 +478,15 @@ impl GpuContext {
             .and_then(|c| c.lock().ok().map(|c| c.stats()))
     }
 
+    /// The GPU encoder's cost of a block, nanoseconds: measured by
+    /// timestamps where the device has them, assumed until then. `None`
+    /// without an encoder.
+    pub fn imagery_ns_per_block(&self) -> Option<f64> {
+        self.compressor
+            .as_ref()
+            .and_then(|c| c.lock().ok().map(|c| c.ns_per_block()))
+    }
+
     /// Creates a context without any surface (tests, offscreen render).
     /// Returns a typed error when the machine has no usable adapter, so
     /// CI without a GPU can skip cleanly.

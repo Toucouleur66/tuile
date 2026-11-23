@@ -136,3 +136,126 @@ fn the_encodes_take_one_frame_each_under_a_tiny_share() {
         assert_eq!(pump.pending_uploads(), 0, "{plan}: nothing waits for ever");
     }
 }
+
+/// A flat mesh over `tile`.
+fn flat(tile: TileId) -> tuile_core::content::DecodedTileContent {
+    let (z, x, y) = tile.terrain_coord();
+    let rect = tuile_terrain::GeographicTilingScheme::default()
+        .tile_rect(tuile_terrain::TileCoord::new(z, x, y));
+    tuile_terrain::fill_content(&rect, [Some(0.0); 4], 0.0)
+}
+
+/// **The encode pacing never splits a swap group.** A drape takes the
+/// frame's first encode; behind it, a tile's mesh and its drape form a swap
+/// group. The drape does not fit the encodes' share — and the mesh, which
+/// encodes nothing, waits with it rather than be drawn bare. Both go the
+/// next frame, together. Off: everything goes at once.
+#[test]
+fn encode_pacing_never_splits_a_swap_group() {
+    use support::{mesh, select};
+    use tuile_core::budget::{Bytes, SwapGroup, UploadPlan};
+    use tuile_core::protocol::ServerMessage;
+    for (plan, compression) in PLANS {
+        let Some(gpu) = gpu_with(compression) else {
+            continue;
+        };
+        let (first, paired) = (TileId::from_terrain(4, 3, 2), TileId::from_terrain(4, 4, 2));
+        let texture = |seed: u8| painted(&gpu, 256, 256, move |x, _| [x as u8, seed, 50, 255]);
+        let lead = ResourceId::drape(first, LayerId(0), 4);
+        let (m, d) = (
+            ResourceId::Mesh(paired),
+            ResourceId::drape(paired, LayerId(0), 4),
+        );
+        let mut members = vec![m, d];
+        members.sort_unstable();
+        let mut selected = select(Vec::new(), 1);
+        if let ServerMessage::Select { plan, .. } = &mut selected {
+            *plan = UploadPlan {
+                items: vec![lead, m, d],
+                bytes: Bytes::ZERO,
+                groups: vec![SwapGroup { members }],
+            };
+        }
+        let mut stream = Scripted::new([
+            drape(first, 1, whole_drape(first, 4, texture(10))),
+            mesh(paired, 2, flat(paired)),
+            drape(paired, 3, whole_drape(paired, 4, texture(20))),
+            selected,
+        ]);
+        let mut pump = ContentPump::new(glam::DVec3::ZERO);
+        pump.set_encode_pace(EncodePace { share_micros: 1 });
+        pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
+        let first_frame = (acked(&stream, m).is_some(), acked(&stream, d).is_some());
+        let uploads = pump.last_uploads();
+        if gpu.imagery_plan().target == ImageryFormat::Rgba8 {
+            assert_eq!(first_frame, (true, true), "{plan}");
+            assert_eq!(uploads.deferred_encode, 0, "{plan}");
+            continue;
+        }
+        assert!(
+            acked(&stream, lead).is_some(),
+            "{plan}: the first encode goes"
+        );
+        assert_eq!(
+            first_frame,
+            (false, false),
+            "{plan}: the group was split — its mesh went without its drape"
+        );
+        assert_eq!(uploads.deferred_encode, 2, "{plan}: the whole group waits");
+        assert_eq!(uploads.deferred, 0, "{plan}: not the byte lane's");
+        pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
+        assert!(
+            acked(&stream, m).is_some() && acked(&stream, d).is_some(),
+            "{plan}: the group goes whole the next frame"
+        );
+        assert_eq!(pump.pending_uploads(), 0, "{plan}");
+    }
+}
+
+/// **A frame's encodes are counted, and its deferrals by lane.** Three
+/// drapes under a share too small for one tile: the first frame encodes one
+/// 256² tile — 5,463 blocks, mip chain included — and defers two to the
+/// encode lane, none to the byte lane. Off encodes and defers nothing.
+#[test]
+fn a_frames_encodes_and_deferrals_are_counted_by_lane() {
+    for (plan, compression) in PLANS {
+        let Some(gpu) = gpu_with(compression) else {
+            continue;
+        };
+        let tiles = [
+            TileId::from_terrain(4, 3, 2),
+            TileId::from_terrain(4, 4, 2),
+            TileId::from_terrain(4, 5, 2),
+        ];
+        let mut stream = Scripted::new(tiles.iter().enumerate().map(|(i, t)| {
+            let texture = painted(&gpu, 256, 256, |x, _| [x as u8, 100, 50, 255]);
+            drape(*t, i as u64 + 1, whole_drape(*t, 4, texture))
+        }));
+        let mut pump = ContentPump::new(glam::DVec3::ZERO);
+        pump.set_encode_pace(EncodePace { share_micros: 1 });
+        pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
+        let u = pump.last_uploads();
+        let want = match gpu.imagery_plan().target {
+            ImageryFormat::Rgba8 => (3, 0, 0, 0, 0),
+            _ => (1, 0, 2, 1, 5_463),
+        };
+        assert_eq!(
+            (
+                u.uploaded,
+                u.deferred,
+                u.deferred_encode,
+                u.encoded_tiles,
+                u.encode_blocks
+            ),
+            want,
+            "{plan}"
+        );
+        assert_eq!(u.encode_gpu_micros > 0, want.4 > 0, "{plan}");
+        let totals = pump.totals();
+        assert_eq!(
+            (totals.deferred_encode, totals.encode_blocks),
+            (u64::from(want.2), want.4),
+            "{plan}"
+        );
+    }
+}

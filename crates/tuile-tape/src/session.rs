@@ -46,6 +46,8 @@ pub const FRAME_TOPIC: &str = "/viewer/frame";
 pub const SKY_TOPIC: &str = "/viewer/sky";
 /// Where a frame's [`InputEvents`] go.
 pub const INPUT_TOPIC: &str = "/viewer/input";
+/// Where a frame's [`UploadFrame`] goes.
+pub const UPLOAD_TOPIC: &str = "/viewer/uploads";
 
 const FRAME_SCHEMA: &str = "tuile.ViewerFrame";
 const FRAME_JSON_SCHEMA: &str = r#"{
@@ -93,6 +95,48 @@ const INPUT_JSON_SCHEMA: &str = r#"{
   },
   "required": ["version", "events"]
 }"#;
+
+const UPLOAD_SCHEMA: &str = "tuile.ViewerUploads";
+const UPLOAD_JSON_SCHEMA: &str = r#"{
+  "type": "object",
+  "description": "what one frame's uploads did, by lane: see tuile_tape::session::UploadFrame",
+  "properties": {
+    "version":         {"type": "integer", "const": 1},
+    "deadline_bytes":  {"type": "integer", "description": "the frame's upload deadline, bytes"},
+    "uploaded":        {"type": "integer", "description": "resources uploaded"},
+    "uploaded_bytes":  {"type": "integer", "description": "the bytes their uploads moved"},
+    "deferred":        {"type": "integer", "description": "plan items the byte lane deferred"},
+    "deferred_encode": {"type": "integer", "description": "plan items the encode lane deferred"},
+    "encoded_tiles":   {"type": "integer", "description": "imagery tiles encoded on the GPU"},
+    "encode_blocks":   {"type": "integer", "description": "the 4x4 blocks those encodes wrote"},
+    "encode_gpu_us":   {"type": "integer", "description": "their GPU time, from the measured cost of a block"},
+    "upload_wall_us":  {"type": "integer", "description": "the render thread's wall time in the uploads"}
+  },
+  "required": ["version", "deferred", "deferred_encode", "encoded_tiles", "encode_blocks"]
+}"#;
+
+/// What one frame's uploads did, by lane: the executor's side of the
+/// graphics budget, frame by frame, beside the camera that drew it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct UploadFrame {
+    /// The frame's upload deadline, bytes.
+    pub deadline_bytes: u64,
+    /// Resources uploaded, and the bytes their uploads moved.
+    pub uploaded: u32,
+    pub uploaded_bytes: u64,
+    /// Plan items the byte lane deferred to a later frame.
+    pub deferred: u32,
+    /// Plan items the encode lane deferred to a later frame.
+    pub deferred_encode: u32,
+    /// Imagery tiles encoded on the GPU, and the 4×4 blocks they wrote.
+    pub encoded_tiles: u32,
+    pub encode_blocks: u64,
+    /// The encodes' GPU time, microseconds: blocks × the measured cost of
+    /// a block (assumed until the device measured one).
+    pub encode_gpu_us: u64,
+    /// The render thread's wall time in the frame's uploads, microseconds.
+    pub upload_wall_us: u64,
+}
 
 /// What a frame was drawn under, beside its camera.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -161,6 +205,7 @@ pub struct Recorded {
     pub context: Option<FrameContext>,
     pub sky: Option<SkyState>,
     pub input: Vec<String>,
+    pub uploads: Option<UploadFrame>,
 }
 
 /// A record as it is written: the record and its version, flat.
@@ -197,6 +242,17 @@ impl Tape {
             events: events.to_vec(),
         };
         self.push_json(INPUT_TOPIC, INPUT_SCHEMA, INPUT_JSON_SCHEMA, &json(&record));
+    }
+
+    /// Appends what the uploads of the frame whose camera was pushed last
+    /// did.
+    pub fn push_uploads(&mut self, uploads: &UploadFrame) {
+        self.push_json(
+            UPLOAD_TOPIC,
+            UPLOAD_SCHEMA,
+            UPLOAD_JSON_SCHEMA,
+            &json(uploads),
+        );
     }
 }
 
@@ -355,13 +411,14 @@ pub fn read(path: impl AsRef<Path>) -> Result<Vec<Recorded>, TapeError> {
             context: None,
             sky: None,
             input: Vec::new(),
+            uploads: None,
         });
     }
     let bytes = std::fs::read(path.as_ref())?;
     for message in mcap::MessageStream::new(&bytes)? {
         let message = message?;
         let topic = message.channel.topic.as_str();
-        if ![FRAME_TOPIC, SKY_TOPIC, INPUT_TOPIC].contains(&topic) {
+        if ![FRAME_TOPIC, SKY_TOPIC, INPUT_TOPIC, UPLOAD_TOPIC].contains(&topic) {
             continue;
         }
         let index = (message.log_time / NANOS_PER_FRAME) as usize;
@@ -374,6 +431,7 @@ pub fn read(path: impl AsRef<Path>) -> Result<Vec<Recorded>, TapeError> {
         match topic {
             FRAME_TOPIC => frame.context = Some(parse(topic, &message.data)?),
             SKY_TOPIC => frame.sky = Some(parse(topic, &message.data)?),
+            UPLOAD_TOPIC => frame.uploads = Some(parse(topic, &message.data)?),
             _ => frame
                 .input
                 .extend(parse::<InputEvents>(topic, &message.data)?.events),
@@ -452,12 +510,25 @@ mod tests {
                 Vec::new()
             };
             tape.push_input(&input);
-            written.push((camera, context, sky, input));
+            let uploads = UploadFrame {
+                deadline_bytes: 1 << 20,
+                uploaded: (n % 5) as u32,
+                uploaded_bytes: n * 349_524,
+                deferred: (n % 3) as u32,
+                deferred_encode: (n % 4) as u32,
+                encoded_tiles: (n % 2) as u32,
+                encode_blocks: (n % 2) * 5_463,
+                encode_gpu_us: (n % 2) * 9_500,
+                upload_wall_us: n,
+            };
+            tape.push_uploads(&uploads);
+            written.push((camera, context, sky, input, uploads));
         }
         tape.finish().expect("closes");
         let read = read(&path).expect("reads");
         assert_eq!(read.len(), written.len());
-        for (frame, (camera, context, sky, input)) in read.iter().zip(&written) {
+        for (frame, (camera, context, sky, input, uploads)) in read.iter().zip(&written) {
+            assert_eq!(frame.uploads, Some(*uploads), "frame {}", frame.index);
             assert_eq!(frame.camera, *camera, "frame {}", frame.index);
             assert_eq!(frame.context, Some(*context), "frame {}", frame.index);
             assert_eq!(frame.sky, Some(*sky), "frame {}", frame.index);
@@ -540,6 +611,8 @@ mod tests {
         tape.finish().expect("closes");
         let read = read(&path).expect("reads");
         assert_eq!(read.len(), 5);
-        assert!(read.iter().all(|f| f.context.is_none() && f.sky.is_none()));
+        assert!(read
+            .iter()
+            .all(|f| f.context.is_none() && f.sky.is_none() && f.uploads.is_none()));
     }
 }

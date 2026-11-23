@@ -62,19 +62,7 @@ impl FrameDeadline {
         let mut used = done;
         let mut n = 0;
         while n < queue.len() {
-            // The unit at `n`: a whole swap group when the queue holds its
-            // members from here on, contiguously, as the plan lays them out;
-            // else the item alone.
-            let unit = groups
-                .iter()
-                .find(|g| {
-                    g.members.len() > 1
-                        && g.members.contains(&queue[n])
-                        && queue
-                            .get(n..n + g.members.len())
-                            .is_some_and(|run| run.iter().all(|r| g.members.contains(r)))
-                })
-                .map_or(1, |g| g.members.len());
+            let unit = swap_unit(queue, n, groups);
             let bytes = queue[n..n + unit]
                 .iter()
                 .fold(Bytes::ZERO, |a, r| a.plus(cost(*r)));
@@ -92,4 +80,22 @@ impl FrameDeadline {
         }
         &queue[..n]
     }
+}
+
+/// The length of the unit at `n` of `queue` (an executor's uploads, in the
+/// plan's order): a whole swap group of `groups` when the queue holds its
+/// members from `n` on, contiguously, as the plan lays them out; else the
+/// item alone. What every lane of a frame — its bytes, its encodes — takes
+/// or defers whole, so that no member of a swap is drawn without the rest.
+pub fn swap_unit(queue: &[ResourceId], n: usize, groups: &[SwapGroup]) -> usize {
+    groups
+        .iter()
+        .find(|g| {
+            g.members.len() > 1
+                && g.members.contains(&queue[n])
+                && queue
+                    .get(n..n + g.members.len())
+                    .is_some_and(|run| run.iter().all(|r| g.members.contains(r)))
+        })
+        .map_or(1, |g| g.members.len())
 }

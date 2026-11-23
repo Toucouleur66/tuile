@@ -396,13 +396,8 @@ fn run(plan: &str, gpu: &GpuContext) {
         heading: 0.0,
     };
     // Settled first, at the gesture's start: a session in use, not a cold
-    // start.
-    for _ in 0..400 {
-        s.frame(gpu, start);
-        if s.pump.pending_uploads() == 0 && s.pump.converged {
-            break;
-        }
-    }
+    // start. How long that takes is the cold settle: every upload landed.
+    settle(plan, "settle-cold", gpu, &mut s, start, 400);
     let lerp = |a: f64, b: f64, t: f64| a + (b - a) * t;
     let geo = |a: f64, b: f64, t: f64| a * (b / a).powf(t);
     let mut pose = start;
@@ -442,12 +437,7 @@ fn run(plan: &str, gpu: &GpuContext) {
     });
     report(plan, "gesture", &all);
     // Still: the camera put down, as a person reading the map.
-    for _ in 0..200 {
-        s.frame(gpu, pose);
-        if s.pump.pending_uploads() == 0 && s.pump.converged {
-            break;
-        }
-    }
+    settle(plan, "settle-after-gesture", gpu, &mut s, pose, 200);
     let still: Vec<FrameNumbers> = (0..120).map(|_| s.frame(gpu, pose)).collect();
     report(plan, "still", &still);
     let (buffers, textures, bind_groups, memory) = device_memory(gpu);
@@ -456,6 +446,37 @@ fn run(plan: &str, gpu: &GpuContext) {
          device_bind_groups={bind_groups} device_MB={:.1} pump_held_MB={:.1}",
         memory as f64 / 1e6,
         s.pump.held_bytes().iter().map(|(_, b)| b).sum::<u64>() as f64 / 1e6
+    );
+}
+
+/// Frames at `pose` until every upload landed and the budget converged, at
+/// most `cap`: how many, how long, what was encoded on the way, the imagery
+/// the GPU held at its peak, and the frames' p99.
+fn settle(plan: &str, phase: &str, gpu: &GpuContext, s: &mut Session, pose: Pose, cap: usize) {
+    let encoded = || gpu.imagery_encode_stats().map_or(0, |e| e.encoded);
+    let imagery = || gpu.imagery.lock().map_or(0, |i| i.live().1);
+    let (encoded0, began) = (encoded(), Instant::now());
+    let mut peak = imagery();
+    let mut frames = Vec::new();
+    let mut landed = false;
+    while frames.len() < cap {
+        frames.push(s.frame(gpu, pose));
+        peak = peak.max(imagery());
+        if s.pump.pending_uploads() == 0 && s.pump.converged {
+            landed = true;
+            break;
+        }
+    }
+    let ms = began.elapsed().as_secs_f64() * 1e3;
+    let mut cpu: Vec<f64> = frames.iter().map(|f| f.cpu_ms).collect();
+    let n = frames.len();
+    let tiles = encoded() - encoded0;
+    eprintln!(
+        "BENCH plan={plan} phase={phase} frames={n} landed={landed} settle_ms={ms:.0} \
+         encoded={tiles} encoded/f={:.2} imagery_peak_MB={:.1} cpu_p99={:.2}",
+        tiles as f64 / n.max(1) as f64,
+        peak as f64 / 1e6,
+        percentile(&mut cpu, 0.99),
     );
 }
 

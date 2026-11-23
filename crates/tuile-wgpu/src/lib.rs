@@ -35,7 +35,10 @@ pub use overlay::{OverlayMask, OverlayRenderer, OverlayVertex};
 pub use prepare::{
     prepare, prepare_drape, Levels, PreparedDrape, PreparedMesh, PreparedTile, Vertex, STITCH_ROWS,
 };
-pub use pump::{ContentPump, Drawn, PumpTotals, Resolution, STITCH_SLIDE_FRAMES, UPLOAD_SHARE_PERMILLE};
+pub use pump::{
+    ContentPump, Drawn, FrameUploads, PumpTotals, Resolution, STITCH_SLIDE_FRAMES,
+    UPLOAD_SHARE_PERMILLE,
+};
 pub use readback::{MappedFrame, Readback, ReadbackRing};
 pub use renderer::{sky_wgsl, LineVertex, SkyLightRead, TileRenderer, ViewUniform};
 pub use sky::{ecef_of, Atmosphere, AtmosphereConfig, Bodies, Lights, SkyFrame, SkyView};
