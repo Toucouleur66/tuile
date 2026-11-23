@@ -101,7 +101,11 @@ pub fn encode_client(message: &ClientMessage) -> Vec<u8> {
             w.u8(6);
             w.u64(*bytes);
         }
-        ClientMessage::Ahead { views, reach } => {
+        ClientMessage::Ahead {
+            views,
+            reach,
+            model,
+        } => {
             w.u8(7);
             let plain: Vec<ViewState> = views.iter().map(|a| a.view).collect();
             write_views(&mut w, &plain);
@@ -111,6 +115,7 @@ pub fn encode_client(message: &ClientMessage) -> Vec<u8> {
             }
             w.f64(reach.ground_mps);
             w.f64(reach.zoom_out_per_s);
+            w.u64(*model);
         }
         ClientMessage::Specify { query, overridden } => {
             w.u8(8);
@@ -268,7 +273,11 @@ pub fn decode_client(bytes: &[u8]) -> Result<ClientMessage, WireError> {
                 ground_mps: r.f64()?,
                 zoom_out_per_s: r.f64()?,
             };
-            ClientMessage::Ahead { views, reach }
+            ClientMessage::Ahead {
+                views,
+                reach,
+                model: r.u64()?,
+            }
         }
         8 => ClientMessage::Specify {
             query: String::from_utf8_lossy(r.bytes()?).into_owned(),
@@ -1674,23 +1683,28 @@ mod tests {
             ground_mps: 1234.5,
             zoom_out_per_s: 3.25,
         };
-        let ClientMessage::Ahead { views, reach: got } =
-            decode_client(&encode_client(&ClientMessage::Ahead {
-                views: vec![
-                    AheadView {
-                        view,
-                        in_us: 250_000,
-                        p_permille: 900,
-                    },
-                    AheadView::certain(eye, 2_000_000),
-                ],
-                reach,
-            }))
-            .expect("reads back")
+        let ClientMessage::Ahead {
+            views,
+            reach: got,
+            model,
+        } = decode_client(&encode_client(&ClientMessage::Ahead {
+            views: vec![
+                AheadView {
+                    view,
+                    in_us: 250_000,
+                    p_permille: 900,
+                },
+                AheadView::certain(eye, 2_000_000),
+            ],
+            reach,
+            model: 0xfeed_beef,
+        }))
+        .expect("reads back")
         else {
             panic!("not the views ahead");
         };
         assert_eq!(got, reach);
+        assert_eq!(model, 0xfeed_beef);
         assert_eq!(
             views
                 .iter()

@@ -307,6 +307,34 @@ pub fn describe() {
     );
 
     describe_gauge!("tuile_tiles_visited", "Nodes the last pass walked.");
+    describe_gauge!(
+        "tuile_predict_horizons",
+        "Horizons the views ahead are predicted at."
+    );
+    describe_gauge!(
+        "tuile_predict_horizon_max_ms",
+        "The farthest prediction horizon, ms."
+    );
+    describe_gauge!(
+        "tuile_predict_laplace_ms",
+        "Decay of an interactive prediction's probability, ms."
+    );
+    describe_gauge!(
+        "tuile_predict_interrupt_ms",
+        "Decay of a known path's probability (interruption), ms."
+    );
+    describe_gauge!(
+        "tuile_predict_rate_decay_ms",
+        "How long a hand's rate lasts in the motion model, ms."
+    );
+    describe_gauge!(
+        "tuile_predict_coast_ms",
+        "A fling's coast time constant, ms."
+    );
+    describe_gauge!(
+        "tuile_predict_digest_low",
+        "The prediction's numbers' digest, its low 32 bits."
+    );
     describe_gauge!("tuile_tiles_culled", "Nodes no view could see.");
     describe_gauge!("tuile_tiles_selected", "Tiles the last pass chose to draw.");
     describe_gauge!("tuile_gaps", "Ground drawn by nothing. Zero on a globe.");
@@ -568,6 +596,13 @@ pub fn publish(m: &Metrics) {
     gauge!("tuile_meshes_in_flight").set(m.meshes_in_flight.get() as f64);
     gauge!("tuile_textures_in_flight").set(m.textures_in_flight.get() as f64);
     gauge!("tuile_resident_bytes").set(m.resident_bytes.get() as f64);
+    gauge!("tuile_predict_horizons").set(m.predict_horizons.get() as f64);
+    gauge!("tuile_predict_horizon_max_ms").set(m.predict_horizon_max_ms.get() as f64);
+    gauge!("tuile_predict_laplace_ms").set(m.predict_laplace_ms.get() as f64);
+    gauge!("tuile_predict_interrupt_ms").set(m.predict_interrupt_ms.get() as f64);
+    gauge!("tuile_predict_rate_decay_ms").set(m.predict_rate_decay_ms.get() as f64);
+    gauge!("tuile_predict_coast_ms").set(m.predict_coast_ms.get() as f64);
+    gauge!("tuile_predict_digest_low").set((m.predict_digest.get() & 0xffff_ffff) as f64);
     gauge!("tuile_imagery_bytes").set(m.imagery_bytes.get() as f64);
     gauge!("tuile_imagery_textures").set(m.imagery_textures.get() as f64);
     gauge!("tuile_imagery_compressed_textures")

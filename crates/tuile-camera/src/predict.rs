@@ -112,6 +112,161 @@ pub struct PredictConfig {
     /// per second: the reachable envelope.
     pub reach_heights_per_s: f64,
     pub reach_zoom_out_per_s: f64,
+    /// The momentum the controller coasts on after a fling, seconds (the
+    /// host applies it to `Inertia::coast_s`): what the model predicts the
+    /// coast of. 0 is none.
+    pub coast_s: f64,
+}
+
+/// The keys of the prediction's query ([`PredictConfig::to_query`]), in
+/// their order: the `tuile://budget?…` route's prediction keys.
+pub const QUERY_KEYS: [&str; 11] = [
+    "horizons",
+    "laplace_s",
+    "interrupt_s",
+    "rate_decay_s",
+    "coast_s",
+    "q_ground",
+    "q_log_height",
+    "q_angle",
+    "reach_heights_per_s",
+    "reach_zoom_out_per_s",
+    "moving_heights_per_s",
+];
+
+impl PredictConfig {
+    /// The numbers for a use context, by its budget specification's label
+    /// (`tuile_budget::SpecKind::label`): a hand on a globe (`interactive`,
+    /// the default), a first-person flight (`fpv`: faster, shorter-lived
+    /// gestures), a known path (`known_path`, `film`, `fpv_film`: a path
+    /// is rarely interrupted). Unknown labels are the default.
+    pub fn for_context(label: &str) -> Self {
+        let d = PredictConfig::default();
+        match label {
+            "fpv" => PredictConfig {
+                horizons_s: vec![0.1, 0.25, 0.5, 1.0],
+                laplace_s: 1.0,
+                rate_decay_s: 1.5,
+                ..d
+            },
+            "known_path" | "film" | "fpv_film" => PredictConfig {
+                interrupt_s: 30.0,
+                ..d
+            },
+            _ => d,
+        }
+    }
+
+    /// The numbers as a query: `horizons=250,500,1000,2000&laplace_s=1.9&…`
+    /// (horizons in milliseconds, the rest in their units; `inf` for an
+    /// infinite rate decay). Read back by [`Self::with_query`].
+    pub fn to_query(&self) -> String {
+        let horizons: Vec<String> = self
+            .horizons_s
+            .iter()
+            .map(|h| format!("{}", (h * 1000.0).round() as u64))
+            .collect();
+        let n = |v: f64| {
+            if v.is_infinite() {
+                "inf".to_owned()
+            } else {
+                format!("{v}")
+            }
+        };
+        format!(
+            "horizons={}&laplace_s={}&interrupt_s={}&rate_decay_s={}&coast_s={}&q_ground={}&q_log_height={}&q_angle={}&reach_heights_per_s={}&reach_zoom_out_per_s={}&moving_heights_per_s={}",
+            horizons.join(","),
+            n(self.laplace_s),
+            n(self.interrupt_s),
+            n(self.rate_decay_s),
+            n(self.coast_s),
+            n(self.q_ground_per_height),
+            n(self.q_log_height),
+            n(self.q_angle),
+            n(self.reach_heights_per_s),
+            n(self.reach_zoom_out_per_s),
+            n(self.moving_heights_per_s),
+        )
+    }
+
+    /// These numbers with the pairs of `query` (`key=value&…`, keys of
+    /// [`QUERY_KEYS`]) set; any other key, or a value that is not a
+    /// non-negative number (`inf` allowed for `rate_decay_s`), is refused
+    /// and nothing is changed. An empty `horizons=` is no prediction.
+    pub fn with_query(&self, query: &str) -> Result<Self, String> {
+        let mut c = self.clone();
+        for pair in query.split('&').filter(|p| !p.is_empty()) {
+            let (key, text) = pair
+                .split_once('=')
+                .ok_or_else(|| format!("{pair:?} is not key=value"))?;
+            c.set(key, text)?;
+        }
+        Ok(c)
+    }
+
+    /// Sets one number by its query key.
+    pub fn set(&mut self, key: &str, text: &str) -> Result<(), String> {
+        let number = |inf: bool| -> Result<f64, String> {
+            let v = if inf && text == "inf" {
+                f64::INFINITY
+            } else {
+                text.parse::<f64>()
+                    .map_err(|_| format!("{key} is a number, not {text:?}"))?
+            };
+            if v.is_nan() || v < 0.0 || (!inf && v.is_infinite()) {
+                return Err(format!("{key} is a non-negative number, not {text:?}"));
+            }
+            Ok(v)
+        };
+        match key {
+            "horizons" => {
+                let mut h = Vec::new();
+                for ms in text.split(',').filter(|t| !t.is_empty()) {
+                    let v: u32 = ms
+                        .parse()
+                        .map_err(|_| format!("horizons are whole milliseconds, not {ms:?}"))?;
+                    if v == 0 || v > 60_000 {
+                        return Err(format!("a horizon is 1 to 60000 ms, not {v}"));
+                    }
+                    h.push(f64::from(v) / 1000.0);
+                }
+                h.sort_by(f64::total_cmp);
+                h.dedup();
+                if h.len() > 16 {
+                    return Err("at most 16 horizons".to_owned());
+                }
+                self.horizons_s = h;
+            }
+            "laplace_s" => self.laplace_s = number(false)?,
+            "interrupt_s" => self.interrupt_s = number(false)?,
+            "rate_decay_s" => self.rate_decay_s = number(true)?,
+            "coast_s" => self.coast_s = number(false)?,
+            "q_ground" => self.q_ground_per_height = number(false)?,
+            "q_log_height" => self.q_log_height = number(false)?,
+            "q_angle" => self.q_angle = number(false)?,
+            "reach_heights_per_s" => self.reach_heights_per_s = number(false)?,
+            "reach_zoom_out_per_s" => self.reach_zoom_out_per_s = number(false)?,
+            "moving_heights_per_s" => self.moving_heights_per_s = number(false)?,
+            _ => {
+                return Err(format!(
+                    "the prediction takes {}, not {key:?}",
+                    QUERY_KEYS.join(", ")
+                ))
+            }
+        }
+        Ok(())
+    }
+
+    /// A digest of the numbers, for a step's record: FNV-1a over
+    /// [`Self::to_query`], the same on every target.
+    pub fn digest(&self) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in self.to_query().bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        h
+    }
 }
 
 impl Default for PredictConfig {
@@ -132,6 +287,7 @@ impl Default for PredictConfig {
             moving_angle_per_s: 0.005,
             reach_heights_per_s: 3.0,
             reach_zoom_out_per_s: 4.0,
+            coast_s: crate::inertia::DEFAULT_COAST_S,
         }
     }
 }
@@ -674,6 +830,23 @@ impl Predictor {
         self.pending.clear();
     }
 
+    /// New numbers from the next frame on. The motion is taken again from
+    /// the next pose; the errors measured stay where the horizons stay, and
+    /// start again where they change.
+    pub fn reconfigure(&mut self, config: PredictConfig) {
+        if config.horizons_s != self.model.config().horizons_s {
+            self.errors = PredictionErrors {
+                horizons: config
+                    .horizons_s
+                    .iter()
+                    .map(|h| HorizonErrors::new(*h))
+                    .collect(),
+            };
+        }
+        self.model = MotionModel::new(config);
+        self.pending.clear();
+    }
+
     /// The frame at `t` seconds, its camera drawn as `camera`, its future
     /// `future`: the model fed and its due predictions scored, and the
     /// views ahead returned — empty when nothing moves or no horizon is
@@ -898,6 +1071,74 @@ mod tests {
         let (a, b) = (run(), run());
         assert!(!a.is_empty());
         assert_eq!(a, b);
+    }
+
+    /// The query reads back what it wrote, refuses what it does not know,
+    /// and changes what it names only.
+    #[test]
+    fn the_numbers_read_back_from_their_query() {
+        let d = PredictConfig::default();
+        assert_eq!(
+            PredictConfig::default().with_query(&d.to_query()),
+            Ok(d.clone())
+        );
+        let c = d
+            .with_query("horizons=500,250,1000&coast_s=0&rate_decay_s=inf&laplace_s=1.2")
+            .expect("valid");
+        assert_eq!(c.horizons_s, vec![0.25, 0.5, 1.0]);
+        assert_eq!((c.coast_s, c.laplace_s), (0.0, 1.2));
+        assert!(c.rate_decay_s.is_infinite());
+        assert_eq!(c.interrupt_s, d.interrupt_s);
+        assert_ne!(c.digest(), d.digest());
+        assert!(d
+            .with_query("horizons=")
+            .expect("valid")
+            .horizons_s
+            .is_empty());
+        for bad in [
+            "warp=1",
+            "coast_s=-1",
+            "laplace_s=inf",
+            "horizons=0",
+            "q_angle=x",
+        ] {
+            assert!(d.with_query(bad).is_err(), "{bad}");
+        }
+        assert_eq!(PredictConfig::for_context("fpv").horizons_s[0], 0.1);
+        assert_eq!(PredictConfig::for_context("film").interrupt_s, 30.0);
+        assert_eq!(PredictConfig::for_context("interactive"), d);
+    }
+
+    /// New numbers change the next views ahead: their horizons and their
+    /// probabilities.
+    #[test]
+    fn reconfigured_numbers_change_the_next_views_ahead() {
+        let mut p = Predictor::new(PredictConfig::default());
+        let mut t = 0.0;
+        let feed = |p: &mut Predictor, t: &mut f64, frames: usize| {
+            let mut last = Vec::new();
+            for _ in 0..frames {
+                let c = pose_at(*t, [800.0, 0.0, 0.0, 0.0, 0.0]).camera(0.6);
+                last = p.frame(*t, &c, Future::Interactive);
+                *t += 1.0 / 60.0;
+            }
+            last
+        };
+        let before = feed(&mut p, &mut t, 30);
+        assert_eq!(before.len(), 4);
+        p.reconfigure(
+            PredictConfig::default()
+                .with_query("horizons=100,300&laplace_s=0.5")
+                .expect("valid"),
+        );
+        let after = feed(&mut p, &mut t, 30);
+        let got: Vec<(u64, u16)> = after
+            .iter()
+            .map(|a| ((a.in_s * 1000.0).round() as u64, a.p_permille))
+            .collect();
+        // e^(−0.1/0.5), e^(−0.3/0.5).
+        assert_eq!(got, vec![(100, 819), (300, 549)]);
+        assert_eq!(p.errors().horizons.len(), 2);
     }
 
     /// Nothing moves, nothing ahead; no horizons, nothing ahead.

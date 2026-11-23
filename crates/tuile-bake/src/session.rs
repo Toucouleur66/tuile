@@ -950,6 +950,7 @@ impl Session {
             .send(ClientMessage::Ahead {
                 views,
                 reach: Reach::default(),
+                model: 0,
             })
             .map_err(|_| FrameError::ServerGone)
     }

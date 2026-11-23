@@ -33,6 +33,10 @@ pub(super) struct Predicting {
     /// Whether the last message sent listed views: an empty list is sent
     /// once, when they stop.
     sent_some: bool,
+    /// The numbers asked on the route, over the use context's.
+    pub(super) ask: crate::steer::PredictAsk,
+    /// The digest of the numbers in force, sent with the views ahead.
+    digest: u64,
 }
 
 impl Default for Predicting {
@@ -43,15 +47,65 @@ impl Default for Predicting {
 
 impl Predicting {
     pub(super) fn new(config: PredictConfig) -> Self {
+        publish(&config);
         Predicting {
+            digest: config.digest(),
             predictor: Predictor::new(config),
             epoch: Instant::now(),
             sent_some: false,
+            ask: crate::steer::PredictAsk::default(),
         }
     }
 }
 
+/// The numbers in force, to the process's metrics (exported with the
+/// telemetry).
+fn publish(c: &PredictConfig) {
+    let m = tuile_core::metrics::metrics();
+    let ms = |s: f64| {
+        if s.is_finite() {
+            (s * 1000.0).round() as u64
+        } else {
+            u64::MAX
+        }
+    };
+    m.predict_digest.set(c.digest());
+    m.predict_horizons.set(c.horizons_s.len() as u64);
+    m.predict_horizon_max_ms
+        .set(ms(c.horizons_s.iter().copied().fold(0.0, f64::max)));
+    m.predict_laplace_ms.set(ms(c.laplace_s));
+    m.predict_interrupt_ms.set(ms(c.interrupt_s));
+    m.predict_rate_decay_ms.set(ms(c.rate_decay_s));
+    m.predict_coast_ms.set(ms(c.coast_s));
+}
+
+/// The numbers for the use context labelled `context`, with `ask`'s over
+/// them. An ask the grammar refuses was refused when it was parsed; were
+/// one to reach here, the context's numbers stand.
+pub(super) fn configured(context: &str, ask: &crate::steer::PredictAsk) -> PredictConfig {
+    let base = PredictConfig::for_context(context);
+    base.with_query(&ask.query()).unwrap_or(base)
+}
+
 impl App {
+    /// The prediction's numbers again, from the use context (the budget's
+    /// specification in force) and the route's ask: in force from the next
+    /// frame, the controller's coast with them, said in the log and the
+    /// metrics.
+    pub(super) fn reconfigure_the_prediction(&mut self) {
+        let context = self
+            .budget_ask
+            .kind
+            .unwrap_or(tuile_core::budget::SpecKind::Interactive)
+            .label();
+        let config = configured(context, &self.predicting.ask);
+        tracing::info!(query = %config.to_query(), context, "prediction numbers");
+        self.controller.inertia.coast_s = config.coast_s;
+        self.predicting.digest = config.digest();
+        publish(&config);
+        self.predicting.predictor.reconfigure(config);
+    }
+
     /// This frame's views ahead, from its future, sent before its camera.
     pub(super) fn send_the_views_ahead(&mut self) {
         let camera = self.controller.camera;
@@ -131,7 +185,11 @@ impl App {
             zoom_out_per_s: r.zoom_out_per_s,
         };
         if let Some(session) = self.session.as_mut() {
-            let _ = session.stream.send(ClientMessage::Ahead { views, reach });
+            let _ = session.stream.send(ClientMessage::Ahead {
+                views,
+                reach,
+                model: self.predicting.digest,
+            });
         }
     }
 
@@ -214,6 +272,7 @@ pub(super) fn prediction_rows(p: &Predictor) -> Vec<Vec<String>> {
         unused,
         100.0 * used as f64 / (used + unused).max(1) as f64,
     )]];
+    out.push(vec![format!("numbers: {}", p.config().to_query())]);
     out.push(
         [
             "horizon",
@@ -342,6 +401,55 @@ mod tests {
         );
     }
 
+    /// Numbers asked on the route change the very next views ahead: their
+    /// horizons and their probabilities, over the context's.
+    #[test]
+    fn numbers_asked_at_runtime_change_the_next_views_ahead() {
+        let mut p = Predictor::new(configured(
+            "interactive",
+            &crate::steer::PredictAsk::default(),
+        ));
+        let now = Instant::now();
+        let flight = super::super::flight::Flight::new(
+            view(2.35, 48.85, 5_000.0),
+            view(6.86, 45.83, 6_000.0),
+            now,
+            4.0,
+        );
+        let here = flight.at(now).0.camera();
+        let futures = Futures {
+            flight: Some((flight, now)),
+            ..Futures::default()
+        };
+        let sent = |p: &mut Predictor, t: f64| -> Vec<(u64, u16)> {
+            views_ahead(p, t, &here, &futures)
+                .iter()
+                .map(|a| ((a.in_s * 1000.0).round() as u64, a.p_permille))
+                .collect()
+        };
+        assert_eq!(
+            sent(&mut p, 0.0),
+            vec![(250, 959), (500, 920), (1000, 846), (2000, 717)]
+        );
+        let Ok(asked) = crate::steer::parse_url("tuile://budget?horizons=100,3000&interrupt_s=2")
+        else {
+            panic!("refused");
+        };
+        let [crate::steer::Command::Predict(Some(ask))] = asked.as_slice() else {
+            panic!("{asked:?}");
+        };
+        let config = configured("interactive", ask);
+        let digest = config.digest();
+        p.reconfigure(config);
+        // e^(−0.1/2), e^(−3/2).
+        assert_eq!(sent(&mut p, 0.1), vec![(100, 951), (3000, 223)]);
+        // The known-path context: a path rarely interrupted.
+        let film = configured("film", &crate::steer::PredictAsk::default());
+        assert_ne!(film.digest(), digest);
+        p.reconfigure(film);
+        assert_eq!(sent(&mut p, 0.2)[3], (2000, 936));
+    }
+
     /// Nothing moving and nothing known, nothing ahead.
     #[test]
     fn a_still_camera_sends_nothing_ahead() {
@@ -360,7 +468,8 @@ mod tests {
         let p = Predictor::new(PredictConfig::default());
         let rows = prediction_rows(&p);
         assert!(rows[0][0].starts_with("Prediction"));
-        assert_eq!(rows.len(), 2 + 4);
-        assert_eq!(rows[2][0], "0.25 s");
+        assert_eq!(rows.len(), 3 + 4);
+        assert!(rows[1][0].starts_with("numbers: horizons=250,500,1000,2000&"));
+        assert_eq!(rows[3][0], "0.25 s");
     }
 }

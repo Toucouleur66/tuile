@@ -492,6 +492,17 @@ pub struct Metrics {
     /// Ring tiles a view ahead named and not drawn by then: predictions
     /// unused, the prefetch they asked for wasted.
     pub ahead_unused: Counter,
+    /// The numbers predicting the views ahead, as the consumer set them
+    /// (`tuile_camera::predict::PredictConfig`): their digest, how many
+    /// horizons and the farthest, the decays and the coast, milliseconds
+    /// (an infinite rate decay as `u64::MAX`).
+    pub predict_digest: Gauge,
+    pub predict_horizons: Gauge,
+    pub predict_horizon_max_ms: Gauge,
+    pub predict_laplace_ms: Gauge,
+    pub predict_interrupt_ms: Gauge,
+    pub predict_rate_decay_ms: Gauge,
+    pub predict_coast_ms: Gauge,
 
     // --- Residency ---
     pub tiles_evicted: Counter,

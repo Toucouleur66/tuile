@@ -109,10 +109,19 @@ impl App {
                 let (query, overridden) = ask.query(tuile_core::budget::SpecKind::Interactive);
                 tracing::info!(%query, overridden, "budget specification asked");
                 self.budget_ask = ask;
+                // The prediction follows the use context too.
+                self.reconfigure_the_prediction();
                 super::gestures::Carry::send(
                     self,
                     tuile_core::protocol::ClientMessage::Specify { query, overridden },
                 );
+            }
+            Command::Predict(ask) => {
+                self.predicting.ask = match ask {
+                    Some(ask) => ask.over(&self.predicting.ask),
+                    None => crate::steer::PredictAsk::default(),
+                };
+                self.reconfigure_the_prediction();
             }
             Command::BudgetLine(on) => self.views.budget_line = on,
             Command::BudgetWindow(ask) => self.budget_window.ask(ask),

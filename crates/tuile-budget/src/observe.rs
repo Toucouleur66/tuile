@@ -78,6 +78,10 @@ pub enum BudgetEvent {
     Fallbacks(u64),
     /// `on_compressed` (CB9).
     Compressed(ResourceId, Generation, Bytes),
+    /// The numbers predicting the views ahead changed: their digest
+    /// (`tuile_camera::predict::PredictConfig::digest`), as the consumer
+    /// sent it with them.
+    Predictor(u64),
 }
 
 /// One decision step, as the host saw it.

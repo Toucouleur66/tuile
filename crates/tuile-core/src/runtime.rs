@@ -1118,6 +1118,8 @@ struct State {
     ahead_when: Vec<(Micros, u16)>,
     /// The reachable envelope the consumer gave with them.
     reach: crate::protocol::Reach,
+    /// The digest of the numbers that predicted them.
+    ahead_model: u64,
     /// The ring tiles a prediction named and when it expects them, until
     /// they are drawn (a prediction used) or their time is past (unused).
     predicted: BTreeMap<TileId, Micros>,
@@ -1198,6 +1200,7 @@ impl State {
             ahead: Vec::new(),
             ahead_when: Vec::new(),
             reach: crate::protocol::Reach::default(),
+            ahead_model: 0,
             predicted: BTreeMap::new(),
             ahead_out: TraversalOutput::default(),
             ahead_near: NearestContent::default(),
@@ -1234,7 +1237,16 @@ impl State {
                 self.view_generation = generation;
                 self.view_moved = true;
             }
-            ClientMessage::Ahead { views, reach } => {
+            ClientMessage::Ahead {
+                views,
+                reach,
+                model,
+            } => {
+                // The numbers that predicted them, recorded when they change.
+                if model != self.ahead_model {
+                    self.ahead_model = model;
+                    self.events.push(BudgetEvent::Predictor(model));
+                }
                 self.ahead_when = views
                     .iter()
                     .map(|a| (Micros(a.in_us), a.p_permille.min(1_000)))
@@ -3284,6 +3296,7 @@ mod tests {
                     },
                 ],
                 reach: crate::protocol::Reach::default(),
+                model: 0,
             })
             .expect("send");
         look(&stream, far_view(), 1);
@@ -3317,6 +3330,7 @@ mod tests {
                     .send(ClientMessage::Ahead {
                         views: vec![crate::protocol::AheadView::certain(near_view(), 1)],
                         reach: crate::protocol::Reach::default(),
+                        model: 0,
                     })
                     .expect("send");
             }

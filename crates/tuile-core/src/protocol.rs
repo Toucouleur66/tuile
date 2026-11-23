@@ -101,8 +101,14 @@ pub enum ClientMessage {
     /// out they are. The ring's tiles carry the earliest and likeliest of
     /// the views that see them (`tuile_budget::AheadUse`). `reach` is how
     /// far the fastest gestures could carry the camera, whatever the views
-    /// say.
-    Ahead { views: Vec<AheadView>, reach: Reach },
+    /// say. `model` is a digest of the numbers that predicted them
+    /// (`tuile_camera::predict::PredictConfig::digest`; 0 for none): the
+    /// step records it when it changes.
+    Ahead {
+        views: Vec<AheadView>,
+        reach: Reach,
+        model: u64,
+    },
     /// The budget's specification from the next step on, as its query
     /// (`tuile_budget::Specification::to_query`, the `tuile://budget?…`
     /// grammar): the host's, chosen by its use context, or — `overridden` —
