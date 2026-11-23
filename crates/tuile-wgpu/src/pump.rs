@@ -219,6 +219,10 @@ pub struct ContentPump {
     /// The encode lane's share of the last frame, blocks (`u64::MAX`: no
     /// lane), for its record.
     encode_share: u64,
+    /// The frames the host runs, measured from one upload to the next, µs
+    /// (a moving average): the encode lane's headroom.
+    frame_us: f64,
+    last_upload: Option<web_time::Instant>,
     /// Drapes part-encoded: the imagery tiles encoded for them so far,
     /// held (and in the shared pool) until the rest are, frames later —
     /// a drape of many tiles never encodes in one frame. The drape it
@@ -294,6 +298,8 @@ impl ContentPump {
             undress_wearers: Vec::new(),
             encode_bucket: EncodeBucket::default(),
             encode_share: u64::MAX,
+            frame_us: 0.0,
+            last_upload: None,
             progress: HashMap::new(),
             contents: None,
             drawn_tiles: std::collections::HashSet::new(),
@@ -668,6 +674,16 @@ impl ContentPump {
         // what the encode lane does.
         let deferred = (order.len() - taken.len()) as u32;
         let began = web_time::Instant::now();
+        // The frame the host really runs: what the encodes' share follows
+        // when it is longer than the display's period.
+        if let Some(last) = self.last_upload.replace(began) {
+            let us = began.duration_since(last).as_secs_f64() * 1e6;
+            self.frame_us = if self.frame_us == 0.0 {
+                us
+            } else {
+                0.8 * self.frame_us + 0.2 * us
+            };
+        }
         let encodes_before = gpu.imagery_encode_stats();
         // The GPU encodes have a share of their own: the blocks this frame
         // may still write, when the plan encodes on the GPU at all. Decided
@@ -859,7 +875,7 @@ impl ContentPump {
         else {
             return (taken, 0, Vec::new());
         };
-        let share = encode_share(deadline, ns);
+        let share = encode_share(deadline, ns, self.frame_us);
         self.encode_share = share;
         self.encode_bucket.refill(share);
         let Ok(pool) = gpu.imagery.lock() else {
@@ -1634,15 +1650,25 @@ fn layers_of(content: &ResourceContent) -> &[tuile_core::raster::ImageryLayer] {
 /// The encode lane's blocks this frame: the deadline's own when the host
 /// set them, else its time over the measured cost of a block — the frame's
 /// upload share given to the encodes — and no lane for an unbounded one.
-fn encode_share(deadline: FrameDeadline, ns_per_block: f64) -> u64 {
+///
+/// The headroom (CB6): when the host's frames run longer than the display's
+/// period — measured, `frame_us` — the encodes take the same share of the
+/// frame it really runs, a stall counted for a quarter of a second at most;
+/// never less than the period's share.
+fn encode_share(deadline: FrameDeadline, ns_per_block: f64, frame_us: f64) -> u64 {
     if deadline.encode_blocks != u64::MAX {
         return deadline.encode_blocks;
     }
     if deadline.time == tuile_core::budget::Micros::NEVER {
         return u64::MAX;
     }
-    (deadline.time.0 as f64 * 1_000.0 / ns_per_block.max(1.0)) as u64
+    let measured = frame_us.clamp(0.0, MAX_FRAME_US) * f64::from(UPLOAD_SHARE_PERMILLE) / 1_000.0;
+    let time_us = (deadline.time.0 as f64).max(measured.floor());
+    (time_us * 1_000.0 / ns_per_block.max(1.0)) as u64
 }
+
+/// The longest frame the encode share follows: a stall is not headroom.
+const MAX_FRAME_US: f64 = 250_000.0;
 
 /// Whether `content` names a texture this context encodes on the GPU: RGBA8
 /// headed for the encoder's block format. Never without an encoder (`Off`).
@@ -1885,13 +1911,47 @@ mod tests {
     #[test]
     fn the_encode_share_is_the_deadlines_time_over_a_blocks_cost() {
         let d = FrameDeadline::from_refresh(60, UPLOAD_SHARE_PERMILLE, 400_000);
-        assert_eq!(encode_share(d, 1_739.0), d.time.0 * 1_000 / 1_739);
-        assert_eq!(encode_share(d.with_encode_blocks(5_463), 1_739.0), 5_463);
-        assert_eq!(encode_share(FrameDeadline::UNBOUNDED, 1_739.0), u64::MAX);
+        let at_60 = 16_666.0;
+        assert_eq!(encode_share(d, 1_739.0, at_60), d.time.0 * 1_000 / 1_739);
         assert_eq!(
-            encode_share(d, 0.0),
+            encode_share(d.with_encode_blocks(5_463), 1_739.0, at_60),
+            5_463
+        );
+        assert_eq!(
+            encode_share(FrameDeadline::UNBOUNDED, 1_739.0, at_60),
+            u64::MAX
+        );
+        assert_eq!(
+            encode_share(d, 0.0, at_60),
             d.time.0 * 1_000,
             "never divides by zero"
+        );
+    }
+
+    /// **The share follows the frames the host really runs** (CB6's
+    /// headroom, found by CB8: a viewer at 20 frames a second encoded a
+    /// 60 Hz frame's share, a third of what its frames left room for). The
+    /// encodes take the deadline's share of the measured frame when it is
+    /// longer than the display's period — never less than the period's,
+    /// and a stall counts for no more than a quarter of a second.
+    #[test]
+    fn the_encode_share_follows_the_measured_frame() {
+        let d = FrameDeadline::from_refresh(60, UPLOAD_SHARE_PERMILLE, 400_000);
+        let slow = encode_share(d, 1_739.0, 50_000.0);
+        assert_eq!(
+            slow,
+            50_000 * 250 / 1_000 * 1_000 / 1_739,
+            "the period's share, not the frame's"
+        );
+        assert_eq!(
+            encode_share(d, 1_739.0, 5_000.0),
+            d.time.0 * 1_000 / 1_739,
+            "a frame shorter than the period: the period's share"
+        );
+        assert_eq!(
+            encode_share(d, 1_739.0, 10_000_000.0),
+            250_000 * 250 / 1_000 * 1_000 / 1_739,
+            "a stall counts for a quarter of a second at most"
         );
     }
     use std::collections::VecDeque;

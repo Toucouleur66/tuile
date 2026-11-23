@@ -25,16 +25,16 @@ apart from section B below (the numbering B1–B8 of `gpu-compressed-textures.md
 
 | Step | What | Status |
 |---|---|---|
-| CB1 | see it: the frame record's encode fields, metrics, an MCAP channel, the HUD and budget-window lines; a swap group deferred whole by the encode pacing | in review |
-| CB2 | a cost per path: `transfer`, `transient`, `encode_blocks`; `plan` caps on `transfer`; the decoded tier charges `transfer`; a fallback ack is not drift | |
-| CB3 | simulation profiles: `desktop-bc7`, `handheld-astc-gpu`, `web-webgl2-cpu`, `headset-90-astc` | |
-| CB4 | the transient peak and reservations; a GPU-encoded ack after the GPU has finished | |
-| CB5 | the encode lane in the core's `FrameDeadline` (`take_with`, `EncodeBucket`) | |
-| CB6 | the wgpu pump runs the core's deadline: a resumable per-tile drape encode, `EncodePace` removed | |
-| CB7 | the web CPU path's accounting | |
-| CB8 | acceptance: imagery peak ≤ 15.5 MB, BC7 settle ≤ 6.0 s, ASTC ≤ 7.0 s, frame p99 ≤ Off + 1 ms, holes 0; a phone filmed | |
-| CB9 | compression on by default in tuile-viewer and tuile-bevy (only once CB8 holds) | |
-| CB10 | split encodes for 90 Hz | |
+| CB1 | see it: the frame record's encode fields, metrics, an MCAP channel, the HUD and budget-window lines; a swap group deferred whole by the encode pacing | done (#295) |
+| CB2 | a cost per path: `transfer`, `transient`, `encode_blocks`; `plan` caps on `transfer`; the decoded tier charges `transfer`; a fallback ack is not drift | done (#296) |
+| CB3 | simulation profiles: `desktop-bc7`, `handheld-astc-gpu`, `web-webgl2-cpu`, `headset-90-astc` | done (#297) |
+| CB4 | the transient peak and reservations; a GPU-encoded ack after the GPU has finished | done (#298) |
+| CB5 | the encode lane in the core's `FrameDeadline` (`take_with`, `EncodeBucket`) | done (#301) |
+| CB6 | the wgpu pump runs the core's deadline: a resumable per-tile drape encode, `EncodePace` removed | done (#301; the share's headroom with CB8) |
+| CB7 | the web CPU path's accounting | done (#302); the board's Compression section #306 |
+| CB8 | acceptance: imagery peak ≤ 15.5 MB, BC7 settle ≤ 6.0 s, ASTC ≤ 7.0 s, frame p99 ≤ Off + 1 ms, holes 0; a phone filmed | measured (`gpu-compressed-textures.md` §9.1b): peak, p99 and holes hold; settle not met at the plan's share — Laurent's decision; the phone is his |
+| CB9 | compression on by default in tuile-viewer and tuile-bevy (only once CB8 holds) | waits for CB8 |
+| CB10 | split encodes for 90 Hz | not started: texcomp v0.3.0+ `encode_into` (block-aligned origins) is the lever |
 
 It comes before A2 and A4.
 
