@@ -1309,7 +1309,8 @@ impl Budget {
     /// resource order. `item` is the draw item of its mesh, `meshes_in`
     /// whether Batch may want its drapes (always under Interactive).
     /// Returns whether they read the pressure: a drape worn one level finer
-    /// than its need is wanted coarser under pressure only, and a change of
+    /// than its need is wanted coarser at once under pressure, after the
+    /// deficit's dwell otherwise (colour consistency), and a change of
     /// pressure to or from `Normal` moves no other want.
     // The buffers a step reuses, and the re-read time it hands back: no
     // struct of its own for one caller and the debug check.
@@ -1387,21 +1388,32 @@ impl Budget {
                             // is wanted, whatever its level.
                             Some(w) if w.resource.layer() != Some(layer) => true,
                             Some(w) if w.level.abs_diff(n) > 1 => true,
-                            Some(w) if w.level < n => {
+                            Some(w) if w.level == n => false,
+                            Some(w) => {
                                 // A level under its need: wanted once the
                                 // quality it brings over the time it is
                                 // expected to serve pays for its restore
                                 // cost (spec §5.3); until then, read again
-                                // when it will.
-                                let at = self.deficit_due(t, layer, tn, n - w.level);
-                                if let Some(at) = at.filter(|at| *at > self.now) {
-                                    *reread = Some(reread.map_or(at, |r| r.min(at)));
+                                // when it will. A level over it — a finer
+                                // drape kept from a zoom-out — is another
+                                // acquisition of the imagery than its
+                                // neighbours' own levels, a patch of another
+                                // colour: its own level is wanted the same
+                                // way, the gap weighed less than a missing
+                                // level's (`value::FINER_GAP_PERMILLE`), and
+                                // at once under pressure (coarser is lighter).
+                                let finer = w.level > n;
+                                reads_pressure |= finer;
+                                if finer && self.pressure != Pressure::Normal {
+                                    true
+                                } else {
+                                    let gap = w.level.abs_diff(n);
+                                    let at = self.deficit_due(t, layer, tn, gap, finer);
+                                    if let Some(at) = at.filter(|at| *at > self.now) {
+                                        *reread = Some(reread.map_or(at, |r| r.min(at)));
+                                    }
+                                    at.is_some_and(|at| at <= self.now)
                                 }
-                                at.is_some_and(|at| at <= self.now)
-                            }
-                            Some(w) => {
-                                reads_pressure |= w.level > n;
-                                self.pressure != Pressure::Normal && w.level > n
                             }
                         };
                         off.then_some(if floor {
@@ -1439,12 +1451,14 @@ impl Budget {
         layer: LayerId,
         tn: &TileNeed,
         gap: u32,
+        finer: bool,
     ) -> Option<Micros> {
         let level = tn.need.level;
         let input = super::value::DeficitInput {
             tile: t,
             centrality: tn.q.centrality,
             gap,
+            finer,
             since: self
                 .level_since
                 .get(&(t, layer))

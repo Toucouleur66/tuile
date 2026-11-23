@@ -100,6 +100,13 @@ fn still() -> (u64, u64, u32, u64) {
 /// keeps for the next split (1 280 B; the design above) where the resource
 /// order's history left none — a block of room any history may leave in any
 /// kept map, bounded, not growth with the set.
+///
+/// And once more, by a decision (Laurent's, colour consistency before
+/// detail): 850 -> 853. A drape worn a level finer than its need now loads
+/// its own level after the deficit's dwell, so the shrink flight ends with
+/// 1 076 resources tracked where it ended with 1 055, those own levels
+/// beside what the finer ones left (918 029 B held against 897 593): the
+/// same structures over another history, not growth with the set.
 fn motion() -> (u64, u64, i64, i64, usize) {
     let mut sim = Sim::new(Profile::desktop(), 11);
     sim.count_output = true;

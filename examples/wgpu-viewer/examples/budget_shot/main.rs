@@ -19,7 +19,10 @@
 //! `<out>/window-cumulative.png` (since the start) and
 //! `<out>/window-since-reset.png` (since `window=reset`, back to the first
 //! view); then each tile's levels written on it, `<out>/labels-lag.png`
-//! (the lag view) and `<out>/labels.png` (`tuile://view?labels=on`). The credential comes
+//! (the lag view) and `<out>/labels.png` (`tuile://view?labels=on`); then,
+//! labels on, a glide out to `--zoom-out` times the altitude (8):
+//! `<out>/zoom-out-at-rest.png` as it ends and `<out>/zoom-out-still.png`
+//! after `--seconds` still (six at least). The credential comes
 //! as for the window (`CESIUM_ION_TOKEN`, the token file, …); give it in
 //! the environment to keep a build outside the signed bundle away from the
 //! keychain.
@@ -36,6 +39,7 @@ struct Asked {
     out: PathBuf,
     size: (u32, u32),
     seconds: f64,
+    zoom_out: f64,
 }
 
 fn read(args: &[String]) -> Result<Asked, String> {
@@ -66,6 +70,7 @@ fn read(args: &[String]) -> Result<Asked, String> {
             number("--height", 800.0)? as u32,
         ),
         seconds: number("--seconds", 4.0)?,
+        zoom_out: number("--zoom-out", 8.0)?,
     })
 }
 
@@ -157,6 +162,19 @@ fn run(asked: &Asked) -> Result<(), String> {
     ));
     run.run_for(1.0);
     save(&run, asked, "labels")?;
+    // A zoom-out, labels on: the eye glides to `--zoom-out` times its
+    // altitude (eight by default), then holds still. Right at rest, tiles
+    // may still wear the finer imagery they had (`T14 · I14→13`); once
+    // still, each wears its own level.
+    let out = View {
+        altitude: asked.view.altitude * asked.zoom_out,
+        ..asked.view
+    };
+    run.act(&Action::Glide(out, 4.0));
+    run.run_for(4.0);
+    save(&run, asked, "zoom-out-at-rest")?;
+    run.run_for(asked.seconds.max(6.0));
+    save(&run, asked, "zoom-out-still")?;
     run.finish().map(|_| ())
 }
 

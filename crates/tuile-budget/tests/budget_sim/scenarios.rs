@@ -301,6 +301,57 @@ fn a_zoom_out_to_200_km_and_back_never_shows_a_hole() {
     assert_eq!(after, 0, "{lost} lost in all");
 }
 
+/// Colour consistency before detail (`T11 · I12→11` on the viewer's labels):
+/// after a zoom-out, then still, every exactly drawn tile wears its own
+/// imagery level — none a level finer, kept because it was resident, none
+/// coarser — within three seconds of rest, far under the memory limits, and
+/// keeps it. The imagery being another acquisition per level, a tile worn
+/// over its need is a patch of another colour among its neighbours. No step
+/// of the whole run draws a tile bare (the simulation fails on any, I1).
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
+)]
+fn after_a_zoom_out_then_still_every_tile_wears_its_own_imagery_level() {
+    let mut sim = Sim::new(Profile::desktop(), 11);
+    // Approach and settle at 2 km, then out to 16 km in four seconds.
+    let out = |t: f64| {
+        if t < 5.0 {
+            approach(t)
+        } else if t < 10.0 {
+            home()
+        } else {
+            let k = ((t - 10.0) / 4.0).min(1.0);
+            Camera {
+                h: 2_000.0 * detmath::exp2(3.0 * k),
+                ..home()
+            }
+        }
+    };
+    sim.run(14.0, &out);
+    let stop = sim.now;
+    sim.run(8.0, &|_| out(14.0));
+    let over_at_stop = sim
+        .log
+        .iter()
+        .find(|l| l.now >= stop)
+        .map(|l| l.stats.deficit.imagery_over_tiles)
+        .unwrap_or(0);
+    let settled = stop.plus(Micros::from_secs(3));
+    for l in sim.log.iter().filter(|l| l.now >= settled) {
+        let d = &l.stats.deficit;
+        assert_eq!(
+            (d.imagery_over_tiles, d.imagery_under_tiles),
+            (0, 0),
+            "{RED}: at {:?}, tiles worn over / under their imagery need \
+             ({over_at_stop} over at rest)",
+            l.now
+        );
+        assert!(l.stats.gpu[Class::Drape] < l.stats.target[Class::Drape]);
+    }
+}
+
 /// S3 (M3.1), I10: back down after a zoom-out, the drapes are sharp again.
 #[test]
 #[cfg_attr(

@@ -634,6 +634,15 @@ is expected to serve, pays for its restore cost.
   place), so the incremental passes re-read exactly the places whose crossing came, and the
   full recomputation (`check_wants`, debug builds) at the same `now` agrees. Until a tier is
   measured (§4.2), the cost is the network's — the crossing time is an upper bound.
+- **Both ways, the finer side weighed half** (Laurent, 2026-11-23: colour consistency before
+  extra detail). A place worn a level *finer* than its need — a drape kept from a zoom-out
+  because it was resident, `T11 · I12→11` on the labels — is a want too: a provider serves
+  another acquisition per level, so it is a patch of another colour among neighbours wearing
+  their own level, and nothing else ever brings it back while memory is under its target. Its
+  gap counts `value::FINER_GAP_PERMILLE` (500 ‰) of an under-need gap of the same size, so it
+  falls due after one (`T ≤ 750 ms` for one level), never at a hole's urgency (`Drape`), and
+  at once under memory pressure (coarser is lighter). The finer drape stays worn until the own
+  level is drawable (`best_drape_for`): the switch never leaves the place bare.
 
 ### 5.4 Films: the schedule is a file, and time is frames (Laurent, 2026-11-20)
 
