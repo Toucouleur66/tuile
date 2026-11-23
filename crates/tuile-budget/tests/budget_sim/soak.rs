@@ -218,8 +218,21 @@ fn soak(minutes: u64) {
         sim.log.len()
     );
     assert!(first.p95_ms > 0.0, "nothing loaded");
+    // The last window draws at full detail: before the progressive score,
+    // its flat latency came from a picture relaxed on every one of its
+    // steps (scale 1.93, 406 waits against 697) — a budget held between its
+    // watermarks by copies nobody drew, the stall Laurent saw in Tuile.app
+    // (`docs/explorations/budget-progressive-coarse-preload.md` §3). At full
+    // detail the tour asks for more (1 753 waits) and waits a little longer:
+    // the bound is a third over the first window's, never a relaxed picture.
+    let relaxed_last = sim
+        .log
+        .iter()
+        .filter(|l| l.now >= end.since(Micros(span)) && l.stats.sse_scale_milli > 1_000)
+        .count();
+    assert_eq!(relaxed_last, 0, "the last window is relaxed: the stall");
     assert!(
-        last.p95_ms <= 1.1 * first.p95_ms,
+        last.p95_ms <= 1.4 * first.p95_ms,
         "I6: p95 {} → {} ms",
         first.p95_ms,
         last.p95_ms
