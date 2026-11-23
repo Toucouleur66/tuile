@@ -77,6 +77,12 @@ impl ViewerHost for Configured {
         }
     }
 
+    /// The host's own: a file names terrain and imagery, never 3D Tiles, so
+    /// the host's tilesets stay on offer (its menu switch with them).
+    fn tilesets(&self) -> Vec<crate::embed::TilesetChoice> {
+        self.inner.tilesets()
+    }
+
     async fn connect(&self) -> Result<Arc<dyn Sources>, String> {
         let inner = self.inner.connect().await?;
         if self.settings.templates.is_empty() {
@@ -466,6 +472,44 @@ mod tests {
             let e = without.imagery(layer.asset).await.err().expect("no token");
             assert!(e.contains("\"far\"") && e.contains("token"), "{e}");
         });
+    }
+
+    /// A host offering one 3D Tiles tileset, and nothing else to say.
+    struct Offering;
+
+    #[async_trait::async_trait]
+    impl ViewerHost for Offering {
+        fn identity(&self) -> Identity {
+            Identity::default()
+        }
+        fn terrain(&self) -> TerrainChoice {
+            TerrainChoice {
+                asset: 1,
+                cache: "terrain-1".into(),
+            }
+        }
+        fn imagery(&self) -> Vec<ImageryChoice> {
+            vec![ImageryChoice::new("aerial", "Aerial", 2, "a")]
+        }
+        fn tilesets(&self) -> Vec<crate::embed::TilesetChoice> {
+            vec![crate::embed::TilesetChoice::new("Photorealistic 3D Tiles", 2275207)]
+        }
+        async fn connect(&self) -> Result<Arc<dyn Sources>, String> {
+            Err("not connected in this test".into())
+        }
+    }
+
+    #[test]
+    fn a_file_naming_its_layers_keeps_the_hosts_tilesets() {
+        let settings = Settings {
+            imagery: vec![ImageryChoice::new("photo", "Photo", 2, "a")],
+            ..Settings::default()
+        };
+        let host = Configured::wrap(Arc::new(Offering), settings);
+        assert_eq!(
+            host.tilesets(),
+            [crate::embed::TilesetChoice::new("Photorealistic 3D Tiles", 2275207)]
+        );
     }
 
     #[test]
