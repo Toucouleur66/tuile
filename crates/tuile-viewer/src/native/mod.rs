@@ -218,41 +218,43 @@ fn session(
 ) -> anyhow::Result<()> {
     // The command line, read by `main`. Exit code 2 is the usual one for a
     // command that was not understood.
-    let (view, here, imagery, compression, clock, max_altitude, record, tilesets) = match invocation
-    {
-        Ok(start::Invocation::Run {
-            view,
-            here,
-            imagery,
-            compression,
-            clock,
-            max_altitude,
-            record,
-            tilesets,
-            ..
-        }) => (
-            view,
-            here,
-            imagery,
-            compression,
-            clock,
-            max_altitude,
-            record,
-            tilesets,
-        ),
-        Ok(start::Invocation::Help) => {
-            println!("{}", start::usage());
-            return Ok(());
-        }
-        Err(error) => {
-            eprintln!(
-                "{}: {error}\n\n{}",
-                embed::identity().executable,
-                start::usage()
-            );
-            std::process::exit(2);
-        }
-    };
+    let (view, here, imagery, compression, encode_level, clock, max_altitude, record, tilesets) =
+        match invocation {
+            Ok(start::Invocation::Run {
+                view,
+                here,
+                imagery,
+                compression,
+                encode_level,
+                clock,
+                max_altitude,
+                record,
+                tilesets,
+                ..
+            }) => (
+                view,
+                here,
+                imagery,
+                compression,
+                encode_level,
+                clock,
+                max_altitude,
+                record,
+                tilesets,
+            ),
+            Ok(start::Invocation::Help) => {
+                println!("{}", start::usage());
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!(
+                    "{}: {error}\n\n{}",
+                    embed::identity().executable,
+                    start::usage()
+                );
+                std::process::exit(2);
+            }
+        };
     // Which layer `--imagery` meant is the host's list to say, and a name
     // that is not on it is a command that was not understood — said here,
     // with the list, before anything is connected to.
@@ -292,6 +294,15 @@ fn session(
                 std::process::exit(2);
             }
         };
+    // How hard the GPU encoder searches each block: the flag, else the
+    // settings page, else the default.
+    let encode_level = match settings::imagery_encode_level(encode_level, &host::Machine) {
+        Ok(level) => level,
+        Err(why) => {
+            eprintln!("{}: {why}", embed::identity().executable);
+            std::process::exit(2);
+        }
+    };
     // The 3D Tiles drawn over the globe: the flag, else the settings page,
     // else TUILE_TILESETS; none when nothing says.
     let tilesets = match settings::tilesets(tilesets, &host::Machine) {
@@ -470,6 +481,7 @@ fn session(
         controls: true,
         backends,
         imagery_compression: compression,
+        imagery_encode_level: encode_level,
         record,
         tilesets: offered,
         tilesets_on: on.clone(),

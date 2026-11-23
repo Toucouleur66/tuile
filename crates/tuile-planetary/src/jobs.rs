@@ -745,13 +745,13 @@ mod tests {
         let levels = (0..7)
             .map(|l| UASTC[..BlockFormat::level_bytes(64 >> l, 64 >> l)].to_vec())
             .collect();
-        texcomp::ktx2::write(&Texture {
-            format: Format::Uastc(UastcChannels::Rgb),
-            srgb: true,
-            width: 64,
-            height: 64,
+        texcomp::ktx2::write(&Texture::new(
+            Format::Uastc(UastcChannels::Rgb),
+            true,
+            64,
+            64,
             levels,
-        })
+        ))
         .expect("a valid texture")
     }
 

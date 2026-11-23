@@ -108,6 +108,13 @@ export interface ViewerOptions {
    */
   imageryCompression?: "off" | "auto" | "bc7" | "astc";
   /**
+   * How hard the GPU encoder searches each block when imagery is encoded on
+   * the GPU (WebGPU): 0 (the default, the fastest) to 4, each level more GPU
+   * time for sharper blocks. The encodes per frame shrink to keep the frame's
+   * GPU time. No effect when nothing is encoded on the GPU.
+   */
+  imageryEncodeLevel?: 0 | 1 | 2 | 3 | 4;
+  /**
    * The instant the scene is lit for — where the sun, the Moon and the stars
    * stand: `"now"` (the default), `"sunset"` or `"sunrise"` (the next one over
    * the opening view), or an RFC 3339 instant (`"2026-06-21T19:42:00Z"`).

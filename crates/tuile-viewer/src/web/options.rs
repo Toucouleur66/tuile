@@ -57,6 +57,11 @@ pub(crate) struct Options {
     /// See [`tuile_wgpu::ImageryCompression`].
     #[serde(default, deserialize_with = "compression")]
     pub imagery_compression: tuile_wgpu::ImageryCompression,
+    /// How hard the GPU encoder searches each block when imagery is encoded
+    /// on the GPU: 0 (the default, fastest) to
+    /// [`tuile_wgpu::MAX_ENCODE_LEVEL`]. See `--imagery-encode-level`.
+    #[serde(default = "default_encode_level", deserialize_with = "encode_level")]
+    pub imagery_encode_level: u32,
     /// The instant the scene is lit for: `now` (the default), `sunset`,
     /// `sunrise` or an RFC 3339 instant — as the `--time` flag.
     #[serde(default)]
@@ -214,6 +219,15 @@ fn compression<'de, D: serde::Deserializer<'de>>(
 ) -> Result<tuile_wgpu::ImageryCompression, D::Error> {
     let name = String::deserialize(d)?;
     tuile_wgpu::compression_named(&name).map_err(serde::de::Error::custom)
+}
+
+fn default_encode_level() -> u32 {
+    tuile_wgpu::DEFAULT_ENCODE_LEVEL
+}
+
+fn encode_level<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    let level = u32::deserialize(d)?;
+    tuile_wgpu::encode_level_named(&level.to_string()).map_err(serde::de::Error::custom)
 }
 
 /// Which bottom corner the caption keeps to.
@@ -929,6 +943,28 @@ mod tests {
         let refused = with(r#""etc2""#).expect_err("not a compression");
         assert!(refused.contains("off, auto, bc7, astc"), "{refused}");
         assert!(with("true").is_err());
+    }
+
+    /// `imageryEncodeLevel` is a number from 0 to the encoder's highest; the
+    /// default level when left out.
+    #[test]
+    fn imagery_encode_level_is_a_number() {
+        let with = |value: &str| {
+            options(&CATALOG.replacen(
+                r#""name": "Atlas","#,
+                &format!(r#""name": "Atlas", "imageryEncodeLevel": {value},"#),
+                1,
+            ))
+        };
+        assert_eq!(
+            options(CATALOG).expect("valid").imagery_encode_level,
+            tuile_wgpu::DEFAULT_ENCODE_LEVEL
+        );
+        assert_eq!(with("1").expect("1").imagery_encode_level, 1);
+        assert_eq!(with("4").expect("4").imagery_encode_level, 4);
+        for bad in ["5", "-1", "1.5", r#""high""#] {
+            assert!(with(bad).is_err(), "{bad}");
+        }
     }
 
     /// What a host can get wrong is refused in a sentence that names it.

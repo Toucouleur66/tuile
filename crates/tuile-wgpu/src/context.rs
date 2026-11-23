@@ -191,6 +191,8 @@ pub struct GpuContext {
     texture_caps: GpuTextureCaps,
     /// The GPU encoder, when the plan encodes on the GPU.
     pub(crate) compressor: Option<Mutex<Compressor>>,
+    /// How hard that encoder searches: see [`Self::with_encode_level`].
+    encode_level: u32,
     /// What the upload and release path asked of the device: see
     /// [`Self::upload_ops`].
     pub(crate) ops: crate::ops::OpCounters,
@@ -338,6 +340,7 @@ impl GpuContext {
             imagery_plan: ImageryPlan::RGBA8,
             texture_caps: GpuTextureCaps::default(),
             compressor: None,
+            encode_level: crate::compress::DEFAULT_ENCODE_LEVEL,
             ops: crate::ops::OpCounters::default(),
             chains: crate::chains::Chains::default(),
             uploads: Mutex::new(uploads),
@@ -404,6 +407,7 @@ impl GpuContext {
                 &self.device,
                 &self.queue,
                 format,
+                self.encode_level,
             ))),
             _ => None,
         };
@@ -416,6 +420,36 @@ impl GpuContext {
     /// switch in a running session calls.
     pub fn set_imagery_compression(&mut self, choice: ImageryCompression) -> ImageryPlan {
         self.set_imagery_plan(choice.plan(self.texture_caps))
+    }
+
+    /// Encodes imagery at `level` ([`crate::DEFAULT_ENCODE_LEVEL`] unless
+    /// set, clamped to [`crate::MAX_ENCODE_LEVEL`]): how hard the GPU
+    /// encoder searches each block, a trade of GPU time for quality. The
+    /// pump paces by the cost of a block at that level, so a frame's encode
+    /// share stays the same GPU time. Without an encoder (a plan that does
+    /// not encode on the GPU) it is kept for one, and changes nothing.
+    pub fn with_encode_level(mut self, level: u32) -> Self {
+        let level = level.min(crate::compress::MAX_ENCODE_LEVEL);
+        if level != self.encode_level {
+            self.encode_level = level;
+            if let Some(format) = self.imagery_plan.target.block() {
+                if self.compressor.is_some() {
+                    self.compressor = Some(Mutex::new(Compressor::new(
+                        &self.device,
+                        &self.queue,
+                        format,
+                        level,
+                    )));
+                }
+            }
+        }
+        self
+    }
+
+    /// The encode level this context's encoder searches at: see
+    /// [`Self::with_encode_level`].
+    pub fn encode_level(&self) -> u32 {
+        self.encode_level
     }
 
     /// How this context holds imagery: what the consumer's loader is told.

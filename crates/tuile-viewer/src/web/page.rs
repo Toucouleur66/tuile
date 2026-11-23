@@ -208,6 +208,7 @@ fn start_viewer_with(
         // adapter when its device comes up, and passed to the worker in its
         // start message.
         imagery_compression: compression,
+        imagery_encode_level: options.imagery_encode_level,
         // A page has no file to record into.
         record: Default::default(),
         tilesets: offered,

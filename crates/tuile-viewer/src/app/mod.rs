@@ -129,6 +129,11 @@ pub struct ViewerConfig {
     /// How the imagery is held on the GPU: the person's choice, off unless
     /// they asked (`--imagery-compression`, or the phone's settings page).
     pub(crate) imagery_compression: tuile_wgpu::ImageryCompression,
+    /// How hard the GPU encoder searches each block when imagery is encoded
+    /// on the GPU, 0 to [`tuile_wgpu::MAX_ENCODE_LEVEL`]
+    /// (`--imagery-encode-level`, or the phone's settings page):
+    /// [`tuile_wgpu::DEFAULT_ENCODE_LEVEL`] unless asked.
+    pub(crate) imagery_encode_level: u32,
     /// Where the session is recorded (`--record`): the camera and, frame by
     /// frame, what the picture was drawn under — see `tuile_tape::session`.
     /// `TUILE_RECORD` says the same where there is no command line.
@@ -360,6 +365,8 @@ pub struct App {
     imagery_compression: tuile_wgpu::ImageryCompression,
     /// See [`ViewerConfig::keeps_choices`].
     keeps_choices: bool,
+    /// See [`ViewerConfig::imagery_encode_level`].
+    imagery_encode_level: u32,
     /// The loader's imagery plan, once a session is up: told the device's.
     imagery_plan: Option<tuile_planetary::ImageryPlanHandle>,
     lifecycle: lifecycle::Lifecycle,
@@ -627,6 +634,7 @@ impl App {
             backends: config.backends,
             imagery_compression: config.imagery_compression,
             keeps_choices: config.keeps_choices,
+            imagery_encode_level: config.imagery_encode_level,
             imagery_plan: None,
             rig: Rig::MONO,
             speaker: crate::desktop::try_alert,

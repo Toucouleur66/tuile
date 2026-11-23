@@ -62,6 +62,30 @@ pub(crate) fn imagery_compression(
     }
 }
 
+/// The key the phone's settings page keeps the imagery encode level under:
+/// a number from 0 to [`tuile_wgpu::MAX_ENCODE_LEVEL`].
+pub(crate) const IMAGERY_ENCODE_LEVEL_KEY: &str = "imagery_encode_level";
+
+/// How hard the GPU encoder searches each block: what
+/// `--imagery-encode-level` said, else the settings page, else
+/// [`tuile_wgpu::DEFAULT_ENCODE_LEVEL`]. A value that is not a level is an
+/// error that says so.
+pub(crate) fn imagery_encode_level(
+    flag: Option<u32>,
+    host: &dyn crate::host::Host,
+) -> Result<u32, String> {
+    if let Some(level) = flag {
+        return Ok(level);
+    }
+    match host
+        .setting(IMAGERY_ENCODE_LEVEL_KEY)
+        .filter(|v| !v.trim().is_empty())
+    {
+        Some(value) => tuile_wgpu::encode_level_named(&value),
+        None => Ok(tuile_wgpu::DEFAULT_ENCODE_LEVEL),
+    }
+}
+
 /// The key the phone's settings page keeps the 3D Tiles tilesets under, and
 /// the environment variable that says the same where there is none: asset
 /// numbers, comma-separated.
