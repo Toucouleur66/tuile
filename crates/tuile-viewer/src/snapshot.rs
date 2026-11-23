@@ -79,6 +79,8 @@ pub(crate) struct Snapshot {
     /// Whether the budget window is shown, and on its cumulative view.
     pub budget_window: bool,
     pub budget_window_cumulative: bool,
+    /// Whether the budget window shows its tables rather than its board.
+    pub budget_window_tables: bool,
 }
 
 impl Snapshot {
@@ -123,6 +125,7 @@ impl Snapshot {
             budget_spec: None,
             budget_window: false,
             budget_window_cumulative: false,
+            budget_window_tables: false,
         }
     }
 }

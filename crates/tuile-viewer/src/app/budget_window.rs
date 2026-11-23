@@ -10,7 +10,11 @@
 //!
 //! It reads the budget's published signals (`tuile_core::metrics::budget`,
 //! a [`BudgetSignals`]) and nothing else: the numbers the telemetry exports,
-//! never a second computation of them. Two views:
+//! never a second computation of them. Two tabs: the **board**, drawn —
+//! gauges, bars and colours for what deserves a look, every number written
+//! beside its shape (`tuile_ui::budget_board`) — and the **tables**, the
+//! same numbers as text (`window=table`; `window=graph` back). Two views
+//! in each:
 //!
 //! - **instant**: the last step — what is held, drawn, selected, under its
 //!   need, in flight and queued, by level and class, and the layers' drapes;
@@ -53,7 +57,13 @@ pub(super) struct BudgetWindow {
     /// Drawn in a window of its own rather than over the view: see
     /// [`Self::own_window`].
     own_window: bool,
-    layout: Option<tuile_ui::PanelLayout>,
+    /// The tables rather than the board.
+    tables: bool,
+    /// The decision's time over the last publications, for the board.
+    decide: tuile_ui::budget_board::DecideHistory,
+    /// The board's texts, kept from one drawing to the next.
+    texts: tuile_ui::budget_board::TextCache,
+    layout: Option<tuile_ui::Drawing>,
     laid: Option<(Instant, (u32, u32), u64)>,
 }
 
@@ -69,6 +79,10 @@ impl BudgetWindow {
                 self.shown = true;
                 self.cumulative = true;
                 self.reset = true;
+            }
+            WindowAsk::Tables(on) => {
+                self.shown = true;
+                self.tables = on;
             }
         }
         // Laid out again at once.
@@ -109,7 +123,7 @@ impl BudgetWindow {
 
     /// The panel as laid out for its own window, if it has one and is
     /// shown.
-    pub(super) fn own_layout(&self) -> Option<&tuile_ui::PanelLayout> {
+    pub(super) fn own_layout(&self) -> Option<&tuile_ui::Drawing> {
         self.layout
             .as_ref()
             .filter(|_| self.shown && self.own_window)
@@ -119,9 +133,14 @@ impl BudgetWindow {
         self.cumulative
     }
 
+    /// Whether the tables are shown rather than the board.
+    pub(super) fn tables(&self) -> bool {
+        self.tables
+    }
+
     /// The panel as drawn over the view, if shown there: never when it has
     /// a window of its own.
-    pub(super) fn layout(&self) -> Option<&tuile_ui::PanelLayout> {
+    pub(super) fn layout(&self) -> Option<&tuile_ui::Drawing> {
         self.layout
             .as_ref()
             .filter(|_| self.shown && !self.own_window)
@@ -135,7 +154,12 @@ impl BudgetWindow {
         scale: f64,
         layers: &[String],
     ) -> (u32, u32) {
-        let rows = self.rows_for(signals, Instant::now(), layers);
+        let now = Instant::now();
+        if !self.tables {
+            let mut texts = tuile_ui::budget_board::TextCache::default();
+            return self.board(signals, now, layers, &mut texts, scale).size;
+        }
+        let rows = self.rows_for(signals, now, layers);
         tuile_ui::Panel::default()
             .layout(
                 tuile_ui::Font::bundled(),
@@ -145,6 +169,32 @@ impl BudgetWindow {
                 scale,
             )
             .size
+    }
+
+    /// The board for `signals` at `now`, at its own size, its top-left
+    /// corner at the origin.
+    fn board(
+        &self,
+        signals: Option<&BudgetSignals>,
+        now: Instant,
+        layers: &[String],
+        texts: &mut tuile_ui::budget_board::TextCache,
+        scale: f64,
+    ) -> tuile_ui::Drawing {
+        let view = tuile_ui::budget_board::BoardView {
+            cumulative: self.cumulative,
+            from: self
+                .cumulative
+                .then(|| {
+                    self.from
+                        .as_ref()
+                        .map(|(f, when)| (f, now.duration_since(*when).as_secs_f64()))
+                })
+                .flatten(),
+            layers,
+            decide: self.decide.summary(),
+        };
+        tuile_ui::budget_board::draw(signals, &view, texts, scale)
     }
 
     /// Lays the panel out from `signals`, at most every [`EVERY_MS`], in a
@@ -171,14 +221,20 @@ impl BudgetWindow {
         if std::mem::take(&mut self.reset) {
             self.from = signals.map(|s| (s.clone(), now));
         }
-        let rows = self.rows_for(signals, now, layers);
-        self.layout = Some(tuile_ui::Panel::default().layout(
-            tuile_ui::Font::bundled(),
-            &rows,
-            at,
-            frame,
-            scale,
-        ));
+        if let Some(s) = signals {
+            self.decide.note(s);
+        }
+        self.layout = Some(if self.tables {
+            let rows = self.rows_for(signals, now, layers);
+            tuile_ui::Panel::default()
+                .layout(tuile_ui::Font::bundled(), &rows, at, frame, scale)
+                .into()
+        } else {
+            let mut texts = std::mem::take(&mut self.texts);
+            let board = self.board(signals, now, layers, &mut texts, scale);
+            self.texts = texts;
+            moved(board, at)
+        });
         self.laid = Some((now, frame, step));
         true
     }
@@ -206,6 +262,23 @@ impl BudgetWindow {
             ),
         }
     }
+}
+
+/// `d` with its top-left corner at `at`, device pixels.
+fn moved(mut d: tuile_ui::Drawing, at: (f64, f64)) -> tuile_ui::Drawing {
+    if at == (0.0, 0.0) {
+        return d;
+    }
+    let (x, y) = (at.0.round() as f32, at.1.round() as f32);
+    for v in &mut d.mesh {
+        v.position[0] += x;
+        v.position[1] += y;
+    }
+    for l in &mut d.labels {
+        l.position[0] += x;
+        l.position[1] += y;
+    }
+    d
 }
 
 fn mib(bytes: u64) -> String {
@@ -568,6 +641,30 @@ mod tests {
         assert!(!w.wants_own_window());
         w.lay_out(Some(&s), (900, 400), (8.0, 8.0), 1.0, &[]);
         assert!(w.layout().is_some() && w.own_layout().is_none());
+    }
+
+    /// The board by default, the tables when asked, and back; asking for
+    /// a tab shows the window.
+    #[test]
+    fn the_board_or_the_tables() {
+        let s = signals();
+        let mut w = BudgetWindow::default();
+        w.ask(WindowAsk::Show(true));
+        assert!(!w.tables());
+        assert!(w.lay_out(Some(&s), (2000, 1200), (0.0, 0.0), 1.0, &[]));
+        let board = w.layout().expect("drawn").clone();
+        assert!(board.labels.len() > 10, "the board writes each number");
+        w.ask(WindowAsk::Tables(true));
+        assert!(w.tables());
+        assert!(w.lay_out(Some(&s), (2000, 1200), (0.0, 0.0), 1.0, &[]));
+        assert_eq!(
+            w.layout().expect("drawn").labels.len(),
+            1,
+            "the tables: one mask"
+        );
+        w.ask(WindowAsk::Show(false));
+        w.ask(WindowAsk::Tables(false));
+        assert!(w.shown() && !w.tables());
     }
 
     /// A window of its own opens at the panel's size: as wide as the

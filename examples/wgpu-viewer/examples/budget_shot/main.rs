@@ -16,7 +16,8 @@
 //! and `<out>/approach.png` (the eye a fifth lower, then still for
 //! `--seconds`), and prints the budget's line at each; then the budget
 //! window, which is a window of its own — headless, a picture of its own at
-//! the panel's size: `<out>/window.png` (this step),
+//! the panel's size: `<out>/window.png` (this step, the board),
+//! `<out>/window-table.png` (the same step's tables, `window=table`),
 //! `<out>/window-cumulative.png` (since the start) and
 //! `<out>/window-since-reset.png` (since `window=reset`, back to the first
 //! view), with the view beside it untouched, `<out>/window-view.png`; then
@@ -161,6 +162,10 @@ fn run(asked: &Asked) -> Result<(), String> {
     run.run_for(asked.seconds);
     save_window(&run, asked, "window")?;
     save(&run, asked, "window-view")?;
+    run.act(&Action::Url("tuile://budget?window=table".to_owned()));
+    run.run_for(0.5);
+    save_window(&run, asked, "window-table")?;
+    run.act(&Action::Url("tuile://budget?window=graph".to_owned()));
     run.act(&Action::Url("tuile://budget?window=cumulative".to_owned()));
     run.run_for(1.0);
     save_window(&run, asked, "window-cumulative")?;

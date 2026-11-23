@@ -31,7 +31,7 @@
 //! | `tuile://imagery?name=<key>` | drapes another of the host's imagery layers; `name=next` takes the one after the present |
 //! | `tuile://import?src=https://…` | fetches a configuration file and imports it, as opening it would (`crate::import`) |
 //! | `tuile://telemetry?metrics=on\|off&profiling=on\|off` | the performance numbers sent to the configured collector, or not: see `tuile_telemetry` (nothing happens where none is configured) |
-//! | `tuile://budget?spec=auto\|interactive\|fpv\|known_path\|film\|fpv_film&margin=&horizon_ms=&speculation_slots=&line=on\|off&window=on\|off\|instant\|cumulative\|reset` | **a diagnostic**: forces the budget's specification (the context chooses it otherwise: ordinary navigation runs `interactive`), a few of its numbers, the budget's line over the view, and the budget window — a window of its own on a desktop and on a page (a browser window the page opens), over the view on a phone (per level and per layer, this step or summed since its start, `reset` summing from now); `spec=auto` gives the choice back to the context (`docs/explorations/budget-eviction-prefetch-spec.md` §3.3) |
+//! | `tuile://budget?spec=auto\|interactive\|fpv\|known_path\|film\|fpv_film&margin=&horizon_ms=&speculation_slots=&line=on\|off&window=on\|off\|instant\|cumulative\|reset\|graph\|table` | **a diagnostic**: forces the budget's specification (the context chooses it otherwise: ordinary navigation runs `interactive`), a few of its numbers, the budget's line over the view, and the budget window — a window of its own on a desktop and on a page (a browser window the page opens), over the view on a phone (per level and per layer, drawn as gauges and bars coloured by what deserves a look — `graph`, the default — or as tables, `table`; this step or summed since its start, `reset` summing from now); `spec=auto` gives the choice back to the context (`docs/explorations/budget-eviction-prefetch-spec.md` §3.3) |
 //!
 //! ## The scene's clock in a link
 //!
@@ -168,6 +168,8 @@ pub(crate) enum WindowAsk {
     Cumulative(bool),
     /// Shown, cumulative, summed from now.
     Reset,
+    /// Shown, as tables (`true`) or as the board (`false`).
+    Tables(bool),
 }
 
 /// One thing the view can be told to do, whoever is telling it.
@@ -545,9 +547,12 @@ pub(crate) fn parse_url_among(
                         "instant" => WindowAsk::Cumulative(false),
                         "cumulative" => WindowAsk::Cumulative(true),
                         "reset" => WindowAsk::Reset,
+                        "table" => WindowAsk::Tables(true),
+                        "graph" => WindowAsk::Tables(false),
                         _ => {
                             return Err(format!(
-                                "window is on, off, instant, cumulative or reset, not {text:?}"
+                                "window is on, off, instant, cumulative, reset, table or graph, \
+                                 not {text:?}"
                             ))
                         }
                     })),
@@ -1307,6 +1312,8 @@ mod tests {
             ("instant", WindowAsk::Cumulative(false)),
             ("cumulative", WindowAsk::Cumulative(true)),
             ("reset", WindowAsk::Reset),
+            ("table", WindowAsk::Tables(true)),
+            ("graph", WindowAsk::Tables(false)),
         ] {
             assert_eq!(
                 parse_url(&format!("tuile://budget?window={text}")),

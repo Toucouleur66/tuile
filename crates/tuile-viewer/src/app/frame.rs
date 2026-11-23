@@ -420,7 +420,7 @@ impl App {
         }));
         // The budget window's background, over the view and the control.
         if let Some(panel) = self.budget_window.layout() {
-            nav_mesh.extend(panel.background.iter().map(|v| OverlayVertex {
+            nav_mesh.extend(panel.mesh.iter().map(|v| OverlayVertex {
                 position: v.position,
                 color: v.color,
             }));
@@ -441,7 +441,7 @@ impl App {
             .and_then(|bar| bar.label.as_ref())
             .into_iter()
             .chain(self.tile_labels.placed.iter())
-            .chain(self.budget_window.layout().and_then(|p| p.label.as_ref()))
+            .chain(self.budget_window.layout().into_iter().flat_map(|p| p.labels.iter()))
             .map(|label| tuile_wgpu::OverlayMask {
                 width: label.mask.width,
                 height: label.mask.height,
