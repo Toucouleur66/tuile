@@ -6,7 +6,11 @@
 //! layer asked for this step when it is another — `T12 · I11→13`.
 //!
 //! Shown with the diagnostic views that colour tiles by their levels
-//! (`levels`, `lag`, `cap`), or alone with `tuile://view?labels=on`. Each
+//! (`levels`, `lag`, `cap`), or alone with `tuile://view?labels=on`: over
+//! the real picture then, imagery and all, with each tile outlined by the
+//! shader (`frame::view_params`), so the imagery a tile wears is read
+//! beside the level it says. The labels are the overlay's, drawn after the
+//! ground, on a dark background that reads on any imagery. Each
 //! label sits at its tile's projected centre and is left out where it would
 //! cover one already placed, coarser tiles first: readable at any zoom, a
 //! tile too small on screen for its label simply has none. The text is the
@@ -26,9 +30,10 @@ pub(super) const WITH_LEVEL_VIEWS: std::ops::RangeInclusive<usize> = 4..=6;
 const TEXT_SIZE: f64 = 11.0;
 /// The room around a label's text, and between two labels.
 const PAD: f64 = 3.0;
-/// The background behind each label, linear: dark, the picture showing
-/// through.
-const BACKGROUND: [f32; 4] = [0.0, 0.0, 0.0, 0.62];
+/// The background behind each label, linear: dark enough for the white
+/// text to read over snow and bright rock as over sea — the labels sit over
+/// the real picture with `labels=on` — the picture still showing through.
+const BACKGROUND: [f32; 4] = [0.0, 0.0, 0.0, 0.78];
 const TEXT: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 
 /// What a drawn tile's label says.
@@ -175,6 +180,21 @@ mod tests {
         assert!((x - 400.0).abs() < 1e-3 && (y - 200.0).abs() < 1e-3);
         assert!(project(&vp, DVec3::new(0.0, 0.0, 100.0), (800.0, 400.0)).is_none());
         assert!(project(&vp, DVec3::new(1e5, 0.0, -1.0), (800.0, 400.0)).is_none());
+    }
+
+    /// The labels alone (`tuile://view?labels=on`) keep the real picture
+    /// — the diagnostic view is not touched — and outline the tiles over
+    /// it; the level views keep their own colours and edges.
+    #[test]
+    fn labels_alone_outline_the_tiles_over_the_real_picture() {
+        use super::super::frame::view_params;
+        let normal = view_params(0, true);
+        assert_eq!((normal[1], normal[2]), (0.0, 1.0));
+        assert_eq!(view_params(0, false)[2], 0.0, "no labels, no outlines");
+        for view in WITH_LEVEL_VIEWS {
+            let p = view_params(view, true);
+            assert_eq!((p[1], p[2]), (view as f32, 0.0));
+        }
     }
 
     /// Two tiles whose labels would cover each other: the coarser keeps its

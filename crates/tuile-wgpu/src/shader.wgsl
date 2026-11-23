@@ -284,6 +284,27 @@ fn tile_marks(colour: vec3f, uv: vec2f, role: f32, lambert: f32, uv_px: f32) -> 
     return c;
 }
 
+// The tiles' outlines over the real picture, imagery and all
+// (`view.params.z`, the viewer's `tuile://view?labels=on`): a dark line a
+// pixel wide on the tile's edge and a light one inside it, so an edge reads
+// on snow and on sea alike, and the picture between the edges is untouched.
+//
+// Measured in pixels along each axis of the tile's uv (`d` its change
+// across a pixel), so the line is a pixel wide however the tile is turned.
+// An axis whose uv does not change across the pixel has no edge there: a
+// skirt hanging from the tile's edge carries that edge's uv all the way
+// down, and outlining it would paint the whole wall.
+fn outlined(colour: vec3f, uv: vec2f, d: vec2f) -> vec3f {
+    var px = 1e9;
+    if (d.x > 0.0) { px = min(px, min(uv.x, 1.0 - uv.x) / d.x); }
+    if (d.y > 0.0) { px = min(px, min(uv.y, 1.0 - uv.y) / d.y); }
+    // Dark, never black: black on the globe is ground missing, to the eye
+    // and to every scan of a picture (`tuile_tape::scan::BLACK`).
+    if (px < 1.0) { return vec3f(0.03); }
+    if (px < 2.0) { return vec3f(0.85); }
+    return colour;
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4f {
     let first = material.flags.x;
@@ -331,7 +352,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     let mode = view.params.y;
     // The uv a pixel spans: taken here, in uniform control flow, for the
     // level views' tile edges.
-    let uv_px = max(fwidth(in.uv).x, fwidth(in.uv).y);
+    let uv_d = fwidth(in.uv);
+    let uv_px = max(uv_d.x, uv_d.y);
     // The role and the capped levels share the last lane.
     let role = material.levels.w % 4.0;
     let capped = floor(material.levels.w / 4.0);
@@ -368,10 +390,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
         if (layers < 1.5) { return vec4f(0.0, 0.8, 0.2, 1.0); }
         return vec4f(0.1, 0.4, 1.0, 1.0);
     }
+    // The outlines, over the picture as it is drawn below — after its light
+    // and its air, so the line is the same line at every distance.
+    let outlines = view.params.z > 0.5;
     // Unlit: the imagery exactly as sampled, with lighting and air removed. If
     // the black survives this, no amount of sun or atmosphere caused it.
     if (mode == DIAGNOSTIC_UNLIT) {
-        return vec4f(albedo.rgb, opacity);
+        var c = albedo.rgb;
+        if (outlines) { c = outlined(c, in.uv, uv_d); }
+        return vec4f(c, opacity);
     }
     if (atmosphere.shape.w != 0.0) {
         // The physical atmosphere (`ground_seen`, the film's own): the
@@ -389,9 +416,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
                 + atmosphere.sh_z.xyz * facing.z,
             vec3f(0.0),
         );
-        return vec4f(graded(ground_seen(albedo.rgb, p, ground, facing, ambient, 1.0)), albedo.a);
+        var seen = graded(ground_seen(albedo.rgb, p, ground, facing, ambient, 1.0));
+        if (outlines) { seen = outlined(seen, in.uv, uv_d); }
+        return vec4f(seen, albedo.a);
     }
-    return vec4f(aerial_perspective(lit, in.world, in.height, view.air), albedo.a);
+    var seen = aerial_perspective(lit, in.world, in.height, view.air);
+    if (outlines) { seen = outlined(seen, in.uv, uv_d); }
+    return vec4f(seen, albedo.a);
 }
 
 /// What the air between the eye and this fragment does to its colour.
