@@ -69,6 +69,11 @@ IMAGERY_LAYERS
                        BC7 on a desktop, ASTC 4x4 on a phone), or that format.
                        Blocks hold a quarter of the bytes, encoded on the GPU
                        at upload; a tile that cannot be encoded stays RGBA8
+    --imagery-encode-level <0-4>
+                       how hard the GPU encoder searches each block: 0 (the
+                       default) is the fastest, each level more GPU time for
+                       sharper blocks. The encodes per frame shrink to keep
+                       the frame's GPU time
 
 SOURCES BY ADDRESS (no catalog, no token; each replaces the host's own):
     --terrain-url <url>          quantized-mesh terrain: the URL of its layer.json.
@@ -286,13 +291,15 @@ pub(crate) enum Invocation {
     ///
     /// `imagery` is the layer `--imagery` named, as typed: which layer that
     /// is depends on the host's list, which this parser does not have.
-    /// `compression` is what `--imagery-compression` said, if it was given.
+    /// `compression` is what `--imagery-compression` said, if it was given,
+    /// and `encode_level` what `--imagery-encode-level` said.
     Run {
         view: StartView,
         here: bool,
         imagery: Option<String>,
         addresses: Addresses,
         compression: Option<tuile_wgpu::ImageryCompression>,
+        encode_level: Option<u32>,
         /// `--time`, `--time-offset` and `--time-rate`: the instant the scene
         /// is lit for, and how it runs.
         clock: tuile_atmosphere::ClockSettings,
@@ -493,7 +500,7 @@ where
     let mut here = false;
     let mut imagery: Option<String> = None;
     // The flags that take text: each at most once.
-    let mut texts: [(&str, Option<String>); 14] = [
+    let mut texts: [(&str, Option<String>); 15] = [
         ("--terrain-url", None),
         ("--imagery-template", None),
         ("--imagery-scheme", None),
@@ -508,6 +515,7 @@ where
         ("--record-codec", None),
         ("--config", None),
         ("--tileset", None),
+        ("--imagery-encode-level", None),
     ];
     let mut compression: Option<tuile_wgpu::ImageryCompression> = None;
     let mut seen = [false; FLAGS.len()];
@@ -594,7 +602,7 @@ where
     if here && (seen[0] || seen[1]) {
         return Err("--here and --lon/--lat both say where to start; give one".to_owned());
     }
-    let [(_, terrain), (_, template), (_, scheme), (_, max_level), (_, time), (_, offset), (_, rate), (_, ceiling), (_, record), (_, record_fps), (_, record_scale), (_, record_codec), (_, config), (_, tileset)] =
+    let [(_, terrain), (_, template), (_, scheme), (_, max_level), (_, time), (_, offset), (_, rate), (_, ceiling), (_, record), (_, record_fps), (_, record_scale), (_, record_codec), (_, config), (_, tileset), (_, encode_level)] =
         texts;
     // Read as an altitude is, with the same bounds: it is one.
     let max_altitude = ceiling
@@ -620,12 +628,16 @@ where
     let tilesets = tileset
         .map(|text| asset_list("--tileset", &text))
         .transpose()?;
+    let encode_level = encode_level
+        .map(|text| tuile_wgpu::encode_level_named(&text))
+        .transpose()?;
     Ok(Invocation::Run {
         view,
         here,
         imagery,
         addresses,
         compression,
+        encode_level,
         clock,
         max_altitude,
         tilesets,
@@ -719,6 +731,7 @@ mod tests {
             imagery: None,
             addresses,
             compression: None,
+            encode_level: None,
             clock: _,
             max_altitude: None,
             record: _,
@@ -1046,6 +1059,28 @@ mod tests {
         assert!(FLAGS_TEXT.contains("--imagery-compression <off|auto|bc7|astc>"));
     }
 
+    /// `--imagery-encode-level` is a number from 0 to the encoder's highest,
+    /// once; without it nothing is said and the default level holds.
+    #[test]
+    fn imagery_encode_level_is_a_number_once() {
+        let said = |args: &[&str]| match parse(args) {
+            Ok(Invocation::Run { encode_level, .. }) => encode_level,
+            other => unreachable!("{args:?} should start a session, got {other:?}"),
+        };
+        assert_eq!(said(&[]), None);
+        assert_eq!(said(&["--imagery-encode-level", "1"]), Some(1));
+        assert_eq!(said(&["--imagery-encode-level=0", "--lat", "3"]), Some(0));
+        for bad in [
+            &["--imagery-encode-level"][..],
+            &["--imagery-encode-level", "5"],
+            &["--imagery-encode-level", "fast"],
+            &["--imagery-encode-level", "1", "--imagery-encode-level", "2"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+        assert!(FLAGS_TEXT.contains("--imagery-encode-level <0-4>"));
+    }
+
     /// `--record` names the file a session is recorded into, once.
     #[test]
     fn record_names_the_session_file() {
@@ -1137,6 +1172,7 @@ mod tests {
                 imagery: None,
                 addresses: Addresses::default(),
                 compression: None,
+                encode_level: None,
                 clock: Default::default(),
                 max_altitude: None,
                 record: Default::default(),

@@ -8555,10 +8555,12 @@ dependencies = [
 
 [[package]]
 name = "texcomp"
-version = "0.2.0"
-source = "git+https://github.com/lapoule-dev/texcomp?tag=v0.2.0#b3e1d4d0bc2ca71dd1ac617b2d5eda842e2868b0"
+version = "0.4.0"
+source = "git+https://github.com/lapoule-dev/texcomp?tag=v0.4.0#91fb96faa5d0dbcc526f62ab1498e984acb1185e"
 dependencies = [
  "bytemuck",
+ "miniz_oxide 0.8.9",
+ "ruzstd 0.8.3",
  "thiserror 2.0.18",
  "wgpu",
 ]

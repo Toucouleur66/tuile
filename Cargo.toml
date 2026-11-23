@@ -120,7 +120,7 @@ futures-executor = "0.3.32"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 # KTX 2.0 and the UASTC transcoders, on the CPU: no default features, so no
 # wgpu.
-texcomp = { git = "https://github.com/lapoule-dev/texcomp", tag = "v0.2.0", default-features = false }
+texcomp = { git = "https://github.com/lapoule-dev/texcomp", tag = "v0.4.0", default-features = false }
 wgpu = "30.0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1.0.102"

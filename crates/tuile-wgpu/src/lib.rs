@@ -23,8 +23,9 @@ mod webgl2;
 mod world_overlay;
 
 pub use compress::{
-    adapter_plan, caps_of, compression_named, encode_reservation, format_name, plan_features,
-    plan_for, stored_features, texture_caps, EncodeStats, ImageryCompression,
+    adapter_plan, caps_of, compression_named, encode_level_named, encode_reservation, format_name,
+    plan_features, plan_for, stored_features, texture_caps, EncodeStats, ImageryCompression,
+    DEFAULT_ENCODE_LEVEL, MAX_ENCODE_LEVEL,
 };
 pub use context::{
     switchable_features, ContextError, GpuContext, ImageryTextures, DEPTH_FORMAT, SAMPLES,

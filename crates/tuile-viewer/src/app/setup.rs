@@ -53,13 +53,19 @@ impl GpuOnItsWay {
         window: Arc<Window>,
         backends: Option<wgpu::Backends>,
         compression: tuile_wgpu::ImageryCompression,
+        encode_level: u32,
     ) -> Self {
         let mut refusals = Vec::new();
         let mut answer = Err(String::from("no backend to try"));
         for attempt in attempts(backends, cfg!(target_os = "android")) {
             // Each attempt's surface is dropped before the next is made: a
             // window takes one producer at a time.
-            answer = pollster::block_on(bring_up(Arc::clone(&window), attempt, compression));
+            answer = pollster::block_on(bring_up(
+                Arc::clone(&window),
+                attempt,
+                compression,
+                encode_level,
+            ));
             match &answer {
                 Ok(_) => break,
                 Err(why) => {
@@ -79,12 +85,13 @@ impl GpuOnItsWay {
         window: Arc<Window>,
         backends: Option<wgpu::Backends>,
         compression: tuile_wgpu::ImageryCompression,
+        encode_level: u32,
     ) -> Self {
         let slot = Rc::new(RefCell::new(None));
         let answer = Rc::clone(&slot);
         let viewer = crate::web::imagery::viewer();
         wasm_bindgen_futures::spawn_local(async move {
-            let up = bring_up(Arc::clone(&window), backends, compression).await;
+            let up = bring_up(Arc::clone(&window), backends, compression, encode_level).await;
             // How the device holds imagery, for the session's worker waiting
             // on it: RGBA8 where there is no device — nothing will draw, and
             // the session must not wait for ever.
@@ -163,6 +170,7 @@ async fn bring_up(
     window: Arc<Window>,
     backends: Option<wgpu::Backends>,
     compression: tuile_wgpu::ImageryCompression,
+    encode_level: u32,
 ) -> Result<Gpu, String> {
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     if let Some(backends) = backends {
@@ -230,6 +238,7 @@ async fn bring_up(
         ?compression,
         held = tuile_wgpu::format_name(imagery_plan.target),
         encode = ?imagery_plan.encode,
+        encode_level,
         caps = ?tuile_wgpu::texture_caps(&adapter),
         "imagery"
     );
@@ -268,6 +277,7 @@ async fn bring_up(
         format,
         gpu: GpuContext::new(device, queue)
             .with_texture_caps(tuile_wgpu::texture_caps(&adapter))
+            .with_encode_level(encode_level)
             .with_imagery_plan(imagery_plan),
         backend: info.backend,
         stored_imagery,
@@ -314,6 +324,7 @@ impl App {
             window,
             self.backends,
             self.imagery_compression,
+            self.imagery_encode_level,
         ));
         self.take_the_gpu();
     }

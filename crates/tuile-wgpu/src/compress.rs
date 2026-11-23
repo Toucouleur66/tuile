@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 use crate::ops::OpCounters;
-use texcomp::gpu::{EncodeError, EncoderScratch, GpuEncoder, Level};
+use texcomp::gpu::{EncodeError, EncoderScratch, GpuEncoder, Level, Quality};
 use tuile_core::content::DecodedTexture;
 use tuile_core::texels::{
     BlockFormat, GpuTextureCaps, ImageryEncode, ImageryFormat, ImageryPlan, StoredPlan,
@@ -150,6 +150,18 @@ pub fn compression_named(name: &str) -> Result<ImageryCompression, String> {
     }
 }
 
+/// The encode level a person names: a whole number from 0 to
+/// [`MAX_ENCODE_LEVEL`]. Anything else is an error that says so, never a
+/// level guessed at.
+pub fn encode_level_named(text: &str) -> Result<u32, String> {
+    match text.trim().parse::<u32>() {
+        Ok(level) if level <= MAX_ENCODE_LEVEL => Ok(level),
+        _ => Err(format!(
+            "imagery encode level {text:?} is not a whole number from 0 to {MAX_ENCODE_LEVEL}"
+        )),
+    }
+}
+
 /// A short name for a resident format, for a status line.
 pub fn format_name(format: ImageryFormat) -> &'static str {
     match format {
@@ -198,13 +210,43 @@ pub fn encode_reservation(plan: ImageryPlan, tiles: u32) -> tuile_core::budget::
     tuile_core::budget::Bytes(u64::from(tiles.max(1)) * (src + dst + levels * 256))
 }
 
-/// GPU nanoseconds per block assumed before the device has measured any:
-/// the viewer's measure on Apple M-series (Metal), timestamps around the
-/// encode pass — about 1.7–1.9 µs a block, 9.5 ms a 256² BC7 tile with its
-/// chain (`gpu-compressed-textures.md` §9.1). Taken for ASTC 4×4 too until
-/// its own first measure: an over-estimate paces slower, never faster.
-fn assumed_ns_per_block(_format: BlockFormat) -> f64 {
-    1_739.0
+/// How hard the GPU encoder searches each block: texcomp's
+/// `Quality::level`, 0 (fastest) to [`MAX_ENCODE_LEVEL`]. A number, not a
+/// switch: each level trades GPU time for quality, and a host sets the one
+/// its device affords ([`GpuContext::with_encode_level`](crate::GpuContext::with_encode_level)).
+///
+/// 0 by default: the search tuile has always encoded with, at the cost the
+/// pump's lane was measured on. Level 1 gains up to 2.8 dB on ASTC 4×4
+/// aerial imagery for about 19 times the GPU time, 0.1 dB on BC7 for three
+/// times (texcomp's README, Apple M2).
+pub const DEFAULT_ENCODE_LEVEL: u32 = 0;
+
+/// The highest encode level; a higher one is taken as this.
+pub const MAX_ENCODE_LEVEL: u32 = Quality::MAX_LEVEL;
+
+/// GPU nanoseconds per block assumed before the device has measured any, at
+/// encode `level`.
+///
+/// Level 0 is the viewer's measure on Apple M-series (Metal), timestamps
+/// around the encode pass — about 1.7–1.9 µs a block, 9.5 ms a 256² BC7 tile
+/// with its chain (`gpu-compressed-textures.md` §9.1), taken for ASTC 4×4
+/// too until its own first measure: an over-estimate paces slower, never
+/// faster. Above it, the larger of that and texcomp's published GPU time per
+/// 256² tile with its chain (5,463 blocks) at that level on Apple M2 —
+/// level 3, which it does not publish, is assumed at level 4's cost.
+fn assumed_ns_per_block(format: BlockFormat, level: u32) -> f64 {
+    const VIEWER: f64 = 1_739.0;
+    // GPU ms per 256² tile with its chain, aerial imagery, levels 1 to 4.
+    let tile_ms: f64 = match (format, level.min(MAX_ENCODE_LEVEL)) {
+        (_, 0) => return VIEWER,
+        (BlockFormat::Bc7, 1) => 12.1,
+        (BlockFormat::Bc7, 2) => 32.0,
+        (BlockFormat::Bc7, _) => 144.1,
+        (BlockFormat::Astc4x4, 1) => 26.6,
+        (BlockFormat::Astc4x4, 2) => 36.0,
+        (BlockFormat::Astc4x4, _) => 100.4,
+    };
+    (tile_ms * 1e6 / 5_463.0).max(VIEWER)
 }
 
 /// What the encoder has done this session: tiles encoded, tiles that had to
@@ -223,6 +265,8 @@ pub struct EncodeStats {
 /// buffers it reuses and its stopwatch.
 pub(crate) struct Compressor {
     format: BlockFormat,
+    /// See [`DEFAULT_ENCODE_LEVEL`].
+    level: u32,
     encoder: GpuEncoder,
     scratch: EncoderScratch,
     timing: Option<Timing>,
@@ -251,8 +295,14 @@ const READY: u8 = 2;
 const RECORDED: u8 = 3;
 
 impl Compressor {
-    pub(crate) fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: BlockFormat) -> Self {
-        let encoder = GpuEncoder::new(device, to_texcomp(format));
+    pub(crate) fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: BlockFormat,
+        level: u32,
+    ) -> Self {
+        let level = level.min(MAX_ENCODE_LEVEL);
+        let encoder = GpuEncoder::with_quality(device, to_texcomp(format), Quality::level(level));
         // Room for one 256² tile up front: the size every drape tile is.
         let scratch = EncoderScratch::with_capacity(device, &encoder, 1, 256, 256);
         let timing = device
@@ -282,6 +332,7 @@ impl Compressor {
             });
         Self {
             format,
+            level,
             encoder,
             scratch,
             timing,
@@ -307,7 +358,7 @@ impl Compressor {
     pub(crate) fn ns_per_block(&self) -> f64 {
         self.stats
             .measured_ns_per_block
-            .unwrap_or_else(|| assumed_ns_per_block(self.format))
+            .unwrap_or_else(|| assumed_ns_per_block(self.format, self.level))
     }
 
     /// Records the encode of each tile — a base and its mips — into `cmd`:
@@ -530,8 +581,40 @@ mod tests {
         let tile = tile_blocks(BlockFormat::Bc7, 256, 256);
         assert_eq!(tile, 5463);
         for format in [BlockFormat::Bc7, BlockFormat::Astc4x4] {
-            let ms = tile as f64 * assumed_ns_per_block(format) / 1e6;
+            let ms = tile as f64 * assumed_ns_per_block(format, DEFAULT_ENCODE_LEVEL) / 1e6;
             assert!((9.0..10.0).contains(&ms), "{format:?}: {ms} ms a tile");
         }
+    }
+
+    /// An encode level is a whole number within the encoder's, or an error.
+    #[test]
+    fn an_encode_level_is_named_by_its_number() {
+        assert_eq!(encode_level_named("0"), Ok(0));
+        assert_eq!(encode_level_named(" 4 "), Ok(4));
+        for bad in ["", "5", "-1", "1.5", "high"] {
+            assert!(encode_level_named(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// **A higher level costs at least as much, and never less than the
+    /// viewer's measure**: the lane shrinks as the search grows, so a frame
+    /// spends the same GPU time whatever the level. Beyond the highest,
+    /// the highest.
+    #[test]
+    fn the_assumed_cost_climbs_with_the_level() {
+        for format in [BlockFormat::Bc7, BlockFormat::Astc4x4] {
+            let costs: Vec<f64> = (0..=MAX_ENCODE_LEVEL + 2)
+                .map(|level| assumed_ns_per_block(format, level))
+                .collect();
+            assert!(
+                costs.windows(2).all(|w| w[0] <= w[1]),
+                "{format:?}: {costs:?}"
+            );
+            assert!(costs.iter().all(|&c| c >= 1_739.0), "{format:?}: {costs:?}");
+            assert_eq!(costs[MAX_ENCODE_LEVEL as usize], costs[costs.len() - 1]);
+        }
+        // Level 1 at texcomp's measure: ASTC 4×4 26.6 ms a tile.
+        let ms = 5_463.0 * assumed_ns_per_block(BlockFormat::Astc4x4, 1) / 1e6;
+        assert!((26.0..27.0).contains(&ms), "{ms} ms");
     }
 }

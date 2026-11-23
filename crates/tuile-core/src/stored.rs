@@ -57,6 +57,15 @@ pub fn decode(
     plan: StoredPlan,
 ) -> Result<DecodedTexture, RasterError> {
     let tex = ktx2::read(bytes).map_err(|e| invalid(e.to_string()))?;
+    // The reader takes every texture type KTX 2.0 has; an imagery tile is
+    // one 2D image and its mips. Anything else is refused here, never drawn
+    // from its first face, layer or slice.
+    if tex.height == 0 || tex.depth != 0 || tex.layers != 0 || tex.faces != 1 {
+        return Err(invalid(format!(
+            "not one 2D texture (height {}, depth {}, {} layers, {} faces)",
+            tex.height, tex.depth, tex.layers, tex.faces
+        )));
+    }
     let (width, height) = (tex.width, tex.height);
     match tex.format {
         Format::Uastc(_) => {
@@ -98,7 +107,12 @@ pub fn decode(
             on_grid,
             plan,
         ),
-        other => Err(invalid(format!("a block format not read here: {other:?}"))),
+        // Texels stored uncompressed are not a stored-compressed tile: an
+        // imagery layer serves those as PNG.
+        Format::Rgba8 => Err(invalid(
+            "RGBA8 texels, not blocks: serve them as PNG".into(),
+        )),
+        other => Err(invalid(format!("a format not read here: {other:?}"))),
     }
 }
 
@@ -204,14 +218,7 @@ mod tests {
     };
 
     fn ktx2_file(format: Format, srgb: bool, levels: Vec<Vec<u8>>) -> Vec<u8> {
-        ktx2::write(&Texture {
-            format,
-            srgb,
-            width: SIDE,
-            height: SIDE,
-            levels,
-        })
-        .expect("a valid texture")
+        ktx2::write(&Texture::new(format, srgb, SIDE, SIDE, levels)).expect("a valid texture")
     }
 
     fn uastc_file(srgb: bool) -> Vec<u8> {
@@ -397,6 +404,51 @@ mod tests {
         let astc = ktx2_file(Format::Astc4x4, true, vec![ASTC.to_vec()]);
         let t = decode(&astc, true, ImageryCompression::Auto.stored(PHONE)).expect("kept");
         assert_eq!(blocks(&t).0, BlockFormat::Astc4x4);
+    }
+
+    /// **One 2D texture of blocks, nothing else**: the reader takes arrays,
+    /// cubemaps, 3D and RGBA8 (1D too, in RGBA8 only), none of which is an
+    /// imagery tile. Each is
+    /// refused, as it was when the reader refused them itself — an absence
+    /// the ancestor covers, never a tile drawn from one face or layer.
+    #[test]
+    fn only_a_2d_texture_of_blocks_is_a_tile() {
+        let kept = ImageryCompression::Auto.stored(APPLE);
+        let tile = Texture::new(Format::Bc7, true, SIDE, SIDE, vec![BC7.to_vec()]);
+        let file = ktx2::write(&tile).expect("a valid texture");
+        assert!(decode(&file, true, kept).is_ok(), "the 2D tile reads");
+        type Reshape = fn(&mut Texture);
+        let cases: [(&str, Reshape); 3] = [
+            ("an array", |t| t.layers = 2),
+            ("a cubemap", |t| t.faces = 6),
+            ("a 3D texture", |t| t.depth = 2),
+        ];
+        for (what, edit) in cases {
+            let mut t = tile.clone();
+            edit(&mut t);
+            // A whole level for the shape: every layer, face and slice.
+            let images = t.layers.max(1) * t.faces * t.depth.max(1);
+            t.levels = vec![BC7.repeat(images as usize)];
+            let file = ktx2::write(&t).unwrap_or_else(|e| panic!("{what}: {e}"));
+            for plan in [kept, StoredPlan::OFF] {
+                let e = decode(&file, true, plan).expect_err(what);
+                assert!(e.to_string().contains("KTX2"), "{what}: {e}");
+            }
+        }
+        let rgba = Texture::new(
+            Format::Rgba8,
+            true,
+            SIDE,
+            SIDE,
+            vec![vec![128; (SIDE * SIDE * 4) as usize]],
+        );
+        let rgba = ktx2::write(&rgba).expect("a valid texture");
+        for plan in [kept, StoredPlan::OFF] {
+            for on_grid in [true, false] {
+                let e = decode(&rgba, on_grid, plan).expect_err("RGBA8");
+                assert!(e.to_string().contains("RGBA8"), "{e}");
+            }
+        }
     }
 
     /// Corrupt files and blocks are errors, never a panic and never a

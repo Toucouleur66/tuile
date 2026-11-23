@@ -607,6 +607,7 @@ impl Headless {
             controls: true,
             backends: None,
             imagery_compression: start.imagery_compression,
+            imagery_encode_level: tuile_wgpu::DEFAULT_ENCODE_LEVEL,
             // A headless run writes its own session log (`Start::log`).
             record: Default::default(),
             // The run's, all on, and a switch never kept: a run leaves the
