@@ -55,6 +55,17 @@ pub trait ContentStore: Send + Sync {
     /// platform, and this crate compiles to wasm.
     async fn put(&self, key: &str, value: Bytes, ttl: Option<Duration>);
 
+    /// The value under `key` even past the lifetime it was written with: what
+    /// a cached source serves when the origin cannot answer (offline, a
+    /// timeout, a 5xx), rather than nothing. A tile that expired is still the
+    /// right ground, and soft or stale ground beats a hole. `None` when the
+    /// store holds nothing under `key`, or keeps nothing past its lifetime
+    /// (the default).
+    async fn get_stale(&self, key: &str) -> Option<Bytes> {
+        let _ = key;
+        None
+    }
+
     /// What the store can say of a value **without reading it**: whether it
     /// holds one, a digest of its bytes and, for an image, its size.
     ///
