@@ -611,8 +611,12 @@ impl Need {
             && self.distance.to_bits() == other.distance.to_bits()
             && imagery_same
             && self.rect.as_ref().map(rect_bits) == other.rect.as_ref().map(rect_bits)
-            && self.proximity.map(|p| (p.need_level, p.tiles_away.to_bits()))
-                == other.proximity.map(|p| (p.need_level, p.tiles_away.to_bits()))
+            && self
+                .proximity
+                .map(|p| (p.need_level, p.tiles_away.to_bits()))
+                == other
+                    .proximity
+                    .map(|p| (p.need_level, p.tiles_away.to_bits()))
     }
 
     /// A need for a tile at `level`, of mesh class `class`, with neutral

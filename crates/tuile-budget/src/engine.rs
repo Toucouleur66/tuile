@@ -1769,13 +1769,8 @@ impl Budget {
         let sc = if precedence >= super::priority::Precedence::Value {
             // The one currency (spec §1b): what loading it gains, from its
             // arrival on.
-            let p = super::value::probability(
-                &self.spec,
-                self.reach_tiles(),
-                urgency,
-                w.level,
-                &w.q,
-            );
+            let p =
+                super::value::probability(&self.spec, self.reach_tiles(), urgency, w.level, &w.q);
             let preload = urgency >= Urgency::Ring;
             let gain = super::value::load_gain(&self.costed, p, w.q.centrality, tier, preload);
             i64::try_from(gain.0).unwrap_or(i64::MAX)
@@ -2218,7 +2213,8 @@ impl Budget {
             let keep = self.kept(s) || self.is_floor(class, self.arena.level(s));
             if self.arena.stale_gpu(s, epoch) && !self.arena.has_transit(s) && !keep {
                 let r = self.arena.id(s);
-                d.scores.push(self.held_event(s, Side::Evict, Reason::Recycled));
+                d.scores
+                    .push(self.held_event(s, Side::Evict, Reason::Recycled));
                 self.arena.take_gpu(s, &mut self.ledger);
                 d.evict.push(r);
                 st.evicted += 1;
@@ -2866,13 +2862,8 @@ impl Budget {
                 }
             }
             let mut strain = false;
-            let prob = super::value::probability(
-                &self.spec,
-                self.reach_tiles(),
-                w.urgency,
-                w.level,
-                &w.q,
-            );
+            let prob =
+                super::value::probability(&self.spec, self.reach_tiles(), w.urgency, w.level, &w.q);
             // Room for its peak: resident, and what an encode on the GPU
             // holds beside it until it has run.
             let ok = self.make_room(
@@ -3223,8 +3214,8 @@ impl Budget {
     /// step: a frame's
     /// releases stay small; the next step goes on.
     fn release_below_floor_value(&mut self, now: Micros, d: &mut Decisions, st: &mut BudgetStats) {
-        let floor = super::value::CERTAIN / 1_000
-            * u32::from(self.spec.params.floor_value_permille);
+        let floor =
+            super::value::CERTAIN / 1_000 * u32::from(self.spec.params.floor_value_permille);
         if floor == 0 {
             return;
         }
@@ -3259,7 +3250,10 @@ impl Budget {
         let mut after: Option<(EvictKey, Slot)> = None;
         let mut low_cpu: Vec<Slot> = Vec::new();
         for _ in 0..visits {
-            let Some(e) = self.arena.next_filed(after.as_ref(), |_| true, &[Held::Cpu]) else {
+            let Some(e) = self
+                .arena
+                .next_filed(after.as_ref(), |_| true, &[Held::Cpu])
+            else {
                 break;
             };
             looked += 1;
@@ -3717,7 +3711,6 @@ impl Budget {
     }
 }
 
-
 impl Budget {
     /// The score of the GPU copy of `s` as the release key reads it, as a
     /// decision record of `side` for `reason`
@@ -3843,7 +3836,12 @@ impl Budget {
             restore_measured: {
                 let s = &self.smoothed;
                 let m = |t: &super::inputs::SmoothedTier| t.latency_us.get().is_some();
-                [false, m(&s.store) || m(&s.http_cache), m(&s.http_cache), m(&s.network)]
+                [
+                    false,
+                    m(&s.store) || m(&s.http_cache),
+                    m(&s.http_cache),
+                    m(&s.network),
+                ]
             },
         }
     }
@@ -3895,7 +3893,9 @@ impl Budget {
             let terms = self.held_terms(s);
             let (_, _, band) = a.place(s);
             let level = a.level(s);
-            report.board.put(level_index(level), band, Side::Held, &terms);
+            report
+                .board
+                .put(level_index(level), band, Side::Held, &terms);
             let state = if self.is_floor(a.class(s), level) {
                 HeldState::Floor
             } else if self.kept(s) {

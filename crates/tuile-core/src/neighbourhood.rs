@@ -110,9 +110,7 @@ impl Neighbourhood {
             let d = tree.properties(t).bounding_volume.distance_to_point(eye);
             let better = match under {
                 None => true,
-                Some((l, dd, id)) => {
-                    level > l || (level == l && (d < dd || (d == dd && t < id)))
-                }
+                Some((l, dd, id)) => level > l || (level == l && (d < dd || (d == dd && t < id))),
             };
             if better {
                 under = Some((level, d, t));
@@ -218,7 +216,11 @@ impl Neighbourhood {
         self.key?;
         let level = usize::try_from(tree.level(t)).ok()?;
         let size = self.sizes.get(level).copied().filter(|s| *s > 0.0)?;
-        let d = tree.properties(t).bounding_volume.distance_to_point(self.footprint) / size;
+        let d = tree
+            .properties(t)
+            .bounding_volume
+            .distance_to_point(self.footprint)
+            / size;
         #[allow(clippy::cast_possible_truncation)]
         Some(d as f32)
     }
@@ -316,7 +318,11 @@ mod tests {
             let k = per_level(rho);
             let f = Plane.properties(drawn[0]).bounding_volume.center();
             for l in 0..=n + 3 {
-                let at: Vec<_> = h.tiles().iter().filter(|(t, _)| t.terrain_coord().0 == l).collect();
+                let at: Vec<_> = h
+                    .tiles()
+                    .iter()
+                    .filter(|(t, _)| t.terrain_coord().0 == l)
+                    .collect();
                 if l <= 3 || l > n + 1 {
                     assert!(at.is_empty(), "ρ {rho} level {l}: listed outside the range");
                     continue;
@@ -334,7 +340,10 @@ mod tests {
                         let id = TileId::from_terrain(l, x as u64, y as u64);
                         let d = Plane.properties(id).bounding_volume.distance_to_point(f);
                         if d <= r {
-                            assert!(listed.contains(&id), "ρ {rho} level {l}: {x},{y} at {d} m not listed");
+                            assert!(
+                                listed.contains(&id),
+                                "ρ {rho} level {l}: {x},{y} at {d} m not listed"
+                            );
                         }
                     }
                 }

@@ -433,12 +433,18 @@ impl ScoreParams {
             ("rho_tiles", i64::from(self.rho)),
             ("margin_permille", i64::from(self.margin_permille)),
             ("floor_level", opt(self.floor_level)),
-            ("preload_slots_permille", i64::from(self.preload_slots_permille)),
+            (
+                "preload_slots_permille",
+                i64::from(self.preload_slots_permille),
+            ),
             ("need_level", opt(self.need_level)),
             ("headroom_permille", i64::from(self.headroom_permille)),
             ("floor_value_permille", i64::from(self.floor_value_permille)),
             ("coarse_from", i64::from(self.coarse_from)),
-            ("coarse_boost_permille", i64::from(self.coarse_boost_permille)),
+            (
+                "coarse_boost_permille",
+                i64::from(self.coarse_boost_permille),
+            ),
         ]
     }
 
@@ -449,7 +455,11 @@ impl ScoreParams {
             .zip(self.restore_us)
             .zip(self.restore_measured)
             .map(|((t, us), m)| {
-                format!("{t} {:.1} ms{}", us as f64 / 1000.0, if m { "*" } else { "" })
+                format!(
+                    "{t} {:.1} ms{}",
+                    us as f64 / 1000.0,
+                    if m { "*" } else { "" }
+                )
             })
             .collect();
         format!("R(tier): {} (* measured)", parts.join(", "))
@@ -561,8 +571,22 @@ mod tests {
     #[test]
     fn a_cell_sums_its_terms() {
         let mut c = Cell::default();
-        c.put(&Terms::new(CERTAIN, CERTAIN, CERTAIN, 150_000, 256 << 10, 256 << 10));
-        c.put(&Terms::new(CERTAIN / 2, CERTAIN, CERTAIN / 2, 150_000, 256 << 10, 256 << 10));
+        c.put(&Terms::new(
+            CERTAIN,
+            CERTAIN,
+            CERTAIN,
+            150_000,
+            256 << 10,
+            256 << 10,
+        ));
+        c.put(&Terms::new(
+            CERTAIN / 2,
+            CERTAIN,
+            CERTAIN / 2,
+            150_000,
+            256 << 10,
+            256 << 10,
+        ));
         assert_eq!(c.count, 2);
         assert_eq!(c.score.max, 150_000);
         assert_eq!(c.score.min, 75_000);

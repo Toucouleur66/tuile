@@ -16,7 +16,9 @@
 //! stay as they are (`crate::resource::ALLOWED_LABELS`).
 
 use serde_json::{json, Value as Json};
-use tuile_core::budget::score::{HeldTile, ScoreEvent, Terms, DISTANCE_BANDS, DISTANCE_BAND_LABELS};
+use tuile_core::budget::score::{
+    HeldTile, ScoreEvent, Terms, DISTANCE_BANDS, DISTANCE_BAND_LABELS,
+};
 use tuile_core::budget::{observe::labels, ResourceId};
 use tuile_core::metrics::ScoreRecords;
 

@@ -643,7 +643,11 @@ fn resource_name(r: tuile_core::budget::ResourceId) -> String {
     };
     match r {
         ResourceId::Mesh(t) => format!("{} mesh", tile(t)),
-        ResourceId::Drape { tile: t, layer, level } => {
+        ResourceId::Drape {
+            tile: t,
+            layer,
+            level,
+        } => {
             format!("{} drape L{} z{level}", tile(t), layer.0)
         }
     }
@@ -722,8 +726,7 @@ fn score_rows(
             .enumerate()
             .map(|(i, name)| {
                 let n = if cumulative {
-                    s.released_total[i]
-                        .saturating_sub(from.map_or(0, |(f, _)| f.released_total[i]))
+                    s.released_total[i].saturating_sub(from.map_or(0, |(f, _)| f.released_total[i]))
                 } else {
                     r[i].iter().flatten().map(|v| u64::from(*v)).sum()
                 };
@@ -733,7 +736,11 @@ fn score_rows(
         out.push(Vec::new());
         out.push(vec![format!(
             "released {}: {} · kept under target − {:.1} %",
-            if cumulative { "since the start" } else { "this step" },
+            if cumulative {
+                "since the start"
+            } else {
+                "this step"
+            },
             totals.join(", "),
             f64::from(p.headroom_permille) / 10.0
         )]);
@@ -760,7 +767,15 @@ fn score_rows(
     out.push(Vec::new());
     out.push(
         [
-            "level", "side", "count", "score mean", "score min", "score max", "A", "D", "R µs",
+            "level",
+            "side",
+            "count",
+            "score mean",
+            "score min",
+            "score max",
+            "A",
+            "D",
+            "R µs",
             "MiB",
         ]
         .map(str::to_owned)
@@ -779,7 +794,11 @@ fn score_rows(
                     }
                 }
                 _ => {
-                    let board = if cumulative { &s.score_total } else { &s.score_recent };
+                    let board = if cumulative {
+                        &s.score_total
+                    } else {
+                        &s.score_recent
+                    };
                     for b in 0..DISTANCE_BANDS {
                         c.add(board.cell(l, b, side));
                     }
@@ -811,9 +830,11 @@ fn score_rows(
             out.push(Vec::new());
             out.push(vec![format!("{title}, step {}", h.step)]);
             out.push(
-                ["tile", "level", "d", "A", "D", "R µs", "MiB", "score", "state"]
-                    .map(str::to_owned)
-                    .to_vec(),
+                [
+                    "tile", "level", "d", "A", "D", "R µs", "MiB", "score", "state",
+                ]
+                .map(str::to_owned)
+                .to_vec(),
             );
             for t in list.iter().take(12) {
                 out.push(vec![
@@ -1061,7 +1082,14 @@ mod tests {
             band: 1,
             side: Side::Evict,
             reason: Reason::Sweep,
-            terms: Terms::new(CERTAIN * 8 / 10, CERTAIN / 2, CERTAIN * 4 / 10, 150_000, 256 << 10, 256 << 10),
+            terms: Terms::new(
+                CERTAIN * 8 / 10,
+                CERTAIN / 2,
+                CERTAIN * 4 / 10,
+                150_000,
+                256 << 10,
+                256 << 10,
+            ),
         };
         board_of(&[e, e], &mut s.score_total);
         board_of(&[e], &mut s.score_recent);
@@ -1079,7 +1107,9 @@ mod tests {
         s.score_held = Some(held);
         let instant = rows(&s, None, false, &[]);
         assert!(
-            instant.iter().any(|r| r[0].contains("a0=0.80") && r[0].contains("ρ=4") && r[0].contains("n = 13")),
+            instant.iter().any(|r| r[0].contains("a0=0.80")
+                && r[0].contains("ρ=4")
+                && r[0].contains("n = 13")),
             "{instant:?}"
         );
         let by_band = instant
@@ -1103,5 +1133,4 @@ mod tests {
             .unwrap();
         assert_eq!(terms[2], "2");
     }
-
 }
