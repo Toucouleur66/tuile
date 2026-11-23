@@ -143,6 +143,10 @@ fn start_viewer_with(
         &options.tilesets,
         &super::system::tilesets_kept_on(&options.name),
     );
+    // How the imagery is held: what the person last chose in the menu, else
+    // the page's option — the host's default — else off.
+    let compression =
+        super::system::compression_kept(&options.name).unwrap_or(options.imagery_compression);
     let handheld = options.profile == ProfileChoice::Handheld;
     let profile = Profile::browser(handheld, options.device_memory);
     tracing::info!(
@@ -163,7 +167,7 @@ fn start_viewer_with(
         profile: options.profile,
         device_memory: options.device_memory,
         decode_workers: options.decode_workers,
-        compression: options.imagery_compression,
+        compression,
         telemetry: options.telemetry.clone(),
     });
     // The page's own numbers — the frames, the uploads — when the host
@@ -200,14 +204,15 @@ fn start_viewer_with(
             .with_prevent_default(true),
         controls: options.ui,
         backends: Some(options.backend.backends()),
-        // The host's choice: resolved against the page's adapter when its
-        // device comes up, and passed to the worker in its start message.
-        imagery_compression: options.imagery_compression,
+        // The person's or the host's choice: resolved against the page's
+        // adapter when its device comes up, and passed to the worker in its
+        // start message.
+        imagery_compression: compression,
         // A page has no file to record into.
         record: Default::default(),
         tilesets: offered,
         tilesets_on,
-        keeps_tilesets: true,
+        keeps_choices: true,
     };
     let app = App::new(config, launch);
     let id = CURRENT.with(|c| c.get()) + 1;

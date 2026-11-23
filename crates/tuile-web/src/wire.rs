@@ -121,6 +121,11 @@ pub fn encode_client(message: &ClientMessage) -> Vec<u8> {
                 w.u64(rule.backoff.0);
             }
         }
+        ClientMessage::Reserve { class, bytes } => {
+            w.u8(10);
+            w.u8(class.index() as u8);
+            w.u64(*bytes);
+        }
     }
     w.0
 }
@@ -249,6 +254,18 @@ pub fn decode_client(bytes: &[u8]) -> Result<ClientMessage, WireError> {
             }
             ClientMessage::Fallbacks(tuile_core::budget::FallbackSpec { rules })
         }
+        10 => ClientMessage::Reserve {
+            class: match r.u8()? {
+                tag if usize::from(tag) < Class::ALL.len() => Class::ALL[usize::from(tag)],
+                tag => {
+                    return Err(WireError::Tag {
+                        what: "a class",
+                        tag,
+                    })
+                }
+            },
+            bytes: r.u64()?,
+        },
         tag => {
             return Err(WireError::Tag {
                 what: "a client message",
@@ -1633,6 +1650,16 @@ mod tests {
                 bytes: 4096,
             },
             ClientMessage::Fallbacks(tuile_core::budget::FallbackSpec::none()),
+            // The encoder's scratch taken off the drapes' limits, and let
+            // go of: what a page switching its imagery compression sends.
+            ClientMessage::Reserve {
+                class: Class::Drape,
+                bytes: 1_444_096,
+            },
+            ClientMessage::Reserve {
+                class: Class::Drape,
+                bytes: 0,
+            },
         ];
         messages.extend(
             [

@@ -381,3 +381,147 @@ fn draped_ground_under_the_camera_is_never_black_under_every_plan() {
         );
     }
 }
+
+/// **Compression switched under a running session never leaves ground
+/// bare, and what is prepared after the switch is in the new form.**
+///
+/// A drape held block-compressed; the context switched off: the old drape
+/// stays bound and drawn on every frame until its replacement lands, the
+/// encoder and its scratch are gone at once, and a tile still marked for the
+/// old form (decoded before the switch) uploads as RGBA8 with no encode. The
+/// replacement is RGBA8. Switched back on, the next one is the block format
+/// again, encoded on the GPU. Every frame of it is measured for black.
+#[test]
+fn compression_switched_under_a_session_keeps_the_ground_drawn() {
+    use tuile_core::texels::{ImageryEncode, ImageryFormat};
+    let Some(mut gpu) = (match pollster::block_on(GpuContext::headless_switchable(
+        tuile_wgpu::ImageryCompression::Auto,
+    )) {
+        Ok(gpu) => Some(gpu),
+        Err(e) => {
+            assert!(
+                std::env::var("TUILE_REQUIRE_GPU").is_err(),
+                "TUILE_REQUIRE_GPU is set and there is no usable adapter: {e}"
+            );
+            eprintln!("skipping GPU test: no usable adapter ({e})");
+            None
+        }
+    }) else {
+        return;
+    };
+    let compressed = gpu.imagery_plan();
+    if compressed.encode != ImageryEncode::Gpu {
+        eprintln!("skipping: this adapter does not encode imagery on its GPU");
+        return;
+    }
+    let here = TileId::from_terrain(3, 4, 4);
+    let ground = |x: u32, y: u32| [80 + (x % 160) as u8, 120, 80 + (y % 160) as u8, 255];
+    // Each generation of the drape is a new imagery source, as a new
+    // imagery generation is in a session: never the old texture again.
+    let drape_of = |texture: tuile_core::content::DecodedTexture, source: u32| {
+        let mut d = whole_drape(here, 3, texture);
+        d.tiles[0].source = source;
+        d
+    };
+    let rgba = || {
+        let mut pixels = Vec::with_capacity(256 * 256 * 4);
+        for y in 0..256 {
+            for x in 0..256 {
+                pixels.extend_from_slice(&ground(x, y));
+            }
+        }
+        tuile_core::content::DecodedTexture::from_rgba8(256, 256, pixels)
+    };
+    let worn = ResourceId::drape(here, LayerId(0), 3);
+    let wear = |gen| {
+        select(
+            vec![wearing(exact(here), worn, 3, UvTransform::IDENTITY)],
+            gen,
+        )
+    };
+    let eye = centre_of(here) * 1.1;
+    let formats = |gpu: &GpuContext| -> Vec<ImageryFormat> {
+        let mut f: Vec<ImageryFormat> = gpu
+            .imagery
+            .lock()
+            .expect("imagery")
+            .live_textures_by_format()
+            .into_iter()
+            .map(|(format, _, _)| format)
+            .collect();
+        f.sort_by_key(|f| *f as u8);
+        f
+    };
+    let ground_drawn = |gpu: &GpuContext, pump: &mut ContentPump, when: &str| {
+        let black = black_fraction_in_the_middle(gpu, pump, eye);
+        assert!(
+            black < 0.01,
+            "{when}: {:.1}% of the middle of the frame is black — the drape \
+             was not drawn",
+            black * 100.0
+        );
+    };
+
+    // Held compressed.
+    let mut stream = Scripted::new([
+        mesh(here, 1, content_for(here)),
+        drape(here, 2, drape_of(rgba().planned(compressed), 0)),
+        wear(1),
+    ]);
+    let mut pump = ContentPump::new(eye);
+    pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
+    pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
+    assert_eq!(formats(&gpu), [compressed.target], "held compressed");
+    ground_drawn(&gpu, &mut pump, "compressed");
+    let encoded = gpu.imagery_encode_stats().expect("an encoder").encoded;
+    assert!(encoded >= 1);
+
+    // Switched off: no encoder, no scratch, the old drape still drawn.
+    let off = gpu.set_imagery_compression(tuile_wgpu::ImageryCompression::Off);
+    assert_eq!(off.target, ImageryFormat::Rgba8);
+    assert_eq!(gpu.imagery_scratch_bytes(), None, "the scratch let go");
+    assert!(gpu.imagery_encode_stats().is_none(), "the encoder let go");
+    ground_drawn(&gpu, &mut pump, "the frame of the switch");
+    pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
+    ground_drawn(&gpu, &mut pump, "a frame before the replacement");
+    assert_eq!(formats(&gpu), [compressed.target], "the old drape kept");
+
+    // A tile decoded before the switch, still marked for the old form, then
+    // its replacement under the new plan: both RGBA8, nothing encoded.
+    stream
+        .inbox
+        .push_back(drape(here, 3, drape_of(rgba().planned(compressed), 1)));
+    stream.inbox.push_back(wear(2));
+    pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
+    ground_drawn(&gpu, &mut pump, "the late tile");
+    stream
+        .inbox
+        .push_back(drape(here, 4, drape_of(rgba().planned(off), 2)));
+    stream.inbox.push_back(wear(3));
+    pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
+    pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
+    ground_drawn(&gpu, &mut pump, "off");
+    assert_eq!(pump.pending_uploads(), 0);
+    assert_eq!(formats(&gpu), [ImageryFormat::Rgba8], "prepared as RGBA8");
+    assert!(
+        gpu.imagery_encode_stats().is_none(),
+        "no encode work when off"
+    );
+
+    // Switched back on: the next drape is the block format again.
+    let on = gpu.set_imagery_compression(tuile_wgpu::ImageryCompression::Auto);
+    assert_eq!(on, compressed);
+    assert!(gpu.imagery_scratch_bytes().is_some(), "an encoder again");
+    ground_drawn(&gpu, &mut pump, "the frame of the switch back");
+    stream
+        .inbox
+        .push_back(drape(here, 5, drape_of(rgba().planned(on), 3)));
+    stream.inbox.push_back(wear(4));
+    pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
+    ground_drawn(&gpu, &mut pump, "a frame of the replacement");
+    pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
+    ground_drawn(&gpu, &mut pump, "on again");
+    assert_eq!(pump.pending_uploads(), 0);
+    assert_eq!(formats(&gpu), [compressed.target], "prepared compressed");
+    assert!(gpu.imagery_encode_stats().expect("an encoder").encoded >= 1);
+}

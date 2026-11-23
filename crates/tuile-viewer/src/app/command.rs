@@ -137,6 +137,7 @@ impl App {
             ),
             Command::OpenConfiguration => crate::desktop::choose_configuration(),
             Command::Imagery(layer) => self.drape(layer),
+            Command::Compression(choice) => self.compress(choice),
             Command::Clock { instant, rate } => {
                 let wall = super::wall_seconds();
                 self.atmosphere.clock.set(instant, wall);
@@ -269,6 +270,7 @@ impl App {
                 budget_window_cumulative: self.budget_window.cumulative(),
                 budget_window_tables: self.budget_window.tables(),
                 budget_window_issues: self.budget_window.issues_only(),
+                compressed: self.imagery_compression != tuile_wgpu::ImageryCompression::Off,
             },
             |snapshot| crate::menu::State::of(&snapshot, layers),
         )
@@ -305,8 +307,9 @@ impl App {
             budget_spec: self.budget_ask.kind,
             budget_window: self.budget_window.shown(),
             budget_window_cumulative: self.budget_window.cumulative(),
-                budget_window_tables: self.budget_window.tables(),
-                budget_window_issues: self.budget_window.issues_only(),
+            budget_window_tables: self.budget_window.tables(),
+            budget_window_issues: self.budget_window.issues_only(),
+            compression: self.imagery_compression,
             ..Snapshot::of(&self.controller, size)
         };
         crate::snapshot::publish(snapshot);
@@ -317,12 +320,18 @@ impl App {
     }
 
     /// The imagery on the GPU, by the format it is held in: `imagery BC7
-    /// 31 MiB (360 × 88 KiB)`, and the RGBA8 beside it where some had to
-    /// stay RGBA8.
+    /// 31 MiB (360 × 88 KiB) · compression auto`, and the RGBA8 beside it
+    /// where some had to stay RGBA8 — or still is, just after a switch.
     fn imagery_held(&self) -> Option<String> {
         let active = self.active.as_ref()?;
         let mut held = active.gpu.imagery.lock().ok()?.live_textures_by_format();
-        let line = held_line(active.gpu.imagery_plan().target, &mut held);
+        // And the choice in force, which the menu switches: `compression
+        // auto`, `compression off`.
+        let line = format!(
+            "{} · compression {}",
+            held_line(active.gpu.imagery_plan().target, &mut held),
+            super::compression::compression_name(self.imagery_compression)
+        );
         // And, where the GPU encodes, what its encodes have done.
         let encodes = encode_line(
             active.gpu.imagery_encode_stats(),

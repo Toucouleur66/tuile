@@ -43,10 +43,12 @@ pub(crate) const IMAGERY_COMPRESSION_KEY: &str = "imagery_compression";
 /// How the imagery is held on the GPU: what `--imagery-compression` said,
 /// else what the person chose in the system's settings page for the
 /// application (a phone's *Settings › Tuile*, kept between launches), else
-/// off. A value nobody can read is an error naming the four there are.
+/// what they last chose in the menu (`kept`, the last session's), else off.
+/// A value nobody can read is an error naming the four there are.
 pub(crate) fn imagery_compression(
     flag: Option<tuile_wgpu::ImageryCompression>,
     host: &dyn crate::host::Host,
+    kept: impl FnOnce() -> Option<tuile_wgpu::ImageryCompression>,
 ) -> Result<tuile_wgpu::ImageryCompression, String> {
     if let Some(choice) = flag {
         return Ok(choice);
@@ -56,7 +58,7 @@ pub(crate) fn imagery_compression(
         .filter(|v| !v.trim().is_empty())
     {
         Some(value) => tuile_wgpu::compression_named(&value),
-        None => Ok(tuile_wgpu::ImageryCompression::Off),
+        None => Ok(kept().unwrap_or(tuile_wgpu::ImageryCompression::Off)),
     }
 }
 
@@ -322,24 +324,36 @@ mod tests {
     /// **Off unless the person chose**: the flag first, then the settings
     /// page, and a value nobody can read is said, not guessed at.
     #[test]
-    fn compression_is_the_flag_then_the_settings_page_then_off() {
+    fn compression_is_the_flag_then_the_settings_page_then_the_menu_then_off() {
+        let none = || None;
+        let auto = || Some(ImageryCompression::Auto);
         assert_eq!(
-            imagery_compression(None, &Page(None)),
+            imagery_compression(None, &Page(None), none),
             Ok(ImageryCompression::Off)
         );
         assert_eq!(
-            imagery_compression(None, &Page(Some(""))),
+            imagery_compression(None, &Page(Some("")), none),
             Ok(ImageryCompression::Off)
         );
+        // The menu's choice, kept from the last session.
         assert_eq!(
-            imagery_compression(None, &Page(Some("auto"))),
+            imagery_compression(None, &Page(None), auto),
             Ok(ImageryCompression::Auto)
         );
         assert_eq!(
-            imagery_compression(Some(ImageryCompression::Off), &Page(Some("astc"))),
+            imagery_compression(None, &Page(Some("off")), auto),
+            Ok(ImageryCompression::Off),
+            "the settings page over the menu's last choice"
+        );
+        assert_eq!(
+            imagery_compression(None, &Page(Some("auto")), none),
+            Ok(ImageryCompression::Auto)
+        );
+        assert_eq!(
+            imagery_compression(Some(ImageryCompression::Off), &Page(Some("astc")), auto),
             Ok(ImageryCompression::Off),
             "the command line wins"
         );
-        assert!(imagery_compression(None, &Page(Some("etc2"))).is_err());
+        assert!(imagery_compression(None, &Page(Some("etc2")), none).is_err());
     }
 }

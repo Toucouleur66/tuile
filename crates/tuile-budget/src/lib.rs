@@ -577,6 +577,20 @@ impl Budget {
         self.factor = (total.0, den);
     }
 
+    /// What the executor holds of `class`'s memory outside any resource
+    /// from now on ([`BudgetConfig::reserved`]): its encoder's scratch, which
+    /// a consumer that changes how it holds imagery under a running session
+    /// takes or lets go of. Replaces what was reserved; off the limits from
+    /// the next step. More than the class's hard limit is refused, and what
+    /// was reserved is kept.
+    pub fn reserve(&mut self, class: Class, bytes: Bytes) -> Result<(), ConfigError> {
+        if bytes > self.cfg.hard_limit[class] {
+            return Err(ConfigError::Reserved(class));
+        }
+        self.cfg.reserved[class] = bytes;
+        Ok(())
+    }
+
     /// The platform's thermal state; takes effect at the next step.
     pub fn set_thermal(&mut self, t: Thermal) {
         self.thermal = t;

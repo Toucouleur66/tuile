@@ -29,6 +29,7 @@
 //! | `tuile://view?freeze=on\|off&wireframe=on\|off&labels=on\|off&diagnostic=normal\|unlit\|coverage\|geometry\|levels\|lag\|cap` | the display switches, and the diagnostic view `D` cycles; `labels` writes each tile's terrain and imagery levels on it (`T12 · I11→13`) and outlines the tiles, over the real picture and its imagery; the level views `levels`, `lag` and `cap` write them too, over their colours |
 //! | `tuile://tileset?asset=<n>&show=on\|off` | one of the host's 3D Tiles tilesets drawn over the globe, or not |
 //! | `tuile://imagery?name=<key>` | drapes another of the host's imagery layers; `name=next` takes the one after the present |
+//! | `tuile://compression?mode=off\|auto\|bc7\|astc` | how the imagery is held on the GPU, from now on and for the next session: `off` RGBA8, `auto` the best block format the device holds; every drape is prepared again in the new form, the old one drawn until its replacement is up |
 //! | `tuile://import?src=https://…` | fetches a configuration file and imports it, as opening it would (`crate::import`) |
 //! | `tuile://telemetry?metrics=on\|off&profiling=on\|off` | the performance numbers sent to the configured collector, or not: see `tuile_telemetry` (nothing happens where none is configured) |
 //! | `tuile://budget?spec=auto\|interactive\|fpv\|known_path\|film\|fpv_film&margin=&horizon_ms=&speculation_slots=&line=on\|off&window=on\|off\|instant\|cumulative\|reset\|graph\|table&window_levels=all\|issues` | **a diagnostic**: forces the budget's specification (the context chooses it otherwise: ordinary navigation runs `interactive`), a few of its numbers, the budget's line over the view, and the budget window — a window of its own on a desktop and on a page (a browser window the page opens), over the view on a phone (per level and per layer, drawn as gauges and bars coloured by what deserves a look — `graph`, the default — or as tables, `table`; this step or summed since its start, `reset` summing from now); `spec=auto` gives the choice back to the context (`docs/explorations/budget-eviction-prefetch-spec.md` §3.3) |
@@ -250,6 +251,10 @@ pub(crate) enum Command {
     /// specification, for a host whose layer has a substitute
     /// (`docs/explorations/imagery-layer-substitution.md`).
     Fallback(Option<(u32, u32)>),
+    /// How the imagery is held on the GPU from now on — RGBA8 when off, a
+    /// block format otherwise — and kept for the next session: see
+    /// `crate::app::compression`.
+    Compression(tuile_wgpu::ImageryCompression),
 }
 
 /// Which of `layers` a person, a flag, a URL or a script means by `text`: a
@@ -462,6 +467,12 @@ pub(crate) fn parse_url_among(
                 _ => Err("tileset takes asset= and show=on|off".to_owned()),
             }
         }
+        "compression" => match pairs.as_slice() {
+            [("mode", mode)] => Ok(vec![Command::Compression(tuile_wgpu::compression_named(
+                mode,
+            )?)]),
+            _ => Err("compression takes exactly one parameter, mode=off|auto|bc7|astc".to_owned()),
+        },
         "fallback" => match pairs.as_slice() {
             [("show", "off")] => Ok(vec![Command::Fallback(None)]),
             _ => {
@@ -1578,6 +1589,36 @@ mod tests {
             "tileset?asset=x&show=on",
             "tileset?asset=7&show=maybe",
             "tileset?asset=7&show=on&layer=2",
+        ] {
+            assert!(parse_url(&url(wrong)).is_err(), "{wrong}");
+        }
+    }
+
+    /// The imagery compression is switched by its mode, the four names the
+    /// flag and the settings page take, and nothing else reads as one.
+    #[test]
+    fn the_compression_is_switched_by_url() {
+        use tuile_core::texels::BlockFormat;
+        use tuile_wgpu::ImageryCompression;
+        let url = |rest: &str| format!("{}://{rest}", scheme());
+        for (mode, choice) in [
+            ("off", ImageryCompression::Off),
+            ("auto", ImageryCompression::Auto),
+            ("AUTO", ImageryCompression::Auto),
+            ("bc7", ImageryCompression::Format(BlockFormat::Bc7)),
+            ("astc", ImageryCompression::Format(BlockFormat::Astc4x4)),
+        ] {
+            assert_eq!(
+                parse_url(&url(&format!("compression?mode={mode}"))),
+                Ok(vec![Command::Compression(choice)]),
+                "{mode}"
+            );
+        }
+        for wrong in [
+            "compression",
+            "compression?mode=etc2",
+            "compression?mode=off&mode=auto",
+            "compression?show=off",
         ] {
             assert!(parse_url(&url(wrong)).is_err(), "{wrong}");
         }

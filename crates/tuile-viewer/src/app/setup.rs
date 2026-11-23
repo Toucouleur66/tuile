@@ -233,6 +233,11 @@ async fn bring_up(
         caps = ?tuile_wgpu::texture_caps(&adapter),
         "imagery"
     );
+    // And every block format the adapter samples, whatever the choice: the
+    // person can change it under the running session (the menu's Compress
+    // Imagery, `crate::app::compression`), and a device cannot gain a
+    // feature after it is made. Asking costs nothing until a texture uses it.
+    let switchable = tuile_wgpu::switchable_features(&adapter);
     // Everything the adapter has, which is by definition what it supports: on
     // WebGL2 that is the downlevel set raised to what the context reports, and
     // the renderer fits its imagery slots to it.
@@ -240,7 +245,7 @@ async fn bring_up(
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("viewer"),
             required_limits: adapter.limits(),
-            required_features: features | imagery_features,
+            required_features: features | imagery_features | switchable,
             ..Default::default()
         })
         .await
@@ -261,7 +266,9 @@ async fn bring_up(
         instance,
         surface,
         format,
-        gpu: GpuContext::new(device, queue).with_imagery_plan(imagery_plan),
+        gpu: GpuContext::new(device, queue)
+            .with_texture_caps(tuile_wgpu::texture_caps(&adapter))
+            .with_imagery_plan(imagery_plan),
         backend: info.backend,
         stored_imagery,
     })

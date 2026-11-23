@@ -60,6 +60,10 @@ pub(crate) enum ToWorker {
     Slots { reported: u32 },
     /// Drape the host's layer of this index.
     Imagery { layer: usize },
+    /// Hold imagery so from now on: the page's device's plans after a
+    /// change of choice under the session. The drapes are renewed by the
+    /// [`ToWorker::Imagery`] that follows.
+    Compression { imagery: super::imagery::Held },
     /// Hold the loads not yet started, or let them go.
     Pause { paused: bool },
     /// Open the host's 3D Tiles tileset of this asset number: a source of the

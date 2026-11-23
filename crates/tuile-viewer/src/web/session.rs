@@ -109,6 +109,19 @@ impl Started {
         None
     }
 
+    /// Tells the worker's loader how imagery is held from now on: a choice
+    /// changed under the session (`crate::app::compression`), in order with
+    /// the request that renews the drapes after it.
+    pub(crate) fn hold_imagery(
+        &self,
+        plan: tuile_core::texels::ImageryPlan,
+        stored: tuile_core::texels::StoredPlan,
+    ) {
+        self.link.post(&ToWorker::Compression {
+            imagery: super::imagery::Held::new(plan, stored),
+        });
+    }
+
     /// The 3D Tiles drawn over the globe, from the start: none — a page
     /// opens each once the session is up ([`Started::open_tileset`]).
     pub(crate) fn take_surfaces(&mut self) -> (Vec<crate::surface::Surface>, Vec<(i64, String)>) {

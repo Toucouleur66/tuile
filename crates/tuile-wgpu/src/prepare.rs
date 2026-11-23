@@ -174,6 +174,12 @@ pub struct PreparedTile {
     /// What the tile is dressed with: each drape and the uv transform it is
     /// worn through. Empty while undressed.
     dressing: Vec<(ResourceId, [u64; 4])>,
+    /// Which preparation of each of those drapes it wears
+    /// ([`PreparedDrape::serial`]): a drape delivered again under the same
+    /// resource — its imagery's new generation, a new form of the same
+    /// pictures — is a new preparation, and its wearers are dressed in it
+    /// at their next draw, the old textures bound until then.
+    dressed_in: Vec<u64>,
     /// The levels the tile was last told ([`Self::dress`]).
     levels: Levels,
     /// Approximate GPU memory of this tile, bytes — **excluding draped
@@ -358,7 +364,8 @@ impl PreparedTile {
     ) {
         let key: Vec<(ResourceId, [u64; 4])> =
             drapes.iter().map(|(r, _, uv)| (*r, uv_bits(*uv))).collect();
-        if key == self.dressing && !self._imagery.is_empty() {
+        let serials: Vec<u64> = drapes.iter().map(|(_, d, _)| d.serial).collect();
+        if key == self.dressing && serials == self.dressed_in && !self._imagery.is_empty() {
             if levels != self.levels {
                 self.levels = levels;
                 let row = levels.row();
@@ -396,6 +403,7 @@ impl PreparedTile {
         }
         self._imagery = passes;
         self.dressing = key;
+        self.dressed_in = serials;
     }
 
     /// Takes every drape off: the tile shows its base colour (and the
@@ -413,6 +421,7 @@ impl PreparedTile {
         }
         self.dress_in(gpu, &[], Levels::default());
         self.dressing.clear();
+        self.dressed_in.clear();
     }
 
     /// Whether any mesh here carries more layers than one draw could bind.
@@ -591,6 +600,7 @@ pub(crate) fn prepare_in(
         own,
         _imagery: passes,
         dressing: Vec::new(),
+        dressed_in: Vec::new(),
         levels: Levels::default(),
         gpu_bytes,
     }
@@ -616,6 +626,15 @@ pub struct PreparedDrape {
     /// What it is charged: the budget's estimate of its textures, the shared
     /// floor excepted — what [`DrapeContent::cost`] says.
     pub gpu_bytes: u64,
+    /// This preparation, among every drape this process prepared: what tells
+    /// a wearer that the drape under a resource it wears is a new one.
+    pub(crate) serial: u64,
+}
+
+/// The next [`PreparedDrape::serial`].
+fn next_drape_serial() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Uploads a drape: each of its imagery tiles once however many drapes name
@@ -657,6 +676,7 @@ pub(crate) fn prepare_drape_in(gpu: &GpuContext, drape: &DrapeContent) -> Prepar
         level: drape.level,
         layers,
         gpu_bytes: charged.gpu.0,
+        serial: next_drape_serial(),
     }
 }
 

@@ -8,6 +8,7 @@
 mod budget_screen;
 mod budget_window;
 mod command;
+mod compression;
 mod credits;
 mod demand;
 #[cfg(feature = "control")]
@@ -33,6 +34,7 @@ mod screen;
 mod script;
 mod setup;
 mod shutter;
+pub(crate) use compression::compression_name;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use setup::backend_named;
 mod stall;
@@ -137,9 +139,10 @@ pub struct ViewerConfig {
     /// Those on at the start: what the session was started with, else the
     /// last session's choice. The launch opens these.
     pub(crate) tilesets_on: Vec<i64>,
-    /// Whether a switch is kept for the next session; not by a headless
-    /// run, which must leave the person's choice alone.
-    pub(crate) keeps_tilesets: bool,
+    /// Whether a switch — a tileset, the imagery compression — is kept for
+    /// the next session; not by a headless run, which must leave the
+    /// person's choice alone.
+    pub(crate) keeps_choices: bool,
 }
 
 /// Where the on-screen controls live: the part of the frame not under a
@@ -352,8 +355,11 @@ pub struct App {
     gpu_on_its_way: Option<setup::GpuOnItsWay>,
     /// See [`ViewerConfig::backends`].
     backends: Option<wgpu::Backends>,
-    /// See [`ViewerConfig::imagery_compression`].
+    /// See [`ViewerConfig::imagery_compression`]: the choice in force,
+    /// switched under the session by [`compression`].
     imagery_compression: tuile_wgpu::ImageryCompression,
+    /// See [`ViewerConfig::keeps_choices`].
+    keeps_choices: bool,
     /// The loader's imagery plan, once a session is up: told the device's.
     imagery_plan: Option<tuile_planetary::ImageryPlanHandle>,
     lifecycle: lifecycle::Lifecycle,
@@ -540,7 +546,7 @@ impl App {
             tilesets: tilesets::Tilesets::new(
                 &config.tilesets,
                 &config.tilesets_on,
-                config.keeps_tilesets,
+                config.keeps_choices,
             ),
             launch: Some(launch),
             failed: None,
@@ -620,6 +626,7 @@ impl App {
             gpu_on_its_way: None,
             backends: config.backends,
             imagery_compression: config.imagery_compression,
+            keeps_choices: config.keeps_choices,
             imagery_plan: None,
             rig: Rig::MONO,
             speaker: crate::desktop::try_alert,

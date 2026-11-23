@@ -63,6 +63,31 @@ pub(crate) fn keep_tilesets_on(on: &[i64]) {
     let _ = std::fs::write(&file, format!("{}\n", line.join(",")));
 }
 
+/// Keeps `choice`, how the person last asked for the imagery to be held,
+/// for the next session — a file in the application's support directory,
+/// removed when it is off, the default.
+pub(crate) fn keep_compression(choice: tuile_wgpu::ImageryCompression) {
+    let Some(file) = host::compression_file(&host::Machine) else {
+        return;
+    };
+    if choice == tuile_wgpu::ImageryCompression::Off {
+        let _ = std::fs::remove_file(&file);
+        return;
+    }
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&file, format!("{}\n", crate::app::compression_name(choice)));
+}
+
+/// The imagery compression the last session left, if it left one: a file
+/// that does not read as one is no choice at all.
+pub(crate) fn compression_kept() -> Option<tuile_wgpu::ImageryCompression> {
+    host::compression_file(&host::Machine)
+        .and_then(|file| std::fs::read_to_string(file).ok())
+        .and_then(|text| tuile_wgpu::compression_named(text.trim()).ok())
+}
+
 /// The 3D Tiles tilesets the last session left switched on. A file that
 /// does not read as asset numbers is no choice at all.
 pub(crate) fn tilesets_kept_on() -> Vec<i64> {
@@ -259,13 +284,14 @@ fn session(
     lift_the_open_file_limit();
     // How the imagery is held on the GPU: the person's choice — the flag,
     // else the phone's settings page — and off when they made none.
-    let compression = match settings::imagery_compression(compression, &host::Machine) {
-        Ok(choice) => choice,
-        Err(why) => {
-            eprintln!("{}: {why}", embed::identity().executable);
-            std::process::exit(2);
-        }
-    };
+    let compression =
+        match settings::imagery_compression(compression, &host::Machine, compression_kept) {
+            Ok(choice) => choice,
+            Err(why) => {
+                eprintln!("{}: {why}", embed::identity().executable);
+                std::process::exit(2);
+            }
+        };
     // The 3D Tiles drawn over the globe: the flag, else the settings page,
     // else TUILE_TILESETS; none when nothing says.
     let tilesets = match settings::tilesets(tilesets, &host::Machine) {
@@ -447,7 +473,7 @@ fn session(
         record,
         tilesets: offered,
         tilesets_on: on.clone(),
-        keeps_tilesets: true,
+        keeps_choices: true,
     };
 
     // Everything the engine counts, scrapeable, so the log can stop being a

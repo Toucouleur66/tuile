@@ -521,7 +521,9 @@ impl Headless {
 
     fn bring_up(start: Start, claim: Claim) -> Result<Self, Refused> {
         let launching = Instant::now();
-        let gpu = pollster::block_on(tuile_wgpu::GpuContext::headless_with(
+        // Able to hold every choice the adapter can: a script may switch it
+        // under the run, as the menu does.
+        let gpu = pollster::block_on(tuile_wgpu::GpuContext::headless_switchable(
             start.imagery_compression,
         ))
         .map_err(|e| Refused::NoGpu(e.to_string()))?;
@@ -530,7 +532,11 @@ impl Headless {
         crate::embed::adopt(start.host.identity(), start.host.imagery());
         let layers = crate::embed::layers();
         let profile = start.device.profile();
-        let budget = profile.budget();
+        let mut budget = profile.budget();
+        // The GPU encoder's scratch, off the drapes' limits, as a window's
+        // session reserves it (CB4): nothing when the plan does not encode.
+        budget.reserved[tuile_core::budget::Class::Drape] =
+            tuile_wgpu::encode_reservation(gpu.imagery_plan(), 1);
         let limits = Limits {
             resident_bytes: profile.gpu_bytes,
             pinned_level: budget.pinned_level,
@@ -607,7 +613,7 @@ impl Headless {
             // person's choice alone.
             tilesets: Vec::new(),
             tilesets_on: start.tilesets.clone(),
-            keeps_tilesets: false,
+            keeps_choices: false,
         };
         let mut app = App::new(config, launch);
         app.speak_through(said);
