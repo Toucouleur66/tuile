@@ -268,6 +268,10 @@ impl PreparedTile {
         };
         let (now, was) = (rows(plan), rows(&self.stitching.told));
         let at_once = fresh || slide == 0;
+        let strips = (STITCH_ROWS * 16) as u64;
+        gpu.ops.staged(&gpu.ops.write_buffer, strips);
+        gpu.ops.staged(&gpu.ops.write_buffer, strips);
+        gpu.ops.staged(&gpu.ops.write_buffer, 16);
         gpu.queue
             .write_buffer(&self.tile_buf, STRIPS_AT, bytemuck::cast_slice(&now));
         gpu.queue.write_buffer(
@@ -289,7 +293,8 @@ impl PreparedTile {
 
     /// Moves a sliding tile on to where `frame` has it. Returns whether it
     /// is still on its way.
-    pub(crate) fn slide(&mut self, queue: &wgpu::Queue, frame: u64, slide: u32) -> bool {
+    pub(crate) fn slide(&mut self, gpu: &GpuContext, frame: u64, slide: u32) -> bool {
+        let queue = &gpu.queue;
         let Some(since) = self.stitching.sliding_since else {
             return false;
         };
@@ -297,6 +302,7 @@ impl PreparedTile {
         // Eased at both ends: an edge sets off and arrives without a jerk.
         let eased = slid * slid * (3.0 - 2.0 * slid);
         let any = f32::from(!self.stitching.told.is_nothing() || slid < 1.0);
+        gpu.ops.staged(&gpu.ops.write_buffer, 16);
         queue.write_buffer(
             &self.tile_buf,
             STITCH_AT,
@@ -353,6 +359,7 @@ impl PreparedTile {
                 self.levels = levels;
                 let row = levels.row();
                 for buf in self.meshes.iter().flat_map(|m| &m._material_bufs) {
+                    gpu.ops.staged(&gpu.ops.write_buffer, 16);
                     gpu.queue
                         .write_buffer(buf, LEVELS_AT, bytemuck::cast_slice(&row));
                 }
@@ -414,6 +421,16 @@ impl PreparedTile {
     /// MOVING camera: keep the render origin near the eye so the f32 the GPU
     /// sees stays small (sub-meter precise), even at planetary ECEF scale.
     pub fn rebase(&self, queue: &wgpu::Queue, render_origin: DVec3) {
+        self.rebase_counted(queue, None, render_origin);
+    }
+
+    /// [`Self::rebase`], counting the write it makes, if any, in `ops`.
+    pub(crate) fn rebase_counted(
+        &self,
+        queue: &wgpu::Queue,
+        ops: Option<&crate::ops::OpCounters>,
+        render_origin: DVec3,
+    ) {
         // Already there, to within a metre. The threshold used to live on the
         // caller, which meant it was asked once for the whole resident set: if
         // the eye had moved, *every* tile was rewritten. Asking per tile is what
@@ -427,6 +444,9 @@ impl PreparedTile {
             return;
         }
         self.rebased_to.set(render_origin);
+        if let Some(ops) = ops {
+            ops.staged(&ops.write_buffer, 64);
+        }
         let model =
             tuile_core::geo::rebased_model(self.origin_ecef, self.transform_local, render_origin);
         queue.write_buffer(
@@ -455,6 +475,8 @@ pub fn prepare(
     // The model, and no stitching: zeros say a tile has none.
     let mut uniform = vec![0u8; TILE_UNIFORM_BYTES];
     uniform[..64].copy_from_slice(bytemuck::cast_slice(&model.to_cols_array()));
+    gpu.ops.buffer_init(TILE_UNIFORM_BYTES as u64);
+    crate::ops::OpCounters::add(&gpu.ops.bind_groups_created, 1);
     let tile_buf = gpu
         .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -634,6 +656,7 @@ fn passes(
 ) -> Vec<ImageryPass> {
     let slots = gpu.imagery_slots as usize;
     let table = |batch: &[(Placement, &Arc<GpuImagery>, ImageryCoord, u32)]| {
+        gpu.ops.buffer_init(u64::from(gpu.imagery_slots) * 2 * 16);
         gpu.device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("tuile imagery layers"),
@@ -717,7 +740,9 @@ fn encode(
     if compressor.format() != format {
         return None;
     }
-    let texture = compressor.encode(&gpu.device, &gpu.queue, t, mips).ok()?;
+    let texture = compressor
+        .encode(&gpu.device, &gpu.queue, &gpu.ops, t, mips)
+        .ok()?;
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     let bytes = BlockFormat::level_bytes(t.width, t.height)
         + mips
@@ -776,9 +801,11 @@ fn upload_blocks(
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
+    crate::ops::OpCounters::add(&gpu.ops.textures_created, 1);
     for (level, bytes) in levels.iter().enumerate() {
         let (w, h) = size(level as u32);
         let (across, down) = (w.div_ceil(side), h.div_ceil(side));
+        gpu.ops.staged(&gpu.ops.write_texture, bytes.len() as u64);
         gpu.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &texture,
@@ -824,8 +851,11 @@ fn upload_rgba8(gpu: &GpuContext, t: &DecodedTexture, mips: &[DecodedTexture]) -
         view_formats: &[],
     });
 
+    crate::ops::OpCounters::add(&gpu.ops.textures_created, 1);
     let mut bytes = 0usize;
     for (level, image) in std::iter::once(t).chain(mips.iter()).enumerate() {
+        gpu.ops
+            .staged(&gpu.ops.write_texture, image.texels.byte_len() as u64);
         gpu.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &texture,
@@ -898,6 +928,9 @@ fn materials(
             levels: levels.row(),
         };
         // Written to when the levels move under an unchanged dressing.
+        gpu.ops
+            .buffer_init(std::mem::size_of::<MaterialUniform>() as u64);
+        crate::ops::OpCounters::add(&gpu.ops.bind_groups_created, 1);
         let material_buf = gpu
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -969,6 +1002,10 @@ fn mesh_buffers(gpu: &GpuContext, mesh: &DecodedMesh) -> (wgpu::Buffer, wgpu::Bu
                 .unwrap_or([0.0, 0.0]),
         })
         .collect();
+    gpu.ops
+        .buffer_init(std::mem::size_of_val(vertices.as_slice()) as u64);
+    gpu.ops
+        .buffer_init(std::mem::size_of_val(mesh.indices.as_slice()) as u64);
     let vertex_buf = gpu
         .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {

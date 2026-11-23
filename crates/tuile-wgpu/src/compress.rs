@@ -26,6 +26,7 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
+use crate::ops::OpCounters;
 use texcomp::gpu::{EncodeError, EncoderScratch, GpuEncoder, Level};
 use tuile_core::content::DecodedTexture;
 use tuile_core::texels::{
@@ -313,10 +314,11 @@ impl Compressor {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        ops: &OpCounters,
         base: &DecodedTexture,
         mips: &[DecodedTexture],
     ) -> Result<wgpu::Texture, EncodeError> {
-        self.collect(device);
+        self.collect(device, ops);
         let levels: Vec<Level<'_>> = std::iter::once(base)
             .chain(mips.iter())
             .map(|t| Level {
@@ -325,6 +327,7 @@ impl Compressor {
                 rgba8: t.rgba8().unwrap_or_default(),
             })
             .collect();
+        OpCounters::add(&ops.encoders, 1);
         let mut cmd = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("tuile imagery encode"),
         });
@@ -359,9 +362,21 @@ impl Compressor {
             }
         }
         // Submitted now, before the next call rewrites the scratch.
+        OpCounters::add(&ops.submits, 1);
         queue.submit([cmd.finish()]);
         match &result {
-            Ok(_) => self.stats.encoded += 1,
+            Ok(_) => {
+                self.stats.encoded += 1;
+                // The encoder's texture, its pass, and its writes: one per
+                // level of texels and one for the jobs.
+                OpCounters::add(&ops.textures_created, 1);
+                OpCounters::add(&ops.encode_passes, 1);
+                OpCounters::add(&ops.encoded_tiles, 1);
+                for level in &levels {
+                    ops.staged(&ops.write_buffer, level.rgba8.len() as u64);
+                }
+                ops.staged(&ops.write_buffer, 256 * levels.len() as u64);
+            }
             Err(_) => self.stats.fell_back += 1,
         }
         if measuring {
@@ -369,6 +384,7 @@ impl Compressor {
                 t.blocks = tile_blocks(self.format, base.width, base.height);
                 t.state.store(MAPPING, Ordering::Release);
                 let state = Arc::clone(&t.state);
+                OpCounters::add(&ops.readbacks, 1);
                 t.readback
                     .slice(..)
                     .map_async(wgpu::MapMode::Read, move |done| {
@@ -382,12 +398,13 @@ impl Compressor {
     /// Reads the last measured pass, if the GPU has finished it, into the
     /// cost per block: a moving average, so one slow pass does not halve the
     /// next frame's share.
-    pub(crate) fn collect(&mut self, device: &wgpu::Device) {
+    pub(crate) fn collect(&mut self, device: &wgpu::Device, ops: &OpCounters) {
         let Some(t) = &mut self.timing else {
             return;
         };
         if t.state.load(Ordering::Acquire) == MAPPING {
             // Lets a finished map call back; waits for nothing.
+            OpCounters::add(&ops.polls, 1);
             let _ = device.poll(wgpu::PollType::Poll);
         }
         if t.state.load(Ordering::Acquire) != READY {

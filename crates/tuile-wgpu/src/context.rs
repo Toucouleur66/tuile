@@ -184,6 +184,9 @@ pub struct GpuContext {
     imagery_plan: ImageryPlan,
     /// The GPU encoder, when the plan encodes on the GPU.
     pub(crate) compressor: Option<Mutex<Compressor>>,
+    /// What the upload and release path asked of the device: see
+    /// [`Self::upload_ops`].
+    pub(crate) ops: crate::ops::OpCounters,
 }
 
 impl GpuContext {
@@ -316,6 +319,7 @@ impl GpuContext {
             imagery_slots,
             imagery_plan: ImageryPlan::RGBA8,
             compressor: None,
+            ops: crate::ops::OpCounters::default(),
         }
     }
 
@@ -348,6 +352,14 @@ impl GpuContext {
     /// How this context holds imagery: what the consumer's loader is told.
     pub fn imagery_plan(&self) -> ImageryPlan {
         self.imagery_plan
+    }
+
+    /// What the upload and release path has asked of the device since this
+    /// context was made: buffers, textures and bind groups created, writes,
+    /// staging, encoders, submits, encodes and readbacks. Two snapshots
+    /// subtract into one frame's.
+    pub fn upload_ops(&self) -> crate::ops::UploadOps {
+        self.ops.snapshot()
     }
 
     /// What the GPU encoder has done, when there is one.

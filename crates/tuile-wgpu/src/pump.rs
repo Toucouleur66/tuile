@@ -44,6 +44,55 @@ struct Queued {
     gen: Generation,
     class: Class,
     content: ResourceContent,
+    /// When, and at which frame, the delivery reached the pump: what its
+    /// time from delivered to drawable is measured from.
+    arrived: web_time::Instant,
+    arrived_frame: u64,
+}
+
+/// What the pump has done since it was made, summed: uploads and their
+/// bytes, acknowledgements, releases, and how long deliveries waited for
+/// their upload. Two snapshots subtract into what happened between them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PumpTotals {
+    /// Resources uploaded, and the bytes their uploads moved.
+    pub uploads: u64,
+    pub upload_bytes: u64,
+    /// Messages sent to the server acknowledging or refusing an upload.
+    pub ack_messages: u64,
+    /// Resources released, and the bytes they were acknowledged with.
+    pub releases: u64,
+    pub released_bytes: u64,
+    /// `Evict` messages applied.
+    pub evict_messages: u64,
+    /// From delivered to drawable: summed over the uploads, and the
+    /// longest, in microseconds and in frames.
+    pub wait_micros: u64,
+    pub wait_micros_max: u64,
+    pub wait_frames: u64,
+    pub wait_frames_max: u64,
+    /// Wall time spent in the frames' uploads, microseconds.
+    pub upload_micros: u64,
+}
+
+impl std::ops::Sub for PumpTotals {
+    type Output = PumpTotals;
+    /// What happened between `earlier` and `self`; the maxima are `self`'s.
+    fn sub(self, earlier: PumpTotals) -> PumpTotals {
+        PumpTotals {
+            uploads: self.uploads - earlier.uploads,
+            upload_bytes: self.upload_bytes - earlier.upload_bytes,
+            ack_messages: self.ack_messages - earlier.ack_messages,
+            releases: self.releases - earlier.releases,
+            released_bytes: self.released_bytes - earlier.released_bytes,
+            evict_messages: self.evict_messages - earlier.evict_messages,
+            wait_micros: self.wait_micros - earlier.wait_micros,
+            wait_micros_max: self.wait_micros_max,
+            wait_frames: self.wait_frames - earlier.wait_frames,
+            wait_frames_max: self.wait_frames_max,
+            upload_micros: self.upload_micros - earlier.upload_micros,
+        }
+    }
 }
 
 /// What an upload is charged, and to which class, for the refund when it
@@ -135,6 +184,8 @@ pub struct ContentPump {
     contents: Option<HashMap<TileId, std::sync::Arc<tuile_core::DecodedTileContent>>>,
     /// The meshes the last [`Self::resolve`] drew: exact, held and fallback.
     drawn_tiles: std::collections::HashSet<TileId>,
+    /// See [`Self::totals`].
+    totals: PumpTotals,
 }
 
 /// Frames a tile takes to slide to its new edge when what is drawn beside it
@@ -183,7 +234,13 @@ impl ContentPump {
             encode_pace: EncodePace::DEFAULT,
             contents: None,
             drawn_tiles: std::collections::HashSet::new(),
+            totals: PumpTotals::default(),
         }
+    }
+
+    /// What this pump has done since it was made: see [`PumpTotals`].
+    pub fn totals(&self) -> PumpTotals {
+        self.totals
     }
 
     /// Keeps each resident mesh's decoded content beside its GPU copy, for a
@@ -359,7 +416,7 @@ impl ContentPump {
             self.sliding.retain(|id| {
                 prepared
                     .get_mut(id)
-                    .is_some_and(|tile| tile.slide(&gpu.queue, frame, slide))
+                    .is_some_and(|tile| tile.slide(gpu, frame, slide))
             });
         }
     }
@@ -549,9 +606,11 @@ impl ContentPump {
             if self.upload_one(stream, gpu, r, q).is_some() {
                 uploaded.push((r, Bytes(staging)));
                 moved += staging;
+                self.totals.upload_bytes += staging;
             }
         }
         let wall = began.elapsed();
+        self.totals.upload_micros += wall.as_micros() as u64;
         // The throughput is of what the uploads moved.
         let bytes = moved;
         // The throughput a frame's deadline is made of, measured: a moving
@@ -595,6 +654,7 @@ impl ContentPump {
     ) -> Option<u64> {
         let m = tuile_core::metrics::metrics();
         let started = web_time::Instant::now();
+        let (arrived, arrived_frame) = (q.arrived, q.arrived_frame);
         // What this would replace leaves with it: a redelivery after a change
         // of epoch is new before old, in place.
         let replaced = self.held.get(&r).map_or(0, |h| h.bytes);
@@ -651,6 +711,7 @@ impl ContentPump {
                 resource: r,
                 gen: q.gen,
             });
+            self.totals.ack_messages += 1;
             return None;
         }
         store(self);
@@ -684,6 +745,15 @@ impl ContentPump {
             gen: q.gen,
             bytes,
         });
+        let waited = arrived.elapsed().as_micros() as u64;
+        let frames = self.frame.saturating_sub(arrived_frame);
+        let t = &mut self.totals;
+        t.ack_messages += 1;
+        t.uploads += 1;
+        t.wait_micros += waited;
+        t.wait_micros_max = t.wait_micros_max.max(waited);
+        t.wait_frames += frames;
+        t.wait_frames_max = t.wait_frames_max.max(frames);
         Some(bytes)
     }
 
@@ -761,6 +831,8 @@ impl ContentPump {
                         gen,
                         class,
                         content,
+                        arrived: web_time::Instant::now(),
+                        arrived_frame: self.frame,
                     },
                 );
                 tuile_core::metrics::metrics()
@@ -779,9 +851,12 @@ impl ContentPump {
             ServerMessage::Evict { resources } => {
                 let m = tuile_core::metrics::metrics();
                 let mut drapes_gone = Vec::new();
+                self.totals.evict_messages += 1;
                 for r in &resources {
                     if let Some(h) = self.held.remove(r) {
                         self.held_bytes[h.class] = self.held_bytes[h.class].saturating_sub(h.bytes);
+                        self.totals.releases += 1;
+                        self.totals.released_bytes += h.bytes;
                     }
                     match r {
                         ResourceId::Mesh(tile) => {
@@ -1052,17 +1127,17 @@ impl ContentPump {
             covering: surfaces(&covering),
             covering_fallback: surfaces(&covering_fallback),
         };
-        self.rebase_for_drawing(
-            &gpu.queue,
-            drawn
-                .exact
-                .iter()
-                .chain(drawn.fallback.iter())
-                .chain(drawn.backdrop.iter())
-                .chain(drawn.covering.iter())
-                .chain(drawn.covering_fallback.iter())
-                .copied(),
-        );
+        let origin = self.render_origin;
+        for tile in drawn
+            .exact
+            .iter()
+            .chain(drawn.fallback.iter())
+            .chain(drawn.backdrop.iter())
+            .chain(drawn.covering.iter())
+            .chain(drawn.covering_fallback.iter())
+        {
+            tile.rebase_counted(&gpu.queue, Some(&gpu.ops), origin);
+        }
         (drawn, counts)
     }
 

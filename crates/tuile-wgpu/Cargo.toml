@@ -37,6 +37,9 @@ naga = { version = "30.0.1", features = ["wgsl-in", "glsl-out"] }
 futures-executor = { workspace = true }
 futures-util = { workspace = true }
 glam = { workspace = true }
+# The device's own count of what it holds: `tests/upload_bench.rs` reads
+# when an eviction's memory is really given back.
+wgpu = { workspace = true, features = ["counters"] }
 image = { workspace = true }
 pollster = { workspace = true }
 tracing = { workspace = true }
