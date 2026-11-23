@@ -193,6 +193,9 @@ struct Active {
     gpu: GpuContext,
     renderer: TileRenderer,
     overlay: OverlayRenderer,
+    /// Over `overlay`: the budget panel's layer on top
+    /// (`tuile_ui::Drawing::on_top`), after every text `overlay` draws.
+    overlay_on_top: OverlayRenderer,
     /// A host's shapes in the world: `tuile_overlay::OverlayMesh`, through
     /// the frame's own camera. Nothing is drawn through it in a session with
     /// no host, and it costs three pipelines.
