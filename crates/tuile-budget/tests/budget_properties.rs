@@ -1004,3 +1004,46 @@ proptest! {
         prop_assert!(!d.is_fallback(d.gpu) && !d.is_fallback(Bytes(d.gpu.0 + 1)));
     }
 }
+
+proptest! {
+    /// CB5, `Off` unchanged: with no block to encode, the encode lane never
+    /// binds — `take_with` takes what `take` takes, whatever the carry.
+    #[test]
+    fn take_with_no_blocks_is_take(
+        costs in proptest::collection::vec(1u64..400_000, 1..12),
+        cap in 0u64..2_000_000,
+        done in 0u64..500_000,
+        split in proptest::collection::vec(any::<bool>(), 12),
+        carry in any::<i64>(),
+    ) {
+        use tuile_budget::{EncodeBucket, FrameDeadline, Micros, SwapGroup};
+        let queue: Vec<ResourceId> = (0..costs.len())
+            .map(|x| ResourceId::Mesh(t(6, x as u64, 0)))
+            .collect();
+        // Groups: runs of the queue cut where `split` says.
+        let mut groups = Vec::new();
+        let mut run = Vec::new();
+        for (i, r) in queue.iter().enumerate() {
+            run.push(*r);
+            if split[i] || i + 1 == queue.len() {
+                if run.len() > 1 {
+                    let mut members = std::mem::take(&mut run);
+                    members.sort_unstable();
+                    groups.push(SwapGroup { members });
+                }
+                run.clear();
+            }
+        }
+        let d = FrameDeadline {
+            bytes: Bytes(cap),
+            time: Micros(1_000),
+            encode_blocks: 0,
+        };
+        let cost = |r: ResourceId| Bytes(costs[queue.iter().position(|q| *q == r).unwrap_or(0)]);
+        let plain = d.take(&queue, &groups, Bytes(done), cost);
+        let mut bucket = EncodeBucket { carry };
+        let with = d.take_with(&queue, &groups, Bytes(done), &mut bucket, |r| (cost(r), 0));
+        prop_assert_eq!(plain, with);
+        prop_assert_eq!(bucket.carry, carry, "nothing taken from the lane");
+    }
+}

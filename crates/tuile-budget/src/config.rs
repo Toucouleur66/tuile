@@ -164,6 +164,12 @@ pub struct BudgetConfig {
     pub request_heap: u32,
     /// GPU upload bytes per frame. Batch: [`Bytes::MAX`].
     pub upload_bytes_per_frame: Bytes,
+    /// The 4×4 blocks a step's upload plan may ask the GPU to encode
+    /// (CB5): the plan's encode lane, as `upload_bytes_per_frame` is its
+    /// byte lane; the executor's own lane (`FrameDeadline::encode_blocks`)
+    /// paces the frames. Interactive: three 256² tiles with their chains;
+    /// Batch: `u64::MAX`.
+    pub encode_blocks_per_step: u64,
     /// Decoded bytes in transit to the consumer, not yet acknowledged.
     pub delivery_credit: Bytes,
     /// How long a load may stay unneeded before it is cancelled.
@@ -266,6 +272,7 @@ impl BudgetConfig {
             max_local_reads: 8,
             request_heap: 256,
             upload_bytes_per_frame: Bytes::mib(8),
+            encode_blocks_per_step: 3 * 5_463,
             delivery_credit: Bytes::mib(32),
             cancel_grace: Micros::from_millis(500),
             load_timeout: Micros::from_secs(4),
@@ -312,6 +319,7 @@ impl BudgetConfig {
             max_local_reads: 32,
             request_heap: 4_096,
             upload_bytes_per_frame: Bytes::MAX,
+            encode_blocks_per_step: u64::MAX,
             delivery_credit: Bytes::MAX,
             cancel_grace: Micros::NEVER,
             load_timeout: Micros::from_secs(120),

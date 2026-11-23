@@ -19,9 +19,10 @@
 //! order is the RGBA8 path's: the texture is complete before anything binds
 //! it.
 //!
-//! The encodes are paced by the pump under their own per-frame share of GPU
-//! time ([`EncodePace`]), measured with timestamps where the device has
-//! them and assumed from the encoder's measured cost per block elsewhere.
+//! The encodes are paced by the pump on the core's encode lane
+//! (`tuile_core::budget::EncodeBucket`, CB6): a frame's share of blocks,
+//! its time over the cost of a block — measured with timestamps where the
+//! device has them, assumed from the viewer's measure elsewhere.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -198,48 +199,12 @@ pub fn encode_reservation(plan: ImageryPlan, tiles: u32) -> tuile_core::budget::
 }
 
 /// GPU nanoseconds per block assumed before the device has measured any:
-/// texcomp's published cost on Apple M2 (Metal), wall clock per 256² tile
-/// with its mips (5463 blocks) — BC7 5.1 ms, ASTC 4×4 1.9 ms. Wall clock
-/// includes the upload, so it over-states the kernel; a measure replaces it.
-fn assumed_ns_per_block(format: BlockFormat) -> f64 {
-    match format {
-        BlockFormat::Bc7 => 5.1e6 / 5463.0,
-        BlockFormat::Astc4x4 => 1.9e6 / 5463.0,
-    }
-}
-
-/// The GPU's share of a frame the imagery encodes may take, and how many
-/// blocks that is.
-///
-/// Deliberately simple, and outside the budget's own accounting (a later
-/// step brings encode time into `FrameDeadline`): one number of GPU time per
-/// frame, divided by the cost of a block — measured by timestamps around the
-/// encoder's compute pass where the device has `TIMESTAMP_QUERY`, assumed
-/// from the encoder's published cost elsewhere. A frame always takes the
-/// first resource that needs encoding, however large, so nothing waits for
-/// ever; the next one waits for a frame with room.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct EncodePace {
-    /// GPU time per frame for encodes, microseconds.
-    pub share_micros: u64,
-}
-
-impl EncodePace {
-    /// A quarter of a 60 Hz frame.
-    pub const DEFAULT: EncodePace = EncodePace {
-        share_micros: 4_000,
-    };
-
-    /// Blocks a frame may encode at `ns_per_block`.
-    pub fn blocks_per_frame(self, ns_per_block: f64) -> u64 {
-        (self.share_micros as f64 * 1_000.0 / ns_per_block.max(1.0)) as u64
-    }
-}
-
-impl Default for EncodePace {
-    fn default() -> Self {
-        Self::DEFAULT
-    }
+/// the viewer's measure on Apple M-series (Metal), timestamps around the
+/// encode pass — about 1.7–1.9 µs a block, 9.5 ms a 256² BC7 tile with its
+/// chain (`gpu-compressed-textures.md` §9.1). Taken for ASTC 4×4 too until
+/// its own first measure: an over-estimate paces slower, never faster.
+fn assumed_ns_per_block(_format: BlockFormat) -> f64 {
+    1_739.0
 }
 
 /// What the encoder has done this session: tiles encoded, tiles that had to
@@ -558,21 +523,15 @@ mod tests {
         );
     }
 
-    /// **The pace is GPU time over the cost of a block**: about one 256² BC7
-    /// tile per frame at the assumed cost, nearly three of ASTC.
+    /// **Until measured, a block costs what the viewer measured**: a 256²
+    /// tile with its chain is 5,463 blocks, about 9.5 ms.
     #[test]
-    fn the_pace_is_time_over_the_cost_of_a_block() {
-        let pace = EncodePace::DEFAULT;
+    fn the_assumed_cost_is_the_measured_one() {
         let tile = tile_blocks(BlockFormat::Bc7, 256, 256);
         assert_eq!(tile, 5463);
-        let bc7 = pace.blocks_per_frame(assumed_ns_per_block(BlockFormat::Bc7));
-        let astc = pace.blocks_per_frame(assumed_ns_per_block(BlockFormat::Astc4x4));
-        assert!(bc7 < tile && bc7 > tile / 2, "{bc7}");
-        assert!(astc > 2 * tile && astc < 3 * tile, "{astc}");
-        assert_eq!(
-            pace.blocks_per_frame(0.0),
-            4_000_000,
-            "never divides by zero"
-        );
+        for format in [BlockFormat::Bc7, BlockFormat::Astc4x4] {
+            let ms = tile as f64 * assumed_ns_per_block(format) / 1e6;
+            assert!((9.0..10.0).contains(&ms), "{format:?}: {ms} ms a tile");
+        }
     }
 }

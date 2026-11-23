@@ -153,6 +153,12 @@ pub struct BudgetStats {
     /// The part of `gpu` in transit to the GPU (delivered, not yet
     /// acknowledged), per class.
     pub transit: PerClass<Bytes>,
+    /// Of `transit`, what an encode on the GPU holds beside the blocks until
+    /// it has run (`Cost::transient`), per class: zero without compression.
+    pub transient: PerClass<Bytes>,
+    /// What the copies in transit cross in (`Cost::transfer`), per class:
+    /// their resident bytes without compression.
+    pub transfer: PerClass<Bytes>,
     /// The drawable part of `gpu` (`gpu` less `transit`), per class, by the
     /// level the budget files each resource at ([`level_index`]). Kept as
     /// the copies come and go, never summed over the resources.

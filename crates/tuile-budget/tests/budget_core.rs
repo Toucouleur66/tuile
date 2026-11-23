@@ -3603,6 +3603,7 @@ mod deadline {
         let cap = |b| FrameDeadline {
             bytes: Bytes(b),
             time: Micros(1_000),
+            encode_blocks: u64::MAX,
         };
         let (a, b, c, e) = (
             mesh(t(3, 0, 0)),
@@ -3635,6 +3636,57 @@ mod deadline {
         // Not first in the frame: nothing over the deadline goes.
         assert_eq!(cap(50).take(&[e], &[], Bytes(10), cost), none);
         assert_eq!(cap(250).take(&queue, &[], Bytes(100), cost), &[a]);
+    }
+
+    /// CB5: the encode lane. A share of 6,000 blocks a frame, tiles of
+    /// 5,463: the first goes (the lane in credit), the second too — into
+    /// debt — and the third waits, with everything behind it (no
+    /// overtaking: the mesh after it waits too). Next frame the debt is
+    /// carried (−4,926 + 6,000 = 1,074 lets one more go, then the mesh,
+    /// which encodes nothing); the frame after, the last tile. A group goes or waits whole, its blocks summed.
+    #[test]
+    fn the_encode_lane_admits_while_out_of_debt_and_nothing_overtakes() {
+        use tuile_budget::EncodeBucket;
+        let d = FrameDeadline::UNBOUNDED.with_encode_blocks(6_000);
+        let tiles: Vec<ResourceId> = (0..4).map(|x| dr(t(4, x, 0), 4)).collect();
+        let m = mesh(t(4, 9, 0));
+        let mut queue = tiles.clone();
+        queue.insert(3, m);
+        let cost = |r: ResourceId| match r {
+            ResourceId::Drape { .. } => (Bytes(349_524), 5_463),
+            _ => (Bytes(1_000), 0),
+        };
+        let mut bucket = EncodeBucket::default();
+        bucket.refill(d.encode_blocks);
+        let first = d.take_with(&queue, &[], Bytes::ZERO, &mut bucket, cost);
+        assert_eq!(first, &queue[..2], "{RED}");
+        assert_eq!(bucket.carry, 6_000 - 2 * 5_463);
+        bucket.refill(d.encode_blocks);
+        assert_eq!(bucket.carry, 6_000 - 2 * 5_463 + 6_000, "debt carried over");
+        let second = d.take_with(&queue[2..], &[], Bytes::ZERO, &mut bucket, cost);
+        assert_eq!(
+            second,
+            &queue[2..4],
+            "one more, into debt again, and the mesh behind it, which encodes nothing"
+        );
+        bucket.refill(d.encode_blocks);
+        let third = d.take_with(&queue[4..], &[], Bytes::ZERO, &mut bucket, cost);
+        assert_eq!(third, &queue[4..], "back in credit: the last tile");
+        // Capped at one share: an idle lane does not bank frames.
+        let mut idle = EncodeBucket::default();
+        for _ in 0..10 {
+            idle.refill(6_000);
+        }
+        assert_eq!(idle.carry, 6_000);
+        // A group's blocks are summed and it goes whole or not at all.
+        let g = [dr(t(5, 0, 0), 5), mesh(t(5, 0, 0))];
+        let mut members = g.to_vec();
+        members.sort_unstable();
+        let groups = [SwapGroup { members }];
+        let mut debt = EncodeBucket { carry: -1 };
+        assert!(d
+            .take_with(&g, &groups, Bytes::ZERO, &mut debt, cost)
+            .is_empty());
     }
 }
 
@@ -4185,5 +4237,50 @@ mod reservations {
         );
         c.reserved[Class::Drape] = c.hard_limit[Class::Drape].plus(Bytes(1));
         assert!(c.validate().is_err(), "a reservation past the hard limit");
+    }
+}
+
+/// CB5: the plan's encode lane. A step asks the GPU to encode no more than
+/// `encode_blocks_per_step`, the first item whatever its size.
+mod encode_lane {
+    use super::cost_per_path::gpu_encoded;
+    use super::*;
+
+    #[test]
+    fn the_plan_caps_its_encodes_per_step() {
+        let mut c = Rig::interactive_config();
+        c.encode_blocks_per_step = 5_463;
+        let mut r = Rig::new(c);
+        let tiles = [t(4, 0, 0), t(4, 1, 0), t(4, 2, 0)];
+        let need = drawn_draped(&tiles, 4);
+        let mut d = r.step(&need);
+        for _ in 0..8 {
+            for s in &d.start {
+                let cost = match s.resource {
+                    ResourceId::Drape { .. } => gpu_encoded(),
+                    _ => est(s.resource),
+                };
+                r.b.on_loaded(s.resource, s.gen, cost);
+            }
+            d = r.step(&need);
+            for (m, g) in &d.deliver {
+                if matches!(m, ResourceId::Mesh(_)) {
+                    r.b.on_drawable(*m, *g, est(*m).gpu);
+                }
+            }
+        }
+        let d = r.step(&need);
+        let drapes = d
+            .upload_plan
+            .items
+            .iter()
+            .filter(|i| matches!(i, ResourceId::Drape { .. }))
+            .count();
+        assert_eq!(drapes, 1, "three encodes asked of one step: {RED}");
+        assert_eq!(d.upload_plan.encode_blocks, 5_463);
+        // An unbounded lane is a valid configuration.
+        let mut c = Rig::interactive_config();
+        c.encode_blocks_per_step = u64::MAX;
+        assert!(c.validate().is_ok());
     }
 }

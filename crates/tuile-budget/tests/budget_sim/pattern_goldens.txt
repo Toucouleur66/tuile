@@ -14,8 +14,8 @@ p4-orbit desktop 402b95e6b5a48704
 p5-rotation handheld 3096ac326b7938ad
 p6-look-around headset-90 bec31bac52446287
 film aa5e5772aada813a
-p1-cold desktop-bc7 5c9818169e2be930
-p1-cold handheld-astc-gpu 2a3d058e36933664
+p1-cold desktop-bc7 c16bb6bd85e0b432
+p1-cold handheld-astc-gpu 2d640ab2ff2976f5
 p1-cold web-webgl2-cpu f911724e5fe4372f
-p2-fast-dive desktop-bc7 65eccebeecb018d4
-p2-fast-dive headset-90-astc ecb7ed0784209e35
+p2-fast-dive desktop-bc7 05db4394184e7702
+p2-fast-dive headset-90-astc 5797c9c48e3e3fcb

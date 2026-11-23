@@ -533,6 +533,10 @@ pub struct Metrics {
     pub present_seconds: Timer,
     pub uploads: Counter,
     pub upload_seconds: Timer,
+    /// One imagery tile encoded into blocks on the CPU, mip chain included
+    /// (CB7): where it is paid — a browser's decode worker on WebGL2 —
+    /// what the decoded tier's reservation is sized against.
+    pub cpu_encode_seconds: Timer,
     /// Stitching (`crate::stitch`), on a consumer that plans when what it
     /// draws changes: plans worked out and the time they took, tiles given
     /// new strips, and tiles left unstitched because their plan had more

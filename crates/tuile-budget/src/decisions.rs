@@ -146,6 +146,9 @@ pub struct UploadPlan {
     pub items: Vec<ResourceId>,
     /// Their estimated bytes.
     pub bytes: Bytes,
+    /// The 4×4 blocks their GPU encodes write (CB5): capped per step by
+    /// `BudgetConfig::encode_blocks_per_step`. Zero without compression.
+    pub encode_blocks: u64,
     /// Swap groups among them, completed together when possible.
     pub groups: Vec<SwapGroup>,
 }
@@ -157,6 +160,7 @@ impl UploadPlan {
     pub(crate) fn clear(&mut self) {
         self.items.clear();
         self.bytes = Bytes::ZERO;
+        self.encode_blocks = 0;
     }
 
     /// The `n`th group of the plan being built, emptied, to fill: an old
@@ -249,6 +253,11 @@ impl Decisions {
             }
         }
         h.u64(self.upload_plan.bytes.0);
+        // Only when the plan encodes (CB5): a digest without compression is
+        // the one it was.
+        if self.upload_plan.encode_blocks > 0 {
+            h.u64(self.upload_plan.encode_blocks);
+        }
         h.u64(self.upload_plan.groups.len() as u64);
         for g in &self.upload_plan.groups {
             h.u64(g.members.len() as u64);

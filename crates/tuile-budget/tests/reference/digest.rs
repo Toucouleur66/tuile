@@ -310,6 +310,19 @@ impl Feed for BudgetStats {
         } else {
             text
         };
+        // And the compression's split of the transits, which says nothing
+        // `transit` does not without it.
+        let zero = PerClass::<Bytes>::default();
+        let text = if self.transient == zero {
+            text.replace(&format!(", transient: {zero:?}"), "")
+        } else {
+            text
+        };
+        let text = if self.transient == zero {
+            text.replace(&format!(", transfer: {:?}", self.transfer), "")
+        } else {
+            text
+        };
         h.bytes(text.as_bytes());
     }
 }

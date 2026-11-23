@@ -273,7 +273,14 @@ fn window_numbers(s: &mut tuile_core::budget::BudgetSignals, f: &mut dyn FnMut(&
         f(&mut s.protected_bytes[c]);
         f(&mut s.upload_bytes_total[c]);
         f(&mut s.wasted_starts_total[c]);
+        // The compression's numbers the board reads (the frames' are the
+        // page's own: `BudgetSignals::take_frames_from`).
+        f(&mut s.transient_bytes[c]);
+        f(&mut s.transfer_bytes[c]);
+        f(&mut s.reserved_bytes[c]);
+        f(&mut s.encode_fallbacks_total[c]);
     }
+    f(&mut s.decoded_reserved_bytes);
     let y = &mut s.layers;
     for i in 0..LAYERS {
         small(&mut y.gpu_tiles[i], f);
@@ -332,6 +339,12 @@ mod tests {
         s.layers_seen = 0b11;
         s.decide_micros.count = 9;
         s.floor_level = Some(0);
+        // And the compression section's.
+        s.transient_bytes[Class::Drape] = 349_524;
+        s.transfer_bytes[Class::Drape] = 699_048;
+        s.reserved_bytes[Class::Drape] = 442_196;
+        s.decoded_reserved_bytes = 524_340;
+        s.encode_fallbacks_total[Class::Drape] = 2;
         let glance = Glance::of(&s);
         assert_eq!(Glance::of(&glance.signals()), glance);
         assert_eq!(glance.signals().bytes, s.bytes);
@@ -340,6 +353,23 @@ mod tests {
         assert_eq!(back.layer_loads_total, s.layer_loads_total);
         assert_eq!((back.layers_seen, back.floor_level), (0b11, Some(0)));
         assert_eq!(back.decide_micros.count, 9);
+        assert_eq!(
+            (
+                back.transient_bytes,
+                back.transfer_bytes,
+                back.reserved_bytes,
+                back.decoded_reserved_bytes,
+                back.encode_fallbacks_total,
+            ),
+            (
+                s.transient_bytes,
+                s.transfer_bytes,
+                s.reserved_bytes,
+                s.decoded_reserved_bytes,
+                s.encode_fallbacks_total
+            ),
+            "the compression section crosses"
+        );
         assert!(glance.signals().converged);
     }
 }
