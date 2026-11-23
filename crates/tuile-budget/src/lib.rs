@@ -854,6 +854,15 @@ impl Budget {
         }
     }
 
+    /// Takes the arena out, an empty one in its place, for a test to drop
+    /// it under a counting allocator: the heap the arena alone holds.
+    /// Leaves the budget unusable for decisions; measurement only.
+    #[doc(hidden)]
+    pub fn take_arena_to_measure(&mut self) -> Box<dyn std::any::Any> {
+        let empty = state::Arena::new(self.cfg.pinned_level);
+        Box::new(std::mem::replace(&mut self.arena, empty))
+    }
+
     /// Drops the buffers a step reuses from one step to the next, which
     /// have grown to the size of the view: a host freeing memory (sent to
     /// the background) can give them back; the next step grows them again.
