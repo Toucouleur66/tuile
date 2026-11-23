@@ -18,7 +18,7 @@ use common::*;
 use object_store::ObjectStore;
 use tuile_tile_server::catalog::layers;
 use tuile_tile_server::derived::{
-    downsample, encode_webp, linear_to_srgb, ParentConfig, SRGB_TO_LINEAR,
+    downsample, encode_webp, linear_to_srgb, ParentConfig, DEFAULT_WEBP_METHOD, SRGB_TO_LINEAR,
 };
 use tuile_tile_server::{
     Catalog, Derivations, Fresh, MemoryRegister, ParentLayer, Refreshed, ServiceConfig, Source,
@@ -223,8 +223,8 @@ fn the_same_children_give_the_same_bytes() {
     let b = downsample([&kids[0], &kids[1], &kids[2], &kids[3]], SIDE as usize);
     assert_eq!(a, b);
     let (wa, wb) = (
-        encode_webp(&a, SIDE, 85.0).expect("webp"),
-        encode_webp(&b, SIDE, 85.0).expect("webp"),
+        encode_webp(&a, SIDE, 85.0, DEFAULT_WEBP_METHOD).expect("webp"),
+        encode_webp(&b, SIDE, 85.0, DEFAULT_WEBP_METHOD).expect("webp"),
     );
     assert_eq!(wa, wb, "libwebp, one thread: the same bytes");
     assert_eq!(&wa[..4], b"RIFF");

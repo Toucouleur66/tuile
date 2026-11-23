@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+[package]
+name = "derived-codecs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Standalone: not a member of the tuile workspace.
+[workspace]
+[dependencies]
+image = { version = "=0.25.10", default-features = false, features = ["jpeg", "webp"] }
+zune-jpeg = "=0.5.15"
+zune-core = "0.5"
+jpeg-decoder = "0.3"
+turbojpeg = { version = "1.5", features = ["cmake"] }
+webp = { version = "=0.3.1", default-features = false }
+libwebp-sys = { version = "=0.9.6", optional = true }
+image-compare = "0.4"
+image-webp = "0.2"
+[features]
+sse41 = ["dep:libwebp-sys", "libwebp-sys/sse41"]
+avx2 = ["dep:libwebp-sys", "libwebp-sys/sse41", "libwebp-sys/avx2"]
+[profile.release]
+lto = "thin"

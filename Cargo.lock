@@ -9694,6 +9694,8 @@ dependencies = [
  "tuile-core",
  "url",
  "webp",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
