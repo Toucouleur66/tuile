@@ -2619,13 +2619,9 @@ impl Budget {
         if self.ledger.gpu[class].minus(freeable).plus(bytes) > limit {
             if urgency >= Urgency::Ring && prob > 0 {
                 let a = &self.arena;
-                // The bottom of the order only: the lowest scores are the
-                // swap's candidates, and a step's work stays bounded.
-                let looked = room
+                let looked = room.grouped.len();
+                let extra = room
                     .grouped
-                    .len()
-                    .min(usize::from(self.spec.params.release_visits));
-                let extra = room.grouped[..looked]
                     .iter()
                     .filter(|&&((.., r), s)| {
                         a.class(s) == class
