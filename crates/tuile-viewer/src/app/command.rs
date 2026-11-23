@@ -266,6 +266,7 @@ impl App {
                 budget_window: self.budget_window.shown(),
                 budget_window_cumulative: self.budget_window.cumulative(),
                 budget_window_tables: self.budget_window.tables(),
+                budget_window_issues: self.budget_window.issues_only(),
             },
             |snapshot| crate::menu::State::of(&snapshot, layers),
         )
@@ -303,6 +304,7 @@ impl App {
             budget_window: self.budget_window.shown(),
             budget_window_cumulative: self.budget_window.cumulative(),
                 budget_window_tables: self.budget_window.tables(),
+                budget_window_issues: self.budget_window.issues_only(),
             ..Snapshot::of(&self.controller, size)
         };
         crate::snapshot::publish(snapshot);

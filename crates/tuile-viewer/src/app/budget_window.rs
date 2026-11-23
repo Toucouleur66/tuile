@@ -61,9 +61,20 @@ pub(super) struct BudgetWindow {
     tables: bool,
     /// The decision's time over the last publications, for the board.
     decide: tuile_ui::budget_board::DecideHistory,
+    /// Since when each class and level has been stalled, for the board's
+    /// alerts: one is an alert once it has lasted the delay (1 s, or
+    /// `TUILE_BUDGET_STALL_MS`).
+    stalls: Option<tuile_ui::budget_board::StallWatch>,
+    /// The origin of the stalls' clock.
+    started: Option<Instant>,
     /// The board's texts, kept from one drawing to the next.
     texts: tuile_ui::budget_board::TextCache,
     layout: Option<tuile_ui::Drawing>,
+    /// Its scroll, the pointer over it and the keyboard's focus: the
+    /// legend shown (`tuile_ui::budget_board::BoardControl`).
+    control: tuile_ui::budget_board::BoardControl,
+    /// Only the levels with an issue (`window_levels=issues`).
+    issues_only: bool,
     laid: Option<(Instant, (u32, u32), u64)>,
 }
 
@@ -83,6 +94,10 @@ impl BudgetWindow {
             WindowAsk::Tables(on) => {
                 self.shown = true;
                 self.tables = on;
+            }
+            WindowAsk::Levels(issues) => {
+                self.shown = true;
+                self.issues_only = issues;
             }
         }
         // Laid out again at once.
@@ -133,6 +148,27 @@ impl BudgetWindow {
         self.cumulative
     }
 
+    /// Whether only the levels with an issue are listed.
+    pub(super) fn issues_only(&self) -> bool {
+        self.issues_only
+    }
+
+    /// What a person did in its own window: scrolled, pointed, pressed a
+    /// key. Says whether it asked the window something the menu shows.
+    pub(super) fn input(&mut self, input: tuile_ui::budget_board::BoardInput) -> bool {
+        use tuile_ui::budget_board::BoardKey as K;
+        self.laid = None;
+        let asked = match self.control.input(input) {
+            Some(K::Tables) => WindowAsk::Tables(!self.tables),
+            Some(K::Cumulative) => WindowAsk::Cumulative(!self.cumulative),
+            Some(K::Reset) => WindowAsk::Reset,
+            Some(K::Issues) => WindowAsk::Levels(!self.issues_only),
+            _ => return false,
+        };
+        self.ask(asked);
+        true
+    }
+
     /// Whether the tables are shown rather than the board.
     pub(super) fn tables(&self) -> bool {
         self.tables
@@ -157,7 +193,9 @@ impl BudgetWindow {
         let now = Instant::now();
         if !self.tables {
             let mut texts = tuile_ui::budget_board::TextCache::default();
-            return self.board(signals, now, layers, &mut texts, scale).size;
+            return self
+                .board(signals, now, layers, &mut texts, scale, None)
+                .size;
         }
         let rows = self.rows_for(signals, now, layers);
         tuile_ui::Panel::default()
@@ -180,6 +218,7 @@ impl BudgetWindow {
         layers: &[String],
         texts: &mut tuile_ui::budget_board::TextCache,
         scale: f64,
+        width: Option<f64>,
     ) -> tuile_ui::Drawing {
         let view = tuile_ui::budget_board::BoardView {
             cumulative: self.cumulative,
@@ -193,6 +232,9 @@ impl BudgetWindow {
                 .flatten(),
             layers,
             decide: self.decide.summary(),
+            stalls: self.stalls.as_ref().unwrap_or(&NO_STALLS),
+            width,
+            issues_only: self.issues_only,
         };
         tuile_ui::budget_board::draw(signals, &view, texts, scale)
     }
@@ -223,18 +265,40 @@ impl BudgetWindow {
         }
         if let Some(s) = signals {
             self.decide.note(s);
+            let since = *self.started.get_or_insert(now);
+            self.stalls
+                .get_or_insert_with(stall_watch)
+                .note(s, now.duration_since(since).as_secs_f64());
         }
-        self.layout = Some(if self.tables {
+        // A window someone sizes: the board laid out for its width, and
+        // scrolled in it. One nobody sizes (a headless run's texture) is
+        // the board's own size.
+        let sized = frame.0 < 16_384;
+        let width = sized.then(|| f64::from(frame.0) / scale.max(1.0) - at.0 / scale.max(1.0));
+        let mut texts = std::mem::take(&mut self.texts);
+        let drawing: tuile_ui::Drawing = if self.tables {
             let rows = self.rows_for(signals, now, layers);
+            // The table's own height: scrolled like the board.
+            let frame_for = if self.own_window {
+                (frame.0, 16_384)
+            } else {
+                frame
+            };
             tuile_ui::Panel::default()
-                .layout(tuile_ui::Font::bundled(), &rows, at, frame, scale)
+                .layout(tuile_ui::Font::bundled(), &rows, at, frame_for, scale)
                 .into()
         } else {
-            let mut texts = std::mem::take(&mut self.texts);
-            let board = self.board(signals, now, layers, &mut texts, scale);
-            self.texts = texts;
-            moved(board, at)
+            moved(
+                self.board(signals, now, layers, &mut texts, scale, width),
+                at,
+            )
+        };
+        self.layout = Some(if self.own_window && sized {
+            self.control.present(drawing, frame, scale, &mut texts)
+        } else {
+            drawing
         });
+        self.texts = texts;
         self.laid = Some((now, frame, step));
         true
     }
@@ -262,6 +326,21 @@ impl BudgetWindow {
             ),
         }
     }
+}
+
+/// A watch before any signals: nothing stalled yet.
+static NO_STALLS: std::sync::LazyLock<tuile_ui::budget_board::StallWatch> =
+    std::sync::LazyLock::new(stall_watch);
+
+/// The stalls' watch, its delay from `TUILE_BUDGET_STALL_MS` when set (a
+/// tuning, not a switch), [`tuile_ui::budget_board::STALL_DELAY`]
+/// otherwise.
+fn stall_watch() -> tuile_ui::budget_board::StallWatch {
+    let delay = std::env::var("TUILE_BUDGET_STALL_MS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map_or(tuile_ui::budget_board::STALL_DELAY, |ms| ms / 1000.0);
+    tuile_ui::budget_board::StallWatch::with_delay(delay)
 }
 
 /// `d` with its top-left corner at `at`, device pixels.

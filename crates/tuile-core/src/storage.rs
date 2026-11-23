@@ -78,6 +78,33 @@ pub trait ContentStore: Send + Sync {
         let _ = key;
         false
     }
+
+    /// What the store holds of the tiles whose keys are
+    /// `{group}/{level}/{x}/{y}`, by level — `[tiles, bytes]` added into
+    /// `out` — from its own ledger of what it inserted and let go,
+    /// **synchronously and without reading anything**: the disk tier of
+    /// the budget window and of `tuile_tier_*`. An absence remembered is
+    /// not a tile. `false` (the default) for a store that keeps no such
+    /// ledger: its tier is not known.
+    fn stored(&self, group: &str, out: &mut crate::budget::ByLevel) -> bool {
+        let _ = (group, out);
+        false
+    }
+}
+
+/// The group and level of a tile's key, `{group}/{level}/{x}/{y}`, as the
+/// stores' ledgers file it ([`ContentStore::stored`]); none for a key of
+/// another shape or a level past the budget's.
+pub fn tile_key_level(key: &str) -> Option<(&str, usize)> {
+    let mut parts = key.rsplitn(4, '/');
+    let y = parts.next()?;
+    let x = parts.next()?;
+    let level = parts.next()?;
+    let group = parts.next()?;
+    y.parse::<u64>().ok()?;
+    x.parse::<u64>().ok()?;
+    let level = level.parse::<usize>().ok()?;
+    (level < crate::budget::LEVELS && !group.is_empty()).then_some((group, level))
 }
 
 /// What a store knows of a value it was not asked to read: see
@@ -150,6 +177,18 @@ mod tests {
                 .expect("lock")
                 .insert(key.to_owned(), value);
         }
+    }
+
+    /// A tile's key is filed by its group and level; anything else is
+    /// not a tile.
+    #[test]
+    fn a_tile_key_has_a_group_and_a_level() {
+        assert_eq!(tile_key_level("img/bing-aerial/12/2100/1450"), Some(("img/bing-aerial", 12)));
+        assert_eq!(tile_key_level("mesh/ion/cwt/3/1/2"), Some(("mesh/ion/cwt", 3)));
+        assert_eq!(tile_key_level("img/x/99/1/2"), None, "past the levels");
+        assert_eq!(tile_key_level("scheme/bing"), None);
+        assert_eq!(tile_key_level("img/x/a/1/2"), None);
+        assert_eq!(tile_key_level("12/1/2"), None, "no group");
     }
 
     #[test]

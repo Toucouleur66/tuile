@@ -94,4 +94,9 @@ impl ImageryProvider for SwitchableImagery {
     fn holds(&self, coord: ImageryCoord) -> bool {
         self.now().1.holds(coord)
     }
+
+    /// The layer now served's: the store's tiles of the others are theirs.
+    fn stored(&self, out: &mut tuile_core::budget::ByLevel) -> bool {
+        self.now().1.stored(out)
+    }
 }

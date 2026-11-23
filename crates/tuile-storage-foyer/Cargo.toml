@@ -24,4 +24,5 @@ tuile-core = { version = "0.17.1", path = "../tuile-core" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-tokio = { workspace = true }
+# `time`: a test waits for the disk tier's reclaim.
+tokio = { workspace = true, features = ["time"] }

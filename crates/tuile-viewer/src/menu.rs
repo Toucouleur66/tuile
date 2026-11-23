@@ -63,6 +63,7 @@ pub(crate) enum Ask {
     ToggleBudgetWindow,
     ToggleBudgetWindowCumulative,
     ToggleBudgetWindowTables,
+    ToggleBudgetWindowIssues,
     /// A diagnostic override of the budget's specification; `None` back to
     /// the context's.
     BudgetSpec(Option<tuile_core::budget::SpecKind>),
@@ -138,6 +139,8 @@ pub(crate) struct State {
     pub budget_window_cumulative: bool,
     /// The budget window on its tables rather than its board.
     pub budget_window_tables: bool,
+    /// The budget window listing only the levels with an issue.
+    pub budget_window_issues: bool,
 }
 
 impl State {
@@ -158,6 +161,7 @@ impl State {
             budget_window: snapshot.budget_window,
             budget_window_cumulative: snapshot.budget_window_cumulative,
             budget_window_tables: snapshot.budget_window_tables,
+            budget_window_issues: snapshot.budget_window_issues,
         }
     }
 
@@ -196,6 +200,9 @@ impl Ask {
             ),
             Self::ToggleBudgetWindowTables => Command::BudgetWindow(
                 crate::steer::WindowAsk::Tables(!now.budget_window_tables),
+            ),
+            Self::ToggleBudgetWindowIssues => Command::BudgetWindow(
+                crate::steer::WindowAsk::Levels(!now.budget_window_issues),
             ),
             Self::BudgetSpec(kind) => Command::Budget(crate::steer::BudgetAsk {
                 kind,
@@ -260,6 +267,7 @@ impl Ask {
             Self::ToggleBudgetWindow => Some(now.budget_window),
             Self::ToggleBudgetWindowCumulative => Some(now.budget_window_cumulative),
             Self::ToggleBudgetWindowTables => Some(now.budget_window_tables),
+            Self::ToggleBudgetWindowIssues => Some(now.budget_window_issues),
             Self::BudgetSpec(kind) => Some(now.budget_spec == kind),
             Self::Diagnostic(view) => Some(now.diagnostic == view),
             Self::Imagery(layer) => Some(now.layer == layer),
@@ -412,6 +420,10 @@ pub(crate) fn layout(
             Ask::ToggleBudgetWindowCumulative,
         ),
         item("Budget Window: Tables", Ask::ToggleBudgetWindowTables),
+        item(
+            "Budget Window: Levels With an Issue",
+            Ask::ToggleBudgetWindowIssues,
+        ),
         item(
             "Budget Window: Sum From Now",
             Ask::Do(Command::BudgetWindow(crate::steer::WindowAsk::Reset)),
@@ -751,6 +763,7 @@ impl Default for State {
             budget_window: false,
             budget_window_cumulative: false,
             budget_window_tables: false,
+            budget_window_issues: false,
         }
     }
 }
@@ -901,6 +914,7 @@ mod tests {
             budget_window: false,
             budget_window_cumulative: false,
             budget_window_tables: false,
+            budget_window_issues: false,
         };
         let marked: Vec<String> = items(&layers)
             .into_iter()
@@ -1002,6 +1016,7 @@ mod tests {
             budget_window: false,
             budget_window_cumulative: false,
             budget_window_tables: false,
+            budget_window_issues: false,
         };
         for (ask, command) in [
             (Ask::ToggleWireframe, Command::Wireframe(true)),

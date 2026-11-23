@@ -37,9 +37,14 @@ struct Popup {
     window: web_sys::Window,
     canvas: web_sys::HtmlCanvasElement,
     context: web_sys::CanvasRenderingContext2d,
+    /// The wheel, the pointer and the keys, held for as long as the window.
+    _listeners: Vec<Closure<dyn FnMut(web_sys::Event)>>,
 }
 
 thread_local! {
+    /// What the person did in the window since the viewer last looked: the
+    /// desktop window's inputs, in device pixels.
+    static INPUTS: RefCell<Vec<tuile_ui::budget_board::BoardInput>> = const { RefCell::new(Vec::new()) };
     static POPUP: RefCell<Option<Popup>> = const { RefCell::new(None) };
     /// The page's `pagehide` handler, installed once.
     static HIDE: RefCell<Option<Closure<dyn FnMut()>>> = const { RefCell::new(None) };
@@ -121,10 +126,12 @@ fn dress(window: web_sys::Window) -> Option<Popup> {
         .ok()??
         .dyn_into::<web_sys::CanvasRenderingContext2d>()
         .ok()?;
+    let _listeners = listen(&window, &canvas);
     Some(Popup {
         window,
         canvas,
         context,
+        _listeners,
     })
 }
 
@@ -164,6 +171,107 @@ pub(crate) fn show(pixels: &[u8], size: (u32, u32)) {
             let _ = p.context.put_image_data(&image, 0.0, 0.0);
         }
     });
+}
+
+/// What the person did in the window since the last call.
+pub(crate) fn take_inputs() -> Vec<tuile_ui::budget_board::BoardInput> {
+    INPUTS.with(|i| std::mem::take(&mut *i.borrow_mut()))
+}
+
+/// The window's wheel, pointer and keys, as the desktop window's: device
+/// pixels, the same keys.
+fn listen(
+    window: &web_sys::Window,
+    canvas: &web_sys::HtmlCanvasElement,
+) -> Vec<Closure<dyn FnMut(web_sys::Event)>> {
+    use tuile_ui::budget_board::{BoardInput as In, BoardKey as K};
+    let push = |input: In| INPUTS.with(|i| i.borrow_mut().push(input));
+    let dpr = {
+        let window = window.clone();
+        move || window.device_pixel_ratio().max(1.0)
+    };
+    let mut out = Vec::new();
+    let mut on = |target: &web_sys::EventTarget, kind: &str, f: Box<dyn FnMut(web_sys::Event)>| {
+        let closure = Closure::<dyn FnMut(web_sys::Event)>::new(f);
+        let _ = target.add_event_listener_with_callback(kind, closure.as_ref().unchecked_ref());
+        out.push(closure);
+    };
+    let at = {
+        let dpr = dpr.clone();
+        move |e: &web_sys::MouseEvent| {
+            (
+                f64::from(e.offset_x()) * dpr(),
+                f64::from(e.offset_y()) * dpr(),
+            )
+        }
+    };
+    {
+        let dpr = dpr.clone();
+        on(
+            canvas,
+            "wheel",
+            Box::new(move |e: web_sys::Event| {
+                if let Some(w) = e.dyn_ref::<web_sys::WheelEvent>() {
+                    e.prevent_default();
+                    // Lines or pages, in pixels: a line is forty points.
+                    let k = match w.delta_mode() {
+                        1 => 40.0,
+                        2 => 400.0,
+                        _ => 1.0,
+                    };
+                    push(In::Wheel(w.delta_y() * k * dpr()));
+                }
+            }),
+        );
+    }
+    for (kind, pressed) in [
+        ("mousemove", None),
+        ("mousedown", Some(true)),
+        ("mouseup", Some(false)),
+    ] {
+        let at = at.clone();
+        on(
+            canvas,
+            kind,
+            Box::new(move |e: web_sys::Event| {
+                if let Some(m) = e.dyn_ref::<web_sys::MouseEvent>() {
+                    let (x, y) = at(m);
+                    push(match pressed {
+                        None => In::Pointer(x, y),
+                        Some(true) => In::Press(x, y),
+                        Some(false) => In::Release,
+                    });
+                }
+            }),
+        );
+    }
+    on(canvas, "mouseleave", Box::new(move |_| push(In::Leave)));
+    on(
+        window,
+        "keydown",
+        Box::new(move |e: web_sys::Event| {
+            let Some(k) = e.dyn_ref::<web_sys::KeyboardEvent>() else {
+                return;
+            };
+            let key = match k.key().as_str() {
+                "t" | "T" => K::Tables,
+                "c" | "C" => K::Cumulative,
+                "r" | "R" => K::Reset,
+                "i" | "I" => K::Issues,
+                "Tab" | "ArrowDown" => K::Next,
+                "ArrowUp" => K::Previous,
+                "Backspace" | "Delete" | "Escape" => K::Clear,
+                "PageDown" | " " => K::PageDown,
+                "PageUp" => K::PageUp,
+                "Home" => K::Top,
+                "End" => K::Bottom,
+                _ => return,
+            };
+            e.prevent_default();
+            push(In::Key(key));
+        }),
+    );
+    out
 }
 
 /// Closes the window, if it is open.

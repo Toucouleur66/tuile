@@ -32,6 +32,7 @@ mod state;
 pub mod stats;
 pub mod tier;
 pub mod tile_id;
+pub mod tiers;
 pub mod types;
 mod value;
 pub mod view;
@@ -55,6 +56,7 @@ pub use spec::{
     Anticipation, Band, Facts, Params, Predicate, RestoreCosts, Rule, SpecError, SpecKind, Specification,
     Speculation, Term,
 };
+pub use tiers::{ByLevel, DiskTiers};
 pub use stats::{
     layer_index, level_index, prefetch_index, BudgetStats, CancelReason, Deficit, EvictReason,
     LayerStats, LevelStats, LAYERS, LEVELS,

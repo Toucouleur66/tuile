@@ -110,6 +110,11 @@ impl TileLoader for Gated {
         self.inner.store_changes(since, asked, touched)
     }
 
+    /// A ledger, never a read, so never held.
+    fn stored(&self, out: &mut tuile_core::budget::DiskTiers) -> bool {
+        self.inner.stored(out)
+    }
+
     async fn warm_up(&self, through_level: u32) {
         self.gate.passed().await;
         self.inner.warm_up(through_level).await;

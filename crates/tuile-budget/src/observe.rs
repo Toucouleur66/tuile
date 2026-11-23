@@ -490,6 +490,11 @@ pub struct BudgetSignals {
     pub spec_overridden: bool,
     /// `spec_changes_total`: re-specifications recorded.
     pub spec_changes_total: u64,
+    /// What the session's local store holds, by class, layer and level —
+    /// the disk tier of `tuile_tier_*` ([`crate::tiers`]). Filled by the
+    /// session from its loader when it publishes; the meter leaves it
+    /// empty.
+    pub disk: crate::tiers::DiskTiers,
 }
 
 /// The closed label sets of spec §16.5.

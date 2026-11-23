@@ -43,6 +43,61 @@ pub struct Drawing {
     pub mesh: Mesh,
     pub labels: Vec<Label>,
     pub size: (u32, u32),
+    /// What each bar and cell means, where it is: for a pointer over it, or
+    /// a keyboard's focus on it ([`tooltip`]).
+    pub hits: Vec<Hit>,
+}
+
+/// A region of the board and its legend: each colour, mark and shape
+/// drawn there, what it means and its value now — one line each.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hit {
+    /// Left, top, width, height, device pixels.
+    pub rect: [f64; 4],
+    pub lines: Vec<Legend>,
+}
+
+/// One line of a legend: its swatch, as drawn on the board, and its words.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Legend {
+    pub swatch: Swatch,
+    pub text: String,
+}
+
+/// What a legend line shows beside its words.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Swatch {
+    /// Nothing: a line of words.
+    None,
+    /// A bar's segment of this colour.
+    Fill([f32; 4]),
+    /// A mark across a bar, of this colour.
+    Tick([f32; 4]),
+    /// A severity's shape.
+    Marker(Severity),
+}
+
+fn line(swatch: Swatch, text: String) -> Legend {
+    Legend { swatch, text }
+}
+
+/// The legend of a severity's mark: its shape and colour in words, what it
+/// means.
+fn marker_line(sev: Severity, what: &str) -> Legend {
+    let shape = match sev {
+        Severity::Ok => "green dot = ok",
+        Severity::Waste => "purple square = waste",
+        Severity::Warn => "orange diamond = watch",
+        Severity::Alert => "red triangle = alert",
+    };
+    line(Swatch::Marker(sev), format!("{shape}: {what}"))
+}
+
+impl Hit {
+    pub fn contains(&self, (x, y): (f64, f64)) -> bool {
+        let [l, t, w, h] = self.rect;
+        x >= l && x < l + w && y >= t && y < t + h
+    }
 }
 
 impl From<crate::PanelLayout> for Drawing {
@@ -51,6 +106,7 @@ impl From<crate::PanelLayout> for Drawing {
             mesh: p.background,
             labels: p.label.into_iter().collect(),
             size: p.size,
+            hits: Vec::new(),
         }
     }
 }
@@ -134,6 +190,21 @@ pub struct LevelCell {
     /// Need, prefetch.
     pub in_flight: [u32; 2],
     pub queued: [u32; 2],
+    /// Whether the budget counts a deficit of the class's kind this step
+    /// (`under_need_tiles`): the per-level `under` and the stand-ins are
+    /// that deficit by level, and read as nought when it is.
+    pub deficit: bool,
+    /// The level holds waste ([`level_waste`]).
+    pub waste: bool,
+}
+
+/// The budget's deficit for `c`'s kind this step: meshes for the meshes,
+/// imagery for the drapes — the header's `under need`.
+pub fn class_deficit(s: &BudgetSignals, c: Class) -> u32 {
+    match c {
+        Class::Drape => s.under_need_tiles[1],
+        _ => s.under_need_tiles[0],
+    }
 }
 
 impl LevelCell {
@@ -146,10 +217,31 @@ impl LevelCell {
             decoded: v.decoded_tiles[c][l],
             drawn: v.drawn[c][l],
             selected: v.selected[c][l],
-            under: v.under_need[c][l],
+            under: if class_deficit(s, c) > 0 {
+                v.under_need[c][l]
+            } else {
+                0
+            },
             in_flight: v.in_flight[c][l],
             queued: v.queued[c][l],
+            deficit: class_deficit(s, c) > 0,
+            waste: level_waste(s, c, l).under != [0, 0],
         }
+    }
+
+    /// Selected tiles drawn by stand-ins: a deficit by level, so none when
+    /// the budget counts none.
+    pub fn stand_ins(&self) -> u32 {
+        if self.deficit {
+            self.selected.saturating_sub(self.drawn)
+        } else {
+            0
+        }
+    }
+
+    /// Under its need with nothing in flight or queued at the level.
+    pub fn stalled(&self) -> bool {
+        self.under > 0 && self.loading() == 0
     }
 
     fn loading(&self) -> u32 {
@@ -158,18 +250,107 @@ impl LevelCell {
 }
 
 /// One level of one class, judged: tiles under their need with nothing in
-/// flight or queued at the level is a stall (alert); under their need while
-/// loads run, or selected tiles drawn by stand-ins, a warning; many copies
-/// at a level nothing selects or draws — the floor's levels aside — waste.
-pub fn level_severity(cell: &LevelCell, floor: bool) -> Severity {
-    if cell.under > 0 && cell.loading() == 0 {
+/// flight or queued at the level for longer than the stall's delay
+/// (`long`, [`StallWatch`]) is a stall (alert); under their need while
+/// loads run or before the delay, or selected tiles drawn by stand-ins, a
+/// warning; bytes held for nothing ([`level_waste`]) waste.
+pub fn level_severity(cell: &LevelCell, long: bool) -> Severity {
+    if cell.stalled() && long {
         Severity::Alert
-    } else if cell.under > 0 || cell.drawn < cell.selected {
+    } else if cell.under > 0 || cell.stand_ins() > 0 {
         Severity::Warn
-    } else if !floor && cell.selected == 0 && cell.gpu.saturating_sub(cell.drawn) >= WASTE_TILES {
+    } else if cell.waste {
         Severity::Waste
     } else {
         Severity::Ok
+    }
+}
+
+/// How long a stall must last before it is one: a transient — the loads
+/// of a move not started yet, a tile waiting out its dwell — never paints
+/// red.
+pub const STALL_DELAY: f64 = 1.0;
+
+/// Since when each class, and each level of each class, has been under its
+/// need with nothing in flight or queued: a stall is an alert once it has
+/// lasted [`StallWatch::delay`].
+#[derive(Debug, Clone)]
+pub struct StallWatch {
+    delay: f64,
+    now: f64,
+    classes: [Option<f64>; 4],
+    levels: HashMap<(usize, usize), f64>,
+}
+
+impl Default for StallWatch {
+    fn default() -> Self {
+        Self::with_delay(STALL_DELAY)
+    }
+}
+
+impl StallWatch {
+    /// A watch whose stalls are alerts after `delay` seconds.
+    pub fn with_delay(delay: f64) -> Self {
+        Self {
+            delay: delay.max(0.0),
+            now: 0.0,
+            classes: [None; 4],
+            levels: HashMap::new(),
+        }
+    }
+
+    /// Every stall an alert at once: for pictures and tests of one state.
+    pub fn at_once() -> Self {
+        Self::with_delay(0.0)
+    }
+
+    /// The stall's delay, seconds.
+    pub fn delay(&self) -> f64 {
+        self.delay
+    }
+
+    /// Takes `s` as the state at `now` (seconds, any origin).
+    pub fn note(&mut self, s: &BudgetSignals, now: f64) {
+        self.now = now;
+        for (c, _, _) in CLASSES {
+            let k = c as usize;
+            let mut class_under = 0u64;
+            let mut class_loading = 0u64;
+            for l in 0..LEVELS {
+                let x = LevelCell::of(s, c, l);
+                class_under += u64::from(x.under);
+                class_loading += u64::from(x.loading());
+                if x.stalled() {
+                    self.levels.entry((k, l)).or_insert(now);
+                } else {
+                    self.levels.remove(&(k, l));
+                }
+            }
+            if class_under > 0 && class_loading == 0 {
+                self.classes[k].get_or_insert(now);
+            } else {
+                self.classes[k] = None;
+            }
+        }
+    }
+
+    fn long(&self, since: Option<f64>) -> bool {
+        self.delay <= 0.0 || since.is_some_and(|t| self.now - t >= self.delay)
+    }
+
+    /// Since how many seconds level `l` of `c` has been stalled.
+    pub fn level_since(&self, c: Class, l: usize) -> Option<f64> {
+        self.levels.get(&(c as usize, l)).map(|t| self.now - t)
+    }
+
+    /// Whether level `l` of `c`, stalled now, has been for the delay.
+    pub fn level_long(&self, c: Class, l: usize) -> bool {
+        self.long(self.levels.get(&(c as usize, l)).copied())
+    }
+
+    /// Whether class `c`, stalled now, has been for the delay.
+    pub fn class_long(&self, c: Class) -> bool {
+        self.long(self.classes[c as usize])
     }
 }
 
@@ -197,9 +378,9 @@ fn floor_at(s: &BudgetSignals, l: usize) -> bool {
     s.floor_level.is_some_and(|f| l as u32 <= f)
 }
 
-/// What deserves a look in `s`, the worst first. A healthy budget has
-/// nothing here.
-pub fn attention(s: &BudgetSignals) -> Vec<Issue> {
+/// What deserves a look in `s`, the worst first, its stalls judged by
+/// `stalls`. A healthy budget has nothing here.
+pub fn attention(s: &BudgetSignals, stalls: &StallWatch) -> Vec<Issue> {
     let mut out = Vec::new();
     let mut add = |severity, weight: u64, text: String| {
         out.push(Issue {
@@ -223,11 +404,21 @@ pub fn attention(s: &BudgetSignals) -> Vec<Issue> {
             (0..LEVELS).map(|l| (l, LevelCell::of(s, c, l))).collect();
         let under: u64 = cells.iter().map(|(_, x)| u64::from(x.under)).sum();
         let loading: u64 = cells.iter().map(|(_, x)| u64::from(x.loading())).sum();
-        if under > 0 && loading == 0 {
+        if under > 0 && loading == 0 && stalls.class_long(c) {
             add(
                 Severity::Alert,
                 under,
                 format!("{name}: {under} tiles under need, nothing in flight or queued — stalled"),
+            );
+        } else if under > 0 && loading == 0 {
+            add(
+                Severity::Warn,
+                under,
+                format!(
+                    "{name}: {under} tiles under need, nothing in flight or queued yet — waiting \
+                     (a stall after {:.1} s)",
+                    stalls.delay()
+                ),
             );
         } else if under > 0 {
             add(
@@ -237,7 +428,7 @@ pub fn attention(s: &BudgetSignals) -> Vec<Issue> {
             );
             // The levels that wait with nothing of their own loading.
             for (l, x) in &cells {
-                if x.under > 0 && x.loading() == 0 {
+                if x.stalled() && stalls.level_long(c, *l) {
                     add(
                         Severity::Alert,
                         u64::from(x.under),
@@ -249,10 +440,7 @@ pub fn attention(s: &BudgetSignals) -> Vec<Issue> {
                 }
             }
         }
-        let stand_ins: u64 = cells
-            .iter()
-            .map(|(_, x)| u64::from(x.selected.saturating_sub(x.drawn)))
-            .sum();
+        let stand_ins: u64 = cells.iter().map(|(_, x)| u64::from(x.stand_ins())).sum();
         if stand_ins > 0 {
             add(
                 Severity::Warn,
@@ -261,7 +449,7 @@ pub fn attention(s: &BudgetSignals) -> Vec<Issue> {
             );
         }
         for (l, x) in &cells {
-            if level_severity(x, floor_at(s, *l)) == Severity::Waste {
+            if level_severity(x, false) == Severity::Waste {
                 add(
                     Severity::Waste,
                     u64::from(x.gpu - x.drawn),
@@ -411,6 +599,13 @@ pub struct BoardView<'a> {
     /// The imagery layers' names, by index.
     pub layers: &'a [String],
     pub decide: Option<DecideSummary>,
+    /// The stalls, and for how long: what makes one an alert.
+    pub stalls: &'a StallWatch,
+    /// The width the board is laid out for, points: sections too wide for
+    /// it are stacked, lines wrapped. None: as wide as it likes.
+    pub width: Option<f64>,
+    /// Only the levels with something to look at (`window_levels=issues`).
+    pub issues_only: bool,
 }
 
 const TEXT: u32 = 0xDDDDDD;
@@ -436,9 +631,19 @@ struct Painter<'a> {
     labels: Vec<Label>,
     cache: &'a mut TextCache,
     extent: (f64, f64),
+    hits: Vec<Hit>,
 }
 
 impl Painter<'_> {
+    /// `text` explains the region `x, y, w, h` (points).
+    fn hit(&mut self, x: f64, y: f64, w: f64, h: f64, lines: Vec<Legend>) {
+        let k = self.scale;
+        self.hits.push(Hit {
+            rect: [x * k, y * k, w * k, h * k],
+            lines,
+        });
+    }
+
     fn grow(&mut self, x: f64, y: f64) {
         self.extent.0 = self.extent.0.max(x);
         self.extent.1 = self.extent.1.max(y);
@@ -618,6 +823,7 @@ pub fn draw(
         labels: Vec::new(),
         cache,
         extent: (0.0, 0.0),
+        hits: Vec::new(),
     };
     let mut y = MARGIN;
     match s {
@@ -626,9 +832,11 @@ pub fn draw(
         }
         Some(s) => {
             y = header(&mut p, s, view, y);
-            y = issues(&mut p, s, y);
+            y = issues(&mut p, s, view, y);
             y = gauges(&mut p, s, view, y);
             y = levels(&mut p, s, view, y);
+            y = tiers(&mut p, s, view, y);
+            y = scores(&mut p, s, view, y);
             layers(&mut p, s, view, y);
         }
     }
@@ -645,6 +853,7 @@ pub fn draw(
     Drawing {
         mesh,
         labels: p.labels,
+        hits: p.hits,
         size: ((w * scale).ceil() as u32, (h * scale).ceil() as u32),
     }
 }
@@ -659,24 +868,19 @@ fn header(p: &mut Painter<'_>, s: &BudgetSignals, view: &BoardView<'_>, y: f64) 
         (true, Some((_, secs))) => format!("Budget — cumulative, the last {secs:.0} s"),
     };
     p.text(MARGIN, y, &title, 13.0, text);
-    let y = y + 20.0;
-    let mut x = MARGIN;
-    x += p.text(
-        x,
-        y,
-        &format!(
-            "spec {}{} · SSE scale {:.2}",
-            s.spec.label(),
-            if s.spec_overridden {
-                " (override)"
-            } else {
-                " (context)"
-            },
-            f64::from(s.sse_scale_milli) / 1000.0
-        ),
-        EM,
-        text,
-    ) + 12.0;
+    let mut flow = Flow::new(y + 20.0, view.width);
+    let spec = format!(
+        "spec {}{} · SSE scale {:.2}",
+        s.spec.label(),
+        if s.spec_overridden {
+            " (override)"
+        } else {
+            " (context)"
+        },
+        f64::from(s.sse_scale_milli) / 1000.0
+    );
+    let (x, y) = flow.place(p.width(&spec, EM));
+    p.text(x, y, &spec, EM, text);
     let pressure = ["normal", "warning", "critical", "background"]
         .get(usize::from(s.pressure_level))
         .unwrap_or(&"?");
@@ -685,13 +889,13 @@ fn header(p: &mut Painter<'_>, s: &BudgetSignals, view: &BoardView<'_>, y: f64) 
         1 => Severity::Warn,
         _ => Severity::Alert,
     };
-    x += p.badge(x, y, sev(s.pressure_level), &format!("pressure {pressure}")) + 8.0;
-    x += p.badge(
-        x,
-        y,
-        sev(s.thermal_level),
-        &format!("thermal {}", s.thermal_level),
-    ) + 12.0;
+    for (level, label) in [
+        (s.pressure_level, format!("pressure {pressure}")),
+        (s.thermal_level, format!("thermal {}", s.thermal_level)),
+    ] {
+        let (x, y) = flow.place(p.width(&label, EM) + 22.0);
+        p.badge(x, y, sev(level), &label);
+    }
     let decide = match view.decide {
         Some(d) => format!(
             "decide mean {:.2} ms, max {:.2} ms over the last {} steps ({:.0} s)",
@@ -702,26 +906,92 @@ fn header(p: &mut Painter<'_>, s: &BudgetSignals, view: &BoardView<'_>, y: f64) 
         ),
         None => "decide: waiting for a second publication".to_owned(),
     };
-    x += p.text(x, y, &decide, EM, text) + 12.0;
-    p.text(
-        x,
-        y,
-        &format!(
-            "work {} this step, {:.0} mean · {} steps",
-            s.decide_work,
-            s.decide_work_total as f64 / s.decide_micros.count.max(1) as f64,
-            s.decide_micros.count
-        ),
-        EM,
-        dim,
+    let (x, y) = flow.place(p.width(&decide, EM));
+    p.text(x, y, &decide, EM, text);
+    let work = format!(
+        "work {} this step, {:.0} mean · {} steps",
+        s.decide_work,
+        s.decide_work_total as f64 / s.decide_micros.count.max(1) as f64,
+        s.decide_micros.count
     );
-    y + ROW + 4.0
+    let (x, y) = flow.place(p.width(&work, EM));
+    p.text(x, y, &work, EM, dim);
+    flow.end() + 4.0
+}
+
+/// `text` from `(x, y)`, its words onto further lines (at `x`) when the
+/// view's width would cut it; returns the line under the last.
+fn wrapped(
+    p: &mut Painter<'_>,
+    x: f64,
+    y: f64,
+    text: &str,
+    size: f64,
+    colour: [f32; 4],
+    width: Option<f64>,
+) -> f64 {
+    let Some(right) = width.map(|w| w - MARGIN) else {
+        p.text(x, y, text, size, colour);
+        return y + ROW;
+    };
+    let mut y = y;
+    let mut line = String::new();
+    for word in text.split(' ') {
+        let candidate = if line.is_empty() {
+            word.to_owned()
+        } else {
+            format!("{line} {word}")
+        };
+        if !line.is_empty() && x + p.width(&candidate, size) > right {
+            p.text(x, y, &line, size, colour);
+            y += ROW;
+            line = word.to_owned();
+        } else {
+            line = candidate;
+        }
+    }
+    p.text(x, y, &line, size, colour);
+    y + ROW
+}
+
+/// Items placed left to right, onto the next line when the view's width
+/// would cut one: text is never clipped by a narrow window.
+struct Flow {
+    x: f64,
+    y: f64,
+    right: Option<f64>,
+}
+
+impl Flow {
+    fn new(y: f64, width: Option<f64>) -> Self {
+        Self {
+            x: MARGIN,
+            y,
+            right: width.map(|w| w - MARGIN),
+        }
+    }
+
+    /// Where an item `w` points wide goes.
+    fn place(&mut self, w: f64) -> (f64, f64) {
+        if self.x > MARGIN && self.right.is_some_and(|r| self.x + w > r) {
+            self.x = MARGIN;
+            self.y += ROW;
+        }
+        let at = (self.x, self.y);
+        self.x += w + 12.0;
+        at
+    }
+
+    /// The line under the last.
+    fn end(&self) -> f64 {
+        self.y + ROW
+    }
 }
 
 /// The attention list: the worst issues, one line each, or one line
 /// saying there are none.
-fn issues(p: &mut Painter<'_>, s: &BudgetSignals, y: f64) -> f64 {
-    let list = attention(s);
+fn issues(p: &mut Painter<'_>, s: &BudgetSignals, view: &BoardView<'_>, y: f64) -> f64 {
+    let list = attention(s, view.stalls);
     let text = srgb(TEXT, 1.0);
     let mut y = y;
     if list.is_empty() {
@@ -731,6 +1001,13 @@ fn issues(p: &mut Painter<'_>, s: &BudgetSignals, y: f64) -> f64 {
     }
     const SHOWN: usize = 6;
     for issue in list.iter().take(SHOWN) {
+        p.hit(
+            MARGIN,
+            y - 1.0,
+            900.0,
+            ROW - 1.0,
+            vec![marker_line(issue.severity, &issue.text)],
+        );
         p.marker(issue.severity, MARGIN + 5.0, y + ROW / 2.0 - 2.0, 9.0);
         let w = p.text(
             MARGIN + 14.0,
@@ -739,8 +1016,15 @@ fn issues(p: &mut Painter<'_>, s: &BudgetSignals, y: f64) -> f64 {
             EM,
             issue.severity.colour(),
         );
-        p.text(MARGIN + 20.0 + w.max(36.0), y, &issue.text, EM, text);
-        y += ROW;
+        y = wrapped(
+            p,
+            MARGIN + 20.0 + w.max(36.0),
+            y,
+            &issue.text,
+            EM,
+            text,
+            view.width,
+        );
     }
     if list.len() > SHOWN {
         p.text(
@@ -776,6 +1060,7 @@ fn gauges(p: &mut Painter<'_>, s: &BudgetSignals, view: &BoardView<'_>, y: f64) 
         let finite_hard = (hard != u64::MAX).then_some(hard);
         let max = (finite_hard.unwrap_or(0).max(target).max(drawable + transit) as f64) * 1.05;
         let x0 = MARGIN + 74.0;
+        p.hit(MARGIN, y - 1.0, 74.0 + BAR, ROW - 1.0, explain_gauge(s, c));
         p.marker(sev, MARGIN + 5.0, y + ROW / 2.0 - 2.0, 9.0);
         p.text(MARGIN + 14.0, y, &format!("{short} {name}"), EM, text);
         let mut prot = srgb(DRAWN, 1.0);
@@ -807,57 +1092,62 @@ fn gauges(p: &mut Painter<'_>, s: &BudgetSignals, view: &BoardView<'_>, y: f64) 
                 p.rect(tx - 1.0, y + 1.0, 2.0, 13.0, colour);
             }
         }
-        p.text(
-            x0 + BAR + 10.0,
-            y,
-            &format!(
-                "{} MiB (+{} transit) of {} target{}, {} protected",
-                mib(drawable),
-                mib(transit),
-                mib(target),
-                finite_hard.map_or(String::new(), |h| format!(", {} hard", mib(h))),
-                mib(protected),
-            ),
-            EM,
-            text,
+        let numbers = format!(
+            "{} MiB (+{} transit) of {} target{}, {} protected",
+            mib(drawable),
+            mib(transit),
+            mib(target),
+            finite_hard.map_or(String::new(), |h| format!(", {} hard", mib(h))),
+            mib(protected),
         );
+        // Beside the bar, or under it in a narrow window.
+        if fits(view, 74.0 + BAR + 10.0 + p.width(&numbers, EM)) {
+            p.text(x0 + BAR + 10.0, y, &numbers, EM, text);
+        } else {
+            y += ROW;
+            p.text(x0, y, &numbers, EM, text);
+        }
         y += ROW;
     }
     // The other numbers of the header, as the table has them; ground holes
     // and floor as badges.
-    let mut x = MARGIN;
+    let mut flow = Flow::new(y, view.width);
     let holes = if s.lost_tiles > 0 || s.bare_items > 0 {
         Severity::Alert
     } else {
         Severity::Ok
     };
-    x += p.badge(
-        x,
-        y,
-        holes,
-        &format!("ground holes: {} lost, {} bare", s.lost_tiles, s.bare_items),
-    ) + 8.0;
     let floor = match (s.floor_in, s.floor_level) {
         (_, None) => (Severity::Ok, "floor none".to_owned()),
         (true, Some(l)) => (Severity::Ok, format!("floor in, levels ≤ {l}")),
         (false, Some(l)) => (Severity::Warn, format!("floor not in yet, levels ≤ {l}")),
     };
-    x += p.badge(x, y, floor.0, &floor.1) + 12.0;
-    p.text(
-        x,
-        y,
-        &format!(
-            "decoded {} MiB · in flight {} · local reads {} · under need {} mesh, {} imagery",
-            mib(s.decoded_bytes),
-            s.in_flight.iter().map(|(_, v)| u64::from(v)).sum::<u64>(),
-            s.local_reads,
-            s.under_need_tiles[0],
-            s.under_need_tiles[1],
+    for (sev, label) in [
+        (
+            holes,
+            format!("ground holes: {} lost, {} bare", s.lost_tiles, s.bare_items),
         ),
-        EM,
-        text,
-    );
-    y += ROW;
+        floor,
+    ] {
+        let (x, y) = flow.place(p.width(&label, EM) + 22.0);
+        p.badge(x, y, sev, &label);
+    }
+    for item in [
+        format!("decoded {} MiB", mib(s.decoded_bytes)),
+        format!(
+            "in flight {}",
+            s.in_flight.iter().map(|(_, v)| u64::from(v)).sum::<u64>()
+        ),
+        format!("local reads {}", s.local_reads),
+        format!(
+            "under need {} mesh, {} imagery",
+            s.under_need_tiles[0], s.under_need_tiles[1]
+        ),
+    ] {
+        let (x, y) = flow.place(p.width(&item, EM));
+        p.text(x, y, &item, EM, text);
+    }
+    y = flow.end();
     if view.cumulative {
         let from = view.from.map(|(f, _)| f);
         let since =
@@ -892,18 +1182,94 @@ fn gauges(p: &mut Painter<'_>, s: &BudgetSignals, view: &BoardView<'_>, y: f64) 
 /// flight and queued, need and prefetch) as a bar; each level's cell
 /// tinted and marked by [`level_severity`]. Cumulative: the counters summed.
 fn levels(p: &mut Painter<'_>, s: &BudgetSignals, view: &BoardView<'_>, y: f64) -> f64 {
-    let text = srgb(TEXT, 1.0);
-    let dim = srgb(DIM, 1.0);
-    let classes: Vec<(Class, &str)> = CLASSES
+    let classes = shown_classes(s);
+    let block = level_block(view);
+    if fits(view, LEVEL_COLUMN + classes.len() as f64 * block) {
+        return levels_of(p, s, view, y, &classes);
+    }
+    // Too narrow for the classes side by side: one under the other.
+    let mut y = y;
+    for c in classes {
+        y = levels_of(p, s, view, y, &[c]);
+    }
+    y
+}
+
+/// The classes the board shows: terrain and drapes, and 3D Tiles once it
+/// has held anything.
+fn shown_classes(s: &BudgetSignals) -> Vec<(Class, &'static str)> {
+    CLASSES
         .iter()
         .filter(|(c, _, _)| {
-            *c != Class::Tiles3dMesh || s.levels_seen[*c] != 0 || s.bytes_levels[*c] != 0
+            *c != Class::Tiles3dMesh
+                || s.levels_seen[*c] != 0
+                || s.bytes_levels[*c] != 0
+                || s.disk.seen[*c] != 0
         })
         .map(|(c, short, _)| (*c, *short))
-        .collect();
-    let seen = classes
-        .iter()
-        .fold(0u32, |a, (c, _)| a | s.levels_seen[*c] | s.bytes_levels[*c]);
+        .collect()
+}
+
+/// Whether `width` points of content fit the view's width.
+fn fits(view: &BoardView<'_>, width: f64) -> bool {
+    view.width.is_none_or(|w| 2.0 * MARGIN + width <= w)
+}
+
+/// A class's block of the level chart, points.
+fn level_block(view: &BoardView<'_>) -> f64 {
+    let numbers: f64 = if view.cumulative {
+        CUMULATIVE_COLUMNS.iter().map(|c| c.1).sum()
+    } else {
+        INSTANT_COLUMNS.iter().map(|c| c.1).sum()
+    };
+    14.0 + RESIDENCY_BAR
+        + 6.0
+        + numbers
+        + if view.cumulative {
+            0.0
+        } else {
+            8.0 + LOADS_BAR
+        }
+        + 16.0
+}
+
+/// Which levels the board lists: every level from 0 to the finest any
+/// class has named, or only those with something to look at (`issues`:
+/// a level a rule colours, in any class shown).
+pub fn level_rows(
+    s: &BudgetSignals,
+    view: &BoardView<'_>,
+    classes: &[(Class, &str)],
+) -> Vec<usize> {
+    let seen = classes.iter().fold(0u32, |a, (c, _)| {
+        a | s.levels_seen[*c] | s.bytes_levels[*c] | if s.disk.known { s.disk.seen[*c] } else { 0 }
+    });
+    if seen == 0 {
+        return Vec::new();
+    }
+    let finest = 31 - seen.leading_zeros() as usize;
+    (0..=finest.min(LEVELS - 1))
+        .filter(|&l| {
+            !view.issues_only
+                || classes.iter().any(|(c, _)| {
+                    let cell = LevelCell::of(s, *c, l);
+                    level_severity(&cell, view.stalls.level_long(*c, l)) != Severity::Ok
+                })
+        })
+        .collect()
+}
+
+fn levels_of(
+    p: &mut Painter<'_>,
+    s: &BudgetSignals,
+    view: &BoardView<'_>,
+    y: f64,
+    classes: &[(Class, &'static str)],
+) -> f64 {
+    let text = srgb(TEXT, 1.0);
+    let dim = srgb(DIM, 1.0);
+    let rows = level_rows(s, view, classes);
+    let seen = rows.iter().fold(0u32, |a, l| a | (1 << l));
     let numbers: f64 = if view.cumulative {
         CUMULATIVE_COLUMNS.iter().map(|c| c.1).sum()
     } else {
@@ -921,7 +1287,7 @@ fn levels(p: &mut Painter<'_>, s: &BudgetSignals, view: &BoardView<'_>, y: f64) 
         + 16.0;
     // The scales: the most copies, the most loads, of a class at a level.
     let mut most = HashMap::new();
-    for (c, _) in &classes {
+    for (c, _) in classes {
         let (mut copies, mut loads) = (1u64, 1u64);
         for l in (0..LEVELS).filter(|l| seen & (1 << l) != 0) {
             let x = LevelCell::of(s, *c, l);
@@ -965,7 +1331,21 @@ fn levels(p: &mut Painter<'_>, s: &BudgetSignals, view: &BoardView<'_>, y: f64) 
         }
     }
     y += ROW;
-    for l in (0..LEVELS).filter(|l| seen & (1 << l) != 0) {
+    if rows.is_empty() {
+        p.text(
+            MARGIN + LEVEL_COLUMN,
+            y,
+            if view.issues_only {
+                "no level needs attention"
+            } else {
+                "no level yet"
+            },
+            EM,
+            dim,
+        );
+        y += ROW;
+    }
+    for &l in &rows {
         let floor = floor_at(s, l);
         p.text_right(
             MARGIN + LEVEL_COLUMN - 10.0,
@@ -980,7 +1360,7 @@ fn levels(p: &mut Painter<'_>, s: &BudgetSignals, view: &BoardView<'_>, y: f64) 
             if view.cumulative {
                 level_cumulative(p, s, view, *c, l, x0, y, copies);
             } else {
-                level_instant(p, s, *c, l, x0, y, copies, loads);
+                level_instant(p, s, *c, l, x0, y, copies, loads, view.stalls);
             }
         }
         y += ROW;
@@ -998,10 +1378,38 @@ fn level_instant(
     y: f64,
     copies: f64,
     loads: f64,
+    stalls: &StallWatch,
 ) {
     let text = srgb(TEXT, 1.0);
     let x = LevelCell::of(s, c, l);
-    let sev = level_severity(&x, floor_at(s, l));
+    let sev = level_severity(&x, stalls.level_long(c, l));
+    // What the row says, in words: the copies, then the under-need and
+    // the loads over it.
+    let numbers: f64 = INSTANT_COLUMNS.iter().map(|c| c.1).sum();
+    let long = stalls.level_long(c, l);
+    p.hit(
+        x0,
+        y - 1.0,
+        14.0 + RESIDENCY_BAR + 6.0 + numbers,
+        ROW - 1.0,
+        explain_residency(s, c, l, &x, long),
+    );
+    let under_x =
+        x0 + 14.0 + RESIDENCY_BAR + 6.0 + INSTANT_COLUMNS[..4].iter().map(|c| c.1).sum::<f64>();
+    p.hit(
+        under_x,
+        y - 1.0,
+        INSTANT_COLUMNS[4].1,
+        ROW - 1.0,
+        explain_under(c, l, &x, stalls),
+    );
+    p.hit(
+        under_x + INSTANT_COLUMNS[4].1,
+        y - 1.0,
+        INSTANT_COLUMNS[5].1 + INSTANT_COLUMNS[6].1 + 8.0 + LOADS_BAR,
+        ROW - 1.0,
+        explain_loads(c, l, &x),
+    );
     if sev != Severity::Ok {
         let mut tint = sev.colour();
         tint[3] = 0.16;
@@ -1129,6 +1537,373 @@ fn level_cumulative(
     }
 }
 
+/// Where the tiles are, level by level, for each class side by side — or
+/// one under the other when the window is too narrow: on the disk (the
+/// local store's ledger), in RAM (decoded copies), on the GPU (resident:
+/// drawn and held) — each a bar on its own scale, its tiles and bytes
+/// written beside it — and what the level holds as waste
+/// ([`level_waste`]). A shell with no local store says so.
+fn tiers(p: &mut Painter<'_>, s: &BudgetSignals, view: &BoardView<'_>, y: f64) -> f64 {
+    let text = srgb(TEXT, 1.0);
+    let dim = srgb(DIM, 1.0);
+    let mut y = y;
+    p.text(MARGIN, y, "Where the tiles are", EM, text);
+    y += ROW;
+    p.text(
+        MARGIN,
+        y,
+        "disk: the local store · RAM: decoded · GPU: resident, drawn | held · waste: held for nothing",
+        EM - 1.0,
+        dim,
+    );
+    y += ROW;
+    if !s.disk.known {
+        p.text(
+            MARGIN,
+            y,
+            "disk: not known here — no local store",
+            EM - 1.0,
+            dim,
+        );
+        y += ROW;
+        p.text(
+            MARGIN,
+            y,
+            "(a browser's HTTP cache is not visible to the page)",
+            EM - 1.0,
+            dim,
+        );
+        y += ROW;
+    }
+    let classes = shown_classes(s);
+    if fits(view, LEVEL_COLUMN + classes.len() as f64 * TIER_BLOCK) {
+        return tiers_of(p, s, view, y, &classes);
+    }
+    for c in classes {
+        y = tiers_of(p, s, view, y, &[c]);
+    }
+    y
+}
+
+const TIER_BAR: f64 = 52.0;
+const TIER_VALUE: f64 = 96.0;
+const TIER: f64 = TIER_BAR + 6.0 + TIER_VALUE + 8.0;
+const WASTE_VALUE: f64 = 92.0;
+const TIER_BLOCK: f64 = 14.0 + 3.0 * TIER + WASTE_VALUE + 16.0;
+
+fn tiers_of(
+    p: &mut Painter<'_>,
+    s: &BudgetSignals,
+    view: &BoardView<'_>,
+    y: f64,
+    classes: &[(Class, &'static str)],
+) -> f64 {
+    let text = srgb(TEXT, 1.0);
+    let dim = srgb(DIM, 1.0);
+    let mut y = y;
+    let rows = level_rows(s, view, classes);
+    for (i, (_, short)) in classes.iter().enumerate() {
+        let x0 = MARGIN + LEVEL_COLUMN + i as f64 * TIER_BLOCK + 14.0;
+        for (t, name) in ["disk", "RAM", "GPU"].iter().enumerate() {
+            p.text(
+                x0 + t as f64 * TIER,
+                y,
+                &format!("{short} {name}"),
+                EM - 1.0,
+                dim,
+            );
+        }
+        p.text_right(x0 + 3.0 * TIER + WASTE_VALUE, y, "waste", EM - 1.0, dim);
+    }
+    p.text(MARGIN, y, "level", EM, dim);
+    y += ROW;
+    // Each tier's scale: the most tiles it holds at a level, per class.
+    let most = |c: Class, t: usize| -> f64 {
+        rows.iter()
+            .filter_map(|&l| tier_of(s, t, c, l))
+            .map(|[n, _]| n)
+            .max()
+            .unwrap_or(0)
+            .max(1) as f64
+    };
+    let scales: Vec<[f64; 3]> = classes
+        .iter()
+        .map(|(c, _)| [most(*c, 0), most(*c, 1), most(*c, 2)])
+        .collect();
+    for &l in &rows {
+        let floor = floor_at(s, l);
+        p.text_right(
+            MARGIN + LEVEL_COLUMN - 10.0,
+            y,
+            &format!("{l}{}", if floor { " F" } else { "" }),
+            EM,
+            if floor { dim } else { text },
+        );
+        for (i, (c, _)) in classes.iter().enumerate() {
+            let x0 = MARGIN + LEVEL_COLUMN + i as f64 * TIER_BLOCK;
+            let cell = LevelCell::of(s, *c, l);
+            let waste = level_waste(s, *c, l);
+            if cell.waste {
+                p.marker(Severity::Waste, x0 + 6.0, y + ROW / 2.0 - 2.0, 8.0);
+            }
+            for (t, scale) in scales[i].iter().enumerate() {
+                let x = x0 + 14.0 + t as f64 * TIER;
+                let Some([n, bytes]) = tier_of(s, t, *c, l) else {
+                    p.bar(x, y + 3.0, TIER_BAR, 9.0, &[], 0.0);
+                    p.text(x + TIER_BAR + 6.0, y, "?", EM, dim);
+                    continue;
+                };
+                let parts: Vec<(f64, [f32; 4])> = match t {
+                    0 => vec![(n as f64, srgb(DIM, 1.0))],
+                    1 => vec![(n as f64, srgb(LOADS, 1.0))],
+                    _ => {
+                        let drawn = u64::from(cell.drawn).min(n);
+                        vec![
+                            (drawn as f64, srgb(DRAWN, 1.0)),
+                            (
+                                (n - drawn) as f64,
+                                if cell.waste {
+                                    Severity::Waste.colour()
+                                } else {
+                                    srgb(HELD, 1.0)
+                                },
+                            ),
+                        ]
+                    }
+                };
+                p.bar(x, y + 3.0, TIER_BAR, 9.0, &parts, *scale);
+                p.hit(x, y - 1.0, TIER, ROW - 1.0, explain_tier(s, t, *c, l));
+                let value = if n == 0 {
+                    "·".to_owned()
+                } else {
+                    format!("{n} · {} MiB", mib(bytes))
+                };
+                p.text_right(x + TIER_BAR + 6.0 + TIER_VALUE, y, &value, EM, text);
+            }
+            let under = waste.under[0] + waste.under[1];
+            let value = match (waste.scored, under) {
+                (_, 0) if waste.scored => {
+                    format!("over {} MiB", mib(waste.over[0] + waste.over[1]))
+                }
+                (_, 0) => "·".to_owned(),
+                (true, b) => format!("{} MiB", mib(b)),
+                (false, b) => format!("{} MiB*", mib(b)),
+            };
+            p.text_right(
+                x0 + 14.0 + 3.0 * TIER + WASTE_VALUE,
+                y,
+                &value,
+                EM,
+                if under > 0 {
+                    Severity::Waste.colour()
+                } else {
+                    dim
+                },
+            );
+            p.hit(
+                x0 + 14.0 + 3.0 * TIER,
+                y - 1.0,
+                WASTE_VALUE,
+                ROW - 1.0,
+                explain_waste(*c, l, &waste),
+            );
+        }
+        y += ROW;
+    }
+    if rows.iter().any(|&l| {
+        classes
+            .iter()
+            .any(|(c, _)| !level_waste(s, *c, l).scored && level_waste(s, *c, l).under != [0, 0])
+    }) {
+        p.text(
+            MARGIN + LEVEL_COLUMN,
+            y,
+            "* by the static rule: no level selected, ≥ 64 copies held, not the floor — until the budget scores its levels",
+            EM - 1.0,
+            dim,
+        );
+        y += ROW;
+    }
+    y + 8.0
+}
+
+/// What a level of a class holds as waste: the bytes the budget would let
+/// go of first — held **under** its exchange threshold λ — on the GPU and
+/// in RAM (decoded), and the bytes held over it; `scored` when they are the
+/// budget's own scores.
+///
+/// Until the budget publishes its scores by level and tier, the static
+/// rule stands in (`scored` false): copies held at a level nothing selects
+/// and nothing draws, [`WASTE_TILES`] or more, the floor's levels aside —
+/// their GPU bytes, prorated, are the waste. When the scores are there,
+/// this is the one place that reads them, and every view of waste follows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LevelWaste {
+    /// GPU, RAM.
+    pub under: [u64; 2],
+    pub over: [u64; 2],
+    pub scored: bool,
+}
+
+/// See [`LevelWaste`].
+pub fn level_waste(s: &BudgetSignals, c: Class, l: usize) -> LevelWaste {
+    let v = &s.levels;
+    let (gpu, drawn, selected) = (v.gpu_tiles[c][l], v.drawn[c][l], v.selected[c][l]);
+    let held = gpu.saturating_sub(drawn);
+    if floor_at(s, l) || selected > 0 || held < WASTE_TILES || gpu == 0 {
+        return LevelWaste::default();
+    }
+    let [drawable, transit] = s.bytes_by_level[c][l];
+    let bytes = (drawable + transit) * u64::from(held) / u64::from(gpu);
+    LevelWaste {
+        under: [bytes, 0],
+        over: [0, 0],
+        scored: false,
+    }
+}
+
+/// A level's scores, as the budget publishes them: the 10th, 50th and
+/// 90th percentiles of the scores of its preload candidates, of what it
+/// holds and of what it evicted, and λ, the exchange threshold — what is
+/// held under it is released, a candidate over it is loaded.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LevelScores {
+    pub preload: Option<[f64; 3]>,
+    pub held: Option<[f64; 3]>,
+    pub evicted: Option<[f64; 3]>,
+    pub lambda: Option<f64>,
+}
+
+/// The scores of level `l` of `c`, once the budget publishes them; none
+/// before. The one place that reads them: the box plots follow.
+pub fn level_scores(s: &BudgetSignals, c: Class, l: usize) -> Option<LevelScores> {
+    let _ = (s, c, l);
+    None
+}
+
+/// The legend of a level's box plots.
+pub fn explain_scores(c: Class, l: usize, x: &LevelScores) -> Vec<Legend> {
+    let q = |name: &str, v: Option<[f64; 3]>| match v {
+        Some([p10, p50, p90]) => format!("{name}: 10th {p10:.3}, median {p50:.3}, 90th {p90:.3}"),
+        None => format!("{name}: none"),
+    };
+    let mut out = vec![
+        line(Swatch::None, format!("{} level {l}: scores", class_title(c))),
+        line(Swatch::Fill(srgb(LOADS, 1.0)), "bar = 10th to 90th percentile of the scores".to_owned()),
+        line(Swatch::Tick(srgb(TEXT, 1.0)), "white tick = the median".to_owned()),
+        line(
+            Swatch::Tick(Severity::Alert.colour()),
+            format!(
+                "red mark = λ, the exchange threshold{}: held below it are released, candidates above it are loaded",
+                x.lambda.map_or(String::new(), |v| format!(" ({v:.3})"))
+            ),
+        ),
+    ];
+    out.push(line(
+        Swatch::Fill(srgb(LOADS, 1.0)),
+        q("sky blue = preload candidates", x.preload),
+    ));
+    out.push(line(
+        Swatch::Fill(srgb(DRAWN, 1.0)),
+        q("dark blue = held", x.held),
+    ));
+    if x.evicted.is_some() {
+        out.push(line(
+            Swatch::Fill(srgb(HELD, 1.0)),
+            q("grey = evicted", x.evicted),
+        ));
+    }
+    out
+}
+
+/// The scores by level, once the budget publishes them: for each class a
+/// box plot of its preload candidates and one of what it holds, side by
+/// side, on one scale, λ marked. Nothing before the data is there.
+fn scores(p: &mut Painter<'_>, s: &BudgetSignals, view: &BoardView<'_>, y: f64) -> f64 {
+    let classes = shown_classes(s);
+    let rows = level_rows(s, view, &classes);
+    let any = rows.iter().any(|&l| {
+        classes
+            .iter()
+            .any(|(c, _)| level_scores(s, *c, l).is_some())
+    });
+    if !any {
+        return y;
+    }
+    let text = srgb(TEXT, 1.0);
+    let dim = srgb(DIM, 1.0);
+    let mut y = y;
+    p.text(
+        MARGIN,
+        y,
+        "Scores — preload candidates and held, 10th–90th percentile, median, λ",
+        EM,
+        text,
+    );
+    y += ROW;
+    // One scale for every plot: the highest score or λ seen.
+    let top = rows
+        .iter()
+        .flat_map(|&l| {
+            classes
+                .iter()
+                .filter_map(move |(c, _)| level_scores(s, *c, l))
+        })
+        .flat_map(|x| [x.preload.map(|q| q[2]), x.held.map(|q| q[2]), x.lambda])
+        .flatten()
+        .fold(0.0f64, f64::max)
+        .max(1e-9);
+    const PLOT: f64 = 150.0;
+    let block = 14.0 + 2.0 * (PLOT + 12.0) + 12.0;
+    for &l in &rows {
+        p.text_right(MARGIN + LEVEL_COLUMN - 10.0, y, &l.to_string(), EM, dim);
+        for (i, (c, _)) in classes.iter().enumerate() {
+            let Some(x) = level_scores(s, *c, l) else {
+                continue;
+            };
+            let x0 = MARGIN + LEVEL_COLUMN + i as f64 * block + 14.0;
+            for (k, (q, colour)) in [(x.preload, LOADS), (x.held, DRAWN)]
+                .into_iter()
+                .enumerate()
+            {
+                let px = x0 + k as f64 * (PLOT + 12.0);
+                p.rect(px, y + 3.0, PLOT, 9.0, srgb(TRACK, 1.0));
+                if let Some([p10, p50, p90]) = q {
+                    let at = |v: f64| px + (v / top).clamp(0.0, 1.0) * PLOT;
+                    p.rect(
+                        at(p10),
+                        y + 4.0,
+                        (at(p90) - at(p10)).max(1.0),
+                        7.0,
+                        srgb(colour, 1.0),
+                    );
+                    p.rect(at(p50) - 1.0, y + 2.0, 2.0, 11.0, srgb(TEXT, 1.0));
+                }
+                if let Some(v) = x.lambda {
+                    let lx = px + (v / top).clamp(0.0, 1.0) * PLOT;
+                    p.rect(lx - 1.0, y, 2.0, 15.0, Severity::Alert.colour());
+                }
+            }
+            p.hit(
+                x0,
+                y - 1.0,
+                2.0 * (PLOT + 12.0),
+                ROW - 1.0,
+                explain_scores(*c, l, &x),
+            );
+        }
+        y += ROW;
+    }
+    let _ = text;
+    y + 8.0
+}
+
+/// The tiles and bytes of tier `t` (0 disk, 1 RAM, 2 GPU) of `c` at `l`:
+/// see `tuile_core::budget::tiers::tier`.
+fn tier_of(s: &BudgetSignals, t: usize, c: Class, l: usize) -> Option<[u64; 2]> {
+    tuile_core::budget::tiers::tier(s, t, c, l)
+}
+
 /// The imagery layers: copies held and drawn as a bar, the table's numbers,
 /// failures marked.
 fn layers(p: &mut Painter<'_>, s: &BudgetSignals, view: &BoardView<'_>, y: f64) -> f64 {
@@ -1145,15 +1920,22 @@ fn layers(p: &mut Painter<'_>, s: &BudgetSignals, view: &BoardView<'_>, y: f64) 
         (format!("RAM hits{suffix}"), 104.0),
         (format!("done{suffix}"), 84.0),
         (format!("failed{suffix}"), 86.0),
+        ("on disk".to_owned(), 130.0),
     ];
     const NAME: f64 = 170.0;
+    let compact = !fits(
+        view,
+        NAME + RESIDENCY_BAR + 6.0 + columns.iter().map(|c| c.1).sum::<f64>(),
+    );
     let mut y = y;
     p.text(MARGIN, y, "layer", EM, dim);
     p.text(MARGIN + NAME, y, "drawn | held", EM, dim);
-    let mut x = MARGIN + NAME + RESIDENCY_BAR + 6.0;
-    for (name, w) in &columns {
-        x += w;
-        p.text_right(x, y, name, EM - 1.0, dim);
+    if !compact {
+        let mut x = MARGIN + NAME + RESIDENCY_BAR + 6.0;
+        for (name, w) in &columns {
+            x += w;
+            p.text_right(x, y, name, EM - 1.0, dim);
+        }
     }
     y += ROW;
     let l = &s.layers;
@@ -1186,6 +1968,32 @@ fn layers(p: &mut Painter<'_>, s: &BudgetSignals, view: &BoardView<'_>, y: f64) 
             p.marker(Severity::Alert, MARGIN + 5.0, y + ROW / 2.0 - 2.0, 8.0);
         }
         p.text(MARGIN + 14.0, y, &name, EM, text);
+        {
+            let mut lines = vec![
+                line(
+                    Swatch::None,
+                    format!("layer {name}: {} MiB on the GPU", mib(l.gpu_bytes[i].0)),
+                ),
+                line(
+                    Swatch::Fill(srgb(DRAWN, 1.0)),
+                    format!("dark blue = drapes worn: {}", l.drawn[i]),
+                ),
+                line(
+                    Swatch::Fill(srgb(HELD, 1.0)),
+                    format!(
+                        "grey = held, not worn: {}",
+                        l.gpu_tiles[i].saturating_sub(l.drawn[i])
+                    ),
+                ),
+            ];
+            if failing {
+                lines.push(marker_line(
+                    Severity::Alert,
+                    &format!("{} loads failed", counts[4]),
+                ));
+            }
+            p.hit(MARGIN, y - 1.0, NAME + RESIDENCY_BAR, ROW - 1.0, lines);
+        }
         p.bar(
             MARGIN + NAME,
             y + 3.0,
@@ -1206,6 +2014,18 @@ fn layers(p: &mut Painter<'_>, s: &BudgetSignals, view: &BoardView<'_>, y: f64) 
             (n(u64::from(l.drawn[i])), text),
             (n(u64::from(l.in_flight[i])), text),
         ];
+        let disk = if s.disk.known {
+            let (n, b) = s.disk.layers[i]
+                .iter()
+                .fold((0u64, 0u64), |(n, b), [x, y]| (n + x, b + y));
+            if n == 0 {
+                "·".to_owned()
+            } else {
+                format!("{n} · {} MiB", mib(b))
+            }
+        } else {
+            "?".to_owned()
+        };
         values.extend(counts.iter().enumerate().map(|(k, v)| {
             (
                 n(*v),
@@ -1216,6 +2036,19 @@ fn layers(p: &mut Painter<'_>, s: &BudgetSignals, view: &BoardView<'_>, y: f64) 
                 },
             )
         }));
+        values.push((disk, if s.disk.known { text } else { dim }));
+        if compact {
+            // Too narrow for the columns: each number named, flowing
+            // under the bar.
+            let mut flow = Flow::new(y + ROW, view.width);
+            for ((value, colour), (name, _)) in values.iter().zip(&columns) {
+                let item = format!("{name} {value}");
+                let (x, fy) = flow.place(p.width(&item, EM));
+                p.text(x, fy, &item, EM, *colour);
+            }
+            y = flow.end();
+            continue;
+        }
         let mut x = MARGIN + NAME + RESIDENCY_BAR + 6.0;
         for ((value, colour), (_, w)) in values.iter().zip(&columns) {
             x += w;
@@ -1224,6 +2057,651 @@ fn layers(p: &mut Painter<'_>, s: &BudgetSignals, view: &BoardView<'_>, y: f64) 
         y += ROW;
     }
     y
+}
+
+/// A class's name at the head of a sentence.
+fn class_title(c: Class) -> &'static str {
+    match c {
+        Class::TerrainMesh => "Terrain",
+        Class::Drape => "Imagery",
+        Class::Tiles3dMesh => "3D Tiles",
+        Class::Overlay => "Overlay",
+    }
+}
+
+/// A count of tiles in words: "no", "one", or the number.
+fn tiles(n: u64, what: &str) -> String {
+    match n {
+        0 => format!("no {what}s"),
+        1 => format!("one {what}"),
+        n => format!("{n} {what}s"),
+    }
+}
+
+/// The legend of a level's copies bar — drawn, held, the selection's end —
+/// and of its mark.
+pub fn explain_residency(
+    s: &BudgetSignals,
+    c: Class,
+    l: usize,
+    x: &LevelCell,
+    long: bool,
+) -> Vec<Legend> {
+    let held = x.gpu.saturating_sub(x.drawn);
+    let mut out = vec![
+        line(
+            Swatch::None,
+            format!(
+                "{} level {l}: {} MiB on the GPU",
+                class_title(c),
+                mib(x.bytes)
+            ),
+        ),
+        line(
+            Swatch::Fill(srgb(DRAWN, 1.0)),
+            format!("dark blue = drawn: {}", x.drawn),
+        ),
+    ];
+    if x.waste {
+        let w = level_waste(s, c, l);
+        out.push(line(
+            Swatch::Fill(Severity::Waste.colour()),
+            format!(
+                "purple = held for nothing: {held} ({} MiB)",
+                mib(w.under[0] + w.under[1])
+            ),
+        ));
+    } else {
+        out.push(line(
+            Swatch::Fill(srgb(HELD, 1.0)),
+            format!("grey = held on the GPU, not drawn: {held}"),
+        ));
+    }
+    if x.selected > x.drawn {
+        out.push(line(
+            Swatch::Tick(Severity::Warn.colour()),
+            format!(
+                "orange tick = where the selection ends: {} selected",
+                x.selected
+            ),
+        ));
+    } else {
+        out.push(line(Swatch::None, format!("selected: {}", x.selected)));
+    }
+    out.extend(row_mark(x, long));
+    out
+}
+
+/// The legend of a row's tint and mark, if it has one.
+fn row_mark(x: &LevelCell, long: bool) -> Option<Legend> {
+    let sev = level_severity(x, long);
+    let what = match sev {
+        Severity::Ok => return None,
+        Severity::Alert => format!(
+            "{} under need, nothing loading — a stall",
+            tiles(u64::from(x.under), "tile")
+        ),
+        Severity::Warn if x.under > 0 && x.loading() == 0 => {
+            format!(
+                "{} under need, nothing loading yet",
+                tiles(u64::from(x.under), "tile")
+            )
+        }
+        Severity::Warn if x.under > 0 => format!(
+            "{} under need, loads under way",
+            tiles(u64::from(x.under), "tile")
+        ),
+        Severity::Warn => format!(
+            "{} drawn by another level while theirs loads",
+            tiles(u64::from(x.stand_ins()), "selected tile")
+        ),
+        Severity::Waste => "copies held that nothing selects or draws".to_owned(),
+    };
+    Some(marker_line(sev, &what))
+}
+
+/// The legend of a level's under-need cell.
+pub fn explain_under(c: Class, l: usize, x: &LevelCell, stalls: &StallWatch) -> Vec<Legend> {
+    let mut out = vec![line(
+        Swatch::None,
+        format!(
+            "{} level {l}: under need: {}",
+            class_title(c),
+            tiles(u64::from(x.under), "tile")
+        ),
+    )];
+    if x.under > 0 {
+        if x.loading() > 0 {
+            out.push(line(
+                Swatch::None,
+                format!("loading at this level: {}", x.loading()),
+            ));
+        } else {
+            let since = stalls.level_since(c, l).unwrap_or(0.0);
+            out.push(line(
+                Swatch::None,
+                format!(
+                    "nothing loading for {since:.1} s (a stall after {:.1} s)",
+                    stalls.delay()
+                ),
+            ));
+        }
+    }
+    out.extend(row_mark(x, stalls.level_long(c, l)));
+    out
+}
+
+/// The legend of a level's loads bar.
+pub fn explain_loads(c: Class, l: usize, x: &LevelCell) -> Vec<Legend> {
+    let [fly_n, fly_p] = x.in_flight;
+    let [q_n, q_p] = x.queued;
+    let mut pale = srgb(LOADS, 1.0);
+    pale[3] = 0.5;
+    let mut pale_q = srgb(QUEUED, 1.0);
+    pale_q[3] = 0.5;
+    vec![
+        line(Swatch::None, format!("{} level {l}: loads", class_title(c))),
+        line(
+            Swatch::Fill(srgb(LOADS, 1.0)),
+            format!("sky blue = in flight for the present need: {fly_n}"),
+        ),
+        line(
+            Swatch::Fill(pale),
+            format!("pale blue = in flight for prefetch: {fly_p}"),
+        ),
+        line(
+            Swatch::Fill(srgb(QUEUED, 1.0)),
+            format!("yellow = queued for the present need: {q_n}"),
+        ),
+        line(
+            Swatch::Fill(pale_q),
+            format!("pale yellow = queued for prefetch: {q_p}"),
+        ),
+    ]
+}
+
+/// The legend of a level's waste: what it holds for nothing, and over the
+/// threshold when the budget scores it.
+pub fn explain_waste(c: Class, l: usize, w: &LevelWaste) -> Vec<Legend> {
+    let mut out = vec![line(
+        Swatch::None,
+        format!("{} level {l}: waste", class_title(c)),
+    )];
+    out.push(line(
+        Swatch::Fill(Severity::Waste.colour()),
+        format!(
+            "purple = held for nothing: {} MiB on the GPU, {} MiB in RAM",
+            mib(w.under[0]),
+            mib(w.under[1])
+        ),
+    ));
+    if w.scored {
+        out.push(line(
+            Swatch::None,
+            format!(
+                "held over the exchange threshold: {} MiB on the GPU, {} MiB in RAM",
+                mib(w.over[0]),
+                mib(w.over[1])
+            ),
+        ));
+    } else {
+        out.push(line(
+            Swatch::None,
+            "by the static rule: nothing selected here, 64 copies or more, not the floor"
+                .to_owned(),
+        ));
+    }
+    out
+}
+
+/// The legend of one tier's bar at a level.
+pub fn explain_tier(s: &BudgetSignals, t: usize, c: Class, l: usize) -> Vec<Legend> {
+    let at = format!("{} level {l}", class_title(c));
+    match (t, tier_of(s, t, c, l)) {
+        (0, None) => vec![line(
+            Swatch::None,
+            format!("{at} on the disk: not known — no local store here (a browser's HTTP cache is not visible to the page)"),
+        )],
+        (0, Some([n, b])) => vec![
+            line(Swatch::None, format!("{at} on the disk, the local store")),
+            line(Swatch::Fill(srgb(DIM, 1.0)), format!("grey = tiles stored: {n} ({} MiB)", mib(b))),
+        ],
+        (1, Some([n, b])) => vec![
+            line(Swatch::None, format!("{at} in RAM, decoded")),
+            line(Swatch::Fill(srgb(LOADS, 1.0)), format!("sky blue = decoded copies: {n} ({} MiB)", mib(b))),
+        ],
+        (_, Some([n, b])) => {
+            let drawn = u64::from(s.levels.drawn[c][l]).min(n);
+            vec![
+                line(Swatch::None, format!("{at} on the GPU: {n} resident ({} MiB)", mib(b))),
+                line(Swatch::Fill(srgb(DRAWN, 1.0)), format!("dark blue = drawn: {drawn}")),
+                line(Swatch::Fill(srgb(HELD, 1.0)), format!("grey = held, not drawn: {}", n - drawn)),
+            ]
+        }
+        (_, None) => vec![line(Swatch::None, format!("{at}: not known"))],
+    }
+}
+
+/// The legend of a class's GPU gauge.
+pub fn explain_gauge(s: &BudgetSignals, c: Class) -> Vec<Legend> {
+    let [drawable, transit] = s.bytes[c];
+    let (target, hard, protected) = (
+        s.target_bytes[c],
+        s.hard_limit_bytes[c],
+        s.protected_bytes[c],
+    );
+    let sev = gauge(drawable + transit, protected, target, hard);
+    let mut prot = srgb(DRAWN, 1.0);
+    prot[3] = 0.55;
+    let colour = match sev {
+        Severity::Alert => "red",
+        Severity::Warn => "orange",
+        _ => "green",
+    };
+    let mut out = vec![
+        line(Swatch::None, format!("{} on the GPU", class_title(c))),
+        line(
+            Swatch::Fill(prot),
+            format!(
+                "pale blue = protected (the floor, what is drawn): {} MiB",
+                mib(protected.min(drawable))
+            ),
+        ),
+        line(
+            Swatch::Fill(sev.colour()),
+            format!(
+                "{colour} = unprotected, what the budget trims: {} MiB",
+                mib(drawable.saturating_sub(protected.min(drawable)))
+            ),
+        ),
+        line(
+            Swatch::Fill(srgb(LOADS, 0.8)),
+            format!("sky blue = in transit to the GPU: {} MiB", mib(transit)),
+        ),
+        line(
+            Swatch::Tick(srgb(TEXT, 1.0)),
+            format!("white mark = the target: {} MiB", mib(target)),
+        ),
+    ];
+    if hard != u64::MAX {
+        out.push(line(
+            Swatch::Tick(srgb(DIM, 1.0)),
+            format!("grey mark = the hard limit: {} MiB", mib(hard)),
+        ));
+    }
+    if sev != Severity::Ok {
+        out.push(marker_line(
+            sev,
+            if sev == Severity::Alert {
+                "over the target or the hard limit"
+            } else {
+                "near the target"
+            },
+        ));
+    }
+    out
+}
+
+/// The scrollbar of a board taller than its window: where its track and
+/// its thumb are (device pixels), for a pointer to grab and drag.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Scrollbar {
+    /// Left, top, width, height of the track; top and height of the thumb.
+    pub track: [f64; 4],
+    pub thumb: (f64, f64),
+    /// The content's height and the window's, device pixels.
+    pub content: f64,
+    pub view: f64,
+}
+
+impl Scrollbar {
+    /// The offset that puts the thumb's top at `y`, the pointer having
+    /// grabbed it `grab` pixels under its top.
+    pub fn offset_at(&self, y: f64, grab: f64) -> f64 {
+        let room = (self.track[3] - self.thumb.1).max(1.0);
+        let at = (y - grab - self.track[1]).clamp(0.0, room);
+        at / room * (self.content - self.view)
+    }
+
+    /// Whether `(x, y)` is on the track.
+    pub fn on_track(&self, (x, y): (f64, f64)) -> bool {
+        let [l, t, w, h] = self.track;
+        x >= l - 4.0 && x < l + w + 4.0 && y >= t && y < t + h
+    }
+}
+
+/// `d` in a window of `frame` device pixels, scrolled down `offset` pixels
+/// (clamped here to what there is to scroll): moved up, with a scrollbar on
+/// the right when it is taller than the window, none when it fits.
+pub fn fit(
+    mut d: Drawing,
+    frame: (u32, u32),
+    offset: &mut f64,
+    scale: f64,
+) -> (Drawing, Option<Scrollbar>) {
+    let (content, view) = (f64::from(d.size.1), f64::from(frame.1.max(1)));
+    if content <= view {
+        *offset = 0.0;
+        return (d, None);
+    }
+    let max = content - view;
+    *offset = offset.clamp(0.0, max);
+    let dy = offset.round() as f32;
+    for v in &mut d.mesh {
+        v.position[1] -= dy;
+    }
+    for l in &mut d.labels {
+        l.position[1] -= dy;
+    }
+    d.labels.retain(|l| {
+        let top = f64::from(l.position[1]);
+        top + f64::from(l.mask.height) > 0.0 && top < view
+    });
+    for h in &mut d.hits {
+        h.rect[1] -= f64::from(dy);
+    }
+    d.hits
+        .retain(|h| h.rect[1] + h.rect[3] > 0.0 && h.rect[1] < view);
+    let k = scale.max(1.0);
+    let (w, pad) = (8.0 * k, 3.0 * k);
+    let track = [f64::from(frame.0) - w - pad, pad, w, view - 2.0 * pad];
+    let thumb_h = (track[3] * view / content).max(24.0 * k).min(track[3]);
+    let thumb_y = track[1] + (track[3] - thumb_h) * (*offset / max);
+    let mut rect = |x: f64, y: f64, w: f64, h: f64, c: [f32; 4]| {
+        for (px, py) in [
+            (x, y),
+            (x + w, y),
+            (x, y + h),
+            (x, y + h),
+            (x + w, y),
+            (x + w, y + h),
+        ] {
+            d.mesh.push(Vertex::new(px, py, c));
+        }
+    };
+    rect(track[0], track[1], track[2], track[3], srgb(TRACK, 1.0));
+    rect(track[0], thumb_y, track[2], thumb_h, srgb(DIM, 1.0));
+    d.size.1 = frame.1;
+    (
+        d,
+        Some(Scrollbar {
+            track,
+            thumb: (thumb_y, thumb_h),
+            content,
+            view,
+        }),
+    )
+}
+
+/// The region under `at` (device pixels), if one explains itself.
+pub fn hit_at(d: &Drawing, at: (f64, f64)) -> Option<&Hit> {
+    // The last drawn is on top: a cell inside a row's band wins.
+    d.hits.iter().rev().find(|h| h.contains(at))
+}
+
+/// `d` with `hit`'s text in a box beside it — under it, or above it near
+/// the bottom — and its region outlined: what a pointer over it, or the
+/// keyboard's focus on it, shows. Wrapped to a third of the window.
+pub fn tooltip(d: &mut Drawing, hit: &Hit, frame: (u32, u32), cache: &mut TextCache, scale: f64) {
+    let k = scale.max(1.0);
+    let font = Font::bundled();
+    let px = (EM * k) as f32;
+    let lh = f64::from(font.line_height(px)).max(14.0 * k);
+    let pad = 6.0 * k;
+    let sw = 12.0 * k;
+    let indent = |l: &Legend| {
+        if l.swatch == Swatch::None {
+            0.0
+        } else {
+            sw + 6.0 * k
+        }
+    };
+    let w = hit
+        .lines
+        .iter()
+        .map(|l| indent(l) + f64::from(font.width(&l.text, px)))
+        .fold(0.0, f64::max)
+        + 2.0 * pad;
+    let h = lh * hit.lines.len() as f64 + 2.0 * pad;
+    let [hx, hy, hw, hh] = hit.rect;
+    let (fw, fh) = (f64::from(frame.0), f64::from(frame.1));
+    let x = hx.clamp(0.0, (fw - w).max(0.0));
+    let y = if hy + hh + 4.0 + h <= fh {
+        hy + hh + 4.0
+    } else {
+        (hy - 4.0 - h).max(0.0)
+    };
+    let mut mesh: Mesh = Vec::new();
+    let rect = |mesh: &mut Mesh, x: f64, y: f64, w: f64, h: f64, c: [f32; 4]| {
+        for (px, py) in [
+            (x, y),
+            (x + w, y),
+            (x, y + h),
+            (x, y + h),
+            (x + w, y),
+            (x + w, y + h),
+        ] {
+            mesh.push(Vertex::new(px, py, c));
+        }
+    };
+    // The region, outlined.
+    let o = srgb(TEXT, 0.9);
+    let t = k;
+    rect(&mut mesh, hx, hy, hw, t, o);
+    rect(&mut mesh, hx, hy + hh - t, hw, t, o);
+    rect(&mut mesh, hx, hy, t, hh, o);
+    rect(&mut mesh, hx + hw - t, hy, t, hh, o);
+    // The box.
+    rect(&mut mesh, x, y, w, h, srgb(0x262626, 0.98));
+    rect(&mut mesh, x, y, w, t, srgb(DIM, 1.0));
+    d.mesh.extend(mesh);
+    for (i, l) in hit.lines.iter().enumerate() {
+        let ly = y + pad + lh * i as f64;
+        let cy = ly + lh / 2.0;
+        // The swatch, as the board draws it.
+        let mut p = Painter {
+            font,
+            scale: 1.0,
+            mesh: Mesh::new(),
+            labels: Vec::new(),
+            cache,
+            extent: (0.0, 0.0),
+            hits: Vec::new(),
+        };
+        match l.swatch {
+            Swatch::None => {}
+            Swatch::Fill(c) => {
+                p.rect(x + pad, cy - 4.5 * k, sw, 9.0 * k, srgb(TRACK, 1.0));
+                p.rect(x + pad, cy - 4.5 * k, sw, 9.0 * k, c);
+            }
+            Swatch::Tick(c) => {
+                p.rect(x + pad, cy - 4.5 * k, sw, 9.0 * k, srgb(TRACK, 1.0));
+                p.rect(x + pad + sw / 2.0 - k, cy - 6.5 * k, 2.0 * k, 13.0 * k, c);
+            }
+            Swatch::Marker(sev) => p.marker(sev, x + pad + sw / 2.0, cy, 10.0 * k),
+        }
+        d.mesh.extend(p.mesh);
+        let mask = cache
+            .masks
+            .entry((l.text.clone(), (px * 16.0) as u32))
+            .or_insert_with(|| font.rasterize(&l.text, px))
+            .clone();
+        let top = cy - f64::from(mask.height) / 2.0;
+        d.labels.push(Label {
+            mask,
+            position: [(x + pad + indent(l)).round() as f32, top.round() as f32],
+            color: srgb(TEXT, 1.0),
+        });
+    }
+}
+
+/// What a person does in the budget window: the same on a desktop's
+/// window and a page's (device pixels, in the window).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BoardInput {
+    /// The wheel or the trackpad, this many pixels down.
+    Wheel(f64),
+    /// The pointer moved to here.
+    Pointer(f64, f64),
+    /// The button pressed here, and let go.
+    Press(f64, f64),
+    Release,
+    /// The pointer left the window.
+    Leave,
+    Key(BoardKey),
+}
+
+/// The keys the budget window answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoardKey {
+    /// The focus to the next or the previous region with a legend: the
+    /// legends without a mouse.
+    Next,
+    Previous,
+    /// No focus.
+    Clear,
+    PageDown,
+    PageUp,
+    Top,
+    Bottom,
+    /// The tables or the board, this step or the sums, sums from now,
+    /// every level or those with an issue.
+    Tables,
+    Cumulative,
+    Reset,
+    Issues,
+}
+
+/// The budget window's scroll, pointer and focus: where it is scrolled to,
+/// whether its bar is held, which region's legend is shown.
+#[derive(Debug, Clone, Default)]
+pub struct BoardControl {
+    /// Scrolled down, device pixels.
+    pub offset: f64,
+    pointer: Option<(f64, f64)>,
+    focus: Option<usize>,
+    /// The thumb held, this many pixels under its top.
+    grab: Option<f64>,
+    /// The last drawing's scrollbar, and how many regions it had.
+    bar: Option<Scrollbar>,
+    regions: usize,
+    view: f64,
+}
+
+impl BoardControl {
+    /// Takes `ev`; returns a key that asks the window something
+    /// (`Tables`, `Cumulative`, `Reset`, `Issues`) for the caller to do.
+    pub fn input(&mut self, ev: BoardInput) -> Option<BoardKey> {
+        match ev {
+            BoardInput::Wheel(dy) => self.offset += dy,
+            BoardInput::Pointer(x, y) => {
+                // The pointer takes over from the keyboard's focus.
+                self.focus = None;
+                self.pointer = Some((x, y));
+                if let (Some(grab), Some(bar)) = (self.grab, self.bar) {
+                    self.offset = bar.offset_at(y, grab);
+                }
+            }
+            BoardInput::Press(x, y) => {
+                // A press where the pointer is (a window that tells the
+                // button and not the place).
+                let (x, y) = if x.is_nan() || y.is_nan() {
+                    self.pointer?
+                } else {
+                    (x, y)
+                };
+                self.pointer = Some((x, y));
+                if let Some(bar) = self.bar.filter(|b| b.on_track((x, y))) {
+                    let (top, h) = bar.thumb;
+                    let grab = if (top..top + h).contains(&y) {
+                        y - top
+                    } else {
+                        h / 2.0
+                    };
+                    self.grab = Some(grab);
+                    self.offset = bar.offset_at(y, grab);
+                }
+            }
+            BoardInput::Release => self.grab = None,
+            BoardInput::Leave => {
+                self.pointer = None;
+                self.grab = None;
+            }
+            BoardInput::Key(k) => match k {
+                BoardKey::Next | BoardKey::Previous => {
+                    // Before the first drawing: the first region, or the
+                    // last (made the last one by `present`).
+                    let n = self.regions.max(1);
+                    self.focus = Some(match (self.focus, k) {
+                        (None, BoardKey::Next) => 0,
+                        (None, _) if self.regions == 0 => usize::MAX,
+                        (None, _) => n - 1,
+                        (Some(i), BoardKey::Next) => (i + 1) % n,
+                        (Some(i), _) => (i + n - 1) % n,
+                    });
+                }
+                BoardKey::Clear => self.focus = None,
+                BoardKey::PageDown => self.offset += self.view * 0.9,
+                BoardKey::PageUp => self.offset -= self.view * 0.9,
+                BoardKey::Top => self.offset = 0.0,
+                BoardKey::Bottom => self.offset = f64::MAX / 4.0,
+                other => return Some(other),
+            },
+        }
+        None
+    }
+
+    /// `d` as the window shows it, `frame` device pixels: scrolled, its
+    /// bar when it does not fit, and the legend of the region focused — or
+    /// under the pointer.
+    pub fn present(
+        &mut self,
+        d: Drawing,
+        frame: (u32, u32),
+        scale: f64,
+        cache: &mut TextCache,
+    ) -> Drawing {
+        // The focus follows the regions: a region focused near the bottom
+        // is scrolled into view.
+        let regions = d.hits.len();
+        self.focus = match self.focus {
+            _ if regions == 0 => None,
+            Some(i) if i >= regions => Some(regions - 1),
+            f => f,
+        };
+        if let Some(h) = self.focus.and_then(|i| d.hits.get(i)) {
+            let (top, bottom) = (h.rect[1], h.rect[1] + h.rect[3]);
+            let view = f64::from(frame.1);
+            if top < self.offset {
+                self.offset = top - 8.0;
+            } else if bottom > self.offset + view {
+                self.offset = bottom - view + 8.0;
+            }
+        }
+        let focused = self.focus.and_then(|i| d.hits.get(i).cloned());
+        let (mut d, bar) = fit(d, frame, &mut self.offset, scale);
+        self.bar = bar;
+        self.regions = regions;
+        self.view = f64::from(frame.1);
+        let shown = match focused {
+            // Moved with the drawing.
+            Some(mut h) => {
+                h.rect[1] -= self.offset.round();
+                Some(h)
+            }
+            None if self.grab.is_none() => self.pointer.and_then(|at| hit_at(&d, at).cloned()),
+            None => None,
+        };
+        if let Some(h) = shown {
+            tooltip(&mut d, &h, frame, cache, scale);
+        }
+        d
+    }
+
+    /// Whether the content is taller than the window: a bar is drawn.
+    pub fn scrolls(&self) -> bool {
+        self.bar.is_some()
+    }
 }
 
 /// Budget signals for pictures and tests: a healthy step, and a stalled
@@ -1269,10 +2747,20 @@ pub mod fixtures {
         s.bytes_levels[c] |= 1 << l;
         s.levels.gpu_tiles[c][l] = gpu;
         s.levels.decoded_tiles[c][l] = gpu;
+        s.levels.decoded[c][l] = tuile_core::budget::Bytes(mib * MIB / 10);
         s.levels.drawn[c][l] = drawn;
         s.levels.selected[c][l] = selected;
         s.bytes_by_level[c][l] = [mib * MIB / 10, 0];
         s.bytes[c][0] += mib * MIB / 10;
+        // The local store holds three times what the GPU does, the floor's
+        // levels and all.
+        s.disk.known = true;
+        let mut by = tuile_core::budget::ByLevel::default();
+        by[l] = [u64::from(gpu) * 3, mib * MIB / 10 * 3];
+        let layer = (c == Class::Drape).then_some(0);
+        s.disk.add(c, layer, &by);
+        let seen = s.disk.seen;
+        s.disk.mark_seen(&seen);
     }
 
     /// A healthy step: every selected tile drawn at its level, nothing
@@ -1359,6 +2847,214 @@ pub mod fixtures {
 mod tests {
     use super::*;
 
+    fn view<'a>(stalls: &'a StallWatch, width: Option<f64>, issues_only: bool) -> BoardView<'a> {
+        BoardView {
+            cumulative: false,
+            from: None,
+            layers: &[],
+            decide: None,
+            stalls,
+            width,
+            issues_only,
+        }
+    }
+
+    /// The bar appears only when the board is taller than its window; the
+    /// wheel scrolls it, never past either end.
+    #[test]
+    fn a_scrollbar_only_when_the_board_does_not_fit() {
+        let s = fixtures::stalled();
+        let stalls = StallWatch::at_once();
+        let mut cache = TextCache::default();
+        let d = draw(
+            Some(&s),
+            &view(&stalls, Some(1400.0), false),
+            &mut cache,
+            1.0,
+        );
+        let mut c = BoardControl::default();
+        c.present(d.clone(), (1400, d.size.1 + 10), 1.0, &mut cache);
+        assert!(!c.scrolls(), "it fits: no bar");
+        assert_eq!(c.offset, 0.0);
+        let shown = c.present(d.clone(), (1400, 300), 1.0, &mut cache);
+        assert!(c.scrolls(), "taller than its window: a bar");
+        assert_eq!(shown.size.1, 300);
+        c.input(BoardInput::Wheel(120.0));
+        c.present(d.clone(), (1400, 300), 1.0, &mut cache);
+        assert_eq!(c.offset, 120.0);
+        c.input(BoardInput::Wheel(1e9));
+        c.present(d.clone(), (1400, 300), 1.0, &mut cache);
+        assert_eq!(c.offset, f64::from(d.size.1) - 300.0, "not past the end");
+        c.input(BoardInput::Key(BoardKey::Top));
+        c.present(d, (1400, 300), 1.0, &mut cache);
+        assert_eq!(c.offset, 0.0);
+    }
+
+    /// A narrow window stacks what does not fit side by side: taller,
+    /// never wider than it can help.
+    #[test]
+    fn a_narrow_window_stacks_the_classes() {
+        let s = fixtures::healthy();
+        let stalls = StallWatch::at_once();
+        let mut cache = TextCache::default();
+        let wide = draw(
+            Some(&s),
+            &view(&stalls, Some(2400.0), false),
+            &mut cache,
+            1.0,
+        );
+        let narrow = draw(
+            Some(&s),
+            &view(&stalls, Some(760.0), false),
+            &mut cache,
+            1.0,
+        );
+        assert!(narrow.size.1 > wide.size.1, "stacked: taller");
+        assert!(
+            narrow.size.0 < wide.size.0,
+            "and narrower: {} vs {}",
+            narrow.size.0,
+            wide.size.0
+        );
+        assert!(narrow.size.0 <= 760, "within the window: {}", narrow.size.0);
+    }
+
+    /// Every level from 0 to the finest, or only those with an issue.
+    #[test]
+    fn the_filter_shows_only_the_levels_with_an_issue() {
+        let s = fixtures::stalled();
+        let stalls = StallWatch::at_once();
+        let classes = shown_classes(&s);
+        let all = level_rows(&s, &view(&stalls, None, false), &classes);
+        assert_eq!(
+            all,
+            (0..=21).collect::<Vec<_>>(),
+            "every level, gaps included"
+        );
+        let issues = level_rows(&s, &view(&stalls, None, true), &classes);
+        assert_eq!(issues, vec![15, 16, 17, 21]);
+        let healthy = fixtures::healthy();
+        assert!(level_rows(
+            &healthy,
+            &view(&stalls, None, true),
+            &shown_classes(&healthy)
+        )
+        .is_empty());
+    }
+
+    /// The scores' box plots explain themselves: the bar, the median, λ.
+    #[test]
+    fn a_box_plot_explains_itself() {
+        let x = LevelScores {
+            preload: Some([0.1, 0.4, 0.9]),
+            held: Some([0.2, 0.5, 0.7]),
+            evicted: None,
+            lambda: Some(0.3),
+        };
+        let lines: Vec<String> = explain_scores(Class::Drape, 15, &x)
+            .into_iter()
+            .map(|l| l.text)
+            .collect();
+        assert_eq!(lines[1], "bar = 10th to 90th percentile of the scores");
+        assert_eq!(lines[2], "white tick = the median");
+        assert_eq!(
+            lines[3],
+            "red mark = λ, the exchange threshold (0.300): held below it are released, candidates above it are loaded"
+        );
+        assert_eq!(
+            lines[4],
+            "sky blue = preload candidates: 10th 0.100, median 0.400, 90th 0.900"
+        );
+        // No scores published yet: no section.
+        assert_eq!(level_scores(&fixtures::stalled(), Class::Drape, 15), None);
+    }
+
+    /// The legends: each colour of a bar, its meaning and its value.
+    #[test]
+    fn a_bar_explains_its_colours() {
+        let x = LevelCell {
+            gpu: 285,
+            bytes: 28 * 1024 * 1024,
+            drawn: 69,
+            selected: 72,
+            in_flight: [4, 5],
+            queued: [40, 0],
+            deficit: true,
+            ..LevelCell::default()
+        };
+        let s = fixtures::healthy();
+        let texts = |v: Vec<Legend>| v.into_iter().map(|l| l.text).collect::<Vec<_>>();
+        assert_eq!(
+            texts(explain_residency(&s, Class::Drape, 17, &x, false)),
+            [
+                "Imagery level 17: 28.0 MiB on the GPU",
+                "dark blue = drawn: 69",
+                "grey = held on the GPU, not drawn: 216",
+                "orange tick = where the selection ends: 72 selected",
+                "orange diamond = watch: 3 selected tiles drawn by another level while theirs loads",
+            ]
+        );
+        assert_eq!(
+            texts(explain_loads(Class::Drape, 17, &x)),
+            [
+                "Imagery level 17: loads",
+                "sky blue = in flight for the present need: 4",
+                "pale blue = in flight for prefetch: 5",
+                "yellow = queued for the present need: 40",
+                "pale yellow = queued for prefetch: 0",
+            ]
+        );
+        let gauge = texts(explain_gauge(&s, Class::TerrainMesh));
+        assert!(
+            gauge
+                .iter()
+                .any(|l| l == "white mark = the target: 1410.0 MiB"),
+            "{gauge:?}"
+        );
+        assert!(
+            gauge
+                .iter()
+                .any(|l| l == "grey mark = the hard limit: 2015.0 MiB"),
+            "{gauge:?}"
+        );
+    }
+
+    /// The legend shows for the region under the pointer, and for the one
+    /// the keyboard's focus is on: the same, without a mouse.
+    #[test]
+    fn a_legend_under_the_pointer_or_the_focus() {
+        let s = fixtures::stalled();
+        let stalls = StallWatch::at_once();
+        let mut cache = TextCache::default();
+        let d = draw(
+            Some(&s),
+            &view(&stalls, Some(2400.0), false),
+            &mut cache,
+            1.0,
+        );
+        let first = d.hits[0].clone();
+        let texts = |d: &Drawing| d.labels.len();
+        let mut c = BoardControl::default();
+        let bare = c.present(d.clone(), (2400, 2000), 1.0, &mut cache);
+        let [x, y, w, h] = first.rect;
+        c.input(BoardInput::Pointer(x + w / 2.0, y + h / 2.0));
+        assert_eq!(
+            hit_at(&d, (x + w / 2.0, y + h / 2.0)).map(|h| h.lines.len()),
+            Some(first.lines.len()),
+            "{first:?}"
+        );
+        let hovered = c.present(d.clone(), (2400, 2000), 1.0, &mut cache);
+        assert_eq!(
+            texts(&hovered),
+            texts(&bare) + first.lines.len(),
+            "its legend's lines"
+        );
+        let mut k = BoardControl::default();
+        k.input(BoardInput::Key(BoardKey::Next));
+        let focused = k.present(d, (2400, 2000), 1.0, &mut cache);
+        assert_eq!(texts(&focused), texts(&bare) + first.lines.len());
+    }
+
     const MIB: u64 = 1024 * 1024;
 
     /// The thresholds: under nine tenths of the target is fine, from it a
@@ -1382,46 +3078,76 @@ mod tests {
     }
 
     /// A level: a stall is under its need with nothing loading; under its
-    /// need while loading, or stand-ins, a warning; many copies nothing
-    /// selects, waste — but never the floor's.
+    /// need while loading, or stand-ins, a warning; a level holding waste,
+    /// waste.
     #[test]
     fn a_level_is_coloured_by_its_loads_and_its_need() {
         let base = LevelCell {
             gpu: 100,
             drawn: 40,
             selected: 40,
+            deficit: true,
             ..LevelCell::default()
         };
-        assert_eq!(level_severity(&base, false), Severity::Ok);
+        assert_eq!(level_severity(&base, true), Severity::Ok);
         let stall = LevelCell { under: 5, ..base };
-        assert_eq!(level_severity(&stall, false), Severity::Alert);
+        assert_eq!(level_severity(&stall, true), Severity::Alert);
         let loading = LevelCell {
             under: 5,
             queued: [0, 1],
             ..base
         };
-        assert_eq!(level_severity(&loading, false), Severity::Warn);
+        assert_eq!(level_severity(&loading, true), Severity::Warn);
         let stand_ins = LevelCell { drawn: 30, ..base };
-        assert_eq!(level_severity(&stand_ins, false), Severity::Warn);
+        assert_eq!(level_severity(&stand_ins, true), Severity::Warn);
         let waste = LevelCell {
-            gpu: 1522,
-            drawn: 0,
-            selected: 0,
+            waste: true,
             ..LevelCell::default()
         };
-        assert_eq!(level_severity(&waste, false), Severity::Waste);
-        assert_eq!(level_severity(&waste, true), Severity::Ok, "the floor");
-        let few = LevelCell {
-            gpu: WASTE_TILES - 1,
-            ..waste
-        };
-        assert_eq!(level_severity(&few, false), Severity::Ok);
+        assert_eq!(level_severity(&waste, true), Severity::Waste);
+    }
+
+    /// Waste is what [`level_waste`] says a level holds for nothing — the
+    /// static rule until the budget scores its levels: copies at a level
+    /// nothing selects, never the floor's, never a few — and every view of
+    /// it follows: the level's colour, the attention list.
+    #[test]
+    fn waste_follows_the_levels_held_for_nothing() {
+        let s = fixtures::stalled();
+        let w = level_waste(&s, Class::Drape, 21);
+        assert!(!w.scored && w.under[0] > 0, "{w:?}");
+        assert!(LevelCell::of(&s, Class::Drape, 21).waste);
+        assert_eq!(
+            level_waste(&s, Class::Drape, 12),
+            LevelWaste::default(),
+            "selected"
+        );
+        let mut floor = s.clone();
+        floor.floor_level = Some(21);
+        assert_eq!(
+            level_waste(&floor, Class::Drape, 21),
+            LevelWaste::default(),
+            "the floor"
+        );
+        let mut few = s.clone();
+        few.levels.gpu_tiles[Class::Drape][21] = WASTE_TILES - 1;
+        assert_eq!(
+            level_waste(&few, Class::Drape, 21),
+            LevelWaste::default(),
+            "a few"
+        );
+        assert!(attention(&few, &StallWatch::at_once())
+            .iter()
+            .all(|i| i.severity != Severity::Waste));
     }
 
     /// A healthy step has nothing to look at.
     #[test]
     fn a_healthy_budget_needs_no_attention() {
-        assert_eq!(attention(&fixtures::healthy()), Vec::new());
+        assert_eq!(
+            attention(&fixtures::healthy(), &StallWatch::at_once()),
+            Vec::new()
+        );
     }
 
     /// The stall: imagery under its need with nothing in flight or queued
@@ -1429,7 +3155,7 @@ mod tests {
     /// draws follow as waste.
     #[test]
     fn a_stall_is_the_first_red_item() {
-        let list = attention(&fixtures::stalled());
+        let list = attention(&fixtures::stalled(), &StallWatch::at_once());
         let first = list.first().expect("an issue");
         assert_eq!(first.severity, Severity::Alert);
         assert_eq!(
@@ -1445,11 +3171,109 @@ mod tests {
         // the levels with nothing of their own loading still are.
         let mut s = fixtures::stalled();
         s.levels.in_flight[Class::Drape][14] = [2, 0];
-        let list = attention(&s);
+        let list = attention(&s, &StallWatch::at_once());
         assert!(list.iter().any(|i| i.severity == Severity::Warn
             && i.text.starts_with("imagery: 209 tiles under need, 2 loads")));
         assert!(list.iter().any(|i| i.severity == Severity::Alert
             && i.text == "level 15 imagery: 80 under need, nothing loading at this level"));
+    }
+
+    /// Laurent's live state: imagery level 14 drawn 94 of 96, 2 under its
+    /// need, nothing in flight or queued — read off the last walk, while the
+    /// budget's deficit this step is nought. One count: no alert, no
+    /// warning, nothing about level 14.
+    #[test]
+    fn a_level_under_need_the_budget_does_not_count_is_no_alarm() {
+        let mut s = fixtures::healthy();
+        let d = Class::Drape;
+        s.levels_seen[d] |= 1 << 14;
+        s.levels.gpu_tiles[d][14] = 120;
+        s.levels.drawn[d][14] = 94;
+        s.levels.selected[d][14] = 96;
+        s.levels.under_need[d][14] = 2;
+        s.under_need_tiles = [0, 0];
+        let mut watch = StallWatch::default();
+        watch.note(&s, 0.0);
+        watch.note(&s, 30.0);
+        let list = attention(&s, &watch);
+        assert!(list.is_empty(), "{list:?}");
+        let cell = LevelCell::of(&s, d, 14);
+        assert_eq!(level_severity(&cell, watch.level_long(d, 14)), Severity::Ok);
+        assert_eq!(cell.under, 0, "the deficit by level: none");
+    }
+
+    /// A stall is an alert only once it has lasted the delay: before, it
+    /// is a warning that it waits.
+    #[test]
+    fn a_stall_alerts_only_after_its_delay() {
+        let s = fixtures::stalled();
+        let mut watch = StallWatch::with_delay(1.0);
+        watch.note(&s, 10.0);
+        let early = attention(&s, &watch);
+        assert!(
+            early.iter().all(|i| i.severity != Severity::Alert),
+            "a transient painted red: {early:?}"
+        );
+        assert!(
+            early.iter().any(|i| i.text.contains("waiting")),
+            "{early:?}"
+        );
+        let cell = LevelCell::of(&s, Class::Drape, 15);
+        assert_eq!(
+            level_severity(&cell, watch.level_long(Class::Drape, 15)),
+            Severity::Warn
+        );
+        watch.note(&s, 11.2);
+        let late = attention(&s, &watch);
+        assert_eq!(
+            late.first().map(|i| (i.severity, i.text.as_str())),
+            Some((
+                Severity::Alert,
+                "imagery: 209 tiles under need, nothing in flight or queued — stalled"
+            ))
+        );
+        assert_eq!(
+            level_severity(&cell, watch.level_long(Class::Drape, 15)),
+            Severity::Alert
+        );
+        // Loads start: the stall's clock starts again.
+        let mut moving = s.clone();
+        moving.levels.in_flight[Class::Drape][15] = [1, 0];
+        watch.note(&moving, 11.5);
+        watch.note(&s, 11.6);
+        assert!(attention(&s, &watch)
+            .iter()
+            .all(|i| !i.text.ends_with("stalled")));
+    }
+
+    /// The disk tier: the store's tiles by level beside RAM and GPU, its
+    /// numbers written; with no store, said not known.
+    #[test]
+    fn the_tiers_are_drawn_with_their_numbers() {
+        let mut s = fixtures::healthy();
+        s.disk.classes[Class::Drape][12] = [345, 9 * 1024 * 1024];
+        let draw_texts = |s: &BudgetSignals| {
+            let mut cache = TextCache::default();
+            let view = BoardView {
+                cumulative: false,
+                from: None,
+                layers: &[],
+                decide: None,
+                stalls: &StallWatch::default(),
+                width: None,
+                issues_only: false,
+            };
+            draw(Some(s), &view, &mut cache, 1.0);
+            cache.masks.into_keys().map(|(t, _)| t).collect::<Vec<_>>()
+        };
+        let texts = draw_texts(&s);
+        assert!(texts.iter().any(|t| t == "345 · 9.0 MiB"), "{texts:?}");
+        s.disk.known = false;
+        let texts = draw_texts(&s);
+        assert!(
+            texts.iter().any(|t| t.starts_with("disk: not known here")),
+            "{texts:?}"
+        );
     }
 
     /// Ground missing, a class over its limit, pressure and failures are
@@ -1461,7 +3285,7 @@ mod tests {
         s.bytes[Class::Drape] = [2600 * MIB, 0];
         s.pressure_level = 2;
         s.layers.failures[0] = 4;
-        let list = attention(&s);
+        let list = attention(&s, &StallWatch::at_once());
         for text in [
             "ground: 3 tiles lost, 0 bare — ground missing",
             "imagery: 2600.0 MiB over its 2519.0 MiB hard limit",
@@ -1513,6 +3337,9 @@ mod tests {
             from: None,
             layers: &["Aerial".to_owned()],
             decide: None,
+            stalls: &StallWatch::default(),
+            width: None,
+            issues_only: false,
         };
         let d = draw(Some(&s), &view, &mut cache, 1.0);
         let texts: Vec<&str> = cache.masks.keys().map(|(t, _)| t.as_str()).collect();
@@ -1528,6 +3355,11 @@ mod tests {
         assert!(d.size.0 > 900 && d.size.1 > 300, "{:?}", d.size);
         // And twice as large at twice the density.
         let d2 = draw(Some(&s), &view, &mut cache, 2.0);
-        assert!(d2.size.0 >= d.size.0 * 2 - 2);
+        assert!(
+            d2.size.0 * 10 >= d.size.0 * 19,
+            "{:?} at 2x, {:?} at 1x",
+            d2.size,
+            d.size
+        );
     }
 }

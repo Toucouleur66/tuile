@@ -264,6 +264,14 @@ pub(super) struct ItemStats {
     pub tile_level: u32,
 }
 
+/// What a walk of the levels must agree with: the deficit the header
+/// counts, and the selection's exact, fallback, held and lost tiles. The
+/// per-level `under_need` is the deficit by level, so the two are read off
+/// the same step.
+fn walk_counts(st: &BudgetStats) -> (super::stats::Deficit, [u32; 4]) {
+    (st.deficit, [st.exact, st.fallback, st.held, st.lost])
+}
+
 /// What `Budget::level_stats` walks for: kept from one step to the next.
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct WalkedLevels {
@@ -281,6 +289,11 @@ pub(super) struct Scratch {
     /// layer (`level_stats`), kept for the still steps that read it again.
     walked_levels: Option<WalkedLevels>,
     walked_scale: u32,
+    /// The deficit and the selection's counts the last walk was taken
+    /// with: a step that moves them is not still for the walk, whatever
+    /// else it decided (a drape swapped for one already resident moves
+    /// the draw set and nothing else).
+    walked_counts: Option<(super::stats::Deficit, [u32; 4])>,
     /// A drawn tile's chosen drape levels, for the step per level
     /// (`level_stats`).
     chosen: Vec<(LayerId, u32)>,
@@ -1885,8 +1898,10 @@ impl Budget {
             && d.release.is_empty()
             && d.cancel.is_empty()
             && d.upload_plan.items.is_empty()
-            && d.sse_scale_milli == self.scratch.walked_scale;
+            && d.sse_scale_milli == self.scratch.walked_scale
+            && self.scratch.walked_counts == Some(walk_counts(&st));
         self.scratch.walked_scale = d.sse_scale_milli;
+        self.scratch.walked_counts = Some(walk_counts(&st));
         self.level_stats(tiles, quiet, d, &mut st);
         self.put_back(taken);
         self.need = need;

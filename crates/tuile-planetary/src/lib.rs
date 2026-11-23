@@ -2136,6 +2136,24 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
         self.store_events();
         self.changes.touched(since, asked, self, touched)
     }
+
+    /// The terrain store's meshes; the imagery store's tiles of the layer
+    /// served (layer 0) and of its substitute, by imagery level.
+    fn stored(&self, out: &mut tuile_core::budget::DiskTiers) -> bool {
+        use tuile_core::budget::{layer_index, ByLevel, Class};
+        let mut by = ByLevel::default();
+        let mut known = self.terrain.stored(&mut by);
+        out.add(Class::TerrainMesh, None, &by);
+        let mut by = ByLevel::default();
+        known |= self.imagery.stored(&mut by);
+        out.add(Class::Drape, Some(layer_index(LayerId(0))), &by);
+        if let Some(s) = &self.substitute {
+            let mut by = ByLevel::default();
+            known |= s.provider.stored(&mut by);
+            out.add(Class::Drape, Some(layer_index(LayerId(0).substitute())), &by);
+        }
+        known
+    }
 }
 
 /// What the store events read of the loader as it is now.

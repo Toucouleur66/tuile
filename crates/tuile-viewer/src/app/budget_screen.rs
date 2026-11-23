@@ -63,14 +63,6 @@ pub(super) fn route(id: WindowId, view: Option<WindowId>, panel: Option<WindowId
     }
 }
 
-/// What a key in the budget window toggles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Toggle {
-    Tables,
-    Cumulative,
-    Reset,
-}
-
 /// What an event on the budget window's own window does.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum PanelEvent {
@@ -82,9 +74,11 @@ pub(super) enum PanelEvent {
     Rescale(f64),
     /// The system wants it drawn again.
     Redraw,
-    /// A key asking the budget window something: `T` its tables or its
-    /// board, `C` this step or the counters summed, `R` summed from now.
-    Ask(Toggle),
+    /// The wheel, the pointer, a key: scrolling, a legend, the focus, or
+    /// asking the window something — `T` its tables or its board, `C` this
+    /// step or the counters summed, `R` summed from now, `I` the levels
+    /// with an issue or all of them.
+    Input(tuile_ui::budget_board::BoardInput),
     /// Anything else: the panel takes no input.
     Nothing,
 }
@@ -92,7 +86,8 @@ pub(super) enum PanelEvent {
 /// What `event` on the budget window's own window does. Escape closes it,
 /// as it would a sheet; it never reaches the view, where it would end the
 /// viewer.
-pub(super) fn panel_event(event: &WindowEvent) -> PanelEvent {
+pub(super) fn panel_event(event: &WindowEvent, scale: f64) -> PanelEvent {
+    use tuile_ui::budget_board::{BoardInput as In, BoardKey as K};
     use winit::keyboard::{Key, NamedKey};
     match event {
         WindowEvent::CloseRequested | WindowEvent::Destroyed => PanelEvent::Close,
@@ -102,13 +97,39 @@ pub(super) fn panel_event(event: &WindowEvent) -> PanelEvent {
             PanelEvent::Close
         }
         WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
-            match event.logical_key.as_ref() {
-                Key::Character("t" | "T") => PanelEvent::Ask(Toggle::Tables),
-                Key::Character("c" | "C") => PanelEvent::Ask(Toggle::Cumulative),
-                Key::Character("r" | "R") => PanelEvent::Ask(Toggle::Reset),
-                _ => PanelEvent::Nothing,
-            }
+            let key = match event.logical_key.as_ref() {
+                Key::Character("t" | "T") => K::Tables,
+                Key::Character("c" | "C") => K::Cumulative,
+                Key::Character("r" | "R") => K::Reset,
+                Key::Character("i" | "I") => K::Issues,
+                Key::Named(NamedKey::Tab | NamedKey::ArrowDown) => K::Next,
+                Key::Named(NamedKey::ArrowUp) => K::Previous,
+                Key::Named(NamedKey::Backspace | NamedKey::Delete) => K::Clear,
+                Key::Named(NamedKey::PageDown | NamedKey::Space) => K::PageDown,
+                Key::Named(NamedKey::PageUp) => K::PageUp,
+                Key::Named(NamedKey::Home) => K::Top,
+                Key::Named(NamedKey::End) => K::Bottom,
+                _ => return PanelEvent::Nothing,
+            };
+            PanelEvent::Input(In::Key(key))
         }
+        WindowEvent::MouseWheel { delta, .. } => PanelEvent::Input(In::Wheel(match delta {
+            winit::event::MouseScrollDelta::LineDelta(_, y) => -f64::from(*y) * 40.0 * scale,
+            winit::event::MouseScrollDelta::PixelDelta(p) => -p.y,
+        })),
+        WindowEvent::CursorMoved { position, .. } => {
+            PanelEvent::Input(In::Pointer(position.x, position.y))
+        }
+        WindowEvent::CursorLeft { .. } => PanelEvent::Input(In::Leave),
+        WindowEvent::MouseInput {
+            state,
+            button: winit::event::MouseButton::Left,
+            ..
+        } => PanelEvent::Input(if state.is_pressed() {
+            In::Press(f64::NAN, f64::NAN)
+        } else {
+            In::Release
+        }),
         WindowEvent::Resized(size) => PanelEvent::Resize((size.width, size.height)),
         WindowEvent::ScaleFactorChanged { scale_factor, .. } => PanelEvent::Rescale(*scale_factor),
         WindowEvent::RedrawRequested => PanelEvent::Redraw,
@@ -440,6 +461,14 @@ impl App {
         if self.budget_screen.is_none() {
             self.open_the_budget_window(event_loop);
         }
+        // What the person did in a page's window since the last turn.
+        #[cfg(target_arch = "wasm32")]
+        for input in crate::web::popup::take_inputs() {
+            if self.budget_window.input(input) {
+                self.publish_the_view(None);
+            }
+        }
+
         let names = self.budget_layer_names();
         let Some(active) = self.active.as_ref() else {
             return;
@@ -504,7 +533,9 @@ impl App {
                         points(natural.0, 320.0, 1_600.0),
                         points(natural.1, 160.0, 1_000.0),
                     ))
-                    .with_min_inner_size(winit::dpi::LogicalSize::new(240.0, 120.0))
+                    // As narrow as the board's narrowest section, one class wide:
+                    // narrower would cut its text.
+                    .with_min_inner_size(winit::dpi::LogicalSize::new(680.0, 200.0))
                     .with_resizable(true);
                 event_loop
                     .create_window(attrs)
@@ -575,7 +606,8 @@ impl App {
 
     /// An event on the budget window's own window.
     pub(super) fn on_panel_event(&mut self, event: &WindowEvent) {
-        match panel_event(event) {
+        let scale = self.budget_screen.as_ref().map_or(1.0, |s| s.scale);
+        match panel_event(event, scale) {
             PanelEvent::Close => {
                 tracing::info!("budget window closed");
                 self.budget_window.closed();
@@ -595,15 +627,11 @@ impl App {
                 }
             }
             PanelEvent::Redraw => {}
-            PanelEvent::Ask(toggle) => {
-                let w = &self.budget_window;
-                self.budget_window.ask(match toggle {
-                    Toggle::Tables => crate::steer::WindowAsk::Tables(!w.tables()),
-                    Toggle::Cumulative => crate::steer::WindowAsk::Cumulative(!w.cumulative()),
-                    Toggle::Reset => crate::steer::WindowAsk::Reset,
-                });
-                // The menu's marks follow.
-                self.publish_the_view(None);
+            PanelEvent::Input(input) => {
+                if self.budget_window.input(input) {
+                    // The menu's marks follow.
+                    self.publish_the_view(None);
+                }
             }
             PanelEvent::Nothing => return,
         }
@@ -686,6 +714,9 @@ mod tests {
                 cumulative: false,
                 from: None,
                 layers: &["Aerial".to_owned()],
+                stalls: &tuile_ui::budget_board::StallWatch::at_once(),
+                width: None,
+                issues_only: false,
                 decide: Some(tuile_ui::budget_board::DecideSummary {
                     mean_ms: 0.9,
                     max_ms: 2.4,
@@ -734,20 +765,24 @@ mod tests {
     /// nothing else on it does anything — no key reaches the view.
     #[test]
     fn the_budget_windows_events() {
-        assert_eq!(panel_event(&WindowEvent::CloseRequested), PanelEvent::Close);
-        assert_eq!(panel_event(&WindowEvent::Destroyed), PanelEvent::Close);
         assert_eq!(
-            panel_event(&WindowEvent::Resized(winit::dpi::PhysicalSize::new(
-                640, 300
-            ))),
+            panel_event(&WindowEvent::CloseRequested, 1.0),
+            PanelEvent::Close
+        );
+        assert_eq!(panel_event(&WindowEvent::Destroyed, 1.0), PanelEvent::Close);
+        assert_eq!(
+            panel_event(
+                &WindowEvent::Resized(winit::dpi::PhysicalSize::new(640, 300)),
+                1.0
+            ),
             PanelEvent::Resize((640, 300))
         );
         assert_eq!(
-            panel_event(&WindowEvent::RedrawRequested),
+            panel_event(&WindowEvent::RedrawRequested, 1.0),
             PanelEvent::Redraw
         );
         assert_eq!(
-            panel_event(&WindowEvent::Focused(true)),
+            panel_event(&WindowEvent::Focused(true), 1.0),
             PanelEvent::Nothing
         );
     }
