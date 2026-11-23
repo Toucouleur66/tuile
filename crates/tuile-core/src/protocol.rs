@@ -98,6 +98,17 @@ pub enum ClientMessage {
     /// session substitutes nothing. Replaces the one given before; a tile
     /// changing layer swaps new before old, never bare.
     Fallbacks(crate::budget::FallbackSpec),
+    /// What the consumer holds of `class`'s memory outside any resource from
+    /// the next step on — its GPU encoder's scratch, off the drapes' limits
+    /// ([`crate::budget::BudgetConfig::reserved`]) — replacing what was
+    /// reserved before. A consumer that changes how it holds imagery under a
+    /// running session says so: nothing once it no longer encodes. One more
+    /// than the class's hard limit is refused and the reservation in force
+    /// kept.
+    Reserve {
+        class: crate::budget::Class,
+        bytes: u64,
+    },
 }
 
 /// What the tree knows about a tile, travelling with every message that names

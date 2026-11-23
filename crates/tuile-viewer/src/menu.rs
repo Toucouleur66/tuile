@@ -91,6 +91,8 @@ pub(crate) enum Ask {
     ToggleMetrics,
     /// The CPU profiles taken and sent, or not.
     ToggleProfiling,
+    /// The imagery held block-compressed on the GPU, or as RGBA8.
+    ToggleCompression,
 }
 
 /// The rates the clock steps through, scene seconds a second: backwards an
@@ -141,6 +143,8 @@ pub(crate) struct State {
     pub budget_window_tables: bool,
     /// The budget window listing only the levels with an issue.
     pub budget_window_issues: bool,
+    /// The imagery held compressed: any choice but off.
+    pub compressed: bool,
 }
 
 impl State {
@@ -162,6 +166,7 @@ impl State {
             budget_window_cumulative: snapshot.budget_window_cumulative,
             budget_window_tables: snapshot.budget_window_tables,
             budget_window_issues: snapshot.budget_window_issues,
+            compressed: snapshot.compression != tuile_wgpu::ImageryCompression::Off,
         }
     }
 
@@ -215,6 +220,11 @@ impl Ask {
             },
             Self::ToggleMetrics => Command::Metrics(!now.metrics),
             Self::ToggleProfiling => Command::Profiling(!now.profiling),
+            Self::ToggleCompression => Command::Compression(if now.compressed {
+                tuile_wgpu::ImageryCompression::Off
+            } else {
+                tuile_wgpu::ImageryCompression::Auto
+            }),
             Self::Diagnostic(view) => Command::Diagnostic(view),
             Self::NextDiagnostic => Command::Diagnostic((now.diagnostic + 1) % DIAGNOSTICS.len()),
             Self::Imagery(layer) => Command::Imagery(layer),
@@ -276,6 +286,7 @@ impl Ask {
             Self::ToggleTileset { index, .. } => Some(now.tileset_on(index)),
             Self::ToggleMetrics => Some(now.metrics),
             Self::ToggleProfiling => Some(now.profiling),
+            Self::ToggleCompression => Some(now.compressed),
             Self::Do(_)
             | Self::NextDiagnostic
             | Self::NextImagery
@@ -401,6 +412,10 @@ pub(crate) fn layout(
         imagery.push(Entry::Separator);
         imagery.push(item("Next Layer", Ask::NextImagery));
     }
+    // How it is held on the GPU: compressed (the best block format the
+    // device holds) or RGBA8, switched under the running session.
+    imagery.push(Entry::Separator);
+    imagery.push(item("Compress Imagery", Ask::ToggleCompression));
     let time = vec![
         item("A Quarter of an Hour Back", Ask::Shift(-900)),
         item("A Quarter of an Hour On", Ask::Shift(900)),
@@ -767,6 +782,7 @@ impl Default for State {
             budget_window_cumulative: false,
             budget_window_tables: false,
             budget_window_issues: false,
+            compressed: false,
         }
     }
 }
@@ -889,6 +905,8 @@ mod tests {
             asset: 96188,
             on: true,
         });
+        // The imagery compressed, from the state it is in: off by default.
+        wanted.push(Command::Compression(tuile_wgpu::ImageryCompression::Auto));
         for command in wanted {
             assert!(reachable.contains(&command), "{command:?} is on no menu");
         }
@@ -919,6 +937,7 @@ mod tests {
             budget_window_cumulative: false,
             budget_window_tables: false,
             budget_window_issues: false,
+            compressed: true,
         };
         let marked: Vec<String> = items(&layers)
             .into_iter()
@@ -931,6 +950,7 @@ mod tests {
                 "Wireframe",
                 "Diagnostic View: Coverage",
                 "Aerial with labels",
+                "Compress Imagery",
                 "Specification of the Context",
                 "3D Tiles 96188"
             ]
@@ -1021,6 +1041,7 @@ mod tests {
             budget_window_cumulative: false,
             budget_window_tables: false,
             budget_window_issues: false,
+            compressed: true,
         };
         for (ask, command) in [
             (Ask::ToggleWireframe, Command::Wireframe(true)),
@@ -1039,6 +1060,10 @@ mod tests {
             (Ask::NextDiagnostic, Command::Diagnostic(0)),
             (Ask::NextImagery, Command::Imagery(0)),
             (Ask::Imagery(1), Command::Imagery(1)),
+            (
+                Ask::ToggleCompression,
+                Command::Compression(tuile_wgpu::ImageryCompression::Off),
+            ),
         ] {
             assert_eq!(ask.command(&now), command);
             assert_eq!(ask.command(&now), ask.command(&now));

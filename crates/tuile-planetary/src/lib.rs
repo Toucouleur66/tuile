@@ -589,24 +589,55 @@ impl Default for GlobeOptions {
 ///
 /// A texture is marked when it is decoded and keeps that mark in the decoded
 /// cache, so a plan set later applies to what is decoded from then on.
+///
+/// It may also carry the plan for tiles stored already compressed
+/// ([`Self::set_stored`]), for a consumer that changes its choice under a
+/// running session; until it does, the loader uses
+/// [`GlobeOptions::stored_imagery`].
 #[derive(Clone, Default)]
-pub struct ImageryPlanHandle(Arc<std::sync::Mutex<tuile_core::texels::ImageryPlan>>);
+pub struct ImageryPlanHandle(Arc<std::sync::Mutex<HeldPlans>>);
+
+#[derive(Clone, Copy, Default)]
+struct HeldPlans {
+    plan: tuile_core::texels::ImageryPlan,
+    stored: Option<tuile_core::texels::StoredPlan>,
+}
 
 impl ImageryPlanHandle {
     /// A handle that already reads `plan`.
     pub fn new(plan: tuile_core::texels::ImageryPlan) -> Self {
-        Self(Arc::new(std::sync::Mutex::new(plan)))
+        Self(Arc::new(std::sync::Mutex::new(HeldPlans {
+            plan,
+            stored: None,
+        })))
     }
 
     /// Declares the plan, as soon as the consumer's device says what it is.
     pub fn set(&self, plan: tuile_core::texels::ImageryPlan) {
         if let Ok(mut held) = self.0.lock() {
-            *held = plan;
+            held.plan = plan;
         }
     }
 
     pub fn get(&self) -> tuile_core::texels::ImageryPlan {
-        self.0.lock().map(|p| *p).unwrap_or_default()
+        self.0.lock().map(|p| p.plan).unwrap_or_default()
+    }
+
+    /// Declares what is done with tiles stored already compressed from now
+    /// on, in place of [`GlobeOptions::stored_imagery`]: a consumer's choice
+    /// changed under a running session.
+    pub fn set_stored(&self, stored: tuile_core::texels::StoredPlan) {
+        if let Ok(mut held) = self.0.lock() {
+            held.stored = Some(stored);
+        }
+    }
+
+    /// The stored plan declared through [`Self::set_stored`], else `options`.
+    pub fn stored_or(
+        &self,
+        options: tuile_core::texels::StoredPlan,
+    ) -> tuile_core::texels::StoredPlan {
+        self.0.lock().ok().and_then(|p| p.stored).unwrap_or(options)
     }
 }
 
@@ -1175,7 +1206,7 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
                     bytes: fetched.value,
                     scheme,
                     coord: c,
-                    stored: self.opts.stored_imagery,
+                    stored: self.opts.imagery_plan.stored_or(self.opts.stored_imagery),
                     plan: self.opts.imagery_plan.get(),
                 };
                 let (tex, black) = offload::run_portable(off.as_ref(), job)
@@ -2355,6 +2386,39 @@ mod tests {
             GlobeOptions::default().imagery_plan.get()
         );
         assert_eq!(off.stored_imagery, GlobeOptions::default().stored_imagery);
+    }
+
+    /// A choice changed under a running session reaches the loader through
+    /// the handle it shares: both plans, the stored one in place of the
+    /// options' from then on, and every clone of the handle sees it.
+    #[test]
+    fn a_choice_changed_under_a_session_reaches_both_plans() {
+        use tuile_core::texels::{GpuTextureCaps, ImageryCompression};
+        let caps = GpuTextureCaps {
+            bc: true,
+            astc: false,
+            compute: true,
+        };
+        let o = GlobeOptions::default().with_imagery_compression(ImageryCompression::Auto, caps);
+        let loader_side = o.imagery_plan.clone();
+        assert_eq!(
+            loader_side.stored_or(o.stored_imagery),
+            ImageryCompression::Auto.stored(caps),
+            "the options' until a change"
+        );
+        o.imagery_plan.set(ImageryCompression::Off.plan(caps));
+        o.imagery_plan
+            .set_stored(ImageryCompression::Off.stored(caps));
+        assert_eq!(loader_side.get(), ImageryCompression::Off.plan(caps));
+        assert_eq!(
+            loader_side.stored_or(o.stored_imagery),
+            ImageryCompression::Off.stored(caps)
+        );
+        assert_ne!(
+            ImageryCompression::Off.stored(caps),
+            ImageryCompression::Auto.stored(caps),
+            "the change is a change"
+        );
     }
 
     /// An imagery provider that refuses everything and counts being asked.

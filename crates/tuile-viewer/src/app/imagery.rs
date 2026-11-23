@@ -32,6 +32,11 @@ pub(super) struct Imagery {
     asking: Option<usize>,
     /// The layer asked for while another was resolving.
     waiting: Option<usize>,
+    /// The layer being served asked for again — every drape prepared anew,
+    /// in a new form of the same pictures (`compression`) — while another
+    /// was resolving: done once it has, unless a change of layer waiting
+    /// does it anyway.
+    again: bool,
     /// A switch that has been made and has not finished crossing the screen:
     /// when it was asked for, and the most imagery the GPU held on the way.
     turning: Option<Turning>,
@@ -53,6 +58,7 @@ impl Imagery {
             generation: 0,
             asking: None,
             waiting: None,
+            again: false,
             turning: None,
         }
     }
@@ -82,8 +88,23 @@ impl Imagery {
         true
     }
 
+    /// Notes that the layer being served is asked for again: a new
+    /// generation of the same pictures, every drape prepared anew and the old
+    /// one worn until its replacement is drawable. Returns the layer to
+    /// resolve now — `None` when another resolution is running, after which
+    /// it is done ([`Self::answered`]).
+    pub(super) fn ask_again(&mut self) -> Option<usize> {
+        if self.asking.is_some() {
+            self.again = true;
+            return None;
+        }
+        self.asking = Some(self.layer);
+        Some(self.layer)
+    }
+
     /// Notes how the resolution that was running ended. Returns the layer to
-    /// resolve next, if one was waiting and is still a change.
+    /// resolve next, if one was waiting and is still a change, or if the
+    /// layer served was asked for again meanwhile.
     pub(super) fn answered(&mut self, layer: usize, generation: Option<u64>) -> Option<usize> {
         self.asking = None;
         if let Some(generation) = generation {
@@ -91,8 +112,18 @@ impl Imagery {
             // Truncated as the engine truncates it: see `ImageryLayer::source`.
             self.generation = generation as u32;
         }
-        let next = self.waiting.take()?;
-        self.ask(next).then_some(next)
+        let again = std::mem::take(&mut self.again);
+        // A change of layer waiting is a new generation too: it prepares
+        // every drape anew by itself.
+        if let Some(next) = self.waiting.take() {
+            if self.ask(next) {
+                return Some(next);
+            }
+        }
+        if again {
+            return self.ask_again();
+        }
+        None
     }
 }
 
@@ -250,6 +281,34 @@ mod tests {
         assert_eq!(imagery.answered(0, None), None);
         assert_eq!((imagery.layer, imagery.generation), (2, 0));
         assert!(imagery.ask(0), "and it can be asked for again");
+    }
+
+    /// The layer served asked for again resolves at once, or — another
+    /// resolving — once that one has, unless a change of layer waiting
+    /// renews every drape by itself.
+    #[test]
+    fn the_layer_asked_for_again_waits_its_turn_and_is_not_lost() {
+        let mut imagery = Imagery::new(layers(), 1);
+        assert_eq!(imagery.ask_again(), Some(1), "nothing resolving: now");
+        assert_eq!(imagery.ask_again(), None, "one resolving: later");
+        assert_eq!(imagery.answered(1, Some(1)), Some(1), "and then");
+        assert_eq!(imagery.answered(1, Some(2)), None);
+        assert_eq!((imagery.layer, imagery.generation), (1, 2));
+        // Asked again while a change of layer resolves: that change may
+        // have taken its generation before the new form was declared, so
+        // the layer it lands on is asked again once it has.
+        assert!(imagery.ask(2));
+        assert_eq!(imagery.ask_again(), None);
+        assert_eq!(imagery.answered(2, Some(3)), Some(2));
+        assert_eq!(imagery.answered(2, Some(4)), None);
+        // With a further change waiting, asked after the new form was
+        // declared: that one renews every drape by itself, and goes alone.
+        assert!(imagery.ask(0));
+        assert_eq!(imagery.ask_again(), None);
+        assert!(!imagery.ask(1));
+        assert_eq!(imagery.answered(0, Some(5)), Some(1));
+        assert_eq!(imagery.answered(1, Some(6)), None);
+        assert_eq!((imagery.layer, imagery.generation), (1, 6));
     }
 
     /// The key goes round the list from the layer last asked for, so two

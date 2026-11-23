@@ -83,6 +83,8 @@ pub(crate) struct Snapshot {
     pub budget_window_tables: bool,
     /// Whether it lists only the levels with an issue.
     pub budget_window_issues: bool,
+    /// How the imagery is held on the GPU: the person's choice in force.
+    pub compression: tuile_wgpu::ImageryCompression,
 }
 
 impl Snapshot {
@@ -129,6 +131,7 @@ impl Snapshot {
             budget_window_cumulative: false,
             budget_window_tables: false,
             budget_window_issues: false,
+            compression: tuile_wgpu::ImageryCompression::Off,
         }
     }
 }

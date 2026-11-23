@@ -10,7 +10,9 @@
 
 use std::sync::{Arc, Mutex};
 use tuile_core::raster::{ImageryCoord, ImageryPool};
-use tuile_core::texels::{ImageryCompression, ImageryEncode, ImageryFormat, ImageryPlan};
+use tuile_core::texels::{
+    GpuTextureCaps, ImageryCompression, ImageryEncode, ImageryFormat, ImageryPlan,
+};
 
 use crate::compress::{Compressor, EncodeStats};
 use wgpu::util::DeviceExt;
@@ -182,6 +184,11 @@ pub struct GpuContext {
     /// How this context holds imagery: the consumer's plan, RGBA8 unless it
     /// chose otherwise. See [`Self::with_imagery_plan`].
     imagery_plan: ImageryPlan,
+    /// What the adapter this device came from can do with block-compressed
+    /// textures: what a choice made after the device exists is resolved
+    /// against ([`Self::set_imagery_compression`]). Nothing until the
+    /// consumer says ([`Self::with_texture_caps`]).
+    texture_caps: GpuTextureCaps,
     /// The GPU encoder, when the plan encodes on the GPU.
     pub(crate) compressor: Option<Mutex<Compressor>>,
     /// What the upload and release path asked of the device: see
@@ -329,6 +336,7 @@ impl GpuContext {
             imagery: Mutex::new(ImageryTextures::default()),
             imagery_slots,
             imagery_plan: ImageryPlan::RGBA8,
+            texture_caps: GpuTextureCaps::default(),
             compressor: None,
             ops: crate::ops::OpCounters::default(),
             chains: crate::chains::Chains::default(),
@@ -345,13 +353,53 @@ impl GpuContext {
     /// to RGBA8 — the plan is what [`Self::imagery_plan`] then reports, and
     /// what the consumer hands its loader. Off, the default, changes nothing.
     pub fn with_imagery_plan(mut self, plan: ImageryPlan) -> Self {
+        self.set_imagery_plan(plan);
+        self
+    }
+
+    /// What the adapter this device came from can do with block-compressed
+    /// textures ([`crate::texture_caps`]): what a choice made under a
+    /// running session is resolved against.
+    pub fn with_texture_caps(mut self, caps: GpuTextureCaps) -> Self {
+        self.texture_caps = caps;
+        self
+    }
+
+    /// See [`Self::with_texture_caps`].
+    pub fn texture_caps(&self) -> GpuTextureCaps {
+        self.texture_caps
+    }
+
+    /// Holds imagery as `plan` says from now on, under a running session;
+    /// returns the plan in force, which is RGBA8 where this device was not
+    /// created to sample the plan's format.
+    ///
+    /// What the GPU already holds stays as it is, and drawn: a texture is
+    /// complete and independent of the encoder that made it. Only what is
+    /// uploaded from now on follows the new plan — and texels marked for a
+    /// format the context no longer encodes upload as RGBA8, never as
+    /// nothing. Off lets go of the encoder and its scratch: no encode work,
+    /// no scratch bytes. The frame's uploads are submitted first, so no
+    /// record still waits on the encoder being let go.
+    pub fn set_imagery_plan(&mut self, plan: ImageryPlan) -> ImageryPlan {
         let sampled = crate::compress::plan_features(plan);
         let plan = if self.device.features().contains(sampled) {
             plan
         } else {
             ImageryPlan::RGBA8
         };
+        self.flush_uploads();
+        if let Ok(mut filed) = self.encoded.lock() {
+            filed.clear();
+        }
+        let keeps = |c: &Mutex<Compressor>| {
+            c.lock()
+                .is_ok_and(|c| Some(c.format()) == plan.target.block())
+        };
         self.compressor = match (plan.encode, plan.target.block()) {
+            (ImageryEncode::Gpu, Some(_)) if self.compressor.as_ref().is_some_and(keeps) => {
+                self.compressor.take()
+            }
             (ImageryEncode::Gpu, Some(format)) => Some(Mutex::new(Compressor::new(
                 &self.device,
                 &self.queue,
@@ -360,7 +408,14 @@ impl GpuContext {
             _ => None,
         };
         self.imagery_plan = plan;
-        self
+        plan
+    }
+
+    /// [`Self::set_imagery_plan`], from a person's choice resolved against
+    /// this context's [`texture_caps`](Self::with_texture_caps): what a
+    /// switch in a running session calls.
+    pub fn set_imagery_compression(&mut self, choice: ImageryCompression) -> ImageryPlan {
+        self.set_imagery_plan(choice.plan(self.texture_caps))
     }
 
     /// How this context holds imagery: what the consumer's loader is told.
@@ -505,6 +560,23 @@ impl GpuContext {
     /// adapter found: the device is created with the features the plan
     /// needs, and only those. Off is exactly [`Self::headless`].
     pub async fn headless_with(compression: ImageryCompression) -> Result<Self, ContextError> {
+        Self::headless_on(compression, false).await
+    }
+
+    /// [`Self::headless_with`], on a device that can also hold imagery as
+    /// any other choice the adapter can: what a consumer that lets a person
+    /// change the choice under a running session creates
+    /// ([`Self::set_imagery_compression`], [`crate::switchable_features`]).
+    pub async fn headless_switchable(
+        compression: ImageryCompression,
+    ) -> Result<Self, ContextError> {
+        Self::headless_on(compression, true).await
+    }
+
+    async fn headless_on(
+        compression: ImageryCompression,
+        switchable: bool,
+    ) -> Result<Self, ContextError> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -515,7 +587,10 @@ impl GpuContext {
             })
             .await
             .map_err(|e| ContextError::NoAdapter(e.to_string()))?;
-        let (plan, required_features) = crate::compress::plan_for(compression, &adapter);
+        let (plan, mut required_features) = crate::compress::plan_for(compression, &adapter);
+        if switchable {
+            required_features |= switchable_features(&adapter);
+        }
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("tuile headless"),
@@ -528,8 +603,21 @@ impl GpuContext {
             })
             .await
             .map_err(|e| ContextError::NoDevice(e.to_string()))?;
-        Ok(Self::new(device, queue).with_imagery_plan(plan))
+        Ok(Self::new(device, queue)
+            .with_texture_caps(crate::compress::texture_caps(&adapter))
+            .with_imagery_plan(plan))
     }
+}
+
+/// The features a device needs on top of its plan's for every other choice
+/// of imagery compression the adapter can hold to be switched to under a
+/// running session: each block format it samples, and timestamps for the
+/// encoder's pace. Requesting them costs nothing until a texture uses them.
+pub fn switchable_features(adapter: &wgpu::Adapter) -> wgpu::Features {
+    let wanted = wgpu::Features::TEXTURE_COMPRESSION_BC
+        | wgpu::Features::TEXTURE_COMPRESSION_ASTC
+        | wgpu::Features::TIMESTAMP_QUERY;
+    adapter.features() & wanted
 }
 
 #[cfg(test)]

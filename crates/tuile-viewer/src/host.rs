@@ -260,6 +260,13 @@ pub(crate) fn tilesets_on_file(host: &dyn Host) -> Option<PathBuf> {
     Some(support_dir(host)?.join("tilesets-on"))
 }
 
+/// Where the imagery compression a person chose in the menu is kept for the
+/// next session: one word, `auto`, `bc7` or `astc`; none when it is off.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn compression_file(host: &dyn Host) -> Option<PathBuf> {
+    Some(support_dir(host)?.join("imagery-compression"))
+}
+
 /// The file a token is read from, and the one a person is told to create.
 ///
 /// On a phone that is `Documents/token`: the one directory of an application

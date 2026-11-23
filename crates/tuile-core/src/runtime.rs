@@ -1149,6 +1149,15 @@ impl State {
                 self.budget.retarget(Bytes(total_bytes));
                 self.events.push(BudgetEvent::Retarget(Bytes(total_bytes)));
             }
+            ClientMessage::Reserve { class, bytes } => {
+                match self.budget.reserve(class, Bytes(bytes)) {
+                    Ok(()) => {
+                        tracing::info!(?class, bytes, "reserved off the budget's limits");
+                        self.events.push(BudgetEvent::Reserved(class, Bytes(bytes)));
+                    }
+                    Err(e) => tracing::warn!(?class, bytes, "reservation refused: {e}"),
+                }
+            }
             ClientMessage::Specify { query, overridden } => {
                 let spec = crate::budget::Specification::from_query(&query)
                     .and_then(|s| self.budget.specify(s.clone()).map(|()| s));
@@ -3214,6 +3223,41 @@ mod tests {
             charged(surface),
             Some(content().cost_held(false)),
             "a 3D Tiles mesh charged a CPU copy"
+        );
+    }
+
+    /// **A consumer's reservation follows its encoder**: `Reserve` takes
+    /// the scratch off the drapes' limits and gives it back, the step after
+    /// records it, and one past the hard limit is refused and changes
+    /// nothing. Red with the message ignored.
+    #[test]
+    fn a_reservation_is_taken_and_given_back_over_the_stream() {
+        let budget = roomy();
+        let meter: SharedMeter = Arc::new(Mutex::new(BudgetMeter::new(&budget)));
+        let mut state = State::new(
+            Config::default(),
+            Budget::new(budget.clone()).expect("budget"),
+            meter,
+        );
+        let (tx, _rx) = futures_channel::mpsc::unbounded();
+        let reserve = |bytes| ClientMessage::Reserve {
+            class: Class::Drape,
+            bytes,
+        };
+        state.on_client(reserve(1 << 20), &tx);
+        assert_eq!(state.budget.config().reserved[Class::Drape], Bytes(1 << 20));
+        assert!(state
+            .events
+            .contains(&BudgetEvent::Reserved(Class::Drape, Bytes(1 << 20))));
+        state.on_client(reserve(0), &tx);
+        assert_eq!(state.budget.config().reserved[Class::Drape], Bytes::ZERO);
+        let hard = budget.hard_limit[Class::Drape];
+        assert!(hard < Bytes::MAX, "the drapes have a hard limit to be past");
+        state.on_client(reserve(hard.0 + 1), &tx);
+        assert_eq!(
+            state.budget.config().reserved[Class::Drape],
+            Bytes::ZERO,
+            "a refused reservation changes nothing"
         );
     }
 

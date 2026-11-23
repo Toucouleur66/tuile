@@ -315,6 +315,33 @@ pub(crate) fn tilesets_kept_on(name: &str) -> Vec<i64> {
         .unwrap_or_default()
 }
 
+/// Where the imagery compression a person chose in the menu is kept for the
+/// next session of the viewer named `name`.
+fn compression_key(name: &str) -> String {
+    format!("tuile-viewer/imagery-compression/{name}")
+}
+
+/// Keeps `choice` for the next session; off, the default, forgets it.
+pub(crate) fn keep_compression(choice: tuile_wgpu::ImageryCompression) {
+    let Some(storage) = storage() else {
+        return;
+    };
+    let key = compression_key(&name());
+    let _ = if choice == tuile_wgpu::ImageryCompression::Off {
+        storage.remove_item(&key)
+    } else {
+        storage.set_item(&key, crate::app::compression_name(choice))
+    };
+}
+
+/// The imagery compression the last session of the viewer named `name`
+/// left, if it left one that reads as one.
+pub(crate) fn compression_kept(name: &str) -> Option<tuile_wgpu::ImageryCompression> {
+    storage()
+        .and_then(|s| s.get_item(&compression_key(name)).ok().flatten())
+        .and_then(|text| tuile_wgpu::compression_named(&text).ok())
+}
+
 /// Keeps `link` as the view the next session of this viewer opens on, or —
 /// with `None` — forgets the last one.
 pub(crate) fn keep_the_view(link: Option<&str>) {

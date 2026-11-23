@@ -188,6 +188,7 @@ async fn start(
         tracing::info!("the geometry server has stopped");
     });
     let handles = Handles {
+        plan: globe.plan,
         budget: globe.budget,
         layers: globe.layers,
         choices: layers,
@@ -301,6 +302,8 @@ fn breathe() -> tuile_core::runtime::Pause {
 
 /// The loader's handles, which the page's messages act on.
 struct Handles {
+    /// How the loader holds imagery: the page's device's plans.
+    plan: tuile_planetary::ImageryPlanHandle,
     budget: tuile_planetary::LayerBudget,
     layers: Layers,
     choices: Vec<crate::embed::ImageryChoice>,
@@ -344,6 +347,11 @@ impl Handles {
                     let outcome = layers.switch_to(layer, &choice).await;
                     post(&ToPage::Switched { layer, outcome });
                 });
+            }
+            Ok(ToWorker::Compression { imagery }) => {
+                tracing::info!(?imagery, "imagery, as the page's device now holds it");
+                self.plan.set(imagery.plan());
+                self.plan.set_stored(imagery.stored());
             }
             Ok(ToWorker::Telemetry { on }) => tuile_telemetry::set_metrics(on),
             Ok(ToWorker::Start { .. }) => tracing::warn!("a second start was ignored"),

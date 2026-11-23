@@ -27,7 +27,8 @@ pub use compress::{
     plan_for, stored_features, texture_caps, EncodeStats, ImageryCompression,
 };
 pub use context::{
-    ContextError, GpuContext, ImageryTextures, DEPTH_FORMAT, SAMPLES, TEXTURE_FORMAT,
+    switchable_features, ContextError, GpuContext, ImageryTextures, DEPTH_FORMAT, SAMPLES,
+    TEXTURE_FORMAT,
 };
 pub use host::{view_proj_from_world, DepthDirection, HostFrame, HostPass, TargetLayout};
 pub use ops::UploadOps;

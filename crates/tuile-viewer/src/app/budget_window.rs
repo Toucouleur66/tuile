@@ -479,6 +479,12 @@ pub(super) fn rows(
         since(s.encode_blocks_total, |f| f.encode_blocks_total),
         enc_sum as f64 / enc_count.max(1) as f64 / 1000.0,
     )));
+    // What the executor holds outside any resource, off the drapes' limits:
+    // the encoder's scratch while imagery is compressed, nothing once off.
+    out.push(line(format!(
+        "encoder scratch reserved {} MiB off the drapes",
+        mib(s.reserved_bytes[Class::Drape]),
+    )));
     if cumulative {
         let up: u64 = s.upload_bytes_total.iter().map(|(_, v)| v).sum();
         let up0: u64 = from.map_or(0, |(f, _)| {
@@ -684,6 +690,25 @@ mod tests {
             &row(&rows_reset, "0 base")[5..10],
             ["·", "6", "·", "6", "·"]
         );
+    }
+
+    /// The reservation in force is on the window: the encoder's scratch
+    /// while imagery is compressed, nought once it is switched off — the
+    /// budget's own number, so a switch is seen where its cost is.
+    #[test]
+    fn the_window_shows_the_reservation_in_force() {
+        let mut s = signals();
+        s.reserved_bytes[Class::Drape] = 3 << 20;
+        let shown = |s: &BudgetSignals| {
+            rows(s, None, false, &[])
+                .into_iter()
+                .filter_map(|r| r.into_iter().next())
+                .find(|l| l.starts_with("encoder scratch"))
+                .expect("the line")
+        };
+        assert_eq!(shown(&s), "encoder scratch reserved 3.0 MiB off the drapes");
+        s.reserved_bytes[Class::Drape] = 0;
+        assert_eq!(shown(&s), "encoder scratch reserved 0.0 MiB off the drapes");
     }
 
     /// The executor's lanes: deferrals by bytes and by encodes, apart, and

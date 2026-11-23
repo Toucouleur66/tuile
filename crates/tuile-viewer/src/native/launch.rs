@@ -83,6 +83,19 @@ impl Started {
         rx
     }
 
+    /// Tells the loader how imagery is held from now on — for a JPEG or PNG
+    /// tile, and for one stored already compressed: a choice changed under
+    /// the session (`crate::app::compression`). What is decoded from then
+    /// on is marked for it.
+    pub(crate) fn hold_imagery(
+        &self,
+        plan: tuile_core::texels::ImageryPlan,
+        stored: tuile_core::texels::StoredPlan,
+    ) {
+        self.imagery_plan.set(plan);
+        self.imagery_plan.set_stored(stored);
+    }
+
     /// How the loader holds imagery, for the window to tell it the device's
     /// plan.
     pub(crate) fn imagery_plan(&self) -> Option<&tuile_planetary::ImageryPlanHandle> {

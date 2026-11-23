@@ -59,6 +59,9 @@ pub enum BudgetEvent {
     Thermal(Thermal),
     /// `retarget`.
     Retarget(Bytes),
+    /// `reserve`: what the executor holds of a class outside any resource
+    /// from this step on.
+    Reserved(Class, Bytes),
     /// `new_epoch`.
     NewEpoch(Class, Option<LayerId>),
     /// `release_beyond`, and how many GPU copies it dropped.
@@ -1312,6 +1315,11 @@ impl BudgetObserver for BudgetMeter {
         s.drawn_tiles = [st.exact, st.held, st.fallback];
         s.fallback_depth_max = s.fallback_depth_max.max(st.fallback_depth_max);
         for e in r.events {
+            // The reservation in force, as the budget now takes it off the
+            // limits: a switch of the consumer's encoder is seen here.
+            if let BudgetEvent::Reserved(class, bytes) = e {
+                s.reserved_bytes[*class] = bytes.0;
+            }
             if let BudgetEvent::Specify(kind, _, overridden) = e {
                 s.spec = *kind;
                 s.spec_overridden = *overridden;
