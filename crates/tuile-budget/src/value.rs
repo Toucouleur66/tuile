@@ -333,9 +333,6 @@ pub struct DeficitInput {
     pub facts: Facts,
 }
 
-/// What a gap of levels over the need weighs against a gap under it, ‰.
-///
-
 /// When tile `d.tile`'s own drape becomes worth loading while it wears one
 /// `d.gap` levels under its need, or over it (`d.finer`, weighed the
 /// specification's `finer_gap_permille`: a drape worn finer than its need

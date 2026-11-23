@@ -184,7 +184,7 @@ fn settle(r: &mut Rig, need: &NeedSet, max: usize) -> Decisions {
     r.settle(need, max)
 }
 
-/// 1. The pinned floor (levels 0 to 2) stays resident under pressure: it is
+/// Test 1 — The pinned floor (levels 0 to 2) stays resident under pressure: it is
 /// loaded first, and the pressure that evicts the neighbourhood never takes
 /// it; the graded coarse levels go last, level 4 before level 3.
 #[test]
@@ -221,7 +221,7 @@ fn the_pinned_floor_stays_under_pressure_and_the_coarse_levels_go_last() {
     }
 }
 
-/// 2. An aggressive zoom-out from level 13, one level every two steps with
+/// Test 2 — An aggressive zoom-out from level 13, one level every two steps with
 /// no load completing on the way: every step's view is drawn exactly, with
 /// its own tiles — the neighbourhood held them already — and levels 11 and
 /// 12 were resident before the zoom-out began.
@@ -252,7 +252,7 @@ fn an_aggressive_zoom_out_from_level_13_finds_its_ground_resident() {
     }
 }
 
-/// 3. A rotation near the ground: the view turns from east to west; the
+/// Test 3 — A rotation near the ground: the view turns from east to west; the
 /// tiles the turn brings in were neighbours, resident, and draw at once.
 #[test]
 fn a_rotation_near_the_ground_finds_its_neighbours_resident() {
@@ -274,7 +274,7 @@ fn a_rotation_near_the_ground_finds_its_neighbours_resident() {
     assert_eq!(d.stats.fallback, 0, "the turn found coarser ground only");
 }
 
-/// 4. The release order follows the score: under a shrinking budget, every
+/// Test 4 — The release order follows the score: under a shrinking budget, every
 /// preload evicted scores no more than any preload still held (the
 /// present need and the floor apart).
 #[test]
@@ -322,7 +322,7 @@ fn the_release_order_follows_the_score() {
         .unwrap();
 }
 
-/// 5. The bound: what the need lists as preloads is at most `⌊π(ρ+1)²⌋` a
+/// Test 5 — The bound: what the need lists as preloads is at most `⌊π(ρ+1)²⌋` a
 /// level, and so at most the floor plus that many per level; the
 /// probabilities the budget gives them are those of the formula.
 #[test]
@@ -360,7 +360,7 @@ fn the_preloads_are_bounded_per_profile() {
     assert_eq!(a, CERTAIN * 2 / 10);
 }
 
-/// 6. Preloads go on in the background while the view is still, and never
+/// Test 6 — Preloads go on in the background while the view is still, and never
 /// delay the present need: a hole that opens while preloads hold the slots
 /// starts on the step it opens.
 #[test]
@@ -562,8 +562,10 @@ fn a_turn_re_keys_what_it_names_not_what_is_held() {
         // `held` copies at level 9 far from the view, then left.
         let side = (held as f64).sqrt().ceil() as u64;
         let bulk: Vec<TileId> = (0..held).map(|i| t(9, i % side, 300 + i / side)).collect();
-        let mut first = NeedSet::default();
-        first.drawn = bulk.iter().map(|&t| (t, need(t))).collect();
+        let first = NeedSet {
+            drawn: bulk.iter().map(|&t| (t, need(t))).collect(),
+            ..NeedSet::default()
+        };
         settle(&mut r, &first, 50);
         let east = View {
             reach: 3.0,
@@ -671,7 +673,7 @@ fn a_still_view_keeps_its_pools_under_the_headroom() {
 #[test]
 fn the_fine_preloads_left_behind_by_a_zoom_out_are_released() {
     let mut r = Rig::new(config(Bytes::mib(512), 4));
-    let (fx, fy) = (0.7071, 0.2929);
+    let (fx, fy) = (0.7083, 0.2917);
     let low = View::at(fx, fy, 13);
     settle(&mut r, &low.need(4), 600);
     let finer: Vec<TileId> = around(14, fx, fy, 4.0).into_iter().map(|(_, t)| t).collect();
@@ -807,9 +809,9 @@ fn at_rest_the_fine_levels_left_behind_are_released_in_both_tiers() {
     let count = |r: &Rig| {
         let h = r.b.held_report();
         let mut by = [0u32; 25];
-        for l in 0..25 {
+        for (l, n) in by.iter_mut().enumerate() {
             for b in 0..tuile_budget::score::DISTANCE_BANDS {
-                by[l] += h.board.cell(l, b, Side::Held).count;
+                *n += h.board.cell(l, b, Side::Held).count;
             }
         }
         (by[14..=19].iter().sum::<u32>(), by)

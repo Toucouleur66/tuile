@@ -1162,11 +1162,8 @@ impl BudgetSignals {
             out.push(("restore_cost_seconds", vec![("tier", tier)], us as f64 / 1e6));
         }
         for l in 0..LEVELS {
-            for b in 0..DISTANCE_BANDS {
-                let at = vec![
-                    ("level", labels::LEVEL[l]),
-                    ("distance", DISTANCE_BAND_LABELS[b]),
-                ];
+            for (b, band) in DISTANCE_BAND_LABELS.iter().enumerate() {
+                let at = vec![("level", labels::LEVEL[l]), ("distance", *band)];
                 let p = self.preload_by_level_distance[l][b];
                 let e = self.evictions_by_level_distance[l][b];
                 let total = |side| self.score_total.cell(l, b, side).count;
@@ -1218,14 +1215,14 @@ impl BudgetSignals {
         for (i, reason) in crate::score::RELEASE_REASONS.iter().enumerate() {
             out.push(("released_total", vec![("reason", reason)], self.released_total[i] as f64));
             for l in 0..LEVELS {
-                for b in 0..DISTANCE_BANDS {
+                for (b, band) in DISTANCE_BAND_LABELS.iter().enumerate() {
                     let v = self.released_by_level_distance[i][l][b];
                     if v > 0 || self.score_total.cell(l, b, Side::Evict).count > 0 {
                         out.push((
                             "released_by_level_distance",
                             vec![
                                 ("level", labels::LEVEL[l]),
-                                ("distance", DISTANCE_BAND_LABELS[b]),
+                                ("distance", *band),
                                 ("reason", reason),
                             ],
                             f64::from(v),
