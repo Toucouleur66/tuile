@@ -58,7 +58,7 @@ pub const ALLOWED: [&str; 16] = [
 ];
 
 /// The metric label keys a series may carry.
-pub const ALLOWED_LABELS: [&str; 25] = [
+pub const ALLOWED_LABELS: [&str; 26] = [
     // tuile_core::metrics: the per-level and per-eye series.
     "series",
     "level",
@@ -98,6 +98,9 @@ pub const ALLOWED_LABELS: [&str; 25] = [
     "q",
     "step",
     "quantile",
+    // The frame deadline's deferral lanes (`bytes`, `encode`:
+    // `tuile_budget_frame_deferred`, `tuile_budget_upload_deferred_total`).
+    "lane",
     // Histograms' bucket bound, where a recorder writes one as a label.
     "le",
 ];
