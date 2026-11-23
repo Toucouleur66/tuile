@@ -310,7 +310,12 @@ impl DecodedTileContent {
                 .sum::<u64>();
         let mut cost = mesh_cost(vertices, VERTEX_STRIDE, indices, cpu_copy);
         for t in &self.textures {
-            cost = cost.plus(t.cost());
+            // A texture a mesh owns is never compressed in place: only the
+            // shared imagery of a drape is (CB9).
+            let mut owned = t.cost();
+            owned.compressed = crate::budget::Bytes::ZERO;
+            owned.compress_blocks = 0;
+            cost = cost.plus(owned);
         }
         cost
     }
@@ -380,7 +385,8 @@ impl DrapeContent {
     ) -> crate::budget::cost::Cost {
         use crate::budget::cost::Cost;
         use crate::budget::Bytes;
-        self.tiles
+        let mut cost = self
+            .tiles
             .iter()
             .enumerate()
             .skip(self.floor_tiles)
@@ -402,15 +408,25 @@ impl DrapeContent {
                 // the GPU like `gpu`, shared alike; the blocks an encode
                 // writes are work, the whole tile's, like the bytes moved.
                 let share = |b: Bytes| b.scaled(ppm, 1_000_000);
+                // Compressed in place (CB9): the drape holds each tile
+                // compressed where it can be, as it is where it cannot.
+                let compressed = whole.compresses_to().unwrap_or(whole.gpu);
                 Cost {
                     gpu: share(whole.gpu),
                     staging: whole.staging,
                     transfer: share(whole.transfer),
                     transient: share(whole.transient),
                     encode_blocks: whole.encode_blocks,
+                    compressed: share(compressed),
+                    compress_blocks: whole.compress_blocks,
                 }
             })
-            .fold(Cost::default(), Cost::plus)
+            .fold(Cost::default(), Cost::plus);
+        if cost.compress_blocks == 0 {
+            // Nothing in it can be compressed: an identity, as it was.
+            cost.compressed = Bytes::ZERO;
+        }
+        cost
     }
 }
 
@@ -503,25 +519,30 @@ impl DecodedTexture {
         self.texels.resident()
     }
 
+    /// The format it is uploaded in, and held in until anything compresses
+    /// it (CB9).
+    pub fn uploaded_format(&self) -> crate::texels::ImageryFormat {
+        self.texels.uploaded()
+    }
+
     /// What it costs a consumer whole, mip chain included, in the format it
-    /// is held in: see [`Texels::cost`](crate::texels::Texels::cost).
+    /// is uploaded in: see [`Texels::cost`](crate::texels::Texels::cost).
     pub fn cost(&self) -> crate::budget::cost::Cost {
         self.texels.cost(self.width, self.height)
     }
 
-    /// What it costs held in `format` instead of the format it records: the
-    /// chain in that format, and the same bytes moved. A consumer that could
-    /// not hold it as planned — an encode that failed, a device without the
-    /// format — charges this.
+    /// What it costs uploaded in `format` instead of the format it crosses
+    /// in: the chain in that format, and the same bytes moved. A consumer
+    /// that could not upload it as it came — blocks its device cannot
+    /// sample, shown by a stand-in — charges this.
     pub fn cost_as(&self, format: crate::texels::ImageryFormat) -> crate::budget::cost::Cost {
         let planned = self.cost();
         let gpu =
             crate::budget::cost::drape_cost(self.width, self.height, format.cost_format()).gpu;
-        if format == self.resident_format() {
+        if format == self.uploaded_format() {
             return planned;
         }
-        // Held as it crossed (an encode that fell back): no encode, no
-        // transient; the same bytes moved.
+        // Held otherwise: nothing to compress, the same bytes moved.
         crate::budget::cost::Cost {
             transfer: planned.transfer.max(gpu),
             ..crate::budget::cost::Cost::new(gpu, planned.staging)
@@ -1142,29 +1163,58 @@ pub(crate) mod tests {
                     resident: ImageryFormat::from(format),
                 },
             };
+            // CB9: uploaded and held as RGBA8, a quarter once compressed in
+            // place.
             let gpu = drape(vec![whole(on_gpu)]).cost();
-            assert_eq!(gpu.gpu, Bytes(87_408), "{format:?}");
+            assert_eq!(gpu.gpu, Bytes(349_524), "{format:?}");
+            assert_eq!(gpu.compresses_to(), Some(Bytes(87_408)), "{format:?}");
+            assert_eq!(gpu.compress_blocks, 5_463, "{format:?}");
             assert_eq!(gpu.staging, rgba.staging, "{format:?}");
         }
     }
 
-    /// **A drape is acknowledged in the format each tile really went
-    /// resident in.** Planned as blocks and held as blocks, it is charged
-    /// what [`DrapeContent::cost`] says; a tile that had to stay RGBA8 (an
-    /// encode refused) is charged RGBA8, and the bytes moved do not change.
+    /// **A drape compresses what it can (CB9):** a tile the encoder does
+    /// not take is held compressed as it is, RGBA8, and a drape none of
+    /// whose tiles can be compressed is an identity cost.
     #[test]
-    fn a_drape_is_acknowledged_in_the_format_it_went_resident_in() {
+    fn a_drape_compresses_the_tiles_it_can() {
         use crate::budget::Bytes;
         use crate::texels::{ImageryFormat, Texels};
-        let planned = DecodedTexture {
-            width: 256,
-            height: 256,
+        let tile = |side: u32| DecodedTexture {
+            width: side,
+            height: side,
             texels: Texels::Rgba8 {
                 pixels: Vec::new(),
                 resident: ImageryFormat::Bc7,
             },
         };
-        let d = drape(vec![whole(planned)]);
+        let mut odd = whole(tile(250));
+        odd.coverage = [0.0, 0.0, 0.5, 1.0];
+        let mut even = whole(tile(256));
+        even.coverage = [0.5, 0.0, 1.0, 1.0];
+        let both = drape(vec![odd.clone(), even]).cost();
+        let half = |b: u64| Bytes(b / 2);
+        let odd_rgba8 = drape_cost(250, 250, TextureFormat::Rgba8).gpu;
+        assert_eq!(both.compress_blocks, 5_463);
+        assert_eq!(
+            both.compressed,
+            half(odd_rgba8.0).plus(half(87_408)),
+            "the odd tile's half held as RGBA8, the even one's as blocks"
+        );
+        let none = drape(vec![odd]).cost();
+        assert_eq!(none.compresses_to(), None);
+        assert!(none.is_identity());
+    }
+
+    /// **A drape is acknowledged in the format each tile really went
+    /// resident in.** Uploaded as it came, it is charged what
+    /// [`DrapeContent::cost`] says; blocks shown by an RGBA8 stand-in are
+    /// charged RGBA8, and the bytes moved do not change.
+    #[test]
+    fn a_drape_is_acknowledged_in_the_format_it_went_resident_in() {
+        use crate::budget::Bytes;
+        use crate::texels::{BlockFormat, ImageryFormat};
+        let d = drape(vec![whole(blocks_256(BlockFormat::Bc7))]);
         assert_eq!(d.cost_with(|_, t| t.texture.cost()), d.cost());
         assert_eq!(d.cost().gpu, Bytes(87_408));
         let fell_back = d.cost_with(|_, t| t.texture.cost_as(ImageryFormat::Rgba8));

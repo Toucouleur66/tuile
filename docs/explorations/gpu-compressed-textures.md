@@ -135,25 +135,33 @@ KTX 2.0 reader. No ETC1S, RDO, Zstd or ETC2.
 
 ## 5. The paths in the viewers
 
-### 5.1 Native, GPU encode (G1)
+### 5.1 Native, GPU compression in place (G1, CB9)
 
 - The loader decodes JPEG/PNG to RGBA8 as before and marks it with the
-  plan's target (`Texels::Rgba8 { resident }`), so the budget charges blocks.
-- At upload, `upload_texture` encodes it with `texcomp::GpuEncoder` and a
-  reused `EncoderScratch`, mip chain included, into a texture of the target
-  format; ready blocks upload row by row.
-- **Any encode that cannot be done uploads RGBA8**: a size that is not whole
-  blocks, a tile too large for the device, a context without an encoder.
-  `EncodeStats { encoded, fell_back, measured_ns_per_block }` counts them.
-- Pacing (CB5–CB6): the encodes run on the core's **encode lane**
-  (`FrameDeadline::encode_blocks`, `EncodeBucket`): each frame refills it
-  by its share — the deadline's upload time over the cost of a block,
-  measured with timestamps around the compute pass where the device has
-  `TIMESTAMP_QUERY`, 1,739 ns assumed until then — and each 256² tile
-  takes its 5,463 blocks, into debt by one tile at most: **no frame encodes
-  more than its share and one tile**. A drape of many tiles is encoded a
-  tile at a time over frames, the tiles held for it, the drape it replaces
-  drawn until it is acknowledged. `EncodePace` is gone.
+  plan's target (`Texels::Rgba8 { resident }`): **compressible**, not
+  compressed. Since CB9 (`compress-what-lasts.md`) it is **uploaded and
+  drawn as RGBA8 at once**, its texture kept readable (`COPY_SRC`), and
+  charged as RGBA8; its cost says what it would hold compressed
+  (`Cost::compressed`) and the blocks that writes (`Cost::compress_blocks`).
+- The graphics budget decides which resident drapes to compress — a high
+  enough probability of use (#289's score) and a copy that has lasted (2 s
+  drawable), highest value first; over the low watermark at once
+  (compression before eviction) — and says so (`Decisions::compress`,
+  `ServerMessage::Compress`).
+- The pump compresses them **in place** (`in_place.rs`): `texcomp` 0.4's
+  `encode_into` reads each resident RGBA8 texture, its whole chain,
+  straight from the GPU into a new BC7 / ASTC 4×4 texture; the new texture
+  replaces the old in the shared pool and in every drape naming it; the
+  RGBA8 one goes once nothing binds it. A drape done is acknowledged
+  (`ClientMessage::Compressed`) once the GPU has finished the frame.
+- **A tile that cannot be compressed stays RGBA8** — not whole blocks, a
+  tile the encoder refuses, a context without an encoder. Never a hole.
+- Pacing (CB5–CB6, #311): the compressions run on the core's **encode lane**
+  (`FrameDeadline::encode_blocks`, `EncodeBucket`), after the frame's
+  uploads, in the frame's measured headroom over the cost of a block — a
+  tile at a time, into debt by one tile at most: **no frame compresses
+  more than its share and one tile**, and **no upload waits for an
+  encode**.
 - The viewer: `--imagery-compression off|auto|bc7|astc` (also on the headless
   runner), and *Settings › Tuile › Imagery compression* on iOS, read at
   launch. The status line shows what is held, e.g. `imagery BC7 31 MiB`.

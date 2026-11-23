@@ -191,6 +191,11 @@ pub struct Decisions {
     pub release: Vec<ResourceId>,
     /// The consumer's uploads this frame.
     pub upload_plan: UploadPlan,
+    /// GPU copies to compress in place (CB9: display at once, compress
+    /// what lasts), in the order to compress them: each in its frames'
+    /// spare GPU time, the compressed copy made and bound before the RGBA8
+    /// one goes, then acknowledged with `Budget::on_compressed`.
+    pub compress: Vec<(ResourceId, Generation)>,
     /// What to draw.
     pub draw: DrawSet,
     /// The LOD relaxation fed back to the traversal, in thousandths
@@ -222,6 +227,7 @@ impl Decisions {
         self.evict.clear();
         self.release.clear();
         self.upload_plan.clear();
+        self.compress.clear();
         self.sse_scale_milli = 0;
         self.frame_ready = false;
         self.fatal = None;
@@ -286,6 +292,16 @@ impl Decisions {
             h.u64(i.serves.len() as u64);
             for t in &i.serves {
                 h.u64(t.0);
+            }
+        }
+        // Only when something is compressed (CB9): a digest without
+        // compression is the one it was.
+        if !self.compress.is_empty() {
+            h.u64(0xc0_4d_9e55);
+            h.u64(self.compress.len() as u64);
+            for (r, g) in &self.compress {
+                h.resource(*r);
+                h.u64(g.0);
             }
         }
         h.u64(u64::from(self.sse_scale_milli));

@@ -1028,9 +1028,10 @@ fn pattern_goldens_hold() {
     assert_eq!(got, want);
 }
 
-/// CB3: the compressed clients hold their drapes in blocks — a quarter of
-/// RGBA8 a drape, give or take the small levels and the fallbacks — and every encode that fell back
-/// reaches the budget as a fallback, one for one, never as drift (checked
+/// CB3, CB9: the compressed clients hold their drapes in blocks once they
+/// have lasted — a quarter of RGBA8 a drape, give or take the small levels,
+/// the refusals and the preloads the score leaves RGBA8 — and every
+/// compression refused reaches the budget as refused, one for one (checked
 /// every step by `Sim::check`), on a desktop, a phone, a page on WebGL2 and
 /// a 90 Hz headset.
 #[test]
@@ -1052,7 +1053,7 @@ fn compressed_clients_hold_blocks_and_their_fallbacks_are_counted() {
         let counted: u64 = sim
             .log
             .iter()
-            .map(|l| u64::from(l.stats.fallbacks[Class::Drape]))
+            .map(|l| u64::from(l.stats.fallbacks[Class::Drape] + l.stats.compress.refused))
             .sum();
         // The drapes it holds, against the same drapes as RGBA8.
         let as_rgba8 = sim
@@ -1063,7 +1064,7 @@ fn compressed_clients_hold_blocks_and_their_fallbacks_are_counted() {
             .fold(0u64, |a, r| a + super::world::cost(*r).gpu.0);
         let held = sim.gpu.bytes[Class::Drape].0;
         assert!(
-            held > 0 && held * 3 < as_rgba8,
+            held > 0 && held * 2 < as_rgba8,
             "{name}: drapes hold {held} bytes, {as_rgba8} as RGBA8"
         );
         let fell = sim.gpu.fallbacks;

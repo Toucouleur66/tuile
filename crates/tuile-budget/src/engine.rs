@@ -356,6 +356,10 @@ pub(super) struct Scratch {
     transit: Vec<(PriorityKey, Bytes, (u8, TileId), bool)>,
     /// What the step's read-only passes walk, added to its `work`.
     walked: std::sync::atomic::AtomicU32,
+    /// The copies the compression pass visits, and those it finds
+    /// eligible (CB9).
+    pub(super) compress_visit: Vec<ResourceId>,
+    pub(super) compress_found: Vec<super::compress_pass::Found>,
 }
 
 /// What a step can evict beyond the arena's idle bytes: the grouped GPU
@@ -789,8 +793,12 @@ impl Budget {
                         continue;
                     };
                     let a = &mut self.arena;
+                    // The cost it was delivered at, once drawable: what
+                    // the compression reads of it (CB9).
+                    let mut landed = None;
                     if a.transit(s).is_some_and(|t| t.gen == g) {
                         if let Some(t) = a.take_transit(s, &mut self.ledger) {
+                            landed = Some(t.cost);
                             if t.cost.is_fallback(actual) {
                                 // An encode that fell back to the form it
                                 // crossed in: charged as it is held, and
@@ -817,6 +825,7 @@ impl Budget {
                         // Uploaded although its delivery was withdrawn: the
                         // GPU holds it, so the ledger does.
                         let epoch = a.cpu(s).map(|c| c.epoch).unwrap_or(0);
+                        landed = a.cpu(s).map(|c| c.cost);
                         a.put_gpu(
                             s,
                             &mut self.ledger,
@@ -829,6 +838,12 @@ impl Budget {
                     } else {
                         st.stale += 1;
                     }
+                    if let Some(cost) = landed {
+                        self.compress_admit(r, g, now, cost, actual);
+                    }
+                }
+                Event::Compressed(r, g, actual) => {
+                    self.compress_done(r, g, actual, st);
                 }
                 Event::Discarded(r, g) => {
                     let Some(s) = self.arena.find(r) else {
@@ -1987,7 +2002,12 @@ impl Budget {
         picked = std::mem::take(&mut self.scratch.picked);
         st.work = st.work.saturating_add(sat_u32(self.arena.transits_len()));
 
-        // 9. Eviction and release.
+        // 9. Compression before eviction (CB9, law 4), then eviction and
+        // release.
+        if !eff.batch {
+            let (pressed, hard) = self.compress_limits(&eff);
+            self.compress_pass(now, eff.encode, &hard, &pressed, d, &mut st);
+        }
         if !eff.batch {
             self.evict(now, &eff, wants, d, &mut st);
         }
@@ -2367,6 +2387,43 @@ impl Budget {
                 st.recycled[class][2] += 1;
             }
         }
+    }
+
+    /// What the compression pass weighs per class (CB9): whether the class
+    /// is over its low watermark — where a sweep or a delivery's room
+    /// starts evicting — once the compressions in flight are acknowledged,
+    /// or the platform signals pressure: then compressing comes before
+    /// evicting (law 4). And its hard limit, which no compression's
+    /// transient crosses.
+    fn compress_limits(&self, eff: &Eff) -> (PerClass<bool>, PerClass<Bytes>) {
+        let w = self.cfg.watermarks;
+        let pct = |b: Bytes| b.scaled(u64::from(w.low_percent), 100);
+        let settled = self.settled();
+        let signalled = self.pressure != Pressure::Normal;
+        let pool_over = eff.pool.is_some_and(|p| {
+            let used = Class::ALL
+                .iter()
+                .filter(|c| p.members[**c])
+                .fold(Bytes::ZERO, |a, c| a.plus(settled.gpu[*c]));
+            used > pct(p.target)
+        });
+        let pressed = PerClass::from_fn(|c| {
+            signalled
+                || match eff.pool {
+                    Some(p) if p.members[c] => {
+                        pool_over || settled.gpu[c] > pct(p.ceil_target[c])
+                    }
+                    _ => eff.target[c] != Bytes::MAX && settled.gpu[c] > pct(eff.target[c]),
+                }
+        });
+        let hard = PerClass::from_fn(|c| match eff.pool {
+            Some(p) if p.members[c] => {
+                let target = p.target(c, &self.ledger.gpu);
+                p.hard(c, &self.ledger.gpu, target)
+            }
+            _ => eff.hard[c],
+        });
+        (pressed, hard)
     }
 
     fn protected_bytes(&self) -> PerClass<Bytes> {
@@ -3222,7 +3279,9 @@ impl Budget {
             if eff.pool.is_some_and(|p| p.members[class]) {
                 continue;
             }
-            let used = self.ledger.gpu[class];
+            // What the compressions in flight give back counts as given
+            // back (CB9, law 4): the sweep evicts what they cannot free.
+            let used = self.settled().gpu[class];
             let high = eff.target[class].scaled(u64::from(w.high_percent), 100);
             let low = eff.target[class].scaled(u64::from(w.low_percent), 100);
             if used <= high {
@@ -3242,7 +3301,7 @@ impl Budget {
             while let Some(((.., r), s)) =
                 walk.next(&self.arena, grouped, |c| c == class, &Held::GPU)
             {
-                if self.ledger.gpu[class] <= low {
+                if self.settled().gpu[class] <= low {
                     break;
                 }
                 st.work = st.work.saturating_add(1);
@@ -3499,12 +3558,14 @@ impl Budget {
         // to its own low one, as a class outside the pool is.
         let ceiling_high = |c: Class| pct(p.ceil_target[c], w.high_percent);
         let ceiling_low = |c: Class| pct(p.ceil_target[c], w.low_percent);
+        // What the compressions in flight give back counts as given back
+        // (CB9, law 4).
         let high = pct(p.target, w.high_percent);
-        let pool_over = used(&self.ledger) > high;
+        let pool_over = used(&self.settled()) > high;
         if !pool_over
             && Class::ALL
                 .iter()
-                .all(|c| !(p.members[*c] && self.ledger.gpu[*c] > ceiling_high(*c)))
+                .all(|c| !(p.members[*c] && self.settled().gpu[*c] > ceiling_high(*c)))
         {
             return;
         }
@@ -3537,8 +3598,8 @@ impl Budget {
         let mut law = self.sweep_law();
         for lawful in [true, false] {
             let mut over: PerClass<bool> =
-                PerClass::from_fn(|c| p.members[c] && self.ledger.gpu[c] > ceiling_high(c));
-            let pool_over = used(&self.ledger) > high;
+                PerClass::from_fn(|c| p.members[c] && self.settled().gpu[c] > ceiling_high(c));
+            let pool_over = used(&self.settled()) > high;
             if !pool_over && Class::ALL.iter().all(|c| !over[*c]) {
                 break;
             }
@@ -3572,17 +3633,18 @@ impl Budget {
                     self.arena.class(s),
                     self.arena.gpu(s).map_or(Bytes::ZERO, |g| g.bytes),
                 );
+                let settled = self.settled();
                 for c in Class::ALL {
-                    over[c] &= self.ledger.gpu[c] > ceiling(c);
+                    over[c] &= settled.gpu[c] > ceiling(c);
                 }
-                let pool_trim = pool_over && used(&self.ledger) > pool_bound;
+                let pool_trim = pool_over && used(&settled) > pool_bound;
                 if !pool_trim && Class::ALL.iter().all(|c| !over[*c]) {
                     break;
                 }
                 // Over its ceiling it goes; for the pool's sake, only down to
                 // its floor.
                 let goes = over[class]
-                    || (pool_trim && self.ledger.gpu[class].minus(bytes) >= floor(class));
+                    || (pool_trim && settled.gpu[class].minus(bytes) >= floor(class));
                 if goes {
                     let why = (!lawful).then_some(Reason::Fit);
                     self.evict_as(now, s, class, why, d, st);
@@ -3642,6 +3704,8 @@ impl Budget {
         st: &mut BudgetStats,
     ) {
         let r = self.arena.id(s);
+        // A compression in flight goes with its copy.
+        self.compress.flights.remove(&r);
         let why = if self.pressure == Pressure::Normal {
             EvictReason::Sweep
         } else {

@@ -327,9 +327,12 @@ async fn settle<S: GeometryStream + Unpin>(
             // Delivered and taken back before it was held: never counted.
             // The probe shows no window, so it holds nothing back on the
             // coarse pyramid's account.
+            // Held decoded, it never compresses anything (CB9): it is
+            // never asked to, its imagery uncompressed.
             ServerMessage::Cancel { .. }
             | ServerMessage::Select { .. }
-            | ServerMessage::Priming(_) => {}
+            | ServerMessage::Priming(_)
+            | ServerMessage::Compress { .. } => {}
         }
     }
     let drawn: Vec<_> = scene

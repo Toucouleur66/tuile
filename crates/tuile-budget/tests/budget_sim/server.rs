@@ -206,7 +206,7 @@ impl Profile {
 
     /// `self`, its imagery held as `plan` says, named `name`; a GPU plan's
     /// encodes fall back one time in a hundred.
-    fn compressed(mut self, name: &'static str, plan: SimPlan) -> Self {
+    pub fn compressed(mut self, name: &'static str, plan: SimPlan) -> Self {
         self.name = name;
         self.plan = plan;
         self.fallback_permille = if plan == SimPlan::Gpu { 10 } else { 0 };
@@ -712,6 +712,9 @@ impl Sim {
             let at = &self.evicted_at;
             self.evicted_why.retain(|r, _| at.contains_key(r));
         }
+        for (r, g, _, b) in std::mem::take(&mut self.gpu.compressed) {
+            self.budget.on_compressed(r, g, b);
+        }
         for (r, g, b) in acks {
             if let Some(at) = self.wanted_at.remove(&r) {
                 self.waits
@@ -849,9 +852,20 @@ impl Sim {
                         let c = super::world::cost_for(*r, self.profile.plan);
                         a.plus(c.gpu.plus(c.transient))
                     });
+            // Compressed this frame, its acknowledgement not read yet: the
+            // budget still charges both copies (CB9).
+            let compressed = self
+                .gpu
+                .compressed
+                .iter()
+                .filter(|(r, ..)| class_of(*r) == c)
+                .fold(Bytes::ZERO, |a, (_, _, charged, now)| {
+                    a.plus(charged.minus(*now))
+                });
             let held = self.gpu.bytes[c]
                 .plus(pending)
                 .plus(estimated)
+                .plus(compressed)
                 .minus(acknowledged);
             if d.stats.gpu[c] != held {
                 self.fail(&format!(
@@ -921,6 +935,22 @@ impl Sim {
     fn check(&self, need: &NeedSet, d: &Decisions, views: &[View]) {
         let s = &d.stats;
         let cfg = &self.profile.budget;
+        // CB9: only a drape is compressed in place, each once a step, what
+        // the policy found eligible, within the step's lane — and nothing
+        // where nothing can be compressed.
+        let c = &s.compress;
+        let mut asked = BTreeSet::new();
+        for (r, _) in &d.compress {
+            if !matches!(r, ResourceId::Drape { .. }) || !asked.insert(*r) {
+                self.fail(&format!("CB9: {r:?} asked to be compressed"));
+            }
+        }
+        if c.started as usize != d.compress.len() || c.started > c.eligible {
+            self.fail(&format!("CB9: {c:?} for {} asked", d.compress.len()));
+        }
+        if self.profile.plan != SimPlan::Gpu && (c.waiting > 0 || !d.compress.is_empty()) {
+            self.fail(&format!("CB9: {c:?} with nothing compressible"));
+        }
         // I1 (D-A1): every drawn item wears its drapes, from the first step.
         if s.bare != 0 {
             self.fail(&format!("I1: {} items drawn bare", s.bare));
@@ -1133,6 +1163,16 @@ impl Sim {
             })
             .max()
             .unwrap_or(0)
+    }
+
+    /// The drapes on the GPU of the tiles the last step drew (CB9).
+    pub fn drawn_drapes(&self) -> Vec<ResourceId> {
+        self.gpu
+            .drawable
+            .keys()
+            .filter(|r| matches!(r, ResourceId::Drape { tile, .. } if self.drawn_last.contains(tile)))
+            .copied()
+            .collect()
     }
 
     /// Runs `script` from `t0` for `secs` seconds of simulated time.

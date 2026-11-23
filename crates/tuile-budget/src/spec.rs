@@ -301,6 +301,34 @@ pub const PROGRESSIVE: Progressive = Progressive {
     coarse_boost_permille: 950,
 };
 
+/// When a texture held RGBA8 is compressed in place on the GPU (CB9:
+/// display at once, compress what lasts): the laws of
+/// `docs/explorations/compress-what-lasts.md`. A copy is compressed when
+/// its probability of use is high enough **and** it has lasted — the
+/// expected residency, by its age (a copy that has stayed is likely to
+/// stay): the hot, freshly needed copy stays RGBA8, as a page just touched
+/// stays out of a compressed-memory pool. Under pressure the age is
+/// waived: compressing comes before evicting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Compress {
+    /// The least probability of use, ‰ of certainty, of a copy compressed:
+    /// below it the copy stays RGBA8 and is released as such.
+    pub probability_permille: u16,
+    /// The least time a copy has been drawable before it is compressed.
+    pub after: Micros,
+    /// The compressible copies a step looks at: the bound of the pass.
+    pub visits: u16,
+}
+
+/// The defaults: a quarter of certainty (a neighbour one radius away, two
+/// levels over the need, the graded coarse levels), two seconds drawable,
+/// 64 copies a step.
+pub const COMPRESS: Compress = Compress {
+    probability_permille: 250,
+    after: Micros::from_secs(2),
+    visits: 64,
+};
+
 /// The room kept free under each target by default, ‰: none until a value
 /// is chosen — 12.5 % was measured to cost the soak's revisits (the
 /// cache it keeps out), `tuile://budget?headroom=125` tries it.
@@ -385,6 +413,8 @@ pub struct Params {
     /// What a drape worn finer than its need weighs against one worn as
     /// much coarser, ‰ (#277's over-need deficit).
     pub finer_gap_permille: u16,
+    /// When a texture held RGBA8 is compressed in place (CB9).
+    pub compress: Compress,
 }
 
 /// The policy of the decider: rules and numbers. See the [module
@@ -476,6 +506,7 @@ impl Specification {
                 sweep_keep_poses: SWEEP_KEEP_POSES,
                 rho_tiles: 0,
                 finer_gap_permille: FINER_GAP,
+                compress: COMPRESS,
             },
         }
     }
@@ -532,6 +563,7 @@ impl Specification {
                 sweep_keep_poses: SWEEP_KEEP_POSES,
                 rho_tiles: 0,
                 finer_gap_permille: FINER_GAP,
+                compress: COMPRESS,
             },
         }
     }
@@ -595,6 +627,7 @@ impl Specification {
                 sweep_keep_poses: SWEEP_KEEP_POSES,
                 rho_tiles: 0,
                 finer_gap_permille: FINER_GAP,
+                compress: COMPRESS,
             },
         }
     }
@@ -705,6 +738,9 @@ impl Specification {
             ("sweep_keep_poses", u64::from(p.sweep_keep_poses), 36_000),
             ("rho", u64::from(p.rho_tiles), 16),
             ("finer_gap", u64::from(p.finer_gap_permille), 1_000),
+            ("compress_p", u64::from(p.compress.probability_permille), 1_000),
+            ("compress_after_ms", p.compress.after.0 / 1_000, 60_000),
+            ("compress_visits", u64::from(p.compress.visits), 4_096),
         ];
         if let Some((name, ..)) = bounded.iter().find(|(_, v, max)| v > max) {
             return Err(SpecError::OutOfBounds(name));
@@ -741,7 +777,7 @@ impl Specification {
              &restore_decoded_ms={}&restore_stored_ms={}&restore_http_cache_ms={}\
              &restore_remote_ms={}&p_ring={}&p_ancestor={}&a0={}&a_desc={}&headroom={}&floor_value={}\
              &release_visits={}&rho={}&finer_gap={}&coarse_from={}&coarse_boost={}\
-             &sweep_keep_poses={}",
+             &sweep_keep_poses={}&compress_p={}&compress_after_ms={}&compress_visits={}",
             self.kind.label(),
             p.margin_permille,
             ms(p.min_dwell),
@@ -766,6 +802,9 @@ impl Specification {
             p.progressive.coarse_from,
             p.progressive.coarse_boost_permille,
             p.sweep_keep_poses,
+            p.compress.probability_permille,
+            ms(p.compress.after),
+            p.compress.visits,
         );
         // A term's weight when all its rules share one; a term weighed
         // differently by predicate (FPV's recency) keeps its kind's rules.
@@ -829,6 +868,9 @@ impl Specification {
                 "finer_gap" => p.finer_gap_permille = n16,
                 "coarse_from" => p.progressive.coarse_from = n16,
                 "coarse_boost" => p.progressive.coarse_boost_permille = n16,
+                "compress_p" => p.compress.probability_permille = n16,
+                "compress_after_ms" => p.compress.after = millis,
+                "compress_visits" => p.compress.visits = n16,
                 _ => match k
                     .strip_prefix("w_")
                     .and_then(|t| Term::ALL.into_iter().find(|x| term_key(*x) == t))
