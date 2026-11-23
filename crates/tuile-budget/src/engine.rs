@@ -2812,16 +2812,18 @@ impl Budget {
         if !eff.batch {
             let shrinking = matches!(r, ResourceId::Mesh(t) if coarsening.contains_key(&t));
             let urgent = matches!(w.urgency, Urgency::Floor | Urgency::Hole | Urgency::Drape);
-            let preload = w.urgency >= Urgency::Ring;
+            // Speculation — the ring, a refresh — waits under the headroom;
+            // the chain of ancestors is what is drawn's fallback (coverage)
+            // and takes the room the present need takes.
+            let preload = matches!(w.urgency, Urgency::Ring | Urgency::Refresh);
             let mut limit = if shrinking {
                 eff.hard[class]
             } else if urgent {
                 eff.hard[class].minus(eff.reserve[class])
             } else if preload {
-                // Preload only into room the view does not use, under the
-                // headroom, and it never displaces anything wanted.
-                self.headroom(eff.target[class])
-                    .scaled(u64::from(self.cfg.watermarks.low_percent), 100)
+                // Preload only into room the view does not use, and it
+                // never displaces anything wanted.
+                eff.target[class].scaled(u64::from(self.cfg.watermarks.low_percent), 100)
             } else {
                 eff.target[class].min(eff.hard[class].minus(eff.reserve[class]))
             };
@@ -2834,7 +2836,7 @@ impl Budget {
                 } else if urgent {
                     p.hard.minus(reserve)
                 } else if preload {
-                    self.headroom(p.target)
+                    p.target
                         .scaled(u64::from(self.cfg.watermarks.low_percent), 100)
                 } else {
                     p.target.min(p.hard.minus(reserve))
@@ -2843,6 +2845,15 @@ impl Budget {
             }
             if preload && (*strained || *blocked) {
                 return;
+            }
+            // Speculation waits while the specification's fixed headroom
+            // is short (0 by default) — it never evicts to make that room.
+            if preload {
+                let h = u64::from(self.spec.params.headroom_permille.min(1_000));
+                let line = eff.target[class].scaled(1_000 - h, 1_000);
+                if h > 0 && self.ledger.gpu[class].plus(c.cost.gpu) > line {
+                    return;
+                }
             }
             let mut strain = false;
             let prob = super::value::probability(
@@ -3063,8 +3074,14 @@ impl Budget {
             "the room counts the bytes of its residents still evictable"
         );
         let w = self.cfg.watermarks;
+        // Stuck: relaxed, and nothing loading or starting — the detail can
+        // only come back once every class is under its low watermark.
+        let stuck = self.relaxing()
+            && d.start.is_empty()
+            && self.local_reads == 0
+            && self.in_flight.iter().all(|(_, n)| n == 0);
         if let Some(p) = eff.pool {
-            self.evict_pooled(now, p, wants, d, st);
+            self.evict_pooled(now, p, wants, stuck, d, st);
         }
         for class in Class::ALL {
             if eff.pool.is_some_and(|p| p.members[class]) {
@@ -3076,10 +3093,9 @@ impl Budget {
             // Relaxed, the level of detail comes back only once every class
             // is under its low watermark (`relax`): a class held between
             // the watermarks by copies nobody draws would keep the picture
-            // coarse, and nothing loading, for ever — the lowest scores go
-            // down to the low watermark then too.
-            let stuck = self.relaxing() && used > low;
-            if used <= high && !stuck {
+            // coarse, and nothing loading, for ever — stuck so, the lowest
+            // scores go down to the low watermark too.
+            if used <= high && !(stuck && used > low) {
                 continue;
             }
             let room = match self.scratch.room.take() {
@@ -3110,13 +3126,11 @@ impl Budget {
         // Only a step under pressure built one: nothing kept across steps.
         self.scratch.room = None;
         self.release_below_floor_value(now, d, st);
-        // The decoded tier: over its target, down to the headroom under it
-        // — a copy demoted from the GPU is what a turn back finds without
-        // the network, so it is not released below the target for room's
-        // sake alone.
+        // The decoded tier: over its target, down to it — a copy demoted
+        // from the GPU is what a turn back finds without the network, so it
+        // is not released below the target for room's sake alone.
         if self.ledger.decoded > eff.decoded {
-            let decoded = self.headroom(eff.decoded);
-            self.release_decoded(decoded, d, st);
+            self.release_decoded(eff.decoded, d, st);
         }
     }
 
@@ -3312,6 +3326,7 @@ impl Budget {
         now: Micros,
         p: PoolEff,
         wants: Wants<'_>,
+        stuck: bool,
         d: &mut Decisions,
         st: &mut BudgetStats,
     ) {
@@ -3334,7 +3349,7 @@ impl Budget {
         // Relaxed and between the watermarks: down to the low one, so the
         // detail can come back (`relax`).
         let pool_over = used(&self.ledger) > high
-            || (self.relaxing() && used(&self.ledger) > pct(p.target, w.low_percent));
+            || (stuck && used(&self.ledger) > pct(p.target, w.low_percent));
         if !pool_over && Class::ALL.iter().all(|c| !over[*c]) {
             return;
         }

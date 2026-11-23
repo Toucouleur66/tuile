@@ -121,8 +121,11 @@ The score orders the value band only. Before it, in this order and whatever the 
   the larger of the specification's fixed share (`headroom_permille`, default 0) and the
   dynamic one: the measured upload rate (bytes delivered a second, smoothed over 0.5 s) over
   the horizon, plus the bytes in transit — about nothing at rest (a revisit finds its cache),
-  the next second of uploads in motion (84 MB on the test's pan at 512 MiB). The decoded
-  tier, once over its target, is released down to the same line. A GPU class (or the pool)
+  the next second of uploads in motion (84 MB on the test's pan at 512 MiB). The headroom
+  holds speculation back (the ring, a refresh); the chain of ancestors of what is drawn is
+  coverage and takes the room the present need takes. The decoded tier, over its target, is
+  released down to it (a turn back finds its demoted copies there: releasing it to the
+  dynamic line made a turn and back refetch 115 tiles in the simulation). A GPU class (or the pool)
   over its target is swept down to its low watermark, lowest scores first, not bounded per
   step, so need never waits while low scores hold the pools.
 - **What left the need goes.** A copy that leaves the need keeps a 64th of its probability
