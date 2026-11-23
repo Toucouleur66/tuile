@@ -3172,6 +3172,14 @@ impl Budget {
         }
     }
 
+    /// Whether `s`, no longer wanted, is of a level more than one finer than
+    /// what the view needs now: nothing selects it soon, it goes once out
+    /// of the need for the thrash window, whatever it was.
+    fn far_finer(&self, s: Slot) -> bool {
+        self.need_level
+            .is_some_and(|n| self.arena.level(s) > n.saturating_add(1))
+    }
+
     /// `target` less the headroom: the larger of the specification's fixed
     /// share and the dynamic one — the measured upload rate over the
     /// horizon, plus the bytes in transit: about nothing at rest, the next
@@ -3233,7 +3241,7 @@ impl Budget {
                 .cold(s)
                 .unneeded_since()
                 .is_some_and(|t| now.since(t) >= super::THRASH_WINDOW);
-            if p < floor
+            if (p < floor || self.far_finer(s))
                 && long_gone
                 && a.has_gpu(s)
                 && !a.has_transit(s)
@@ -3258,7 +3266,7 @@ impl Budget {
                 .cold(s)
                 .unneeded_since()
                 .is_some_and(|t| now.since(t) >= super::THRASH_WINDOW);
-            if p < floor && long_gone && a.has_cpu(s) && !a.has_transit(s) {
+            if (p < floor || self.far_finer(s)) && long_gone && a.has_cpu(s) && !a.has_transit(s) {
                 low_cpu.push(s);
             }
         }

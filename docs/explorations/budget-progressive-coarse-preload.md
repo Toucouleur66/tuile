@@ -125,12 +125,17 @@ The score orders the value band only. Before it, in this order and whatever the 
   tier, once over its target, is released down to the same line. A GPU class (or the pool)
   over its target is swept down to its low watermark, lowest scores first, not bounded per
   step, so need never waits while low scores hold the pools.
-- **What left the need goes.** A copy that leaves the need keeps a 128th of its probability
+- **What left the need goes.** A copy that leaves the need keeps a 64th of its probability
   (a copy drawn without being wanted — a stand-in for another tile — counts as certain while
-  drawn): under the **floor value** (1 %, `floor_value_permille`) whatever it was. Once out
-  of the need for the thrash window (10 s: a turn and back finds it still) it goes, room or
-  not, from both tiers: its GPU copy, then its decoded copy. At rest the pools hold the need,
-  its ring and the coarse stack, not old fine levels. Laurent's Bordeaux capture scripted (a
+  drawn). Once out of the need for the thrash window (10 s: a turn and back finds it still),
+  it goes, room or not, from both tiers (its GPU copy, then its decoded copy) when its
+  probability is under the **floor value** (1 %, `floor_value_permille`: every preload left
+  behind) **or its level is more than one finer than the need's** (nothing selects it soon,
+  whatever it was). A copy drawn a moment ago at the need's level stays as the cache a revisit
+  finds (1.6 %): the simulation's revisits (soak I6, turn and back, newly visible ground)
+  need it — releasing every left copy after 10 s was tried and broke those four invariants.
+  At rest the pools hold the need, its ring, the coarse stack and the recent cache, not old
+  fine levels. Laurent's Bordeaux capture scripted (a
   dive to level 19, out to 12, still): levels 14–19 held 406 tiles → 0 after 11 s, decoded
   124 MB → 76 MB (`at_rest_the_fine_levels_left_behind_are_released_in_both_tiers`). The pass
   looks at `release_visits` (64) copies a step per tier from the bottom of the release
