@@ -1490,9 +1490,14 @@ impl Budget {
                 let du = match tn.membership {
                     Membership::Blocker => Some(Urgency::Blocker),
                     _ if !mesh_drawable => Some(urgency),
-                    // A preload not drawn: its drapes are preloads too,
-                    // of the tile's own score — never the present need's.
-                    Membership::Ancestor | Membership::Ring if item.is_none() => Some(urgency),
+                    // A ring tile not drawn (the neighbourhood, the views
+                    // ahead): its drapes are preloads too, of the tile's own
+                    // score — never the present need's. An ancestor of what
+                    // is drawn keeps its drapes in the present need's band:
+                    // a coarse drape serves every tile under it, and its
+                    // arrival re-reads them all — early, while the view
+                    // moves, not on a still step (the work bound).
+                    Membership::Ring if item.is_none() => Some(urgency),
                     _ => {
                         let worn = item.and_then(|i| i.drape(layer).copied());
                         let off = match worn {
@@ -3472,10 +3477,25 @@ impl Budget {
                 .saturating_add(rate.saturating_mul(dt))
                 .min(max);
         } else {
-            let calm = Class::ALL.iter().all(|&c| {
-                self.ledger.gpu[c]
-                    <= eff.target[c].scaled(u64::from(self.cfg.watermarks.low_percent), 100)
+            // Calm when what must be held — the protected bytes: drawn, in a
+            // swap, the floor — fits under the low watermarks again. The
+            // copies nobody draws are a cache the sweep and the admission
+            // let go of as the detail asks for room: counting them kept a
+            // class between its watermarks relaxed for ever (Laurent's stall,
+            // 2026-11-23: drapes at 97–99 % of target, imagery under need,
+            // nothing loading).
+            let low = |b: Bytes| b.scaled(u64::from(self.cfg.watermarks.low_percent), 100);
+            let high = |b: Bytes| b.scaled(u64::from(self.cfg.watermarks.high_percent), 100);
+            let mut calm = Class::ALL.iter().all(|&c| {
+                protected[c] <= low(eff.target[c]) && self.ledger.gpu[c] <= high(eff.target[c])
             });
+            if let Some(p) = eff.pool {
+                let pooled = Class::ALL
+                    .iter()
+                    .filter(|c| p.members[**c])
+                    .fold(Bytes::ZERO, |a, c| a.plus(protected[*c]));
+                calm &= pooled <= low(p.target);
+            }
             if calm {
                 let down = u64::from(r.down_per_second).saturating_mul(dt);
                 self.scale_fine = self.scale_fine.saturating_sub(down).max(one);
