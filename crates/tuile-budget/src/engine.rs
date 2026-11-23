@@ -3098,6 +3098,10 @@ impl Budget {
             if used <= high && !(stuck && used > low) {
                 continue;
             }
+            // Stuck between the watermarks, only the junk goes: what is no
+            // longer wanted and worth less than the floor value or far finer
+            // than the need. The cache of the need's own levels stays.
+            let junk_only = used <= high;
             let room = match self.scratch.room.take() {
                 Some(room) => room,
                 None => self.room(wants, st),
@@ -3116,7 +3120,7 @@ impl Budget {
                 }
                 // Still on the GPU, and not on its way again.
                 let evictable = self.arena.has_gpu(s) && !self.arena.has_transit(s);
-                if !evictable {
+                if !evictable || (junk_only && !self.junk(wants, s)) {
                     continue;
                 }
                 self.evict_one(now, s, class, d, st);
@@ -3184,6 +3188,15 @@ impl Budget {
                 self.release_one(s, d, st);
             }
         }
+    }
+
+    /// Whether `s` is junk: not wanted, and under the floor value or far
+    /// finer than the need — what a stuck budget lets go of.
+    fn junk(&self, wants: Wants<'_>, s: Slot) -> bool {
+        let floor = super::value::CERTAIN / 1_000
+            * u32::from(self.spec.params.floor_value_permille);
+        !wants.contains_key(&self.arena.id(s))
+            && (self.arena.place(s).1 < floor || self.far_finer(s))
     }
 
     /// Whether `s`, no longer wanted, is of a level more than one finer than
@@ -3348,6 +3361,7 @@ impl Budget {
         let high = pct(p.target, w.high_percent);
         // Relaxed and between the watermarks: down to the low one, so the
         // detail can come back (`relax`).
+        let junk_only = used(&self.ledger) <= high && Class::ALL.iter().all(|c| !over[*c]);
         let pool_over = used(&self.ledger) > high
             || (stuck && used(&self.ledger) > pct(p.target, w.low_percent));
         if !pool_over && Class::ALL.iter().all(|c| !over[*c]) {
@@ -3376,7 +3390,7 @@ impl Budget {
         let mut walk = Walk::default();
         while let Some((_, s)) = walk.next(&self.arena, &room.grouped, member, &Held::GPU) {
             st.work = st.work.saturating_add(1);
-            if !candidate(self, s) {
+            if !candidate(self, s) || (junk_only && !self.junk(wants, s)) {
                 continue;
             }
             let (class, bytes) = (

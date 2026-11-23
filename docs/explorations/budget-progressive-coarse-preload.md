@@ -117,17 +117,17 @@ The score orders the value band only. Before it, in this order and whatever the 
 
 **Release keeps a headroom, and lets go of what is no longer worth holding.**
 
-- **Dynamic headroom.** Preloads are delivered only under `target − headroom`, the headroom
-  the larger of the specification's fixed share (`headroom_permille`, default 0) and the
-  dynamic one: the measured upload rate (bytes delivered a second, smoothed over 0.5 s) over
-  the horizon, plus the bytes in transit — about nothing at rest (a revisit finds its cache),
-  the next second of uploads in motion (84 MB on the test's pan at 512 MiB). The headroom
-  holds speculation back (the ring, a refresh); the chain of ancestors of what is drawn is
-  coverage and takes the room the present need takes. The decoded tier, over its target, is
-  released down to it (a turn back finds its demoted copies there: releasing it to the
-  dynamic line made a turn and back refetch 115 tiles in the simulation). A GPU class (or the pool)
-  over its target is swept down to its low watermark, lowest scores first, not bounded per
-  step, so need never waits while low scores hold the pools.
+- **Headroom.** Speculation (the ring, a refresh) is delivered only under
+  `target × (1 − headroom)` (`headroom_permille`, default 0), never by evicting to make that
+  room; the chain of ancestors of what is drawn is coverage and takes the room the present
+  need takes. The dynamic headroom — the measured upload rate (bytes delivered a second,
+  smoothed over 0.5 s) over the horizon, plus the bytes in transit — is measured and reported
+  (`ScoreStats::headroom_bytes`: 0 at rest, 84 MB on the test's pan at 512 MiB): gating the
+  ring on it delayed the views ahead in the simulation (a slow zoom-in missed its 2 s bound),
+  so it informs and does not gate yet. A GPU class (or the pool) over its target is swept down
+  to its low watermark, lowest scores first, not bounded per step, so need never waits while
+  low scores hold the pools; the decoded tier over its target is released down to it (a turn
+  back finds its demoted copies there).
 - **What left the need goes.** A copy that leaves the need keeps a 64th of its probability
   (a copy drawn without being wanted — a stand-in for another tile — counts as certain while
   drawn). Once out of the need for the thrash window (10 s: a turn and back finds it still),
@@ -144,8 +144,11 @@ The score orders the value band only. Before it, in this order and whatever the 
   looks at `release_visits` (64) copies a step per tier from the bottom of the release
   order: a frame's releases stay small.
 - **Relaxed, between the watermarks.** A relaxed picture comes back to full detail only once
-  every class is under its low watermark; a class held between them by copies nobody draws is
-  swept down to it.
+  every class is under its low watermark; stuck so — relaxed, nothing starting, loading or
+  reading — a class held between them is swept down to it of its junk: what is no longer
+  wanted and under the floor value or far finer than the need (Laurent's stall). Sweeping
+  everything unprotected whenever relaxed took the soak's cache (183–217 ms instead of 33 ms
+  at p95).
 - Measured on the simulation and not kept: a fixed 12.5 % headroom swept under the target
   every step (the soak's revisits waited 167–267 ms at p95 instead of 33 ms; a slow zoom-in
   missed its bound), and a 75 % cap on the preloads' share of the slots (it starved the views
