@@ -454,3 +454,37 @@ fn no_frame_encodes_more_than_its_share_and_one_tile() {
         assert_eq!(per_frame.iter().sum::<u32>(), 12, "{plan}: {per_frame:?}");
     }
 }
+
+/// **A mesh's own imagery resumes as a drape's does** (CB6, found by the
+/// upload bench: two tiles in 400 frames). A mesh wearing two tiles of its
+/// own at a one-tile share: a tile a frame, held for it between frames, and
+/// the mesh lands — never re-encoding its first tile for ever.
+#[test]
+fn a_meshs_own_imagery_resumes_across_frames() {
+    use support::mesh;
+    for (plan, compression) in PLANS {
+        let Some(gpu) = gpu_with(compression) else {
+            continue;
+        };
+        let tile = TileId::from_terrain(4, 3, 2);
+        let mut content = flat(tile);
+        content.imagery = mosaic(&gpu, tile, 2, 11).tiles;
+        let mut stream = Scripted::new([mesh(tile, 1, content)]);
+        let mut pump = ContentPump::new(glam::DVec3::ZERO);
+        let mut frames = 0;
+        let mut encoded = 0;
+        while pump.pending_uploads() > 0 || frames == 0 {
+            pump.pump(&mut stream, &gpu, one_tile());
+            encoded += pump.last_uploads().encoded_tiles;
+            let _ = pump.resolve(&gpu);
+            frames += 1;
+            if frames > 12 {
+                break;
+            }
+        }
+        assert_eq!(pump.pending_uploads(), 0, "{plan}: never landed: {RED}");
+        if gpu.imagery_plan().target != ImageryFormat::Rgba8 {
+            assert_eq!(encoded, 2, "{plan}: each tile once");
+        }
+    }
+}

@@ -702,19 +702,23 @@ impl ContentPump {
                 .iter()
                 .filter_map(|r| self.queue.get(r).map(|q| &q.content))
                 .collect();
+            // A mesh carries its own imagery as a drape does: either's
+            // tiles may be begun.
             let begun: Vec<&tuile_core::raster::ImageryLayer> = partial
                 .iter()
-                .filter_map(|(r, i)| match self.queue.get(r).map(|q| &q.content) {
-                    Some(ResourceContent::Drape(d)) => d.tiles.get(*i),
-                    _ => None,
+                .filter_map(|(r, i)| {
+                    self.queue
+                        .get(r)
+                        .and_then(|q| layers_of(&q.content).get(*i))
                 })
                 .collect();
             crate::prepare::encode_frame(gpu, &contents, &begun);
             for (r, i) in &partial {
-                let Some(ResourceContent::Drape(d)) = self.queue.get(r).map(|q| &q.content) else {
-                    continue;
-                };
-                let Some(l) = d.tiles.get(*i) else {
+                let Some(l) = self
+                    .queue
+                    .get(r)
+                    .and_then(|q| layers_of(&q.content).get(*i))
+                else {
                     continue;
                 };
                 let held = crate::prepare::hold_imagery(gpu, l);
@@ -885,10 +889,7 @@ impl ContentPump {
                 owned += *q
                     .owned_blocks
                     .get_or_insert_with(|| owned_blocks(format, &q.content));
-                let layers: &[tuile_core::raster::ImageryLayer] = match &q.content {
-                    ResourceContent::Mesh(m) => &m.imagery,
-                    ResourceContent::Drape(d) => &d.tiles,
-                };
+                let layers = layers_of(&q.content);
                 for (i, l) in layers.iter().enumerate() {
                     if !l.is_visible() {
                         continue;
@@ -1612,6 +1613,15 @@ fn encodes(
     t: &tuile_core::content::DecodedTexture,
 ) -> bool {
     t.resident_format().block() == Some(format) && t.rgba8().is_some()
+}
+
+/// Every imagery layer `content` names, visible or not, by its index: a
+/// mesh's own, or a drape's tiles.
+fn layers_of(content: &ResourceContent) -> &[tuile_core::raster::ImageryLayer] {
+    match content {
+        ResourceContent::Mesh(m) => &m.imagery,
+        ResourceContent::Drape(d) => &d.tiles,
+    }
 }
 
 /// The encode lane's blocks this frame: the deadline's own when the host
