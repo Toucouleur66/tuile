@@ -23,6 +23,7 @@ pub mod inputs;
 pub mod need;
 mod need_state;
 pub mod observe;
+mod origin;
 pub mod priority;
 #[doc(hidden)]
 pub mod snapshot;
@@ -37,7 +38,9 @@ pub mod types;
 mod value;
 pub mod view;
 
-pub use config::{BudgetConfig, FailurePolicy, Pool, PressureFractions, Relaxation, Watermarks};
+pub use config::{
+    BudgetConfig, FailurePolicy, OriginBackoff, Pool, PressureFractions, Relaxation, Watermarks,
+};
 pub use deadline::{swap_unit, FrameDeadline};
 pub use decisions::{
     Decisions, DrapeChoice, Drapes, DrawItem, DrawSet, Role, Serves, Start, SwapGroup, UploadPlan,
@@ -347,6 +350,9 @@ pub struct Budget {
     /// (`inputs`), and the sample given for the next step.
     smoothed: inputs::Smoothed,
     measured_next: Option<inputs::Measured>,
+    /// Whether each origin answers (`origin`): the ones whose loads failed
+    /// since they last answered.
+    origins: origin::Origins,
 }
 
 impl Budget {
@@ -393,6 +399,7 @@ impl Budget {
             spec_next: None,
             smoothed: inputs::Smoothed::default(),
             measured_next: None,
+            origins: Default::default(),
         })
         .map(|mut b: Budget| {
             let v = value::Valuation::of(&b.spec, b.cfg.pinned_level);
@@ -449,6 +456,12 @@ impl Budget {
     /// The configuration.
     pub fn config(&self) -> &BudgetConfig {
         &self.cfg
+    }
+
+    /// How many origins are down: their loads held to one probe at a time
+    /// until one answers (`OriginBackoff`).
+    pub fn origins_down(&self) -> usize {
+        self.origins.down()
     }
 
     /// One decision step: applies the recorded arrivals, then decides.

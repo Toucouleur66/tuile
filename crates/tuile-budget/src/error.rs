@@ -38,6 +38,10 @@ pub enum ConfigError {
     /// A zero first delay or a first delay above the ceiling.
     #[error("retry backoff is incoherent")]
     Backoff,
+    /// No failure count, a zero first probe delay, or a first delay above
+    /// the ceiling.
+    #[error("origin backoff is incoherent")]
+    OriginBackoff,
     /// Batch never retries: a film never ships a hole.
     #[error("a batch budget must end the session on failure")]
     BatchMustEndOnFailure,

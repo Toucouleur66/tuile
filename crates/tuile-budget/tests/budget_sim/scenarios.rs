@@ -647,6 +647,89 @@ fn a_network_outage_leaves_the_tracked_state_bounded_and_recovers() {
     );
 }
 
+/// A lost network, then its return (`origin`). Every network load fails at
+/// once for a minute while the view jumps from place to place, then the
+/// network is back and the camera stays at the last place. While it is
+/// out, each origin (here the terrain meshes and the one imagery layer) is
+/// asked by one probe at a time, at most two a second each, however many
+/// tiles want it: never a storm of retries. Once it is back, the first
+/// probe that answers sends every tile that backs off to the network again:
+/// the view converges within the time the same view takes to load from
+/// nothing, plus two probe ceilings (the longest a probe waits, jitter
+/// included) and a second — not after each tile's own backoff (30 s at
+/// most).
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
+)]
+fn a_lost_network_is_probed_gently_and_its_return_loads_the_view_promptly() {
+    let mut profile = Profile::desktop();
+    profile.net = profile.net.clean();
+    let mut sim = Sim::new(profile, 22);
+    let (from, to) = (Micros::from_secs(5), Micros::from_secs(65));
+    sim.net.outage = Some((from, to));
+    let end = Micros::from_secs(95);
+    let mut starts: Vec<(Micros, u64)> = Vec::new();
+    let mut back = None;
+    while sim.now < end {
+        let t = sim.now.0 as f64 / 1e6;
+        if sim.now >= to && back.is_none() {
+            back = Some(sim.now);
+        }
+        sim.step(jumps(t));
+        starts.push((sim.now, sim.net.network_starts));
+    }
+    // The most network starts in any second of the outage, past its first
+    // (the loads in flight when it began fail then).
+    let settled = from.plus(Micros::from_secs(1));
+    let mut worst = (0u64, Micros::ZERO);
+    for (i, &(t, n)) in starts.iter().enumerate() {
+        let until = t.plus(Micros::from_secs(1));
+        if t < settled || until > to {
+            continue;
+        }
+        let last = starts[i..]
+            .iter()
+            .take_while(|(u, _)| *u < until)
+            .last()
+            .map_or(n, |(_, m)| *m);
+        if last - n > worst.0 {
+            worst = (last - n, t);
+        }
+    }
+    let back = back.expect("the network came back");
+    let took = sim.converged_after(back);
+    eprintln!(
+        "lost network: at most {} network starts in one second of the outage (at {:?}); \
+         converged {took:?} after it came back",
+        worst.0, worst.1
+    );
+    assert!(
+        worst.0 <= 4,
+        "{RED}: {} network starts in the second from {:?}, with the network out: \
+         two origins, two probes a second at most each",
+        worst.0,
+        worst.1
+    );
+    // The same view, loaded from nothing on a network that never went.
+    let mut fresh = Sim::new(sim.profile.clone(), 22);
+    let last = jumps(end.0 as f64 / 1e6);
+    fresh.run(30.0, &|_| last);
+    let load = fresh.converged_after(Micros::ZERO).expect(RED);
+    let probe = tuile_budget::BudgetConfig::interactive(Bytes::ZERO)
+        .origin
+        .probe_max;
+    let bound = load.plus(Micros(2 * probe.0)).plus(Micros::from_secs(1));
+    let took = took.expect(RED);
+    eprintln!("lost network: the view loads in {load:?} from nothing; bound {bound:?}");
+    assert!(
+        took <= bound,
+        "{RED}: converged {took:?} after the network came back, bound {bound:?} \
+         ({load:?} to load the view from nothing)"
+    );
+}
+
 /// I14, I15: a relaunch fills the view from the store, without network for
 /// what the store holds.
 #[test]

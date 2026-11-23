@@ -1551,6 +1551,12 @@ impl Arena {
         self.note(s, Change::TIER);
     }
 
+    /// The work of the resource of `s` changed outside its load: its retry
+    /// fell due early (`origin`).
+    pub fn note_work(&mut self, s: Slot) {
+        self.note(s, Change::LOAD);
+    }
+
     /// Forgets the changes up to `n`.
     pub fn forget_changes(&mut self, n: usize) {
         self.changed.drain(..n.min(self.changed.len()));
