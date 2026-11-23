@@ -37,7 +37,10 @@ use crate::text::{Font, Label, Mask};
 use crate::{Mesh, Vertex};
 
 /// A panel drawn: triangles, then text over them, in device pixels; and
-/// its size.
+/// its size. What lies over the whole panel — a legend's box and its words
+/// ([`tooltip`]) — is a layer of its own, [`Drawing::on_top`], drawn after
+/// the panel's text: in the panel's triangles, the panel's words would be
+/// written over it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Drawing {
     pub mesh: Mesh,
@@ -46,6 +49,15 @@ pub struct Drawing {
     /// What each bar and cell means, where it is: for a pointer over it, or
     /// a keyboard's focus on it ([`tooltip`]).
     pub hits: Vec<Hit>,
+    /// Drawn last: its triangles, then its text.
+    pub on_top: Layer,
+}
+
+/// Triangles, then text over them, in device pixels.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Layer {
+    pub mesh: Mesh,
+    pub labels: Vec<Label>,
 }
 
 /// A region of the board and its legend: each colour, mark and shape
@@ -107,6 +119,7 @@ impl From<crate::PanelLayout> for Drawing {
             labels: p.label.into_iter().collect(),
             size: p.size,
             hits: Vec::new(),
+            on_top: Layer::default(),
         }
     }
 }
@@ -855,6 +868,7 @@ pub fn draw(
         labels: p.labels,
         hits: p.hits,
         size: ((w * scale).ceil() as u32, (h * scale).ceil() as u32),
+        on_top: Layer::default(),
     }
 }
 
@@ -2441,7 +2455,8 @@ pub fn hit_at(d: &Drawing, at: (f64, f64)) -> Option<&Hit> {
 
 /// `d` with `hit`'s text in a box beside it — under it, or above it near
 /// the bottom — and its region outlined: what a pointer over it, or the
-/// keyboard's focus on it, shows. Wrapped to a third of the window.
+/// keyboard's focus on it, shows. Wrapped to a third of the window. All of
+/// it in [`Drawing::on_top`]: over the board's text, not under it.
 pub fn tooltip(d: &mut Drawing, hit: &Hit, frame: (u32, u32), cache: &mut TextCache, scale: f64) {
     let k = scale.max(1.0);
     let font = Font::bundled();
@@ -2492,9 +2507,11 @@ pub fn tooltip(d: &mut Drawing, hit: &Hit, frame: (u32, u32), cache: &mut TextCa
     rect(&mut mesh, hx, hy, t, hh, o);
     rect(&mut mesh, hx + hw - t, hy, t, hh, o);
     // The box.
-    rect(&mut mesh, x, y, w, h, srgb(0x262626, 0.98));
+    // Opaque: nothing of the board under it may show through.
+    rect(&mut mesh, x, y, w, h, srgb(0x262626, 1.0));
     rect(&mut mesh, x, y, w, t, srgb(DIM, 1.0));
-    d.mesh.extend(mesh);
+    let layer = &mut d.on_top;
+    layer.mesh.extend(mesh);
     for (i, l) in hit.lines.iter().enumerate() {
         let ly = y + pad + lh * i as f64;
         let cy = ly + lh / 2.0;
@@ -2520,14 +2537,14 @@ pub fn tooltip(d: &mut Drawing, hit: &Hit, frame: (u32, u32), cache: &mut TextCa
             }
             Swatch::Marker(sev) => p.marker(sev, x + pad + sw / 2.0, cy, 10.0 * k),
         }
-        d.mesh.extend(p.mesh);
+        layer.mesh.extend(p.mesh);
         let mask = cache
             .masks
             .entry((l.text.clone(), (px * 16.0) as u32))
             .or_insert_with(|| font.rasterize(&l.text, px))
             .clone();
         let top = cy - f64::from(mask.height) / 2.0;
-        d.labels.push(Label {
+        layer.labels.push(Label {
             mask,
             position: [(x + pad + indent(l)).round() as f32, top.round() as f32],
             color: srgb(TEXT, 1.0),
@@ -3033,7 +3050,7 @@ mod tests {
             1.0,
         );
         let first = d.hits[0].clone();
-        let texts = |d: &Drawing| d.labels.len();
+        let texts = |d: &Drawing| d.labels.len() + d.on_top.labels.len();
         let mut c = BoardControl::default();
         let bare = c.present(d.clone(), (2400, 2000), 1.0, &mut cache);
         let [x, y, w, h] = first.rect;
@@ -3048,6 +3065,16 @@ mod tests {
             texts(&hovered),
             texts(&bare) + first.lines.len(),
             "its legend's lines"
+        );
+        assert_eq!(bare.on_top, Layer::default(), "no legend, nothing on top");
+        assert_eq!(
+            hovered.on_top.labels.len(),
+            first.lines.len(),
+            "the legend's words on top, over the board's"
+        );
+        assert_eq!(
+            hovered.labels, bare.labels,
+            "the board's own words untouched"
         );
         let mut k = BoardControl::default();
         k.input(BoardInput::Key(BoardKey::Next));

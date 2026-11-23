@@ -451,6 +451,15 @@ impl App {
             })
             .collect();
         active.overlay.set_masks(&active.gpu, &masks);
+        // The budget panel's layer on top, after all of that.
+        let top = self.budget_window.layout().map(|p| &p.on_top);
+        super::budget_screen::set_layer(
+            &mut active.overlay_on_top,
+            &active.gpu,
+            top.map_or(&[], |t| t.mesh.as_slice()),
+            top.map_or(&[], |t| t.labels.as_slice()),
+            active.size,
+        );
     }
 
     /// Resolves what to draw, draws it, and hands the frame to the compositor.
@@ -532,7 +541,7 @@ impl App {
             a: 1.0,
         };
         let renderer = &active.renderer;
-        let overlay = &active.overlay;
+        let (overlay, overlay_on_top) = (&active.overlay, &active.overlay_on_top);
         let shell = &active.shell;
         // In a cell because the frame's two hooks are handed over together
         // and want it differently: the pass borrows it to draw, and the pass
@@ -606,6 +615,7 @@ impl App {
                 pass.set_scissor_rect(0, 0, w as u32, h as u32);
             }
             overlay.render(pass);
+            overlay_on_top.render(pass);
         };
         // The overlays' own pass, on the frame's encoder once its pass has
         // closed: the HUD's mode needs a depth attachment the ground never

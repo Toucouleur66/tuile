@@ -12,7 +12,7 @@ mod spinner;
 mod statusbar;
 mod text;
 
-pub use budget_board::Drawing;
+pub use budget_board::{Drawing, Layer};
 pub use credits::{BarLayout, CreditBar};
 pub use nav::{NavWidget, Part};
 pub use panel::{Panel, PanelLayout, BACKGROUND as PANEL_BACKGROUND};

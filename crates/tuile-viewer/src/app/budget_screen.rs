@@ -170,6 +170,9 @@ pub(super) struct PanelScreen {
     target: Target,
     targets: FrameTargets,
     overlay: OverlayRenderer,
+    /// The panel's layer on top (`tuile_ui::Drawing::on_top`): a legend,
+    /// drawn after the panel's text.
+    on_top: OverlayRenderer,
     /// The drawable, device pixels.
     pub(super) size: (u32, u32),
     /// Device pixels per point.
@@ -225,6 +228,7 @@ impl PanelScreen {
             scale: window.scale_factor().max(1.0),
             targets: FrameTargets::for_surface(gpu, format, size),
             overlay: OverlayRenderer::new(gpu, format.render, Some(DEPTH_FORMAT)),
+            on_top: OverlayRenderer::new(gpu, format.render, Some(DEPTH_FORMAT)),
             target: Target::Window {
                 window,
                 surface,
@@ -253,6 +257,7 @@ impl PanelScreen {
             },
             targets: FrameTargets::new(gpu, TEXTURE_FORMAT, size),
             overlay: OverlayRenderer::new(gpu, TEXTURE_FORMAT, Some(DEPTH_FORMAT)),
+            on_top: OverlayRenderer::new(gpu, TEXTURE_FORMAT, Some(DEPTH_FORMAT)),
             size,
             scale: scale.max(1.0),
         }
@@ -292,29 +297,19 @@ impl PanelScreen {
 
     /// Draws `panel` and shows it: presented on a window, read back on a
     /// texture.
+    /// The panel first, its triangles then its text; its layer on top
+    /// after, so a legend's box hides the panel's text under it.
     pub(super) fn paint(&mut self, gpu: &GpuContext, panel: &tuile_ui::Drawing) {
-        let vertices: Vec<OverlayVertex> = panel
-            .mesh
-            .iter()
-            .map(|v| OverlayVertex {
-                position: v.position,
-                color: v.color,
-            })
-            .collect();
-        self.overlay.set_geometry(gpu, &vertices, self.size);
-        let masks: Vec<OverlayMask<'_>> = panel
-            .labels
-            .iter()
-            .map(|label| OverlayMask {
-                width: label.mask.width,
-                height: label.mask.height,
-                coverage: &label.mask.coverage,
-                position: label.position,
-                color: label.color,
-            })
-            .collect();
-        self.overlay.set_masks(gpu, &masks);
-        let overlay = &self.overlay;
+        set_layer(
+            &mut self.overlay,
+            gpu,
+            &panel.mesh,
+            &panel.labels,
+            self.size,
+        );
+        let top = &panel.on_top;
+        set_layer(&mut self.on_top, gpu, &top.mesh, &top.labels, self.size);
+        let (overlay, on_top) = (&self.overlay, &self.on_top);
         let size = self.size;
         match &mut self.target {
             #[cfg(not(any(target_arch = "wasm32", target_os = "ios", target_os = "android")))]
@@ -334,7 +329,10 @@ impl PanelScreen {
                     },
                     || super::setup::configure(surface, gpu, *format, size),
                     || window.pre_present_notify(),
-                    |pass| overlay.render(pass),
+                    |pass| {
+                        overlay.render(pass);
+                        on_top.render(pass);
+                    },
                     |_, _| {},
                 );
                 if presented == tuile_wgpu::Presented::Invalid {
@@ -356,7 +354,10 @@ impl PanelScreen {
                         clear: clear(),
                         capture: None,
                     },
-                    |pass| overlay.render(pass),
+                    |pass| {
+                        overlay.render(pass);
+                        on_top.render(pass);
+                    },
                     |_, _| {},
                 );
                 *tag += 1;
@@ -395,6 +396,36 @@ impl PanelScreen {
             Target::Window { .. } => None,
         }
     }
+}
+
+/// `overlay` to draw `mesh`, then `labels` over it, in a drawable of
+/// `size` device pixels.
+pub(super) fn set_layer(
+    overlay: &mut OverlayRenderer,
+    gpu: &GpuContext,
+    mesh: &[tuile_ui::Vertex],
+    labels: &[tuile_ui::Label],
+    size: (u32, u32),
+) {
+    let vertices: Vec<OverlayVertex> = mesh
+        .iter()
+        .map(|v| OverlayVertex {
+            position: v.position,
+            color: v.color,
+        })
+        .collect();
+    overlay.set_geometry(gpu, &vertices, size);
+    let masks: Vec<OverlayMask<'_>> = labels
+        .iter()
+        .map(|label| OverlayMask {
+            width: label.mask.width,
+            height: label.mask.height,
+            coverage: &label.mask.coverage,
+            position: label.position,
+            color: label.color,
+        })
+        .collect();
+    overlay.set_masks(gpu, &masks);
 }
 
 /// A page's window is the page's to close: it goes with its screen, and
@@ -759,6 +790,125 @@ mod tests {
             waste > 200,
             "the drapes held for nothing are not drawn as waste: {waste}"
         );
+    }
+
+    /// A legend's box hides the board under it: drawn after the board's
+    /// text, not under it. A box of blank lines over rows of numbers is
+    /// dark inside, where the same rows without it are written.
+    /// `TUILE_BOARD_PICTURES=<dir>` also writes a real legend over a row.
+    #[test]
+    fn a_legend_hides_the_board_under_it() {
+        use tuile_ui::budget_board::{BoardControl, BoardInput, Hit, Legend, Swatch};
+        let gpu = match futures_executor::block_on(GpuContext::headless()) {
+            Ok(gpu) => gpu,
+            Err(e) => {
+                assert!(
+                    std::env::var("TUILE_REQUIRE_GPU").is_err(),
+                    "TUILE_REQUIRE_GPU is set and there is no usable adapter: {e}"
+                );
+                eprintln!("skipping: no usable adapter ({e})");
+                return;
+            }
+        };
+        let scale = 2.0;
+        let stalls = tuile_ui::budget_board::StallWatch::at_once();
+        let view = tuile_ui::budget_board::BoardView {
+            cumulative: false,
+            from: None,
+            layers: &["Aerial".to_owned()],
+            stalls: &stalls,
+            width: None,
+            issues_only: false,
+            decide: None,
+        };
+        let mut texts = tuile_ui::budget_board::TextCache::default();
+        let s = tuile_ui::budget_board::fixtures::stalled();
+        let board = tuile_ui::budget_board::draw(Some(&s), &view, &mut texts, scale);
+        let (fw, fh) = (f64::from(board.size.0), f64::from(board.size.1));
+        let picture = |d: &tuile_ui::Drawing| {
+            let mut screen = PanelScreen::texture(&gpu, d.size, scale, true);
+            screen.paint(&gpu, d);
+            let (pixels, size) = screen.last_picture().expect("read back");
+            (pixels.to_vec(), size)
+        };
+        // The pixels of `rect` brighter than the box could ever be: ink.
+        let ink = |(pixels, size): &(Vec<u8>, (u32, u32)), [x, y, w, h]: [f64; 4]| {
+            let mut n = 0;
+            for py in y as u32..(y + h) as u32 {
+                for px in x as u32..(x + w) as u32 {
+                    let i = ((py * size.0 + px) * 4) as usize;
+                    n += usize::from(pixels[i..i + 3].iter().any(|&c| c > 0x60));
+                }
+            }
+            n
+        };
+        // A row in the upper half, left of the middle: its box below it
+        // lies over the rows that follow.
+        let row = board
+            .hits
+            .iter()
+            .find(|h| {
+                let [x, y, w, _] = h.rect;
+                w >= 200.0 && x + 400.0 < fw && y > fh / 8.0 && y < fh / 2.0
+            })
+            .expect("a row with a legend")
+            .clone();
+        let blank = Hit {
+            rect: row.rect,
+            lines: vec![
+                Legend {
+                    swatch: Swatch::None,
+                    text: " ".repeat(200),
+                };
+                3
+            ],
+        };
+        // The board's words well inside the box — under its top line, left
+        // of its right edge — and only them: the bars are triangles, which
+        // the box hides whichever layer it is in.
+        let [hx, hy, _, hh] = row.rect;
+        let top = hy + hh + 4.0;
+        let words: Vec<[f64; 4]> = board
+            .labels
+            .iter()
+            .map(|l| {
+                let [x, y] = l.position.map(f64::from);
+                [x, y, f64::from(l.mask.width), f64::from(l.mask.height)]
+            })
+            .filter(|&[x, y, w, h]| {
+                x >= hx + 16.0 && x + w <= hx + 800.0 && y >= top + 8.0 && y + h <= top + 90.0
+            })
+            .collect();
+        let ink_in = |p: &(Vec<u8>, (u32, u32))| words.iter().map(|&r| ink(p, r)).sum::<usize>();
+        let bare = picture(&board);
+        assert!(
+            ink_in(&bare) > 100,
+            "no board text where the box goes: {words:?}"
+        );
+        let mut covered = board.clone();
+        tuile_ui::budget_board::tooltip(&mut covered, &blank, board.size, &mut texts, scale);
+        let shown = picture(&covered);
+        assert_eq!(
+            ink_in(&shown),
+            0,
+            "the board's text shows through the legend's box"
+        );
+        if let Ok(dir) = std::env::var("TUILE_BOARD_PICTURES") {
+            let mut control = BoardControl::default();
+            let [x, y, w, h] = row.rect;
+            control.input(BoardInput::Pointer(x + w / 2.0, y + h / 2.0));
+            let d = control.present(board.clone(), board.size, scale, &mut texts);
+            let (pixels, size) = picture(&d);
+            let path = std::path::Path::new(&dir).join("board-tooltip.png");
+            image::save_buffer(
+                &path,
+                &pixels,
+                size.0,
+                size.1,
+                image::ExtendedColorType::Rgba8,
+            )
+            .expect("written");
+        }
     }
 
     /// Closing the budget window's window closes it; resizing sizes it;

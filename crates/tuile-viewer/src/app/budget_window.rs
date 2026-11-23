@@ -349,11 +349,12 @@ fn moved(mut d: tuile_ui::Drawing, at: (f64, f64)) -> tuile_ui::Drawing {
         return d;
     }
     let (x, y) = (at.0.round() as f32, at.1.round() as f32);
-    for v in &mut d.mesh {
+    let top = &mut d.on_top;
+    for v in d.mesh.iter_mut().chain(&mut top.mesh) {
         v.position[0] += x;
         v.position[1] += y;
     }
-    for l in &mut d.labels {
+    for l in d.labels.iter_mut().chain(&mut top.labels) {
         l.position[0] += x;
         l.position[1] += y;
     }
