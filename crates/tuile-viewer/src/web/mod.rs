@@ -36,6 +36,8 @@ mod log;
 pub(crate) mod menu;
 #[cfg(target_arch = "wasm32")]
 pub mod page;
+#[cfg(target_arch = "wasm32")]
+pub(crate) mod popup;
 // The decode pool's bookkeeping, on every target so its tests run on the host.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) mod imagery;

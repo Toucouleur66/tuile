@@ -472,6 +472,11 @@ impl App {
         configure_surface(&mut active);
         active.screen.request_redraw();
         self.active = Some(active);
+        // The budget window has a window of its own wherever there can be a
+        // second one: a desktop's, a page's, a headless run's texture. A
+        // phone has one window, and the panel stays over it.
+        self.budget_window
+            .set_own_window(!cfg!(any(target_os = "ios", target_os = "android")));
         // The loader has been running against the correctness floor; this is
         // the first moment anything knows what the device will bind.
         self.fit_the_layer_budget();

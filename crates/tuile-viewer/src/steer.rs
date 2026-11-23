@@ -26,12 +26,12 @@
 //! | `tuile://goto?…&time=&timeOffset=&timeRate=` | also sets the scene's clock, as `--time`, `--time-offset` and `--time-rate` do: see below |
 //! | `tuile://north` | north up, about the point at the centre of the view |
 //! | `tuile://here` | centres on the current location (the system still asks the person) |
-//! | `tuile://view?freeze=on\|off&wireframe=on\|off&labels=on\|off&diagnostic=normal\|unlit\|coverage\|geometry\|levels\|lag\|cap` | the display switches, and the diagnostic view `D` cycles; `labels` writes each tile's terrain and imagery levels on it (`T12 · I11→13`), as the level views `levels`, `lag` and `cap` do |
+//! | `tuile://view?freeze=on\|off&wireframe=on\|off&labels=on\|off&diagnostic=normal\|unlit\|coverage\|geometry\|levels\|lag\|cap` | the display switches, and the diagnostic view `D` cycles; `labels` writes each tile's terrain and imagery levels on it (`T12 · I11→13`) and outlines the tiles, over the real picture and its imagery; the level views `levels`, `lag` and `cap` write them too, over their colours |
 //! | `tuile://tileset?asset=<n>&show=on\|off` | one of the host's 3D Tiles tilesets drawn over the globe, or not |
 //! | `tuile://imagery?name=<key>` | drapes another of the host's imagery layers; `name=next` takes the one after the present |
 //! | `tuile://import?src=https://…` | fetches a configuration file and imports it, as opening it would (`crate::import`) |
 //! | `tuile://telemetry?metrics=on\|off&profiling=on\|off` | the performance numbers sent to the configured collector, or not: see `tuile_telemetry` (nothing happens where none is configured) |
-//! | `tuile://budget?spec=auto\|interactive\|fpv\|known_path\|film\|fpv_film&margin=&horizon_ms=&speculation_slots=&line=on\|off&window=on\|off\|instant\|cumulative\|reset` | **a diagnostic**: forces the budget's specification (the context chooses it otherwise: ordinary navigation runs `interactive`), a few of its numbers, the budget's line over the view, and the budget window (per level and per layer, this step or summed since its start, `reset` summing from now); `spec=auto` gives the choice back to the context (`docs/explorations/budget-eviction-prefetch-spec.md` §3.3) |
+//! | `tuile://budget?spec=auto\|interactive\|fpv\|known_path\|film\|fpv_film&margin=&horizon_ms=&speculation_slots=&line=on\|off&window=on\|off\|instant\|cumulative\|reset` | **a diagnostic**: forces the budget's specification (the context chooses it otherwise: ordinary navigation runs `interactive`), a few of its numbers, the budget's line over the view, and the budget window — a window of its own on a desktop and on a page (a browser window the page opens), over the view on a phone (per level and per layer, this step or summed since its start, `reset` summing from now); `spec=auto` gives the choice back to the context (`docs/explorations/budget-eviction-prefetch-spec.md` §3.3) |
 //!
 //! ## The scene's clock in a link
 //!

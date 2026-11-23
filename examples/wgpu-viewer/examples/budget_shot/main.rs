@@ -15,14 +15,17 @@
 //! `<out>/fpv.png` (the FPV specification forced, `tuile://budget?spec=fpv`)
 //! and `<out>/approach.png` (the eye a fifth lower, then still for
 //! `--seconds`), and prints the budget's line at each; then the budget
-//! window over the view: `<out>/window.png` (this step),
+//! window, which is a window of its own — headless, a picture of its own at
+//! the panel's size: `<out>/window.png` (this step),
 //! `<out>/window-cumulative.png` (since the start) and
 //! `<out>/window-since-reset.png` (since `window=reset`, back to the first
-//! view); then each tile's levels written on it, `<out>/labels-lag.png`
-//! (the lag view) and `<out>/labels.png` (`tuile://view?labels=on`); then,
-//! labels on, a glide out to `--zoom-out` times the altitude (8):
-//! `<out>/zoom-out-at-rest.png` as it ends and `<out>/zoom-out-still.png`
-//! after `--seconds` still (six at least). The credential comes
+//! view), with the view beside it untouched, `<out>/window-view.png`; then
+//! each tile's levels written on it, `<out>/labels-lag.png` (the lag view)
+//! and `<out>/labels.png` (`tuile://view?labels=on`: the imagery, the
+//! tiles' outlines and their levels over it); then, labels on, a glide out
+//! to `--zoom-out` times the altitude (8): `<out>/zoom-out-at-rest.png` as it
+//! ends and `<out>/zoom-out-still.png` after `--seconds` still (six at
+//! least). The credential comes
 //! as for the window (`CESIUM_ION_TOKEN`, the token file, …); give it in
 //! the environment to keep a build outside the signed bundle away from the
 //! keychain.
@@ -105,6 +108,18 @@ fn save(run: &Headless, asked: &Asked, name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Saves the budget window's own picture as `<out>/<name>.png`.
+fn save_window(run: &Headless, asked: &Asked, name: &str) -> Result<(), String> {
+    let (pixels, (w, h)) = run
+        .budget_window()
+        .ok_or("the budget window drew nothing")?;
+    let path = asked.out.join(format!("{name}.png"));
+    image::save_buffer(&path, pixels, w, h, image::ExtendedColorType::Rgba8)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    println!("{}: {w}x{h}", path.display());
+    Ok(())
+}
+
 fn run(asked: &Asked) -> Result<(), String> {
     std::fs::create_dir_all(&asked.out).map_err(|e| e.to_string())?;
     let dir = tempfile::Builder::new()
@@ -144,16 +159,21 @@ fn run(asked: &Asked) -> Result<(), String> {
     // sums since its start, then since a reset a few seconds back.
     run.act(&Action::Url("tuile://budget?line=off&window=on".to_owned()));
     run.run_for(asked.seconds);
-    save(&run, asked, "window")?;
+    save_window(&run, asked, "window")?;
+    save(&run, asked, "window-view")?;
     run.act(&Action::Url("tuile://budget?window=cumulative".to_owned()));
     run.run_for(1.0);
-    save(&run, asked, "window-cumulative")?;
+    save_window(&run, asked, "window-cumulative")?;
     run.act(&Action::Url("tuile://budget?window=reset".to_owned()));
     run.act(&Action::Go(asked.view));
     run.run_for(asked.seconds);
-    save(&run, asked, "window-since-reset")?;
+    save_window(&run, asked, "window-since-reset")?;
     // Each tile's levels written on it: with the lag view, then alone.
     run.act(&Action::Url("tuile://budget?window=off".to_owned()));
+    run.run_for(0.2);
+    if run.budget_window().is_some() {
+        return Err("the budget window stayed open after window=off".to_owned());
+    }
     run.act(&Action::Url("tuile://view?diagnostic=lag".to_owned()));
     run.run_for(1.0);
     save(&run, asked, "labels-lag")?;

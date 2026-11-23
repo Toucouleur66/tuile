@@ -308,7 +308,16 @@ fn on_click(
                 let now = crate::snapshot::current()
                     .map(|snapshot| State::of(&snapshot, layers))
                     .unwrap_or_default();
-                crate::desktop::queue(Request::Do(ask.command(&now)));
+                let command = ask.command(&now);
+                // The budget window is a browser window of its own, and a
+                // browser opens one only from a gesture's handler: this
+                // one. The viewer finds it open on its next turn.
+                if let Command::BudgetWindow(window) = &command {
+                    if *window != crate::steer::WindowAsk::Show(false) {
+                        super::popup::open((1_000.0, 600.0));
+                    }
+                }
+                crate::desktop::queue(Request::Do(command));
             }
             Action::About => about(),
         }

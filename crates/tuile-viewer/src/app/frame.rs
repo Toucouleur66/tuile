@@ -351,7 +351,7 @@ impl App {
                 // the same clearance.
                 view_proj: eye.view_proj_with_clearance(origin, aspect, clearance),
                 sun_dir: [sun.x, sun.y, sun.z, 0.0],
-                params: [AMBIENT, self.views.diagnostic as f32, 0.0, 0.0],
+                params: view_params(self.views.diagnostic, self.tile_labels.forced),
                 // Strength 0 is what turns it off, so the checkbox needs no
                 // second path through the renderer — the shader already
                 // short-circuits on it.
@@ -945,6 +945,21 @@ impl App {
         self.watch.last_traversals = traversals;
         self.watch.last_altitude = Some(cam.altitude());
     }
+}
+
+/// The view's parameters for the shader: the ambient term, the diagnostic
+/// view, and the tiles' outlines over the real picture when the levels are
+/// written on the tiles without a level view (`tuile://view?labels=on`) —
+/// the imagery stays, the edges and the labels go over it. The level views
+/// draw their own edges, over their own colours.
+pub(super) fn view_params(diagnostic: usize, labels: bool) -> [f32; 4] {
+    let outlines = labels && !super::tile_labels::WITH_LEVEL_VIEWS.contains(&diagnostic);
+    [
+        AMBIENT,
+        diagnostic as f32,
+        if outlines { 1.0 } else { 0.0 },
+        0.0,
+    ]
 }
 
 /// The budget's signals in one clause of the status line: what the GPU holds

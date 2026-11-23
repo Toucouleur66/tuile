@@ -19,7 +19,9 @@ pub struct ViewUniform {
     pub view_proj: [f32; 16],
     /// Direction the light travels, normalized, w unused.
     pub sun_dir: [f32; 4],
-    /// x = ambient term.
+    /// x = ambient term; y = the diagnostic view (0 the real picture); z =
+    /// the tiles' outlines over the real picture when 1 (the levels written
+    /// on the tiles are read against them); w unused.
     pub params: [f32; 4],
     /// The air between the eye and the ground. Off by default — a scene that is
     /// not a planet has no air in it, and the model is

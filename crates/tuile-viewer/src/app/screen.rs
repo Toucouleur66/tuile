@@ -41,6 +41,15 @@ impl Screen {
         }
     }
 
+    /// The window's id; none headless.
+    pub(super) fn window_id(&self) -> Option<winit::window::WindowId> {
+        match self {
+            Self::Window(w) => Some(w.window.id()),
+            #[cfg(feature = "control")]
+            Self::Offscreen(_) => None,
+        }
+    }
+
     pub(super) fn set_title(&self, title: &str) {
         match self {
             Self::Window(w) => w.window.set_title(title),

@@ -2,8 +2,11 @@
 // Copyright (c) lapoule.dev
 
 //! The budget window: the graphics budget, per level and per imagery layer,
-//! in a panel over the view — the same panel on every shell, browser
-//! included, drawn by the overlay as the credits bar is.
+//! in a window of its own — an operating-system window on a desktop, a
+//! browser window opened by the page, a texture of its own in a headless
+//! run (`budget_screen`) — and in a panel over the view on a phone, which
+//! has no second window. The same panel everywhere, laid out here and drawn
+//! by the overlay as the credits bar is.
 //!
 //! It reads the budget's published signals (`tuile_core::metrics::budget`,
 //! a [`BudgetSignals`]) and nothing else: the numbers the telemetry exports,
@@ -47,6 +50,9 @@ pub(super) struct BudgetWindow {
     from: Option<(BudgetSignals, Instant)>,
     /// A reset asked for, taken on the next signals.
     reset: bool,
+    /// Drawn in a window of its own rather than over the view: see
+    /// [`Self::own_window`].
+    own_window: bool,
     layout: Option<tuile_ui::PanelLayout>,
     laid: Option<(Instant, (u32, u32), u64)>,
 }
@@ -76,17 +82,74 @@ impl BudgetWindow {
         self.shown
     }
 
+    /// Drawn in a window of its own — whatever the shell's is — instead of
+    /// over the view. Set once, by the shell, before anything is shown.
+    pub(super) fn set_own_window(&mut self, own: bool) {
+        self.own_window = own;
+        self.laid = None;
+    }
+
+    /// Whether the panel wants a window of its own now: shown, on a shell
+    /// that gives it one.
+    pub(super) fn wants_own_window(&self) -> bool {
+        self.shown && self.own_window
+    }
+
+    /// Its own window was closed by the person, or could not be opened:
+    /// the window is hidden, as `window=off` hides it, and nothing else
+    /// changes — the view, its session and the budget go on as they were.
+    pub(super) fn closed(&mut self) {
+        self.ask(WindowAsk::Show(false));
+    }
+
+    /// Laid out again on the next call, whenever that is.
+    pub(super) fn again(&mut self) {
+        self.laid = None;
+    }
+
+    /// The panel as laid out for its own window, if it has one and is
+    /// shown.
+    pub(super) fn own_layout(&self) -> Option<&tuile_ui::PanelLayout> {
+        self.layout
+            .as_ref()
+            .filter(|_| self.shown && self.own_window)
+    }
+
     pub(super) fn cumulative(&self) -> bool {
         self.cumulative
     }
 
-    /// The panel as drawn, if shown.
+    /// The panel as drawn over the view, if shown there: never when it has
+    /// a window of its own.
     pub(super) fn layout(&self) -> Option<&tuile_ui::PanelLayout> {
-        self.layout.as_ref().filter(|_| self.shown)
+        self.layout
+            .as_ref()
+            .filter(|_| self.shown && !self.own_window)
+    }
+
+    /// The panel's own size, device pixels, for `signals` at `scale`: what
+    /// a window of its own is opened at.
+    pub(super) fn natural_size(
+        &self,
+        signals: Option<&BudgetSignals>,
+        scale: f64,
+        layers: &[String],
+    ) -> (u32, u32) {
+        let rows = self.rows_for(signals, Instant::now(), layers);
+        tuile_ui::Panel::default()
+            .layout(
+                tuile_ui::Font::bundled(),
+                &rows,
+                (0.0, 0.0),
+                (16_384, 16_384),
+                scale,
+            )
+            .size
     }
 
     /// Lays the panel out from `signals`, at most every [`EVERY_MS`], in a
-    /// frame of `frame` device pixels whose safe area starts at `at`.
+    /// frame of `frame` device pixels whose safe area starts at `at`. Says
+    /// whether it was laid out again.
     pub(super) fn lay_out(
         &mut self,
         signals: Option<&BudgetSignals>,
@@ -94,21 +157,40 @@ impl BudgetWindow {
         at: (f64, f64),
         scale: f64,
         layers: &[String],
-    ) {
+    ) -> bool {
         if !self.shown {
-            return;
+            return false;
         }
         let now = Instant::now();
         let step = signals.map_or(0, |s| s.decide_micros.count);
         if let Some((when, size, _)) = self.laid {
             if size == frame && now.duration_since(when).as_millis() < EVERY_MS {
-                return;
+                return false;
             }
         }
         if std::mem::take(&mut self.reset) {
             self.from = signals.map(|s| (s.clone(), now));
         }
-        let rows = match signals {
+        let rows = self.rows_for(signals, now, layers);
+        self.layout = Some(tuile_ui::Panel::default().layout(
+            tuile_ui::Font::bundled(),
+            &rows,
+            at,
+            frame,
+            scale,
+        ));
+        self.laid = Some((now, frame, step));
+        true
+    }
+
+    /// The rows for `signals`, in the view asked for, at `now`.
+    fn rows_for(
+        &self,
+        signals: Option<&BudgetSignals>,
+        now: Instant,
+        layers: &[String],
+    ) -> Vec<Vec<String>> {
+        match signals {
             None => vec![vec!["Budget: no signals yet".to_owned()]],
             Some(s) => rows(
                 s,
@@ -122,15 +204,7 @@ impl BudgetWindow {
                 self.cumulative,
                 layers,
             ),
-        };
-        self.layout = Some(tuile_ui::Panel::default().layout(
-            tuile_ui::Font::bundled(),
-            &rows,
-            at,
-            frame,
-            scale,
-        ));
-        self.laid = Some((now, frame, step));
+        }
     }
 }
 
@@ -462,5 +536,49 @@ mod tests {
         assert!(w.shown() && w.cumulative());
         w.ask(WindowAsk::Show(false));
         assert!(!w.shown() && w.layout().is_none());
+    }
+
+    /// On a shell that gives it a window of its own, the panel is laid out
+    /// for that window and never drawn over the view; closing its window
+    /// hides it, as `window=off` does, and asking again shows it again.
+    #[test]
+    fn a_panel_with_its_own_window_is_never_over_the_view() {
+        let s = signals();
+        let mut w = BudgetWindow::default();
+        w.set_own_window(true);
+        assert!(!w.wants_own_window(), "hidden: no window");
+        w.ask(WindowAsk::Show(true));
+        assert!(w.wants_own_window());
+        assert!(w.lay_out(Some(&s), (900, 400), (0.0, 0.0), 1.0, &[]));
+        assert!(w.own_layout().is_some(), "laid out for its window");
+        assert!(w.layout().is_none(), "nothing over the view");
+        w.closed();
+        assert!(!w.shown() && !w.wants_own_window() && w.own_layout().is_none());
+        w.ask(WindowAsk::Cumulative(true));
+        assert!(w.wants_own_window() && w.cumulative());
+    }
+
+    /// Over the view (a phone), the panel is drawn there, and never asks
+    /// for a window.
+    #[test]
+    fn a_panel_over_the_view_never_wants_a_window() {
+        let s = signals();
+        let mut w = BudgetWindow::default();
+        w.ask(WindowAsk::Show(true));
+        assert!(!w.wants_own_window());
+        w.lay_out(Some(&s), (900, 400), (8.0, 8.0), 1.0, &[]);
+        assert!(w.layout().is_some() && w.own_layout().is_none());
+    }
+
+    /// A window of its own opens at the panel's size: as wide as the
+    /// table, whatever the frame.
+    #[test]
+    fn its_own_window_opens_at_the_panels_size() {
+        let s = signals();
+        let w = BudgetWindow::default();
+        let (width, height) = w.natural_size(Some(&s), 1.0, &[]);
+        let (w2, h2) = w.natural_size(Some(&s), 2.0, &[]);
+        assert!(width > 300 && height > 100, "{width}x{height}");
+        assert!(w2 > width * 3 / 2 && h2 > height * 3 / 2, "denser, larger");
     }
 }
