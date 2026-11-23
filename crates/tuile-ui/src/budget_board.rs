@@ -816,6 +816,71 @@ const LEVEL_COLUMN: f64 = 40.0;
 const RESIDENCY_BAR: f64 = 110.0;
 const LOADS_BAR: f64 = 50.0;
 
+/// The present need's waits (`tuile_budget::waits`): first loads and
+/// reloads after an eviction — evicted under 5 s, under 30 s before — each
+/// its rate since the last publish and its 50th and 95th percentiles since
+/// the start. Nothing until a wait ended.
+fn waits(p: &mut Painter<'_>, s: &BudgetSignals, y: f64) -> f64 {
+    use tuile_core::budget::waits::{percentile_ms, WAIT_KINDS};
+    let total: u64 = s.waits.millis.iter().flatten().sum();
+    if total == 0 {
+        return y;
+    }
+    let text = srgb(TEXT, 1.0);
+    let dim = srgb(DIM, 1.0);
+    let mut y = y;
+    p.text(MARGIN, y, "Waits", 12.0, text);
+    y += ROW;
+    let secs = (s.waits_recent_micros as f64 / 1e6).max(1e-3);
+    let names = ["first loads", "reloads < 5 s", "reloads < 30 s"];
+    for (k, kind) in WAIT_KINDS.iter().enumerate() {
+        let n: u64 = s.waits.millis[k].iter().sum();
+        let rate = s.waits_recent[k] as f64 / secs;
+        let q =
+            |q| percentile_ms(&s.waits.millis[k], q).map_or("·".to_owned(), |v| format!("{v} ms"));
+        let line = format!(
+            "{}: {rate:.1}/s · p50 {} · p95 {} · {n} since the start",
+            names[k],
+            q(50),
+            q(95)
+        );
+        let why = match k {
+            0 => "a tile the view asks for, loaded for the first time (or evicted over 30 s ago)".to_owned(),
+            1 => "a tile the view asks for again under 5 s after the budget let it go: an eviction undone at once".to_owned(),
+            _ => "a tile the view asks for again 5 to 30 s after the budget let it go".to_owned(),
+        };
+        let mut legend = vec![
+            self::line(Swatch::None, format!("waits, {kind}")),
+            self::line(Swatch::None, why),
+            self::line(
+                Swatch::None,
+                "a wait runs from the step the present need asks for a tile not on the GPU to the step it is drawable".to_owned(),
+            ),
+            self::line(Swatch::None, "rate: since the last publish; percentiles: since the start".to_owned()),
+        ];
+        if k > 0 {
+            let r = s.waits.reload_reasons;
+            legend.push(self::line(
+                Swatch::None,
+                format!(
+                    "reloads by the eviction they undo: headroom {}, below the floor value {}, room made {}, recycled {}",
+                    r[0], r[1], r[2], r[3]
+                ),
+            ));
+        }
+        p.hit(
+            MARGIN,
+            y - 1.0,
+            p.width(&line, EM) + 14.0,
+            ROW - 1.0,
+            legend,
+        );
+        p.text(MARGIN + 14.0, y, &line, EM, if n == 0 { dim } else { text });
+        y += ROW;
+    }
+    y + 8.0
+}
+
 /// Draws the board for `s` (none yet: a line saying so) at `scale` device
 /// pixels per point, its top-left corner at the origin.
 pub fn draw(
@@ -851,6 +916,7 @@ pub fn draw(
             y = levels(&mut p, s, view, y);
             y = tiers(&mut p, s, view, y);
             y = scores(&mut p, s, view, y);
+            y = waits(&mut p, s, y);
             layers(&mut p, s, view, y);
         }
     }
@@ -3861,5 +3927,42 @@ mod tests {
         assert!(w.scored);
         assert_eq!(w.under, [3_000, 0], "three of four held under λ");
         assert_eq!(w.over, [1_000, 0]);
+    }
+
+    /// The waits reach the board: first loads and reloads, their rates and
+    /// percentiles, and nothing at all before a wait ended.
+    #[test]
+    fn the_board_shows_the_waits_split_by_first_load_and_reload() {
+        let mut s = fixtures::healthy();
+        let mut cache = TextCache::default();
+        let view = BoardView {
+            cumulative: false,
+            from: None,
+            layers: &["Aerial".to_owned()],
+            decide: None,
+            stalls: &StallWatch::default(),
+            width: None,
+            issues_only: false,
+        };
+        draw(Some(&s), &view, &mut cache, 1.0);
+        assert!(
+            !cache.masks.keys().any(|(t, _)| t == "Waits"),
+            "no wait yet, no section"
+        );
+        s.waits.millis[0][8] = 9; // nine first loads of 128–255 ms
+        s.waits.millis[0][10] = 1;
+        s.waits.millis[1][6] = 2; // two reloads of 32–63 ms, evicted < 5 s before
+        s.waits_recent = [5, 2, 0];
+        s.waits_recent_micros = 1_000_000;
+        draw(Some(&s), &view, &mut cache, 1.0);
+        let texts: Vec<&str> = cache.masks.keys().map(|(t, _)| t.as_str()).collect();
+        for t in [
+            "Waits",
+            "first loads: 5.0/s · p50 128 ms · p95 512 ms · 10 since the start",
+            "reloads < 5 s: 2.0/s · p50 32 ms · p95 32 ms · 2 since the start",
+            "reloads < 30 s: 0.0/s · p50 · · p95 · · 0 since the start",
+        ] {
+            assert!(texts.contains(&t), "{t} not drawn: {texts:?}");
+        }
     }
 }

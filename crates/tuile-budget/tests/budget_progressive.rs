@@ -858,3 +858,83 @@ fn the_headroom_follows_the_uploads() {
     assert!(most > 4 * rest.max(1 << 16), "no headroom in motion: {most} B");
     eprintln!("headroom: {rest} B at rest, {most} B in motion");
 }
+
+/// Every wait of the present need is classified by the meter
+/// (`tuile_budget::waits`): a first load, or a reload of a copy evicted
+/// less than 5 s or 30 s before, with the eviction's reason — what
+/// explains a latency live.
+#[test]
+fn a_wait_is_classified_first_load_or_reload_after_an_eviction() {
+    let mut c = config(Bytes::mib(64), 4);
+    c.pinned_level = None;
+    let run = |gap_s: u64| {
+        let mut r = Rig::new(c.clone());
+        let a: Vec<TileId> = (0..4u64).map(|x| t(10, 100 + x, 100)).collect();
+        let b: Vec<TileId> = (0..4u64).map(|x| t(10, 900 + x, 900)).collect();
+        let here = drawn(&a);
+        let there = drawn(&b);
+        let mut meter = tuile_budget::BudgetMeter::new(r.b.config());
+        let mut n = 0u64;
+        // A step of the rig, observed by a meter: the waits are the meter's.
+        let mut step = |r: &mut Rig, need: &NeedSet, meter: &mut tuile_budget::BudgetMeter| {
+            let (now, frame) = (r.now, r.frame);
+            let d = r.step(need);
+            let rec = tuile_budget::StepRecord {
+                step: n,
+                frame,
+                now,
+                views_changed: true,
+                eyes: 1,
+                need,
+                events: &[],
+                presence: &[],
+                decisions: &d,
+                ledger: r.b.ledger(),
+                pressure: tuile_budget::Pressure::Normal,
+                thermal: tuile_budget::Thermal::Nominal,
+                decide_wall: None,
+            };
+            tuile_budget::BudgetObserver::step(meter, &rec);
+            n += 1;
+            r.complete(&d);
+            d
+        };
+        let kinds = |m: &tuile_budget::BudgetMeter| -> [u64; 3] {
+            let w = m.signals().waits;
+            [0, 1, 2].map(|k| w.millis[k].iter().sum())
+        };
+        for _ in 0..30 {
+            step(&mut r, &here, &mut meter);
+        }
+        assert_eq!(kinds(&meter), [4, 0, 0], "the first loads");
+        // Away, and the budget cut: `a`'s meshes are evicted.
+        r.b.retarget(Bytes::kib(64));
+        let mut evicted = false;
+        for _ in 0..30 {
+            let d = step(&mut r, &there, &mut meter);
+            evicted |= a.iter().any(|t| d.evict.contains(&ResourceId::Mesh(*t)));
+        }
+        assert!(evicted, "nothing of `a` evicted: the test proves nothing");
+        r.b.retarget(Bytes::mib(64));
+        // Still away for the gap, then back.
+        for _ in 0..gap_s * 60 {
+            step(&mut r, &there, &mut meter);
+        }
+        let before = kinds(&meter);
+        for _ in 0..30 {
+            step(&mut r, &here, &mut meter);
+        }
+        let after = kinds(&meter);
+        (
+            [after[0] - before[0], after[1] - before[1], after[2] - before[2]],
+            meter.signals().waits.reload_reasons,
+        )
+    };
+    let (soon, reasons) = run(1);
+    assert!(soon[1] > 0 && soon[0] == 0, "back within 5 s: reloads <5 s, {soon:?}");
+    assert!(reasons[..3].iter().sum::<u64>() > 0, "the reloads name their eviction's reason");
+    let (later, _) = run(12);
+    assert!(later[2] > 0 && later[1] == 0, "back after 12 s: reloads <30 s, {later:?}");
+    let (long, _) = run(40);
+    assert!(long[0] > 0 && long[1] + long[2] == 0, "back after 40 s: first loads again, {long:?}");
+}

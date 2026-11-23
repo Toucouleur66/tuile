@@ -217,6 +217,36 @@ fn soak(minutes: u64) {
         last.heap,
         sim.log.len()
     );
+    // The waits split by their kind, as the meter tells them
+    // (`tuile_budget::waits`): first loads, and reloads of a mesh evicted
+    // under 5 s or 30 s before, by `Decisions::evict` — told from the
+    // outside, so the same on any budget (`--nocapture`).
+    let outside = |from: Micros, to: Micros| {
+        let mut by: [Vec<f64>; 3] = Default::default();
+        for ((t, ms), k) in sim.waits.iter().zip(&sim.wait_kinds) {
+            if *t >= from && *t < to {
+                by[usize::from(*k)].push(*ms);
+            }
+        }
+        let parts: Vec<String> = by
+            .iter_mut()
+            .zip(["first", "reload_5s", "reload_30s"])
+            .map(|(v, kind)| {
+                v.sort_by(f64::total_cmp);
+                let q = |q: usize| {
+                    v.get(v.len() * q / 100)
+                        .map_or("-".to_owned(), |x| format!("{x:.0}"))
+                };
+                format!("{kind} {} (p50 {} p95 {} ms)", v.len(), q(50), q(95))
+            })
+            .collect();
+        parts.join(", ")
+    };
+    eprintln!(
+        "soak {minutes} min: mesh waits by eviction, first window: {}; last window: {}",
+        outside(Micros(span), Micros(2 * span)),
+        outside(end.since(Micros(span)), end)
+    );
     assert!(first.p95_ms > 0.0, "nothing loaded");
     // The last window draws at full detail: before the progressive score,
     // its flat latency came from a picture relaxed on every one of its

@@ -542,6 +542,15 @@ pub struct BudgetSignals {
     pub score_total: crate::score::ScoreBoard,
     /// `score_min{…}` and `score_max{…}`: the same since the last publish.
     pub score_recent: crate::score::ScoreBoard,
+    /// The present need's waits since the meter's start, first loads and
+    /// reloads after an eviction (`crate::waits`): `waits_total{kind,
+    /// class,level}`, `wait_p50_ms{kind}`, `wait_p95_ms{kind}` (from the
+    /// durations' histogram by kind) and `reloads_total{reason}`.
+    pub waits: crate::waits::WaitTotals,
+    /// The waits ended since the last publish, by kind, and the time they
+    /// span, µs: a rate per second.
+    pub waits_recent: [u64; 3],
+    pub waits_recent_micros: u64,
     /// `exchange_threshold`: λ, the score at the memory boundary since
     /// the last publish — the highest score released to make room or keep
     /// the target (sweep, pressure, admission, swap): what is held under it
@@ -649,6 +658,10 @@ pub mod labels {
     pub const SIDE: [&str; 4] = ["preload", "evict", "held", "decoded"];
     /// `term` of the score.
     pub const TERM: [&str; 5] = crate::score::TERM_LABELS;
+    /// `kind` of `waits_total`, `wait_p50_ms`, `wait_p95_ms`.
+    pub const WAIT_KIND: [&str; 3] = crate::waits::WAIT_KINDS;
+    /// `reason` of `reloads_total`.
+    pub const RELOAD: [&str; 4] = ["headroom", "below_floor_value", "make_room", "recycled"];
     /// `q` of `score_quantile`.
     pub const QUANTILE: [&str; 3] = ["0.1", "0.5", "0.9"];
     /// `tier` of `restore_cost_seconds`.
@@ -1163,6 +1176,37 @@ impl BudgetSignals {
         if let Some(n) = self.score_params.need_level {
             out.push(("need_level", vec![], f64::from(n)));
         }
+        // The waits, by kind (`crate::waits`).
+        for (k, kind) in crate::waits::WAIT_KINDS.iter().enumerate() {
+            for c in Class::ALL {
+                for l in 0..LEVELS {
+                    let n = self.waits.count[c][l][k];
+                    if n > 0 {
+                        out.push((
+                            "waits_total",
+                            vec![
+                                ("kind", kind),
+                                ("class", labels::class(c)),
+                                ("level", labels::LEVEL[l]),
+                            ],
+                            n as f64,
+                        ));
+                    }
+                }
+            }
+            for (q, name) in [(50, "wait_p50_ms"), (95, "wait_p95_ms")] {
+                if let Some(ms) = crate::waits::percentile_ms(&self.waits.millis[k], q) {
+                    out.push((name, vec![("kind", kind)], ms as f64));
+                }
+            }
+        }
+        for (i, reason) in labels::RELOAD.iter().enumerate() {
+            out.push((
+                "reloads_total",
+                vec![("reason", reason)],
+                self.waits.reload_reasons[i] as f64,
+            ));
+        }
         if let Some(l) = self.score_lambda {
             out.push(("exchange_threshold", vec![], l as f64));
         }
@@ -1316,6 +1360,8 @@ pub struct BudgetMeter {
     scratch: MeterScratch,
     batch_steps: u64,
     violations: Violations,
+    /// The present need's waits, followed (`crate::waits`).
+    waits: crate::waits::WaitTracker,
 }
 
 /// The meter's per-step buffers.
@@ -1383,6 +1429,8 @@ impl BudgetMeter {
         self.s.fallback_depth_max = 0;
         self.s.score_recent = crate::score::ScoreBoard::default();
         self.s.score_lambda = None;
+        self.s.waits_recent = [0; 3];
+        self.s.waits_recent_micros = 0;
         self.s.score_events.clear();
         s
     }
@@ -1695,6 +1743,16 @@ impl BudgetObserver for BudgetMeter {
             .extend(d.draw.items.iter().flat_map(|i| i.serves.iter().copied()));
         x.served.sort_unstable();
         x.served.dedup();
+        // The waits: the draw ends them, the need opens them.
+        s.waits_recent_micros += dt;
+        self.waits.step(
+            r.now,
+            r.need,
+            d,
+            &x.drawn,
+            &mut s.waits,
+            &mut s.waits_recent,
+        );
         let drawn = &x.drawn;
         let parents = &x.parents;
         x.swapped.clear();

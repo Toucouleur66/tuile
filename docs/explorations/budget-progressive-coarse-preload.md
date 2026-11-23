@@ -280,6 +280,29 @@ marked, and its waste (`level_waste`) is, once scores are published, the held by
 (preloads in flight / evicted, or started / evicted since the cumulative view's start), the
 terms per level and side, and the two held lists.
 
+### Why a tile waits (`tuile_budget::waits`)
+
+A wait is a tile the present need wants drawn that is not drawn as itself (shown by an
+ancestor, or not at all), from the step it is first wanted to the step it is drawn as
+itself; a tile the need stops wanting ends no wait. The **meter** follows them
+(`BudgetMeter`, `waits::WaitTracker`) from the step records — `decide` does not, and pays
+nothing for them: its allocation ratchets do not move. Each wait is classified when it
+opens: a **first load**, or a **reload** of a mesh evicted (`Decisions::evict`) less than
+5 s before (`reload_5s`) or 5 to 30 s before (`reload_30s`); an eviction is remembered 30 s
+(`RELOAD_MEMORY`), past that a reload counts as a first load. A reload carries the
+eviction's reason from the step's `Decisions::scores`: headroom sweep, below the floor
+value, room made, or the rest (an epoch's recycling).
+
+`BudgetSignals::waits` totals them by class, level and kind, their durations by kind on the
+load latencies' power-of-two ms buckets, and the reloads by reason. Series:
+`tuile_budget_waits_total{kind,class,level}`, `tuile_budget_wait_p50_ms{kind}`,
+`tuile_budget_wait_p95_ms{kind}`, `tuile_budget_reloads_total{reason}`. The board's
+**Waits** section prints, per kind, the rate since the last publish, p50 and p95 since the
+start, and the count, with a hover legend; the reloads' legend splits them by the
+eviction's reason. The 5-minute soak prints the same split for its first and last windows,
+told the same way from its mesh waits and the decisions' evictions — comparable with a
+budget that predates the classification.
+
 ### Grafana panels (proposal, to port into the STL dashboards)
 
 ```json

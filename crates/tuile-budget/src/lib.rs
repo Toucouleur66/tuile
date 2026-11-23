@@ -37,6 +37,7 @@ pub mod tiers;
 pub mod types;
 mod value;
 pub mod score;
+pub mod waits;
 pub mod view;
 
 pub use config::{

@@ -985,6 +985,7 @@ fn labels_stay_within_their_closed_sets() {
                 .iter()
                 .chain(&labels::EVICT)
                 .chain(&labels::RELEASE)
+                .chain(&labels::RELOAD)
                 .copied()
                 .collect(),
             "kind" => labels::FAILURE
@@ -995,6 +996,7 @@ fn labels_stay_within_their_closed_sets() {
                 .chain(&labels::LOAD_KIND)
                 .chain(&labels::LEVEL_EVENT)
                 .chain(&labels::LAYER_LOAD)
+                .chain(&labels::WAIT_KIND)
                 .copied()
                 .collect(),
             "gap" => labels::GAP.to_vec(),
@@ -1219,6 +1221,8 @@ fn the_score_series_are_the_decisions_terms() {
         assert_eq!(find("exchange_threshold", &[]), l as f64);
     }
     assert!(series.iter().any(|(n, _, _)| *n == "score_quantile"));
+    // The waits of the drawn tiles, first loads.
+    assert!(find("waits_total", &[("kind", "first")]) > 0.0);
     assert_eq!(find("param", &[("name", "rho_tiles")]), 3.0);
     assert_eq!(find("param", &[("name", "floor_level")]), 1.0);
     assert_eq!(find("need_level", &[]), 6.0);
