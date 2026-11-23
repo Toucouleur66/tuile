@@ -2619,28 +2619,32 @@ impl Budget {
         if self.ledger.gpu[class].minus(freeable).plus(bytes) > limit {
             if urgency >= Urgency::Ring && prob > 0 {
                 let a = &self.arena;
-                let looked = room.grouped.len();
-                let extra = room
-                    .grouped
-                    .iter()
-                    .filter(|&&((.., r), s)| {
-                        a.class(s) == class
-                            && a.has_gpu(s)
-                            && !a.has_transit(s)
-                            && !self.kept(s)
-                            && !self.is_floor(class, a.level(s))
-                            && victim(self, &r, s).is_none()
-                            && swaps(self, &r, s)
-                    })
-                    .fold(Bytes::ZERO, |acc, &(_, s)| {
-                        acc.plus(a.gpu(s).map_or(Bytes::ZERO, |g| g.bytes))
-                    });
-                st.work = st.work.saturating_add(sat_u32(looked));
-                swapping = self.ledger.gpu[class]
+                // Lowest scores first, until enough: the scan stops as soon
+                // as the room is found (a step's work stays bounded by it).
+                let need = self.ledger.gpu[class]
                     .minus(freeable)
-                    .minus(extra)
                     .plus(bytes)
-                    <= limit;
+                    .minus(limit);
+                let mut extra = Bytes::ZERO;
+                let mut looked = 0u32;
+                for &((.., r), s) in &room.grouped {
+                    if extra >= need {
+                        break;
+                    }
+                    looked += 1;
+                    let ok = a.class(s) == class
+                        && a.has_gpu(s)
+                        && !a.has_transit(s)
+                        && !self.kept(s)
+                        && !self.is_floor(class, a.level(s))
+                        && victim(self, &r, s).is_none()
+                        && swaps(self, &r, s);
+                    if ok {
+                        extra = extra.plus(a.gpu(s).map_or(Bytes::ZERO, |g| g.bytes));
+                    }
+                }
+                st.work = st.work.saturating_add(looked);
+                swapping = extra >= need;
             }
             if !swapping {
                 *strained = true;
