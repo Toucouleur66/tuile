@@ -40,18 +40,21 @@ const MIB: u64 = 1 << 20;
 
 /// Default for [`DiskCacheConfig::budget_bytes`].
 pub const DEFAULT_DISK_BUDGET: u64 = 8 * GIB;
-/// Default for [`DiskCacheConfig::downloads_in_flight`]: small copies are
-/// what the first readers of their zones wait on, as many as the requests a
-/// burst of new zones brings.
+/// Default for [`DiskCacheConfig::downloads_in_flight`]: as many small copies
+/// as the zones a burst of reads brings to their copy.
 pub const DEFAULT_DOWNLOADS_IN_FLIGHT: usize = 16;
-/// Default for [`DiskCacheConfig::await_copy_bytes`]: a zone of a few
-/// megabytes comes down in about the time of the two or three range reads a
-/// single tile of it costs.
-pub const DEFAULT_AWAIT_COPY_BYTES: u64 = 4 * MIB;
+/// Default for [`DiskCacheConfig::copy_after_reads`]: a zone is copied on its
+/// second read from the bucket. Measured in production (stl-tiles, November
+/// 2026), copying on the first read brought down about one whole archive per
+/// tile read from it — ~1.6 TB a day for a 2 GiB cache: most zones are read
+/// once. A zone read a second time is the first evidence it will be read
+/// again; waiting for a third would read by ranges the zones a camera dwells
+/// on for one read more, for no saving on the zones read once.
+pub const DEFAULT_COPY_AFTER_READS: u32 = 2;
 /// Archives at least this large are copied one at a time, on a queue of their
 /// own that yields to the small copies: a coarse zone of tens of megabytes
-/// must neither take the bandwidth readers are waiting on nor hold up the
-/// copies of the small zones behind it.
+/// must neither take the bandwidth of the copies of the small zones nor hold
+/// them up behind it.
 pub const LARGE_ARCHIVE_BYTES: u64 = 16 * MIB;
 /// Default for [`DiskCacheConfig::max_archive_bytes`]: past this, an archive
 /// is read by ranges rather than copied whole.
@@ -80,14 +83,12 @@ pub struct DiskCacheConfig {
     /// When a zone is first read from the bucket, also copy the zones around
     /// it at the same level: a camera that moves reaches them next.
     pub prefetch_neighbours: bool,
-    /// A read waits for the copy of an archive up to this size rather than
-    /// reading it by ranges alongside the copy. `0`: never wait.
-    pub await_copy_bytes: u64,
-    /// Reads of a zone from the bucket before its archives are copied whole:
-    /// `1` copies a zone on its first read. Where most zones are read once
-    /// (a server whose clients spread over the globe, a walk over a layer),
-    /// a copy per read downloads whole archives for one tile each; a zone
-    /// read again is the one worth holding. `0` is taken as `1`.
+    /// Reads of a zone from the bucket before its archives are copied whole,
+    /// in the background: no read ever waits for a copy, it reads by ranges
+    /// until the copy is local. Where most zones are read once (a server
+    /// whose clients spread over the globe, a walk over a layer), a copy per
+    /// read downloads whole archives for one tile each; a zone read again is
+    /// the one worth holding. `0` is taken as `1`.
     pub copy_after_reads: u32,
 }
 
@@ -99,8 +100,7 @@ impl DiskCacheConfig {
             downloads_in_flight: DEFAULT_DOWNLOADS_IN_FLIGHT,
             max_archive_bytes: DEFAULT_MAX_ARCHIVE_BYTES,
             prefetch_neighbours: false,
-            await_copy_bytes: DEFAULT_AWAIT_COPY_BYTES,
-            copy_after_reads: 1,
+            copy_after_reads: DEFAULT_COPY_AFTER_READS,
         }
     }
 }

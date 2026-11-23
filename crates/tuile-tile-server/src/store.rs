@@ -1009,13 +1009,10 @@ impl TileStore {
             .filter(|a| !l.is_expired(&a.epoch, now))
             .collect();
         if !live.iter().all(|a| self.disk_reader(&a.key).is_some()) && self.read_enough(&key) {
-            // A read of this zone from the bucket: copy it whole, so the next
-            // read of any of its tiles is local — and this one too, when the
-            // archives are small enough to be worth waiting for.
-            let waits = self.copy_zone(l, zone, &live, now);
-            if !waits.is_empty() {
-                futures_util::future::join_all(waits).await;
-            }
+            // Read often enough from the bucket: copy it whole in the
+            // background, so a later read of any of its tiles is local. This
+            // one reads by ranges, never waiting on the copy.
+            self.copy_zone(l, zone, &live, now);
         }
         // The newest archive first, as it usually holds the tile; on a miss,
         // all the older ones at once, so a tile held only by the oldest costs
@@ -1104,8 +1101,9 @@ impl TileStore {
         let Ok(mut reads) = self.zone_reads.lock() else {
             return true;
         };
-        // Kept once reached: a read while the copy is in flight joins it, and
-        // a zone evicted from disk is copied again on its next read.
+        // Kept once reached: a read while the copy is in flight does not start
+        // another, and a zone evicted from disk is copied again on its next
+        // read.
         let n = reads.get(key).unwrap_or(0).saturating_add(1).min(after);
         reads.insert(key.clone(), n, 1);
         if n < after {
@@ -1115,26 +1113,14 @@ impl TileStore {
     }
 
     /// Starts local copies of a zone's archives and, if configured, of the
-    /// zones around it. Returns the copies worth waiting for.
-    fn copy_zone(
-        &self,
-        layer: &Layer,
-        zone: Zone,
-        live: &[&ArchiveRef],
-        now: SystemTime,
-    ) -> Vec<crate::disk::ArchiveCopy> {
+    /// zones around it. Nothing waits on them.
+    fn copy_zone(&self, layer: &Layer, zone: Zone, live: &[&ArchiveRef], now: SystemTime) {
         let Some(disk) = &self.disk else {
-            return Vec::new();
+            return;
         };
-        let mut waits = Vec::new();
         for a in live {
-            if let Some((copy, started)) = disk.copy(self.store.clone(), &a.key, a.bytes) {
-                if started {
-                    self.stats.copies.fetch_add(1, Ordering::Relaxed);
-                }
-                if a.bytes <= disk.cfg.await_copy_bytes {
-                    waits.push(copy);
-                }
+            if let Some((_, true)) = disk.copy(self.store.clone(), &a.key, a.bytes) {
+                self.stats.copies.fetch_add(1, Ordering::Relaxed);
             }
         }
         let key = (layer.name.clone(), zone);
@@ -1147,7 +1133,6 @@ impl TileStore {
                 self.prefetch_zone(layer, near, now);
             }
         }
-        waits
     }
 
     /// Copies a zone's archives in the background, reading its manifest

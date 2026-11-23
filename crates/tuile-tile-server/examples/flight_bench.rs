@@ -246,12 +246,6 @@ async fn service(
     }
     let mut disk_cfg = tuile_tile_server::DiskCacheConfig::new(disk);
     disk_cfg.prefetch_neighbours = std::env::var("TUILE_BENCH_NEIGHBOURS").is_ok();
-    if let Some(b) = std::env::var("TUILE_BENCH_AWAIT_COPY_BYTES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        disk_cfg.await_copy_bytes = b;
-    }
     let store = store.with_disk_cache(disk_cfg).await.expect("disk cache");
     TileService::new(Arc::new(store), ups)
 }
