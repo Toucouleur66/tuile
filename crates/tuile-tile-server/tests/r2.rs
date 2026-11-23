@@ -255,7 +255,11 @@ async fn the_life_of_a_zone(objects: Arc<dyn ObjectStore>) {
     let dir = tempfile::tempdir().expect("dir");
     let server = Arc::new(
         store_on(objects.clone(), &clock, trusting)
-            .with_disk_cache(DiskCacheConfig::new(dir.path()))
+            .with_disk_cache(DiskCacheConfig {
+                // A zone copied on its first read.
+                copy_after_reads: 1,
+                ..DiskCacheConfig::new(dir.path())
+            })
             .await
             .expect("disk"),
     );

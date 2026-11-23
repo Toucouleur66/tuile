@@ -330,39 +330,37 @@ async fn with_disk(
         .expect("disk cache")
 }
 
-/// Copies in the background only: reads never wait for them.
-fn background(dir: &std::path::Path) -> DiskCacheConfig {
+/// Copies a zone on its first read from the bucket, for the tests about what
+/// happens once a zone is local.
+fn first_read(dir: &std::path::Path) -> DiskCacheConfig {
     DiskCacheConfig {
-        await_copy_bytes: 0,
+        copy_after_reads: 1,
         ..DiskCacheConfig::new(dir)
     }
 }
 
+/// A read never waits for a copy, however small the zone: the read that
+/// starts the copy is served by ranges, and the copy lands behind it.
 #[tokio::test]
-async fn a_small_zone_is_copied_whole_before_its_first_read() {
+async fn a_read_never_waits_for_the_copy_it_starts() {
     let clock = TestClock::new();
     let objects = memory();
     two_zones(objects.clone(), &clock, 16).await;
     let dir = tempfile::tempdir().expect("dir");
-    let counted = Counting::over(objects);
-    let s = with_disk(counted.clone(), &clock, DiskCacheConfig::new(dir.path())).await;
+    let s = with_disk(objects, &clock, first_read(dir.path())).await;
 
     let (x, y) = in_zone(0);
     assert_eq!(
         s.get(IMAGERY, LEVEL, x, y).await.expect("get"),
         Some(body(LEVEL, x, y, 1))
     );
-    let st = s.stats();
     assert_eq!(
-        (st.disk, st.remote),
-        (1, 0),
-        "the first read is already local"
+        (s.stats().disk, s.stats().remote),
+        (0, 1),
+        "the read that starts the copy is served from the bucket"
     );
-    assert_eq!(
-        counted.gets() - counted.manifest_gets(),
-        1,
-        "one whole-archive request, no range read"
-    );
+    s.settle().await;
+    assert_eq!(count_files(dir.path()), 1, "and the copy lands behind it");
 }
 
 #[tokio::test]
@@ -372,7 +370,7 @@ async fn a_zone_s_second_tile_is_read_from_local_disk() {
     two_zones(objects.clone(), &clock, 16).await;
     let dir = tempfile::tempdir().expect("dir");
     let counted = Counting::over(objects);
-    let s = with_disk(counted.clone(), &clock, background(dir.path())).await;
+    let s = with_disk(counted.clone(), &clock, first_read(dir.path())).await;
 
     let (x, y) = in_zone(0);
     assert_eq!(
@@ -405,24 +403,16 @@ async fn a_zone_s_second_tile_is_read_from_local_disk() {
     assert_eq!(s.stats().remote, 2);
 }
 
-/// A zone read once is read by ranges and never copied; its second read
-/// copies it, and the reads after that are local.
+/// By default a zone read once is read by ranges and never copied; its
+/// second read copies it in the background, and the reads after that are
+/// local.
 #[tokio::test]
-async fn a_zone_is_copied_only_once_read_often_enough() {
+async fn by_default_a_zone_is_copied_on_its_second_read() {
     let clock = TestClock::new();
     let objects = memory();
     two_zones(objects.clone(), &clock, 16).await;
     let dir = tempfile::tempdir().expect("dir");
-    let counted = Counting::over(objects);
-    let s = with_disk(
-        counted.clone(),
-        &clock,
-        DiskCacheConfig {
-            copy_after_reads: 2,
-            ..DiskCacheConfig::new(dir.path())
-        },
-    )
-    .await;
+    let s = with_disk(objects, &clock, DiskCacheConfig::new(dir.path())).await;
 
     // The zone east, read once: never copied.
     let (x, y) = in_zone(0);
@@ -434,15 +424,17 @@ async fn a_zone_is_copied_only_once_read_often_enough() {
     assert_eq!(count_files(dir.path()), 0, "a zone read once is not copied");
     assert_eq!((s.stats().disk, s.stats().remote), (0, 1));
 
-    // The test zone, read twice: the second read copies it, and waits for
-    // the copy as any read of a small zone does.
+    // The test zone, read twice: the second read copies it.
     s.get(IMAGERY, LEVEL, x, y).await.expect("get");
+    s.settle().await;
     assert_eq!(count_files(dir.path()), 0, "nor on its first read");
     let (x1, y1) = in_zone(1);
     assert_eq!(
         s.get(IMAGERY, LEVEL, x1, y1).await.expect("get"),
         Some(body(LEVEL, x1, y1, 1))
     );
+    assert_eq!(s.stats().remote, 3, "the second read is still remote");
+    s.settle().await;
     assert_eq!(count_files(dir.path()), 1, "copied on its second read");
     let before = s.stats();
     let (x2, y2) = in_zone(2);
@@ -462,7 +454,7 @@ async fn the_disk_budget_evicts_the_least_recently_read_zone() {
     let probe = with_disk(
         objects.clone(),
         &clock,
-        DiskCacheConfig::new(probe_dir.path()),
+        first_read(probe_dir.path()),
     )
     .await;
     let (x, y) = in_zone(0);
@@ -476,7 +468,7 @@ async fn the_disk_budget_evicts_the_least_recently_read_zone() {
         &clock,
         DiskCacheConfig {
             budget_bytes: one + one / 2,
-            ..background(dir.path())
+            ..first_read(dir.path())
         },
     )
     .await;
@@ -529,11 +521,11 @@ async fn a_restarted_store_starts_warm_from_its_disk() {
     let dir = tempfile::tempdir().expect("dir");
     let (x, y) = in_zone(0);
     {
-        let s = with_disk(objects.clone(), &clock, DiskCacheConfig::new(dir.path())).await;
+        let s = with_disk(objects.clone(), &clock, first_read(dir.path())).await;
         s.get(IMAGERY, LEVEL, x, y).await.expect("get");
         s.settle().await;
     }
-    let s = with_disk(objects, &clock, DiskCacheConfig::new(dir.path())).await;
+    let s = with_disk(objects, &clock, first_read(dir.path())).await;
     assert_eq!(
         s.get(IMAGERY, LEVEL, x, y).await.expect("get"),
         Some(body(LEVEL, x, y, 1))
@@ -548,7 +540,7 @@ async fn a_newer_archive_still_wins_over_a_local_copy() {
     let objects = memory();
     two_zones(objects.clone(), &clock, 4).await;
     let dir = tempfile::tempdir().expect("dir");
-    let s = with_disk(objects.clone(), &clock, DiskCacheConfig::new(dir.path())).await;
+    let s = with_disk(objects.clone(), &clock, first_read(dir.path())).await;
     let (x, y) = in_zone(0);
     s.get(IMAGERY, LEVEL, x, y).await.expect("get");
     s.settle().await;
@@ -576,7 +568,7 @@ async fn neighbour_zones_are_copied_when_asked() {
         let dir = tempfile::tempdir().expect("dir");
         let cfg = DiskCacheConfig {
             prefetch_neighbours: prefetch,
-            ..background(dir.path())
+            ..first_read(dir.path())
         };
         let s = with_disk(objects.clone(), &clock, cfg).await;
         s.get(IMAGERY, LEVEL, x, y).await.expect("get");

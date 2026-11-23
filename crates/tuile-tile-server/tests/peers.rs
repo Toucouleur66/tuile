@@ -358,7 +358,11 @@ async fn a_compaction_pass_elsewhere_is_heard_and_its_merged_archives_leave_the_
     let dir = tempfile::tempdir().expect("dir");
     let server = Arc::new(
         store(&objects, &clock, trusting)
-            .with_disk_cache(DiskCacheConfig::new(dir.path()))
+            .with_disk_cache(DiskCacheConfig {
+                // A zone copied on its first read.
+                copy_after_reads: 1,
+                ..DiskCacheConfig::new(dir.path())
+            })
             .await
             .expect("disk"),
     );
@@ -393,6 +397,12 @@ async fn a_compaction_pass_elsewhere_is_heard_and_its_merged_archives_leave_the_
         archives_on_disk(dir.path()),
         1,
         "the merged archive, and none of what it replaced"
+    );
+    // The read that started the copy did not wait for it; the next is local.
+    let (x, y) = in_zone(2);
+    assert_eq!(
+        server.get(IMAGERY, LEVEL, x, y).await.expect("get"),
+        Some(body(LEVEL, x, y, 1))
     );
     assert_eq!(
         server.stats().disk,
