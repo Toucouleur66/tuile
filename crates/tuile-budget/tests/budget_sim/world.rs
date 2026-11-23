@@ -19,7 +19,7 @@ use std::collections::BTreeSet;
 
 use super::detmath;
 
-use tuile_budget::cost::{drape_cost, Cost, TextureFormat};
+use tuile_budget::cost::{chain_blocks, drape_cost, Cost, TextureFormat};
 use tuile_budget::{
     Bytes, Class, GeoRect, ImageryNeed, Need, NeedSet, ResourceId, TexelFootprint, TileId,
 };
@@ -364,13 +364,44 @@ pub fn has_children(id: TileId) -> bool {
 /// What a resource costs: meshes by region (the city's its own), drapes by
 /// mosaic size (one 256² imagery tile per level of climb, squared).
 pub fn cost(r: ResourceId) -> Cost {
+    cost_for(r, SimPlan::Rgba8)
+}
+
+/// How a simulated client holds its imagery (CB3): what its drapes cost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SimPlan {
+    /// RGBA8, as every profile before compression.
+    Rgba8,
+    /// RGBA8 crosses and the GPU encodes it into 16-byte blocks (BC7, ASTC
+    /// 4×4): resident blocks, RGBA8 moved and held while it encodes, the
+    /// chain's blocks written.
+    Gpu,
+    /// Blocks encoded on the CPU (a decode worker, WebGL2): blocks cross
+    /// and are held.
+    Cpu,
+}
+
+/// [`cost`] under `plan`: meshes are the same whatever the plan.
+pub fn cost_for(r: ResourceId, plan: SimPlan) -> Cost {
     match r {
         ResourceId::Mesh(t) if is_city(t) => Cost::flat(CITY_MESH),
         ResourceId::Mesh(t) => Cost::flat(region(t).mesh_bytes()),
         ResourceId::Drape { tile: t, level, .. } => {
             let up = level.saturating_sub(t.terrain_coord().0).min(4);
             let side = 256u32 << up;
-            drape_cost(side, side, TextureFormat::Rgba8)
+            let rgba8 = drape_cost(side, side, TextureFormat::Rgba8);
+            let blocks = drape_cost(side, side, TextureFormat::Block16);
+            match plan {
+                SimPlan::Rgba8 => rgba8,
+                SimPlan::Cpu => blocks,
+                SimPlan::Gpu => Cost {
+                    gpu: blocks.gpu,
+                    staging: rgba8.staging,
+                    transfer: rgba8.gpu,
+                    transient: rgba8.gpu,
+                    encode_blocks: chain_blocks(side, side),
+                },
+            }
         }
     }
 }

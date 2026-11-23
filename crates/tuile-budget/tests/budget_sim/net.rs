@@ -169,6 +169,8 @@ pub struct SimNet {
     /// at once (a refused connection, a resolver with no answer: back within
     /// a millisecond, not after a round trip).
     pub outage: Option<(Micros, Micros)>,
+    /// How the client holds its imagery: what a decoded copy costs.
+    pub plan: super::world::SimPlan,
 }
 
 impl SimNet {
@@ -184,6 +186,7 @@ impl SimNet {
             network_bytes: 0,
             store_fills: true,
             outage: None,
+            plan: super::world::SimPlan::Rgba8,
         }
     }
 
@@ -281,7 +284,11 @@ impl SimNet {
                     if self.store_fills && self.store.held.insert(r) {
                         self.store.generation += 1;
                     }
-                    out.push(Arrival::Loaded(r, f.gen, cost(r)));
+                    out.push(Arrival::Loaded(
+                        r,
+                        f.gen,
+                        super::world::cost_for(r, self.plan),
+                    ));
                 }
                 Outcome::Fail => out.push(Arrival::Failed(r, f.gen)),
                 Outcome::Miss => out.push(Arrival::StoreMiss(r, f.gen)),
