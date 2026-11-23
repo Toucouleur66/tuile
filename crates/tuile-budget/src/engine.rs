@@ -3074,14 +3074,8 @@ impl Budget {
             "the room counts the bytes of its residents still evictable"
         );
         let w = self.cfg.watermarks;
-        // Stuck: relaxed, and nothing loading or starting — the detail can
-        // only come back once every class is under its low watermark.
-        let stuck = self.relaxing()
-            && d.start.is_empty()
-            && self.local_reads == 0
-            && self.in_flight.iter().all(|(_, n)| n == 0);
         if let Some(p) = eff.pool {
-            self.evict_pooled(now, p, wants, stuck, d, st);
+            self.evict_pooled(now, p, wants, d, st);
         }
         for class in Class::ALL {
             if eff.pool.is_some_and(|p| p.members[class]) {
@@ -3090,18 +3084,9 @@ impl Budget {
             let used = self.ledger.gpu[class];
             let high = eff.target[class].scaled(u64::from(w.high_percent), 100);
             let low = eff.target[class].scaled(u64::from(w.low_percent), 100);
-            // Relaxed, the level of detail comes back only once every class
-            // is under its low watermark (`relax`): a class held between
-            // the watermarks by copies nobody draws would keep the picture
-            // coarse, and nothing loading, for ever — stuck so, the lowest
-            // scores go down to the low watermark too.
-            if used <= high && !(stuck && used > low) {
+            if used <= high {
                 continue;
             }
-            // Stuck between the watermarks, only the junk goes: what is no
-            // longer wanted and worth less than the floor value or far finer
-            // than the need. The cache of the need's own levels stays.
-            let junk_only = used <= high;
             let room = match self.scratch.room.take() {
                 Some(room) => room,
                 None => self.room(wants, st),
@@ -3120,7 +3105,7 @@ impl Budget {
                 }
                 // Still on the GPU, and not on its way again.
                 let evictable = self.arena.has_gpu(s) && !self.arena.has_transit(s);
-                if !evictable || (junk_only && !self.junk(wants, s)) {
+                if !evictable {
                     continue;
                 }
                 self.evict_one(now, s, class, d, st);
@@ -3190,32 +3175,12 @@ impl Budget {
         }
     }
 
-    /// Whether `s` is junk: not wanted, and under the floor value or far
-    /// finer than the need — what a stuck budget lets go of.
-    fn junk(&self, wants: Wants<'_>, s: Slot) -> bool {
-        let floor = super::value::CERTAIN / 1_000
-            * u32::from(self.spec.params.floor_value_permille);
-        !wants.contains_key(&self.arena.id(s))
-            && (self.arena.place(s).1 < floor || self.far_finer(s))
-    }
-
     /// Whether `s`, no longer wanted, is of a level more than one finer than
     /// what the view needs now: nothing selects it soon, it goes once out
     /// of the need for the thrash window, whatever it was.
     fn far_finer(&self, s: Slot) -> bool {
         self.need_level
             .is_some_and(|n| self.arena.level(s) > n.saturating_add(1))
-    }
-
-    /// `target` less the headroom: the larger of the specification's fixed
-    /// share and the dynamic one — the measured upload rate over the
-    /// horizon, plus the bytes in transit: about nothing at rest, the next
-    /// seconds of uploads in motion
-    /// (`docs/explorations/budget-progressive-coarse-preload.md` §3).
-    fn headroom(&self, target: Bytes) -> Bytes {
-        let h = u64::from(self.spec.params.headroom_permille.min(1_000));
-        let fixed = target.minus(target.scaled(1_000 - h, 1_000));
-        target.minus(fixed.max(self.dynamic_headroom()))
     }
 
     /// The dynamic headroom, bytes: the smoothed upload rate over the
@@ -3339,7 +3304,6 @@ impl Budget {
         now: Micros,
         p: PoolEff,
         wants: Wants<'_>,
-        stuck: bool,
         d: &mut Decisions,
         st: &mut BudgetStats,
     ) {
@@ -3359,11 +3323,7 @@ impl Budget {
         let mut over: PerClass<bool> =
             PerClass::from_fn(|c| p.members[c] && self.ledger.gpu[c] > ceiling_high(c));
         let high = pct(p.target, w.high_percent);
-        // Relaxed and between the watermarks: down to the low one, so the
-        // detail can come back (`relax`).
-        let junk_only = used(&self.ledger) <= high && Class::ALL.iter().all(|c| !over[*c]);
-        let pool_over = used(&self.ledger) > high
-            || (stuck && used(&self.ledger) > pct(p.target, w.low_percent));
+        let pool_over = used(&self.ledger) > high;
         if !pool_over && Class::ALL.iter().all(|c| !over[*c]) {
             return;
         }
@@ -3390,7 +3350,7 @@ impl Budget {
         let mut walk = Walk::default();
         while let Some((_, s)) = walk.next(&self.arena, &room.grouped, member, &Held::GPU) {
             st.work = st.work.saturating_add(1);
-            if !candidate(self, s) || (junk_only && !self.junk(wants, s)) {
+            if !candidate(self, s) {
                 continue;
             }
             let (class, bytes) = (

@@ -144,11 +144,12 @@ The score orders the value band only. Before it, in this order and whatever the 
   looks at `release_visits` (64) copies a step per tier from the bottom of the release
   order: a frame's releases stay small.
 - **Relaxed, between the watermarks.** A relaxed picture comes back to full detail only once
-  every class is under its low watermark; stuck so — relaxed, nothing starting, loading or
-  reading — a class held between them is swept down to it of its junk: what is no longer
-  wanted and under the floor value or far finer than the need (Laurent's stall). Sweeping
-  everything unprotected whenever relaxed took the soak's cache (183–217 ms instead of 33 ms
-  at p95).
+  every class is under its low watermark. Laurent's stall (the drapes at 97–99 % of target,
+  relaxed, nothing loading) is a class held between them by copies nobody draws: the floor
+  value's pass takes them (far finer than the need, or under the floor value) and the class
+  falls under its low watermark. An extra sweep when relaxed was tried: run whenever relaxed
+  it took the soak's cache (183–217 ms instead of 33 ms at p95); run only when stuck and on
+  junk only, its walk made a still step's work grow with what is held (2 000 visits a step).
 - Measured on the simulation and not kept: a fixed 12.5 % headroom swept under the target
   every step (the soak's revisits waited 167–267 ms at p95 instead of 33 ms; a slow zoom-in
   missed its bound), and a 75 % cap on the preloads' share of the slots (it starved the views
