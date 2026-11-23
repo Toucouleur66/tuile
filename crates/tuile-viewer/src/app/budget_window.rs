@@ -751,8 +751,9 @@ fn score_rows(
                     .to_vec(),
             );
             for l in 0..LEVELS {
-                let row: Vec<u64> = (0..3)
-                    .map(|i| r[i][l].iter().map(|v| u64::from(*v)).sum())
+                let row: Vec<u64> = r
+                    .iter()
+                    .map(|reason| reason[l].iter().map(|v| u64::from(*v)).sum())
                     .collect();
                 if row.iter().any(|v| *v > 0) {
                     let mut cells = vec![format!("{l} rel")];

@@ -126,7 +126,7 @@ pub fn start_web(config: &Config, identity: Identity<'_>) -> bool {
         // (`crate::logs`): as a desktop sends them, fire and forget.
         let records = tuile_core::metrics::take_score_records();
         if let Some(body) = crate::logs::encode(&crate::resource(), &records, crate::unix_nanos()) {
-            if let Ok(logs) = request(&logs_url, &headers, &body) {
+            if let Ok(logs) = crate::web::request(&logs_url, &headers, &body) {
                 let sent = scope.fetch(&logs);
                 wasm_bindgen_futures::spawn_local(async move {
                     let _ = wasm_bindgen_futures::JsFuture::from(sent).await;
