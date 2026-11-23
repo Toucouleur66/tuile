@@ -564,6 +564,97 @@ mod tests {
         );
     }
 
+    /// A child as a source sends it: a JPEG of `side × side`, made from a
+    /// seeded mix of gradients and grain, so it compresses like imagery and
+    /// every build of every platform makes the same bytes.
+    fn jpeg_child(seed: u32, side: u32) -> Bytes {
+        let mut state = seed.wrapping_mul(2_654_435_761).max(1);
+        let mut grain = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state >> 24) as u8 / 8
+        };
+        let mut rgb = Vec::with_capacity((side * side * 3) as usize);
+        for y in 0..side {
+            for x in 0..side {
+                let base = [
+                    (x * 255 / side) as u8,
+                    (y * 255 / side) as u8,
+                    ((x + y + seed * 37) % 256) as u8,
+                ];
+                rgb.extend(base.map(|c| c.saturating_add(grain())));
+            }
+        }
+        let mut out = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85)
+            .encode(&rgb, side, side, image::ExtendedColorType::Rgb8)
+            .expect("a JPEG");
+        Bytes::from(out)
+    }
+
+    fn sha256(bytes: &[u8]) -> String {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    fn four_children() -> Vec<Bytes> {
+        (1..=4).map(|seed| jpeg_child(seed, 256)).collect()
+    }
+
+    /// The parent of `children`, made as a default parent layer makes it.
+    fn made(children: &[Bytes]) -> Vec<u8> {
+        make(children, DEFAULT_WEBP_QUALITY).expect("a parent")
+    }
+
+    #[test]
+    fn the_same_children_make_the_same_bytes_twice_and_across_threads() {
+        let children = Arc::new(four_children());
+        let first = made(&children);
+        assert_eq!(made(&children), first, "twice");
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let children = Arc::clone(&children);
+                std::thread::spawn(move || made(&children))
+            })
+            .collect();
+        for t in threads {
+            assert_eq!(t.join().expect("a thread"), first, "across threads");
+        }
+    }
+
+    /// The downsample of four known children, pinned: a faster downsample
+    /// must give the same pictures, pixel for pixel.
+    #[test]
+    fn the_downsample_is_pinned() {
+        let pictures: Vec<Vec<u8>> = four_children()
+            .iter()
+            .map(|b| image::load_from_memory(b).expect("a child").into_rgb8().into_raw())
+            .collect();
+        let parent = downsample(
+            [&pictures[0], &pictures[1], &pictures[2], &pictures[3]],
+            256,
+        );
+        assert_eq!(
+            sha256(&parent),
+            "fd8d4d0cf528a0dc784fef2dd6c018f96fc6b93fd267a73f3e7ee51f8dd4793a"
+        );
+    }
+
+    /// The tile four known children make, pinned: what changes these bytes
+    /// changes every parent tile made from now on (the old ones are kept
+    /// until a child changes).
+    #[test]
+    fn the_parent_tile_is_pinned() {
+        assert_eq!(
+            sha256(&made(&four_children())),
+            "2f436a66801cc9ce11f03453ad26d8ec647d49ec250b931afe0fe26548989633"
+        );
+    }
+
     #[test]
     fn a_child_s_dependents_are_its_parent_in_each_parent_layer() {
         let catalog: Catalog = serde_json::from_value(serde_json::json!({"layers": [
