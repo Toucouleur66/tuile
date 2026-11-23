@@ -63,6 +63,14 @@ pub(super) fn route(id: WindowId, view: Option<WindowId>, panel: Option<WindowId
     }
 }
 
+/// What a key in the budget window toggles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Toggle {
+    Tables,
+    Cumulative,
+    Reset,
+}
+
 /// What an event on the budget window's own window does.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum PanelEvent {
@@ -74,6 +82,9 @@ pub(super) enum PanelEvent {
     Rescale(f64),
     /// The system wants it drawn again.
     Redraw,
+    /// A key asking the budget window something: `T` its tables or its
+    /// board, `C` this step or the counters summed, `R` summed from now.
+    Ask(Toggle),
     /// Anything else: the panel takes no input.
     Nothing,
 }
@@ -89,6 +100,14 @@ pub(super) fn panel_event(event: &WindowEvent) -> PanelEvent {
             if event.state.is_pressed() && event.logical_key == Key::Named(NamedKey::Escape) =>
         {
             PanelEvent::Close
+        }
+        WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
+            match event.logical_key.as_ref() {
+                Key::Character("t" | "T") => PanelEvent::Ask(Toggle::Tables),
+                Key::Character("c" | "C") => PanelEvent::Ask(Toggle::Cumulative),
+                Key::Character("r" | "R") => PanelEvent::Ask(Toggle::Reset),
+                _ => PanelEvent::Nothing,
+            }
         }
         WindowEvent::Resized(size) => PanelEvent::Resize((size.width, size.height)),
         WindowEvent::ScaleFactorChanged { scale_factor, .. } => PanelEvent::Rescale(*scale_factor),
@@ -252,9 +271,9 @@ impl PanelScreen {
 
     /// Draws `panel` and shows it: presented on a window, read back on a
     /// texture.
-    pub(super) fn paint(&mut self, gpu: &GpuContext, panel: &tuile_ui::PanelLayout) {
+    pub(super) fn paint(&mut self, gpu: &GpuContext, panel: &tuile_ui::Drawing) {
         let vertices: Vec<OverlayVertex> = panel
-            .background
+            .mesh
             .iter()
             .map(|v| OverlayVertex {
                 position: v.position,
@@ -263,7 +282,7 @@ impl PanelScreen {
             .collect();
         self.overlay.set_geometry(gpu, &vertices, self.size);
         let masks: Vec<OverlayMask<'_>> = panel
-            .label
+            .labels
             .iter()
             .map(|label| OverlayMask {
                 width: label.mask.width,
@@ -576,6 +595,16 @@ impl App {
                 }
             }
             PanelEvent::Redraw => {}
+            PanelEvent::Ask(toggle) => {
+                let w = &self.budget_window;
+                self.budget_window.ask(match toggle {
+                    Toggle::Tables => crate::steer::WindowAsk::Tables(!w.tables()),
+                    Toggle::Cumulative => crate::steer::WindowAsk::Cumulative(!w.cumulative()),
+                    Toggle::Reset => crate::steer::WindowAsk::Reset,
+                });
+                // The menu's marks follow.
+                self.publish_the_view(None);
+            }
             PanelEvent::Nothing => return,
         }
         // Drawn again at once: a window being resized is drawn while it is,
@@ -612,6 +641,93 @@ mod tests {
         // Before the view's window is up: everything is the view's, as it
         // always was.
         assert_eq!(route(view, None, None), Route::View);
+    }
+
+    /// The pixels in the alert colour (vermillion) and the waste colour
+    /// (reddish purple), roughly: the shapes the attention rules draw.
+    fn coloured(pixels: &[u8]) -> (usize, usize) {
+        let near = |p: &[u8], c: [u8; 3]| (0..3).all(|k| p[k].abs_diff(c[k]) < 24);
+        let alert = pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| near(&p[..], [0xD5, 0x5E, 0x00]))
+            .count();
+        let waste = pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| near(&p[..], [0xCC, 0x79, 0xA7]))
+            .count();
+        (alert, waste)
+    }
+
+    /// The board drawn as the budget window draws it — the panel's own
+    /// texture, the overlay — for a healthy step and for the stall of the
+    /// captures: the stall is drawn in the alert's colour, the healthy step
+    /// nowhere. `TUILE_BOARD_PICTURES=<dir>` writes both as PNG.
+    #[test]
+    fn the_board_draws_a_stall_in_red_and_a_healthy_step_without() {
+        let gpu = match futures_executor::block_on(GpuContext::headless()) {
+            Ok(gpu) => gpu,
+            Err(e) => {
+                assert!(
+                    std::env::var("TUILE_REQUIRE_GPU").is_err(),
+                    "TUILE_REQUIRE_GPU is set and there is no usable adapter: {e}"
+                );
+                eprintln!("skipping: no usable adapter ({e})");
+                return;
+            }
+        };
+        let fixtures = tuile_ui::budget_board::fixtures::healthy;
+        let mut texts = tuile_ui::budget_board::TextCache::default();
+        let mut picture = |name: &str, s: &tuile_core::budget::BudgetSignals| {
+            let view = tuile_ui::budget_board::BoardView {
+                cumulative: false,
+                from: None,
+                layers: &["Aerial".to_owned()],
+                decide: Some(tuile_ui::budget_board::DecideSummary {
+                    mean_ms: 0.9,
+                    max_ms: 2.4,
+                    steps: 240,
+                    publications: 120,
+                }),
+            };
+            let board = tuile_ui::budget_board::draw(Some(s), &view, &mut texts, 2.0);
+            let mut screen = PanelScreen::texture(&gpu, board.size, 2.0, true);
+            screen.paint(&gpu, &board);
+            let (pixels, size) = screen.last_picture().expect("read back");
+            if let Ok(dir) = std::env::var("TUILE_BOARD_PICTURES") {
+                let path = std::path::Path::new(&dir).join(format!("{name}.png"));
+                image::save_buffer(
+                    &path,
+                    pixels,
+                    size.0,
+                    size.1,
+                    image::ExtendedColorType::Rgba8,
+                )
+                .expect("written");
+            }
+            coloured(pixels)
+        };
+        let (alert, waste) = picture("board-healthy", &fixtures());
+        assert_eq!(
+            (alert, waste),
+            (0, 0),
+            "a healthy step drawn in alert or waste colours"
+        );
+        let (alert, waste) = picture(
+            "board-stalled",
+            &tuile_ui::budget_board::fixtures::stalled(),
+        );
+        assert!(
+            alert > 200,
+            "the stall is not drawn in the alert's colour: {alert}"
+        );
+        assert!(
+            waste > 200,
+            "the drapes held for nothing are not drawn as waste: {waste}"
+        );
     }
 
     /// Closing the budget window's window closes it; resizing sizes it;

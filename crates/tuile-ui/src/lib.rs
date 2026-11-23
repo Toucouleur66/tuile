@@ -3,6 +3,7 @@
 
 #![doc = include_str!("../README.md")]
 
+pub mod budget_board;
 mod credits;
 mod nav;
 mod panel;
@@ -11,6 +12,7 @@ mod spinner;
 mod statusbar;
 mod text;
 
+pub use budget_board::Drawing;
 pub use credits::{BarLayout, CreditBar};
 pub use nav::{NavWidget, Part};
 pub use panel::{Panel, PanelLayout, BACKGROUND as PANEL_BACKGROUND};
