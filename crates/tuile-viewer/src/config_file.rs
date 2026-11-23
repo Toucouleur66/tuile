@@ -147,8 +147,69 @@ pub(crate) struct TemplateLayer {
     /// The deepest level it serves.
     pub max_level: Option<u32>,
     /// The header its credential goes in, when it takes one: the token
-    /// itself is in secure storage, under [`layer_token_variable`].
+    /// itself is in secure storage, under [`layer_token_variable`], or
+    /// handed out by its issuer.
     pub token_header: Option<String>,
+    /// Where its token is handed out, when it is not given once: asked for
+    /// a fresh one before it runs out and when the server refuses it, and
+    /// kept in memory only (`crate::renew`).
+    pub issuer: Option<TokenIssuer>,
+}
+
+/// A template layer's token issuer: a URL whose answer carries the token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TokenIssuer {
+    /// `https`, or `http` on this machine's loopback.
+    pub url: String,
+    pub answer: IssuedAs,
+}
+
+/// How an issuer's answer carries the token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IssuedAs {
+    /// The cookie of this name (`Set-Cookie`, with its `Max-Age`).
+    Cookie(String),
+    /// This field of a JSON object (with `expires_in`, in seconds).
+    Field(String),
+}
+
+/// A layer's `token_url` and its `token_cookie` or `token_field`, checked.
+fn read_issuer(
+    at: &dyn Fn(&str) -> String,
+    text: &dyn Fn(&str) -> Result<Option<String>, Problem>,
+    has_token: bool,
+) -> Result<Option<TokenIssuer>, Problem> {
+    let url = text("token_url")?;
+    let (cookie, field) = (text("token_cookie")?, text("token_field")?);
+    let Some(url) = url else {
+        if cookie.is_some() {
+            return Err((at("token_cookie"), "goes with a `token_url` only".into()));
+        }
+        if field.is_some() {
+            return Err((at("token_field"), "goes with a `token_url` only".into()));
+        }
+        return Ok(None);
+    };
+    if has_token {
+        return Err((
+            at("token_url"),
+            "a layer has a `token` or a `token_url`, not both".into(),
+        ));
+    }
+    // Checked as an API base is: https, or http on the loopback; said
+    // without the address.
+    api_base(&url).map_err(|why| (at("token_url"), why))?;
+    let answer = match (cookie, field) {
+        (Some(name), None) => IssuedAs::Cookie(name),
+        (None, Some(name)) => IssuedAs::Field(name),
+        _ => {
+            return Err((
+                at("token_url"),
+                "names its answer by a `token_cookie` or a `token_field`, one of them".into(),
+            ))
+        }
+    };
+    Ok(Some(TokenIssuer { url, answer }))
 }
 
 impl TemplateLayer {
@@ -412,7 +473,7 @@ fn read_imagery(section: &str, layers: &[Value]) -> Result<Imagery, Problem> {
                 Some(_) => Err((at(key), "must be a non-empty string".into())),
             }
         };
-        const KEYS: [&str; 12] = [
+        const KEYS: [&str; 15] = [
             "key",
             "name",
             "asset",
@@ -421,6 +482,9 @@ fn read_imagery(section: &str, layers: &[Value]) -> Result<Imagery, Problem> {
             "max_level",
             "token",
             "token_header",
+            "token_url",
+            "token_cookie",
+            "token_field",
             "attribution",
             "substitute",
             "substitute_gap",
@@ -431,8 +495,9 @@ fn read_imagery(section: &str, layers: &[Value]) -> Result<Imagery, Problem> {
                 return Err((
                     at(key),
                     "unknown key; a layer has key, name, asset or template (with scheme, \
-                     max_level, token and token_header), attribution, substitute, \
-                     substitute_gap and substitute_hysteresis"
+                     max_level, token or token_url with token_cookie or token_field, and \
+                     token_header), attribution, substitute, substitute_gap and \
+                     substitute_hysteresis"
                         .into(),
                 ));
             }
@@ -459,7 +524,15 @@ fn read_imagery(section: &str, layers: &[Value]) -> Result<Imagery, Problem> {
         }
         let template = text("template")?;
         if template.is_none() {
-            for only in ["scheme", "max_level", "token", "token_header"] {
+            for only in [
+                "scheme",
+                "max_level",
+                "token",
+                "token_header",
+                "token_url",
+                "token_cookie",
+                "token_field",
+            ] {
                 if layer.contains_key(only) {
                     return Err((at(only), "goes with a `template` only".into()));
                 }
@@ -535,10 +608,11 @@ fn read_imagery(section: &str, layers: &[Value]) -> Result<Imagery, Problem> {
             .get("token")
             .map(|value| read_token(&at("token"), value))
             .transpose()?;
-        let token_header = match (&token, token_header) {
+        let issuer = read_issuer(&at, &text, token.is_some())?;
+        let token_header = match (token.is_some() || issuer.is_some(), token_header) {
             (_, Some(header)) => Some(header),
-            (Some(_), None) => Some(tuile_core::fetch::Credential::AUTHORIZATION.to_owned()),
-            (None, None) => None,
+            (true, None) => Some(tuile_core::fetch::Credential::AUTHORIZATION.to_owned()),
+            (false, None) => None,
         };
         if let Some(token) = token {
             tokens.push((key.clone(), token));
@@ -557,6 +631,7 @@ fn read_imagery(section: &str, layers: &[Value]) -> Result<Imagery, Problem> {
             geographic,
             max_level,
             token_header,
+            issuer,
         });
     }
     // A substitute is another layer of the list, by its key; the rule's
@@ -748,6 +823,14 @@ pub(crate) fn settings_text(section: &str, settings: &Settings) -> String {
                         }
                         if let Some(header) = &x.token_header {
                             t.insert("token_header".into(), Value::String(header.clone()));
+                        }
+                        if let Some(issuer) = &x.issuer {
+                            t.insert("token_url".into(), Value::String(issuer.url.clone()));
+                            let (key, name) = match &issuer.answer {
+                                IssuedAs::Cookie(name) => ("token_cookie", name),
+                                IssuedAs::Field(name) => ("token_field", name),
+                            };
+                            t.insert(key.into(), Value::String(name.clone()));
                         }
                     }
                     None => {
@@ -1005,6 +1088,73 @@ mod tests {
         assert!(s.templates[0].geographic);
         assert!(s.templates[0].token_header.is_none());
         assert_eq!(again, s);
+    }
+
+    /// A template layer whose token is handed out by an issuer: no token
+    /// kept, the issuer and how its answer carries the token, its header;
+    /// written back as read. A token and an issuer together, an issuer
+    /// without its answer, and an answer without an issuer are refused.
+    #[test]
+    fn a_template_layer_names_its_token_issuer() {
+        let text = r#"
+            [[ion.imagery]]
+            key = "far"
+            template = "https://tiles.example/{z}/{x}/{y}.webp"
+            token_url = "https://tiles.example/"
+            token_cookie = "Visit"
+            token_header = "X-Tile-Token"
+            "#;
+        let file = read(text).expect("a file");
+        assert!(file.layer_tokens.is_empty());
+        let t = &file.settings.templates[0];
+        assert_eq!(t.token_header.as_deref(), Some("X-Tile-Token"));
+        assert_eq!(
+            t.issuer,
+            Some(TokenIssuer {
+                url: "https://tiles.example/".into(),
+                answer: IssuedAs::Cookie("Visit".into()),
+            })
+        );
+        let kept = settings_text("ion", &file.settings);
+        assert_eq!(read(&kept).expect("read back").settings, file.settings);
+        let json = read(&text.replace("token_cookie = \"Visit\"", "token_field = \"token\""))
+            .expect("a file");
+        let t = &json.settings.templates[0];
+        assert_eq!(
+            t.issuer.as_ref().map(|i| &i.answer),
+            Some(&IssuedAs::Field("token".into()))
+        );
+        let wrong = [
+            (
+                text.replace(
+                    "token_cookie",
+                    "token = \"abc.def\"\n            token_cookie",
+                ),
+                "ion.imagery[0].token_url",
+            ),
+            (
+                text.replace("token_cookie = \"Visit\"", ""),
+                "ion.imagery[0].token_url",
+            ),
+            (
+                text.replace(
+                    "token_cookie = \"Visit\"",
+                    "token_cookie = \"Visit\"\n            token_field = \"t\"",
+                ),
+                "ion.imagery[0].token_url",
+            ),
+            (
+                text.replace("token_url = \"https://tiles.example/\"", ""),
+                "ion.imagery[0].token_cookie",
+            ),
+            (
+                text.replace("https://tiles.example/\"", "http://tiles.example/\""),
+                "ion.imagery[0].token_url",
+            ),
+        ];
+        for (text, key) in wrong {
+            assert_eq!(read(&text).expect_err(key).key, key);
+        }
     }
 
     /// What is wrong with a template layer is said by its key, never its

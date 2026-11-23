@@ -17,4 +17,4 @@ pub mod post;
 #[cfg(target_arch = "wasm32")]
 mod transport;
 #[cfg(target_arch = "wasm32")]
-pub use transport::{CredentialedWebFetcher, WebFetcher, WebIonHttp};
+pub use transport::{fetch_tile_with, issue_json, CredentialedWebFetcher, WebFetcher, WebIonHttp};

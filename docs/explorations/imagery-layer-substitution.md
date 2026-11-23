@@ -273,6 +273,55 @@ Tests: `config_file::tests::a_template_layer_*`,
 `tuile_native_fetchers::tests::a_credential_goes_with_every_tile_and_is_never_printed`,
 `tuile_core::raster::tests::a_webp_tile_decodes`.
 
+### 5.2 A token that runs out, renewed
+
+Some servers hand their visitors a token that lasts a day. A template layer
+can name where its token is handed out instead of giving one:
+
+```toml
+[[ion.imagery]]
+key = "aerial-far"
+template = "https://tiles.example/aerial-far/{z}/{x}/{y}.webp"
+token_url = "https://tiles.example/"   # its answer carries the token
+token_cookie = "Visit"                 # in this cookie (Set-Cookie, Max-Age)…
+# token_field = "token"                # …or this field of a JSON object (expires_in)
+token_header = "X-Tile-Token"
+```
+
+On a page: `tokenUrl` and `tokenField` — JSON only, since a page does not see
+the cookies another site sets (`Set-Cookie` is withheld from scripts); the
+issuer must answer the page's origin (CORS), and the tile server must allow
+the header.
+
+`tuile-viewer`'s `renew::Renewing` holds the token **in memory only** — never
+in the settings, never in secure storage, never printed — and asks the issuer:
+
+- when it holds none, then **ahead of the lifetime the answer stated** (a tenth
+  of it, at most ten minutes, before its end);
+- when the server **refuses** the one it holds (401 or 403): one renewal, then
+  the tile asked once more. Many tiles refused together renew **once**: the
+  others wait for that answer.
+- A renewal that fails (issuer down, no token in its answer) is not tried
+  again for a pause that doubles from 5 s to 5 min; meanwhile every tile fails
+  at once, as an unreachable server's do — an error, never an absence — so
+  the substitute rule is suspended and the ground drawn from the **source
+  layer** (§3.4). Never a hole.
+
+The issuer is asked afresh each time (no cache, no cookie jar). Counted:
+`tuile_credential_renewals_total{outcome}`.
+
+Tests: `renew::tests::*` (expiry → 401 → renewal → tiles; sixteen concurrent
+refusals → one renewal; issuer down → bounded failure, then tiles again; a
+stated lifetime renewed ahead),
+`native::configured::tests::an_issued_token_is_renewed_when_it_runs_out` (a
+local server: cookie issuer, tokens that run out, issuer down),
+`config_file::tests::a_template_layer_names_its_token_issuer`,
+`web::options::tests::a_template_layer_names_its_token_issuer`,
+`tuile_native_fetchers::tests::an_issuer_hands_out_a_credential`,
+`tuile_core::fetch::tests::issued_credentials_are_read_from_a_cookie_or_json`.
+Not covered: the browser's issuer end to end (it builds for wasm; no headless
+browser test).
+
 ## 6. Budget compatibility (eviction/prefetch decider)
 
 The decider being designed in parallel (`budget-eviction-prefetch-spec.md`) values

@@ -393,6 +393,16 @@ pub(crate) struct LayerSpec {
     /// answer.
     #[serde(default)]
     pub token_header: Option<String>,
+    /// Where the token is handed out instead, renewed before it runs out
+    /// and when the server refuses it, kept in memory only: a URL answering
+    /// a JSON object (`tokenField`, with `expires_in` in seconds), allowed
+    /// to the page's origin (CORS). A cookie cannot serve here: a page does
+    /// not see the cookies another site sets.
+    #[serde(default)]
+    pub token_url: Option<String>,
+    /// The JSON field of `tokenUrl`'s answer that holds the token.
+    #[serde(default)]
+    pub token_field: Option<String>,
     /// Another layer of the list its far tiles are drawn from: `None`, the
     /// default, substitutes nothing.
     #[serde(default)]
@@ -449,7 +459,26 @@ impl SourcesSpec {
         }
         let mut layers = Vec::with_capacity(self.imagery.len());
         for (index, layer) in self.imagery.iter().enumerate() {
-            if layer.template.is_none() && (layer.token.is_some() || layer.token_header.is_some()) {
+            if layer.token_url.is_some() != layer.token_field.is_some() {
+                return Err(format!(
+                    "imagery {:?}: `tokenUrl` and `tokenField` go together",
+                    layer.key
+                ));
+            }
+            if layer.token_url.is_some() && layer.token.is_some() {
+                return Err(format!(
+                    "imagery {:?}: a `token` or a `tokenUrl`, not both",
+                    layer.key
+                ));
+            }
+            if let Some(url) = &layer.token_url {
+                crate::open::absolute_url(&format!("imagery {:?}: `tokenUrl`", layer.key), url)?;
+            }
+            if layer.template.is_none()
+                && (layer.token.is_some()
+                    || layer.token_header.is_some()
+                    || layer.token_url.is_some())
+            {
                 return Err(format!(
                     "imagery {:?}: `token` and `tokenHeader` go with a `template` only",
                     layer.key
@@ -575,6 +604,13 @@ impl LayerSpec {
         crate::open::template_tiling(self.scheme == Some(Grid::Geographic), self.max_level)
     }
 
+    /// The header a template layer's credential goes in.
+    pub(crate) fn credential_header(&self) -> &str {
+        self.token_header
+            .as_deref()
+            .unwrap_or(tuile_core::fetch::Credential::AUTHORIZATION)
+    }
+
     /// The credential a template layer's tiles are asked with, if any.
     pub(crate) fn credential(&self) -> Option<tuile_core::fetch::Credential> {
         let token = self.token.as_ref()?;
@@ -660,6 +696,42 @@ mod tests {
             e.contains("`template` only") && !e.contains("s3cr3t"),
             "{e}"
         );
+    }
+
+    /// A template layer's token may be handed out by a JSON issuer, renewed
+    /// in memory; with its field, never with a `token`.
+    #[test]
+    fn a_template_layer_names_its_token_issuer() {
+        const PAGE: &str = r#"{
+            "name": "Atlas",
+            "profile": "desktop",
+            "sources": {
+                "terrain": { "url": "https://tiles.test/layer.json" },
+                "imagery": [
+                    { "key": "far", "name": "Far", "attribution": "©",
+                      "template": "https://tiles.test/{z}/{x}/{y}.webp",
+                      "tokenUrl": "https://tiles.test/visitor", "tokenField": "token",
+                      "tokenHeader": "X-Tile-Token" }
+                ]
+            }
+        }"#;
+        let o = options(PAGE).expect("valid");
+        let (_, layers) = o.sources.choices().expect("valid");
+        let far = o.sources.template_of(layers[0].asset).expect("a template");
+        assert_eq!(far.token_url.as_deref(), Some("https://tiles.test/visitor"));
+        assert_eq!(far.credential_header(), "X-Tile-Token");
+        assert!(far.credential().is_none(), "no token given once");
+        for wrong in [
+            PAGE.replace(r#", "tokenField": "token""#, ""),
+            PAGE.replace(
+                r#""tokenField": "token","#,
+                r#""tokenField": "token", "token": "x","#,
+            ),
+        ] {
+            let o = options(&wrong).expect("parsed");
+            assert!(o.sources.choices().is_err(), "{wrong}");
+        }
+        assert!(options(&PAGE.replace("tokenField", "tokenCookie")).is_err());
     }
 
     /// Catalog layers keep their numbers, template layers get numbers the

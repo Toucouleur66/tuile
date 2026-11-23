@@ -276,6 +276,38 @@ impl TileFetcher for CredentialedWebFetcher {
     }
 }
 
+/// One tile asked with `credential`: a 404 is [`FetchError::NotFound`], a
+/// refusal [`FetchError::Status`] — what a renewing caller needs to tell a
+/// credential that ran out from a tile that is not there.
+pub async fn fetch_tile_with(
+    url: &Url,
+    credential: &Credential,
+) -> Result<Fetched<Bytes>, FetchError> {
+    fetch_tile(url, Some(credential)).await
+}
+
+/// A credential a server hands out as JSON — `{"<field>": "<value>",
+/// "expires_in": <seconds>}` — with its lifetime when stated, or the
+/// sentence that says why there is none, with no value in it.
+///
+/// JSON and not a cookie: a page cannot read the cookies another site's
+/// answer sets (`Set-Cookie` is withheld from scripts), so the issuer must
+/// answer in its body, and allow the page's origin (CORS).
+pub async fn issue_json(
+    url: &Url,
+    field: &str,
+) -> Result<(String, Option<std::time::Duration>), String> {
+    let at = tuile_core::fetch::redact(url.as_str());
+    let (status, body, _) = get(url, None, patience::Asker::Session)
+        .await
+        .map_err(|e| format!("{at}: {}", tuile_core::fetch::redact(&e)))?;
+    if !(200..300).contains(&status) {
+        return Err(format!("{at} answered {status}"));
+    }
+    tuile_core::fetch::json_credential(&body, field)
+        .ok_or_else(|| format!("{at} gave no {field:?}"))
+}
+
 /// One tile: a 404 is [`FetchError::NotFound`].
 async fn fetch_tile(
     url: &Url,

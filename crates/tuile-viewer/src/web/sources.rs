@@ -82,6 +82,21 @@ impl Sources for PageSources {
             return self.catalog()?.imagery(asset).await;
         };
         let template = layer.template.clone().unwrap_or_default();
+        if let (Some(url), Some(field)) = (&layer.token_url, &layer.token_field) {
+            let renewing = crate::renew::Renewing::new(
+                crate::renew::WebTransport,
+                crate::renew::WebIssuer {
+                    url: crate::open::absolute_url("`tokenUrl`", url)?,
+                    field: field.clone(),
+                    header: layer.credential_header().to_owned(),
+                },
+            );
+            return Ok(Arc::new(TemplateProvider::new(
+                template,
+                Arc::new(renewing),
+                layer.tiling(),
+            )));
+        }
         Ok(match layer.credential() {
             Some(credential) => Arc::new(TemplateProvider::new(
                 template,

@@ -592,6 +592,17 @@ impl TileFetcher for CredentialedHttp {
 }
 
 impl NativeHttp {
+    /// One tile asked with `credential`: a 404 is [`FetchError::NotFound`],
+    /// a refusal [`FetchError::Status`] — what a renewing caller needs to
+    /// tell a credential that ran out from a tile that is not there.
+    pub async fn fetch_tile_with(
+        &self,
+        url: &Url,
+        credential: &Credential,
+    ) -> Result<Fetched<Bytes>, FetchError> {
+        self.fetch_tile(url, Some(credential)).await
+    }
+
     /// One tile: a 404 is [`FetchError::NotFound`], the origin saying it has
     /// no such tile.
     async fn fetch_tile(
@@ -635,6 +646,87 @@ impl NativeHttp {
         };
         asked.answered(answer, &value);
         Ok(Fetched { value, ttl })
+    }
+}
+
+/// Where a tile server hands its credential out: a URL whose answer carries
+/// it, as a cookie (`Set-Cookie: <name>=<value>; Max-Age=<seconds>`) or as a
+/// field of a JSON object (`{"<field>": "<value>", "expires_in": <seconds>}`).
+///
+/// Asked afresh every time: never from a cache, and with no cookie jar — a
+/// jar would send the old value back, and a server may then answer without
+/// a new one. The value is returned, never printed or kept.
+#[derive(Clone)]
+pub struct CredentialIssuer {
+    client: reqwest::Client,
+    url: Url,
+    answer: IssuedAs,
+}
+
+/// How an issuer's answer carries the credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IssuedAs {
+    /// The cookie of this name.
+    Cookie(String),
+    /// This field of a JSON object, with `expires_in` in seconds if stated.
+    Json(String),
+}
+
+impl std::fmt::Debug for CredentialIssuer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialIssuer")
+            .field("url", &tuile_core::fetch::redact(self.url.as_str()))
+            .field("answer", &self.answer)
+            .finish()
+    }
+}
+
+impl CredentialIssuer {
+    pub fn new(url: Url, answer: IssuedAs) -> Result<Self, NativeFetchError> {
+        let client = reqwest::Client::builder()
+            .user_agent(concat!("tuile/", env!("CARGO_PKG_VERSION")))
+            .timeout(Duration::from_secs(20))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| NativeFetchError(e.to_string()))?;
+        Ok(Self {
+            client,
+            url,
+            answer,
+        })
+    }
+
+    /// A fresh value and how long it is good for when the answer says so —
+    /// or the sentence that says why there is none, with no value in it.
+    pub async fn obtain(&self) -> Result<(String, Option<Duration>), String> {
+        let at = tuile_core::fetch::redact(self.url.as_str());
+        let response = self
+            .client
+            .get(self.url.clone())
+            .send()
+            .await
+            .map_err(|e| format!("{at}: {}", tuile_core::fetch::redact(&e.to_string())))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("{at} answered {}", status.as_u16()));
+        }
+        match &self.answer {
+            IssuedAs::Cookie(name) => response
+                .headers()
+                .get_all(reqwest::header::SET_COOKIE)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .find_map(|v| tuile_core::fetch::cookie_credential(v, name))
+                .ok_or_else(|| format!("{at} set no cookie {name:?}")),
+            IssuedAs::Json(field) => {
+                let body = response
+                    .bytes()
+                    .await
+                    .map_err(|e| format!("{at}: {}", tuile_core::fetch::redact(&e.to_string())))?;
+                tuile_core::fetch::json_credential(&body, field)
+                    .ok_or_else(|| format!("{at} gave no {field:?}"))
+            }
+        }
     }
 }
 
@@ -839,6 +931,13 @@ mod tests {
                         "/guarded.png" if keyed => ("200 OK", "image/png", b"for the key"),
                         "/guarded.png" => ("401 Unauthorized", "text/plain", b""),
                         "/guarded-none.png" if keyed => ("404 Not Found", "text/plain", b""),
+                        "/visit" => ("200 OK", "text/html", b"<html>"),
+                        "/visit.json" => (
+                            "200 OK",
+                            "application/json",
+                            br#"{"token":"v2","expires_in":30}"#,
+                        ),
+                        "/down" => ("503 Service Unavailable", "text/plain", b""),
                         "/1/2/3.terrain" => (
                             "200 OK",
                             "application/vnd.quantized-mesh",
@@ -848,8 +947,14 @@ mod tests {
                         "/layer.json" => ("200 OK", "application/json", b"{}"),
                         _ => ("404 Not Found", "text/plain", b""),
                     };
+                    let cookie = if path == "/visit" {
+                        "set-cookie: country=fr; Path=/\r\n\
+                         set-cookie: Visit=v1; Path=/; SameSite=Lax; Max-Age=60\r\n"
+                    } else {
+                        ""
+                    };
                     let head = format!(
-                        "HTTP/1.1 {status}\r\ncontent-type: {kind}\r\n\
+                        "HTTP/1.1 {status}\r\ncontent-type: {kind}\r\n{cookie}\
                          cache-control: max-age=3600\r\ncontent-length: {}\r\n\
                          connection: close\r\n\r\n",
                         body.len()
@@ -894,6 +999,41 @@ mod tests {
             Err(FetchError::NotFound(_))
         ));
         assert!(!format!("{keyed:?}").contains("s3cr3t"));
+    }
+
+    /// An issuer hands its credential out as a cookie or as JSON, with the
+    /// lifetime it states, asked afresh each time; one that is down says so
+    /// without a value.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_issuer_hands_out_a_credential() {
+        let (base, served) = origin().await;
+        let at = |path: &str| base.join(path).expect("url");
+        let cookie =
+            CredentialIssuer::new(at("visit"), IssuedAs::Cookie("Visit".into())).expect("issuer");
+        for _ in 0..2 {
+            assert_eq!(
+                cookie.obtain().await,
+                Ok(("v1".into(), Some(Duration::from_secs(60))))
+            );
+        }
+        assert_eq!(
+            served.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "never cached"
+        );
+        let json = CredentialIssuer::new(at("visit.json"), IssuedAs::Json("token".into()))
+            .expect("issuer");
+        assert_eq!(
+            json.obtain().await,
+            Ok(("v2".into(), Some(Duration::from_secs(30))))
+        );
+        let missing =
+            CredentialIssuer::new(at("visit"), IssuedAs::Cookie("Other".into())).expect("issuer");
+        assert!(missing.obtain().await.is_err());
+        let down =
+            CredentialIssuer::new(at("down"), IssuedAs::Cookie("Visit".into())).expect("issuer");
+        let e = down.obtain().await.expect_err("down");
+        assert!(e.contains("503"), "{e}");
     }
 
     /// A tile fetched twice comes from upstream, then from the cache — and

@@ -32,6 +32,8 @@ tuile-ui = { version = "0.17.1", path = "../tuile-ui" }
 tuile-wgpu = { version = "0.17.1", path = "../tuile-wgpu" }
 # Sources named by address (`open`): a terrain's layer.json, an imagery template.
 url = { workspace = true }
+# The tiles a renewing credential fetches (`renew`), as the transports hand them.
+bytes = { workspace = true }
 # A terrain at a URL is stored under a hash of its layer.json when it declares
 # no version (`open`); the control API's socket speaks JSON too.
 serde_json = { workspace = true }

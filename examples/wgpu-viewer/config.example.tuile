@@ -54,6 +54,12 @@ token = "YOUR-ION-TOKEN"
 # attribution = "© Microsoft and its data suppliers"
 # token = "YOUR-TILE-TOKEN"        # optional: kept in secure storage
 # token_header = "Authorization"   # optional: sent as a bearer by default
+#
+# A server that hands out a token that runs out (a visitor's, for a day)
+# can be named instead of a token: the application asks it for one, keeps
+# it in memory only and asks again before it runs out or when it is refused.
+# Replace `token` above with `token_url` (the issuer's address) and
+# `token_cookie` (the cookie's name), or `token_field` for a JSON answer.
 
 # Optional. Where the first session opens, in the command line's units:
 # degrees, metres above the ground, degrees from north, degrees below the

@@ -23,6 +23,7 @@ mod menu;
 mod open;
 mod profile;
 mod recording;
+mod renew;
 #[cfg(not(target_arch = "wasm32"))]
 mod secrets;
 mod session;

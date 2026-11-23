@@ -19,7 +19,7 @@ use tuile_core::raster::{ImageryProvider, TemplateProvider};
 use tuile_native_fetchers::NativeHttp;
 use tuile_terrain::{LayerJson, TerrainSource};
 
-use crate::config_file::{Settings, TemplateLayer};
+use crate::config_file::{IssuedAs, Settings, TemplateLayer};
 use crate::embed::{Identity, ImageryChoice, Sources, TerrainChoice, ViewerHost};
 
 /// `inner`, with what `settings` names in place of its own.
@@ -106,6 +106,27 @@ impl Templated {
     /// The provider of `layer`: its tiles over HTTP, with its credential
     /// when it takes one — or the sentence that says it has none to send.
     fn provider(&self, layer: &TemplateLayer) -> Result<Arc<dyn ImageryProvider>, String> {
+        if let (Some(issuer), Some(header)) = (&layer.issuer, &layer.token_header) {
+            let url = url::Url::parse(&issuer.url).map_err(|e| e.to_string())?;
+            let answer = match &issuer.answer {
+                IssuedAs::Cookie(name) => tuile_native_fetchers::IssuedAs::Cookie(name.clone()),
+                IssuedAs::Field(name) => tuile_native_fetchers::IssuedAs::Json(name.clone()),
+            };
+            let issuer = tuile_native_fetchers::CredentialIssuer::new(url, answer)
+                .map_err(|e| e.to_string())?;
+            let renewing = crate::renew::Renewing::new(
+                crate::renew::NativeTransport(self.http.clone()),
+                crate::renew::NativeIssuer {
+                    issuer,
+                    header: header.clone(),
+                },
+            );
+            return Ok(Arc::new(TemplateProvider::new(
+                layer.template.clone(),
+                Arc::new(renewing),
+                layer.tiling(),
+            )));
+        }
         let Some(header) = &layer.token_header else {
             return Ok(Arc::new(TemplateProvider::new(
                 layer.template.clone(),
@@ -207,6 +228,141 @@ mod tests {
         format!("http://{at}/{{z}}/{{x}}/{{y}}.webp")
     }
 
+    /// A server that hands visitors a token in a cookie (`/visit`, counted;
+    /// a 503 while `down`) and serves its tiles to the current token only.
+    #[derive(Clone, Default)]
+    struct Visits {
+        generation: Arc<std::sync::atomic::AtomicU64>,
+        issued: Arc<std::sync::atomic::AtomicUsize>,
+        down: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    async fn visitor_server(visits: Visits) -> String {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let at = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let visits = visits.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                    let path = request.split(' ').nth(1).unwrap_or("/").to_owned();
+                    let current = format!("v{}", visits.generation.load(Ordering::SeqCst));
+                    let (status, extra, body) = if path == "/visit" {
+                        if visits.down.load(Ordering::SeqCst) {
+                            ("503 Service Unavailable", String::new(), &b""[..])
+                        } else {
+                            visits.issued.fetch_add(1, Ordering::SeqCst);
+                            (
+                                "200 OK",
+                                format!("set-cookie: Visit={current}; Path=/; Max-Age=86399\r\n"),
+                                &b"<html>"[..],
+                            )
+                        }
+                    } else if request.contains(&format!("\r\nx-tile-token: {current}\r\n")) {
+                        ("200 OK", String::new(), &b"not a picture"[..])
+                    } else {
+                        ("401 Unauthorized", String::new(), &b""[..])
+                    };
+                    let head = format!(
+                        "HTTP/1.1 {status}\r\n{extra}content-length: {}\r\n\
+                         cache-control: no-store\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(body).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        format!("http://{at}/")
+    }
+
+    /// **A token handed out by its issuer is renewed when it runs out**:
+    /// the server refuses the old one, one renewal, the tile again; with the
+    /// issuer down a tile fails as a load does — an error, never an
+    /// absence — which is what returns a substitute's ground to its source
+    /// (the substitution doc, §3.4).
+    #[test]
+    fn an_issued_token_is_renewed_when_it_runs_out() {
+        use std::sync::atomic::Ordering;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().expect("dir");
+            let http = NativeHttp::with_config(tuile_native_fetchers::CacheConfig {
+                dir: dir.path().to_path_buf(),
+                memory_bytes: 1 << 20,
+                disk_bytes: 16 << 20,
+            })
+            .await
+            .expect("transport");
+            let visits = Visits::default();
+            let base = visitor_server(visits.clone()).await;
+            let layer = TemplateLayer {
+                key: "far".into(),
+                asset: crate::config_file::FIRST_TEMPLATE_ASSET,
+                template: format!("{base}{{z}}/{{x}}/{{y}}.webp"),
+                geographic: false,
+                max_level: None,
+                token_header: Some("X-Tile-Token".into()),
+                issuer: Some(crate::config_file::TokenIssuer {
+                    url: format!("{base}visit"),
+                    answer: IssuedAs::Cookie("Visit".into()),
+                }),
+            };
+            let sources = Templated {
+                inner: Arc::new(Host),
+                http,
+                templates: vec![layer.clone()],
+                token: none_kept,
+            };
+            let imagery = sources.imagery(layer.asset).await.expect("the layer");
+            let raw = |level: u32| {
+                let imagery = Arc::clone(&imagery);
+                async move {
+                    imagery
+                        .fetch_tile_bytes(ImageryCoord { level, x: 0, y: 0 })
+                        .await
+                }
+            };
+            assert!(raw(1).await.is_ok(), "asked with the issued token");
+            assert_eq!(visits.issued.load(Ordering::SeqCst), 1);
+            visits.generation.store(1, Ordering::SeqCst);
+            assert!(raw(2).await.is_ok(), "renewed, then asked again");
+            assert_eq!(visits.issued.load(Ordering::SeqCst), 2);
+            visits.generation.store(2, Ordering::SeqCst);
+            visits.down.store(true, Ordering::SeqCst);
+            let failed = raw(3).await;
+            assert!(
+                matches!(
+                    failed,
+                    Err(RasterError::Fetch(
+                        tuile_core::fetch::FetchError::Io { .. }
+                            | tuile_core::fetch::FetchError::Status { .. }
+                    ))
+                ),
+                "{failed:?}"
+            );
+        });
+    }
+
     /// The host's sources, which answer nothing.
     struct Host;
 
@@ -258,6 +414,7 @@ mod tests {
                 geographic: false,
                 max_level: Some(18),
                 token_header: Some("X-Tile-Token".into()),
+                issuer: None,
             };
             let sources = Templated {
                 inner: Arc::new(Host),
