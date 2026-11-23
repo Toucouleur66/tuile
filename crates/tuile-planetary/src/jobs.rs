@@ -337,6 +337,9 @@ std::thread_local! {
 /// CPU path's cost per tile, mip chain included, where it is paid — a
 /// browser's decode worker.
 fn encode_took(format: BlockFormat, took: std::time::Duration) {
+    tuile_core::metrics::metrics()
+        .cpu_encode_seconds
+        .record(took);
     let (count, total, peak) = ENCODES.get();
     let (count, total, peak) = (count + 1, total + took, peak.max(took));
     if count < ENCODES_PER_LINE {

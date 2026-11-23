@@ -82,6 +82,9 @@ pub fn run_worker(make_decode_worker: Option<js_sys::Function>) {
                     // The page speaks no more until it hears back; nothing else
                     // is listened for until the session decides who listens.
                     scope().set_onmessage(None);
+                    // The decode pool, and how many workers it has: none
+                    // without a script to start them.
+                    let mut pool = 0;
                     if let Some(make) = make_decode_worker.clone() {
                         let count = tuile_web::schedule::pool_size(
                             decode_workers,
@@ -89,12 +92,13 @@ pub fn run_worker(make_decode_worker: Option<js_sys::Function>) {
                         );
                         if count > 0 {
                             tuile_web::decode::start(make, count);
+                            pool = u32::try_from(count).unwrap_or(u32::MAX);
                         }
                     }
                     wasm_bindgen_futures::spawn_local(async move {
                         let profile =
                             Profile::browser(profile == ProfileChoice::Handheld, device_memory);
-                        if let Err(reason) = start(sources, opening, profile, imagery).await {
+                        if let Err(reason) = start(sources, opening, profile, imagery, pool).await {
                             tracing::error!("the session could not start: {reason}");
                             post(&ToPage::Failed { reason });
                         }
@@ -115,7 +119,17 @@ async fn start(
     opening: usize,
     profile: Profile,
     imagery: super::imagery::Held,
+    decode_pool: u32,
 ) -> Result<(), String> {
+    // A CPU encode never runs on this worker's thread, the one that answers
+    // the page: without a decode pool, the imagery is held as RGBA8 (CB7).
+    let plan = imagery.plan().without_cpu_encode(decode_pool);
+    let imagery = if plan == imagery.plan() {
+        imagery
+    } else {
+        tracing::warn!("no decode worker to encode imagery on the CPU: held as RGBA8, a fallback");
+        super::imagery::Held::new(plan, imagery.stored())
+    };
     let (terrain, layers) = spec.choices()?;
     let sources = Arc::new(PageSources::new(spec)?);
     let globe = crate::globe::assemble(
@@ -151,6 +165,9 @@ async fn start(
     let mut budget = profile.budget();
     budget.reserved[tuile_core::budget::Class::Drape] =
         tuile_wgpu::encode_reservation(imagery.plan(), 1);
+    // And the decode workers' encodes in flight, off the decoded tier.
+    budget.decoded_reserved =
+        tuile_core::texels::cpu_encode_reservation(imagery.plan(), decode_pool);
     let (stream, server) =
         tuile_core::runtime::in_process_composite(scene.clone(), profile.traversal(), budget)
             .map_err(|e| format!("the budget: {e}"))?;

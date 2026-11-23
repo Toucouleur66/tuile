@@ -433,7 +433,7 @@ pub fn describe() {
 /// `_seconds_peak` (gauges). The sum is a gauge only because the recorder's
 /// counters are integers; it never goes down, and `rate(sum) / rate(count)` is
 /// the mean over any window.
-fn timers(m: &Metrics) -> [(&'static str, &'static str, &Timer); 17] {
+fn timers(m: &Metrics) -> [(&'static str, &'static str, &Timer); 18] {
     [
         ("traversal", "The traversal walk.", &m.traversal_seconds),
         (
@@ -470,6 +470,11 @@ fn timers(m: &Metrics) -> [(&'static str, &'static str, &Timer); 17] {
         ),
         ("present", "Waiting for a drawable.", &m.present_seconds),
         ("upload", "A tile upload to the GPU.", &m.upload_seconds),
+        (
+            "cpu_encode",
+            "An imagery tile encoded into blocks on the CPU, mip chain included.",
+            &m.cpu_encode_seconds,
+        ),
         ("stitch", "Working out a stitching plan.", &m.stitch_seconds),
         (
             "bake_frame",

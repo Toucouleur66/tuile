@@ -143,6 +143,18 @@ pub struct ImageryPlan {
 }
 
 impl ImageryPlan {
+    /// This plan, unless it encodes on the CPU with `workers` decode
+    /// workers to run it — none: then RGBA8 (CB7). A CPU encode is never
+    /// run on the thread that answers the page (tens of milliseconds a
+    /// tile); the ground stays whole, uncompressed.
+    pub fn without_cpu_encode(self, workers: u32) -> ImageryPlan {
+        if self.encode == ImageryEncode::Cpu && workers == 0 {
+            ImageryPlan::RGBA8
+        } else {
+            self
+        }
+    }
+
     /// Uncompressed: RGBA8, no encoder.
     pub const RGBA8: ImageryPlan = ImageryPlan {
         target: ImageryFormat::Rgba8,
@@ -424,6 +436,21 @@ impl Texels {
 /// The UASTC effort level the CPU path encodes at: upstream's level 0, the
 /// fastest — tens of milliseconds a 256² tile in a browser's worker.
 const CPU_LEVEL: texcomp::uastc::Level = texcomp::uastc::Level::Fastest;
+
+/// The CPU bytes the decode workers hold at their peak encoding imagery on
+/// the CPU under `plan` (CB7), off the decoded tier
+/// (`BudgetConfig::decoded_reserved`): per worker, one 256² tile's RGBA8
+/// chain (349,524), its UASTC (87,408) and its transcoded blocks (87,408).
+/// Nothing for a plan that does not encode on the CPU, or without a worker
+/// — where no encode runs: see [`ImageryPlan::without_cpu_encode`].
+pub fn cpu_encode_reservation(plan: ImageryPlan, workers: u32) -> crate::budget::Bytes {
+    if plan.encode != ImageryEncode::Cpu {
+        return crate::budget::Bytes::ZERO;
+    }
+    let rgba8 = drape_cost(256, 256, TextureFormat::Rgba8).gpu.0;
+    let blocks = drape_cost(256, 256, TextureFormat::Block16).gpu.0;
+    crate::budget::Bytes(u64::from(workers) * (rgba8 + 2 * blocks))
+}
 
 /// RGBA8 encoded into `format` on the CPU, its whole mip chain built and
 /// encoded: the blocks a decode worker sends when its consumer's plan says
@@ -777,6 +804,33 @@ mod tests {
             );
             assert!(!c.is_identity());
         }
+    }
+
+    /// **The web CPU path's accounting** (CB7): each decode worker holds,
+    /// encoding a 256² tile, its RGBA8 chain, its UASTC and its blocks —
+    /// 524,340 bytes — off the decoded tier; nothing for any other plan.
+    /// Without a worker no CPU encode runs: the plan is RGBA8.
+    #[test]
+    fn the_cpu_path_reserves_its_workers_and_never_encodes_without_one() {
+        let cpu = ImageryPlan {
+            target: ImageryFormat::Astc4x4,
+            encode: ImageryEncode::Cpu,
+        };
+        let gpu = ImageryPlan {
+            target: ImageryFormat::Bc7,
+            encode: ImageryEncode::Gpu,
+        };
+        assert_eq!(cpu_encode_reservation(cpu, 4), Bytes(4 * 524_340));
+        assert_eq!(cpu_encode_reservation(cpu, 0), Bytes(0));
+        assert_eq!(cpu_encode_reservation(gpu, 4), Bytes(0));
+        assert_eq!(cpu_encode_reservation(ImageryPlan::RGBA8, 4), Bytes(0));
+        assert_eq!(cpu.without_cpu_encode(0), ImageryPlan::RGBA8);
+        assert_eq!(cpu.without_cpu_encode(2), cpu);
+        assert_eq!(
+            gpu.without_cpu_encode(0),
+            gpu,
+            "the page's GPU needs no worker"
+        );
     }
 
     /// **Every path but the GPU's encode crosses as it is held** (CB2): RGBA8
