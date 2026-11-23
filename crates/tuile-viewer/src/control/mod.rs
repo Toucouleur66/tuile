@@ -928,6 +928,14 @@ impl Headless {
         self.app.eye_pixels(eye)
     }
 
+    /// The budget window's last picture (`tuile://budget?window=on`): in a
+    /// headless run it is a texture of its own at the panel's size, as on a
+    /// desktop it is a window of its own — never over the eye's picture.
+    /// Tightly packed RGBA8, sRGB, and its size; none while it is closed.
+    pub fn budget_window(&self) -> Option<(&[u8], (u32, u32))> {
+        self.app.budget_window_picture()
+    }
+
     /// Each eye's camera, as the last frame drew it — what its picture is
     /// scanned against.
     pub fn eye_cameras(&self) -> Vec<tuile_tape::Frame> {

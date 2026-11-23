@@ -13,7 +13,7 @@ mod text;
 
 pub use credits::{BarLayout, CreditBar};
 pub use nav::{NavWidget, Part};
-pub use panel::{Panel, PanelLayout};
+pub use panel::{Panel, PanelLayout, BACKGROUND as PANEL_BACKGROUND};
 pub use spinner::{Spinner, SPOKES};
 pub use text::{Fitted, Font, Label, Mask};
 

@@ -5,6 +5,7 @@
 //! pixel gestures to the render-agnostic [`tuile_camera::CameraController`] and
 //! drives the geometry stream through the [`ContentPump`].
 
+mod budget_screen;
 mod budget_window;
 mod command;
 mod credits;
@@ -388,6 +389,8 @@ pub struct App {
     budget_ask: crate::steer::BudgetAsk,
     /// The budget window over the view (`budget_window`).
     budget_window: budget_window::BudgetWindow,
+    /// The budget window's own window, while it is open (`budget_screen`).
+    budget_screen: Option<budget_screen::PanelScreen>,
     /// The levels written on each tile on screen (`tile_labels`).
     tile_labels: tile_labels::TileLabels,
     recording: tape::Recording,
@@ -554,6 +557,7 @@ impl App {
             views: input::Views::default(),
             budget_ask: crate::steer::BudgetAsk::default(),
             budget_window: budget_window::BudgetWindow::default(),
+            budget_screen: None,
             tile_labels: tile_labels::TileLabels::default(),
             recording: tape::Recording {
                 tape: crate::recording::open_tape(config.record.path.as_deref()),
@@ -980,6 +984,9 @@ impl App {
         self.take_the_location();
         self.take_the_commands();
         self.take_the_imagery();
+        // The budget window's own window, on every turn: drawn whether the
+        // view is or not — hidden, occluded or warming.
+        self.place_the_budget_window(None);
         // Also on the turns that draw nothing — hidden and warming, or
         // occluded — so a script always has a view to read.
         self.publish_the_view(None);
@@ -1093,8 +1100,19 @@ impl ApplicationHandler for App {
         self.short_of_memory();
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        self.on_window_event(event_loop, event);
+    /// The view's window's events to the view; the budget window's to it
+    /// (`budget_screen`); a window gone, to nobody.
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        let view = self.active.as_ref().and_then(|a| a.screen.window_id());
+        let panel = self
+            .budget_screen
+            .as_ref()
+            .and_then(budget_screen::PanelScreen::window_id);
+        match budget_screen::route(id, view, panel) {
+            budget_screen::Route::View => self.on_window_event(event_loop, event),
+            budget_screen::Route::Panel => self.on_panel_event(&event),
+            budget_screen::Route::Gone => {}
+        }
     }
 
     /// Called once as the loop unwinds, however it was left — the close box,
@@ -1115,7 +1133,14 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         match self.turn() {
             Turn::End => event_loop.exit(),
-            Turn::Flow(flow) => event_loop.set_control_flow(flow),
+            Turn::Flow(flow) => {
+                // The budget window's own window is opened here, where the
+                // loop is: the turn has drawn it already when it is open.
+                if self.budget_window.wants_own_window() && self.budget_screen.is_none() {
+                    self.place_the_budget_window(Some(event_loop));
+                }
+                event_loop.set_control_flow(flow);
+            }
         }
     }
 }
