@@ -733,6 +733,7 @@ fn frame(
         deadline: FrameDeadline {
             bytes: Bytes(250),
             time: Micros(1_000),
+            encode_blocks: u64::MAX,
         },
         uploaded,
         deferred,
@@ -757,6 +758,7 @@ fn byte_and_encode_deferrals_are_counted_apart() {
     let deadline = FrameDeadline {
         bytes: Bytes(1 << 20),
         time: Micros(4_000),
+        encode_blocks: u64::MAX,
     };
     let record = |deferred, deferred_encode, encoded_tiles, encode_blocks, gpu| FrameRecord {
         frame: 0,

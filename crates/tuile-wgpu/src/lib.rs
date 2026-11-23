@@ -24,7 +24,7 @@ mod world_overlay;
 
 pub use compress::{
     adapter_plan, caps_of, compression_named, encode_reservation, format_name, plan_features,
-    plan_for, stored_features, texture_caps, EncodePace, EncodeStats, ImageryCompression,
+    plan_for, stored_features, texture_caps, EncodeStats, ImageryCompression,
 };
 pub use context::{
     ContextError, GpuContext, ImageryTextures, DEPTH_FORMAT, SAMPLES, TEXTURE_FORMAT,

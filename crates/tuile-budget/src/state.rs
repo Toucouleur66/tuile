@@ -471,6 +471,9 @@ pub(super) struct Arena {
     gpu: Vec<Gpu>,
     /// The copies in transit, by slot: few at a time, so kept apart.
     transit: SortedMap<u32, Transit>,
+    /// The blocks their GPU encodes write, summed (CB5): zero without
+    /// compression, so a plan reads no transit's cost for them.
+    transit_blocks: u64,
     cpu: Vec<CpuPayload>,
     /// The decoded copies whose cost is not an identity's, by slot: made on
     /// the first such copy, so a budget that never sees imagery encoded on
@@ -569,6 +572,7 @@ impl Default for Arena {
             order: Vec::new(),
             gpu: Vec::new(),
             transit: SortedMap::default(),
+            transit_blocks: 0,
             cpu: Vec::new(),
             cpu_extra: None,
             load: SortedMap::default(),
@@ -1528,6 +1532,11 @@ impl Arena {
         self.protected
     }
 
+    /// The blocks the copies in transit encode on the GPU, summed.
+    pub fn encode_blocks_in_transit(&self) -> u64 {
+        self.transit_blocks
+    }
+
     /// The resources with a copy in transit, in order.
     pub fn transits(&self) -> impl Iterator<Item = ResourceId> + '_ {
         self.transit.keys().map(|n| self.id[Slot(*n).i()])
@@ -1800,6 +1809,7 @@ impl Arena {
         let class = self.class(s);
         l.gpu[class] = l.gpu[class].plus(t.held());
         l.in_transit = l.in_transit.plus(t.cost.staging);
+        self.transit_blocks = self.transit_blocks.saturating_add(t.cost.encode_blocks);
         self.transit.insert(s.0, t);
         self.set(s, TRANSIT, true);
         self.reprotect(s, before);
@@ -1819,6 +1829,7 @@ impl Arena {
         let class = self.class(s);
         l.gpu[class] = l.gpu[class].minus(t.held());
         l.in_transit = l.in_transit.minus(t.cost.staging);
+        self.transit_blocks = self.transit_blocks.saturating_sub(t.cost.encode_blocks);
         self.set(s, TRANSIT, false);
         self.transit.remove(&s.0);
         Some(t)

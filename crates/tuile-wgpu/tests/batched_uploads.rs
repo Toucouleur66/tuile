@@ -14,7 +14,7 @@ use support::{drape, exacts, gpu_with, mesh, painted, select, wearing, whole_dra
 use tuile_core::budget::{FrameDeadline, LayerId, ResourceId, UvTransform};
 use tuile_core::source::TileId;
 use tuile_terrain::{fill_content, GeographicTilingScheme, TileCoord};
-use tuile_wgpu::{ContentPump, EncodePace, GpuContext, ImageryCompression};
+use tuile_wgpu::{ContentPump, GpuContext, ImageryCompression};
 
 /// Whether this device stages through the crate's belt (native backends);
 /// the browser's WebGPU and GL keep their queue writes.
@@ -111,10 +111,8 @@ fn a_frames_encodes_are_one_pass() {
             continue;
         };
         let mut pump = ContentPump::new(glam::DVec3::ZERO);
-        // Room for every encode of the frame.
-        pump.set_encode_pace(EncodePace {
-            share_micros: 1_000_000,
-        });
+        // Room for every encode of the frame: an unbounded deadline has no
+        // encode lane.
         let mut stream = deliveries(&gpu, 16, 7);
         let before = gpu.upload_ops();
         assert_eq!(pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED), 32);

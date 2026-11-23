@@ -757,8 +757,14 @@ fn texels_key(t: &DecodedTexture) -> usize {
 /// compute pass, recorded in the frame's uploads: what `upload_texture`
 /// then takes instead of encoding each texture on its own — one pass and
 /// one submit a frame instead of one per texture. Imagery the GPU already
-/// holds is not encoded, nor imagery named twice. Returns the tiles encoded.
-pub(crate) fn encode_frame(gpu: &GpuContext, contents: &[&ResourceContent]) -> usize {
+/// holds is not encoded, nor imagery named twice. `begun` adds tiles of
+/// drapes that wait (CB6): encoded in the same pass, for
+/// [`hold_imagery`] to take. Returns the tiles encoded.
+pub(crate) fn encode_frame(
+    gpu: &GpuContext,
+    contents: &[&ResourceContent],
+    begun: &[&raster::ImageryLayer],
+) -> usize {
     let Some(compressor) = gpu.compressor.as_ref() else {
         return 0;
     };
@@ -790,6 +796,14 @@ pub(crate) fn encode_frame(gpu: &GpuContext, contents: &[&ResourceContent]) -> u
                 {
                     picked.push(&l.texture);
                 }
+            }
+        }
+        for l in begun {
+            if wanted(&l.texture)
+                && !pool.holds(l.source, l.coord)
+                && named.insert((l.source, l.coord))
+            {
+                picked.push(&l.texture);
             }
         }
     }
@@ -839,6 +853,14 @@ pub(crate) fn encode_frame(gpu: &GpuContext, contents: &[&ResourceContent]) -> u
         filed.insert(texels_key(t), entry);
     }
     encoded
+}
+
+/// Imagery tile `l` on the GPU, in the shared pool, for a drape that waits
+/// for the rest of its tiles (CB6): the frame's encode of it when there was
+/// one, else uploaded as any — RGBA8 where its encode could not be done.
+/// The caller holds it; the drape's upload finds it in the pool.
+pub(crate) fn hold_imagery(gpu: &GpuContext, l: &raster::ImageryLayer) -> Arc<GpuImagery> {
+    gpu.shared_imagery(l.source, l.coord, || upload_texture_in(gpu, &l.texture))
 }
 
 /// Lets go of what the frame's encode pass made and no upload took: a

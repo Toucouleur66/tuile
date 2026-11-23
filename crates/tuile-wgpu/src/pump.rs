@@ -18,15 +18,14 @@
 //! evictions, so between two frames the ground goes from one complete
 //! picture to the next, and never through a frame with a hole.
 
-use crate::compress::EncodePace;
 use crate::context::GpuContext;
 use crate::prepare::{Levels, PreparedDrape, PreparedTile};
 use glam::DVec3;
 use std::collections::{BTreeMap, HashMap};
 use std::task::{Context, Poll};
 use tuile_core::budget::{
-    Bytes, Class, DrawSet, EyeCoverage, FrameDeadline, FrameRecord, Generation, LayerId, PerClass,
-    ResourceId, Role, UploadPlan,
+    Bytes, Class, DrawSet, EncodeBucket, EyeCoverage, FrameDeadline, FrameRecord, Generation,
+    LayerId, PerClass, ResourceId, Role, UploadPlan,
 };
 use tuile_core::protocol::{
     Ancestry, ClientMessage, GeometryStream, Priming, ResourceContent, ServerMessage,
@@ -214,9 +213,14 @@ pub struct ContentPump {
     /// Drapes evicted since the last resolve: their wearers let go of them
     /// there, where the device is.
     undress_wearers: Vec<ResourceId>,
-    /// The GPU time a frame's imagery encodes may take: see
-    /// [`Self::set_encode_pace`].
-    encode_pace: EncodePace,
+    /// The encode lane's carry from frame to frame (CB6): refilled each
+    /// frame by its share, taken by its encodes, into debt by one tile.
+    encode_bucket: EncodeBucket,
+    /// Drapes part-encoded: the imagery tiles encoded for them so far,
+    /// held (and in the shared pool) until the rest are, frames later —
+    /// a drape of many tiles never encodes in one frame. The drape it
+    /// replaces is drawn until it is acknowledged.
+    progress: HashMap<ResourceId, Vec<std::sync::Arc<crate::context::GpuImagery>>>,
     /// Each resident mesh's decoded content, when kept: see
     /// [`Self::keep_contents`].
     contents: Option<HashMap<TileId, std::sync::Arc<tuile_core::DecodedTileContent>>>,
@@ -285,7 +289,8 @@ impl ContentPump {
             throughput: ASSUMED_BYTES_PER_MS,
             meter: None,
             undress_wearers: Vec::new(),
-            encode_pace: EncodePace::DEFAULT,
+            encode_bucket: EncodeBucket::default(),
+            progress: HashMap::new(),
             contents: None,
             drawn_tiles: std::collections::HashSet::new(),
             totals: PumpTotals::default(),
@@ -338,13 +343,6 @@ impl ContentPump {
     /// — not the backdrop behind them.
     pub fn drawn_tiles(&self) -> &std::collections::HashSet<TileId> {
         &self.drawn_tiles
-    }
-
-    /// How much GPU time a frame's imagery encodes may take, when the
-    /// context's plan encodes on the GPU ([`crate::plan_for`], [`crate::GpuContext::with_imagery_plan`]); without an
-    /// encoder it changes nothing. [`EncodePace::DEFAULT`] unless set.
-    pub fn set_encode_pace(&mut self, pace: EncodePace) {
-        self.encode_pace = pace;
     }
 
     /// Records every frame into `meter`, the session's: what the budget's
@@ -620,14 +618,25 @@ impl ContentPump {
 
     /// The order this frame uploads in: the plan's items first, as the plan
     /// has them, then whatever else is queued — coarse before fine, by id.
+    ///
+    /// A drape part-encoded comes first, in resource order: what was begun
+    /// is finished before anything new starts (CB6).
     fn upload_order(&self) -> Vec<ResourceId> {
-        let mut order: Vec<ResourceId> = self
-            .plan
-            .items
-            .iter()
+        let mut begun: Vec<ResourceId> = self
+            .progress
+            .keys()
             .copied()
             .filter(|r| self.queue.contains_key(r))
             .collect();
+        begun.sort_unstable();
+        let mut order = begun.clone();
+        order.extend(
+            self.plan
+                .items
+                .iter()
+                .copied()
+                .filter(|r| self.queue.contains_key(r) && !begun.contains(r)),
+        );
         let planned: std::collections::BTreeSet<ResourceId> = order.iter().copied().collect();
         order.extend(self.queue.keys().copied().filter(|r| !planned.contains(r)));
         order
@@ -662,7 +671,7 @@ impl ContentPump {
         // at the imagery the GPU holds — not two locks per delivery — and
         // as uploading one by one would: imagery an earlier upload of the
         // frame brings is not encoded again.
-        let (going, deferred_encode) = self.pace_encodes(gpu, taken);
+        let (going, deferred_encode, partial) = self.pace_encodes(gpu, taken, deadline);
         // The chains of what goes this frame, built across threads; those
         // of what waits behind it, in the background for its frame. Paced
         // first: a delivery the encodes' share defers has its chain built
@@ -685,13 +694,32 @@ impl ContentPump {
             gpu.chains
                 .keep_only(now.iter().copied().chain(ahead.iter().copied()));
         }
-        // Every encode of the frame in one pass, in the frame's uploads.
+        // Every encode of the frame in one pass, in the frame's uploads:
+        // the deliveries that go, and the tiles a drape that waits had
+        // room for — encoded now, held for it until the rest are.
         {
             let contents: Vec<&ResourceContent> = going
                 .iter()
                 .filter_map(|r| self.queue.get(r).map(|q| &q.content))
                 .collect();
-            crate::prepare::encode_frame(gpu, &contents);
+            let begun: Vec<&tuile_core::raster::ImageryLayer> = partial
+                .iter()
+                .filter_map(|(r, i)| match self.queue.get(r).map(|q| &q.content) {
+                    Some(ResourceContent::Drape(d)) => d.tiles.get(*i),
+                    _ => None,
+                })
+                .collect();
+            crate::prepare::encode_frame(gpu, &contents, &begun);
+            for (r, i) in &partial {
+                let Some(ResourceContent::Drape(d)) = self.queue.get(r).map(|q| &q.content) else {
+                    continue;
+                };
+                let Some(l) = d.tiles.get(*i) else {
+                    continue;
+                };
+                let held = crate::prepare::hold_imagery(gpu, l);
+                self.progress.entry(*r).or_default().push(held);
+            }
         }
         let mut uploaded: Vec<(ResourceId, Bytes)> = Vec::with_capacity(going.len());
         let mut moved = 0u64;
@@ -708,6 +736,8 @@ impl ContentPump {
             // Recorded as what the upload moved: the frame's deadline is in
             // those bytes (I18).
             let done = self.upload_one(stream, gpu, r, q);
+            // Its tiles are the prepared drape's now, or let go with it.
+            self.progress.remove(&r);
             gpu.chains.forget(&content);
             if done.is_some() {
                 uploaded.push((r, Bytes(staging)));
@@ -789,82 +819,135 @@ impl ContentPump {
         uploaded.len()
     }
 
-    /// Of `taken`, what goes this frame under the encodes' share, in order,
-    /// and how many wait for a frame with room. The first encode of a frame
-    /// always goes, however large: nothing waits for ever. The rest wait
-    /// for a frame with room, in the plan's order, as a deadline's do.
+    /// Of `taken` (in the frame's order, its bytes fitting the deadline),
+    /// what goes this frame under the encode lane (CB6), how many wait, and
+    /// the imagery tiles to encode now for a drape that waits: `(drape,
+    /// index of the tile in it)`.
     ///
-    /// A swap group goes or waits **whole**, as the deadline takes it
-    /// ([`tuile_core::budget::swap_unit`]): a mesh let through while the
-    /// drape of its group waits would be drawn bare.
-    fn pace_encodes(&mut self, gpu: &GpuContext, taken: Vec<ResourceId>) -> (Vec<ResourceId>, u32) {
+    /// The lane is the core's ([`EncodeBucket`]): refilled each frame by
+    /// the deadline's `encode_blocks`, or — when the host left it unset —
+    /// by its time over the measured cost of a block. A tile is encoded
+    /// while the lane has blocks left, into debt by the tile that crosses
+    /// it: **no frame encodes more than its share and one tile**. A unit (a
+    /// delivery, or a swap group whole) whose every tile is encoded goes;
+    /// one with tiles left waits, the tiles encoded so far held for it,
+    /// and nothing behind it overtakes it. Imagery the GPU holds already,
+    /// or an earlier unit of the frame brings, is not encoded again.
+    fn pace_encodes(
+        &mut self,
+        gpu: &GpuContext,
+        taken: Vec<ResourceId>,
+        deadline: FrameDeadline,
+    ) -> (Vec<ResourceId>, u32, Vec<(ResourceId, usize)>) {
         let Some(compressor) = gpu.compressor.as_ref() else {
-            return (taken, 0);
+            return (taken, 0, Vec::new());
         };
         let Some((format, ns)) = compressor
             .lock()
             .ok()
             .map(|c| (c.format(), c.ns_per_block()))
         else {
-            return (taken, 0);
+            return (taken, 0, Vec::new());
         };
-        let mut left = self.encode_pace.blocks_per_frame(ns);
+        let share = encode_share(deadline, ns);
+        self.encode_bucket.refill(share);
         let Ok(pool) = gpu.imagery.lock() else {
-            return (taken, 0);
+            return (taken, 0, Vec::new());
         };
         let mut brought: std::collections::HashSet<(u32, tuile_core::raster::ImageryCoord)> =
             std::collections::HashSet::new();
         let mut going = Vec::with_capacity(taken.len());
+        let mut partial = Vec::new();
         let mut deferred = 0;
-        let mut encoded_any = false;
+        let mut stopped = false;
         let mut n = 0;
         while n < taken.len() {
             let unit = &taken[n..n + tuile_core::budget::swap_unit(&taken, n, &self.plan.groups)];
             n += unit.len();
-            // The blocks the unit's encodes would write, imagery an earlier
-            // member brings counted once.
-            let mut blocks = 0;
-            let mut unit_brought = Vec::new();
+            if stopped {
+                deferred += unit.len() as u32;
+                continue;
+            }
+            // What the unit's encodes would write: its members' own
+            // textures, whole, and each imagery tile not held or brought.
+            let mut owned = 0;
+            let mut tiles: Vec<(
+                ResourceId,
+                usize,
+                u64,
+                (u32, tuile_core::raster::ImageryCoord),
+            )> = Vec::new();
+            let mut shown = Vec::new();
             for r in unit {
                 let Some(q) = self.queue.get_mut(r) else {
                     continue;
                 };
-                let owned = *q
+                owned += *q
                     .owned_blocks
                     .get_or_insert_with(|| owned_blocks(format, &q.content));
-                let layers = imagery_of(&q.content);
-                blocks += owned;
-                for l in &layers {
+                let layers: &[tuile_core::raster::ImageryLayer] = match &q.content {
+                    ResourceContent::Mesh(m) => &m.imagery,
+                    ResourceContent::Drape(d) => &d.tiles,
+                };
+                for (i, l) in layers.iter().enumerate() {
+                    if !l.is_visible() {
+                        continue;
+                    }
                     let key = (l.source, l.coord);
+                    shown.push(key);
                     if encodes(format, &l.texture)
                         && !pool.holds(l.source, l.coord)
                         && !brought.contains(&key)
-                        && !unit_brought.contains(&key)
+                        && !tiles.iter().any(|t| t.3 == key)
                     {
-                        blocks +=
+                        let blocks =
                             crate::compress::tile_blocks(format, l.texture.width, l.texture.height);
-                        unit_brought.push(key);
+                        tiles.push((*r, i, blocks, key));
                     }
                 }
-                unit_brought.extend(
-                    layers
-                        .iter()
-                        .filter(|l| l.is_visible())
-                        .map(|l| (l.source, l.coord)),
-                );
             }
-            if blocks > 0 {
-                if encoded_any && blocks > left {
-                    deferred += unit.len() as u32;
-                    continue;
+            if owned == 0 && tiles.is_empty() {
+                brought.extend(shown);
+                going.extend_from_slice(unit);
+                continue;
+            }
+            let bucket = &mut self.encode_bucket;
+            if bucket.carry <= 0 {
+                // The lane is spent: this unit and everything behind it
+                // wait for a frame with room.
+                stopped = true;
+                deferred += unit.len() as u32;
+                continue;
+            }
+            // A unit's own textures are encoded with it, whole.
+            bucket.carry = bucket
+                .carry
+                .saturating_sub(i64::try_from(owned).unwrap_or(i64::MAX));
+            let mut begun = Vec::new();
+            let mut all = true;
+            for (r, i, blocks, key) in &tiles {
+                if bucket.carry <= 0 {
+                    all = false;
+                    break;
                 }
-                left = left.saturating_sub(blocks);
-                encoded_any = true;
+                bucket.carry = bucket
+                    .carry
+                    .saturating_sub(i64::try_from(*blocks).unwrap_or(i64::MAX));
+                brought.insert(*key);
+                begun.push((*r, *i));
             }
-            brought.extend(unit_brought);
-            going.extend_from_slice(unit);
+            if all {
+                brought.extend(shown);
+                going.extend_from_slice(unit);
+            } else {
+                // Tiles left: the unit waits, what it had room for held for
+                // it; nothing behind it overtakes it.
+                partial.extend(begun);
+                stopped = true;
+                deferred += unit.len() as u32;
+            }
         }
-        (going, deferred)
+        (going, deferred, partial)
     }
 
     /// Uploads one delivery and acknowledges it with its actual bytes —
@@ -1068,6 +1151,8 @@ impl ContentPump {
                     },
                 ) {
                     self.dropped.push(was.content);
+                    // What was begun for the copy it replaces is not its.
+                    self.progress.remove(&resource);
                 }
                 tuile_core::metrics::metrics()
                     .pending_uploads
@@ -1080,6 +1165,7 @@ impl ContentPump {
                     if self.queue.get(&r).is_some_and(|q| q.gen == g) {
                         if let Some(was) = self.queue.remove(&r) {
                             self.dropped.push(was.content);
+                            self.progress.remove(&r);
                         }
                     }
                 }
@@ -1117,6 +1203,7 @@ impl ContentPump {
                     // longer counting it.
                     if let Some(was) = self.queue.remove(r) {
                         self.dropped.push(was.content);
+                        self.progress.remove(r);
                     }
                 }
                 // A mesh dressed with an evicted drape lets go of its
@@ -1527,6 +1614,19 @@ fn encodes(
     t.resident_format().block() == Some(format) && t.rgba8().is_some()
 }
 
+/// The encode lane's blocks this frame: the deadline's own when the host
+/// set them, else its time over the measured cost of a block — the frame's
+/// upload share given to the encodes — and no lane for an unbounded one.
+fn encode_share(deadline: FrameDeadline, ns_per_block: f64) -> u64 {
+    if deadline.encode_blocks != u64::MAX {
+        return deadline.encode_blocks;
+    }
+    if deadline.time == tuile_core::budget::Micros::NEVER {
+        return u64::MAX;
+    }
+    (deadline.time.0 as f64 * 1_000.0 / ns_per_block.max(1.0)) as u64
+}
+
 /// Whether `content` names a texture this context encodes on the GPU: RGBA8
 /// headed for the encoder's block format. Never without an encoder (`Off`).
 fn encodes_on_gpu(gpu: &GpuContext, content: &ResourceContent) -> bool {
@@ -1759,6 +1859,24 @@ impl Resolution {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The encode lane's share** (CB6): the deadline's blocks when the
+    /// host set them; else its time over the cost of a block — a quarter
+    /// of a 60 Hz frame at the measured 1,739 ns a block is 2,396 blocks,
+    /// under half a 256² tile, so a tile goes every other frame or so; and
+    /// no lane for an unbounded deadline.
+    #[test]
+    fn the_encode_share_is_the_deadlines_time_over_a_blocks_cost() {
+        let d = FrameDeadline::from_refresh(60, UPLOAD_SHARE_PERMILLE, 400_000);
+        assert_eq!(encode_share(d, 1_739.0), d.time.0 * 1_000 / 1_739);
+        assert_eq!(encode_share(d.with_encode_blocks(5_463), 1_739.0), 5_463);
+        assert_eq!(encode_share(FrameDeadline::UNBOUNDED, 1_739.0), u64::MAX);
+        assert_eq!(
+            encode_share(d, 0.0),
+            d.time.0 * 1_000,
+            "never divides by zero"
+        );
+    }
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
     use tuile_core::budget::{DrapeChoice, DrawItem, SwapGroup, UvTransform};
@@ -1880,6 +1998,7 @@ mod tests {
             UploadPlan {
                 items: vec![ResourceId::Mesh(fine), ResourceId::Mesh(coarse)],
                 bytes: Bytes::ZERO,
+                encode_blocks: 0,
                 groups: vec![SwapGroup::default()],
             },
         ));

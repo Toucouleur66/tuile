@@ -74,6 +74,8 @@ struct Eff {
     quota: PerClass<u32>,
     local: u32,
     upload: Bytes,
+    /// The plan's encode lane, blocks a step (CB5).
+    encode: u64,
     batch: bool,
     /// The pooled ledger's numbers (D-A3); `None` with no member, and
     /// under Batch.
@@ -601,6 +603,11 @@ impl Budget {
             ),
             quota: PerClass::from_fn(|c| (self.cfg.max_in_flight[c] / thermal_div).max(1)),
             local: self.cfg.max_local_reads,
+            encode: if self.cfg.encode_blocks_per_step == u64::MAX {
+                u64::MAX
+            } else {
+                self.cfg.encode_blocks_per_step / u64::from(thermal_div)
+            },
             upload: if self.cfg.upload_bytes_per_frame == Bytes::MAX {
                 Bytes::MAX
             } else {
@@ -2877,6 +2884,19 @@ impl Budget {
         by_group.extend((0..transit.len()).map(|i| u32::try_from(i).unwrap_or(u32::MAX)));
         by_group.sort_unstable_by_key(|&i| (transit[i as usize].2, i));
         let mut groups = 0;
+        // The blocks a member's GPU encode writes, looked up only while
+        // something in transit encodes (CB5): nothing to read without
+        // compression.
+        let encoding = self.arena.encode_blocks_in_transit() > 0;
+        let a = &self.arena;
+        let blocks_of = |r: ResourceId| -> u64 {
+            if !encoding {
+                return 0;
+            }
+            a.find(r)
+                .and_then(|s| a.transit(s))
+                .map_or(0, |t| t.cost.encode_blocks)
+        };
         for i in 0..transit.len() {
             // A group goes whole, at its first member in transit order: a
             // later member finds it gone.
@@ -2890,18 +2910,25 @@ impl Budget {
             let bytes = members
                 .iter()
                 .fold(Bytes::ZERO, |a, &j| a.plus(transit[j as usize].1));
-            if plan.items.is_empty() && plan.bytes.plus(bytes) > eff.upload {
+            let blocks = members.iter().fold(0u64, |a, &j| {
+                a.saturating_add(blocks_of(transit[j as usize].0.resource))
+            });
+            let over = plan.bytes.plus(bytes) > eff.upload
+                || plan.encode_blocks.saturating_add(blocks) > eff.encode;
+            if plan.items.is_empty() && over {
                 // The first item always goes, alone if its group is too big.
                 plan.items.push(k.resource);
                 plan.bytes = b;
+                plan.encode_blocks = blocks_of(k.resource);
                 break;
             }
-            if plan.bytes.plus(bytes) > eff.upload {
+            if over {
                 break;
             }
             plan.items
                 .extend(members.iter().map(|&j| transit[j as usize].0.resource));
             plan.bytes = plan.bytes.plus(bytes);
+            plan.encode_blocks = plan.encode_blocks.saturating_add(blocks);
             for &j in members {
                 transit[j as usize].3 = true;
             }

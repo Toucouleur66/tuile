@@ -283,6 +283,7 @@ pub fn encode_server(message: &ServerMessage) -> Vec<u8> {
             }
             w.resources(&plan.items);
             w.u64(plan.bytes.0);
+            w.u64(plan.encode_blocks);
             w.len(plan.groups.len());
             for group in &plan.groups {
                 w.resources(&group.members);
@@ -375,6 +376,7 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerMessage, WireError> {
             }
             let plan_items = r.resources()?;
             let plan_bytes = Bytes(r.u64()?);
+            let plan_blocks = r.u64()?;
             let n = r.len()?;
             let mut groups = Vec::with_capacity(n.min(1 << 16));
             for _ in 0..n {
@@ -399,6 +401,7 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerMessage, WireError> {
                 plan: UploadPlan {
                     items: plan_items,
                     bytes: plan_bytes,
+                    encode_blocks: plan_blocks,
                     groups,
                 },
                 ancestry,
@@ -1445,6 +1448,7 @@ mod tests {
         let plan = UploadPlan {
             items: vec![drape, ResourceId::Mesh(TileId(5))],
             bytes: Bytes(1 << 20),
+            encode_blocks: 5_463,
             groups: vec![SwapGroup {
                 members: vec![drape, ResourceId::Mesh(TileId(5))],
             }],

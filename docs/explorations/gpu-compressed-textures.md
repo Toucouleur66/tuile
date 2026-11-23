@@ -145,12 +145,15 @@ KTX 2.0 reader. No ETC1S, RDO, Zstd or ETC2.
 - **Any encode that cannot be done uploads RGBA8**: a size that is not whole
   blocks, a tile too large for the device, a context without an encoder.
   `EncodeStats { encoded, fell_back, measured_ns_per_block }` counts them.
-- Pacing: the pump gives encodes their own GPU-time share per frame,
-  `EncodePace` (4 ms by default), divided by the cost of a block — measured
-  with timestamps around the compute pass where the device has
-  `TIMESTAMP_QUERY`, assumed from texcomp's published cost otherwise. The
-  first encode of a frame always goes. This sits **outside** the budget's own
-  accounting; §9.2 replaces it.
+- Pacing (CB5–CB6): the encodes run on the core's **encode lane**
+  (`FrameDeadline::encode_blocks`, `EncodeBucket`): each frame refills it
+  by its share — the deadline's upload time over the cost of a block,
+  measured with timestamps around the compute pass where the device has
+  `TIMESTAMP_QUERY`, 1,739 ns assumed until then — and each 256² tile
+  takes its 5,463 blocks, into debt by one tile at most: **no frame encodes
+  more than its share and one tile**. A drape of many tiles is encoded a
+  tile at a time over frames, the tiles held for it, the drape it replaces
+  drawn until it is acknowledged. `EncodePace` is gone.
 - The viewer: `--imagery-compression off|auto|bc7|astc` (also on the headless
   runner), and *Settings › Tuile › Imagery compression* on iOS, read at
   launch. The status line shows what is held, e.g. `imagery BC7 31 MiB`.
@@ -205,9 +208,16 @@ writes PNG). Whether a store should serve such tiles is the subject of
 - Bake and film pin `StoredPlan::OFF` and an RGBA8 plan; their digests and
   goldens did not move.
 
-What this does **not** yet count — the encoder's scratch, the transient peak
-while RGBA8 staging and blocks coexist, encode time inside `FrameDeadline`,
-the difference between bytes moved and bytes resident in `plan` — is §9.2.
+Since the compression budget (CB2–CB7, §9.2), a `Cost` also says what
+crosses (`transfer`), what is held beside the blocks until the GPU has run
+the encode (`transient`) and the blocks it writes (`encode_blocks`): `plan`
+caps on what crosses and on the blocks a step encodes, a delivery in
+transit is charged its peak until the executor acknowledges it after the
+GPU's work is done, the encoder's scratch is reserved off the drapes'
+limits (`BudgetConfig::reserved`), the web decode workers' encodes off the
+decoded tier (`decoded_reserved`), and an encode that fell back is counted
+as such, never as drift. Without compression every cost is an identity and
+nothing moves.
 
 ## 7. Never black ground
 
