@@ -19,6 +19,17 @@
 //! substitute_gap = 4                    # optional: levels below the finest drawn (default 4)
 //! substitute_hysteresis = 1             # optional: levels of hysteresis (default 1)
 //!
+//! [[ion.imagery]]                       # a layer from a tile server, by URL template
+//! key = "aerial-coarse"
+//! name = "Aerial, coarse levels"
+//! template = "https://tiles.example/aerial/{z}/{x}/{y}.webp"  # XYZ: row 0 north
+//! scheme = "webmercator"                # optional: or "geographic" (default webmercator)
+//! max_level = 18                        # optional: the deepest level it serves
+//! attribution = "© the pictures' owner"
+//! token = "your-tile-token"             # optional: the server's credential; secure storage
+//! token_header = "Authorization"        # optional: the header it goes in (default
+//!                                       # Authorization, as `Bearer <token>`)
+//!
 //! [start]                               # optional: where the first session opens
 //! lon = 6.86
 //! lat = 45.83
@@ -35,6 +46,14 @@
 //! profiling = "on"                      # optional: on (default) or off — the menu switches it
 //! profiling_hz = 100                    # optional: samples a second
 //! ```
+//!
+//! A template layer answers 404 for a tile it does not have: an absence,
+//! drawn from what is held around it, never a hole. A PNG, a JPEG or a WebP
+//! tile is told apart by its bytes: the format is not configured.
+//!
+//! A template layer's `token` goes to secure storage like the section's,
+//! under a key of the layer's own ([`layer_token_variable`]); the settings
+//! keep its `token_header`, which says a credential is expected.
 //!
 //! **The token is read once and handed to secure storage.** It never reaches
 //! a log line, an error message or the settings file: [`Token`] has no
@@ -104,10 +123,113 @@ pub(crate) struct Settings {
     pub terrain: Option<i64>,
     /// The imagery layers, in order; empty means the host's own.
     pub imagery: Vec<ImageryChoice>,
+    /// The layers of [`Settings::imagery`] that come from a URL template,
+    /// by their asset number: what the sources answer them by.
+    pub templates: Vec<TemplateLayer>,
     /// Start-view numbers by flag name (`lon`, `lat`, …), already checked.
     pub start: Vec<(String, f64)>,
     /// Where the performance numbers go (`[telemetry]`), without its token.
     pub telemetry: Option<TelemetrySettings>,
+}
+
+/// An imagery layer from a tile server, named by its URL template.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TemplateLayer {
+    /// The layer's key in [`Settings::imagery`].
+    pub key: String,
+    /// The number it is asked for by: negative, never a catalog's.
+    pub asset: i64,
+    /// `https://…/{z}/{x}/{y}…`.
+    pub template: String,
+    /// On the geographic grid (two tiles at level 0) rather than
+    /// web-mercator.
+    pub geographic: bool,
+    /// The deepest level it serves.
+    pub max_level: Option<u32>,
+    /// The header its credential goes in, when it takes one: the token
+    /// itself is in secure storage, under [`layer_token_variable`], or
+    /// handed out by its issuer.
+    pub token_header: Option<String>,
+    /// Where its token is handed out, when it is not given once: asked for
+    /// a fresh one before it runs out and when the server refuses it, and
+    /// kept in memory only (`crate::renew`).
+    pub issuer: Option<TokenIssuer>,
+}
+
+/// A template layer's token issuer: a URL whose answer carries the token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TokenIssuer {
+    /// `https`, or `http` on this machine's loopback.
+    pub url: String,
+    pub answer: IssuedAs,
+}
+
+/// How an issuer's answer carries the token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IssuedAs {
+    /// The cookie of this name (`Set-Cookie`, with its `Max-Age`).
+    Cookie(String),
+    /// This field of a JSON object (with `expires_in`, in seconds).
+    Field(String),
+}
+
+/// A layer's `token_url` and its `token_cookie` or `token_field`, checked.
+fn read_issuer(
+    at: &dyn Fn(&str) -> String,
+    text: &dyn Fn(&str) -> Result<Option<String>, Problem>,
+    has_token: bool,
+) -> Result<Option<TokenIssuer>, Problem> {
+    let url = text("token_url")?;
+    let (cookie, field) = (text("token_cookie")?, text("token_field")?);
+    let Some(url) = url else {
+        if cookie.is_some() {
+            return Err((at("token_cookie"), "goes with a `token_url` only".into()));
+        }
+        if field.is_some() {
+            return Err((at("token_field"), "goes with a `token_url` only".into()));
+        }
+        return Ok(None);
+    };
+    if has_token {
+        return Err((
+            at("token_url"),
+            "a layer has a `token` or a `token_url`, not both".into(),
+        ));
+    }
+    // Checked as an API base is: https, or http on the loopback; said
+    // without the address.
+    api_base(&url).map_err(|why| (at("token_url"), why))?;
+    let answer = match (cookie, field) {
+        (Some(name), None) => IssuedAs::Cookie(name),
+        (None, Some(name)) => IssuedAs::Field(name),
+        _ => {
+            return Err((
+                at("token_url"),
+                "names its answer by a `token_cookie` or a `token_field`, one of them".into(),
+            ))
+        }
+    };
+    Ok(Some(TokenIssuer { url, answer }))
+}
+
+impl TemplateLayer {
+    /// The grid its tiles are cut on.
+    pub(crate) fn tiling(&self) -> tuile_core::raster::TilingScheme {
+        crate::open::template_tiling(self.geographic, self.max_level)
+    }
+}
+
+/// The first number a configuration file's template layers are asked for
+/// by, the next ones counting down: negative, as every address's is
+/// (`crate::open`), and far from the command line's own (`-1`).
+pub(crate) const FIRST_TEMPLATE_ASSET: i64 = -1000;
+
+/// The secure-storage key a template layer's token is kept under.
+pub(crate) fn layer_token_variable(key: &str) -> String {
+    format!(
+        "TUILE_IMAGERY_TOKEN_{}",
+        key.to_ascii_uppercase().replace('-', "_")
+    )
 }
 
 /// `[telemetry]`, checked: see the module. Its token is kept apart, as the
@@ -130,6 +252,9 @@ impl Settings {
     /// layer's name, else the terrain's number.
     pub(crate) fn headline(&self) -> Option<String> {
         if let Some(layer) = self.imagery.first() {
+            if layer.asset < 0 {
+                return Some(layer.name.clone());
+            }
             return Some(format!("{} (asset {})", layer.name, layer.asset));
         }
         self.terrain.map(|asset| format!("terrain asset {asset}"))
@@ -142,6 +267,8 @@ pub(crate) struct ConfigFile {
     pub token: Option<Token>,
     /// `[telemetry]`'s token: the collector's, never the section's.
     pub telemetry_token: Option<Token>,
+    /// The template layers' tokens, by layer key.
+    pub layer_tokens: Vec<(String, Token)>,
     pub settings: Settings,
 }
 
@@ -199,14 +326,21 @@ pub(crate) fn parse(file: &str, text: &str, section: &str) -> Result<ConfigFile,
 
     let mut token = None;
     let mut telemetry_token = None;
+    let mut layer_tokens = Vec::new();
     let mut settings = Settings::default();
     for (key, value) in &table {
         if key == section {
             let Value::Table(source) = value else {
                 return Err(fail(key, "must be a table: [section]"));
             };
-            read_section(section, source, &mut token, &mut settings)
-                .map_err(|(k, why)| fail(&k, &why))?;
+            read_section(
+                section,
+                source,
+                &mut token,
+                &mut layer_tokens,
+                &mut settings,
+            )
+            .map_err(|(k, why)| fail(&k, &why))?;
         } else if key == "start" {
             let Value::Table(start) = value else {
                 return Err(fail(key, "must be a table: [start]"));
@@ -235,47 +369,53 @@ pub(crate) fn parse(file: &str, text: &str, section: &str) -> Result<ConfigFile,
     Ok(ConfigFile {
         token,
         telemetry_token,
+        layer_tokens,
         settings,
     })
 }
 
 type Problem = (String, String);
 
+/// A token as a file gives it, checked; the problem names `at`, never the
+/// value.
+fn read_token(at: &str, value: &Value) -> Result<Token, Problem> {
+    let Value::String(text) = value else {
+        return Err((at.to_owned(), "must be a string in quotes".into()));
+    };
+    let given = Token::new(text);
+    if given.expose().is_empty() {
+        return Err((at.to_owned(), "is empty".into()));
+    }
+    if given
+        .expose()
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err((
+            at.to_owned(),
+            "holds spaces or line breaks: copy the token again".into(),
+        ));
+    }
+    if looks_like_placeholder(given.expose()) {
+        return Err((
+            at.to_owned(),
+            "is still the example's placeholder: put your own token there".into(),
+        ));
+    }
+    Ok(given)
+}
+
 fn read_section(
     section: &str,
     source: &Table,
     token: &mut Option<Token>,
+    layer_tokens: &mut Vec<(String, Token)>,
     settings: &mut Settings,
 ) -> Result<(), Problem> {
     let at = |key: &str| format!("{section}.{key}");
     for (key, value) in source {
         match key.as_str() {
-            "token" => {
-                let Value::String(text) = value else {
-                    return Err((at(key), "must be a string in quotes".into()));
-                };
-                let given = Token::new(text);
-                if given.expose().is_empty() {
-                    return Err((at(key), "is empty".into()));
-                }
-                if given
-                    .expose()
-                    .chars()
-                    .any(|c| c.is_whitespace() || c.is_control())
-                {
-                    return Err((
-                        at(key),
-                        "holds spaces or line breaks: copy the token again".into(),
-                    ));
-                }
-                if looks_like_placeholder(given.expose()) {
-                    return Err((
-                        at(key),
-                        "is still the example's placeholder: put your own token there".into(),
-                    ));
-                }
-                *token = Some(given);
-            }
+            "token" => *token = Some(read_token(&at(key), value)?),
             "api" => {
                 let Value::String(text) = value else {
                     return Err((at(key), "must be a URL in quotes".into()));
@@ -287,7 +427,10 @@ fn read_section(
                 let Value::Array(layers) = value else {
                     return Err((at(key), "must be a list of [[imagery]] tables".into()));
                 };
-                settings.imagery = read_imagery(section, layers)?;
+                let read = read_imagery(section, layers)?;
+                settings.imagery = read.layers;
+                settings.templates = read.templates;
+                *layer_tokens = read.tokens;
             }
             _ => {
                 return Err((
@@ -300,8 +443,17 @@ fn read_section(
     Ok(())
 }
 
-fn read_imagery(section: &str, layers: &[Value]) -> Result<Vec<ImageryChoice>, Problem> {
+/// The `[[imagery]]` list, read.
+struct Imagery {
+    layers: Vec<ImageryChoice>,
+    templates: Vec<TemplateLayer>,
+    tokens: Vec<(String, Token)>,
+}
+
+fn read_imagery(section: &str, layers: &[Value]) -> Result<Imagery, Problem> {
     let mut out: Vec<ImageryChoice> = Vec::new();
+    let mut templates: Vec<TemplateLayer> = Vec::new();
+    let mut tokens: Vec<(String, Token)> = Vec::new();
     // (layer, the key of its substitute, gap, hysteresis, where it was said)
     let mut substitutes: Vec<(usize, String, u32, u32, String)> = Vec::new();
     for (i, layer) in layers.iter().enumerate() {
@@ -321,10 +473,18 @@ fn read_imagery(section: &str, layers: &[Value]) -> Result<Vec<ImageryChoice>, P
                 Some(_) => Err((at(key), "must be a non-empty string".into())),
             }
         };
-        const KEYS: [&str; 7] = [
+        const KEYS: [&str; 15] = [
             "key",
             "name",
             "asset",
+            "template",
+            "scheme",
+            "max_level",
+            "token",
+            "token_header",
+            "token_url",
+            "token_cookie",
+            "token_field",
             "attribution",
             "substitute",
             "substitute_gap",
@@ -334,8 +494,10 @@ fn read_imagery(section: &str, layers: &[Value]) -> Result<Vec<ImageryChoice>, P
             if !KEYS.contains(&key.as_str()) {
                 return Err((
                     at(key),
-                    "unknown key; a layer has key, name, asset, attribution, substitute, \
-                     substitute_gap and substitute_hysteresis"
+                    "unknown key; a layer has key, name, asset or template (with scheme, \
+                     max_level, token or token_url with token_cookie or token_field, and \
+                     token_header), attribution, substitute, substitute_gap and \
+                     substitute_hysteresis"
                         .into(),
                 ));
             }
@@ -360,12 +522,47 @@ fn read_imagery(section: &str, layers: &[Value]) -> Result<Vec<ImageryChoice>, P
                 at("substitute"),
             ));
         }
-        let asset = asset(
-            layer
-                .get("asset")
-                .ok_or_else(|| (at("asset"), "missing".into()))?,
-        )
-        .map_err(|why| (at("asset"), why))?;
+        let template = text("template")?;
+        if template.is_none() {
+            for only in [
+                "scheme",
+                "max_level",
+                "token",
+                "token_header",
+                "token_url",
+                "token_cookie",
+                "token_field",
+            ] {
+                if layer.contains_key(only) {
+                    return Err((at(only), "goes with a `template` only".into()));
+                }
+            }
+        }
+        let asset = match (layer.get("asset"), &template) {
+            (Some(value), None) => asset(value).map_err(|why| (at("asset"), why))?,
+            (None, Some(template)) => {
+                // Said without the template: the module quotes no value.
+                crate::open::check_template("the template", template).map_err(|_| {
+                    (
+                        at("template"),
+                        "must be an absolute URL naming {z}, {x} and {y}".to_owned(),
+                    )
+                })?;
+                FIRST_TEMPLATE_ASSET - i64::try_from(templates.len()).unwrap_or(0)
+            }
+            (Some(_), Some(_)) => {
+                return Err((
+                    at("template"),
+                    "a layer has an `asset` or a `template`, not both".into(),
+                ))
+            }
+            (None, None) => {
+                return Err((
+                    at("asset"),
+                    "missing: give an `asset` or a `template`".into(),
+                ))
+            }
+        };
         let key = text("key")?.unwrap_or_else(|| format!("asset{asset}"));
         if !key
             .chars()
@@ -381,7 +578,61 @@ fn read_imagery(section: &str, layers: &[Value]) -> Result<Vec<ImageryChoice>, P
         }
         let name = text("name")?.unwrap_or_else(|| key.clone());
         let attribution = text("attribution")?.unwrap_or_default();
-        out.push(ImageryChoice::new(&key, &name, asset, &attribution));
+        let Some(template) = template else {
+            out.push(ImageryChoice::new(&key, &name, asset, &attribution));
+            continue;
+        };
+        let geographic = match text("scheme")?.as_deref() {
+            None | Some("webmercator") => false,
+            Some("geographic") => true,
+            Some(_) => return Err((at("scheme"), "is \"webmercator\" or \"geographic\"".into())),
+        };
+        let max_level = match layer.get("max_level") {
+            None => None,
+            Some(Value::Integer(n)) if (0..=30).contains(n) => Some(*n as u32),
+            Some(_) => return Err((at("max_level"), "must be a level from 0 to 30".into())),
+        };
+        let token_header = text("token_header")?;
+        if let Some(header) = &token_header {
+            let fine = header
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            if !fine {
+                return Err((
+                    at("token_header"),
+                    "must be a header name: letters, digits and dashes".into(),
+                ));
+            }
+        }
+        let token = layer
+            .get("token")
+            .map(|value| read_token(&at("token"), value))
+            .transpose()?;
+        let issuer = read_issuer(&at, &text, token.is_some())?;
+        let token_header = match (token.is_some() || issuer.is_some(), token_header) {
+            (_, Some(header)) => Some(header),
+            (true, None) => Some(tuile_core::fetch::Credential::AUTHORIZATION.to_owned()),
+            (false, None) => None,
+        };
+        if let Some(token) = token {
+            tokens.push((key.clone(), token));
+        }
+        out.push(ImageryChoice::from_template(
+            &key,
+            &name,
+            asset,
+            &attribution,
+            &template,
+        ));
+        templates.push(TemplateLayer {
+            key: key.clone(),
+            asset,
+            template,
+            geographic,
+            max_level,
+            token_header,
+            issuer,
+        });
     }
     // A substitute is another layer of the list, by its key; the rule's
     // numbers are checked as the session will check them.
@@ -405,7 +656,11 @@ fn read_imagery(section: &str, layers: &[Value]) -> Result<Vec<ImageryChoice>, P
             .map_err(|e| (at.clone(), e.to_string()))?;
         out[i] = layer;
     }
-    Ok(out)
+    Ok(Imagery {
+        layers: out,
+        templates,
+        tokens,
+    })
 }
 
 fn read_telemetry(table: &Table) -> Result<(TelemetrySettings, Option<Token>), Problem> {
@@ -556,7 +811,32 @@ pub(crate) fn settings_text(section: &str, settings: &Settings) -> String {
                 let mut t = Table::new();
                 t.insert("key".into(), Value::String(l.key.clone()));
                 t.insert("name".into(), Value::String(l.name.clone()));
-                t.insert("asset".into(), Value::Integer(l.asset));
+                match settings.templates.iter().find(|x| x.asset == l.asset) {
+                    // Never its token: its header says one is kept.
+                    Some(x) => {
+                        t.insert("template".into(), Value::String(x.template.clone()));
+                        if x.geographic {
+                            t.insert("scheme".into(), Value::String("geographic".into()));
+                        }
+                        if let Some(level) = x.max_level {
+                            t.insert("max_level".into(), Value::Integer(i64::from(level)));
+                        }
+                        if let Some(header) = &x.token_header {
+                            t.insert("token_header".into(), Value::String(header.clone()));
+                        }
+                        if let Some(issuer) = &x.issuer {
+                            t.insert("token_url".into(), Value::String(issuer.url.clone()));
+                            let (key, name) = match &issuer.answer {
+                                IssuedAs::Cookie(name) => ("token_cookie", name),
+                                IssuedAs::Field(name) => ("token_field", name),
+                            };
+                            t.insert(key.into(), Value::String(name.clone()));
+                        }
+                    }
+                    None => {
+                        t.insert("asset".into(), Value::Integer(l.asset));
+                    }
+                }
                 if !l.attribution.is_empty() {
                     t.insert("attribution".into(), Value::String(l.attribution.clone()));
                 }
@@ -709,6 +989,214 @@ mod tests {
         assert!(read(&missing).is_err());
         let bad = text.replace("substitute_gap = 5", "substitute_gap = 0");
         assert!(read(&bad).is_err());
+    }
+
+    /// A tile token shaped like a real one and belonging to no one.
+    const TILES: &str = "tiles.0123456789abcdef.not-a-real-token";
+
+    /// A file whose catalog layer is drawn far from a template layer.
+    fn with_a_template_substitute() -> String {
+        format!(
+            r#"
+            [ion]
+            token = "{FAKE}"
+
+            [[ion.imagery]]
+            key = "aerial"
+            name = "Aerial"
+            asset = 2
+            substitute = "aerial-coarse"
+            substitute_gap = 4
+
+            [[ion.imagery]]
+            key = "aerial-coarse"
+            name = "Aerial, coarse levels"
+            template = "https://tiles.example/aerial/{{z}}/{{x}}/{{y}}.webp"
+            max_level = 18
+            attribution = "© someone"
+            token = "{TILES}"
+            token_header = "X-Tile-Token"
+            "#
+        )
+    }
+
+    /// A layer named by its URL template: its own number and namespace, its
+    /// grid, and its token kept apart from the settings, under the header it
+    /// named. A catalog layer takes it as its substitute like any layer.
+    #[test]
+    fn a_template_layer_is_read_and_stands_in_for_a_catalog_layer() {
+        let file = read(&with_a_template_substitute()).expect("a file");
+        let s = &file.settings;
+        assert_eq!(s.imagery.len(), 2);
+        let coarse = &s.imagery[1];
+        assert_eq!(coarse.asset, FIRST_TEMPLATE_ASSET);
+        assert!(
+            coarse.cache.starts_with("imagery-template-"),
+            "{}",
+            coarse.cache
+        );
+        assert_eq!(s.templates.len(), 1);
+        let t = &s.templates[0];
+        assert_eq!(t.key, "aerial-coarse");
+        assert_eq!(t.asset, coarse.asset);
+        assert_eq!(t.template, "https://tiles.example/aerial/{z}/{x}/{y}.webp");
+        assert!(!t.geographic);
+        assert_eq!(t.tiling().maximum_level, 18);
+        assert_eq!(t.token_header.as_deref(), Some("X-Tile-Token"));
+        let sub = s.imagery[0].substitute.clone().expect("a substitute");
+        assert_eq!(
+            (sub.asset, sub.cache.as_str()),
+            (coarse.asset, coarse.cache.as_str())
+        );
+        assert_eq!((sub.gap, sub.hysteresis), (4, 1));
+        assert_eq!(file.layer_tokens.len(), 1);
+        assert_eq!(file.layer_tokens[0].0, "aerial-coarse");
+        assert_eq!(file.layer_tokens[0].1.expose(), TILES);
+        assert_eq!(file.token.as_ref().map(Token::expose), Some(FAKE));
+        assert!(!format!("{file:?}").contains(TILES), "the token printed");
+        assert_eq!(
+            layer_token_variable("aerial-coarse"),
+            "TUILE_IMAGERY_TOKEN_AERIAL_COARSE"
+        );
+    }
+
+    /// The settings keep a template layer whole but its token, and read
+    /// back to the same layers; a token without a header goes as a bearer
+    /// token.
+    #[test]
+    fn a_template_layer_is_kept_without_its_token() {
+        let read_back = |text: &str| {
+            let s = read(text).expect("a file").settings;
+            let kept = settings_text("ion", &s);
+            assert!(!kept.contains(TILES), "the settings hold the token");
+            assert!(!kept.contains(FAKE), "the settings hold the token");
+            (s, read(&kept).expect("the settings read back").settings)
+        };
+        let (s, again) = read_back(&with_a_template_substitute());
+        assert_eq!(again, s);
+        let bearer = with_a_template_substitute().replace("token_header = \"X-Tile-Token\"\n", "");
+        let (s, again) = read_back(&bearer);
+        assert_eq!(
+            s.templates[0].token_header.as_deref(),
+            Some("Authorization")
+        );
+        assert_eq!(again, s);
+        let (s, again) = read_back(
+            "[[ion.imagery]]\nkey = \"open\"\n\
+             template = \"https://t.example/{z}/{x}/{y}.png\"\nscheme = \"geographic\"\n",
+        );
+        assert!(s.templates[0].geographic);
+        assert!(s.templates[0].token_header.is_none());
+        assert_eq!(again, s);
+    }
+
+    /// A template layer whose token is handed out by an issuer: no token
+    /// kept, the issuer and how its answer carries the token, its header;
+    /// written back as read. A token and an issuer together, an issuer
+    /// without its answer, and an answer without an issuer are refused.
+    #[test]
+    fn a_template_layer_names_its_token_issuer() {
+        let text = r#"
+            [[ion.imagery]]
+            key = "far"
+            template = "https://tiles.example/{z}/{x}/{y}.webp"
+            token_url = "https://tiles.example/"
+            token_cookie = "Visit"
+            token_header = "X-Tile-Token"
+            "#;
+        let file = read(text).expect("a file");
+        assert!(file.layer_tokens.is_empty());
+        let t = &file.settings.templates[0];
+        assert_eq!(t.token_header.as_deref(), Some("X-Tile-Token"));
+        assert_eq!(
+            t.issuer,
+            Some(TokenIssuer {
+                url: "https://tiles.example/".into(),
+                answer: IssuedAs::Cookie("Visit".into()),
+            })
+        );
+        let kept = settings_text("ion", &file.settings);
+        assert_eq!(read(&kept).expect("read back").settings, file.settings);
+        let json = read(&text.replace("token_cookie = \"Visit\"", "token_field = \"token\""))
+            .expect("a file");
+        let t = &json.settings.templates[0];
+        assert_eq!(
+            t.issuer.as_ref().map(|i| &i.answer),
+            Some(&IssuedAs::Field("token".into()))
+        );
+        let wrong = [
+            (
+                text.replace(
+                    "token_cookie",
+                    "token = \"abc.def\"\n            token_cookie",
+                ),
+                "ion.imagery[0].token_url",
+            ),
+            (
+                text.replace("token_cookie = \"Visit\"", ""),
+                "ion.imagery[0].token_url",
+            ),
+            (
+                text.replace(
+                    "token_cookie = \"Visit\"",
+                    "token_cookie = \"Visit\"\n            token_field = \"t\"",
+                ),
+                "ion.imagery[0].token_url",
+            ),
+            (
+                text.replace("token_url = \"https://tiles.example/\"", ""),
+                "ion.imagery[0].token_cookie",
+            ),
+            (
+                text.replace("https://tiles.example/\"", "http://tiles.example/\""),
+                "ion.imagery[0].token_url",
+            ),
+        ];
+        for (text, key) in wrong {
+            assert_eq!(read(&text).expect_err(key).key, key);
+        }
+    }
+
+    /// What is wrong with a template layer is said by its key, never its
+    /// value.
+    #[test]
+    fn template_layer_errors_name_the_key() {
+        let base = with_a_template_substitute();
+        let wrong = [
+            (base.replace("{y}", "{row}"), "ion.imagery[1].template"),
+            (
+                base.replace("max_level = 18", "max_level = 99"),
+                "ion.imagery[1].max_level",
+            ),
+            (
+                base.replace(
+                    "token_header = \"X-Tile-Token\"",
+                    "token_header = \"X Tile: Token\"",
+                ),
+                "ion.imagery[1].token_header",
+            ),
+            (
+                base.replace(&format!("token = \"{TILES}\""), "token = \"with a space\""),
+                "ion.imagery[1].token",
+            ),
+            (
+                base.replace(
+                    "asset = 2\n",
+                    "asset = 2\n            token_header = \"X\"\n",
+                ),
+                "ion.imagery[0].token_header",
+            ),
+            (
+                base.replace("max_level = 18", "max_level = 18\n            asset = 9"),
+                "ion.imagery[1].template",
+            ),
+        ];
+        for (text, key) in wrong {
+            let e = read(&text).expect_err(key);
+            assert_eq!(e.key, key, "{e}");
+            assert!(!e.to_string().contains(TILES), "{e}");
+            assert!(!e.to_string().contains("tiles.example"), "{e}");
+        }
     }
 
     #[test]

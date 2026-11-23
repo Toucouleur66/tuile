@@ -10,8 +10,9 @@
 //! `tuile_cesium_ion::proxy`). A template layer is answered here, by the
 //! number [`SourcesSpec::choices`] gave it, and so is a terrain named by
 //! the URL of its `layer.json` ([`tuile_terrain::HttpTerrainSource`]): no
-//! catalog and no token, the browser's `fetch` straight to the server, which
-//! must answer with `Access-Control-Allow-Origin`.
+//! catalog, the browser's `fetch` straight to the server, which must answer
+//! with `Access-Control-Allow-Origin`. A template layer the page gave a
+//! `token` sends it with every tile, under its `tokenHeader`.
 
 use std::sync::Arc;
 
@@ -20,7 +21,7 @@ use tuile_cesium_ion::IonSources;
 use tuile_core::raster::{ImageryProvider, TemplateProvider};
 use tuile_planetary::Sources;
 use tuile_terrain::{HttpTerrainSource, LayerJson, TerrainSource};
-use tuile_web::{WebFetcher, WebIonHttp};
+use tuile_web::{CredentialedWebFetcher, WebFetcher, WebIonHttp};
 
 use super::options::SourcesSpec;
 
@@ -81,10 +82,32 @@ impl Sources for PageSources {
             return self.catalog()?.imagery(asset).await;
         };
         let template = layer.template.clone().unwrap_or_default();
-        Ok(Arc::new(TemplateProvider::new(
-            template,
-            Arc::new(WebFetcher),
-            layer.tiling(),
-        )))
+        if let (Some(url), Some(field)) = (&layer.token_url, &layer.token_field) {
+            let renewing = crate::renew::Renewing::new(
+                crate::renew::WebTransport,
+                crate::renew::WebIssuer {
+                    url: crate::open::absolute_url("`tokenUrl`", url)?,
+                    field: field.clone(),
+                    header: layer.credential_header().to_owned(),
+                },
+            );
+            return Ok(Arc::new(TemplateProvider::new(
+                template,
+                Arc::new(renewing),
+                layer.tiling(),
+            )));
+        }
+        Ok(match layer.credential() {
+            Some(credential) => Arc::new(TemplateProvider::new(
+                template,
+                Arc::new(CredentialedWebFetcher::new(credential)),
+                layer.tiling(),
+            )),
+            None => Arc::new(TemplateProvider::new(
+                template,
+                Arc::new(WebFetcher),
+                layer.tiling(),
+            )),
+        })
     }
 }

@@ -32,6 +32,8 @@ tuile-ui = { version = "0.17.1", path = "../tuile-ui" }
 tuile-wgpu = { version = "0.17.1", path = "../tuile-wgpu" }
 # Sources named by address (`open`): a terrain's layer.json, an imagery template.
 url = { workspace = true }
+# The tiles a renewing credential fetches (`renew`), as the transports hand them.
+bytes = { workspace = true }
 # A terrain at a URL is stored under a hash of its layer.json when it declares
 # no version (`open`); the control API's socket speaks JSON too.
 serde_json = { workspace = true }
@@ -144,6 +146,10 @@ bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+
+# A tile server on a local port, for the template layers' tests.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { workspace = true, features = ["rt", "net", "io-util"] }
 
 # Android: winit's backend over the platform's native activity (no Java of
 # the application's own beyond the small `TuileActivity`, so no Gradle);

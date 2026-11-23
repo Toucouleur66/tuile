@@ -743,4 +743,91 @@ mod tests {
         started.close(Duration::from_secs(10), true);
         runtime.shutdown_background();
     }
+
+    /// Sources whose substitute (asset 99) cannot be resolved — a token
+    /// never kept, a server that refuses — and that answer everything else.
+    struct NoSubstitute(Origin);
+
+    #[async_trait::async_trait]
+    impl crate::embed::Sources for NoSubstitute {
+        async fn terrain(
+            &self,
+            asset: i64,
+        ) -> Result<
+            (
+                tuile_terrain::LayerJson,
+                Arc<dyn tuile_terrain::TerrainSource>,
+            ),
+            String,
+        > {
+            crate::embed::Sources::terrain(&self.0, asset).await
+        }
+        async fn imagery(
+            &self,
+            asset: i64,
+        ) -> Result<Arc<dyn tuile_core::raster::ImageryProvider>, String> {
+            if asset == 99 {
+                return Err("the layer \"far\" takes a token and none is kept".into());
+            }
+            crate::embed::Sources::imagery(&self.0, asset).await
+        }
+    }
+
+    struct WithSubstitute;
+
+    #[async_trait::async_trait]
+    impl ViewerHost for WithSubstitute {
+        fn identity(&self) -> crate::embed::Identity {
+            crate::embed::Identity::default()
+        }
+        fn terrain(&self) -> TerrainChoice {
+            Stalled.terrain()
+        }
+        fn imagery(&self) -> Vec<ImageryChoice> {
+            substituted()
+        }
+        async fn connect(&self) -> Result<Arc<dyn crate::embed::Sources>, String> {
+            Ok(Arc::new(NoSubstitute(Origin(Arc::new(
+                std::sync::atomic::AtomicBool::new(true),
+            )))))
+        }
+    }
+
+    /// A layer drawn far from asset 99.
+    fn substituted() -> Vec<ImageryChoice> {
+        vec![
+            ImageryChoice::new("a", "A", 2, "©").with_substitute(crate::embed::SubstituteChoice {
+                asset: 99,
+                cache: "imagery-far".into(),
+                gap: 4,
+                hysteresis: 1,
+            }),
+        ]
+    }
+
+    /// **A substitute that cannot be resolved never keeps a session from
+    /// opening**: the layer is drawn from its own source, as an unreachable
+    /// substitute's is (the substitution doc, §3.4). Red before: the
+    /// start-up failed with the substitute's error.
+    #[test]
+    fn a_substitute_that_cannot_be_resolved_leaves_the_source() {
+        static LAYERS: std::sync::OnceLock<Vec<ImageryChoice>> = std::sync::OnceLock::new();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut asked = plan(Arc::new(WithSubstitute));
+        asked.layers = LAYERS.get_or_init(substituted).as_slice();
+        asked.store = dir.path().join("store");
+        asked.profile.store_memory_bytes = 1 << 20;
+        asked.profile.store_disk_bytes = 64 << 20;
+        asked.timeout = Duration::from_secs(5);
+        let started = start(runtime.handle(), asked)
+            .wait()
+            .expect("a session without its substitute");
+        started.close(Duration::from_secs(10), true);
+        runtime.shutdown_background();
+    }
 }

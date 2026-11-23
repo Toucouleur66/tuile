@@ -114,7 +114,7 @@ futures-channel = "0.3.32"
 futures-core = "0.3.32"
 futures-util = { version = "0.3.32", default-features = false, features = ["std", "alloc", "async-await"] }
 futures-executor = "0.3.32"
-image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 # KTX 2.0 and the UASTC transcoders, on the CPU: no default features, so no
 # wgpu.
 texcomp = { git = "https://github.com/lapoule-dev/texcomp", tag = "v0.2.0", default-features = false }

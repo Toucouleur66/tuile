@@ -2952,6 +2952,21 @@ mod tests {
         ));
     }
 
+    /// A tile server may answer in WebP: it decodes like a PNG or a JPEG,
+    /// told apart by its bytes, with nothing to configure.
+    #[test]
+    fn a_webp_tile_decodes() {
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 120, 200, 255]));
+        let mut webp = Vec::new();
+        image::codecs::webp::WebPEncoder::new_lossless(&mut webp)
+            .encode(img.as_raw(), 2, 2, image::ExtendedColorType::Rgba8)
+            .expect("encode");
+        assert_eq!(&webp[8..12], b"WEBP");
+        let tex = decode_image(&webp).expect("a WebP tile");
+        assert_eq!((tex.width, tex.height), (2, 2));
+        assert_eq!(&tex.rgba8().unwrap()[0..4], &[10, 120, 200, 255]);
+    }
+
     /// A 1×1 solid texture as a shareable layer source.
     fn solid(rgba: [u8; 4]) -> Arc<DecodedTexture> {
         Arc::new(DecodedTexture::from_rgba8(1, 1, rgba.to_vec()))

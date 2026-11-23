@@ -103,9 +103,15 @@ impl Layers {
         // The layer's substitute first: its drapes are only asked for once
         // the fallback specification that names it is sent, after this.
         if let (Some(lane), Some(sub)) = (&self.substitute, choice.substitute_layer()) {
-            let provider = imagery(&self.sources, &sub, self.store.as_ref())
-                .await
-                .map_err(|e| e.to_string())?;
+            // One that cannot be resolved leaves the layer's own pictures in
+            // its lane: the ground is the source's, never dark (§3.4).
+            let provider = match imagery(&self.sources, &sub, self.store.as_ref()).await {
+                Ok(substitute) => substitute,
+                Err(e) => {
+                    tracing::warn!(layer = %choice.key, "its substitute is not used: {e}");
+                    Arc::clone(&provider)
+                }
+            };
             lane.switch_to(provider);
         }
         Ok(self.switch.switch_to(provider))
@@ -242,8 +248,21 @@ pub(crate) async fn assemble(
     // on the opening layer's, or on the opening picture, which nothing asks
     // of it until a fallback specification names it.
     let substitute = if layers.iter().any(|l| l.substitute.is_some()) {
+        // One that cannot be resolved leaves the opening layer's own
+        // pictures in the lane: a session never fails to open, nor the
+        // ground goes dark, for want of a substitute (the substitution doc,
+        // §3.4).
         let first = match opening_layer.substitute_layer() {
-            Some(sub) => imagery(&sources, &sub, store.as_ref()).await?,
+            Some(sub) => match imagery(&sources, &sub, store.as_ref()).await {
+                Ok(substitute) => substitute,
+                Err(e) => {
+                    tracing::warn!(
+                        layer = %opening_layer.key,
+                        "its substitute is not used: {e}"
+                    );
+                    Arc::clone(&picture)
+                }
+            },
             None => Arc::clone(&picture),
         };
         Some(SwitchableImagery::new(first))

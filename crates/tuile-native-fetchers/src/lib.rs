@@ -16,7 +16,7 @@ use http_cache::FoyerManager;
 use http_cache_reqwest::{Cache, CacheMode, HttpCache, HttpCacheOptions};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use tuile_cesium_ion::{HttpResponse, IonError, IonHttp};
-use tuile_core::fetch::{is_retryable_status, FetchError, Fetched, TileFetcher};
+use tuile_core::fetch::{is_retryable_status, Credential, FetchError, Fetched, TileFetcher};
 use url::Url;
 
 /// Host whose responses carry short-lived ion tokens — never cache them.
@@ -428,12 +428,12 @@ impl NativeHttp {
     async fn get_once(
         &self,
         url: &Url,
-        bearer: Option<&str>,
+        credential: Option<&Credential>,
         fresh: bool,
     ) -> Result<reqwest::Response, reqwest_middleware::Error> {
         let mut req = self.client.get(url.clone());
-        if let Some(token) = bearer {
-            req = req.bearer_auth(token);
+        if let Some(credential) = credential {
+            req = req.header(credential.header(), credential.expose());
         }
         if fresh || url.host_str() == Some(ION_API_HOST) {
             req = req.with_extension(CacheMode::NoStore);
@@ -450,13 +450,13 @@ impl NativeHttp {
     async fn get(
         &self,
         url: &Url,
-        bearer: Option<&str>,
+        credential: Option<&Credential>,
         fresh: bool,
     ) -> Result<reqwest::Response, reqwest_middleware::Error> {
         let spread = spread_of(url);
         let mut attempt = 1;
         loop {
-            let outcome = self.get_once(url, bearer, fresh).await;
+            let outcome = self.get_once(url, credential, fresh).await;
             let last = self.retry.attempts.is_some_and(|max| attempt >= max);
 
             let wait = match &outcome {
@@ -515,7 +515,8 @@ impl NativeHttp {
         fresh: bool,
     ) -> Result<HttpResponse, IonError> {
         let asked = Asked::now(url);
-        let response = match NativeHttp::get(self, url, bearer, fresh).await {
+        let credential = bearer.map(Credential::bearer);
+        let response = match NativeHttp::get(self, url, credential.as_ref(), fresh).await {
             Ok(response) => response,
             Err(e) => {
                 asked.failed();
@@ -548,8 +549,69 @@ impl TileFetcher for NativeHttp {
     }
 
     async fn fetch_cacheable(&self, url: &Url) -> Result<Fetched<Bytes>, FetchError> {
+        self.fetch_tile(url, None).await
+    }
+}
+
+/// A [`NativeHttp`] that sends a [`Credential`] with every tile it asks
+/// for: a tile server that wants one. The same pool and cache as the
+/// transport it was made from; the credential is never printed.
+#[derive(Clone)]
+pub struct CredentialedHttp {
+    http: NativeHttp,
+    credential: Credential,
+}
+
+impl std::fmt::Debug for CredentialedHttp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialedHttp")
+            .field("credential", &self.credential)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NativeHttp {
+    /// This transport, sending `credential` with every tile it fetches.
+    pub fn with_credential(&self, credential: Credential) -> CredentialedHttp {
+        CredentialedHttp {
+            http: self.clone(),
+            credential,
+        }
+    }
+}
+
+#[async_trait]
+impl TileFetcher for CredentialedHttp {
+    async fn fetch(&self, url: &Url) -> Result<Bytes, FetchError> {
+        self.fetch_cacheable(url).await.map(|fetched| fetched.value)
+    }
+
+    async fn fetch_cacheable(&self, url: &Url) -> Result<Fetched<Bytes>, FetchError> {
+        self.http.fetch_tile(url, Some(&self.credential)).await
+    }
+}
+
+impl NativeHttp {
+    /// One tile asked with `credential`: a 404 is [`FetchError::NotFound`],
+    /// a refusal [`FetchError::Status`] — what a renewing caller needs to
+    /// tell a credential that ran out from a tile that is not there.
+    pub async fn fetch_tile_with(
+        &self,
+        url: &Url,
+        credential: &Credential,
+    ) -> Result<Fetched<Bytes>, FetchError> {
+        self.fetch_tile(url, Some(credential)).await
+    }
+
+    /// One tile: a 404 is [`FetchError::NotFound`], the origin saying it has
+    /// no such tile.
+    async fn fetch_tile(
+        &self,
+        url: &Url,
+        credential: Option<&Credential>,
+    ) -> Result<Fetched<Bytes>, FetchError> {
         let asked = Asked::now(url);
-        let response = match NativeHttp::get(self, url, None, false).await {
+        let response = match NativeHttp::get(self, url, credential, false).await {
             Ok(response) => response,
             Err(e) => {
                 asked.failed();
@@ -584,6 +646,87 @@ impl TileFetcher for NativeHttp {
         };
         asked.answered(answer, &value);
         Ok(Fetched { value, ttl })
+    }
+}
+
+/// Where a tile server hands its credential out: a URL whose answer carries
+/// it, as a cookie (`Set-Cookie: <name>=<value>; Max-Age=<seconds>`) or as a
+/// field of a JSON object (`{"<field>": "<value>", "expires_in": <seconds>}`).
+///
+/// Asked afresh every time: never from a cache, and with no cookie jar — a
+/// jar would send the old value back, and a server may then answer without
+/// a new one. The value is returned, never printed or kept.
+#[derive(Clone)]
+pub struct CredentialIssuer {
+    client: reqwest::Client,
+    url: Url,
+    answer: IssuedAs,
+}
+
+/// How an issuer's answer carries the credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IssuedAs {
+    /// The cookie of this name.
+    Cookie(String),
+    /// This field of a JSON object, with `expires_in` in seconds if stated.
+    Json(String),
+}
+
+impl std::fmt::Debug for CredentialIssuer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialIssuer")
+            .field("url", &tuile_core::fetch::redact(self.url.as_str()))
+            .field("answer", &self.answer)
+            .finish()
+    }
+}
+
+impl CredentialIssuer {
+    pub fn new(url: Url, answer: IssuedAs) -> Result<Self, NativeFetchError> {
+        let client = reqwest::Client::builder()
+            .user_agent(concat!("tuile/", env!("CARGO_PKG_VERSION")))
+            .timeout(Duration::from_secs(20))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| NativeFetchError(e.to_string()))?;
+        Ok(Self {
+            client,
+            url,
+            answer,
+        })
+    }
+
+    /// A fresh value and how long it is good for when the answer says so —
+    /// or the sentence that says why there is none, with no value in it.
+    pub async fn obtain(&self) -> Result<(String, Option<Duration>), String> {
+        let at = tuile_core::fetch::redact(self.url.as_str());
+        let response = self
+            .client
+            .get(self.url.clone())
+            .send()
+            .await
+            .map_err(|e| format!("{at}: {}", tuile_core::fetch::redact(&e.to_string())))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("{at} answered {}", status.as_u16()));
+        }
+        match &self.answer {
+            IssuedAs::Cookie(name) => response
+                .headers()
+                .get_all(reqwest::header::SET_COOKIE)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .find_map(|v| tuile_core::fetch::cookie_credential(v, name))
+                .ok_or_else(|| format!("{at} set no cookie {name:?}")),
+            IssuedAs::Json(field) => {
+                let body = response
+                    .bytes()
+                    .await
+                    .map_err(|e| format!("{at}: {}", tuile_core::fetch::redact(&e.to_string())))?;
+                tuile_core::fetch::json_credential(&body, field)
+                    .ok_or_else(|| format!("{at} gave no {field:?}"))
+            }
+        }
     }
 }
 
@@ -781,8 +924,20 @@ mod tests {
                     }
                     let request = String::from_utf8_lossy(&request);
                     let path = request.split(' ').nth(1).unwrap_or("/").to_string();
+                    let lower = request.to_ascii_lowercase();
+                    let keyed = lower.contains("\r\nx-api-key: s3cr3t\r\n");
                     let (status, kind, body): (&str, &str, &[u8]) = match path.as_str() {
                         "/a.png" => ("200 OK", "image/png", b"an image"),
+                        "/guarded.png" if keyed => ("200 OK", "image/png", b"for the key"),
+                        "/guarded.png" => ("401 Unauthorized", "text/plain", b""),
+                        "/guarded-none.png" if keyed => ("404 Not Found", "text/plain", b""),
+                        "/visit" => ("200 OK", "text/html", b"<html>"),
+                        "/visit.json" => (
+                            "200 OK",
+                            "application/json",
+                            br#"{"token":"v2","expires_in":30}"#,
+                        ),
+                        "/down" => ("503 Service Unavailable", "text/plain", b""),
                         "/1/2/3.terrain" => (
                             "200 OK",
                             "application/vnd.quantized-mesh",
@@ -792,8 +947,14 @@ mod tests {
                         "/layer.json" => ("200 OK", "application/json", b"{}"),
                         _ => ("404 Not Found", "text/plain", b""),
                     };
+                    let cookie = if path == "/visit" {
+                        "set-cookie: country=fr; Path=/\r\n\
+                         set-cookie: Visit=v1; Path=/; SameSite=Lax; Max-Age=60\r\n"
+                    } else {
+                        ""
+                    };
                     let head = format!(
-                        "HTTP/1.1 {status}\r\ncontent-type: {kind}\r\n\
+                        "HTTP/1.1 {status}\r\ncontent-type: {kind}\r\n{cookie}\
                          cache-control: max-age=3600\r\ncontent-length: {}\r\n\
                          connection: close\r\n\r\n",
                         body.len()
@@ -805,6 +966,74 @@ mod tests {
             }
         });
         (Url::parse(&format!("http://{at}/")).expect("url"), served)
+    }
+
+    /// A tile server that asks for a credential is sent it, under the
+    /// header it names; the same transport without it is refused; a tile it
+    /// does not have is an absence; and the credential is never printed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_credential_goes_with_every_tile_and_is_never_printed() {
+        let dir = tempfile::tempdir().expect("dir");
+        let http = NativeHttp::with_transport(TransportConfig::over(CacheConfig {
+            dir: dir.path().to_path_buf(),
+            memory_bytes: 16 << 20,
+            disk_bytes: 64 << 20,
+        }))
+        .await
+        .expect("transport");
+        let (base, _) = origin().await;
+        let at = |path: &str| base.join(path).expect("url");
+        let refused = http.fetch_cacheable(&at("guarded.png")).await;
+        assert!(
+            matches!(refused, Err(FetchError::Status { status: 401, .. })),
+            "{refused:?}"
+        );
+        let keyed = http.with_credential(Credential::under("X-Api-Key", "s3cr3t"));
+        let tile = keyed
+            .fetch_cacheable(&at("guarded.png"))
+            .await
+            .expect("let in");
+        assert_eq!(tile.value.as_ref(), b"for the key");
+        assert!(matches!(
+            keyed.fetch_cacheable(&at("guarded-none.png")).await,
+            Err(FetchError::NotFound(_))
+        ));
+        assert!(!format!("{keyed:?}").contains("s3cr3t"));
+    }
+
+    /// An issuer hands its credential out as a cookie or as JSON, with the
+    /// lifetime it states, asked afresh each time; one that is down says so
+    /// without a value.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_issuer_hands_out_a_credential() {
+        let (base, served) = origin().await;
+        let at = |path: &str| base.join(path).expect("url");
+        let cookie =
+            CredentialIssuer::new(at("visit"), IssuedAs::Cookie("Visit".into())).expect("issuer");
+        for _ in 0..2 {
+            assert_eq!(
+                cookie.obtain().await,
+                Ok(("v1".into(), Some(Duration::from_secs(60))))
+            );
+        }
+        assert_eq!(
+            served.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "never cached"
+        );
+        let json = CredentialIssuer::new(at("visit.json"), IssuedAs::Json("token".into()))
+            .expect("issuer");
+        assert_eq!(
+            json.obtain().await,
+            Ok(("v2".into(), Some(Duration::from_secs(30))))
+        );
+        let missing =
+            CredentialIssuer::new(at("visit"), IssuedAs::Cookie("Other".into())).expect("issuer");
+        assert!(missing.obtain().await.is_err());
+        let down =
+            CredentialIssuer::new(at("down"), IssuedAs::Cookie("Visit".into())).expect("issuer");
+        let e = down.obtain().await.expect_err("down");
+        assert!(e.contains("503"), "{e}");
     }
 
     /// A tile fetched twice comes from upstream, then from the cache — and

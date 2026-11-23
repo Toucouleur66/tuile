@@ -132,6 +132,102 @@ impl<T> Fetched<T> {
     }
 }
 
+/// The credential a tile server asks for, sent as one request header:
+/// `Authorization: Bearer <token>` by default, or the token as it is under
+/// a header the server names (an API key header, say).
+///
+/// Never printed: no `Display`, and a `Debug` that names the header and
+/// withholds the value — a fetch error, a retry warning or a log line that
+/// carries a request never carries its secret.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Credential {
+    header: String,
+    value: String,
+}
+
+impl Credential {
+    /// The header a credential goes in when nothing else is said.
+    pub const AUTHORIZATION: &'static str = "Authorization";
+
+    /// `Authorization: Bearer <token>`.
+    pub fn bearer(token: &str) -> Self {
+        Self {
+            header: Self::AUTHORIZATION.to_owned(),
+            value: format!("Bearer {}", token.trim()),
+        }
+    }
+
+    /// `token` under the header `name`: a bearer token when `name` is
+    /// `Authorization` (in any case), the token alone otherwise.
+    pub fn under(name: &str, token: &str) -> Self {
+        if name.trim().eq_ignore_ascii_case(Self::AUTHORIZATION) {
+            Self::bearer(token)
+        } else {
+            Self {
+                header: name.trim().to_owned(),
+                value: token.trim().to_owned(),
+            }
+        }
+    }
+
+    /// The header's name.
+    pub fn header(&self) -> &str {
+        &self.header
+    }
+
+    /// The header's value, for the one place that needs it: the request.
+    pub fn expose(&self) -> &str {
+        &self.value
+    }
+}
+
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Credential({}: <withheld>)", self.header)
+    }
+}
+
+/// The value and `Max-Age` of the cookie `name` in one `Set-Cookie` header,
+/// if it is that cookie and holds a value: how a server that hands its
+/// visitors a token in a cookie says what it is and how long it lasts.
+pub fn cookie_credential(
+    header: &str,
+    name: &str,
+) -> Option<(String, Option<std::time::Duration>)> {
+    let mut parts = header.split(';').map(str::trim);
+    let (key, value) = parts.next()?.split_once('=')?;
+    if key.trim() != name || value.trim().is_empty() {
+        return None;
+    }
+    let max_age = parts.find_map(|p| {
+        let (k, v) = p.split_once('=')?;
+        if k.trim().eq_ignore_ascii_case("max-age") {
+            v.trim().parse::<u64>().ok()
+        } else {
+            None
+        }
+    });
+    Some((
+        value.trim().to_owned(),
+        max_age.map(std::time::Duration::from_secs),
+    ))
+}
+
+/// The value of `field` in a JSON object, and its `expires_in` in seconds
+/// when it states one: how a server that hands out a token as JSON says it.
+pub fn json_credential(body: &[u8], field: &str) -> Option<(String, Option<std::time::Duration>)> {
+    let body: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let value = body.get(field)?.as_str()?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let lifetime = body
+        .get("expires_in")
+        .and_then(serde_json::Value::as_u64)
+        .map(std::time::Duration::from_secs);
+    Some((value.to_owned(), lifetime))
+}
+
 /// Abstract byte source. `Send + Sync` bounds are the native baseline; the
 /// single-threaded wasm relaxation (`maybe_send`) is an M2 follow-up noted
 /// in `docs/01-architecture.md`.
@@ -226,6 +322,53 @@ impl TileFetcher for HttpFetcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cookie a server hands out is read by name with its lifetime; a
+    /// JSON answer by field with its `expires_in`; anything else is none.
+    #[test]
+    fn issued_credentials_are_read_from_a_cookie_or_json() {
+        use std::time::Duration;
+        assert_eq!(
+            cookie_credential(
+                "STL-Token=abc; Path=/; SameSite=Lax; Max-Age=86399",
+                "STL-Token"
+            ),
+            Some(("abc".into(), Some(Duration::from_secs(86_399))))
+        );
+        assert_eq!(
+            cookie_credential("Visit=abc; Path=/", "Visit"),
+            Some(("abc".into(), None))
+        );
+        assert_eq!(cookie_credential("other=abc; Max-Age=5", "Visit"), None);
+        assert_eq!(cookie_credential("Visit=; Max-Age=0", "Visit"), None);
+        assert_eq!(
+            json_credential(br#"{"token":"abc","expires_in":60}"#, "token"),
+            Some(("abc".into(), Some(Duration::from_secs(60))))
+        );
+        assert_eq!(
+            json_credential(br#"{"token":"abc"}"#, "token"),
+            Some(("abc".into(), None))
+        );
+        assert_eq!(json_credential(br#"{"token":""}"#, "token"), None);
+        assert_eq!(json_credential(b"<html>", "token"), None);
+    }
+
+    /// A credential goes as a bearer token unless another header is named,
+    /// and its value never shows in what is printed of it.
+    #[test]
+    fn a_credential_is_a_header_and_is_never_printed() {
+        let bearer = Credential::bearer(" s3cr3t ");
+        assert_eq!(bearer.header(), "Authorization");
+        assert_eq!(bearer.expose(), "Bearer s3cr3t");
+        assert_eq!(Credential::under("authorization", "s3cr3t"), bearer);
+        let keyed = Credential::under("X-Api-Key", "s3cr3t");
+        assert_eq!(keyed.header(), "X-Api-Key");
+        assert_eq!(keyed.expose(), "s3cr3t");
+        for printed in [format!("{bearer:?}"), format!("{keyed:?}")] {
+            assert!(!printed.contains("s3cr3t"), "{printed}");
+        }
+        assert_eq!(format!("{keyed:?}"), "Credential(X-Api-Key: <withheld>)");
+    }
 
     /// No value of a query parameter survives in what an error says, and
     /// everything else does.
