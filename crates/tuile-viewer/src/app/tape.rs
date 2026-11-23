@@ -16,7 +16,7 @@
 
 use super::App;
 use glam::DVec3;
-use tuile_tape::session::{FrameContext, SkyState};
+use tuile_tape::session::{FrameContext, SkyState, UploadFrame};
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 
 /// One recorded frame, put back: its camera, the wall instant it was drawn
@@ -197,6 +197,19 @@ impl App {
         }
         tape.push_input(&self.recording.inputs);
         self.recording.inputs.clear();
+        // What the frame's uploads did, by lane: the bytes and the encodes.
+        let u = active.pump.last_uploads();
+        tape.push_uploads(&UploadFrame {
+            deadline_bytes: u.deadline_bytes,
+            uploaded: u.uploaded,
+            uploaded_bytes: u.uploaded_bytes,
+            deferred: u.deferred,
+            deferred_encode: u.deferred_encode,
+            encoded_tiles: u.encoded_tiles,
+            encode_blocks: u.encode_blocks,
+            encode_gpu_us: u.encode_gpu_micros,
+            upload_wall_us: u.upload_wall_micros,
+        });
         // What the GPU has finished, to the encoders; what they have
         // finished, to the tape.
         #[cfg(not(target_arch = "wasm32"))]

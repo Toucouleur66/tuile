@@ -460,6 +460,24 @@ pub(super) fn rows(
         s.under_need_tiles[0],
         s.under_need_tiles[1],
     )));
+    // The executor's lanes: what its frames deferred, by bytes and by
+    // encodes, and what the encodes did.
+    let enc = &s.frame_encode_micros;
+    let (enc_sum, enc_count) = match from {
+        Some((f, _)) => (
+            enc.sum.saturating_sub(f.frame_encode_micros.sum),
+            enc.count.saturating_sub(f.frame_encode_micros.count),
+        ),
+        None => (enc.sum, enc.count),
+    };
+    out.push(line(format!(
+        "uploads deferred {} by bytes, {} by encodes · encoded {} tiles, {} blocks · encode GPU {:.2} ms a frame that encodes",
+        since(s.upload_deferred_total[0], |f| f.upload_deferred_total[0]),
+        since(s.upload_deferred_total[1], |f| f.upload_deferred_total[1]),
+        since(s.encoded_tiles_total, |f| f.encoded_tiles_total),
+        since(s.encode_blocks_total, |f| f.encode_blocks_total),
+        enc_sum as f64 / enc_count.max(1) as f64 / 1000.0,
+    )));
     if cumulative {
         let up: u64 = s.upload_bytes_total.iter().map(|(_, v)| v).sum();
         let up0: u64 = from.map_or(0, |(f, _)| {
@@ -664,6 +682,38 @@ mod tests {
         assert_eq!(
             &row(&rows_reset, "0 base")[5..10],
             ["·", "6", "·", "6", "·"]
+        );
+    }
+
+    /// The executor's lanes: deferrals by bytes and by encodes, apart, and
+    /// what the encodes did — since the reset in the cumulative view.
+    #[test]
+    fn the_lanes_line_counts_bytes_and_encodes_apart() {
+        let mut s = signals();
+        s.upload_deferred_total = [7, 12];
+        s.encoded_tiles_total = 40;
+        s.encode_blocks_total = 40 * 5_463;
+        s.frame_encode_micros.record(9_500);
+        s.frame_encode_micros.record(10_500);
+        let lanes = |rows: &[Vec<String>]| {
+            rows.iter()
+                .find(|r| r[0].starts_with("uploads deferred"))
+                .map(|r| r[0].clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            lanes(&rows(&s, None, false, &[])),
+            "uploads deferred 7 by bytes, 12 by encodes · encoded 40 tiles, 218520 blocks · encode GPU 10.00 ms a frame that encodes"
+        );
+        let mut then = s.clone();
+        then.upload_deferred_total = [7, 2];
+        then.encoded_tiles_total = 39;
+        then.encode_blocks_total = 39 * 5_463;
+        then.frame_encode_micros = Default::default();
+        then.frame_encode_micros.record(9_500);
+        assert_eq!(
+            lanes(&rows(&s, Some((&then, 5.0)), true, &[])),
+            "uploads deferred 0 by bytes, 10 by encodes · encoded 1 tiles, 5463 blocks · encode GPU 10.50 ms a frame that encodes"
         );
     }
 

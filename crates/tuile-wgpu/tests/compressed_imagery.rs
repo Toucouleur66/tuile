@@ -35,6 +35,16 @@ fn acked(stream: &Scripted, resource: ResourceId) -> Option<u64> {
         })
 }
 
+/// The GPU's work so far finished, and every acknowledgement it held back
+/// sent: what a host's next frames do.
+fn acks_landed(pump: &mut ContentPump, stream: &mut Scripted, gpu: &GpuContext) {
+    pump.acknowledge(stream, gpu);
+    gpu.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("poll");
+    pump.acknowledge(stream, gpu);
+}
+
 /// One drape of `size`² over a tile of its own, uploaded at once, and the
 /// pump that holds it.
 fn upload_one(gpu: &GpuContext, size: u32) -> (Scripted, ContentPump, ResourceId) {
@@ -46,6 +56,7 @@ fn upload_one(gpu: &GpuContext, size: u32) -> (Scripted, ContentPump, ResourceId
     let mut pump = ContentPump::new(glam::DVec3::ZERO);
     pump.pump(&mut stream, gpu, FrameDeadline::UNBOUNDED);
     assert_eq!(pump.pending_uploads(), 0);
+    acks_landed(&mut pump, &mut stream, gpu);
     (stream, pump, ResourceId::drape(tile, LayerId(0), 4))
 }
 
@@ -134,5 +145,191 @@ fn the_encodes_take_one_frame_each_under_a_tiny_share() {
         };
         assert_eq!(per_frame, want, "{plan}");
         assert_eq!(pump.pending_uploads(), 0, "{plan}: nothing waits for ever");
+    }
+}
+
+/// A flat mesh over `tile`.
+fn flat(tile: TileId) -> tuile_core::content::DecodedTileContent {
+    let (z, x, y) = tile.terrain_coord();
+    let rect = tuile_terrain::GeographicTilingScheme::default()
+        .tile_rect(tuile_terrain::TileCoord::new(z, x, y));
+    tuile_terrain::fill_content(&rect, [Some(0.0); 4], 0.0)
+}
+
+/// **The encode pacing never splits a swap group.** A drape takes the
+/// frame's first encode; behind it, a tile's mesh and its drape form a swap
+/// group. The drape does not fit the encodes' share — and the mesh, which
+/// encodes nothing, waits with it rather than be drawn bare. Both go the
+/// next frame, together. Off: everything goes at once.
+#[test]
+fn encode_pacing_never_splits_a_swap_group() {
+    use support::{mesh, select};
+    use tuile_core::budget::{Bytes, SwapGroup, UploadPlan};
+    use tuile_core::protocol::ServerMessage;
+    for (plan, compression) in PLANS {
+        let Some(gpu) = gpu_with(compression) else {
+            continue;
+        };
+        let (first, paired) = (TileId::from_terrain(4, 3, 2), TileId::from_terrain(4, 4, 2));
+        let texture = |seed: u8| painted(&gpu, 256, 256, move |x, _| [x as u8, seed, 50, 255]);
+        let lead = ResourceId::drape(first, LayerId(0), 4);
+        let (m, d) = (
+            ResourceId::Mesh(paired),
+            ResourceId::drape(paired, LayerId(0), 4),
+        );
+        let mut members = vec![m, d];
+        members.sort_unstable();
+        let mut selected = select(Vec::new(), 1);
+        if let ServerMessage::Select { plan, .. } = &mut selected {
+            *plan = UploadPlan {
+                items: vec![lead, m, d],
+                bytes: Bytes::ZERO,
+                groups: vec![SwapGroup { members }],
+            };
+        }
+        let mut stream = Scripted::new([
+            drape(first, 1, whole_drape(first, 4, texture(10))),
+            mesh(paired, 2, flat(paired)),
+            drape(paired, 3, whole_drape(paired, 4, texture(20))),
+            selected,
+        ]);
+        let mut pump = ContentPump::new(glam::DVec3::ZERO);
+        pump.set_encode_pace(EncodePace { share_micros: 1 });
+        pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
+        acks_landed(&mut pump, &mut stream, &gpu);
+        let first_frame = (acked(&stream, m).is_some(), acked(&stream, d).is_some());
+        let uploads = pump.last_uploads();
+        if gpu.imagery_plan().target == ImageryFormat::Rgba8 {
+            assert_eq!(first_frame, (true, true), "{plan}");
+            assert_eq!(uploads.deferred_encode, 0, "{plan}");
+            continue;
+        }
+        assert!(
+            acked(&stream, lead).is_some(),
+            "{plan}: the first encode goes"
+        );
+        assert_eq!(
+            first_frame,
+            (false, false),
+            "{plan}: the group was split — its mesh went without its drape"
+        );
+        assert_eq!(uploads.deferred_encode, 2, "{plan}: the whole group waits");
+        assert_eq!(uploads.deferred, 0, "{plan}: not the byte lane's");
+        pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
+        acks_landed(&mut pump, &mut stream, &gpu);
+        assert!(
+            acked(&stream, m).is_some() && acked(&stream, d).is_some(),
+            "{plan}: the group goes whole the next frame"
+        );
+        assert_eq!(pump.pending_uploads(), 0, "{plan}");
+    }
+}
+
+/// **A frame's encodes are counted, and its deferrals by lane.** Three
+/// drapes under a share too small for one tile: the first frame encodes one
+/// 256² tile — 5,463 blocks, mip chain included — and defers two to the
+/// encode lane, none to the byte lane. Off encodes and defers nothing.
+#[test]
+fn a_frames_encodes_and_deferrals_are_counted_by_lane() {
+    for (plan, compression) in PLANS {
+        let Some(gpu) = gpu_with(compression) else {
+            continue;
+        };
+        let tiles = [
+            TileId::from_terrain(4, 3, 2),
+            TileId::from_terrain(4, 4, 2),
+            TileId::from_terrain(4, 5, 2),
+        ];
+        let mut stream = Scripted::new(tiles.iter().enumerate().map(|(i, t)| {
+            let texture = painted(&gpu, 256, 256, |x, _| [x as u8, 100, 50, 255]);
+            drape(*t, i as u64 + 1, whole_drape(*t, 4, texture))
+        }));
+        let mut pump = ContentPump::new(glam::DVec3::ZERO);
+        pump.set_encode_pace(EncodePace { share_micros: 1 });
+        pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
+        let u = pump.last_uploads();
+        let want = match gpu.imagery_plan().target {
+            ImageryFormat::Rgba8 => (3, 0, 0, 0, 0),
+            _ => (1, 0, 2, 1, 5_463),
+        };
+        assert_eq!(
+            (
+                u.uploaded,
+                u.deferred,
+                u.deferred_encode,
+                u.encoded_tiles,
+                u.encode_blocks
+            ),
+            want,
+            "{plan}"
+        );
+        assert_eq!(u.encode_gpu_micros > 0, want.4 > 0, "{plan}");
+        let totals = pump.totals();
+        assert_eq!(
+            (totals.deferred_encode, totals.encode_blocks),
+            (u64::from(want.2), want.4),
+            "{plan}"
+        );
+    }
+}
+
+/// **A GPU-encoded acknowledgement waits for the GPU** (CB4): until the
+/// GPU has run the encode, the encoder's RGBA8 is held beside the blocks,
+/// and the budget must go on charging both. So the pump that uploads a
+/// drape it encodes does not acknowledge it; once the frame is submitted
+/// and the GPU has finished, the next acknowledgement round does. Off is
+/// acknowledged in the frame that uploads it, as always.
+#[test]
+fn a_gpu_encoded_ack_waits_for_the_gpu() {
+    for (plan, compression) in PLANS {
+        let Some(gpu) = gpu_with(compression) else {
+            continue;
+        };
+        let tile = TileId::from_terrain(4, 3, 2);
+        let texture = painted(&gpu, 256, 256, |x, y| [x as u8, 90, y as u8, 255]);
+        let mut stream = Scripted::new([drape(tile, 1, whole_drape(tile, 4, texture))]);
+        let mut pump = ContentPump::new(glam::DVec3::ZERO);
+        pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
+        let resource = ResourceId::drape(tile, LayerId(0), 4);
+        let encoded = gpu.imagery_plan().target != ImageryFormat::Rgba8;
+        assert_eq!(
+            acked(&stream, resource).is_some(),
+            !encoded,
+            "{plan}: acknowledged before the GPU ran its encode"
+        );
+        assert_eq!(
+            pump.acks_waiting_for_the_gpu(),
+            usize::from(encoded),
+            "{plan}"
+        );
+        acks_landed(&mut pump, &mut stream, &gpu);
+        assert!(
+            acked(&stream, resource).is_some(),
+            "{plan}: never acknowledged"
+        );
+        assert_eq!(pump.acks_waiting_for_the_gpu(), 0, "{plan}");
+    }
+}
+
+/// **The reservation covers the encoder's scratch** (CB4): what a host
+/// takes off the drapes' limits at setup is no less than what the scratch
+/// holds for one tile, and no more than its jobs' alignment over it.
+/// Nothing for a plan that does not encode on the GPU.
+#[test]
+fn the_reservation_covers_the_encoders_scratch() {
+    for (plan, compression) in PLANS {
+        let Some(gpu) = gpu_with(compression) else {
+            continue;
+        };
+        let reserved = tuile_wgpu::encode_reservation(gpu.imagery_plan(), 1).0;
+        match gpu.imagery_scratch_bytes() {
+            None => assert_eq!(reserved, 0, "{plan}"),
+            Some(held) => {
+                assert!(
+                    held <= reserved && reserved - held <= 9 * 256,
+                    "{plan}: the scratch holds {held}, {reserved} reserved"
+                );
+            }
+        }
     }
 }

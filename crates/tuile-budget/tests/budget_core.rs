@@ -286,17 +286,11 @@ mod ledger {
     fn a_drape_costs_its_mip_chain_and_its_aligned_staging() {
         assert_eq!(
             drape_cost(256, 256, TextureFormat::Rgba8),
-            Cost {
-                gpu: Bytes(349_524),
-                staging: Bytes(360_192),
-            }
+            Cost::new(Bytes(349_524), Bytes(360_192))
         );
         assert_eq!(
             drape_cost(256, 256, TextureFormat::Block16),
-            Cost {
-                gpu: Bytes(87_408),
-                staging: Bytes(90_368),
-            }
+            Cost::new(Bytes(87_408), Bytes(90_368))
         );
     }
 
@@ -3513,14 +3507,7 @@ mod staging {
         let need = drawn(&tiles);
         let d = r.step(&need);
         for s in &d.start {
-            r.b.on_loaded(
-                s.resource,
-                s.gen,
-                Cost {
-                    gpu: MESH,
-                    staging: Bytes(MESH.0 * 2),
-                },
-            );
+            r.b.on_loaded(s.resource, s.gen, Cost::new(MESH, Bytes(MESH.0 * 2)));
         }
         let d = r.step(&need);
         assert_eq!(d.deliver.len(), 2, "{RED}");
@@ -3986,5 +3973,217 @@ mod dirty_sets {
             Some(vec![root, k]),
             "{RED}: the tile stands on the ancestor wearing a layer since"
         );
+    }
+}
+
+/// CB2: a cost per path. A drape the GPU encodes crosses as RGBA8, holds
+/// blocks, peaks at both while it encodes and writes its chain's blocks;
+/// the plan is capped on what crosses, the decoded tier charges what its
+/// copy holds, and an encode that fell back is told from drift.
+mod cost_per_path {
+    use super::*;
+    use tuile_budget::cost::{chain_blocks, drape_cost, Cost, TextureFormat};
+
+    /// A 256² drape headed for BC7 or ASTC 4×4, encoded on the GPU.
+    pub(crate) fn gpu_encoded() -> Cost {
+        let blocks = drape_cost(256, 256, TextureFormat::Block16);
+        let rgba8 = drape_cost(256, 256, TextureFormat::Rgba8);
+        Cost {
+            gpu: blocks.gpu,
+            staging: rgba8.staging,
+            transfer: rgba8.gpu,
+            transient: rgba8.gpu,
+            encode_blocks: chain_blocks(256, 256),
+        }
+    }
+
+    /// The numbers of the plan, for a 256² tile with its chain.
+    #[test]
+    fn a_gpu_encoded_tile_moves_349_524_holds_87_408_peaks_and_encodes_5_463_blocks() {
+        let c = gpu_encoded();
+        assert_eq!(
+            (c.gpu, c.transfer, c.transient, c.encode_blocks),
+            (Bytes(87_408), Bytes(349_524), Bytes(349_524), 5_463)
+        );
+        assert!(!c.is_identity());
+        for (w, h) in [(256, 256), (100, 37), (1, 1)] {
+            for f in [TextureFormat::Rgba8, TextureFormat::Block16] {
+                let d = drape_cost(w, h, f);
+                assert!(d.is_identity(), "{w}×{h} {f:?}: {d:?}");
+            }
+        }
+        assert!(Cost::flat(MESH).is_identity());
+        assert!(tuile_budget::cost::mesh_cost(1_000, 32, 6_000, true).is_identity());
+    }
+
+    /// The upload plan's byte cap reads what crosses: two GPU-encoded
+    /// drapes are two RGBA8 tiles on the way, and a cap of one lets one go.
+    #[test]
+    fn the_plan_caps_on_transfer() {
+        let mut c = Rig::interactive_config();
+        c.upload_bytes_per_frame = gpu_encoded().transfer;
+        let mut r = Rig::new(c);
+        let tiles = [t(4, 0, 0), t(4, 1, 0)];
+        let need = drawn_draped(&tiles, 4);
+        let mut d = r.step(&need);
+        for _ in 0..8 {
+            for s in &d.start {
+                let cost = match s.resource {
+                    ResourceId::Drape { .. } => gpu_encoded(),
+                    _ => est(s.resource),
+                };
+                r.b.on_loaded(s.resource, s.gen, cost);
+            }
+            d = r.step(&need);
+            for (m, g) in &d.deliver {
+                if matches!(m, ResourceId::Mesh(_)) {
+                    r.b.on_drawable(*m, *g, est(*m).gpu);
+                }
+            }
+        }
+        let drapes = |d: &Decisions| {
+            d.upload_plan
+                .items
+                .iter()
+                .filter(|i| matches!(i, ResourceId::Drape { .. }))
+                .count()
+        };
+        // Every drape delivered and none acknowledged: both in transit.
+        assert!(r.b.ledger().in_transit >= Bytes(2 * 360_192));
+        let d = r.step(&need);
+        assert_eq!(drapes(&d), 1, "two RGBA8 tiles fit a one-tile cap: {RED}");
+        assert_eq!(d.upload_plan.bytes, gpu_encoded().transfer);
+    }
+
+    /// A decoded copy of a texture the GPU will encode holds RGBA8: the
+    /// decoded tier charges that, not the blocks it will become.
+    #[test]
+    fn the_decoded_tier_charges_what_the_copy_holds() {
+        let mut r = Rig::interactive();
+        let need = drawn_draped(&[t(4, 0, 0)], 4);
+        let d = r.step(&need);
+        let s = d
+            .start
+            .iter()
+            .find(|s| matches!(s.resource, ResourceId::Drape { .. }))
+            .expect("a drape load");
+        r.b.on_loaded(s.resource, s.gen, gpu_encoded());
+        r.step(&need);
+        assert!(r.b.ledger().decoded >= gpu_encoded().transfer, "{RED}");
+        r.b.audit().expect("the ledger recounts the extras");
+    }
+
+    /// An acknowledgement in `(gpu, transfer]` is an encode that fell back
+    /// to RGBA8: counted as a fallback, charged as held — not drift. Past
+    /// `transfer` it is drift.
+    #[test]
+    fn a_fallback_ack_is_not_drift() {
+        for (actual, fallbacks, drift) in [
+            (Bytes(349_524), 1, 0),
+            (Bytes(87_408), 0, 0),
+            (Bytes(500_000), 0, 1),
+        ] {
+            let mut r = Rig::interactive();
+            let need = drawn_draped(&[t(4, 0, 0)], 4);
+            let mut d = r.step(&need);
+            for s in &d.start {
+                let cost = match s.resource {
+                    ResourceId::Drape { .. } => gpu_encoded(),
+                    _ => est(s.resource),
+                };
+                r.b.on_loaded(s.resource, s.gen, cost);
+            }
+            let mut seen = (0, 0);
+            for _ in 0..4 {
+                d = r.step(&need);
+                for (m, g) in &d.deliver {
+                    let bytes = match m {
+                        ResourceId::Drape { .. } => actual,
+                        _ => est(*m).gpu,
+                    };
+                    r.b.on_drawable(*m, *g, bytes);
+                }
+                seen.0 += d.stats.fallbacks[Class::Drape];
+                seen.1 += d.stats.drift_exceeded[Class::Drape];
+            }
+            let d = r.step(&need);
+            seen.0 += d.stats.fallbacks[Class::Drape];
+            seen.1 += d.stats.drift_exceeded[Class::Drape];
+            assert_eq!(seen, (fallbacks, drift), "ack {actual:?}: {RED}");
+            r.b.audit().expect("consistent");
+        }
+    }
+}
+
+/// CB4: the transient peak and the reservations. A delivery the GPU will
+/// encode holds its blocks and the RGBA8 the encoder reads until it is
+/// acknowledged; what the executor holds outside any resource is off the
+/// limits.
+mod reservations {
+    use super::cost_per_path::gpu_encoded;
+    use super::*;
+
+    /// Delivered, a GPU-encoded drape is charged its peak — 87,408 resident
+    /// and 349,524 transient — until its acknowledgement, then what it holds.
+    #[test]
+    fn transit_holds_gpu_plus_transient() {
+        let mut r = Rig::interactive();
+        let need = drawn_draped(&[t(4, 0, 0)], 4);
+        let mut d = r.step(&need);
+        let mut delivered = None;
+        for _ in 0..6 {
+            for s in &d.start {
+                let cost = match s.resource {
+                    ResourceId::Drape { .. } => gpu_encoded(),
+                    _ => est(s.resource),
+                };
+                r.b.on_loaded(s.resource, s.gen, cost);
+            }
+            d = r.step(&need);
+            for (m, g) in &d.deliver {
+                match m {
+                    ResourceId::Drape { .. } => delivered = Some((*m, *g)),
+                    _ => r.b.on_drawable(*m, *g, est(*m).gpu),
+                }
+            }
+            if delivered.is_some() {
+                break;
+            }
+        }
+        let (drape, gen) = delivered.expect("the drape delivered");
+        let peak = Bytes(87_408 + 349_524);
+        assert_eq!(r.b.ledger().gpu[Class::Drape], peak, "{RED}");
+        r.b.audit().expect("the recount agrees");
+        r.b.on_drawable(drape, gen, Bytes(87_408));
+        r.step(&need);
+        assert_eq!(r.b.ledger().gpu[Class::Drape], Bytes(87_408));
+        r.b.audit().expect("consistent");
+    }
+
+    /// A class's reservation is off its target, overflow and hard limit
+    /// (and its pool's); another class keeps its own; a reservation past
+    /// the hard limit is refused.
+    #[test]
+    fn the_limits_subtract_the_reservations() {
+        let need = drawn(&[t(3, 0, 0)]);
+        let plain = Rig::interactive().step(&need).stats;
+        let mut c = Rig::interactive_config();
+        let r = Bytes::mib(3);
+        c.reserved[Class::Drape] = r;
+        let mut rig = Rig::new(c.clone());
+        let held = rig.step(&need).stats;
+        assert_eq!(
+            held.hard_limit[Class::Drape],
+            plain.hard_limit[Class::Drape].minus(r),
+            "{RED}"
+        );
+        assert!(held.target[Class::Drape] < plain.target[Class::Drape]);
+        assert_eq!(
+            held.hard_limit[Class::TerrainMesh],
+            plain.hard_limit[Class::TerrainMesh],
+            "another class keeps its own"
+        );
+        c.reserved[Class::Drape] = c.hard_limit[Class::Drape].plus(Bytes(1));
+        assert!(c.validate().is_err(), "a reservation past the hard limit");
     }
 }

@@ -190,6 +190,9 @@ pub struct BudgetStats {
     pub failures: PerClass<[u32; 2]>,
     /// Acknowledgements more than 5 % off their estimate, per class.
     pub drift_exceeded: PerClass<u32>,
+    /// Acknowledgements of an encode that fell back to the form it crossed
+    /// in (`Cost::is_fallback`), per class: charged as held, not drift.
+    pub fallbacks: PerClass<u32>,
     /// The deepest climb this step from a wanted tile to the ancestor that
     /// stands for it, in levels (P2, P4.1).
     pub fallback_depth_max: u32,
@@ -417,6 +420,13 @@ impl BudgetStats {
         }
         for (_, e) in self.evictions.iter() {
             for n in e {
+                put(u64::from(n));
+            }
+        }
+        // Only when an encode fell back: a digest without one is the one it
+        // was before the count existed.
+        if self.fallbacks.iter().any(|(_, n)| n > 0) {
+            for (_, n) in self.fallbacks.iter() {
                 put(u64::from(n));
             }
         }

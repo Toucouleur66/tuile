@@ -995,6 +995,27 @@ fn pattern_goldens_hold() {
                 }
             }),
         ),
+        // CB3, appended: the compressed clients.
+        (
+            "p1-cold desktop-bc7",
+            golden(Profile::desktop_bc7(), 217, still),
+        ),
+        (
+            "p1-cold handheld-astc-gpu",
+            golden(Profile::handheld_astc_gpu(), 218, still),
+        ),
+        (
+            "p1-cold web-webgl2-cpu",
+            golden(Profile::web_webgl2_cpu(), 219, still),
+        ),
+        (
+            "p2-fast-dive desktop-bc7",
+            golden(Profile::desktop_bc7(), 220, dive),
+        ),
+        (
+            "p2-fast-dive headset-90-astc",
+            golden(Profile::headset_90_astc(), 221, dive),
+        ),
     ];
     let got: String = runs
         .iter()
@@ -1005,4 +1026,48 @@ fn pattern_goldens_hold() {
     }
     let want = std::fs::read_to_string(&path).expect("pattern goldens recorded");
     assert_eq!(got, want);
+}
+
+/// CB3: the compressed clients hold their drapes in blocks — a quarter of
+/// RGBA8 a drape, give or take the small levels and the fallbacks — and every encode that fell back
+/// reaches the budget as a fallback, one for one, never as drift (checked
+/// every step by `Sim::check`), on a desktop, a phone, a page on WebGL2 and
+/// a 90 Hz headset.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
+)]
+fn compressed_clients_hold_blocks_and_their_fallbacks_are_counted() {
+    for (profile, seed) in [
+        (Profile::desktop_bc7(), 231),
+        (Profile::handheld_astc_gpu(), 232),
+        (Profile::web_webgl2_cpu(), 233),
+        (Profile::headset_90_astc(), 234),
+    ] {
+        let name = profile.name;
+        let gpu_plan = profile.plan == super::world::SimPlan::Gpu;
+        let mut sim = Sim::new(clean(profile), seed);
+        sim.run(6.0, &|_| home());
+        let counted: u64 = sim
+            .log
+            .iter()
+            .map(|l| u64::from(l.stats.fallbacks[Class::Drape]))
+            .sum();
+        // The drapes it holds, against the same drapes as RGBA8.
+        let as_rgba8 = sim
+            .gpu
+            .drawable
+            .keys()
+            .filter(|r| matches!(r, ResourceId::Drape { .. }))
+            .fold(0u64, |a, r| a + super::world::cost(*r).gpu.0);
+        let held = sim.gpu.bytes[Class::Drape].0;
+        assert!(
+            held > 0 && held * 3 < as_rgba8,
+            "{name}: drapes hold {held} bytes, {as_rgba8} as RGBA8"
+        );
+        let fell = sim.gpu.fallbacks;
+        assert_eq!(counted, fell, "{name}: a fallback not counted as one");
+        assert_eq!(fell > 0, gpu_plan, "{name}: fallbacks {fell}");
+    }
 }

@@ -398,16 +398,26 @@ impl Texels {
     /// Held: the whole chain in the resident format. Moved: the texels as
     /// they cross — RGBA8 for a texture the GPU encodes on the way, blocks
     /// for one the worker already encoded.
+    ///
+    /// The GPU's encode is the one path whose parts differ: it crosses as
+    /// RGBA8 (`transfer`), holds that RGBA8 beside its blocks until the
+    /// encode has run (`transient`), and writes the chain's blocks
+    /// (`encode_blocks`). Every other path crosses as it is held.
     pub fn cost(&self, width: u32, height: u32) -> Cost {
         let held = drape_cost(width, height, self.resident().cost_format());
         let crossing = match self {
             Texels::Rgba8 { .. } => TextureFormat::Rgba8,
             Texels::Blocks { format, .. } => format.cost_format(),
         };
-        Cost {
-            gpu: held.gpu,
-            staging: drape_cost(width, height, crossing).staging,
+        let crossed = drape_cost(width, height, crossing);
+        let mut cost = Cost::new(held.gpu, crossed.staging);
+        if crossing != self.resident().cost_format() {
+            // RGBA8 the GPU encodes into blocks.
+            cost.transfer = crossed.gpu;
+            cost.transient = crossed.gpu;
+            cost.encode_blocks = crate::budget::cost::chain_blocks(width, height);
         }
+        cost
     }
 }
 
@@ -758,6 +768,35 @@ mod tests {
             let c = t.cost(256, 256);
             assert_eq!(c.gpu, Bytes(87_408), "{resident:?}");
             assert_eq!(c.staging, rgba.staging, "{resident:?}");
+            // CB2: it crosses as RGBA8, holds that RGBA8 beside its blocks
+            // until the encode has run, and writes the chain's blocks.
+            assert_eq!(
+                (c.transfer, c.transient, c.encode_blocks),
+                (Bytes(349_524), Bytes(349_524), 5_463),
+                "{resident:?}"
+            );
+            assert!(!c.is_identity());
+        }
+    }
+
+    /// **Every path but the GPU's encode crosses as it is held** (CB2): RGBA8
+    /// held as RGBA8, and blocks encoded on the CPU or stored, charge
+    /// `transfer == gpu`, nothing transient and no encode — so `Off`
+    /// charges what it always did.
+    #[test]
+    fn every_other_path_crosses_as_it_is_held() {
+        for (w, h) in [(256, 256), (512, 128), (100, 36), (4, 4), (1, 1)] {
+            let rgba = Texels::rgba8(vec![0; (w * h * 4) as usize]).cost(w, h);
+            assert!(rgba.is_identity(), "RGBA8 {w}×{h}: {rgba:?}");
+            assert_eq!(rgba.transfer, rgba.gpu);
+            for format in [BlockFormat::Bc7, BlockFormat::Astc4x4] {
+                let blocks = Texels::Blocks {
+                    format,
+                    levels: Vec::new(),
+                }
+                .cost(w, h);
+                assert!(blocks.is_identity(), "{format:?} {w}×{h}: {blocks:?}");
+            }
         }
     }
 

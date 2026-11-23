@@ -3,11 +3,27 @@
 
 //! The deterministic cost estimator, shared by the budget and the consumer.
 //!
-//! A [`Cost`] has two parts: the bytes a resource keeps on the GPU (and, on
-//! unified memory, the CPU copy kept beside it), and the transient staging
-//! bytes its upload goes through, which count against the delivery credit.
+//! A [`Cost`] says, per path a resource takes to the GPU:
+//! - `gpu`: the bytes it keeps resident (and, on unified memory, the CPU
+//!   copy kept beside it);
+//! - `staging`: the row-aligned bytes its upload moves, against the
+//!   delivery credit and the executor's byte lane;
+//! - `transfer`: the texels in the form they cross in, on `gpu`'s basis —
+//!   what a decoded copy holds and what a frame's upload plan is capped on;
+//! - `transient`: the GPU bytes held beside `gpu` until an encode on the
+//!   GPU has finished (the RGBA8 the encoder reads);
+//! - `encode_blocks`: the 4×4 blocks that encode writes.
+//!
+//! For RGBA8 and meshes `transfer == gpu` and the other two are zero
+//! ([`Cost::is_identity`]): nothing compressed costs what it always did. A
+//! texture the GPU encodes into BC7 or ASTC 4×4 crosses as RGBA8 (349,524
+//! bytes for 256² with its chain), holds blocks (87,408), peaks at both
+//! until its encode is done, and writes 5,463 blocks.
+//!
 //! The consumer reports the actual GPU bytes in its acknowledgement; a drift
-//! above 5 % means this estimator is wrong.
+//! above 5 % means this estimator is wrong — unless the actual lies in
+//! `(gpu, transfer]`, which is an encode that fell back to the form it
+//! crossed in ([`Cost::is_fallback`]), counted as such.
 //!
 //! What it accounts for, as wgpu lays it out:
 //! - texture copies with `bytes_per_row` aligned to 256
@@ -35,12 +51,55 @@ pub struct Cost {
     pub gpu: Bytes,
     /// Transient bytes of the upload (staging), against the delivery credit.
     pub staging: Bytes,
+    /// The texels in their crossing form, on `gpu`'s basis: `gpu` unless
+    /// the GPU encodes them on the way.
+    pub transfer: Bytes,
+    /// Extra GPU bytes held until the GPU's encode has finished.
+    pub transient: Bytes,
+    /// The 4×4 blocks the GPU's encode writes.
+    pub encode_blocks: u64,
 }
 
 impl Cost {
     /// A cost whose staging equals its resident bytes.
     pub const fn flat(b: Bytes) -> Self {
-        Cost { gpu: b, staging: b }
+        Cost::new(b, b)
+    }
+
+    /// Resident `gpu`, moving `staging`, crossing as it is held: no encode
+    /// on the way.
+    pub const fn new(gpu: Bytes, staging: Bytes) -> Self {
+        Cost {
+            gpu,
+            staging,
+            transfer: gpu,
+            transient: Bytes::ZERO,
+            encode_blocks: 0,
+        }
+    }
+
+    /// Crosses as it is held, and nothing is encoded on the GPU: what every
+    /// cost was before compression, and every cost under `Off`.
+    pub const fn is_identity(&self) -> bool {
+        self.transfer.0 == self.gpu.0 && self.transient.0 == 0 && self.encode_blocks == 0
+    }
+
+    /// Whether `actual` acknowledged against this estimate is an encode
+    /// that fell back to the form it crossed in: more than resident, no
+    /// more than what crossed. Never for an identity cost.
+    pub fn is_fallback(&self, actual: Bytes) -> bool {
+        self.gpu < actual && actual <= self.transfer
+    }
+
+    /// The sum of two costs, part by part.
+    pub const fn plus(self, o: Cost) -> Cost {
+        Cost {
+            gpu: self.gpu.plus(o.gpu),
+            staging: self.staging.plus(o.staging),
+            transfer: self.transfer.plus(o.transfer),
+            transient: self.transient.plus(o.transient),
+            encode_blocks: self.encode_blocks.saturating_add(o.encode_blocks),
+        }
     }
 }
 
@@ -56,10 +115,7 @@ pub fn mesh_cost(vertices: u64, stride: u64, indices: u64, cpu_copy: bool) -> Co
     let uniform = align(TILE_UNIFORM_BYTES, UNIFORM_ALIGNMENT);
     let staging = vb.saturating_add(ib).saturating_add(uniform);
     let copy = if cpu_copy { vb.saturating_add(ib) } else { 0 };
-    Cost {
-        gpu: Bytes(staging.saturating_add(copy)),
-        staging: Bytes(staging),
-    }
+    Cost::new(Bytes(staging.saturating_add(copy)), Bytes(staging))
 }
 
 /// A texture's pixel format, for its byte cost.
@@ -92,10 +148,23 @@ pub fn drape_cost(w: u32, h: u32, format: TextureFormat) -> Cost {
         w = (w / 2).max(1);
         h = (h / 2).max(1);
     }
-    Cost {
-        gpu: Bytes(gpu),
-        staging: Bytes(staging),
+    Cost::new(Bytes(gpu), Bytes(staging))
+}
+
+/// The 4×4 blocks a `w × h` texture with its full mip chain holds: what
+/// encoding it on the GPU writes (5,463 for 256²).
+pub fn chain_blocks(w: u32, h: u32) -> u64 {
+    let (mut w, mut h) = (u64::from(w.max(1)), u64::from(h.max(1)));
+    let mut blocks = 0u64;
+    loop {
+        blocks = blocks.saturating_add(w.div_ceil(4).saturating_mul(h.div_ceil(4)));
+        if w == 1 && h == 1 {
+            break;
+        }
+        w = (w / 2).max(1);
+        h = (h / 2).max(1);
     }
+    blocks
 }
 
 /// Whether `actual` is within 5 % of `estimate`.

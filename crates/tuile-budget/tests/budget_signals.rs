@@ -736,9 +736,77 @@ fn frame(
         },
         uploaded,
         deferred,
+        deferred_encode: 0,
+        encoded_tiles: 0,
+        encode_blocks: 0,
+        encode_gpu: Micros::ZERO,
         upload_wall: Micros(300),
         eyes,
     });
+}
+
+/// **Byte and encode deferrals are counted apart**: `upload_deferred_total`
+/// by lane, `deadline_deferrals_total` the byte lane's alone, and the
+/// encodes' tiles, blocks and GPU time summed — the time only of frames
+/// that encoded. A page's frames carried over to a worker's signals keep
+/// them.
+#[test]
+fn byte_and_encode_deferrals_are_counted_apart() {
+    let mut meter = BudgetMeter::new(&Rig::interactive_config());
+    let a = ResourceId::drape(t(3, 0, 0), LayerId(0), 3);
+    let deadline = FrameDeadline {
+        bytes: Bytes(1 << 20),
+        time: Micros(4_000),
+    };
+    let record = |deferred, deferred_encode, encoded_tiles, encode_blocks, gpu| FrameRecord {
+        frame: 0,
+        generation: 0,
+        deadline,
+        uploaded: &[],
+        deferred,
+        deferred_encode,
+        encoded_tiles,
+        encode_blocks,
+        encode_gpu: Micros(gpu),
+        upload_wall: Micros(300),
+        eyes: &[],
+    };
+    meter.frame(&FrameRecord {
+        uploaded: &[(a, Bytes(349_524))],
+        ..record(2, 3, 1, 5_463, 9_500)
+    });
+    meter.frame(&record(1, 0, 0, 0, 0));
+    let s = meter.signals();
+    assert_eq!(s.upload_deferred_total, [3, 3], "{RED}");
+    assert_eq!(s.deadline_deferrals_total, 3, "the byte lane alone");
+    assert_eq!((s.encoded_tiles_total, s.encode_blocks_total), (1, 5_463));
+    assert_eq!(
+        (s.frame_encode_micros.count, s.frame_encode_micros.sum),
+        (1, 9_500),
+        "a frame that encoded nothing is not an encode's time"
+    );
+    let series = s.series();
+    let find = |name: &str, label: Option<(&str, &str)>| {
+        series
+            .iter()
+            .find(|(n, l, _)| *n == name && label.is_none_or(|x| l.contains(&x)))
+            .map(|(_, _, v)| *v)
+    };
+    assert_eq!(
+        find("upload_deferred_total", Some(("lane", "bytes"))),
+        Some(3.0)
+    );
+    assert_eq!(
+        find("upload_deferred_total", Some(("lane", "encode"))),
+        Some(3.0)
+    );
+    assert_eq!(find("encode_blocks_total", None), Some(5_463.0));
+    // A worker's budget, the page's frames over it.
+    let mut worker = tuile_budget::BudgetSignals::default();
+    worker.take_frames_from(&s);
+    assert_eq!(worker.upload_deferred_total, [3, 3]);
+    assert_eq!(worker.uploads_total[Class::Drape], 1);
+    assert_eq!(worker.encode_blocks_total, 5_463);
 }
 
 /// I18: `deadline_deferrals_total` counts what a frame deferred, and
@@ -918,6 +986,7 @@ fn labels_stay_within_their_closed_sets() {
             "level" => labels::LEVEL.to_vec(),
             "eye" => labels::EYE.to_vec(),
             "invariant" => labels::INVARIANT.to_vec(),
+            "lane" => labels::LANE.to_vec(),
             _ => Vec::new(),
         };
         set.contains(&value)

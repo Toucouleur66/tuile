@@ -171,6 +171,32 @@ pub(crate) fn tile_blocks(format: BlockFormat, width: u32, height: u32) -> u64 {
     texcomp::tile_cost(to_texcomp(format), width, height).blocks
 }
 
+/// The GPU bytes the encoder's scratch holds for `tiles` 256² tiles at once,
+/// mip chains included, under `plan`: what a host reserves off the drapes'
+/// limits once at setup (`BudgetConfig::reserved`, CB4) — the RGBA8 the
+/// kernels read, the blocks they write with rows aligned for the copy, and
+/// a job per level. Nothing for a plan that does not encode on the GPU.
+pub fn encode_reservation(plan: ImageryPlan, tiles: u32) -> tuile_core::budget::Bytes {
+    if plan.encode != ImageryEncode::Gpu {
+        return tuile_core::budget::Bytes::ZERO;
+    }
+    let (mut w, mut h) = (256u64, 256u64);
+    let (mut src, mut dst, mut levels) = (0u64, 0u64, 0u64);
+    loop {
+        src += w * h * 4;
+        dst += (w.div_ceil(4) * 16).div_ceil(256) * 256 * h.div_ceil(4);
+        levels += 1;
+        if w == 1 && h == 1 {
+            break;
+        }
+        w = (w / 2).max(1);
+        h = (h / 2).max(1);
+    }
+    // A job's uniform is aligned to the device's offset alignment: 256 at
+    // most.
+    tuile_core::budget::Bytes(u64::from(tiles.max(1)) * (src + dst + levels * 256))
+}
+
 /// GPU nanoseconds per block assumed before the device has measured any:
 /// texcomp's published cost on Apple M2 (Metal), wall clock per 256² tile
 /// with its mips (5463 blocks) — BC7 5.1 ms, ASTC 4×4 1.9 ms. Wall clock
@@ -222,6 +248,8 @@ impl Default for EncodePace {
 pub struct EncodeStats {
     pub encoded: u64,
     pub fell_back: u64,
+    /// The 4×4 blocks the encoded tiles wrote, mip chains included.
+    pub blocks: u64,
     /// Nanoseconds per block from timestamps, `None` until measured.
     pub measured_ns_per_block: Option<f64>,
 }
@@ -305,6 +333,11 @@ impl Compressor {
         self.stats
     }
 
+    /// The GPU bytes its scratch holds now.
+    pub(crate) fn scratch_bytes(&self) -> u64 {
+        self.scratch.bytes()
+    }
+
     /// GPU nanoseconds per block: measured, or assumed until it is.
     pub(crate) fn ns_per_block(&self) -> f64 {
         self.stats
@@ -374,6 +407,7 @@ impl Compressor {
                 Err(_) => self.stats.fell_back += 1,
             }
         }
+        self.stats.blocks += blocks;
         if any {
             // The pass, and the encoder's table of jobs.
             OpCounters::add(&ops.encode_passes, 1);

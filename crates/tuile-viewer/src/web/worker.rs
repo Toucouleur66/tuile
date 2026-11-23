@@ -146,12 +146,14 @@ async fn start(
     scene
         .add_at(0, globe.tree, loader, tuile_core::SourceOptions::default())
         .map_err(|e| format!("the globe could not join the scene: {e}"))?;
-    let (stream, server) = tuile_core::runtime::in_process_composite(
-        scene.clone(),
-        profile.traversal(),
-        profile.budget(),
-    )
-    .map_err(|e| format!("the budget: {e}"))?;
+    // The page's GPU encoder's scratch, off the drapes' limits (CB4):
+    // nothing when the page does not encode on its GPU.
+    let mut budget = profile.budget();
+    budget.reserved[tuile_core::budget::Class::Drape] =
+        tuile_wgpu::encode_reservation(imagery.plan(), 1);
+    let (stream, server) =
+        tuile_core::runtime::in_process_composite(scene.clone(), profile.traversal(), budget)
+            .map_err(|e| format!("the budget: {e}"))?;
     tracing::info!(
         gpu_mib = profile.gpu_bytes >> 20,
         "the session's budget, from the device's memory"

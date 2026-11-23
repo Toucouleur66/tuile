@@ -76,6 +76,37 @@ pub struct PumpTotals {
     pub wait_frames_max: u64,
     /// Wall time spent in the frames' uploads, microseconds.
     pub upload_micros: u64,
+    /// Plan items deferred to a later frame: by the byte lane (the frame's
+    /// deadline), and by the encode lane (the encodes' share).
+    pub deferred: u64,
+    pub deferred_encode: u64,
+    /// Imagery tiles encoded on the GPU, and the 4×4 blocks they wrote.
+    pub encoded_tiles: u64,
+    pub encode_blocks: u64,
+}
+
+/// What one frame's uploads did, by lane: what the pump last told its
+/// meter ([`FrameRecord`]), kept for a host that records it beside the
+/// frame (an MCAP channel) or shows it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameUploads {
+    /// The frame's upload deadline, bytes.
+    pub deadline_bytes: u64,
+    /// Resources uploaded, and the bytes their uploads moved.
+    pub uploaded: u32,
+    pub uploaded_bytes: u64,
+    /// Plan items the byte lane deferred.
+    pub deferred: u32,
+    /// Plan items the encode lane deferred: whole swap groups.
+    pub deferred_encode: u32,
+    /// Imagery tiles encoded on the GPU, and the 4×4 blocks they wrote.
+    pub encoded_tiles: u32,
+    pub encode_blocks: u64,
+    /// The encodes' GPU time, microseconds: the blocks times the measured
+    /// cost of a block (assumed until the device has measured one).
+    pub encode_gpu_micros: u64,
+    /// The render thread's wall time in the frame's uploads.
+    pub upload_wall_micros: u64,
 }
 
 impl std::ops::Sub for PumpTotals {
@@ -94,6 +125,10 @@ impl std::ops::Sub for PumpTotals {
             wait_frames: self.wait_frames - earlier.wait_frames,
             wait_frames_max: self.wait_frames_max,
             upload_micros: self.upload_micros - earlier.upload_micros,
+            deferred: self.deferred - earlier.deferred,
+            deferred_encode: self.deferred_encode - earlier.deferred_encode,
+            encoded_tiles: self.encoded_tiles - earlier.encoded_tiles,
+            encode_blocks: self.encode_blocks - earlier.encode_blocks,
         }
     }
 }
@@ -189,6 +224,19 @@ pub struct ContentPump {
     drawn_tiles: std::collections::HashSet<TileId>,
     /// See [`Self::totals`].
     totals: PumpTotals,
+    /// See [`Self::last_uploads`].
+    last_uploads: FrameUploads,
+    /// The acknowledgements of the deliveries whose textures this frame
+    /// encodes on the GPU: sent once the GPU has finished the frame's
+    /// work, not before — until then the encoder's input is held beside
+    /// the blocks, and the budget charges both (CB4).
+    encode_acks: Vec<ClientMessage>,
+    /// Those of earlier frames, submitted: each batch is sent when its
+    /// flag says the GPU finished it.
+    acks_in_flight: Vec<(
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        Vec<ClientMessage>,
+    )>,
     /// Deliveries dropped from the queue unuploaded — cancelled, evicted or
     /// replaced — whose chains the next upload step lets go of.
     dropped: Vec<ResourceContent>,
@@ -241,6 +289,9 @@ impl ContentPump {
             contents: None,
             drawn_tiles: std::collections::HashSet::new(),
             totals: PumpTotals::default(),
+            last_uploads: FrameUploads::default(),
+            encode_acks: Vec::new(),
+            acks_in_flight: Vec::new(),
             dropped: Vec::new(),
         }
     }
@@ -255,6 +306,11 @@ impl ContentPump {
     /// What this pump has done since it was made: see [`PumpTotals`].
     pub fn totals(&self) -> PumpTotals {
         self.totals
+    }
+
+    /// What the last frame's uploads did, by lane: see [`FrameUploads`].
+    pub fn last_uploads(&self) -> FrameUploads {
+        self.last_uploads
     }
 
     /// Keeps each resident mesh's decoded content beside its GPU copy, for a
@@ -525,6 +581,8 @@ impl ContentPump {
         // a host that pumps several times a frame does not hold every
         // copy until it draws.
         gpu.flush_uploads();
+        self.await_encode_acks(gpu);
+        self.send_finished_acks(stream, gpu);
         let uploaded = self.upload(stream, gpu, deadline);
         // What is drawn may have changed — a draw set, an upload: the tiles
         // are stitched for this frame before anyone draws it.
@@ -593,16 +651,18 @@ impl ContentPump {
         let taken: Vec<ResourceId> = deadline
             .take(&order, &self.plan.groups, Bytes::ZERO, estimate)
             .to_vec();
-        let mut deferred = (order.len() - taken.len()) as u32;
+        // Counted apart: what the byte lane leaves for a later frame, and
+        // what the encode lane does.
+        let deferred = (order.len() - taken.len()) as u32;
         let began = web_time::Instant::now();
+        let encodes_before = gpu.imagery_encode_stats();
         // The GPU encodes have a share of their own: the blocks this frame
         // may still write, when the plan encodes on the GPU at all. Decided
         // for the whole frame first, with one look at the encoder and one
         // at the imagery the GPU holds — not two locks per delivery — and
         // as uploading one by one would: imagery an earlier upload of the
         // frame brings is not encoded again.
-        let (going, paced) = self.pace_encodes(gpu, taken);
-        deferred += paced;
+        let (going, deferred_encode) = self.pace_encodes(gpu, taken);
         // The chains of what goes this frame, built across threads; those
         // of what waits behind it, in the background for its frame. Paced
         // first: a delivery the encodes' share defers has its chain built
@@ -676,6 +736,35 @@ impl ContentPump {
         }
         let m = tuile_core::metrics::metrics();
         m.pending_uploads.set(self.queue.len() as u64);
+        // What the frame encoded, read off the encoder's own counts.
+        let (encoded_tiles, encode_blocks, encode_gpu_micros) =
+            match (encodes_before, gpu.imagery_encode_stats()) {
+                (Some(a), Some(b)) => {
+                    let blocks = b.blocks - a.blocks;
+                    let ns = gpu.imagery_ns_per_block().unwrap_or(0.0);
+                    (
+                        (b.encoded - a.encoded) as u32,
+                        blocks,
+                        (blocks as f64 * ns / 1_000.0) as u64,
+                    )
+                }
+                _ => (0, 0, 0),
+            };
+        self.last_uploads = FrameUploads {
+            deadline_bytes: deadline.bytes.0,
+            uploaded: uploaded.len() as u32,
+            uploaded_bytes: moved,
+            deferred,
+            deferred_encode,
+            encoded_tiles,
+            encode_blocks,
+            encode_gpu_micros,
+            upload_wall_micros: wall.as_micros() as u64,
+        };
+        self.totals.deferred += u64::from(deferred);
+        self.totals.deferred_encode += u64::from(deferred_encode);
+        self.totals.encoded_tiles += u64::from(encoded_tiles);
+        self.totals.encode_blocks += encode_blocks;
         if let Some(meter) = &self.meter {
             if let Ok(mut meter) = meter.lock() {
                 use tuile_core::budget::BudgetObserver;
@@ -685,6 +774,10 @@ impl ContentPump {
                     deadline,
                     uploaded: &uploaded,
                     deferred,
+                    deferred_encode,
+                    encoded_tiles,
+                    encode_blocks,
+                    encode_gpu: tuile_core::budget::Micros(encode_gpu_micros),
                     upload_wall: tuile_core::budget::Micros(wall.as_micros() as u64),
                     eyes: &[EyeCoverage {
                         lost: self.lost,
@@ -700,6 +793,10 @@ impl ContentPump {
     /// and how many wait for a frame with room. The first encode of a frame
     /// always goes, however large: nothing waits for ever. The rest wait
     /// for a frame with room, in the plan's order, as a deadline's do.
+    ///
+    /// A swap group goes or waits **whole**, as the deadline takes it
+    /// ([`tuile_core::budget::swap_unit`]): a mesh let through while the
+    /// drape of its group waits would be drawn bare.
     fn pace_encodes(&mut self, gpu: &GpuContext, taken: Vec<ResourceId>) -> (Vec<ResourceId>, u32) {
         let Some(compressor) = gpu.compressor.as_ref() else {
             return (taken, 0);
@@ -720,40 +817,52 @@ impl ContentPump {
         let mut going = Vec::with_capacity(taken.len());
         let mut deferred = 0;
         let mut encoded_any = false;
-        for r in taken {
-            let Some(q) = self.queue.get_mut(&r) else {
-                going.push(r);
-                continue;
-            };
-            let owned = *q
-                .owned_blocks
-                .get_or_insert_with(|| owned_blocks(format, &q.content));
-            let layers = imagery_of(&q.content);
-            let imagery: u64 = layers
-                .iter()
-                .filter(|l| {
-                    encodes(format, &l.texture)
+        let mut n = 0;
+        while n < taken.len() {
+            let unit = &taken[n..n + tuile_core::budget::swap_unit(&taken, n, &self.plan.groups)];
+            n += unit.len();
+            // The blocks the unit's encodes would write, imagery an earlier
+            // member brings counted once.
+            let mut blocks = 0;
+            let mut unit_brought = Vec::new();
+            for r in unit {
+                let Some(q) = self.queue.get_mut(r) else {
+                    continue;
+                };
+                let owned = *q
+                    .owned_blocks
+                    .get_or_insert_with(|| owned_blocks(format, &q.content));
+                let layers = imagery_of(&q.content);
+                blocks += owned;
+                for l in &layers {
+                    let key = (l.source, l.coord);
+                    if encodes(format, &l.texture)
                         && !pool.holds(l.source, l.coord)
-                        && !brought.contains(&(l.source, l.coord))
-                })
-                .map(|l| crate::compress::tile_blocks(format, l.texture.width, l.texture.height))
-                .sum();
-            let blocks = owned + imagery;
+                        && !brought.contains(&key)
+                        && !unit_brought.contains(&key)
+                    {
+                        blocks +=
+                            crate::compress::tile_blocks(format, l.texture.width, l.texture.height);
+                        unit_brought.push(key);
+                    }
+                }
+                unit_brought.extend(
+                    layers
+                        .iter()
+                        .filter(|l| l.is_visible())
+                        .map(|l| (l.source, l.coord)),
+                );
+            }
             if blocks > 0 {
                 if encoded_any && blocks > left {
-                    deferred += 1;
+                    deferred += unit.len() as u32;
                     continue;
                 }
                 left = left.saturating_sub(blocks);
                 encoded_any = true;
             }
-            brought.extend(
-                layers
-                    .iter()
-                    .filter(|l| l.is_visible())
-                    .map(|l| (l.source, l.coord)),
-            );
-            going.push(r);
+            brought.extend(unit_brought);
+            going.extend_from_slice(unit);
         }
         (going, deferred)
     }
@@ -855,12 +964,18 @@ impl ContentPump {
                 let _ = bytes;
             }
         }
-        // Best effort: a closed stream just means the session is over.
-        let _ = stream.send(ClientMessage::Ack {
+        let ack = ClientMessage::Ack {
             resource: r,
             gen: q.gen,
             bytes,
-        });
+        };
+        if encodes_on_gpu(gpu, &q.content) {
+            // Held at its peak until the GPU has run the encode: told then.
+            self.encode_acks.push(ack);
+        } else {
+            // Best effort: a closed stream just means the session is over.
+            let _ = stream.send(ack);
+        }
         let waited = arrived.elapsed().as_micros() as u64;
         let frames = self.frame.saturating_sub(arrived_frame);
         let t = &mut self.totals;
@@ -1266,7 +1381,66 @@ impl ContentPump {
         // lands before the host's draw: one submit, or none when nothing
         // moved.
         gpu.flush_uploads();
+        // The frame's GPU-encoded acknowledgements wait on this submit:
+        // registered at the next pump's start, after it.
         (drawn, counts)
+    }
+
+    /// The acknowledgements of this frame's GPU encodes, submitted: they
+    /// wait for the GPU to finish the work submitted so far — one callback
+    /// for the frame's batch, never a blocking wait.
+    fn await_encode_acks(&mut self, gpu: &GpuContext) {
+        if self.encode_acks.is_empty() {
+            return;
+        }
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&done);
+        gpu.queue.on_submitted_work_done(move || {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        });
+        self.acks_in_flight
+            .push((done, std::mem::take(&mut self.encode_acks)));
+    }
+
+    /// Sends the acknowledgements whose encodes the GPU has finished, in
+    /// the order they were made. A non-blocking poll lets a finished
+    /// frame's callback run.
+    fn send_finished_acks<S: GeometryStream>(&mut self, stream: &mut S, gpu: &GpuContext) {
+        if self.acks_in_flight.is_empty() {
+            return;
+        }
+        let _ = gpu.device.poll(wgpu::PollType::Poll);
+        while self
+            .acks_in_flight
+            .first()
+            .is_some_and(|(done, _)| done.load(std::sync::atomic::Ordering::Acquire))
+        {
+            let (_, acks) = self.acks_in_flight.remove(0);
+            for ack in acks {
+                // Best effort: a closed stream just means the session is over.
+                let _ = stream.send(ack);
+            }
+        }
+    }
+
+    /// Between frames: submits what is recorded and sends every
+    /// acknowledgement whose GPU encode has finished — what [`Self::pump`]
+    /// does first each frame. For a host that waits on the GPU itself, or
+    /// a test.
+    pub fn acknowledge<S: GeometryStream>(&mut self, stream: &mut S, gpu: &GpuContext) {
+        gpu.flush_uploads();
+        self.await_encode_acks(gpu);
+        self.send_finished_acks(stream, gpu);
+    }
+
+    /// Acknowledgements waiting for the GPU to finish their encodes.
+    pub fn acks_waiting_for_the_gpu(&self) -> usize {
+        self.encode_acks.len()
+            + self
+                .acks_in_flight
+                .iter()
+                .map(|(_, a)| a.len())
+                .sum::<usize>()
     }
 
     /// The draw set the pump is drawing: the last step's.
@@ -1351,6 +1525,26 @@ fn encodes(
     t: &tuile_core::content::DecodedTexture,
 ) -> bool {
     t.resident_format().block() == Some(format) && t.rgba8().is_some()
+}
+
+/// Whether `content` names a texture this context encodes on the GPU: RGBA8
+/// headed for the encoder's block format. Never without an encoder (`Off`).
+fn encodes_on_gpu(gpu: &GpuContext, content: &ResourceContent) -> bool {
+    let Some(format) = gpu
+        .compressor
+        .as_ref()
+        .and_then(|c| c.lock().ok().map(|c| c.format()))
+    else {
+        return false;
+    };
+    let owned = match content {
+        ResourceContent::Mesh(m) => m.textures.iter().any(|t| encodes(format, t)),
+        ResourceContent::Drape(_) => false,
+    };
+    owned
+        || imagery_of(content)
+            .iter()
+            .any(|l| encodes(format, &l.texture))
 }
 
 /// The blocks encoding the textures `content` owns would write — a mesh's

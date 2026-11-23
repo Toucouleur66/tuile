@@ -126,8 +126,18 @@ pub struct FrameRecord<'a> {
     pub deadline: FrameDeadline,
     /// What it uploaded, with the actual bytes.
     pub uploaded: &'a [(ResourceId, Bytes)],
-    /// Plan items it deferred.
+    /// Plan items its byte lane deferred: what did not fit its deadline.
     pub deferred: u32,
+    /// Plan items its encode lane deferred: what did not fit the encodes'
+    /// share, whole swap groups. Counted apart from [`Self::deferred`].
+    pub deferred_encode: u32,
+    /// Imagery tiles it encoded on the GPU, and the 4×4 blocks they wrote.
+    pub encoded_tiles: u32,
+    pub encode_blocks: u64,
+    /// The encodes' GPU time: measured by the executor (timestamps, or the
+    /// blocks times its measured cost of a block). Zero when nothing is
+    /// encoded.
+    pub encode_gpu: Micros,
     /// The wall time its uploads took.
     pub upload_wall: Micros,
     /// Per eye, at most four.
@@ -351,6 +361,11 @@ pub struct BudgetSignals {
     pub overflow_bytes: PerClass<u64>,
     /// `hard_limit_bytes{class}`, effective.
     pub hard_limit_bytes: PerClass<u64>,
+    /// `reserved_bytes{class}`: held by the executor outside any resource
+    /// (the encoder's scratch), off the class's limits.
+    pub reserved_bytes: PerClass<u64>,
+    /// `decoded_reserved_bytes`: off the decoded tier's target.
+    pub decoded_reserved_bytes: u64,
     /// `over_target_seconds_total{class}`, in microseconds.
     pub over_target_micros_total: PerClass<u64>,
     /// `lost_tiles`: wanted tiles with no cover, once the floor is in.
@@ -452,12 +467,25 @@ pub struct BudgetSignals {
     pub frame_upload_bytes: Histogram,
     /// `frame_deadline_bytes`.
     pub frame_deadline_bytes: u64,
-    /// `deadline_deferrals_total`.
+    /// `deadline_deferrals_total`: the byte lane's deferrals.
     pub deadline_deferrals_total: u64,
+    /// `upload_deferred_total{lane}`: plan items a frame deferred, by lane
+    /// (`bytes`, `encode`).
+    pub upload_deferred_total: [u64; 2],
+    /// `encoded_tiles_total`: imagery tiles the executor encoded.
+    pub encoded_tiles_total: u64,
+    /// `encode_blocks_total`: the 4×4 blocks those encodes wrote.
+    pub encode_blocks_total: u64,
+    /// `frame_encode_seconds`: a frame's encodes' GPU time, µs, for the
+    /// frames that encoded something.
+    pub frame_encode_micros: Histogram,
     /// `frame_upload_seconds`, wall clock, µs.
     pub frame_upload_micros: Histogram,
     /// `estimate_drift_exceeded_total{class}`.
     pub estimate_drift_exceeded_total: PerClass<u64>,
+    /// `encode_fallbacks_total{class}`: acknowledgements of an encode that
+    /// fell back to the form it crossed in.
+    pub encode_fallbacks_total: PerClass<u64>,
     /// `swaps_total{kind}`: refine, coarsen, mesh_drape, layer.
     pub swaps_total: [u64; 4],
     /// `swap_gaps_total`: ground covered at the last step, uncovered now.
@@ -528,6 +556,8 @@ pub mod labels {
     pub const DEFICIT: [&str; 2] = ["mesh", "imagery"];
     /// `source` of the specification in force.
     pub const SPEC_SOURCE: [&str; 2] = ["context", "override"];
+    /// `lane` of a deferral.
+    pub const LANE: [&str; 2] = ["bytes", "encode"];
     /// `kind` of a swap.
     pub const SWAP: [&str; 4] = ["refine", "coarsen", "mesh_drape", "layer"];
     /// `eye`.
@@ -573,6 +603,27 @@ pub mod labels {
 pub type Series = (&'static str, Vec<(&'static str, &'static str)>, f64);
 
 impl BudgetSignals {
+    /// The render frames' signals of `frames` — a meter the executor fed
+    /// ([`BudgetObserver::frame`]) — over this one's: for a host whose
+    /// budget runs in one place and whose frames in another (a web page's
+    /// pump, a worker's budget), so that the signals it publishes say what
+    /// both did. The steps' signals stay this one's.
+    pub fn take_frames_from(&mut self, frames: &BudgetSignals) {
+        self.uploads_total = frames.uploads_total;
+        self.upload_bytes_total = frames.upload_bytes_total;
+        self.frame_upload_bytes = frames.frame_upload_bytes.clone();
+        self.frame_deadline_bytes = frames.frame_deadline_bytes;
+        self.deadline_deferrals_total = frames.deadline_deferrals_total;
+        self.upload_deferred_total = frames.upload_deferred_total;
+        self.encoded_tiles_total = frames.encoded_tiles_total;
+        self.encode_blocks_total = frames.encode_blocks_total;
+        self.frame_encode_micros = frames.frame_encode_micros.clone();
+        self.frame_upload_micros = frames.frame_upload_micros.clone();
+        self.eye_lost_tiles = frames.eye_lost_tiles;
+        self.eye_bare_items = frames.eye_bare_items;
+        self.swaps_total[2] = frames.swaps_total[2];
+    }
+
     /// Every series, as a sink exposes it: names without the prefix, labels
     /// from the closed sets of [`labels`], values in the spec's units
     /// (bytes, seconds, counts). Histograms expose their count and sum.
@@ -910,6 +961,28 @@ impl BudgetSignals {
         for (n, v) in more {
             out.push((n, vec![], v));
         }
+        for (i, l) in labels::LANE.iter().enumerate() {
+            out.push((
+                "upload_deferred_total",
+                vec![("lane", l)],
+                self.upload_deferred_total[i] as f64,
+            ));
+        }
+        let encodes: [(&'static str, f64); 4] = [
+            ("encoded_tiles_total", self.encoded_tiles_total as f64),
+            ("encode_blocks_total", self.encode_blocks_total as f64),
+            (
+                "frame_encode_seconds_count",
+                self.frame_encode_micros.count as f64,
+            ),
+            (
+                "frame_encode_seconds_sum",
+                secs(self.frame_encode_micros.sum),
+            ),
+        ];
+        for (n, v) in encodes {
+            out.push((n, vec![], v));
+        }
         per(&mut out, "uploads_total", &self.uploads_total);
         per(&mut out, "upload_bytes_total", &self.upload_bytes_total);
         per(
@@ -917,6 +990,17 @@ impl BudgetSignals {
             "estimate_drift_exceeded_total",
             &self.estimate_drift_exceeded_total,
         );
+        per(
+            &mut out,
+            "encode_fallbacks_total",
+            &self.encode_fallbacks_total,
+        );
+        per(&mut out, "reserved_bytes", &self.reserved_bytes);
+        out.push((
+            "decoded_reserved_bytes",
+            vec![],
+            self.decoded_reserved_bytes as f64,
+        ));
         for (i, k) in labels::SWAP.iter().enumerate() {
             out.push(("swaps_total", vec![("kind", k)], self.swaps_total[i] as f64));
         }
@@ -1022,6 +1106,8 @@ impl BudgetMeter {
         };
         m.s.spec = crate::spec::Specification::for_policy(cfg.policy).kind;
         m.s.floor_level = cfg.pinned_level;
+        m.s.reserved_bytes = PerClass::from_fn(|c| cfg.reserved[c].0);
+        m.s.decoded_reserved_bytes = cfg.decoded_reserved.0;
         m
     }
 
@@ -1133,6 +1219,7 @@ impl BudgetObserver for BudgetMeter {
                 }
             }
             s.estimate_drift_exceeded_total[c] += u64::from(st.drift_exceeded[c]);
+            s.encode_fallbacks_total[c] += u64::from(st.fallbacks[c]);
         }
         s.levels = st.levels;
         let y = &st.layers;
@@ -1417,6 +1504,13 @@ impl BudgetObserver for BudgetMeter {
         s.frame_upload_bytes.record(bytes);
         s.frame_deadline_bytes = f.deadline.bytes.0;
         s.deadline_deferrals_total += u64::from(f.deferred);
+        s.upload_deferred_total[0] += u64::from(f.deferred);
+        s.upload_deferred_total[1] += u64::from(f.deferred_encode);
+        s.encoded_tiles_total += u64::from(f.encoded_tiles);
+        s.encode_blocks_total += f.encode_blocks;
+        if f.encode_blocks > 0 {
+            s.frame_encode_micros.record(f.encode_gpu.0);
+        }
         s.frame_upload_micros.record(f.upload_wall.0);
         s.eye_lost_tiles = [0; 4];
         s.eye_bare_items = [0; 4];

@@ -310,9 +310,7 @@ impl DecodedTileContent {
                 .sum::<u64>();
         let mut cost = mesh_cost(vertices, VERTEX_STRIDE, indices, cpu_copy);
         for t in &self.textures {
-            let c = t.cost();
-            cost.gpu = cost.gpu.plus(c.gpu);
-            cost.staging = cost.staging.plus(c.staging);
+            cost = cost.plus(t.cost());
         }
         cost
     }
@@ -399,16 +397,20 @@ impl DrapeContent {
                 let ppm = (share * 1_000_000.0).round() as u64;
                 // Held: the share. Moved: the whole tile, for an upload is a
                 // texture's, whoever else names it — what an executor's
-                // frame deadline and the delivery credit measure.
+                // frame deadline and the delivery credit measure. What
+                // crosses and what is held while it encodes are bytes on
+                // the GPU like `gpu`, shared alike; the blocks an encode
+                // writes are work, the whole tile's, like the bytes moved.
+                let share = |b: Bytes| b.scaled(ppm, 1_000_000);
                 Cost {
-                    gpu: Bytes(whole.gpu.0).scaled(ppm, 1_000_000),
+                    gpu: share(whole.gpu),
                     staging: whole.staging,
+                    transfer: share(whole.transfer),
+                    transient: share(whole.transient),
+                    encode_blocks: whole.encode_blocks,
                 }
             })
-            .fold(Cost::default(), |a, c| Cost {
-                gpu: a.gpu.plus(c.gpu),
-                staging: a.staging.plus(c.staging),
-            })
+            .fold(Cost::default(), Cost::plus)
     }
 }
 
@@ -512,10 +514,17 @@ impl DecodedTexture {
     /// not hold it as planned — an encode that failed, a device without the
     /// format — charges this.
     pub fn cost_as(&self, format: crate::texels::ImageryFormat) -> crate::budget::cost::Cost {
-        let moved = self.cost().staging;
+        let planned = self.cost();
+        let gpu =
+            crate::budget::cost::drape_cost(self.width, self.height, format.cost_format()).gpu;
+        if format == self.resident_format() {
+            return planned;
+        }
+        // Held as it crossed (an encode that fell back): no encode, no
+        // transient; the same bytes moved.
         crate::budget::cost::Cost {
-            gpu: crate::budget::cost::drape_cost(self.width, self.height, format.cost_format()).gpu,
-            staging: moved,
+            transfer: planned.transfer.max(gpu),
+            ..crate::budget::cost::Cost::new(gpu, planned.staging)
         }
     }
 

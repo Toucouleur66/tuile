@@ -93,6 +93,8 @@ pub(crate) struct Started {
     /// The tilesets asked for and not yet up, by asset: where each one's
     /// answer goes.
     tilesets: Tilesets,
+    /// The page's frames, measured: see [`Started::meter`].
+    frames: tuile_core::runtime::SharedMeter,
 }
 
 /// The tilesets asked of the worker and not yet up.
@@ -136,11 +138,12 @@ impl Started {
     /// Nor anything to open again.
     pub(crate) fn resume_store(&self) {}
 
-    /// The session's meter lives in the worker, beside the budget it
-    /// measures; the page reads the signals it publishes instead (see
-    /// [`ToPage::Signals`]).
+    /// The page's own meter, for its frames: the session's budget is in
+    /// the worker, its frames — the pump, its uploads and encodes — here.
+    /// The page publishes the worker's signals ([`ToPage::Signals`]) with
+    /// these frames' over them.
     pub(crate) fn meter(&self) -> Option<tuile_core::runtime::SharedMeter> {
-        None
+        Some(Arc::clone(&self.frames))
     }
 }
 
@@ -288,7 +291,13 @@ pub(crate) fn start(plan: &Plan) -> Launch {
     // The worker's link, once it exists, for a tileset's stream to tell the
     // worker when it is dropped.
     let weak_link: Rc<RefCell<std::rc::Weak<Link>>> = Rc::default();
+    // The page's frames, measured where they run.
+    let frames: tuile_core::runtime::SharedMeter =
+        Arc::new(std::sync::Mutex::new(tuile_core::budget::BudgetMeter::new(
+            &tuile_core::budget::BudgetConfig::interactive(tuile_core::budget::Bytes::ZERO),
+        )));
     let heard = {
+        let frames = Arc::clone(&frames);
         let (waiting, answers) = (Rc::clone(&waiting), Rc::clone(&answers));
         let tilesets: Tilesets = Rc::clone(&tilesets);
         let link_for_tilesets: Rc<RefCell<std::rc::Weak<Link>>> = Rc::clone(&weak_link);
@@ -328,7 +337,7 @@ pub(crate) fn start(plan: &Plan) -> Launch {
                 if let Some(w) = waiting.borrow_mut().take() {
                     let _ = w
                         .answer
-                        .send(Ok(started(w.stream, w.link, &answers, &tilesets)));
+                        .send(Ok(started(w.stream, w.link, &answers, &tilesets, &frames)));
                 }
             }
             Ok(ToPage::Failed { reason }) => {
@@ -341,8 +350,14 @@ pub(crate) fn start(plan: &Plan) -> Launch {
             }
             // The worker's budget, published here as a desktop's session
             // publishes its own: the overlay reads it the same way.
+            // The page's frames over them: the uploads and encodes are
+            // the page's.
             Ok(ToPage::Signals { glance }) => {
-                tuile_core::metrics::publish_budget(glance.signals());
+                let mut signals = glance.signals();
+                if let Ok(frames) = frames.lock() {
+                    signals.take_frames_from(&frames.signals());
+                }
+                tuile_core::metrics::publish_budget(signals);
             }
             Err(e) => tracing::error!("the worker said something unreadable: {e}"),
         }
@@ -422,6 +437,7 @@ fn started(
     link: Rc<Link>,
     answers: &Rc<RefCell<VecDeque<Answer>>>,
     tilesets: &Tilesets,
+    frames: &tuile_core::runtime::SharedMeter,
 ) -> Started {
     let heights = Arc::new(TerrainHeights::new(GeographicTilingScheme::default()));
     Started {
@@ -444,6 +460,7 @@ fn started(
         },
         link,
         tilesets: Rc::clone(tilesets),
+        frames: Arc::clone(frames),
     }
 }
 

@@ -10,20 +10,33 @@ Kept from the plan approved with Laurent on 2026-10-19/20.
 | A1 correctness defects | done | #100, #109 |
 | A3 audit fixes | done — decide allocations 6,492 → 13 per still step, digests bit-identical | #108 |
 | A5 bake | three-stage pipeline done (#105, v0.12.0); the shared tokio runtime and HTTP pool per process not started | #105 |
-| A6 loading and decoding | GPU-compressed imagery shipped as the client's choice, off by default: the format seam (#114), stored KTX2/UASTC transcode-only (#121), GPU encode to BC7/ASTC in tuile-wgpu (#122), the web paths — GPU encode on WebGPU, CPU encode in the decode workers on WebGL2 (#127); v0.13.0 and v0.14.0. zune-png dropped after the decode bench (#110, open). io_uring not started | #114, #121, #122, #127 |
+| A6 loading and decoding | GPU-compressed imagery shipped as the client's choice, off by default: the format seam (#114), stored KTX2/UASTC transcode-only (#121), GPU encode to BC7/ASTC in tuile-wgpu (#122), the web paths — GPU encode on WebGPU, CPU encode in the decode workers on WebGL2 (#127); v0.13.0 and v0.14.0. zune-png measured slower and dropped (#110, closed). io_uring dropped | #114, #121, #122, #127 |
 | A2 ledger hardening | not started | |
 | A4 incremental decide, dense structures | not started | |
 | B, C | not started | |
 
-**Next: the compression budget.** With compression on, the budget still under-counts it: `plan` caps on resident
-bytes (87,408 per BC7 tile) while 349,524 RGBA8 bytes cross; the encode's transient memory and the encoder scratch
-are never charged; the encode pacing (`EncodePace`, 4 ms a frame) sits outside `FrameDeadline` and assumes 5 ms
-per BC7 tile while it costs 9–10 ms, which explains the settle regression from 5.0 s to 10.2 s. A plan of eight
-PRs — numbered B1–B8 in that plan, unrelated to section B below — fixes it in the core first: a cost per path
-(transfer / resident / transient), the transient peak and fixed reservations in the ledger, an encode lane inside
-`FrameDeadline`, simulation profiles with goldens, then the wgpu pump and the web CPU path on the core's deadline,
-signals, and a measured acceptance (imagery peak ≤ 15.5 MB, BC7 settle ≤ 6.0 s, Off goldens unchanged). It comes
-before A2 and A4.
+**The compression budget (CB1–CB10, in progress from 2026-11-23).** With compression on, the budget still
+under-counts it: `plan` caps on resident bytes (87,408 per BC7 tile) while 349,524 RGBA8 bytes cross; the encode's
+transient memory and the encoder scratch are never charged; the encode pacing (`EncodePace`, 4 ms a frame) sits
+outside `FrameDeadline` and assumes 5 ms per BC7 tile while it costs 9–10 ms, which explains the settle regression
+from 5.0 s to 10.2 s. The budget lives in its own crate, `tuile-budget` (#163), optimised first (O1, then O-CB: the
+CPU mip chains off the render thread and one upload batch per frame, #284–#286). The steps, numbered CB to keep them
+apart from section B below (the numbering B1–B8 of `gpu-compressed-textures.md` §9.2 maps onto them):
+
+| Step | What | Status |
+|---|---|---|
+| CB1 | see it: the frame record's encode fields, metrics, an MCAP channel, the HUD and budget-window lines; a swap group deferred whole by the encode pacing | in review |
+| CB2 | a cost per path: `transfer`, `transient`, `encode_blocks`; `plan` caps on `transfer`; the decoded tier charges `transfer`; a fallback ack is not drift | |
+| CB3 | simulation profiles: `desktop-bc7`, `handheld-astc-gpu`, `web-webgl2-cpu`, `headset-90-astc` | |
+| CB4 | the transient peak and reservations; a GPU-encoded ack after the GPU has finished | |
+| CB5 | the encode lane in the core's `FrameDeadline` (`take_with`, `EncodeBucket`) | |
+| CB6 | the wgpu pump runs the core's deadline: a resumable per-tile drape encode, `EncodePace` removed | |
+| CB7 | the web CPU path's accounting | |
+| CB8 | acceptance: imagery peak ≤ 15.5 MB, BC7 settle ≤ 6.0 s, ASTC ≤ 7.0 s, frame p99 ≤ Off + 1 ms, holes 0; a phone filmed | |
+| CB9 | compression on by default in tuile-viewer and tuile-bevy (only once CB8 holds) | |
+| CB10 | split encodes for 90 Hz | |
+
+It comes before A2 and A4.
 
 ### O1 — the budget's algorithms, before CB (status: O1.5 part 4, 2026-11-02)
 

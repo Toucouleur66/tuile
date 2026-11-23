@@ -16,7 +16,9 @@ use tuile_budget::{
 use super::gpu::SimGpu;
 use super::net::{Arrival, NetProfile, SimNet};
 use super::reference::Lockstep;
-use super::world::{children, is_city, parent, sight, traverse, Camera, Lens, Residency, View};
+use super::world::{
+    children, is_city, parent, sight, traverse, Camera, Lens, Residency, SimPlan, View,
+};
 
 /// One eye of a profile's rig: where it sits along the camera's right
 /// vector, metres, and its lens.
@@ -52,6 +54,12 @@ impl Eye {
     }
 }
 
+/// The GPU encoder's scratch for one 256² tile with its chain, as
+/// `tuile_wgpu::encode_reservation` counts it: the RGBA8 it reads
+/// (349,524), the blocks it writes with rows aligned for the copy (90,368)
+/// and a job per level (9 × 256).
+pub const ENCODER_SCRATCH: Bytes = Bytes(442_196);
+
 /// A device profile: the budget, the network, the frame rate, the eyes.
 #[derive(Clone, Debug)]
 pub struct Profile {
@@ -73,6 +81,11 @@ pub struct Profile {
     /// 1 for a web page whose budget runs in a worker (a decision arrives
     /// one message late).
     pub lag: usize,
+    /// How the client holds its imagery (CB3): RGBA8, or blocks encoded on
+    /// the GPU or the CPU.
+    pub plan: SimPlan,
+    /// Of the GPU encodes, how many in a thousand fall back to RGBA8.
+    pub fallback_permille: u32,
 }
 
 impl Profile {
@@ -97,6 +110,8 @@ impl Profile {
             // A quarter of a 60 Hz frame at 4 MiB/ms: above the plan's cap.
             deadline: FrameDeadline::from_refresh(60, 250, 4 << 20),
             lag: 0,
+            plan: SimPlan::Rgba8,
+            fallback_permille: 0,
         }
     }
 
@@ -118,6 +133,8 @@ impl Profile {
             // A quarter of a 60 Hz frame at 1 MiB/ms: just above the cap.
             deadline: FrameDeadline::from_refresh(60, 250, 1 << 20),
             lag: 0,
+            plan: SimPlan::Rgba8,
+            fallback_permille: 0,
         }
     }
 
@@ -148,6 +165,8 @@ impl Profile {
             eyes: Eye::mono(Lens::desktop()),
             deadline: FrameDeadline::UNBOUNDED,
             lag: 0,
+            plan: SimPlan::Rgba8,
+            fallback_permille: 0,
         }
     }
 
@@ -183,6 +202,39 @@ impl Profile {
         p.budget.upload_bytes_per_frame = Bytes::mib(8);
         p.deadline = FrameDeadline::from_refresh(hz, 250, 1 << 20);
         p
+    }
+
+    /// `self`, its imagery held as `plan` says, named `name`; a GPU plan's
+    /// encodes fall back one time in a hundred.
+    fn compressed(mut self, name: &'static str, plan: SimPlan) -> Self {
+        self.name = name;
+        self.plan = plan;
+        self.fallback_permille = if plan == SimPlan::Gpu { 10 } else { 0 };
+        if plan == SimPlan::Gpu {
+            // The encoder's scratch, reserved off the drapes (CB4).
+            self.budget.reserved[Class::Drape] = ENCODER_SCRATCH;
+        }
+        self
+    }
+
+    /// A desktop holding BC7, encoded on the GPU (CB3).
+    pub fn desktop_bc7() -> Self {
+        Profile::desktop().compressed("desktop-bc7", SimPlan::Gpu)
+    }
+
+    /// A phone holding ASTC 4×4, encoded on the GPU (CB3).
+    pub fn handheld_astc_gpu() -> Self {
+        Profile::handheld().compressed("handheld-astc-gpu", SimPlan::Gpu)
+    }
+
+    /// A page on WebGL2: blocks encoded in its decode workers (CB3).
+    pub fn web_webgl2_cpu() -> Self {
+        Profile::web().compressed("web-webgl2-cpu", SimPlan::Cpu)
+    }
+
+    /// A 90 Hz headset holding ASTC 4×4, encoded on the GPU (CB3).
+    pub fn headset_90_astc() -> Self {
+        Profile::headset(90).compressed("headset-90-astc", SimPlan::Gpu)
     }
 }
 
@@ -407,10 +459,16 @@ impl Sim {
     fn with(profile: Profile, seed: u64, budget: Lockstep) -> Self {
         Sim {
             budget,
-            net: SimNet::new(profile.net, seed),
+            net: {
+                let mut n = SimNet::new(profile.net, seed);
+                n.plan = profile.plan;
+                n
+            },
             gpu: {
                 let mut g = SimGpu::new(profile.deadline, profile.eyes.len());
                 g.lagging = profile.lag > 0;
+                g.plan = profile.plan;
+                g.fallback_permille = profile.fallback_permille;
                 g
             },
             now: Micros::ZERO,
@@ -592,7 +650,7 @@ impl Sim {
         }
         if lagged.is_none() {
             acks = self.execute(&d, self.frame);
-            self.check_executor(&d);
+            self.check_executor(&d, &acks);
         }
         let mut seen = BTreeSet::new();
         for (t, _) in need.drawn.iter().chain(&need.blockers) {
@@ -711,15 +769,36 @@ impl Sim {
     /// I16, in step with the executor: the budget charges what the executor
     /// holds, each resource once — its drawable bytes plus what it was
     /// handed and has not uploaded yet, class by class.
-    fn check_executor(&self, d: &Decisions) {
+    ///
+    /// An upload acknowledged this frame is charged its estimate's peak
+    /// until the budget reads the acknowledgement.
+    fn check_executor(&self, d: &Decisions, acks: &[(ResourceId, Generation, Bytes)]) {
         for c in Class::ALL {
-            let pending = self
-                .gpu
-                .pending
-                .keys()
-                .filter(|r| class_of(**r) == c)
-                .fold(Bytes::ZERO, |a, r| a.plus(super::world::cost(*r).gpu));
-            let held = self.gpu.bytes[c].plus(pending);
+            // Uploaded this frame, its acknowledgement not read yet: the
+            // budget still charges its estimate's peak (resident, and what
+            // an encode on the GPU holds beside it, CB4), the executor what
+            // it acknowledged — a fallback's RGBA8 included (CB3).
+            let (estimated, acknowledged) = acks.iter().filter(|(r, _, _)| class_of(*r) == c).fold(
+                (Bytes::ZERO, Bytes::ZERO),
+                |(e, a), (r, _, b)| {
+                    let c = super::world::cost_for(*r, self.profile.plan);
+                    (e.plus(c.gpu.plus(c.transient)), a.plus(*b))
+                },
+            );
+            let pending =
+                self.gpu
+                    .pending
+                    .keys()
+                    .filter(|r| class_of(**r) == c)
+                    .fold(Bytes::ZERO, |a, r| {
+                        // Delivered, not uploaded: charged at its peak (CB4).
+                        let c = super::world::cost_for(*r, self.profile.plan);
+                        a.plus(c.gpu.plus(c.transient))
+                    });
+            let held = self.gpu.bytes[c]
+                .plus(pending)
+                .plus(estimated)
+                .minus(acknowledged);
             if d.stats.gpu[c] != held {
                 self.fail(&format!(
                     "I16: the budget charges {c:?} {} bytes, the executor holds {}",
@@ -788,6 +867,30 @@ impl Sim {
                     }
                 }
             }
+        }
+        // CB4: the peak — resident, and in transit at its peak — plus what
+        // the executor reserves never crosses a class's configured hard
+        // limit.
+        for c in Class::ALL {
+            let hard = cfg.hard_limit[c];
+            if hard != Bytes::MAX && s.gpu[c].plus(cfg.reserved[c]) > hard {
+                self.fail(&format!(
+                    "CB4: {c:?} peak {} + reserved {} over its hard limit {}",
+                    s.gpu[c].0, cfg.reserved[c].0, hard.0
+                ));
+            }
+        }
+        // CB3: under compression, the ledger is the sum of the states, the
+        // decoded copies' extras included, every step.
+        if self.profile.plan != SimPlan::Rgba8 {
+            if let Err(e) = self.budget.audit_both() {
+                self.fail(&format!("CB3: the ledger against its recount: {e:?}"));
+            }
+        }
+        // CB3: an encode that fell back is a fallback, never drift: the
+        // executor acknowledges every upload exactly.
+        if s.drift_exceeded.iter().any(|(_, n)| n > 0) {
+            self.fail("CB3: an acknowledgement counted as drift");
         }
         // I2: what is not protected fits in the target.
         for c in Class::ALL {

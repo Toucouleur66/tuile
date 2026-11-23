@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 
 use tuile_budget::{Bytes, Class, Decisions, FrameDeadline, Generation, PerClass, ResourceId};
 
-use super::world::cost;
+use super::world::{cost_for, SimPlan};
 
 /// The consumer's GPU.
 pub struct SimGpu {
@@ -39,6 +39,14 @@ pub struct SimGpu {
     /// The executor runs behind the budget: a plan may list what it has
     /// uploaded already, its acknowledgement still on its way.
     pub lagging: bool,
+    /// How it holds imagery (CB3).
+    pub plan: SimPlan,
+    /// Of its GPU encodes, how many in a thousand fall back to RGBA8: a
+    /// resource's fate is a hash of it and its generation, so a run is
+    /// reproducible.
+    pub fallback_permille: u32,
+    /// Its encodes that fell back, total.
+    pub fallbacks: u64,
 }
 
 impl SimGpu {
@@ -55,7 +63,24 @@ impl SimGpu {
             deferred: 0,
             eye_drew: vec![0; eyes],
             lagging: false,
+            plan: SimPlan::Rgba8,
+            fallback_permille: 0,
+            fallbacks: 0,
         }
+    }
+}
+
+impl SimGpu {
+    /// Whether the encode of `r` at `g` falls back: seeded by the pair.
+    fn falls_back(&self, r: ResourceId, g: Generation) -> bool {
+        if self.fallback_permille == 0 {
+            return false;
+        }
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in format!("{r:?}{g:?}").bytes() {
+            h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+        }
+        h % 1_000 < u64::from(self.fallback_permille)
     }
 }
 
@@ -119,7 +144,9 @@ impl SimGpu {
         };
         let now = self
             .deadline
-            .take(&queue, &plan.groups, Bytes::ZERO, |r| cost(r).gpu);
+            .take(&queue, &plan.groups, Bytes::ZERO, |r| {
+                cost_for(r, self.plan).transfer
+            });
         self.deferred += (queue.len() - now.len()) as u64;
         self.frame_items = now.len();
         self.frame_bytes = Bytes::ZERO;
@@ -130,7 +157,14 @@ impl SimGpu {
             let Some(g) = self.pending.remove(r) else {
                 return Err(format!("{r:?} in the plan but never delivered"));
             };
-            let b = cost(*r).gpu;
+            let c = cost_for(*r, self.plan);
+            // An encode that fell back is held as it crossed.
+            let b = if c.encode_blocks > 0 && self.falls_back(*r, g) {
+                self.fallbacks += 1;
+                c.transfer
+            } else {
+                c.gpu
+            };
             self.frame_bytes = self.frame_bytes.plus(b);
             self.drawable.insert(*r, b);
             let c = class(*r);
