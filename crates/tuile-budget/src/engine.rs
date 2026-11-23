@@ -682,7 +682,12 @@ impl Budget {
                     let a = &mut self.arena;
                     if a.transit(s).is_some_and(|t| t.gen == g) {
                         if let Some(t) = a.take_transit(s, &mut self.ledger) {
-                            if !within_drift(t.cost.gpu, actual) {
+                            if t.cost.is_fallback(actual) {
+                                // An encode that fell back to the form it
+                                // crossed in: charged as it is held, and
+                                // not the estimator's error.
+                                st.fallbacks[a.class(s)] += 1;
+                            } else if !within_drift(t.cost.gpu, actual) {
                                 st.drift_exceeded[a.class(s)] += 1;
                             }
                             a.put_gpu(
@@ -2723,7 +2728,9 @@ impl Budget {
                 tier: Tier::Remote,
                 resource: r,
             });
-            transit.push((k, t.cost.gpu, group_of(r), false));
+            // What the upload moves across, not what it will hold: a
+            // texture the GPU encodes crosses as RGBA8.
+            transit.push((k, t.cost.transfer, group_of(r), false));
         }
         // Keys end in the resource: total, so unstable is stable.
         transit.sort_unstable_by_key(|a| a.0);
@@ -3224,7 +3231,7 @@ impl Budget {
             tier,
             gen,
             gpu: a.gpu(s).map(|g| g.bytes).unwrap_or(Bytes::ZERO),
-            decoded: a.cpu(s).map(|c| c.cost.gpu).unwrap_or(Bytes::ZERO),
+            decoded: a.cpu(s).map(|c| c.cost.transfer).unwrap_or(Bytes::ZERO),
             protected: self.protection_of(r, s),
             urgency: a.urgency(s),
             priority: a.priority(s).map(|p| p.key(r)),
@@ -3256,6 +3263,10 @@ impl Budget {
             a.active_consistent(),
             "the active slots drifted from their places or their runs"
         );
+        debug_assert!(
+            a.extras_consistent(),
+            "a decoded copy's cost extras outlive it, or name an identity cost"
+        );
         for s in a.iter() {
             let class = a.class(s);
             if let Some(g) = a.gpu(s) {
@@ -3266,7 +3277,7 @@ impl Budget {
                 l.in_transit = l.in_transit.plus(t.cost.staging);
             }
             if let Some(c) = a.cpu(s) {
-                l.decoded = l.decoded.plus(c.cost.gpu);
+                l.decoded = l.decoded.plus(c.cost.transfer);
             }
             if let Load::Loading {
                 source: Source::Network,

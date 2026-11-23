@@ -338,12 +338,25 @@ struct Order {
     distance: u32,
 }
 
-/// A decoded copy's payload; whether it was delivered is a flag.
+/// A decoded copy's payload; whether it was delivered is a flag. Its
+/// cost's resident and moved bytes: what an identity cost is whole, the
+/// rest kept apart ([`CostExtra`]) for the few that are not.
 #[derive(Clone, Copy, Debug, Default)]
 struct CpuPayload {
     gen: Generation,
-    cost: Cost,
+    gpu: Bytes,
+    staging: Bytes,
     epoch: u64,
+}
+
+/// The parts of a cost that are not an identity's ([`Cost::is_identity`]):
+/// a texture the GPU encodes on the way. Kept by slot beside the column, so
+/// that nothing compressed costs a slot more.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CostExtra {
+    transfer: Bytes,
+    transient: Bytes,
+    encode_blocks: u64,
 }
 
 /// A load's payload; its source is a flag.
@@ -450,6 +463,10 @@ pub(super) struct Arena {
     /// The copies in transit, by slot: few at a time, so kept apart.
     transit: SortedMap<u32, Transit>,
     cpu: Vec<CpuPayload>,
+    /// The decoded copies whose cost is not an identity's, by slot: made on
+    /// the first such copy, so a budget that never sees imagery encoded on
+    /// the GPU holds nothing for it.
+    cpu_extra: Option<SortedMap<u32, CostExtra>>,
     /// The loads in flight, by slot: few at a time, so kept apart.
     load: SortedMap<u32, LoadPayload>,
     /// This step's urgency and priority of the slots with work, by slot:
@@ -544,6 +561,7 @@ impl Default for Arena {
             gpu: Vec::new(),
             transit: SortedMap::default(),
             cpu: Vec::new(),
+            cpu_extra: None,
             load: SortedMap::default(),
             ranks: SortedMap::default(),
             cold: Vec::new(),
@@ -626,6 +644,10 @@ impl Arena {
                 self.order[i] = order;
                 self.gpu[i] = Gpu::default();
                 self.cpu[i] = CpuPayload::default();
+                debug_assert!(
+                    self.extra(s).is_none(),
+                    "a freed slot kept a decoded copy's cost"
+                );
                 self.cold[i] = Cold::default();
                 s
             }
@@ -762,6 +784,9 @@ impl Arena {
         // (each map counts the pass in its upkeep).
         let to = |n: &u32| map.get(*n as usize).copied().unwrap_or(DEAD);
         self.transit.rekey(to);
+        if let Some(x) = &mut self.cpu_extra {
+            x.rekey(to);
+        }
         self.load.rekey(to);
         self.ranks.rekey(to);
         for c in Class::ALL {
@@ -1093,7 +1118,7 @@ impl Arena {
         };
         let held = self.held(s).map(|h| {
             let bytes = match h {
-                Held::Cpu => self.cpu[s.i()].cost.gpu,
+                Held::Cpu => self.cpu_bytes(s),
                 Held::Both | Held::Gpu => self.gpu[s.i()].bytes,
             };
             (h, bytes)
@@ -1312,7 +1337,7 @@ impl Arena {
                 }
             }
             if let Some(k) = self.cpu(s) {
-                cpu[c][at] = cpu[c][at].plus(k.cost.gpu);
+                cpu[c][at] = cpu[c][at].plus(k.cost.transfer);
                 cpu_tiles[c][at] += 1;
             }
         }
@@ -1596,13 +1621,42 @@ impl Arena {
     pub fn cpu(&self, s: Slot) -> Option<CpuCopy> {
         self.has_cpu(s).then(|| {
             let c = self.cpu[s.i()];
+            let mut cost = Cost::new(c.gpu, c.staging);
+            if let Some(x) = self.extra(s) {
+                cost.transfer = x.transfer;
+                cost.transient = x.transient;
+                cost.encode_blocks = x.encode_blocks;
+            }
             CpuCopy {
                 gen: c.gen,
-                cost: c.cost,
+                cost,
                 epoch: c.epoch,
                 delivered_before: self.has(s, DELIVERED),
             }
         })
+    }
+
+    /// Every kept extra is a live decoded copy's, and not an identity's.
+    pub fn extras_consistent(&self) -> bool {
+        self.cpu_extra.iter().flat_map(|m| m.iter()).all(|(n, x)| {
+            let s = Slot(*n);
+            s.i() < self.cpu.len()
+                && self.has_cpu(s)
+                && (x.transfer != self.cpu[s.i()].gpu
+                    || x.transient != Bytes::ZERO
+                    || x.encode_blocks != 0)
+        })
+    }
+
+    /// The parts of `s`'s decoded copy's cost that are not an identity's.
+    fn extra(&self, s: Slot) -> Option<&CostExtra> {
+        self.cpu_extra.as_ref()?.get(&s.0)
+    }
+
+    /// The bytes `s`'s decoded copy holds: its texels as they crossed
+    /// (`Cost::transfer`), RGBA8 for a texture the GPU will encode.
+    pub fn cpu_bytes(&self, s: Slot) -> Bytes {
+        self.extra(s).map_or(self.cpu[s.i()].gpu, |x| x.transfer)
     }
 
     pub fn load(&self, s: Slot) -> Load {
@@ -1671,15 +1725,28 @@ impl Arena {
         self.note(s, Change::CPU);
         self.unfile(s);
         self.drop_cpu(s, l);
-        l.decoded = l.decoded.plus(c.cost.gpu);
+        // The decoded tier holds what crossed: the RGBA8 a GPU encode
+        // reads, not the blocks it will hold.
+        l.decoded = l.decoded.plus(c.cost.transfer);
         let (class, at) = (self.class(s), level_index(self.level(s)));
-        self.cpu_by_level[class][at] = self.cpu_by_level[class][at].plus(c.cost.gpu);
+        self.cpu_by_level[class][at] = self.cpu_by_level[class][at].plus(c.cost.transfer);
         self.cpu_tiles_by_level[class][at] += 1;
         self.cpu[s.i()] = CpuPayload {
             gen: c.gen,
-            cost: c.cost,
+            gpu: c.cost.gpu,
+            staging: c.cost.staging,
             epoch: c.epoch,
         };
+        if !c.cost.is_identity() {
+            let extra = CostExtra {
+                transfer: c.cost.transfer,
+                transient: c.cost.transient,
+                encode_blocks: c.cost.encode_blocks,
+            };
+            self.cpu_extra
+                .get_or_insert_with(SortedMap::default)
+                .insert(s.0, extra);
+        }
         self.set(s, CPU, true);
         self.set(s, DELIVERED, c.delivered_before);
         self.file(s);
@@ -1698,9 +1765,12 @@ impl Arena {
 
     fn drop_cpu(&mut self, s: Slot, l: &mut Ledger) -> Option<CpuCopy> {
         let c = self.cpu(s)?;
-        l.decoded = l.decoded.minus(c.cost.gpu);
+        if let Some(x) = &mut self.cpu_extra {
+            x.remove(&s.0);
+        }
+        l.decoded = l.decoded.minus(c.cost.transfer);
         let (class, at) = (self.class(s), level_index(self.level(s)));
-        self.cpu_by_level[class][at] = self.cpu_by_level[class][at].minus(c.cost.gpu);
+        self.cpu_by_level[class][at] = self.cpu_by_level[class][at].minus(c.cost.transfer);
         self.cpu_tiles_by_level[class][at] = self.cpu_tiles_by_level[class][at].saturating_sub(1);
         self.set(s, CPU, false);
         self.set(s, DELIVERED, false);

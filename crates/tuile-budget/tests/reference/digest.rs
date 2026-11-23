@@ -211,6 +211,13 @@ impl Feed for tuile_budget::cost::Cost {
     fn feed(&self, h: &mut Fnv) {
         self.gpu.feed(h);
         self.staging.feed(h);
+        // The parts compression adds, only where they differ from an
+        // identity cost: digests of uncompressed runs are unchanged.
+        if !self.is_identity() {
+            self.transfer.feed(h);
+            self.transient.feed(h);
+            h.u64(self.encode_blocks);
+        }
     }
 }
 
@@ -294,6 +301,15 @@ impl Feed for BudgetStats {
             .replace(&format!(", levels: {levels}"), "")
             .replace(&format!(", layers: {layers}"), "")
             .replace(&format!(", recycled: {recycled}"), "");
+        // An encode's fallbacks, recorded after the reference was: out of
+        // the text while there are none, so an uncompressed run digests as
+        // it did.
+        let none = PerClass::<u32>::default();
+        let text = if self.fallbacks == none {
+            text.replace(&format!(", fallbacks: {none:?}"), "")
+        } else {
+            text
+        };
         h.bytes(text.as_bytes());
     }
 }

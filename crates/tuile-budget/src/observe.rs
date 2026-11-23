@@ -478,6 +478,9 @@ pub struct BudgetSignals {
     pub frame_upload_micros: Histogram,
     /// `estimate_drift_exceeded_total{class}`.
     pub estimate_drift_exceeded_total: PerClass<u64>,
+    /// `encode_fallbacks_total{class}`: acknowledgements of an encode that
+    /// fell back to the form it crossed in.
+    pub encode_fallbacks_total: PerClass<u64>,
     /// `swaps_total{kind}`: refine, coarsen, mesh_drape, layer.
     pub swaps_total: [u64; 4],
     /// `swap_gaps_total`: ground covered at the last step, uncovered now.
@@ -977,6 +980,11 @@ impl BudgetSignals {
             "estimate_drift_exceeded_total",
             &self.estimate_drift_exceeded_total,
         );
+        per(
+            &mut out,
+            "encode_fallbacks_total",
+            &self.encode_fallbacks_total,
+        );
         for (i, k) in labels::SWAP.iter().enumerate() {
             out.push(("swaps_total", vec![("kind", k)], self.swaps_total[i] as f64));
         }
@@ -1193,6 +1201,7 @@ impl BudgetObserver for BudgetMeter {
                 }
             }
             s.estimate_drift_exceeded_total[c] += u64::from(st.drift_exceeded[c]);
+            s.encode_fallbacks_total[c] += u64::from(st.fallbacks[c]);
         }
         s.levels = st.levels;
         let y = &st.layers;

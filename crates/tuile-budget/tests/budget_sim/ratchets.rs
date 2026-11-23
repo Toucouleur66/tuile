@@ -107,6 +107,14 @@ fn still() -> (u64, u64, u32, u64) {
 /// 1 076 resources tracked where it ended with 1 055, those own levels
 /// beside what the finer ones left (918 029 B held against 897 593): the
 /// same structures over another history, not growth with the set.
+///
+/// `bytes-per-tracked-resource` went up by one, 451 -> 452, and
+/// `bytes-per-tracked-resource-after-shrinking` by three, 853 -> 856, with
+/// the cost per path (CB2, for review): a `Cost` carries what crosses, what
+/// is held while an encode runs and the blocks it writes (16 -> 40 B), in
+/// the events a step drains and in the copies in transit — kept buffers,
+/// sized by the busiest step, not by the tracked set. The decoded copies'
+/// extras live apart and allocate nothing without compression.
 fn motion() -> (u64, u64, i64, i64, usize) {
     let mut sim = Sim::new(Profile::desktop(), 11);
     sim.count_output = true;

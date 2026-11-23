@@ -979,3 +979,28 @@ proptest! {
         }
     }
 }
+
+proptest! {
+    /// CB2, `Off` unchanged: every RGBA8 and block drape, and every mesh,
+    /// crosses as it is held — `transfer == gpu`, nothing transient, no
+    /// encode — so plans, ledgers and digests read what they read before
+    /// compression had a cost of its own.
+    #[test]
+    fn uncompressed_costs_are_identities(
+        w in 1u32..4_096,
+        h in 1u32..4_096,
+        format in 0usize..3,
+        vertices in 0u64..200_000,
+        indices in 0u64..600_000,
+        cpu_copy in any::<bool>(),
+    ) {
+        use tuile_budget::cost::{drape_cost, mesh_cost, TextureFormat};
+        let f = [TextureFormat::Rgba8, TextureFormat::Block16, TextureFormat::Block8][format];
+        let d = drape_cost(w, h, f);
+        prop_assert_eq!(d.transfer, d.gpu);
+        prop_assert_eq!((d.transient, d.encode_blocks), (Bytes::ZERO, 0));
+        let m = mesh_cost(vertices, 32, indices, cpu_copy);
+        prop_assert!(m.is_identity());
+        prop_assert!(!d.is_fallback(d.gpu) && !d.is_fallback(Bytes(d.gpu.0 + 1)));
+    }
+}
