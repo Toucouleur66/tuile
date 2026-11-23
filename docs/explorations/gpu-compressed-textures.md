@@ -286,6 +286,40 @@ Native headless runner, `p2-slow` (Paris from 160 km to 5 km), desktop
 - **Not measured yet:** a real phone (WebGPU ASTC GPU encode, WebGL2 CPU
   path), a headset.
 
+### 9.1b Measured after the compression budget (CB8, 2026-11-23)
+
+Native headless runner, `p2-slow`, desktop 1280×800 @2, Apple M-series,
+Metal, `--idle 30`, main 29f83dba + the encode share's headroom (CB8's
+PR), median of 3. **The Mac was shared with other agents' builds and the
+real catalog's network all evening: `off` itself landed anywhere from 0.4
+to 28 s and drew at ~10 frames a second.** These numbers compare the plans
+within one evening; they are not the acceptance's absolute ones.
+
+| plan | every upload landed | imagery on the GPU at its peak | textures | frame p50 / p99 | black / holes |
+|---|---|---|---|---|---|
+| off | 18.5 s | 90.2 MB | 258 | 107 / 214 ms | 0 / 0 |
+| bc7 | 29.1 s (one run of three not idle after 30 s) | **15.3 MB** | 175 | 90 / 178 ms | 0 / 0 |
+| astc | 24.9 s | 16.3 MB | 186 | 91 / 179 ms | 0 / 0 |
+
+Before the headroom (as merged, two runs): BC7 never idle within 30 s, ASTC
+12.9 s against `off` 4.0 s — the encode lane took a 60 Hz frame's share
+while the viewer ran at 20 frames a second.
+
+`upload_bench` (synthetic server, every frame waits for the GPU; base =
+20bb0c79 before CB1, median of 3): cold settle BC7 1.39 s in 239 frames
+(base 1.51 s, 195 frames, one encode a frame), ASTC **0.65 s in 73 frames**
+(base 1.70 s, 193 frames); `off` unchanged (3 frames).
+
+Against the acceptance: imagery peak ≤ 15.5 MB holds for BC7 (15.3), not
+quite for ASTC (16.3); frame p99 is under `off`'s; no black, no hole.
+**"Every upload landed ≤ 6.0 s (BC7) / 7.0 s (ASTC)" is not met**, and
+cannot be at the plan's share: a quarter of each frame for encodes, 9.5 ms
+of GPU a 256² BC7 tile, is about one tile every 2.3 frames at 60 Hz — 648
+tiles of `p2-slow` (the `off` count on a quiet run) are 6.2 s of GPU alone.
+Landing faster means a larger encode share, paid in frame time: the
+trade-off is Laurent's (the plan's gate). CB9 (on by default) waits for it.
+The phone on WebGPU and WebGL2, filmed, is Laurent's step.
+
 ### 9.2 What remains: the compression budget (B1–B8)
 
 The next step makes the graphics budget account for compression instead of
