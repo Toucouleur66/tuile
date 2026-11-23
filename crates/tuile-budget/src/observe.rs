@@ -530,6 +530,11 @@ pub struct BudgetSignals {
     /// `evictions_by_level_distance{level,distance}`: the last step's GPU
     /// evictions.
     pub evictions_by_level_distance: [[u32; DISTANCE_BANDS]; LEVELS],
+    /// `released_by_level_distance{level,distance,reason}`: the last
+    /// step's releases, GPU and decoded, by reason.
+    pub released_by_level_distance: [[[u32; DISTANCE_BANDS]; LEVELS]; 3],
+    /// `released_total{reason}`.
+    pub released_total: [u64; 3],
     /// `score_decisions_total{level,distance,side}` and
     /// `score_sum_total{level,distance,side,term}`: every preload started
     /// and copy evicted since the meter's start, with its terms (sides
@@ -617,7 +622,7 @@ pub mod labels {
     pub const EYE: [&str; 4] = ["0", "1", "2", "3"];
     /// `name` of a `param`: the progressive score's parameters
     /// (`crate::score::ScoreParams::pairs`).
-    pub const PARAM: [&str; 7] = [
+    pub const PARAM: [&str; 9] = [
         "a0_permille",
         "a_desc_permille",
         "rho_tiles",
@@ -625,13 +630,19 @@ pub mod labels {
         "floor_level",
         "preload_slots_permille",
         "need_level",
+        "headroom_permille",
+        "floor_value_permille",
     ];
+    /// `reason` of `released_by_level_distance`.
+    pub const RELEASE: [&str; 3] = crate::score::RELEASE_REASONS;
     /// `distance`: a band of tiles from the view's footprint.
     pub const DISTANCE: [&str; crate::score::DISTANCE_BANDS] = crate::score::DISTANCE_BAND_LABELS;
     /// `side` of the score.
-    pub const SIDE: [&str; 3] = ["preload", "evict", "held"];
+    pub const SIDE: [&str; 4] = ["preload", "evict", "held", "decoded"];
     /// `term` of the score.
     pub const TERM: [&str; 5] = crate::score::TERM_LABELS;
+    /// `tier` of `restore_cost_seconds`.
+    pub const RESTORE_TIER: [&str; 4] = crate::score::RESTORE_TIERS;
     /// `level`, 0 to 24: a level of the budget's per-level series
     /// (`stats::level_index`; deeper levels count in the last).
     /// A copy's tier in `copies_by_level`.
@@ -1142,6 +1153,12 @@ impl BudgetSignals {
         if let Some(n) = self.score_params.need_level {
             out.push(("need_level", vec![], f64::from(n)));
         }
+        for (tier, us) in crate::score::RESTORE_TIERS
+            .iter()
+            .zip(self.score_params.restore_us)
+        {
+            out.push(("restore_cost_seconds", vec![("tier", tier)], us as f64 / 1e6));
+        }
         for l in 0..LEVELS {
             for b in 0..DISTANCE_BANDS {
                 let at = vec![
@@ -1192,6 +1209,25 @@ impl BudgetSignals {
                         out.push(("score_held_sum", kt.clone(), c.term(t).sum as f64));
                         out.push(("score_held_min", kt.clone(), c.term(t).min as f64));
                         out.push(("score_held_max", kt, c.term(t).max as f64));
+                    }
+                }
+            }
+        }
+        for (i, reason) in crate::score::RELEASE_REASONS.iter().enumerate() {
+            out.push(("released_total", vec![("reason", reason)], self.released_total[i] as f64));
+            for l in 0..LEVELS {
+                for b in 0..DISTANCE_BANDS {
+                    let v = self.released_by_level_distance[i][l][b];
+                    if v > 0 || self.score_total.cell(l, b, Side::Evict).count > 0 {
+                        out.push((
+                            "released_by_level_distance",
+                            vec![
+                                ("level", labels::LEVEL[l]),
+                                ("distance", DISTANCE_BAND_LABELS[b]),
+                                ("reason", reason),
+                            ],
+                            f64::from(v),
+                        ));
                     }
                 }
             }
@@ -1357,6 +1393,10 @@ impl BudgetObserver for BudgetMeter {
         s.score_params = st.score.params;
         s.preload_by_level_distance = st.score.preload_in_flight;
         s.evictions_by_level_distance = st.score.evictions;
+        s.released_by_level_distance = st.score.released;
+        for (i, r) in st.score.released.iter().enumerate() {
+            s.released_total[i] += r.iter().flatten().map(|v| u64::from(*v)).sum::<u64>();
+        }
         crate::score::board_of(&d.scores, &mut s.score_total);
         crate::score::board_of(&d.scores, &mut s.score_recent);
         for e in &d.scores {

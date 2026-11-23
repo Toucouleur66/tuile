@@ -964,7 +964,11 @@ fn labels_stay_within_their_closed_sets() {
                 .chain(&labels::LEVEL_STATE)
                 .copied()
                 .collect(),
-            "tier" => labels::TIER.to_vec(),
+            "tier" => labels::TIER
+                .iter()
+                .chain(&labels::RESTORE_TIER)
+                .copied()
+                .collect(),
             "layer" => labels::LAYER.to_vec(),
             "source" => labels::SOURCE
                 .iter()
@@ -976,6 +980,7 @@ fn labels_stay_within_their_closed_sets() {
             "reason" => labels::CANCEL
                 .iter()
                 .chain(&labels::EVICT)
+                .chain(&labels::RELEASE)
                 .copied()
                 .collect(),
             "kind" => labels::FAILURE

@@ -413,7 +413,7 @@ pub(super) fn rows(
     };
     let work = since(s.decide_work_total, |f| f.decide_work_total);
     out.push(line(format!(
-        "spec {}{} · SSE scale {:.2} · pressure {} · thermal {} · decide mean {:.2} ms, max {:.2} ms · work {} this step, {:.0} mean · {} steps",
+        "spec {}{} · SSE scale {:.2} · pressure {} · thermal {} · decide mean {:.2} ms over {}, peak {:.2} ms over the last publish (0.5 s) · work {} this step, {:.0} mean · {} steps",
         s.spec.label(),
         if s.spec_overridden { " (override)" } else { " (context)" },
         f64::from(s.sse_scale_milli) / 1000.0,
@@ -422,6 +422,11 @@ pub(super) fn rows(
             .unwrap_or(&"?"),
         s.thermal_level,
         sum as f64 / count.max(1) as f64 / 1000.0,
+        if from.is_some() {
+            "the window"
+        } else {
+            "the session"
+        },
         s.decide_peak_micros as f64 / 1000.0,
         s.decide_work,
         work as f64 / count.max(1) as f64,
@@ -670,6 +675,7 @@ fn score_rows(
         p.formula(),
         p.need_level.map_or("?".to_owned(), |n| n.to_string())
     )]);
+    out.push(vec![p.restore_line()]);
     // Preloads and evictions by level × distance band.
     let mut head = vec!["level × d".to_owned()];
     for b in DISTANCE_BAND_LABELS {
@@ -704,6 +710,49 @@ fn score_rows(
         }
         if any {
             out.push(row);
+        }
+    }
+    // Releases, GPU and decoded, by reason and level: this step's, or
+    // since the start in the cumulative view.
+    {
+        use tuile_core::budget::score::RELEASE_REASONS;
+        let r = &s.released_by_level_distance;
+        let totals: Vec<String> = RELEASE_REASONS
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let n = if cumulative {
+                    s.released_total[i]
+                        .saturating_sub(from.map_or(0, |(f, _)| f.released_total[i]))
+                } else {
+                    r[i].iter().flatten().map(|v| u64::from(*v)).sum()
+                };
+                format!("{name} {n}")
+            })
+            .collect();
+        out.push(Vec::new());
+        out.push(vec![format!(
+            "released {}: {} · kept under target − {:.1} %",
+            if cumulative { "since the start" } else { "this step" },
+            totals.join(", "),
+            f64::from(p.headroom_permille) / 10.0
+        )]);
+        if !cumulative {
+            out.push(
+                ["level", "headroom", "below floor value", "make room"]
+                    .map(str::to_owned)
+                    .to_vec(),
+            );
+            for l in 0..LEVELS {
+                let row: Vec<u64> = (0..3)
+                    .map(|i| r[i][l].iter().map(|v| u64::from(*v)).sum())
+                    .collect();
+                if row.iter().any(|v| *v > 0) {
+                    let mut cells = vec![format!("{l} rel")];
+                    cells.extend(row.into_iter().map(n));
+                    out.push(cells);
+                }
+            }
         }
     }
     // The terms per level and side: count, then the score's mean and range,

@@ -13,6 +13,11 @@
 //! point. A tile's distance `d` is its volume's distance to `F` over `s_ℓ`,
 //! the size of the level-`ℓ` tile nearest `F`. The walk is taken again only
 //! when `n`, the tile under `F`, `ρ`, the floor or the tree's shape change.
+//!
+//! The ring is isotropic: any direction is possible. Where the view is
+//! going is the predictions' to say — the views ahead
+//! ([`crate::protocol::ClientMessage::Ahead`]), recorded inputs whose
+//! tiles join the ring — never an extrapolation of this module's.
 
 use std::collections::HashMap;
 

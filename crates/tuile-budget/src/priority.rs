@@ -155,8 +155,13 @@ pub enum Precedence {
     Coverage,
     /// A child a held parent waits on (law 1, a swap completes).
     Swap,
-    /// Everything else, by value.
+    /// The present need's other loads (a drawn tile's drape), by value.
     Value,
+    /// Anticipation — the ring, the preloaded ancestors, a refresh — by
+    /// value, after the present need whatever its value (the law "the
+    /// present need before anticipation",
+    /// `docs/explorations/budget-progressive-coarse-preload.md` §3).
+    Anticipation,
 }
 
 impl Precedence {
@@ -166,9 +171,8 @@ impl Precedence {
             Urgency::Floor => Precedence::Floor,
             Urgency::Hole => Precedence::Coverage,
             Urgency::Blocker => Precedence::Swap,
-            Urgency::Drape | Urgency::Ring | Urgency::Ancestor | Urgency::Refresh => {
-                Precedence::Value
-            }
+            Urgency::Drape => Precedence::Value,
+            Urgency::Ring | Urgency::Ancestor | Urgency::Refresh => Precedence::Anticipation,
         }
     }
 }

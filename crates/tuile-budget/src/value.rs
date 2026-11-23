@@ -277,15 +277,29 @@ pub fn probability(spec: &Specification, rho: u32, u: Urgency, level: u32, q: &Q
 }
 
 /// What loading a missing resource of the value band gains (spec §1b), in
-/// flouz: `P × Δq × w × (H − T_fetch)⁺` — its probability of use
+/// flouz: `P × Δq × w × (H ∓ T_fetch)` — its probability of use
 /// `probability` ([`probability`], [`CERTAIN`] units), one level, the
-/// place's screen weight (‰ of the reference pixel), counted only from its
-/// arrival on over the specification's horizon: a slow fetch earns less, a
-/// local one is preferred at equal worth.
-pub fn load_gain(spec: &Specification, probability: u32, centrality: i32, tier: Tier) -> Flouz {
+/// place's screen weight (‰ of the reference pixel), over the
+/// specification's horizon. For the present need, counted only from its
+/// arrival on, `(H − T)⁺`: a slow fetch earns less, a local one is
+/// preferred at equal worth. For a preload, `H + T`: the lead time a tier
+/// needs — what the measured network makes slow to come back is started
+/// sooner (`docs/explorations/budget-progressive-coarse-preload.md` §2).
+pub fn load_gain(
+    spec: &Specification,
+    probability: u32,
+    centrality: i32,
+    tier: Tier,
+    preload: bool,
+) -> Flouz {
     let p = &spec.params;
     let screen = 500 + u64::try_from(centrality.clamp(0, 1_000)).unwrap_or(0) / 2;
-    let after = p.horizon.0.saturating_sub(p.restore.of(tier).0);
+    let t = p.restore.of(tier).0;
+    let after = if preload {
+        p.horizon.0.saturating_add(t)
+    } else {
+        p.horizon.0.saturating_sub(t)
+    };
     Flouz(
         u64::from(probability).saturating_mul(screen).saturating_mul(after)
             / (u64::from(CERTAIN) * 1_000),
@@ -398,7 +412,7 @@ mod tests {
     fn a_load_gains_by_probability_place_and_arrival() {
         let s = Specification::interactive();
         let q = Quantised::default();
-        let g = |u, c, t| load_gain(&s, probability(&s, 4, u, 9, &q), c, t);
+        let g = |u, c, t| load_gain(&s, probability(&s, 4, u, 9, &q), c, t, false);
         assert!(g(Urgency::Drape, 0, Tier::Remote) > g(Urgency::Ring, 0, Tier::Remote));
         assert!(g(Urgency::Ring, 0, Tier::Remote) > g(Urgency::Ancestor, 0, Tier::Remote));
         assert!(g(Urgency::Drape, 1_000, Tier::Remote) > g(Urgency::Drape, 0, Tier::Remote));

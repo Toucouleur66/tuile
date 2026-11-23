@@ -32,7 +32,7 @@ level-`ℓ` tile under `F`):
 
 ```
 score(t) = P(ℓ, n, d) × R(tier) / bytes(t)          (release: lowest first)
-gain(t)  = P(ℓ, n, d) × S(t) × (H − T(tier))⁺        (load: highest first)
+gain(t)  = P(ℓ, n, d) × S(t) × (H + R(tier))         (preload: highest first)
 
 P(ℓ, n, d) = A(ℓ, n) × D(d)                          the probability of use
 
@@ -48,10 +48,24 @@ D(d)    = ρ² / (ρ + d)²                                (1 at F, ¼ at d = ρ
   (150 ms) — the specification's `RestoreCosts`, replaced by measured ones as they come
   (spec §4.2). Dear to restore ⇒ kept longer.
 - `bytes(t)` is the GPU copy's size, floored at `ref_bytes / 16` (16 KiB).
-- `S(t)` is the screen weight (½ at the edge of the view, 1 at its centre) and
-  `(H − T(tier))⁺` the part of the horizon left once it arrives: a load does not know its
-  bytes yet, it pays its fetch time instead. **The two sides share `P`**: that is the one
-  cost function — what is preloaded first is what is released last.
+- `S(t)` is the screen weight (½ at the edge of the view, 1 at its centre) and `H + R` the
+  lead a preload needs: a tier slow to come back is started sooner. A load does not know its
+  bytes yet. **The two sides share `P` and `R`**: that is the one cost function — what is
+  preloaded first is what is released last. (The present need's own loads keep
+  `S × (H − R)⁺`, in a band of their own before every preload: §3.)
+- `R` is **measured**: the geometry server times every load from the step that started it to
+  the step it landed, by the tier it read (network, local store), and hands the budget each
+  second the interval's median (`Measured`, recorded with the step as any input, so a replay
+  decides the same). The budget smooths it (EMA, τ = 8 s) and uses it for a resource of the
+  reference size, quantised to three significant bits (a change under ~12 % moves nothing),
+  the specification's constant until a tier has samples (`Budget::restore_costs`; the
+  window's `R(tier)` line, `tuile_budget_restore_cost_seconds{tier}`).
+- `n` and `d` follow the pose. An ancestor of what is drawn lies on the view's footprint
+  (`d` = 0) and is scored against the finest level drawn under it — **the need at that
+  place**: a grazing view's far ground is drawn coarse, and its ancestors score `a0` against
+  that coarse need, above a refinement under the eye (`a↓`). The neighbourhood's tiles are
+  placed from `F`. The ring is isotropic (any direction is possible); where the view is going
+  is the predictions' to say (the views ahead, step C), never an extrapolation here.
 - A tile that leaves the neighbourhood keeps its last `P`, and its release key ages as
   GreedyDual-Size's does (`L + P·R/bytes`, `L` the time it was last needed): nothing drops
   from one score to zero.
@@ -92,8 +106,27 @@ The score orders the value band only. Before it, in this order and whatever the 
 
 1. **the floor** (levels ≤ `F`): loaded first, never released;
 2. **coverage**: a wanted tile with nothing drawable (a hole) loads before any value;
-3. **the swap**: what is drawn, and the children a drawn parent waits on, is never released;
-4. **the hard limit**.
+3. **the swap**: what is drawn, the children a drawn parent waits on, and the chain of
+   ancestors of what is drawn (its fallback), are never released;
+4. **the present need before anticipation**: a drawn tile's other loads (its drape) rank
+   before every preload, whatever the values (`Precedence::Value` before
+   `Precedence::Anticipation`);
+5. **the hard limit**.
+
+**Release is proactive, in both tiers.** Every step, the release of the lowest scores keeps
+each GPU class (and the pool) and the decoded tier under `target × (1 − headroom)`
+(`headroom` 12.5 %, `Params::headroom_permille`), not only when a load needs room nor only
+over the target; preloads are delivered only under that line. A copy that leaves the need
+keeps a 64th of its probability of use; a copy no longer wanted whose probability is under
+the **floor value** (1 %, `Params::floor_value_permille`) goes even with room left — a preload
+left behind by a zoom-out goes within a few steps, a copy drawn a moment ago (1/64 ≈ 1.6 %)
+stays as cache until room is needed. That pass looks at 64 copies a step from the bottom of
+the release order (frame spikes stay small); the headroom sweep is not bounded, so need never
+waits while low scores hold the pools. Never released: what is drawn, a swap, the floor, the
+chain of what is drawn, what is in transit. The window and the metrics count the releases
+per step by reason — `headroom`, `below_floor_value`, `make_room` — by level × distance
+(`released_by_level_distance{level,distance,reason}`, `released_total{reason}`), GPU and
+decoded (`side` evict | decoded).
 
 A preload never displaces anything the present need wants; it displaces another preload only
 when `P(new) > P(old) × (1 + m)` (hysteresis: two tiles of nearly equal score do not trade
@@ -145,7 +178,15 @@ come before the far coarse ones by `D`: at `d = ρ` a level-`n` tile scores ¼.
   change: a still or slowly moving camera costs nothing. The walk visits at most
   `4 K` tiles per level (the children of the tiles within `ρ/2`).
 - The budget reads it as part of the need's delta, tile by tile: a tile's `P` changes only
-  when its `d` or `n` did. Its release key is re-filed then, never in a per-step sort.
+  when its `d` or `n` did, for the wants the need named (`ScoreStats::places`). A wanted
+  resource is in no persistent index (the step's room sorts the wanted ones under pressure,
+  as before); a held resource no longer wanted keeps its last `P` and ages by `L`. So a
+  re-key of the persistent release index (`ScoreStats::rekeys`, O(log N) each) happens only
+  for a filed resource whose probability moved — bounded by what the step named, never by
+  what is held (`a_turn_re_keys_what_it_names_not_what_is_held`: the same with 4 000 and
+  40 000 copies held).
+- `d` is quantised in sixteenths of a tile; `F` is a tile's centre, so the distances move
+  only when the eye crosses a tile of its level.
 - The decision stays pure CPU and never waits on I/O; preloads are started with free slots
   only, at most three quarters of them (the last quarter stays free for the present need), and a hole preempts a preload in flight.
 

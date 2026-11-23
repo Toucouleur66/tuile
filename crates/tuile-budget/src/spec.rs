@@ -292,6 +292,11 @@ pub const PROGRESSIVE: Progressive = Progressive {
     descend_permille: 200,
 };
 
+/// The room kept free under each target by default, ‰ (12.5 %).
+pub const HEADROOM: u16 = 125;
+/// The probability under which a copy no longer wanted goes, ‰.
+pub const FLOOR_VALUE: u16 = 10;
+
 /// The defaults: the ring before the ancestors, as the tiers were.
 const ANTICIPATION: Anticipation = Anticipation {
     ring_permille: 500,
@@ -324,6 +329,14 @@ pub struct Params {
     pub anticipation: Anticipation,
     /// The progressive score's level terms.
     pub progressive: Progressive,
+    /// The room kept free under each target, ‰: the release of the lowest
+    /// scores runs every step down to `target × (1 − headroom)`, in both
+    /// tiers (GPU and decoded), not only when a load needs room.
+    pub headroom_permille: u16,
+    /// The probability of use, ‰, under which an undrawn copy no longer
+    /// wanted is released even with room left: the pools hold what is
+    /// useful, not what is old.
+    pub floor_value_permille: u16,
 }
 
 /// The policy of the decider: rules and numbers. See the [module
@@ -409,6 +422,8 @@ impl Specification {
                 blend: Micros::from_secs(2),
                 anticipation: ANTICIPATION,
                 progressive: PROGRESSIVE,
+                headroom_permille: HEADROOM,
+                floor_value_permille: FLOOR_VALUE,
             },
         }
     }
@@ -459,6 +474,8 @@ impl Specification {
                 blend: Micros::ZERO,
                 anticipation: ANTICIPATION,
                 progressive: PROGRESSIVE,
+                headroom_permille: HEADROOM,
+                floor_value_permille: FLOOR_VALUE,
             },
         }
     }
@@ -516,6 +533,8 @@ impl Specification {
                     ancestor_permille: 250,
                 },
                 progressive: PROGRESSIVE,
+                headroom_permille: HEADROOM,
+                floor_value_permille: FLOOR_VALUE,
             },
         }
     }
@@ -618,6 +637,8 @@ impl Specification {
             ("p_ancestor", u64::from(p.anticipation.ancestor_permille), 1_000),
             ("a0", u64::from(p.progressive.a0_permille), 1_000),
             ("a_desc", u64::from(p.progressive.descend_permille), 1_000),
+            ("headroom", u64::from(p.headroom_permille), 500),
+            ("floor_value", u64::from(p.floor_value_permille), 1_000),
         ];
         if let Some((name, ..)) = bounded.iter().find(|(_, v, max)| v > max) {
             return Err(SpecError::OutOfBounds(name));
@@ -652,7 +673,7 @@ impl Specification {
             "spec={}&margin={}&min_dwell_ms={}&horizon_ms={}&blend_ms={}\
              &speculation_slots={}&speculation_memory={}&coarse_through={}\
              &restore_decoded_ms={}&restore_stored_ms={}&restore_http_cache_ms={}\
-             &restore_remote_ms={}&p_ring={}&p_ancestor={}&a0={}&a_desc={}",
+             &restore_remote_ms={}&p_ring={}&p_ancestor={}&a0={}&a_desc={}&headroom={}&floor_value={}",
             self.kind.label(),
             p.margin_permille,
             ms(p.min_dwell),
@@ -669,6 +690,8 @@ impl Specification {
             p.anticipation.ancestor_permille,
             p.progressive.a0_permille,
             p.progressive.descend_permille,
+            p.headroom_permille,
+            p.floor_value_permille,
         );
         // A term's weight when all its rules share one; a term weighed
         // differently by predicate (FPV's recency) keeps its kind's rules.
@@ -724,6 +747,8 @@ impl Specification {
                 "p_ancestor" => p.anticipation.ancestor_permille = n16,
                 "a0" => p.progressive.a0_permille = n16,
                 "a_desc" => p.progressive.descend_permille = n16,
+                "headroom" => p.headroom_permille = n16,
+                "floor_value" => p.floor_value_permille = n16,
                 _ => match k
                     .strip_prefix("w_")
                     .and_then(|t| Term::ALL.into_iter().find(|x| term_key(*x) == t))

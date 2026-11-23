@@ -46,11 +46,13 @@ pub enum Side {
     Evict,
     /// A GPU copy held.
     Held,
+    /// A decoded (RAM) copy released.
+    Decoded,
 }
 
 impl Side {
     /// Every side, in index order.
-    pub const ALL: [Side; 3] = [Side::Preload, Side::Evict, Side::Held];
+    pub const ALL: [Side; 4] = [Side::Preload, Side::Evict, Side::Held, Side::Decoded];
 
     /// Its label (`side` in telemetry).
     pub fn label(self) -> &'static str {
@@ -58,12 +60,13 @@ impl Side {
             Side::Preload => "preload",
             Side::Evict => "evict",
             Side::Held => "held",
+            Side::Decoded => "decoded",
         }
     }
 }
 
 /// Sides of a breakdown.
-pub const SIDES: usize = 3;
+pub const SIDES: usize = 4;
 
 /// The terms of one resource's score.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -277,8 +280,10 @@ pub enum Reason {
     Admission,
     /// A preload displaced by one worth more than it by the margin.
     Swap,
-    /// The sweep down to the low watermark.
+    /// The sweep down to the headroom under the target.
     Sweep,
+    /// A copy no longer wanted, its probability under the floor value.
+    BelowFloorValue,
     /// The sweep, under a memory signal.
     Pressure,
     /// What an epoch's change left behind.
@@ -292,7 +297,8 @@ impl Reason {
             Reason::Preload => "preload",
             Reason::Admission => "admission",
             Reason::Swap => "swap",
-            Reason::Sweep => "sweep",
+            Reason::Sweep => "headroom",
+            Reason::BelowFloorValue => "below_floor_value",
             Reason::Pressure => "pressure",
             Reason::Recycled => "recycled",
         }
@@ -399,11 +405,24 @@ pub struct ScoreParams {
     /// The level the view needs at its nearest point, as the need placed
     /// the last preload it listed (`n`); `None` before any.
     pub need_level: Option<u32>,
+    /// The room kept free under each target, ‰.
+    pub headroom_permille: u32,
+    /// The probability under which a copy no longer wanted goes, ‰.
+    pub floor_value_permille: u32,
+    /// `R` per tier in force, µs, in [`RESTORE_TIERS`]' order: measured
+    /// where the tier has samples, the specification's otherwise.
+    pub restore_us: [u64; 4],
+    /// Whether each tier's `R` is measured.
+    pub restore_measured: [bool; 4],
 }
+
+/// The tiers of [`ScoreParams::restore_us`], as `restore_cost_seconds`
+/// labels them (`tier`).
+pub const RESTORE_TIERS: [&str; 4] = ["decoded", "stored", "http_cache", "network"];
 
 impl ScoreParams {
     /// `name=value` pairs, as the gauges and the header print them.
-    pub fn pairs(&self) -> [(&'static str, i64); 7] {
+    pub fn pairs(&self) -> [(&'static str, i64); 9] {
         let opt = |v: Option<u32>| v.map_or(-1, i64::from);
         [
             ("a0_permille", i64::from(self.a0_permille)),
@@ -413,7 +432,22 @@ impl ScoreParams {
             ("floor_level", opt(self.floor_level)),
             ("preload_slots_permille", i64::from(self.preload_slots_permille)),
             ("need_level", opt(self.need_level)),
+            ("headroom_permille", i64::from(self.headroom_permille)),
+            ("floor_value_permille", i64::from(self.floor_value_permille)),
         ]
+    }
+
+    /// `R` per tier, one line: milliseconds, `*` where measured.
+    pub fn restore_line(&self) -> String {
+        let parts: Vec<String> = RESTORE_TIERS
+            .iter()
+            .zip(self.restore_us)
+            .zip(self.restore_measured)
+            .map(|((t, us), m)| {
+                format!("{t} {:.1} ms{}", us as f64 / 1000.0, if m { "*" } else { "" })
+            })
+            .collect();
+        format!("R(tier): {} (* measured)", parts.join(", "))
     }
 
     /// The formula with its numbers, one line.
@@ -422,13 +456,15 @@ impl ScoreParams {
             .floor_level
             .map_or_else(|| "none".to_owned(), |f| format!("≤{f}"));
         format!(
-            "score = A·D·R/bytes · A=a0·2^−(n−1−ℓ) a0={:.2} a↓={:.2} · D=ρ²/(ρ+d)² ρ={} · m={}% · floor {} · preload ≤{}% slots",
+            "score = A·D·R/bytes · A=a0·2^−(n−1−ℓ) a0={:.2} a↓={:.2} · D=ρ²/(ρ+d)² ρ={} · m={}% · floor {} · preload ≤{}% slots · headroom {:.1}% · floor value P<{:.3}",
             f64::from(self.a0_permille) / 1000.0,
             f64::from(self.descend_permille) / 1000.0,
             self.rho,
             self.margin_permille / 10,
             floor,
             self.preload_slots_permille / 10,
+            f64::from(self.headroom_permille) / 10.0,
+            f64::from(self.floor_value_permille) / 1000.0,
         )
     }
 }
@@ -445,6 +481,29 @@ pub struct ScoreStats {
     pub evictions: [[u32; DISTANCE_BANDS]; LEVELS],
     /// The parameters in force.
     pub params: ScoreParams,
+    /// Places set this step (a want's probability or band read again: the
+    /// wants the need named), and of them the re-keys of the persistent
+    /// release index (a filed resource whose probability moved), each
+    /// O(log N): bounded by what the step named, never by what is held.
+    pub places: u32,
+    pub rekeys: u32,
+    /// This step's releases, GPU and decoded, by reason
+    /// ([`RELEASE_REASONS`]), level and band.
+    pub released: [[[u32; DISTANCE_BANDS]; LEVELS]; 3],
+}
+
+/// The reasons of [`ScoreStats::released`]: the headroom's sweep (and a
+/// memory signal's), the floor value, room made for a delivery.
+pub const RELEASE_REASONS: [&str; 3] = ["headroom", "below_floor_value", "make_room"];
+
+/// The [`RELEASE_REASONS`] index of `r`; `None` for an epoch's recycling.
+pub fn release_reason(r: Reason) -> Option<usize> {
+    match r {
+        Reason::Sweep | Reason::Pressure => Some(0),
+        Reason::BelowFloorValue => Some(1),
+        Reason::Admission | Reason::Swap => Some(2),
+        Reason::Preload | Reason::Recycled => None,
+    }
 }
 
 impl Default for ScoreStats {
@@ -453,6 +512,9 @@ impl Default for ScoreStats {
             preload_in_flight: [[0; DISTANCE_BANDS]; LEVELS],
             evictions: [[0; DISTANCE_BANDS]; LEVELS],
             params: ScoreParams::default(),
+            places: 0,
+            rekeys: 0,
+            released: [[[0; DISTANCE_BANDS]; LEVELS]; 3],
         }
     }
 }

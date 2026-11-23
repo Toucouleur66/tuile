@@ -425,3 +425,254 @@ fn a_preload_worth_more_by_the_margin_takes_a_weaker_ones_place() {
         assert!(gpu(&r, id), "level 11: {id:?} not resident after the zoom-in");
     }
 }
+
+/// A grazing view: tiles near the eye at level 13, the far ground towards
+/// the horizon drawn at level 7. The traversal places each ancestor against
+/// the need *at its place* — the finest level drawn under it — so the far
+/// ground's coarse ancestors (level 6, `A` = a0) load before a refinement
+/// under the eye (level 14, `A` = a↓).
+#[test]
+fn a_grazing_view_loads_the_far_coarse_ground_before_a_refinement_under_the_eye() {
+    let mut c = config(Bytes::mib(512), 4);
+    c.max_in_flight = tuile_budget::PerClass::splat(2);
+    let mut r = Rig::new(c);
+    let near: Vec<TileId> = (0..3).map(|x| t(13, 4000 + x, 3000)).collect();
+    let far: Vec<TileId> = (0..3).map(|x| t(7, 70 + x, 40)).collect();
+    let mut ns = NeedSet {
+        drawn: near.iter().chain(&far).map(|&t| (t, need(t))).collect(),
+        ..NeedSet::default()
+    };
+    // The far ground's parents, on the footprint, needing level 7 there.
+    let far_parents: BTreeSet<TileId> = far.iter().filter_map(|t| parent(*t)).collect();
+    for &p in &far_parents {
+        ns.ancestors.push((p, need(p).with_proximity(7, 0.0)));
+    }
+    // A refinement under the eye: level 14, on the footprint, needing 13.
+    let fine: Vec<TileId> = near.iter().flat_map(|t| children(*t)).take(4).collect();
+    for &f in &fine {
+        ns.ring.push((f, need(f).with_proximity(13, 0.0)));
+    }
+    // The drawn tiles in first.
+    let drawn: BTreeSet<TileId> = ns.drawn.iter().map(|(t, _)| *t).collect();
+    let mut order: Vec<TileId> = Vec::new();
+    for _ in 0..40 {
+        let d = r.step(&ns);
+        for s in &d.start {
+            if let ResourceId::Mesh(t) = s.resource {
+                if !drawn.contains(&t) {
+                    order.push(t);
+                }
+            }
+        }
+        r.load_where(|_| true);
+        r.upload(&d);
+    }
+    let first_fine = order.iter().position(|t| fine.contains(t)).unwrap();
+    let last_far = order.iter().rposition(|t| far_parents.contains(t)).unwrap();
+    assert!(last_far < first_fine, "the refinement came first: {order:?}");
+}
+
+/// `R` is measured: a slower network, measured, raises the restore cost of
+/// what comes back from it — its copies held score higher (kept longer) and
+/// its preloads gain more lead (started sooner) — and the specification's
+/// constant stands until a tier has samples.
+#[test]
+fn a_slower_measured_network_raises_its_restore_cost() {
+    use tuile_budget::{Measured, TierSample};
+    let run = |latency_us: Option<u32>| {
+        // A small decoded tier: the copies held lose their decoded copy and
+        // would come back from the network.
+        let mut c = config(Bytes::mib(512), 4);
+        c.decoded_target = Bytes::mib(2);
+        let mut r = Rig::new(c);
+        if let Some(l) = latency_us {
+            r.b.measure(Measured {
+                interval: 1,
+                network: TierSample {
+                    latency_us: l,
+                    bytes_per_ms: 0,
+                    failures_permille: 0,
+                    samples: 20,
+                },
+                ..Measured::default()
+            });
+        }
+        let v = View::at(0.4, 0.6, 11);
+        let need = v.need(4);
+        let mut preload = None;
+        for _ in 0..400 {
+            let d = r.step(&need);
+            let lead = d
+                .scores
+                .iter()
+                .filter(|e| e.side == Side::Preload)
+                .map(|e| e.terms.r_us)
+                .max();
+            preload = preload.max(lead);
+            let idle = d.start.is_empty() && d.deliver.is_empty() && d.upload_plan.items.is_empty();
+            r.complete(&d);
+            if idle {
+                break;
+            }
+        }
+        let held = r.b.held_report();
+        let restore = r.b.restore_costs();
+        // The copies held without their decoded copy come back from the
+        // network: the largest R held, and the largest score.
+        let score = held
+            .board
+            .cells()
+            .fold(None, |acc: Option<(u64, u64)>, (.., c)| {
+                let (r, sc) = acc.unwrap_or((0, 0));
+                Some((r.max(c.r_us.max), sc.max(c.score.max)))
+            });
+        (restore, preload, score)
+    };
+    let (default, ..) = run(None);
+    assert_eq!(default.remote, tuile_budget::Micros::from_millis(150), "the constant until samples");
+    let (fast, fast_preload, fast_held) = run(Some(80_000));
+    let (slow, slow_preload, slow_held) = run(Some(1_200_000));
+    assert!(slow.remote > fast.remote, "{slow:?} {fast:?}");
+    assert!(slow_preload > fast_preload, "{slow_preload:?} {fast_preload:?}");
+    let (fast_r, fast_s) = fast_held.unwrap();
+    let (slow_r, slow_s) = slow_held.unwrap();
+    assert!(slow_r > fast_r && slow_s > fast_s, "{slow_held:?} {fast_held:?}");
+}
+
+/// The release order follows the camera without re-keying what is held:
+/// a turn re-places only the wants the need named — the neighbourhood —
+/// and re-keys the persistent index only for those filed whose probability
+/// moved, as many with 4 000 as with 40 000 copies held.
+#[test]
+fn a_turn_re_keys_what_it_names_not_what_is_held() {
+    let rekeys_with = |held: u64| -> (u32, u32) {
+        let mut c = config(Bytes::gib(64), 4);
+        c.max_in_flight = tuile_budget::PerClass::splat(8_192);
+        c.request_heap = 65_536;
+        c.upload_bytes_per_frame = Bytes::gib(64);
+        c.delivery_credit = Bytes::gib(64);
+        let mut r = Rig::new(c);
+        // `held` copies at level 9 far from the view, then left.
+        let side = (held as f64).sqrt().ceil() as u64;
+        let bulk: Vec<TileId> = (0..held).map(|i| t(9, i % side, 300 + i / side)).collect();
+        let mut first = NeedSet::default();
+        first.drawn = bulk.iter().map(|&t| (t, need(t))).collect();
+        settle(&mut r, &first, 50);
+        let east = View {
+            reach: 3.0,
+            look: Some((1.0, 0.0)),
+            ..View::at(0.21, 0.13, 13)
+        };
+        settle(&mut r, &east.need(4), 200);
+        // The turn: the neighbourhood's distances move (the motion's side
+        // nearer), every tile of it named.
+        let mut turned = east.need(4);
+        for (_, n) in turned.ring.iter_mut() {
+            if let Some(p) = n.proximity.as_mut() {
+                p.tiles_away = (p.tiles_away + 0.75).min(4.0);
+            }
+        }
+        let d = r.step(&turned);
+        (d.stats.score.places, d.stats.score.rekeys)
+    };
+    let (places_small, rekeys_small) = rekeys_with(4_000);
+    let (places_large, rekeys_large) = rekeys_with(40_000);
+    assert!(places_small > 0, "the turn placed nothing");
+    assert_eq!(places_small, places_large, "places depend on what is held");
+    assert_eq!(rekeys_small, rekeys_large, "re-keys depend on what is held");
+    // Bounded by the neighbourhood: K per level over the levels listed.
+    assert!(places_large as usize <= per_level(4) * 14 * 2, "{places_large}");
+}
+
+/// Laurent's Tuile.app, 4.3 km over a coast (main 9a5ee85e): the drapes'
+/// class at its target, nearly all of it undrawn fine drapes left from a
+/// zoom-in, 220 tiles under their imagery need, and nothing loading. The
+/// pool full of what nobody draws must give way to the need: still, the
+/// view's own drapes load and every tile wears its own level.
+#[test]
+fn a_pool_full_of_undrawn_fine_drapes_gives_way_to_the_need() {
+    let mut r = Rig::new(config(Bytes::mib(96), 4));
+    // Zoomed in: tiles of level 16 wearing level-18 imagery, as many as
+    // the drapes' class holds.
+    let fine: Vec<TileId> = (0..12u64).flat_map(|x| (0..12u64).map(move |y| t(16, 21_000 + x, 14_000 + y))).collect();
+    let zoomed = NeedSet {
+        drawn: fine.iter().map(|&id| (id, draped(id, 18))).collect(),
+        ..NeedSet::default()
+    };
+    settle(&mut r, &zoomed, 600);
+    // Out: other tiles, level 11, wanting level-13 imagery; the fine drapes
+    // are drawn by nobody now.
+    let wide: Vec<TileId> = (0..10u64).flat_map(|x| (0..10u64).map(move |y| t(11, 600 + x, 400 + y))).collect();
+    let out = NeedSet {
+        drawn: wide.iter().map(|&id| (id, draped(id, 13))).collect(),
+        ..NeedSet::default()
+    };
+    let mut started = 0;
+    let mut last = None;
+    for _ in 0..600 {
+        let d = r.step(&out);
+        started += d.start.len();
+        r.complete(&d);
+        last = Some(d);
+    }
+    let d = last.unwrap();
+    assert!(started > 0, "nothing loaded");
+    assert_eq!(d.stats.lost + d.stats.bare, 0);
+    assert_eq!(
+        d.stats.deficit.imagery_under(),
+        0,
+        "tiles under their imagery need while undrawn drapes hold the pool"
+    );
+    for &id in &wide {
+        assert!(
+            r.b.resource(dr(id, 13)).is_some_and(|v| v.gpu > Bytes::ZERO),
+            "{id:?}'s own drape not resident"
+        );
+    }
+}
+
+/// The headroom: a still view whose neighbourhood outgrows the budget
+/// settles with the unprotected copies under `target − headroom` in every
+/// class, and holds no copy left behind under the floor value.
+#[test]
+fn a_still_view_keeps_its_pools_under_the_headroom() {
+    let mut r = Rig::new(config(Bytes::mib(48), 4));
+    let v = View::at(0.3333, 0.6666, 14);
+    let need = v.need(4);
+    let mut d = settle(&mut r, &need, 800);
+    for _ in 0..30 {
+        d = r.step(&need);
+        r.complete(&d);
+    }
+    let headroom = tuile_budget::spec::HEADROOM;
+    for c in [Class::TerrainMesh, Class::Drape] {
+        let free = d.stats.gpu[c].minus(d.stats.protected[c]);
+        let under = d.stats.target[c].scaled(u64::from(1_000 - headroom), 1_000);
+        assert!(free <= under, "{c:?}: {free:?} unprotected over {under:?}");
+    }
+    let floor = CERTAIN / 1_000 * u32::from(tuile_budget::spec::FLOOR_VALUE);
+    let held = r.b.held_report();
+    for h in held.lowest.iter().filter(|h| h.state == tuile_budget::score::HeldState::Left) {
+        assert!(h.terms.p >= floor, "{:?} held under the floor value", h.resource);
+    }
+}
+
+/// After a zoom-out, the preloads left behind — the finer level the old
+/// view anticipated — are released within a few steps, room or not.
+#[test]
+fn the_fine_preloads_left_behind_by_a_zoom_out_are_released() {
+    let mut r = Rig::new(config(Bytes::mib(512), 4));
+    let (fx, fy) = (0.7071, 0.2929);
+    let low = View::at(fx, fy, 13);
+    settle(&mut r, &low.need(4), 600);
+    let finer: Vec<TileId> = around(14, fx, fy, 4.0).into_iter().map(|(_, t)| t).collect();
+    assert!(finer.iter().any(|t| gpu(&r, *t)), "level 14 never preloaded");
+    let high = View::at(fx, fy, 9);
+    let need = high.need(4);
+    for _ in 0..20 {
+        let d = r.step(&need);
+        r.complete(&d);
+    }
+    let left = finer.iter().filter(|t| gpu(&r, **t)).count();
+    assert_eq!(left, 0, "{left} level-14 preloads still held 20 steps after the zoom-out");
+}

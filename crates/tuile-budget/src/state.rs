@@ -549,6 +549,9 @@ pub(super) struct Arena {
     /// Slots that held nothing at some point since the prune last looked:
     /// the only ones a prune can free.
     emptied: Vec<Slot>,
+    /// Re-keys of the release index by a change of place since the step
+    /// last took them ([`Arena::take_rekeys`]).
+    rekeys: u32,
 }
 
 /// The bytes one slot holds across the columns, its index and free-list
@@ -620,6 +623,7 @@ impl Default for Arena {
             protected: PerClass::splat(Bytes::ZERO),
             gpu_epochs: BTreeMap::new(),
             emptied: Vec::new(),
+            rekeys: 0,
         }
     }
 }
@@ -934,6 +938,13 @@ impl Arena {
         (need, u32::from(o.prob), o.band())
     }
 
+    /// The re-keys of the release index by a change of place since the
+    /// last call: each O(log N), only for a resource whose probability
+    /// moved.
+    pub fn take_rekeys(&mut self) -> u32 {
+        std::mem::take(&mut self.rekeys)
+    }
+
     /// The specification's table the release key reads.
     pub fn valuation(&self) -> &super::value::Valuation {
         &self.valuation
@@ -1005,9 +1016,13 @@ impl Arena {
         if o.prob == prob && o.level_band == level_band && o.need == need {
             return;
         }
-        // Only the probability is in the key: the rest is statistics.
+        // Only the probability is in the key: the rest is statistics. A
+        // grouped resource is in no index: nothing to re-key.
         let rekey = o.prob != prob;
         if rekey {
+            if !self.grouped(s) && self.held(s).is_some() {
+                self.rekeys = self.rekeys.saturating_add(1);
+            }
             self.unfile(s);
         }
         let o = &mut self.order[s.i()];
