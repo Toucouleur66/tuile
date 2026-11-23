@@ -32,6 +32,7 @@ mod readout;
 mod screen;
 mod script;
 mod setup;
+mod shutter;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use setup::backend_named;
 mod stall;
@@ -397,6 +398,11 @@ pub struct App {
     /// The levels written on each tile on screen (`tile_labels`).
     tile_labels: tile_labels::TileLabels,
     recording: tape::Recording,
+    /// Snapshots: the frame drawn, saved with the view in its EXIF.
+    shutter: shutter::Shutter,
+    /// The fallback rule last given by hand (`Command::Fallback`), for a
+    /// snapshot's notes: `None` when none was.
+    fallback: Option<Option<(u32, u32)>>,
     warmup: warmup::Warmup,
     pacing: pacing::Pacing,
     watch: pacing::Watch,
@@ -562,6 +568,8 @@ impl App {
             budget_window: budget_window::BudgetWindow::default(),
             budget_screen: None,
             tile_labels: tile_labels::TileLabels::default(),
+            shutter: shutter::Shutter::new(snapshot_settings()),
+            fallback: None,
             recording: tape::Recording {
                 tape: crate::recording::open_tape(config.record.path.as_deref()),
                 trace: crate::recording::open_trace(),
@@ -829,7 +837,7 @@ impl App {
     /// text this window has and because the log may be going nowhere: a
     /// session started from an icon has no terminal to read. The message
     /// stays a few seconds, or until the next one replaces it.
-    fn say(&mut self, message: &str) {
+    pub(super) fn say(&mut self, message: &str) {
         tracing::info!("{message}");
         let now = web_time::Instant::now();
         self.notice = Some((message.to_owned(), now));
@@ -1037,7 +1045,7 @@ impl App {
     /// The 3D view, in device pixels: the frame above the credits bar, from
     /// the frame's top-left — the whole frame when there is no bar. What the
     /// camera, the traversal, picking and the gestures all measure against.
-    fn viewport(&self) -> (f64, f64) {
+    pub(super) fn viewport(&self) -> (f64, f64) {
         credits::view_of(self.frame_size(), self.credits.height())
     }
 
@@ -1202,6 +1210,19 @@ fn world_overlay_view(
     // direction to the eye is measured from.
     tuile_wgpu::WorldOverlayView::new(view_proj, right, right.cross(fwd))
         .with_eye((camera.position - origin).as_vec3())
+}
+
+/// What `[snapshot]` of the configuration says: the settings a desktop or a
+/// phone runs with. A page has none and takes the defaults.
+fn snapshot_settings() -> crate::photo::SnapshotSettings {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        crate::import::running().snapshot.unwrap_or_default()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        crate::photo::SnapshotSettings::default()
+    }
 }
 
 /// The wall's present, Unix seconds UTC.

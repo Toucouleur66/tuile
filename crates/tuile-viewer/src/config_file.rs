@@ -45,6 +45,13 @@
 //! profiling_endpoint = "https://collector.example/pyroscope"  # optional: CPU profiles
 //! profiling = "on"                      # optional: on (default) or off — the menu switches it
 //! profiling_hz = 100                    # optional: samples a second
+//!
+//! [snapshot]                            # optional: the S key's pictures
+//! folder = "~/Pictures/Tuile"           # optional: where they go (this is the default)
+//! format = "jpeg"                       # optional: or "png", lossless (default jpeg)
+//! quality = 95                          # optional: the JPEG's, 1 to 100 (default 95)
+//! layers = ["shapes"]                   # optional: drawn over the globe: shapes, hud,
+//!                                       # controls (default none: the globe only)
 //! ```
 //!
 //! A template layer answers 404 for a tile it does not have: an absence,
@@ -92,6 +99,9 @@ const TELEMETRY_KEYS: [&str; 7] = [
     "profiling_hz",
 ];
 
+/// The keys of `[snapshot]`.
+const SNAPSHOT_KEYS: [&str; 4] = ["folder", "format", "quality", "layers"];
+
 /// An access token. Never printed: no `Display`, a `Debug` that hides it.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Token(String);
@@ -130,6 +140,8 @@ pub(crate) struct Settings {
     pub start: Vec<(String, f64)>,
     /// Where the performance numbers go (`[telemetry]`), without its token.
     pub telemetry: Option<TelemetrySettings>,
+    /// Where snapshots go and how they are made (`[snapshot]`).
+    pub snapshot: Option<crate::photo::SnapshotSettings>,
 }
 
 /// An imagery layer from a tile server, named by its URL template.
@@ -353,10 +365,18 @@ pub(crate) fn parse(file: &str, text: &str, section: &str) -> Result<ConfigFile,
             let (read, its_token) = read_telemetry(telemetry).map_err(|(k, why)| fail(&k, &why))?;
             settings.telemetry = Some(read);
             telemetry_token = its_token;
+        } else if key == "snapshot" {
+            let Value::Table(snapshot) = value else {
+                return Err(fail(key, "must be a table: [snapshot]"));
+            };
+            settings.snapshot = Some(read_snapshot(snapshot).map_err(|(k, why)| fail(&k, &why))?);
         } else {
             return Err(fail(
                 key,
-                &format!("unknown section; this file knows [{section}], [start] and [telemetry]"),
+                &format!(
+                    "unknown section; this file knows [{section}], [start], [telemetry] \
+                     and [snapshot]"
+                ),
             ));
         }
     }
@@ -740,6 +760,64 @@ fn read_telemetry(table: &Table) -> Result<(TelemetrySettings, Option<Token>), P
     Ok((out, token))
 }
 
+fn read_snapshot(table: &Table) -> Result<crate::photo::SnapshotSettings, Problem> {
+    use crate::photo::{Format, Layers};
+    let mut out = crate::photo::SnapshotSettings::default();
+    let mut png = false;
+    let mut quality = None;
+    for (key, value) in table {
+        let at = format!("snapshot.{key}");
+        if !SNAPSHOT_KEYS.contains(&key.as_str()) {
+            return Err((
+                at,
+                format!("unknown key; the keys are {}", SNAPSHOT_KEYS.join(", ")),
+            ));
+        }
+        match (key.as_str(), value) {
+            ("folder", Value::String(folder)) if !folder.trim().is_empty() => {
+                out.folder = Some(folder.trim().to_owned());
+            }
+            ("format", Value::String(format)) => match format.trim() {
+                "jpeg" | "jpg" => png = false,
+                "png" => png = true,
+                _ => return Err((at, "must be \"jpeg\" or \"png\"".into())),
+            },
+            ("quality", Value::Integer(q)) if (1..=100).contains(q) => quality = Some(*q as u8),
+            ("layers", Value::Array(names)) => {
+                let names: Option<Vec<&str>> = names.iter().map(Value::as_str).collect();
+                let names =
+                    names.ok_or_else(|| (at.clone(), "must be a list of names in quotes".into()))?;
+                out.layers = Some(Layers::from_names(names).map_err(|why| (at.clone(), why))?);
+            }
+            ("folder", _) => return Err((at, "must be a non-empty path in quotes".into())),
+            ("format", _) => return Err((at, "must be \"jpeg\" or \"png\"".into())),
+            ("quality", _) => return Err((at, "must be a whole number from 1 to 100".into())),
+            _ => {
+                return Err((
+                    at,
+                    format!("must be a list of {}", Layers::NAMES.join(", ")),
+                ))
+            }
+        }
+    }
+    if png && quality.is_some() {
+        return Err((
+            "snapshot.quality".into(),
+            "is a JPEG's: a PNG is lossless".into(),
+        ));
+    }
+    if table.contains_key("format") || quality.is_some() {
+        out.format = Some(if png {
+            Format::Png
+        } else {
+            Format::Jpeg {
+                quality: quality.unwrap_or(crate::photo::DEFAULT_QUALITY),
+            }
+        });
+    }
+    Ok(out)
+}
+
 fn read_start(start: &Table) -> Result<Vec<(String, f64)>, Problem> {
     let mut out = Vec::new();
     for (key, value) in start {
@@ -894,12 +972,72 @@ pub(crate) fn settings_text(section: &str, settings: &Settings) -> String {
         }
         root.insert("telemetry".into(), Value::Table(table));
     }
+    if let Some(snapshot) = &settings.snapshot {
+        let mut table = Table::new();
+        if let Some(folder) = &snapshot.folder {
+            table.insert("folder".into(), Value::String(folder.clone()));
+        }
+        match snapshot.format {
+            Some(crate::photo::Format::Png) => {
+                table.insert("format".into(), Value::String("png".into()));
+            }
+            Some(crate::photo::Format::Jpeg { quality }) => {
+                table.insert("format".into(), Value::String("jpeg".into()));
+                table.insert("quality".into(), Value::Integer(i64::from(quality)));
+            }
+            None => {}
+        }
+        if let Some(layers) = snapshot.layers {
+            table.insert(
+                "layers".into(),
+                Value::Array(
+                    layers
+                        .names()
+                        .into_iter()
+                        .map(|n| Value::String(n.into()))
+                        .collect(),
+                ),
+            );
+        }
+        root.insert("snapshot".into(), Value::Table(table));
+    }
     toml::to_string(&root).unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `[snapshot]`: read, checked key by key, and kept as it was said.
+    #[test]
+    fn the_snapshot_section_is_read_and_kept() {
+        use crate::photo::{Format, Layers};
+        let text = "[snapshot]\nfolder = \"~/Desktop/globe\"\nquality = 90\nlayers = [\"hud\"]\n";
+        let file = parse("a.tuile", text, "ion").expect("reads");
+        let snapshot = file.settings.snapshot.clone().expect("a snapshot section");
+        assert_eq!(snapshot.folder.as_deref(), Some("~/Desktop/globe"));
+        assert_eq!(snapshot.format, Some(Format::Jpeg { quality: 90 }));
+        assert_eq!(
+            snapshot.layers,
+            Some(Layers {
+                hud: true,
+                ..Layers::default()
+            })
+        );
+        let kept = settings_text("ion", &file.settings);
+        assert_eq!(parse("kept", &kept, "ion").expect("reads back").settings, file.settings);
+        let png = parse("a.tuile", "[snapshot]\nformat = \"png\"\n", "ion").expect("reads");
+        assert_eq!(png.settings.snapshot.and_then(|s| s.format), Some(Format::Png));
+        for (bad, key) in [
+            ("[snapshot]\nformat = \"gif\"\n", "snapshot.format"),
+            ("[snapshot]\nquality = 0\n", "snapshot.quality"),
+            ("[snapshot]\nformat = \"png\"\nquality = 90\n", "snapshot.quality"),
+            ("[snapshot]\nlayers = [\"menu\"]\n", "snapshot.layers"),
+            ("[snapshot]\nfolders = \"x\"\n", "snapshot.folders"),
+        ] {
+            assert_eq!(parse("a.tuile", bad, "ion").expect_err(bad).key, key, "{bad}");
+        }
+    }
 
     /// A token shaped like a real one and belonging to no one.
     const FAKE: &str = "fake.0123456789abcdef.not-a-real-token";

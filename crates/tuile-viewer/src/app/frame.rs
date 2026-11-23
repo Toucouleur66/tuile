@@ -55,6 +55,7 @@ impl App {
         let indicator = self.the_loading_indicator();
         self.upload_the_control(indicator);
         let drew = self.draw_and_present();
+        self.develop_the_snapshots();
         self.note_what_needs_frames(indicator);
         let Some((rendered, resolution, old_imagery)) = drew else {
             return;
@@ -482,6 +483,12 @@ impl App {
         // Whether this frame is due a picture of the recording, and the
         // frame index it carries.
         let snap = self.picture_due();
+        // Whether this frame is a snapshot's, and what it is taken with.
+        let shot = if self.shutter.take_armed() {
+            self.exposure()
+        } else {
+            None
+        };
         let labels_on = self.tile_labels.forced
             || super::tile_labels::WITH_LEVEL_VIEWS.contains(&self.views.diagnostic);
         let active = self.active.as_mut()?;
@@ -562,7 +569,9 @@ impl App {
         // The picture, inside whatever the window is: everything of the scene
         // is drawn in it, and the bars around it keep the clear.
         let box_ = picture;
-        let paint = |pass: &mut wgpu::RenderPass<'_>| {
+        // What a frame draws over the globe: on screen, everything; in a
+        // snapshot, what its settings list (see `shutter`).
+        let paint_with = |pass: &mut wgpu::RenderPass<'_>, layers: crate::photo::Layers| {
             if box_.width != 0 && box_.height != 0 {
                 // A plain clear outside, the scene in full inside: the
                 // scissor keeps the bars, and the viewport maps the picture.
@@ -606,7 +615,12 @@ impl App {
             // A host's shapes, after the ground that may hide them. What asked
             // for `OverlaysOnly` is not here: it goes in the pass that
             // follows, which has a depth of its own.
-            world.borrow().render(pass);
+            if layers.shapes {
+                world.borrow().render(pass);
+            }
+            if !layers.controls {
+                return;
+            }
             // The on-screen control, over everything and in the whole frame:
             // it is laid out in device pixels, not in the picture.
             if box_.width != 0 && box_.height != 0 {
@@ -617,6 +631,12 @@ impl App {
             overlay.render(pass);
             overlay_on_top.render(pass);
         };
+        let on_screen = crate::photo::Layers {
+            shapes: true,
+            hud: true,
+            controls: true,
+        };
+        let paint = |pass: &mut wgpu::RenderPass<'_>| paint_with(pass, on_screen);
         // The overlays' own pass, on the frame's encoder once its pass has
         // closed: the HUD's mode needs a depth attachment the ground never
         // reached, and that is a second pass or nothing.
@@ -680,11 +700,34 @@ impl App {
                     &views,
                     |view| renderer.set_view(&gpu.queue, view),
                     clear,
-                    (paint, after),
+                    (&paint, &after),
                 );
                 tuile_wgpu::Presented::Yes
             }
         };
+        // The snapshot asked for: the same frame once more, into the
+        // shutter's own texture, with only the layers its settings list.
+        if let Some(exposure) = shot {
+            let layers = exposure.layers;
+            let taken = self.shutter.expose(
+                &active.gpu,
+                &active.targets,
+                clear,
+                (
+                    |pass: &mut wgpu::RenderPass<'_>| paint_with(pass, layers),
+                    |encoder: &mut wgpu::CommandEncoder, frame: &tuile_wgpu::FramePass<'_>| {
+                        if layers.hud {
+                            after(encoder, frame);
+                        }
+                    },
+                ),
+                exposure,
+                picture,
+            );
+            if !taken {
+                tracing::warn!("snapshot not taken: the last ones are still on their way");
+            }
+        }
         let _ = &views;
         if outcome == tuile_wgpu::Presented::Invalid {
             tracing::warn!("the surface refused the frame");
@@ -845,7 +888,7 @@ impl App {
     /// credits bar, the whole frame without one) unless a host held the
     /// camera to an aspect, and then the largest rectangle of that shape,
     /// centred in the view.
-    fn picture(&self) -> crate::frame_host::Letterbox {
+    pub(super) fn picture(&self) -> crate::frame_host::Letterbox {
         let (w, h) = self.viewport();
         crate::frame_host::Letterbox::of((w as u32, h as u32), self.fixed_aspect)
     }

@@ -207,6 +207,8 @@ pub(crate) enum Command {
     CopyLink,
     /// Go where the link on the clipboard says, if it holds one.
     PasteLink,
+    /// Save the picture drawn, with the view in its EXIF: see `crate::photo`.
+    Snapshot,
     /// Show the keys and the flags, in a window: from the menu bar.
     #[cfg_attr(
         not(all(target_os = "macos", feature = "application")),
@@ -430,6 +432,7 @@ pub(crate) fn parse_url_among(
         }
         "north" => bare(Command::NorthUp),
         "here" => bare(Command::Here),
+        "snapshot" => bare(Command::Snapshot),
         "imagery" => match pairs.as_slice() {
             [("name", "next")] => Ok(vec![Command::NextImagery]),
             [("name", name)] => Ok(vec![Command::Imagery(layer_named(layers, name)?)]),
@@ -843,6 +846,15 @@ mod tests {
         let refused = layer_named(&layers, "road").expect_err("not a layer");
         assert!(refused.contains("aerial, labels, satellite"), "{refused}");
         assert!(layer_named(&[], "aerial").is_err());
+    }
+
+    /// `snapshot` saves the picture, and takes nothing: a URL from outside
+    /// does not choose where a file goes.
+    #[test]
+    fn a_snapshot_url_saves_the_picture() {
+        assert_eq!(parse_url("tuile://snapshot"), Ok(vec![Command::Snapshot]));
+        assert_eq!(parse_url("TUILE:snapshot/"), Ok(vec![Command::Snapshot]));
+        assert!(parse_url("tuile://snapshot?folder=/etc").is_err());
     }
 
     /// The imagery URL names one of the host's layers, or the next one, and

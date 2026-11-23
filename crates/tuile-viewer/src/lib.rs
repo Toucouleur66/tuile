@@ -33,6 +33,7 @@ mod signals;
     not(all(target_os = "macos", feature = "application")),
     allow(dead_code)
 )]
+mod photo;
 mod snapshot;
 mod start;
 mod steer;

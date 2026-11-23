@@ -200,7 +200,9 @@ impl App {
         let busy = Busy {
             moving: moving || self.flight.is_some(),
             touching: self.touches.any(),
-            indicator: indicator.is_some(),
+            // A snapshot on its way keeps the frames coming until it is
+            // kept: it is read back over the next few.
+            indicator: indicator.is_some() || self.shutter.busy(),
             uploaded: self.uploaded,
             pending_uploads: self.active.as_ref().map_or(0, |a| a.pump.pending_uploads()),
             sliding: self.active.as_ref().map_or(0, |a| a.pump.sliding()),

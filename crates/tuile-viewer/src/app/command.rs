@@ -123,6 +123,7 @@ impl App {
                 }
             }
             Command::CopyLink => self.copy_the_link(),
+            Command::Snapshot => self.take_a_snapshot(),
             Command::PasteLink => self.go_to_the_copied_link(),
             // An application that is its own window was started with flags;
             // a page's viewer was started by its host's script, and has none.
@@ -149,6 +150,7 @@ impl App {
             Command::Profiling(on) => tuile_telemetry::set_profiling(on),
             Command::Fallback(rule) => {
                 use tuile_core::budget::{FallbackRule, FallbackSpec, LayerId};
+                self.fallback = Some(rule);
                 let spec = rule.map_or_else(FallbackSpec::none, |(gap, hysteresis)| {
                     FallbackSpec::one(
                         FallbackRule::new(LayerId(0))

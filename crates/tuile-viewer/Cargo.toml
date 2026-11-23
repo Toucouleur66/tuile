@@ -45,6 +45,15 @@ winit = { workspace = true }
 # (`telemetry`): a desktop's, a phone's and a page's alike.
 metrics = "0.24"
 tuile-telemetry = { version = "0.17.1", path = "../tuile-telemetry" }
+# A snapshot's file (`photo`), on a desktop and on a page alike: encoded by
+# the image crate the recording already uses (pure Rust, builds for wasm),
+# its EXIF written by `little_exif` — MIT OR Apache-2.0, no `unsafe`, writes
+# to a buffer, and the one maintained crate that writes the GPS directory on
+# every target. See `photo`'s header.
+image = { workspace = true }
+little_exif = "0.6.23"
+# A lossless snapshot's `eXIf` chunk: the PNG crate `image` already uses.
+png = "0.18.1"
 
 # The desktop and the phone: an async runtime with threads, the tile store on
 # disk, the counters on a local endpoint, the signals. None of it exists in a
@@ -59,8 +68,6 @@ tuile-storage-foyer = { version = "0.17.1", path = "../tuile-storage-foyer" }
 # The sources the command line names by address (`--terrain-url`,
 # `--imagery-template`), fetched with no token over the native HTTP stack.
 tuile-native-fetchers = { version = "0.17.1", path = "../tuile-native-fetchers" }
-# A recording's pictures, encoded on its own threads: JPEG or PNG.
-image = { workspace = true }
 # Ctrl-C, SIGTERM and SIGHUP have to end the *session*, not the process: a
 # recording is most valuable in exactly the run that ends badly. A safe wrapper
 # rather than raw `libc::signal`, because the workspace denies `unsafe_code`.
@@ -102,6 +109,8 @@ wgpu = { workspace = true, features = ["webgpu", "webgl"] }
 [target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
 version = "0.3.76"
 features = [
+    "Blob",
+    "BlobPropertyBag",
     "CanvasRenderingContext2d",
     "Clipboard",
     "console",
@@ -113,6 +122,7 @@ features = [
     "Event",
     "EventTarget",
     "Geolocation",
+    "HtmlAnchorElement",
     "HtmlCanvasElement",
     "HtmlElement",
     "ImageData",
@@ -129,6 +139,7 @@ features = [
     "PositionError",
     "PositionOptions",
     "Storage",
+    "Url",
     "Window",
     "Worker",
     "WorkerNavigator",
@@ -148,6 +159,9 @@ bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+# A snapshot's EXIF read back by a reader that is not its writer: tests only
+# (BSD-2-Clause, read-only use).
+kamadak-exif = "0.6.2"
 
 # A tile server on a local port, for the template layers' tests.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]

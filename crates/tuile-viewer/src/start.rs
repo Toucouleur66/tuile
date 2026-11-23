@@ -107,6 +107,8 @@ KEYS:
                        tuile://goto?… URL; time=sunset&timeOffset=… when the
                        clock was started from a sunset)
     V                  go to the link on the clipboard
+    S                  save a snapshot: the picture, with the view in its
+                       EXIF, into ~/Pictures/Tuile (a page downloads it)
     I                  the next imagery layer
     W                  wireframe
     D                  cycle the diagnostic views
