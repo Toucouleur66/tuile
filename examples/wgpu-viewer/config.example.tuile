@@ -39,6 +39,21 @@ token = "YOUR-ION-TOKEN"
 # name = "Satellite"
 # asset = 3954
 # attribution = "Contains modified Copernicus Sentinel data"
+#
+# A layer can also come from any tile server, by its URL template
+# ({z}/{x}/{y}, row 0 at the north edge; PNG, JPEG or WebP). With a
+# `substitute` on another layer, that layer's far tiles are drawn from this
+# one (docs/explorations/imagery-layer-substitution.md). Its token, if the
+# server wants one, goes to secure storage like the others.
+#
+# [[ion.imagery]]
+# key = "aerial-far"
+# name = "Aerial, far levels"
+# template = "https://tiles.example/aerial/{z}/{x}/{y}.webp"
+# max_level = 18                   # the deepest level it serves
+# attribution = "© Microsoft and its data suppliers"
+# token = "YOUR-TILE-TOKEN"        # optional: kept in secure storage
+# token_header = "Authorization"   # optional: sent as a bearer by default
 
 # Optional. Where the first session opens, in the command line's units:
 # degrees, metres above the ground, degrees from north, degrees below the

@@ -12,7 +12,7 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 
 use tuile_cesium_ion::{HttpResponse, IonError, IonHttp};
-use tuile_core::fetch::{FetchError, Fetched, TileFetcher};
+use tuile_core::fetch::{Credential, FetchError, Fetched, TileFetcher};
 
 use crate::patience;
 
@@ -130,10 +130,14 @@ type Answer = (u16, Bytes, Option<u64>);
 
 /// The bytes of one response, or the reason there are none — asked as many
 /// times as [`patience`] allows `asker`.
-async fn get(url: &Url, bearer: Option<&str>, asker: patience::Asker) -> Result<Answer, String> {
+async fn get(
+    url: &Url,
+    credential: Option<&Credential>,
+    asker: patience::Asker,
+) -> Result<Answer, String> {
     let mut attempt = 1;
     loop {
-        let (ended, outcome) = match get_once(url, bearer, asker).await {
+        let (ended, outcome) = match get_once(url, credential, asker).await {
             Ok(answer) => (patience::Ended::Answered(answer.0), Ok(answer)),
             Err((ended, why)) => (ended, Err(why)),
         };
@@ -151,7 +155,7 @@ async fn get(url: &Url, bearer: Option<&str>, asker: patience::Asker) -> Result<
 /// One attempt.
 async fn get_once(
     url: &Url,
-    bearer: Option<&str>,
+    credential: Option<&Credential>,
     asker: patience::Asker,
 ) -> Result<Answer, (patience::Ended, String)> {
     let failed = |e: String| (patience::Ended::Failed, e);
@@ -167,12 +171,10 @@ async fn get_once(
 
     let request = web_sys::Request::new_with_str_and_init(url.as_str(), &opts)
         .map_err(|e| failed(js_message(&e)))?;
-    // An empty bearer is no bearer: a catalog behind a proxy is asked with
-    // none, and an `Authorization` header would only cost a preflight.
-    if let Some(token) = bearer.filter(|t| !t.is_empty()) {
+    if let Some(credential) = credential {
         request
             .headers()
-            .set("Authorization", &format!("Bearer {token}"))
+            .set(credential.header(), credential.expose())
             .map_err(|e| failed(js_message(&e)))?;
     }
     // A rejection is a network failure, or the timer's abort.
@@ -245,9 +247,44 @@ impl TileFetcher for WebFetcher {
     }
 
     async fn fetch_cacheable(&self, url: &Url) -> Result<Fetched<Bytes>, FetchError> {
+        fetch_tile(url, None).await
+    }
+}
+
+/// A [`WebFetcher`] that sends a [`Credential`] with every tile it asks
+/// for: a tile server that wants one. The server must allow the header in
+/// its CORS answer (`Access-Control-Allow-Headers`). Never printed.
+#[derive(Debug, Clone)]
+pub struct CredentialedWebFetcher {
+    credential: Credential,
+}
+
+impl CredentialedWebFetcher {
+    pub fn new(credential: Credential) -> Self {
+        Self { credential }
+    }
+}
+
+#[async_trait(?Send)]
+impl TileFetcher for CredentialedWebFetcher {
+    async fn fetch(&self, url: &Url) -> Result<Bytes, FetchError> {
+        Ok(self.fetch_cacheable(url).await?.value)
+    }
+
+    async fn fetch_cacheable(&self, url: &Url) -> Result<Fetched<Bytes>, FetchError> {
+        fetch_tile(url, Some(&self.credential)).await
+    }
+}
+
+/// One tile: a 404 is [`FetchError::NotFound`].
+async fn fetch_tile(
+    url: &Url,
+    credential: Option<&Credential>,
+) -> Result<Fetched<Bytes>, FetchError> {
+    {
         // A tile load: its retries are the budget's.
         let (status, bytes, max_age) =
-            get(url, None, patience::Asker::Load)
+            get(url, credential, patience::Asker::Load)
                 .await
                 .map_err(|message| FetchError::Io {
                     url: url.clone(),
@@ -283,7 +320,11 @@ pub struct WebIonHttp;
 #[async_trait(?Send)]
 impl IonHttp for WebIonHttp {
     async fn get(&self, url: &Url, bearer: Option<&str>) -> Result<HttpResponse, IonError> {
-        let (status, body, max_age) = get(url, bearer, patience::Asker::Session)
+        // An empty bearer is no bearer: a catalog behind a proxy is asked
+        // with none, and an `Authorization` header would only cost a
+        // preflight.
+        let credential = bearer.filter(|t| !t.is_empty()).map(Credential::bearer);
+        let (status, body, max_age) = get(url, credential.as_ref(), patience::Asker::Session)
             .await
             .map_err(|e| IonError::Transport(format!("{url}: {e}")))?;
         Ok(HttpResponse {

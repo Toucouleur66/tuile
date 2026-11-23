@@ -116,6 +116,18 @@ pub(crate) fn telemetry_token() -> Option<config_file::Token> {
     crate::secrets::System.get(TELEMETRY_TOKEN)
 }
 
+/// A template layer's token: the session's configuration file's, else what
+/// an import kept in secure storage.
+pub(crate) fn layer_token(key: &str) -> Option<config_file::Token> {
+    let from_file = SESSION.get().and_then(|s| {
+        s.layer_tokens
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, t)| t.clone())
+    });
+    from_file.or_else(|| crate::secrets::System.get(&config_file::layer_token_variable(key)))
+}
+
 /// The settings the process started with.
 pub(crate) fn running() -> Settings {
     RUNNING.get().cloned().unwrap_or_default()
@@ -252,6 +264,13 @@ pub(crate) fn import(
                 .into(),
         ));
     }
+    if !read.layer_tokens.is_empty() && !secrets.keyed() {
+        return Err(fail(
+            format!("{section}.imagery"),
+            "this platform keeps one token, the source's: a layer's token cannot be kept here"
+                .into(),
+        ));
+    }
     if let Some(token) = &read.token {
         secrets
             .put(variable, token)
@@ -261,6 +280,11 @@ pub(crate) fn import(
         secrets
             .put(TELEMETRY_TOKEN, token)
             .map_err(|why| fail("telemetry.token".into(), why))?;
+    }
+    for (key, token) in &read.layer_tokens {
+        secrets
+            .put(&config_file::layer_token_variable(key), token)
+            .map_err(|why| fail(format!("{section}.imagery.{key}.token"), why))?;
     }
     if let Some(path) = settings {
         let kept = config_file::settings_text(section, &read.settings);
@@ -280,11 +304,12 @@ pub(crate) fn import(
             .iter()
             .map(|l| (&l.key, l.asset))
             .ne(running.imagery.iter().map(|l| (&l.key, l.asset)))
+        || s.templates != running.templates
         || s.start != running.start;
     Ok(Imported {
         file: file.to_owned(),
         headline: s.headline(),
-        token: read.token.is_some(),
+        token: read.token.is_some() || !read.layer_tokens.is_empty(),
         next_start,
     })
 }
@@ -541,6 +566,70 @@ mod tests {
         assert!(single.get("SOME_TOKEN").is_none(), "something was written");
     }
 
+    /// A template layer's token goes under the layer's own key, never the
+    /// source's, and never into the settings — which keep the layer and
+    /// say it takes a token; a store of one token refuses it.
+    #[test]
+    fn a_layer_s_token_is_kept_apart() {
+        const TILES: &str = "tiles.0123456789abcdef.not-a-real-token";
+        let dir = tempfile::tempdir().expect("a directory");
+        let settings = dir.path().join(SETTINGS_FILE);
+        let text = file(&format!(
+            "[[ion.imagery]]\nkey = \"far\"\n\
+             template = \"https://tiles.example/{{z}}/{{x}}/{{y}}.webp\"\n\
+             token = \"{TILES}\"\ntoken_header = \"X-Tile-Token\"\n"
+        ));
+        let store = Fake::default();
+        let done = import(
+            "mine.tuile",
+            &text,
+            "ion",
+            "SOME_TOKEN",
+            &store,
+            Some(&settings),
+            &Settings::default(),
+        )
+        .expect("imported");
+        assert!(done.token && done.next_start);
+        assert!(!done.sentence().contains(TILES));
+        assert_eq!(
+            store
+                .get("TUILE_IMAGERY_TOKEN_FAR")
+                .as_ref()
+                .map(|t| t.expose()),
+            Some(TILES)
+        );
+        assert_eq!(
+            store.get("SOME_TOKEN").as_ref().map(|t| t.expose()),
+            Some(FAKE)
+        );
+        let kept = std::fs::read_to_string(&settings).expect("settings kept");
+        assert!(!kept.contains(TILES), "the settings file holds the token");
+        let back = stored_settings(Some(&settings), "ion");
+        assert_eq!(back.templates.len(), 1);
+        assert_eq!(
+            back.templates[0].token_header.as_deref(),
+            Some("X-Tile-Token")
+        );
+
+        let single = Fake {
+            single: true,
+            ..Fake::default()
+        };
+        let e = import(
+            "mine.tuile",
+            &text,
+            "ion",
+            "SOME_TOKEN",
+            &single,
+            None,
+            &Settings::default(),
+        )
+        .expect_err("a store of one token");
+        assert_eq!(e.key, "ion.imagery");
+        assert!(single.get("SOME_TOKEN").is_none(), "something was written");
+    }
+
     #[test]
     fn a_wrong_file_changes_nothing() {
         let dir = tempfile::tempdir().expect("a directory");
@@ -711,9 +800,12 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
-            .replace("YOUR-INGEST-TOKEN", FAKE);
+            .replace("YOUR-INGEST-TOKEN", FAKE)
+            .replace("YOUR-TILE-TOKEN", FAKE);
         let read = config_file::parse("mine.tuile", &all, "ion").expect("every option");
-        assert_eq!(read.settings.imagery.len(), 2);
+        assert_eq!(read.settings.imagery.len(), 3);
+        assert_eq!(read.settings.templates.len(), 1);
+        assert_eq!(read.layer_tokens.len(), 1);
         assert_eq!(read.settings.start.len(), 5);
         assert!(read.telemetry_token.is_some());
         assert!(read

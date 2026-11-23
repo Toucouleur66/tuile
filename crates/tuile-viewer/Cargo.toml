@@ -143,6 +143,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 
+# A tile server on a local port, for the template layers' tests.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { workspace = true, features = ["rt", "net", "io-util"] }
+
 # Android: winit's backend over the platform's native activity (no Java of
 # the application's own beyond the small `TuileActivity`, so no Gradle);
 # `jni` to call that activity, at the version the TLS verifier below already

@@ -383,10 +383,31 @@ pub(crate) struct LayerSpec {
     pub scheme: Option<Grid>,
     #[serde(default)]
     pub max_level: Option<u32>,
+    /// A template server's credential, sent with every tile — in the page's
+    /// source, so a token that reads nothing but these tiles, limited by
+    /// origin and rate by the server. Never printed.
+    #[serde(default)]
+    pub token: Option<Withheld>,
+    /// The header the token goes in: `Authorization` (as `Bearer <token>`)
+    /// unless the page names another. The server must allow it in its CORS
+    /// answer.
+    #[serde(default)]
+    pub token_header: Option<String>,
     /// Another layer of the list its far tiles are drawn from: `None`, the
     /// default, substitutes nothing.
     #[serde(default)]
     pub substitute: Option<SubstituteSpec>,
+}
+
+/// A value a page gives that is never printed: a `Debug` that withholds it.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct Withheld(pub String);
+
+impl std::fmt::Debug for Withheld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<withheld>")
+    }
 }
 
 /// A layer's substitute: another layer of `sources.imagery`, by key, and
@@ -428,6 +449,15 @@ impl SourcesSpec {
         }
         let mut layers = Vec::with_capacity(self.imagery.len());
         for (index, layer) in self.imagery.iter().enumerate() {
+            if layer.template.is_none() && (layer.token.is_some() || layer.token_header.is_some()) {
+                return Err(format!(
+                    "imagery {:?}: `token` and `tokenHeader` go with a `template` only",
+                    layer.key
+                ));
+            }
+            if layer.token.as_ref().is_some_and(|t| t.0.trim().is_empty()) {
+                return Err(format!("imagery {:?}: `token` is empty", layer.key));
+            }
             let asset = match (&layer.asset, &layer.template) {
                 (Some(asset), None) if *asset >= 0 => *asset,
                 (None, Some(template)) => {
@@ -544,6 +574,16 @@ impl LayerSpec {
     pub(crate) fn tiling(&self) -> tuile_core::raster::TilingScheme {
         crate::open::template_tiling(self.scheme == Some(Grid::Geographic), self.max_level)
     }
+
+    /// The credential a template layer's tiles are asked with, if any.
+    pub(crate) fn credential(&self) -> Option<tuile_core::fetch::Credential> {
+        let token = self.token.as_ref()?;
+        let header = self
+            .token_header
+            .as_deref()
+            .unwrap_or(tuile_core::fetch::Credential::AUTHORIZATION);
+        Some(tuile_core::fetch::Credential::under(header, &token.0))
+    }
 }
 
 /// The asset number of the template layer at `index`.
@@ -572,6 +612,55 @@ mod tests {
             ]
         }
     }"#;
+
+    /// A template layer takes a token, under the header the page names, as
+    /// another layer's substitute; the token is never printed, and goes
+    /// with a template only.
+    #[test]
+    fn a_template_layer_takes_a_token() {
+        const PAGE: &str = r#"{
+            "name": "Atlas",
+            "profile": "desktop",
+            "sources": {
+                "catalog": { "url": "https://tiles.test/catalog" },
+                "terrain": { "asset": 1 },
+                "imagery": [
+                    { "key": "aerial", "name": "Aerial", "attribution": "© survey", "asset": 2,
+                      "substitute": { "layer": "coarse" } },
+                    { "key": "coarse", "name": "Coarse", "attribution": "© survey",
+                      "template": "https://tiles.test/{z}/{x}/{y}.webp", "maxLevel": 18,
+                      "token": "s3cr3t-tiles", "tokenHeader": "X-Tile-Token" }
+                ]
+            }
+        }"#;
+        let o = options(PAGE).expect("valid");
+        let (_, layers) = o.sources.choices().expect("valid");
+        let sub = layers[0].substitute.clone().expect("a substitute");
+        assert_eq!(sub.asset, layers[1].asset);
+        let coarse = o.sources.template_of(layers[1].asset).expect("a template");
+        let credential = coarse.credential().expect("a credential");
+        assert_eq!(credential.header(), "X-Tile-Token");
+        assert_eq!(credential.expose(), "s3cr3t-tiles");
+        assert!(!format!("{o:?}").contains("s3cr3t"), "the token printed");
+        let bearer = PAGE.replace(r#", "tokenHeader": "X-Tile-Token""#, "");
+        let o = options(&bearer).expect("valid");
+        let (_, layers) = o.sources.choices().expect("valid");
+        let coarse = o.sources.template_of(layers[1].asset).expect("a template");
+        assert_eq!(
+            coarse.credential().expect("bearer").expose(),
+            "Bearer s3cr3t-tiles"
+        );
+        let misplaced = PAGE.replace(r#""asset": 2,"#, r#""asset": 2, "token": "x","#);
+        let e = options(&misplaced)
+            .expect("parsed")
+            .sources
+            .choices()
+            .expect_err("misplaced");
+        assert!(
+            e.contains("`template` only") && !e.contains("s3cr3t"),
+            "{e}"
+        );
+    }
 
     /// Catalog layers keep their numbers, template layers get numbers the
     /// catalog never uses, and the worker finds each template by its number.

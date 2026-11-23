@@ -193,8 +193,8 @@ one request goes to any substitute (tested).
 
 | Host | Where | Shape |
 |---|---|---|
-| Viewer config file | `[[ion.imagery]]` keys `substitute = "<key of another layer>"`, `substitute_gap`, `substitute_hysteresis` | the substitute is another layer of the list (catalog asset), stored under its own namespace |
-| Web options (same code as desktop) | `sources.imagery[i].substitute = { "layer": "<key>", "gap": 4, "hysteresis": 1 }` | the referenced layer may be a catalog asset or a URL template |
+| Viewer config file | `[[ion.imagery]]` keys `substitute = "<key of another layer>"`, `substitute_gap`, `substitute_hysteresis` | the substitute is another layer of the list — a catalog asset or a URL template (§5.1) — stored under its own namespace |
+| Web options (same code as desktop) | `sources.imagery[i].substitute = { "layer": "<key>", "gap": 4, "hysteresis": 1 }` | the referenced layer may be a catalog asset or a URL template, with its `token` (§5.1) |
 | A host's catalog (`ViewerHost::imagery`) | `ImageryChoice::with_substitute(SubstituteChoice { asset, cache, gap, hysteresis })` | — |
 | Viewer at runtime | steering `tuile://fallback?gap=4&hysteresis=1`, `tuile://fallback?show=off`; switching layers sends the new layer's specification | a `ClientMessage::Fallbacks` on the stream; web crosses the worker wire (tag 8) |
 | Bevy | `GlobeSources::substitute: Option<Substitute { imagery: ImagerySpec, rule }>` | resolved like the imagery; the rule sent before the first view |
@@ -213,6 +213,65 @@ given the substitute's store and look a tile with the bit up there. Until then a
 pack with substitute tiles renders with a digest mismatch on those tiles — loud,
 never a wrong picture. The `tuile-bake` command line has no `--substitute` flag
 yet: the film product configures it through the library (`GlobeConfig`).
+
+
+### 5.1 A substitute from a tile server
+
+A substitute is often not in the catalog that serves its source: a derived
+layer made by a tile server of one's own, say. Every surface can name it by its
+URL template — `{z}/{x}/{y}`, row 0 at the north edge, on the web-mercator grid
+unless `geographic` is said — with the deepest level it serves and, when the
+server wants one, a credential.
+
+```toml
+[[ion.imagery]]
+key = "aerial"
+name = "Aerial"
+asset = 2
+substitute = "aerial-far"
+substitute_gap = 4
+
+[[ion.imagery]]
+key = "aerial-far"
+name = "Aerial, far levels"
+template = "https://tiles.example/aerial-far/{z}/{x}/{y}.webp"
+max_level = 18
+attribution = "© the pictures' owner"
+token = "…"                        # optional: secure storage, never the settings
+token_header = "Authorization"     # optional: the header it is sent in
+```
+
+- **The credential** is one request header: `Authorization: Bearer <token>`
+  by default, or the token alone under the header the server names
+  (`token_header`; `tokenHeader` on a page). On a desktop or a phone the
+  file's `token` goes to the system's secure storage like the section's — the
+  Keychain on macOS and iOS, the Keystore on Android, the token file elsewhere
+  (refused where that file can hold only one token) — under
+  `TUILE_IMAGERY_TOKEN_<KEY>`; the settings keep the layer and its
+  `token_header`, which says a token is expected, never the value. A page
+  holds its `token` in its source, as it holds its collector's: a token that
+  reads these tiles and nothing else, limited by the server by origin and
+  rate, and allowed in its CORS answer. The value is never printed:
+  `tuile_core::fetch::Credential` withholds it from `Debug`, and errors name
+  the layer's key.
+- **The format** is told from the bytes: PNG, JPEG or WebP, nothing to set.
+- **A 404** is an absence, as §3.4 says: the substitute's ancestry, then the
+  source floor. A missing token is said by the layer's key when the layer is
+  resolved; a refused one (401, 403) is a failed load, not an absence: the
+  tile keeps what it wears and repeated failures suspend the rule (§3.4).
+- **Its store namespace** is the template's (`imagery-template-<hash>`): a
+  server that changes its pictures under the same template says so by
+  changing the template (a `?v=2` it ignores is enough).
+- Its number is negative, as every address's is (`crate::open`): from −1000
+  down in a file, from −1 down on a page.
+
+Tests: `config_file::tests::a_template_layer_*`,
+`import::tests::a_layer_s_token_is_kept_apart`,
+`native::configured::tests::a_template_layer_is_answered_with_its_token`
+(a local server: the token under its header, a WebP tile, a 404 child),
+`web::options::tests::a_template_layer_takes_a_token`,
+`tuile_native_fetchers::tests::a_credential_goes_with_every_tile_and_is_never_printed`,
+`tuile_core::raster::tests::a_webp_tile_decodes`.
 
 ## 6. Budget compatibility (eviction/prefetch decider)
 

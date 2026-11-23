@@ -16,7 +16,7 @@ use http_cache::FoyerManager;
 use http_cache_reqwest::{Cache, CacheMode, HttpCache, HttpCacheOptions};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use tuile_cesium_ion::{HttpResponse, IonError, IonHttp};
-use tuile_core::fetch::{is_retryable_status, FetchError, Fetched, TileFetcher};
+use tuile_core::fetch::{is_retryable_status, Credential, FetchError, Fetched, TileFetcher};
 use url::Url;
 
 /// Host whose responses carry short-lived ion tokens — never cache them.
@@ -428,12 +428,12 @@ impl NativeHttp {
     async fn get_once(
         &self,
         url: &Url,
-        bearer: Option<&str>,
+        credential: Option<&Credential>,
         fresh: bool,
     ) -> Result<reqwest::Response, reqwest_middleware::Error> {
         let mut req = self.client.get(url.clone());
-        if let Some(token) = bearer {
-            req = req.bearer_auth(token);
+        if let Some(credential) = credential {
+            req = req.header(credential.header(), credential.expose());
         }
         if fresh || url.host_str() == Some(ION_API_HOST) {
             req = req.with_extension(CacheMode::NoStore);
@@ -450,13 +450,13 @@ impl NativeHttp {
     async fn get(
         &self,
         url: &Url,
-        bearer: Option<&str>,
+        credential: Option<&Credential>,
         fresh: bool,
     ) -> Result<reqwest::Response, reqwest_middleware::Error> {
         let spread = spread_of(url);
         let mut attempt = 1;
         loop {
-            let outcome = self.get_once(url, bearer, fresh).await;
+            let outcome = self.get_once(url, credential, fresh).await;
             let last = self.retry.attempts.is_some_and(|max| attempt >= max);
 
             let wait = match &outcome {
@@ -515,7 +515,8 @@ impl NativeHttp {
         fresh: bool,
     ) -> Result<HttpResponse, IonError> {
         let asked = Asked::now(url);
-        let response = match NativeHttp::get(self, url, bearer, fresh).await {
+        let credential = bearer.map(Credential::bearer);
+        let response = match NativeHttp::get(self, url, credential.as_ref(), fresh).await {
             Ok(response) => response,
             Err(e) => {
                 asked.failed();
@@ -548,8 +549,58 @@ impl TileFetcher for NativeHttp {
     }
 
     async fn fetch_cacheable(&self, url: &Url) -> Result<Fetched<Bytes>, FetchError> {
+        self.fetch_tile(url, None).await
+    }
+}
+
+/// A [`NativeHttp`] that sends a [`Credential`] with every tile it asks
+/// for: a tile server that wants one. The same pool and cache as the
+/// transport it was made from; the credential is never printed.
+#[derive(Clone)]
+pub struct CredentialedHttp {
+    http: NativeHttp,
+    credential: Credential,
+}
+
+impl std::fmt::Debug for CredentialedHttp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialedHttp")
+            .field("credential", &self.credential)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NativeHttp {
+    /// This transport, sending `credential` with every tile it fetches.
+    pub fn with_credential(&self, credential: Credential) -> CredentialedHttp {
+        CredentialedHttp {
+            http: self.clone(),
+            credential,
+        }
+    }
+}
+
+#[async_trait]
+impl TileFetcher for CredentialedHttp {
+    async fn fetch(&self, url: &Url) -> Result<Bytes, FetchError> {
+        self.fetch_cacheable(url).await.map(|fetched| fetched.value)
+    }
+
+    async fn fetch_cacheable(&self, url: &Url) -> Result<Fetched<Bytes>, FetchError> {
+        self.http.fetch_tile(url, Some(&self.credential)).await
+    }
+}
+
+impl NativeHttp {
+    /// One tile: a 404 is [`FetchError::NotFound`], the origin saying it has
+    /// no such tile.
+    async fn fetch_tile(
+        &self,
+        url: &Url,
+        credential: Option<&Credential>,
+    ) -> Result<Fetched<Bytes>, FetchError> {
         let asked = Asked::now(url);
-        let response = match NativeHttp::get(self, url, None, false).await {
+        let response = match NativeHttp::get(self, url, credential, false).await {
             Ok(response) => response,
             Err(e) => {
                 asked.failed();
@@ -781,8 +832,13 @@ mod tests {
                     }
                     let request = String::from_utf8_lossy(&request);
                     let path = request.split(' ').nth(1).unwrap_or("/").to_string();
+                    let lower = request.to_ascii_lowercase();
+                    let keyed = lower.contains("\r\nx-api-key: s3cr3t\r\n");
                     let (status, kind, body): (&str, &str, &[u8]) = match path.as_str() {
                         "/a.png" => ("200 OK", "image/png", b"an image"),
+                        "/guarded.png" if keyed => ("200 OK", "image/png", b"for the key"),
+                        "/guarded.png" => ("401 Unauthorized", "text/plain", b""),
+                        "/guarded-none.png" if keyed => ("404 Not Found", "text/plain", b""),
                         "/1/2/3.terrain" => (
                             "200 OK",
                             "application/vnd.quantized-mesh",
@@ -805,6 +861,39 @@ mod tests {
             }
         });
         (Url::parse(&format!("http://{at}/")).expect("url"), served)
+    }
+
+    /// A tile server that asks for a credential is sent it, under the
+    /// header it names; the same transport without it is refused; a tile it
+    /// does not have is an absence; and the credential is never printed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_credential_goes_with_every_tile_and_is_never_printed() {
+        let dir = tempfile::tempdir().expect("dir");
+        let http = NativeHttp::with_transport(TransportConfig::over(CacheConfig {
+            dir: dir.path().to_path_buf(),
+            memory_bytes: 16 << 20,
+            disk_bytes: 64 << 20,
+        }))
+        .await
+        .expect("transport");
+        let (base, _) = origin().await;
+        let at = |path: &str| base.join(path).expect("url");
+        let refused = http.fetch_cacheable(&at("guarded.png")).await;
+        assert!(
+            matches!(refused, Err(FetchError::Status { status: 401, .. })),
+            "{refused:?}"
+        );
+        let keyed = http.with_credential(Credential::under("X-Api-Key", "s3cr3t"));
+        let tile = keyed
+            .fetch_cacheable(&at("guarded.png"))
+            .await
+            .expect("let in");
+        assert_eq!(tile.value.as_ref(), b"for the key");
+        assert!(matches!(
+            keyed.fetch_cacheable(&at("guarded-none.png")).await,
+            Err(FetchError::NotFound(_))
+        ));
+        assert!(!format!("{keyed:?}").contains("s3cr3t"));
     }
 
     /// A tile fetched twice comes from upstream, then from the cache — and

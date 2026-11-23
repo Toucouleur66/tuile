@@ -132,6 +132,61 @@ impl<T> Fetched<T> {
     }
 }
 
+/// The credential a tile server asks for, sent as one request header:
+/// `Authorization: Bearer <token>` by default, or the token as it is under
+/// a header the server names (an API key header, say).
+///
+/// Never printed: no `Display`, and a `Debug` that names the header and
+/// withholds the value — a fetch error, a retry warning or a log line that
+/// carries a request never carries its secret.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Credential {
+    header: String,
+    value: String,
+}
+
+impl Credential {
+    /// The header a credential goes in when nothing else is said.
+    pub const AUTHORIZATION: &'static str = "Authorization";
+
+    /// `Authorization: Bearer <token>`.
+    pub fn bearer(token: &str) -> Self {
+        Self {
+            header: Self::AUTHORIZATION.to_owned(),
+            value: format!("Bearer {}", token.trim()),
+        }
+    }
+
+    /// `token` under the header `name`: a bearer token when `name` is
+    /// `Authorization` (in any case), the token alone otherwise.
+    pub fn under(name: &str, token: &str) -> Self {
+        if name.trim().eq_ignore_ascii_case(Self::AUTHORIZATION) {
+            Self::bearer(token)
+        } else {
+            Self {
+                header: name.trim().to_owned(),
+                value: token.trim().to_owned(),
+            }
+        }
+    }
+
+    /// The header's name.
+    pub fn header(&self) -> &str {
+        &self.header
+    }
+
+    /// The header's value, for the one place that needs it: the request.
+    pub fn expose(&self) -> &str {
+        &self.value
+    }
+}
+
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Credential({}: <withheld>)", self.header)
+    }
+}
+
 /// Abstract byte source. `Send + Sync` bounds are the native baseline; the
 /// single-threaded wasm relaxation (`maybe_send`) is an M2 follow-up noted
 /// in `docs/01-architecture.md`.
@@ -226,6 +281,23 @@ impl TileFetcher for HttpFetcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A credential goes as a bearer token unless another header is named,
+    /// and its value never shows in what is printed of it.
+    #[test]
+    fn a_credential_is_a_header_and_is_never_printed() {
+        let bearer = Credential::bearer(" s3cr3t ");
+        assert_eq!(bearer.header(), "Authorization");
+        assert_eq!(bearer.expose(), "Bearer s3cr3t");
+        assert_eq!(Credential::under("authorization", "s3cr3t"), bearer);
+        let keyed = Credential::under("X-Api-Key", "s3cr3t");
+        assert_eq!(keyed.header(), "X-Api-Key");
+        assert_eq!(keyed.expose(), "s3cr3t");
+        for printed in [format!("{bearer:?}"), format!("{keyed:?}")] {
+            assert!(!printed.contains("s3cr3t"), "{printed}");
+        }
+        assert_eq!(format!("{keyed:?}"), "Credential(X-Api-Key: <withheld>)");
+    }
 
     /// No value of a query parameter survives in what an error says, and
     /// everything else does.
