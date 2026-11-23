@@ -494,6 +494,8 @@ pub struct ScoreStats {
     /// O(log N): bounded by what the step named, never by what is held.
     pub places: u32,
     pub rekeys: u32,
+    /// The dynamic headroom after the step, bytes.
+    pub headroom_bytes: u64,
     /// This step's releases, GPU and decoded, by reason
     /// ([`RELEASE_REASONS`]), level and band.
     pub released: [[[u32; DISTANCE_BANDS]; LEVELS]; 3],
@@ -521,6 +523,7 @@ impl Default for ScoreStats {
             params: ScoreParams::default(),
             places: 0,
             rekeys: 0,
+            headroom_bytes: 0,
             released: [[[0; DISTANCE_BANDS]; LEVELS]; 3],
         }
     }

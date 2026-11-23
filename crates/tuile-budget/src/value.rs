@@ -325,7 +325,7 @@ pub struct DeficitInput {
     pub gap: u32,
     /// Whether the drape worn is finer than the level needed: a gap that
     /// costs colour consistency, not detail, weighed
-    /// [`FINER_GAP_PERMILLE`] of an under-need gap of the same size.
+    /// the specification's `finer_gap_permille` of an under-need gap.
     pub finer: bool,
     /// When the tile's need last changed.
     pub since: Micros,
@@ -335,18 +335,12 @@ pub struct DeficitInput {
 
 /// What a gap of levels over the need weighs against a gap under it, ‰.
 ///
-/// A drape worn finer than its need — kept from a zoom-out because it was
-/// resident — shows more detail than the need, but another acquisition of
-/// the imagery than its neighbours, which wear their own level: a patch of
-/// another colour. Colour consistency comes before extra detail, so the gap
-/// is a want; it weighs less than a gap of detail missing, so an under-need
-/// tile falls due first. The specification's
-/// [`crate::spec::Params::finer_gap_permille`], by default this.
-pub const FINER_GAP_PERMILLE: u64 = crate::spec::FINER_GAP as u64;
 
 /// When tile `d.tile`'s own drape becomes worth loading while it wears one
-/// `d.gap` levels under its need, or over it (`d.finer`, weighed
-/// [`FINER_GAP_PERMILLE`]) (spec §5.3, law 7): once `w × gap × dwell ≥
+/// `d.gap` levels under its need, or over it (`d.finer`, weighed the
+/// specification's `finer_gap_permille`: a drape worn finer than its need
+/// shows another acquisition than its neighbours — colour consistency
+/// before extra detail — but weighs less than missing detail) (spec §5.3, law 7): once `w × gap × dwell ≥
 /// cost × (1 + margin)`, the dwell counted from the last change of the
 /// tile's need (a moving camera is not expected to keep the level), `w` the
 /// place's screen weight times the specification's deficit weight, `cost`

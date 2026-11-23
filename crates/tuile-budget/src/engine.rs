@@ -1515,7 +1515,7 @@ impl Budget {
                                 // neighbours' own levels, a patch of another
                                 // colour: its own level is wanted the same
                                 // way, the gap weighed less than a missing
-                                // level's (`value::FINER_GAP_PERMILLE`), and
+                                // level's (`Params::finer_gap_permille`), and
                                 // at once under pressure (coarser is lighter).
                                 let finer = w.level > n;
                                 reads_pressure |= finer;
@@ -1962,6 +1962,7 @@ impl Budget {
             _ => 1_000,
         };
         d.sse_scale_milli = self.scale.max(thermal_floor);
+        self.measure_uploads(now);
         self.last_now = Some(now);
 
         // Batch completeness. What the view waits on: work ranked, or in
@@ -2908,6 +2909,7 @@ impl Budget {
             }
         }
         st.delivered += 1;
+        self.delivered_bytes = self.delivered_bytes.plus(c.cost.gpu);
         d.deliver.push((r, c.gen));
     }
 
@@ -3170,12 +3172,38 @@ impl Budget {
         }
     }
 
-    /// `target` less the specification's headroom: what the release of the
-    /// lowest scores keeps each tier under, every step
+    /// `target` less the headroom: the larger of the specification's fixed
+    /// share and the dynamic one — the measured upload rate over the
+    /// horizon, plus the bytes in transit: about nothing at rest, the next
+    /// seconds of uploads in motion
     /// (`docs/explorations/budget-progressive-coarse-preload.md` §3).
     fn headroom(&self, target: Bytes) -> Bytes {
         let h = u64::from(self.spec.params.headroom_permille.min(1_000));
-        target.scaled(1_000 - h, 1_000)
+        let fixed = target.minus(target.scaled(1_000 - h, 1_000));
+        target.minus(fixed.max(self.dynamic_headroom()))
+    }
+
+    /// The dynamic headroom, bytes: the smoothed upload rate over the
+    /// specification's horizon, plus what is in transit.
+    pub(super) fn dynamic_headroom(&self) -> Bytes {
+        let rate = self.upload_rate.get().unwrap_or(0);
+        let over = u128::from(rate) * u128::from(self.costed.params.horizon.0) / 1_000_000;
+        Bytes(u64::try_from(over).unwrap_or(u64::MAX)).plus(self.ledger.in_transit)
+    }
+
+    /// Takes the step's delivered bytes into the upload rate.
+    pub(super) fn measure_uploads(&mut self, now: Micros) {
+        let dt = self.last_now.map_or(Micros::ZERO, |l| now.since(l));
+        let bytes = std::mem::take(&mut self.delivered_bytes);
+        if dt.0 == 0 {
+            return;
+        }
+        let rate = u128::from(bytes.0) * 1_000_000 / u128::from(dt.0);
+        self.upload_rate.take(
+            u64::try_from(rate).unwrap_or(u64::MAX),
+            dt,
+            Micros::from_millis(500),
+        );
     }
 
     /// Releases, from the bottom of the release order, the GPU copies no
@@ -3215,7 +3243,35 @@ impl Budget {
                 low.push((s, a.class(s)));
             }
         }
-        st.work = st.work.saturating_add(u32::from(visits));
+        // The decoded copies of the same kind, held without a GPU copy.
+        let mut after: Option<(EvictKey, Slot)> = None;
+        let mut low_cpu: Vec<Slot> = Vec::new();
+        for _ in 0..visits {
+            let Some(e) = self.arena.next_filed(after.as_ref(), |_| true, &[Held::Cpu]) else {
+                break;
+            };
+            after = Some(e);
+            let s = e.1;
+            let a = &self.arena;
+            let (_, p, _) = a.place(s);
+            let long_gone = a
+                .cold(s)
+                .unneeded_since()
+                .is_some_and(|t| now.since(t) >= super::THRASH_WINDOW);
+            if p < floor && long_gone && a.has_cpu(s) && !a.has_transit(s) {
+                low_cpu.push(s);
+            }
+        }
+        st.work = st.work.saturating_add(u32::from(visits) * 2);
+        for s in low_cpu {
+            d.scores
+                .push(self.held_event(s, Side::Decoded, Reason::BelowFloorValue));
+            self.arena.take_cpu(s, &mut self.ledger);
+            d.release.push(self.arena.id(s));
+            st.released += 1;
+            st.releases[self.arena.class(s)] += 1;
+            st.levels.releases[self.arena.class(s)][level_index(self.arena.level(s))] += 1;
+        }
         for (s, class) in low {
             d.scores
                 .push(self.held_event(s, Side::Evict, Reason::BelowFloorValue));
@@ -3777,6 +3833,7 @@ impl Budget {
             params: self.score_params(),
             places,
             rekeys,
+            headroom_bytes: self.dynamic_headroom().0,
             ..Default::default()
         };
         for &s in a.active() {

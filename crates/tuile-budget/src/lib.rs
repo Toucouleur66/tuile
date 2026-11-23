@@ -314,6 +314,10 @@ pub struct Budget {
     need_level: Option<u32>,
     /// Places set this step (`score::ScoreStats::places`).
     places: u32,
+    /// The bytes delivered this step, and their rate, bytes a second,
+    /// smoothed: the dynamic headroom's measure.
+    delivered_bytes: Bytes,
+    upload_rate: inputs::Ema,
     /// What the passes after the need keep from one step to the next: the
     /// draw set, the wants, the work, and what changed (O1.4).
     down: downstream::Downstream,
@@ -395,6 +399,8 @@ impl Budget {
             steps: 0,
             need_level: None,
             places: 0,
+            delivered_bytes: Bytes::ZERO,
+            upload_rate: inputs::Ema::default(),
             down: Default::default(),
             scratch: Default::default(),
             recent: Default::default(),

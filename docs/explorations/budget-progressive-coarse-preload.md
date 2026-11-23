@@ -117,28 +117,36 @@ The score orders the value band only. Before it, in this order and whatever the 
 
 **Release keeps a headroom, and lets go of what is no longer worth holding.**
 
-- Preloads are delivered only under `target × (1 − headroom)` (`headroom` 12.5 %,
-  `Params::headroom_permille`): the room above it is the present need's. The decoded tier,
-  once over its target, is released down to the headroom under it. A GPU class (or the pool)
+- **Dynamic headroom.** Preloads are delivered only under `target − headroom`, the headroom
+  the larger of the specification's fixed share (`headroom_permille`, default 0) and the
+  dynamic one: the measured upload rate (bytes delivered a second, smoothed over 0.5 s) over
+  the horizon, plus the bytes in transit — about nothing at rest (a revisit finds its cache),
+  the next second of uploads in motion (84 MB on the test's pan at 512 MiB). The decoded
+  tier, once over its target, is released down to the same line. A GPU class (or the pool)
   over its target is swept down to its low watermark, lowest scores first, not bounded per
   step, so need never waits while low scores hold the pools.
-- A copy that leaves the need keeps a 64th of its probability of use (a copy drawn without
-  being wanted — a stand-in for another tile — counts as certain while drawn). A copy no
-  longer wanted whose probability is under the **floor value** (1 %,
-  `Params::floor_value_permille`) goes even with room left, once out of the need for the
-  thrash window (10 s: a turn and back finds it still) — a preload left behind by a zoom-out
-  goes 10 s later; a copy drawn a moment ago (1/64 ≈ 1.6 %) stays as the cache a turn back or
-  a tour's revisit finds. That pass looks at `release_visits` (64) copies a step from the
-  bottom of the release order: a frame's releases stay small.
-- Measured on the simulation and not kept: a sweep running under the target every step took
-  that cache (the five-minute soak's revisits waited 183–267 ms at p95 instead of 33 ms), and
-  a sweep down to the headroom under the target slowed a slow zoom-in's convergence past its
-  2 s bound.
-- Never released: what is drawn, a swap, the floor, the chain of what is drawn, what is in
-  transit. The window and the metrics count the releases per step by reason — `headroom`,
-  `below_floor_value`, `make_room` — by level × distance
+- **What left the need goes.** A copy that leaves the need keeps a 128th of its probability
+  (a copy drawn without being wanted — a stand-in for another tile — counts as certain while
+  drawn): under the **floor value** (1 %, `floor_value_permille`) whatever it was. Once out
+  of the need for the thrash window (10 s: a turn and back finds it still) it goes, room or
+  not, from both tiers: its GPU copy, then its decoded copy. At rest the pools hold the need,
+  its ring and the coarse stack, not old fine levels. Laurent's Bordeaux capture scripted (a
+  dive to level 19, out to 12, still): levels 14–19 held 406 tiles → 0 after 11 s, decoded
+  124 MB → 76 MB (`at_rest_the_fine_levels_left_behind_are_released_in_both_tiers`). The pass
+  looks at `release_visits` (64) copies a step per tier from the bottom of the release
+  order: a frame's releases stay small.
+- **Relaxed, between the watermarks.** A relaxed picture comes back to full detail only once
+  every class is under its low watermark; a class held between them by copies nobody draws is
+  swept down to it.
+- Measured on the simulation and not kept: a fixed 12.5 % headroom swept under the target
+  every step (the soak's revisits waited 167–267 ms at p95 instead of 33 ms; a slow zoom-in
+  missed its bound), and a 75 % cap on the preloads' share of the slots (it starved the views
+  ahead and coarsened a still view).
+- Never released: what is drawn, a swap, the pinned floor, the chain of what is drawn, what
+  is in transit or wanted this step. The window and the metrics count the releases per step
+  by reason — `headroom`, `below_floor_value`, `make_room` — by level × distance
   (`released_by_level_distance{level,distance,reason}`, `released_total{reason}`), GPU and
-  decoded (`side` evict | decoded).
+  decoded (`side` evict | decoded), and the dynamic headroom (`ScoreStats::headroom_bytes`).
 
 Every number here is the specification's (`Params`, bounded, in the digest, recorded with
 the step, re-specifiable at run time by `tuile://budget?…` and the config file): `a0`,

@@ -617,8 +617,9 @@ fn sel_entries(
 }
 
 /// What a copy that leaves the need keeps of its probability of use: a
-/// 64th (six halvings).
-const LEFT_SHIFT: u32 = 6;
+/// 128th (seven halvings) — under the floor value (1 %) even for a copy
+/// drawn a moment ago: once out of the need for the thrash window, it goes.
+const LEFT_SHIFT: u32 = 7;
 
 /// Whether the prune keeps empty slot `s` at `now` — backing off after a
 /// failure (until 30 s after its want went), or wanted — and if so, the time
@@ -2270,7 +2271,7 @@ impl Budget {
                 cold.set_unneeded_since(None);
                 cold.set_first_wanted(None);
             } else if a.marked(s, Mark::Wanted) {
-                // Left the need: it keeps a 64th of its probability of use
+                // Left the need: it keeps a 128th of its probability of use
                 // (`LEFT_SHIFT`) — a copy drawn a moment ago stays above
                 // the floor value, a preload left behind falls under it and
                 // goes (`docs/explorations/budget-progressive-coarse-preload.md` §3).

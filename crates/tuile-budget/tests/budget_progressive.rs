@@ -784,3 +784,75 @@ fn a_relaxed_budget_between_its_watermarks_comes_back_to_full_detail() {
     assert_eq!(last.sse_scale_milli, 1_000, "still relaxed: the detail never came back");
     assert_eq!(last.stats.deficit.imagery_under(), 0, "imagery still under its need");
 }
+
+/// Laurent's capture over Bordeaux (main, 2026-11-23): at rest, terrain
+/// levels 17–21 holding thousands of tiles nobody drew or selected, the
+/// decoded tier at its cap. Scripted: a dive to level 19, then out to
+/// level 12 and still. Within the thrash window and a little more, the
+/// fine levels left are gone from both tiers; what stays is the need, its
+/// ring and the coarse stack. Prints the numbers.
+#[test]
+fn at_rest_the_fine_levels_left_behind_are_released_in_both_tiers() {
+    let (fx, fy) = (0.4983, 0.6231);
+    let mut r = Rig::new(config(Bytes::mib(512), 4));
+    for n in 13..=19 {
+        let v = View::at(fx, fy, n);
+        let need = v.need(4);
+        for _ in 0..40 {
+            let d = r.step(&need);
+            r.complete(&d);
+        }
+    }
+    let out = View::at(fx, fy, 12).need(4);
+    let count = |r: &Rig| {
+        let h = r.b.held_report();
+        let mut by = [0u32; 25];
+        for l in 0..25 {
+            for b in 0..tuile_budget::score::DISTANCE_BANDS {
+                by[l] += h.board.cell(l, b, Side::Held).count;
+            }
+        }
+        (by[14..=19].iter().sum::<u32>(), by)
+    };
+    let mut d = r.step(&out);
+    let (fine_before, _) = count(&r);
+    let decoded_before = d.stats.decoded;
+    // 11 s still.
+    for _ in 0..660 {
+        r.complete(&d);
+        d = r.step(&out);
+    }
+    let (fine_after, _) = count(&r);
+    eprintln!(
+        "levels 14-19 held: {fine_before} -> {fine_after}; decoded {:?} -> {:?}",
+        decoded_before, d.stats.decoded
+    );
+    assert!(fine_before > 0, "nothing fine held: the test proves nothing");
+    assert_eq!(fine_after, 0, "fine levels still held at rest");
+    // The decoded copies of the fine levels went too.
+    let fine_decoded: u32 = (14..=19).map(|l| d.stats.levels.decoded_tiles[Class::TerrainMesh][l]).sum();
+    assert_eq!(fine_decoded, 0, "fine decoded copies still held at rest");
+}
+
+/// The dynamic headroom: nothing at rest, the next second of uploads in
+/// motion.
+#[test]
+fn the_headroom_follows_the_uploads() {
+    let mut r = Rig::new(config(Bytes::mib(512), 4));
+    let mut d = settle(&mut r, &View::at(0.3, 0.3, 12).need(4), 600);
+    for _ in 0..900 {
+        r.complete(&d);
+        d = r.step(&View::at(0.3, 0.3, 12).need(4));
+    }
+    let rest = d.stats.score.headroom_bytes;
+    assert!(rest < 256 << 10, "a headroom of {rest} B at rest");
+    let mut most = 0;
+    for i in 0..60 {
+        let v = View::at(0.3 + f64::from(i) * 0.0005, 0.3, 12);
+        d = r.step(&v.need(4));
+        r.complete(&d);
+        most = most.max(d.stats.score.headroom_bytes);
+    }
+    assert!(most > 4 * rest.max(1 << 16), "no headroom in motion: {most} B");
+    eprintln!("headroom: {rest} B at rest, {most} B in motion");
+}
