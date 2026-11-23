@@ -779,11 +779,13 @@ mod requests {
     }
 
     /// C15: an urgent request takes a slot from in-flight preload rather
-    /// than wait for it.
+    /// than wait for it. With one slot, preload holds it (its share of the
+    /// slots is at least one); preload never holds more than its share
+    /// (`docs/explorations/budget-progressive-coarse-preload.md` §2).
     #[test]
     fn an_urgent_request_preempts_in_flight_preload_rather_than_wait() {
         let mut c = Rig::interactive_config();
-        c.max_in_flight[Class::TerrainMesh] = 2;
+        c.max_in_flight[Class::TerrainMesh] = 1;
         let mut r = Rig::new(c);
         let (g1, g2, h) = (t(3, 0, 0), t(3, 1, 0), t(3, 5, 5));
         let ring = NeedSet {
@@ -791,13 +793,13 @@ mod requests {
             ..NeedSet::new()
         };
         let d = r.step(&ring);
-        assert_eq!(d.start.len(), 2, "{RED}");
+        assert_eq!(d.start.len(), 1, "{RED}");
         let mut urgent = ring.clone();
         urgent.drawn.push((h, need(h)));
         let d = r.step(&urgent);
         assert!(d.start.iter().any(|s| s.resource == mesh(h)));
         assert_eq!(d.cancel.len(), 1);
-        assert!(d.stats.in_flight[Class::TerrainMesh] <= 2);
+        assert!(d.stats.in_flight[Class::TerrainMesh] <= 1);
     }
 
     /// C27 (liveness): nothing waits while a slot is free.

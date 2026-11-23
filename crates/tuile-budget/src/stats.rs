@@ -180,6 +180,10 @@ pub struct BudgetStats {
     pub evictions: PerClass<[u32; 3]>,
     /// The same evictions per class, by the evicted resource's level.
     pub evictions_by_level: PerClass<[u32; LEVELS]>,
+    /// The progressive score's step numbers: preloads in flight and
+    /// evictions by level and distance band, and its parameters. Not in
+    /// [`BudgetStats::digest`].
+    pub score: crate::score::ScoreStats,
     /// The step per level, per class: what the budget window and the
     /// telemetry's per-level series read.
     pub levels: LevelStats,

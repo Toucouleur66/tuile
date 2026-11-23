@@ -337,14 +337,42 @@ impl Default for EvictIndex {
     }
 }
 
+/// [`super::value::CERTAIN`] as an [`Order::prob`].
+const CERTAIN_U16: u16 = 32_000;
+const _: () = assert!(CERTAIN_U16 as u32 == super::value::CERTAIN);
+
 /// What the eviction order reads, together.
 #[derive(Clone, Copy, Debug, Default)]
 struct Order {
     last_needed: Micros,
-    /// The tile's level.
-    level: u32,
     /// The tile's last known distance, metres.
     distance: u32,
+    /// The tile's level (clamped to [`MAX_ORDER_LEVEL`]) in the low five
+    /// bits, its distance band from the view's footprint when last wanted
+    /// ([`super::score::distance_band`]) in the high three.
+    level_band: u8,
+    /// The level the view needed when it was last wanted, placed
+    /// ([`NO_NEED`] when not): statistics, for its `A` and `D`.
+    need: u8,
+    /// Its probability of use when last wanted, [`super::value::CERTAIN`]
+    /// units: the progressive score's `P`.
+    prob: u16,
+}
+
+/// The deepest level the release order tells apart: deeper ones sort as it
+/// (the per-level breakdowns stop at 24 already).
+pub(super) const MAX_ORDER_LEVEL: u32 = 31;
+/// [`Order::need`] of a resource the need did not place.
+pub(super) const NO_NEED: u8 = u8::MAX;
+
+impl Order {
+    fn level(&self) -> u32 {
+        u32::from(self.level_band & 31)
+    }
+
+    fn band(&self) -> usize {
+        usize::from(self.level_band >> 5)
+    }
 }
 
 /// A decoded copy's payload; whether it was delivered is a flag. Its
@@ -634,8 +662,10 @@ impl Arena {
         let explicit = self.evict.explicit;
         let order = Order {
             last_needed: if explicit { now } else { CUR },
-            level,
             distance: 0,
+            level_band: u8::try_from(level.min(MAX_ORDER_LEVEL)).unwrap_or(31),
+            need: NO_NEED,
+            prob: CERTAIN_U16,
         };
         if explicit {
             // The group of `now` first: making it may file an older group,
@@ -892,7 +922,26 @@ impl Arena {
     }
 
     pub fn level(&self, s: Slot) -> u32 {
-        self.order[s.i()].level
+        self.order[s.i()].level()
+    }
+
+    /// The level the view needed when `s` was last wanted (`None` when the
+    /// need did not place it), its probability of use then, and its
+    /// distance band: what the progressive score read.
+    pub fn place(&self, s: Slot) -> (Option<u32>, u32, usize) {
+        let o = self.order[s.i()];
+        let need = (o.need != NO_NEED).then_some(u32::from(o.need));
+        (need, u32::from(o.prob), o.band())
+    }
+
+    /// The specification's table the release key reads.
+    pub fn valuation(&self) -> &super::value::Valuation {
+        &self.valuation
+    }
+
+    /// The copies `s` holds, as the release key reads them.
+    pub fn held_copies(&self, s: Slot) -> Option<Held> {
+        self.held(s)
     }
 
     /// When the resource of `s` was last needed.
@@ -933,7 +982,7 @@ impl Arena {
     /// group's time), for the test-only snapshot.
     pub fn order_fields(&self, s: Slot) -> (u32, u32, Micros) {
         let o = self.order[s.i()];
-        (o.level, o.distance, self.last_needed(s))
+        (o.level(), o.distance, self.last_needed(s))
     }
 
     pub fn set_distance(&mut self, s: Slot, d: u32) {
@@ -943,6 +992,31 @@ impl Arena {
         self.unfile(s);
         self.order[s.i()].distance = d;
         self.file(s);
+    }
+
+    /// Sets the place of `s` against the present need: its probability of
+    /// use ([`super::value::CERTAIN`] units) and distance band. Its key
+    /// moves only when they changed.
+    pub fn set_place(&mut self, s: Slot, need: Option<u32>, prob: u32, band: usize) {
+        let prob = u16::try_from(prob.min(super::value::CERTAIN)).unwrap_or(CERTAIN_U16);
+        let need = need.map_or(NO_NEED, |n| u8::try_from(n.min(254)).unwrap_or(254));
+        let o = self.order[s.i()];
+        let level_band = (o.level_band & 31) | (u8::try_from(band.min(7)).unwrap_or(7) << 5);
+        if o.prob == prob && o.level_band == level_band && o.need == need {
+            return;
+        }
+        // Only the probability is in the key: the rest is statistics.
+        let rekey = o.prob != prob;
+        if rekey {
+            self.unfile(s);
+        }
+        let o = &mut self.order[s.i()];
+        o.prob = prob;
+        o.level_band = level_band;
+        o.need = need;
+        if rekey {
+            self.file(s);
+        }
     }
 
     /// The resource of `s` was needed at `t`, the newest group's time (once
@@ -1121,10 +1195,10 @@ impl Arena {
         let o = self.order[s.i()];
         let v = &self.valuation;
         let class = self.class(s);
-        let at = level_index(o.level);
+        let at = level_index(o.level());
         let band: u64 = if self.is_floor(s) {
             2
-        } else if v.coarse(o.level) {
+        } else if v.coarse(o.level()) {
             1
         } else {
             0
@@ -1136,10 +1210,13 @@ impl Arena {
             };
             (h, bytes)
         });
-        let value = v.held_value(class, at, self.last_needed(s), held).0.min(VALUE_MASK);
+        let value = v
+            .held_value(class, at, self.last_needed(s), held, u32::from(o.prob))
+            .0
+            .min(VALUE_MASK);
         (
             band << BAND_SHIFT | value,
-            Reverse(o.level),
+            Reverse(o.level()),
             Reverse(o.distance),
             self.id[s.i()],
         )
@@ -1171,7 +1248,8 @@ impl Arena {
 
     /// Whether the resource of `s` is of the floor.
     pub fn is_floor(&self, s: Slot) -> bool {
-        self.class(s).is_ground() && self.pinned.is_some_and(|p| self.order[s.i()].level <= p)
+        self.class(s).is_ground()
+            && self.pinned.is_some_and(|p| self.order[s.i()].level() <= p)
     }
 
     /// Whether `s` is grouped (needed at one of the two most recent times)

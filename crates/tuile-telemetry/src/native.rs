@@ -39,6 +39,7 @@ pub fn start_native(
     }
     let endpoint = config.endpoint.clone()?;
     let url = format!("{endpoint}/v1/metrics");
+    let logs_url = format!("{endpoint}/v1/logs");
     let registry = Registry::new();
     let client = match reqwest::Client::builder().timeout(PUSH_TIMEOUT).build() {
         Ok(client) => client,
@@ -80,6 +81,16 @@ pub fn start_native(
                 crate::unix_nanos(),
             );
             let outcome = push(&client, &url, &headers, encoded.body).await;
+            // The budget's decisions with their score, as log records
+            // (`crate::logs`): the same push, its own path.
+            let records = tuile_core::metrics::take_score_records();
+            if let Some(body) =
+                crate::logs::encode(&crate::resource(), &records, crate::unix_nanos())
+            {
+                if let Err(why) = push(&client, &logs_url, &headers, body).await {
+                    tracing::debug!("telemetry: budget records not sent ({why})");
+                }
+            }
             match (outcome, failing) {
                 (Ok(()), true) => {
                     tracing::info!("telemetry: metrics sent again");

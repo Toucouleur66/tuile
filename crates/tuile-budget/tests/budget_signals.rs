@@ -993,6 +993,10 @@ fn labels_stay_within_their_closed_sets() {
             "eye" => labels::EYE.to_vec(),
             "invariant" => labels::INVARIANT.to_vec(),
             "lane" => labels::LANE.to_vec(),
+            "name" => labels::PARAM.to_vec(),
+            "distance" => labels::DISTANCE.to_vec(),
+            "side" => labels::SIDE.to_vec(),
+            "term" => labels::TERM.to_vec(),
             _ => Vec::new(),
         };
         set.contains(&value)
@@ -1122,4 +1126,78 @@ fn the_drapes_are_counted_per_layer() {
         .collect();
     assert!(named.iter().all(|v| *v == "0" || *v == "1"), "{named:?}");
     assert!(!named.is_empty(), "{RED}: exposed");
+}
+
+/// The progressive score's numbers have one source
+/// (`docs/explorations/budget-progressive-coarse-preload.md` §7): the
+/// series the meter exports for a run are the decisions the steps returned
+/// with their terms — the count per level, band and side, and each term's
+/// sum — and the parameters are the budget's.
+#[test]
+fn the_score_series_are_the_decisions_terms() {
+    use tuile_budget::score::{distance_band, Side, TERM_LABELS};
+    let mut c = Rig::interactive_config();
+    c.pinned_level = Some(1);
+    c.reach_tiles = 3;
+    let mut m = Metered::new(c);
+    // A view at level 6 with preloads placed around it.
+    let drawn_tiles: Vec<_> = (0..3).map(|x| t(6, 20 + x, 30)).collect();
+    let mut need = drawn(&drawn_tiles);
+    for l in 2..=7u32 {
+        let k = 1u64 << (l - 2);
+        for x in 0..3 {
+            let id = t(l, 5 * k + x, 7 * k);
+            need.ring.push((
+                id,
+                need_of(id).with_proximity(6, x as f32 * 1.5),
+            ));
+        }
+    }
+    let mut events = Vec::new();
+    for _ in 0..30 {
+        let d = m.step(&need);
+        events.extend(d.scores.iter().copied());
+        m.r.complete(&d);
+    }
+    m.r.b.retarget(Bytes::mib(1));
+    for _ in 0..5 {
+        let d = m.step(&need);
+        events.extend(d.scores.iter().copied());
+    }
+    assert!(events.iter().any(|e| e.side == Side::Preload));
+    assert!(events.iter().any(|e| e.side == Side::Evict));
+    let series = m.meter.signals().series();
+    let find = |name: &str, want: &[(&str, &str)]| -> f64 {
+        series
+            .iter()
+            .filter(|(n, l, _)| {
+                *n == name && want.iter().all(|w| l.iter().any(|x| x.0 == w.0 && x.1 == w.1))
+            })
+            .map(|(_, _, v)| *v)
+            .sum()
+    };
+    for side in [Side::Preload, Side::Evict] {
+        let of_side: Vec<_> = events.iter().filter(|e| e.side == side).collect();
+        let total = find("score_decisions_total", &[("side", side.label())]);
+        assert_eq!(total as usize, of_side.len(), "{side:?}");
+        let score: u64 = of_side.iter().map(|e| e.terms.score).sum();
+        let summed = find(
+            "score_sum_total",
+            &[("side", side.label()), ("term", TERM_LABELS[0])],
+        );
+        assert_eq!(summed as u64, score, "{side:?}");
+        for e in &of_side {
+            let band = tuile_budget::score::DISTANCE_BAND_LABELS[usize::from(e.band)];
+            assert!(
+                find(
+                    "score_decisions_total",
+                    &[("side", side.label()), ("distance", band)]
+                ) > 0.0
+            );
+        }
+    }
+    let _ = distance_band(0);
+    assert_eq!(find("param", &[("name", "rho_tiles")]), 3.0);
+    assert_eq!(find("param", &[("name", "floor_level")]), 1.0);
+    assert_eq!(find("need_level", &[]), 6.0);
 }

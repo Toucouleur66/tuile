@@ -55,7 +55,7 @@ pub const ALLOWED: [&str; 16] = [
 ];
 
 /// The metric label keys a series may carry.
-pub const ALLOWED_LABELS: [&str; 20] = [
+pub const ALLOWED_LABELS: [&str; 24] = [
     // tuile_core::metrics: the per-level and per-eye series.
     "series",
     "level",
@@ -84,6 +84,13 @@ pub const ALLOWED_LABELS: [&str; 20] = [
     // labels: interactive, known_path, film, fpv, fpv_film, custom), with
     // `source` = context | override (`tuile_budget_spec_info`).
     "spec",
+    // The progressive score's closed sets (`tuile_budget::observe::labels`:
+    // `DISTANCE`, `SIDE`, `TERM`, `PARAM`): a band of tiles from the view,
+    // never a tile.
+    "distance",
+    "side",
+    "term",
+    "name",
     "step",
     "quantile",
     // Histograms' bucket bound, where a recorder writes one as a label.

@@ -41,7 +41,7 @@ pub enum Urgency {
 }
 
 /// A need's floats, quantised once at the boundary.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Quantised {
     /// SSE excess in thousandths, clamped to ±16 000.
     pub sse_excess: i32,
@@ -51,6 +51,37 @@ pub struct Quantised {
     pub distance: u32,
     /// Whether any input float was not finite (it then counts as zero).
     pub rejected: bool,
+    /// The level the view needs at its nearest point, when the need says
+    /// ([`super::need::Proximity`]); clamped to 255.
+    pub need_level: u8,
+    /// The distance from the view's ground footprint in sixteenths of a
+    /// tile of the tile's own level, clamped (fine enough that one step of
+    /// `D(d)` stays under the margin at `ρ` = 2: `(1 + 1/32)²` < 1.25); [`Quantised::NO_PLACE`] when the need
+    /// gives no proximity.
+    pub away: u16,
+}
+
+impl Quantised {
+    /// [`Quantised::away`] of a need without a proximity.
+    pub const NO_PLACE: u16 = u16::MAX;
+
+    /// Whether the need placed the tile against the present need.
+    pub fn placed(&self) -> bool {
+        self.away != Quantised::NO_PLACE
+    }
+}
+
+impl Default for Quantised {
+    fn default() -> Self {
+        Quantised {
+            sse_excess: 0,
+            centrality: 0,
+            distance: 0,
+            rejected: false,
+            need_level: 0,
+            away: Quantised::NO_PLACE,
+        }
+    }
 }
 
 impl Quantised {
@@ -71,7 +102,19 @@ impl Quantised {
         let sse = finite(need.sse_excess);
         let centrality = finite(need.centrality);
         let distance = finite(need.distance);
+        let (need_level, away) = match need.proximity {
+            Some(p) => {
+                let d = finite(p.tiles_away).max(0.0);
+                (
+                    p.need_level.min(255) as u8,
+                    (d * 16.0).round().min(f32::from(Quantised::NO_PLACE - 1)) as u16,
+                )
+            }
+            None => (0, Quantised::NO_PLACE),
+        };
         Quantised {
+            need_level,
+            away,
             sse_excess: (sse.clamp(-16.0, 16.0) * 1000.0).round() as i32,
             centrality: (centrality.clamp(0.0, 1.0) * 1000.0).round() as i32,
             distance: distance.clamp(0.0, u32::MAX as f32) as u32,

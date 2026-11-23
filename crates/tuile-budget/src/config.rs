@@ -192,6 +192,13 @@ pub struct BudgetConfig {
     /// The coarse floor (terrain and imagery): levels `0..=pinned_level` are
     /// requested first and never evicted.
     pub pinned_level: Option<u32>,
+    /// The radius `ρ` of the neighbourhood preloaded around the view, in
+    /// tiles of each level (`docs/explorations/budget-progressive-coarse-preload.md`):
+    /// the traversal lists, per level between the floor and the level
+    /// under the eye, the `⌊π(ρ+1)²⌋` tiles nearest the view's ground
+    /// footprint, and the progressive score weighs them by `ρ²/(ρ+d)²`.
+    /// 0 lists none (a film: no speculation).
+    pub reach_tiles: u32,
     /// The most imagery levels a drape may sit above its tile's terrain level
     /// (a profile parameter: desktop 3, handheld 2, low handheld 1).
     pub imagery_over_terrain_cap: u32,
@@ -291,6 +298,7 @@ impl BudgetConfig {
                 background_percent: 0,
             },
             pinned_level: Some(2),
+            reach_tiles: 4,
             imagery_over_terrain_cap: 3,
             max_drape_side: 2_048,
             imagery_tile_px: 256,
@@ -338,6 +346,7 @@ impl BudgetConfig {
                 background_percent: 100,
             },
             pinned_level: Some(2),
+            reach_tiles: 0,
             imagery_over_terrain_cap: 3,
             max_drape_side: 2_048,
             imagery_tile_px: 256,

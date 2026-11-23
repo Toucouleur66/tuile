@@ -273,6 +273,25 @@ pub struct Anticipation {
     pub ancestor_permille: u16,
 }
 
+/// The level terms of the progressive score
+/// (`docs/explorations/budget-progressive-coarse-preload.md`), thousandths:
+/// `A(ℓ, n)` is 1 at the level the view needs, `a0 × 2^−(n−1−ℓ)` above it
+/// and `a↓ × 2^−(ℓ−n−1)` below it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Progressive {
+    /// `a0`: the level just above the need's.
+    pub a0_permille: u16,
+    /// `a↓`: the level just below it (a zoom-in anticipated).
+    pub descend_permille: u16,
+}
+
+/// The defaults: the level above the need's at four fifths of it, halving
+/// per level up; the level below at a fifth.
+pub const PROGRESSIVE: Progressive = Progressive {
+    a0_permille: 800,
+    descend_permille: 200,
+};
+
 /// The defaults: the ring before the ancestors, as the tiers were.
 const ANTICIPATION: Anticipation = Anticipation {
     ring_permille: 500,
@@ -300,8 +319,11 @@ pub struct Params {
     pub speculation: Speculation,
     /// How long a re-specification blends (law 12).
     pub blend: Micros,
-    /// Anticipation's probabilities in the value band.
+    /// Anticipation's probabilities in the value band, for a preload the
+    /// traversal gives no place against the need.
     pub anticipation: Anticipation,
+    /// The progressive score's level terms.
+    pub progressive: Progressive,
 }
 
 /// The policy of the decider: rules and numbers. See the [module
@@ -381,11 +403,12 @@ impl Specification {
                 restore: RESTORE,
                 ref_bytes: Bytes(256 << 10),
                 speculation: Speculation {
-                    slots_permille: 250,
+                    slots_permille: 750,
                     memory_permille: 200,
                 },
                 blend: Micros::from_secs(2),
                 anticipation: ANTICIPATION,
+                progressive: PROGRESSIVE,
             },
         }
     }
@@ -398,7 +421,7 @@ impl Specification {
         s.set_weight(Term::NextUse, 2_000);
         s.params.horizon = Micros::from_secs(8);
         s.params.speculation = Speculation {
-            slots_permille: 500,
+            slots_permille: 750,
             memory_permille: 300,
         };
         s
@@ -435,6 +458,7 @@ impl Specification {
                 },
                 blend: Micros::ZERO,
                 anticipation: ANTICIPATION,
+                progressive: PROGRESSIVE,
             },
         }
     }
@@ -483,7 +507,7 @@ impl Specification {
                 restore: RESTORE,
                 ref_bytes: Bytes(256 << 10),
                 speculation: Speculation {
-                    slots_permille: 450,
+                    slots_permille: 750,
                     memory_permille: 350,
                 },
                 blend: Micros::from_secs(1),
@@ -491,6 +515,7 @@ impl Specification {
                     ring_permille: 700,
                     ancestor_permille: 250,
                 },
+                progressive: PROGRESSIVE,
             },
         }
     }
@@ -591,6 +616,8 @@ impl Specification {
             ("restore_remote_ms", p.restore.remote.0 / 1_000, 60_000),
             ("p_ring", u64::from(p.anticipation.ring_permille), 1_000),
             ("p_ancestor", u64::from(p.anticipation.ancestor_permille), 1_000),
+            ("a0", u64::from(p.progressive.a0_permille), 1_000),
+            ("a_desc", u64::from(p.progressive.descend_permille), 1_000),
         ];
         if let Some((name, ..)) = bounded.iter().find(|(_, v, max)| v > max) {
             return Err(SpecError::OutOfBounds(name));
@@ -625,7 +652,7 @@ impl Specification {
             "spec={}&margin={}&min_dwell_ms={}&horizon_ms={}&blend_ms={}\
              &speculation_slots={}&speculation_memory={}&coarse_through={}\
              &restore_decoded_ms={}&restore_stored_ms={}&restore_http_cache_ms={}\
-             &restore_remote_ms={}&p_ring={}&p_ancestor={}",
+             &restore_remote_ms={}&p_ring={}&p_ancestor={}&a0={}&a_desc={}",
             self.kind.label(),
             p.margin_permille,
             ms(p.min_dwell),
@@ -640,6 +667,8 @@ impl Specification {
             ms(p.restore.remote),
             p.anticipation.ring_permille,
             p.anticipation.ancestor_permille,
+            p.progressive.a0_permille,
+            p.progressive.descend_permille,
         );
         // A term's weight when all its rules share one; a term weighed
         // differently by predicate (FPV's recency) keeps its kind's rules.
@@ -693,6 +722,8 @@ impl Specification {
                 "restore_remote_ms" => p.restore.remote = millis,
                 "p_ring" => p.anticipation.ring_permille = n16,
                 "p_ancestor" => p.anticipation.ancestor_permille = n16,
+                "a0" => p.progressive.a0_permille = n16,
+                "a_desc" => p.progressive.descend_permille = n16,
                 _ => match k
                     .strip_prefix("w_")
                     .and_then(|t| Term::ALL.into_iter().find(|x| term_key(*x) == t))

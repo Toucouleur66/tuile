@@ -2237,6 +2237,17 @@ impl Budget {
                 if let Some(tn) = tiles.get(&r.tile()) {
                     a.set_distance(s, tn.q.distance);
                 }
+                if let Some(w) = wants.get(&r) {
+                    // The progressive score's place: what the release key
+                    // weighs the restore credit by.
+                    let rho = self.cfg.reach_tiles;
+                    let p = super::value::probability(&self.spec, rho, w.urgency, w.level, &w.q);
+                    let placed = w.q.placed().then_some(u32::from(w.q.need_level));
+                    a.set_place(s, placed, p, super::score::distance_band(w.q.away));
+                    if placed.is_some() {
+                        self.need_level = placed;
+                    }
+                }
             } else if in_drawn {
                 let cold = a.cold_mut(s);
                 cold.set_unneeded_since(None);

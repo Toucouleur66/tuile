@@ -539,6 +539,24 @@ pub struct Need {
     pub imagery: Option<ImageryNeed>,
     /// The tile's footprint in longitude/latitude, for drape UV transforms.
     pub rect: Option<GeoRect>,
+    /// Where the tile lies against the view's present need
+    /// (`docs/explorations/budget-progressive-coarse-preload.md`): the
+    /// level the view needs at its nearest point and how many tiles of the
+    /// tile's own level separate it from there. `None` when the traversal
+    /// does not say: a preload is then worth the specification's flat
+    /// anticipation.
+    pub proximity: Option<Proximity>,
+}
+
+/// A tile's place against the view's present need: what the progressive
+/// score reads ([`crate::value::probability`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Proximity {
+    /// The level the view needs at its nearest point (`n`).
+    pub need_level: u32,
+    /// The distance from the view's ground footprint to the tile, in tiles
+    /// of the tile's own level (`d`).
+    pub tiles_away: f32,
 }
 
 // By hand for `clone_from`, which keeps the layers' buffer: the budget
@@ -554,6 +572,7 @@ impl Clone for Need {
             distance: self.distance,
             imagery: self.imagery.clone(),
             rect: self.rect,
+            proximity: self.proximity,
         }
     }
 
@@ -566,6 +585,7 @@ impl Clone for Need {
         self.distance = source.distance;
         self.imagery.clone_from(&source.imagery);
         self.rect = source.rect;
+        self.proximity = source.proximity;
     }
 }
 
@@ -591,6 +611,8 @@ impl Need {
             && self.distance.to_bits() == other.distance.to_bits()
             && imagery_same
             && self.rect.as_ref().map(rect_bits) == other.rect.as_ref().map(rect_bits)
+            && self.proximity.map(|p| (p.need_level, p.tiles_away.to_bits()))
+                == other.proximity.map(|p| (p.need_level, p.tiles_away.to_bits()))
     }
 
     /// A need for a tile at `level`, of mesh class `class`, with neutral
@@ -605,6 +627,7 @@ impl Need {
             distance: 0.0,
             imagery: None,
             rect: None,
+            proximity: None,
         }
     }
 
@@ -636,6 +659,16 @@ impl Need {
     /// Sets the footprint.
     pub fn with_rect(mut self, v: GeoRect) -> Self {
         self.rect = Some(v);
+        self
+    }
+    /// Sets the place against the present need: the level the view needs
+    /// at its nearest point, and the distance from there in tiles of this
+    /// tile's level.
+    pub fn with_proximity(mut self, need_level: u32, tiles_away: f32) -> Self {
+        self.proximity = Some(Proximity {
+            need_level,
+            tiles_away,
+        });
         self
     }
 }

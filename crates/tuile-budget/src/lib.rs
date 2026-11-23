@@ -36,6 +36,7 @@ pub mod tile_id;
 pub mod tiers;
 pub mod types;
 mod value;
+pub mod score;
 pub mod view;
 
 pub use config::{
@@ -49,14 +50,15 @@ pub use error::{AuditError, ConfigError, SessionError};
 pub use inputs::{Measured, Prediction, Smoothed, TierSample};
 pub use fallback::{FallbackContext, FallbackReport, FallbackRule, FallbackSpec, FallbackState};
 pub use imagery::{DrapeCandidate, GeoRect, LevelClamp, TexelFootprint, UvTransform};
-pub use need::{ImageryNeed, LayerReach, Membership, Need, NeedDelta, NeedSet};
+pub use need::{ImageryNeed, LayerReach, Membership, Need, NeedDelta, NeedSet, Proximity};
 pub use observe::{
     check, BudgetEvent, BudgetMeter, BudgetObserver, BudgetSignals, EyeCoverage, FrameRecord,
     Histogram, StepRecord, Violations,
 };
 pub use priority::{Precedence, PriorityKey, Quantised, Urgency};
 pub use spec::{
-    Anticipation, Band, Facts, Params, Predicate, RestoreCosts, Rule, SpecError, SpecKind, Specification,
+    Anticipation, Band, Facts, Params, Predicate, Progressive, RestoreCosts, Rule, SpecError, SpecKind,
+    Specification,
     Speculation, Term,
 };
 pub use tiers::{ByLevel, DiskTiers};
@@ -70,6 +72,7 @@ pub use types::{
     Thermal, TileId,
 };
 pub use view::{Protection, ResourceState, ResourceView};
+pub use value::{progressive, progressive_terms, CERTAIN};
 
 /// One decision step's input.
 #[derive(Clone, Copy)]
@@ -305,6 +308,10 @@ pub struct Budget {
     ranked_last: Vec<ResourceId>,
     /// Steps taken, for the amortised prune.
     steps: u64,
+    /// The level the view needs at its nearest point, as the last placed
+    /// want gave it (`docs/explorations/budget-progressive-coarse-preload.md`):
+    /// statistics only.
+    need_level: Option<u32>,
     /// What the passes after the need keep from one step to the next: the
     /// draw set, the wants, the work, and what changed (O1.4).
     down: downstream::Downstream,
@@ -378,6 +385,7 @@ impl Budget {
             held_last: Default::default(),
             ranked_last: Vec::new(),
             steps: 0,
+            need_level: None,
             down: Default::default(),
             scratch: Default::default(),
             recent: Default::default(),
@@ -462,6 +470,15 @@ impl Budget {
     /// until one answers (`OriginBackoff`).
     pub fn origins_down(&self) -> usize {
         self.origins.down()
+    }
+
+    /// The GPU-held set by the progressive score
+    /// (`docs/explorations/budget-progressive-coarse-preload.md` §7): its
+    /// aggregates by level and distance band, and the lowest and highest
+    /// scored copies outside the floor. A walk of the tracked resources:
+    /// for a host's periodic report, never called by a step.
+    pub fn held_report(&self) -> score::HeldReport {
+        self.held_report_impl()
     }
 
     /// One decision step: applies the recorded arrivals, then decides.

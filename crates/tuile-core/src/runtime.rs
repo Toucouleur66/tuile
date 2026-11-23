@@ -1021,6 +1021,10 @@ struct State {
     /// above the pinned level that has content.
     floor: Vec<TileId>,
     floor_revision: Option<Option<u64>>,
+    /// The neighbourhood preloaded around the view
+    /// (`docs/explorations/budget-progressive-coarse-preload.md`), walked
+    /// again only when what it depends on moved.
+    hood: crate::neighbourhood::Neighbourhood,
     priming_reported: Option<Priming>,
     frame: u64,
     steps: u64,
@@ -1077,6 +1081,7 @@ impl State {
             sse_scale_milli: 1_000,
             floor: Vec::new(),
             floor_revision: None,
+            hood: Default::default(),
             priming_reported: None,
             frame: 0,
             steps: 0,
@@ -1455,6 +1460,30 @@ impl State {
                 ancestors.insert(t);
             }
         }
+        // The neighbourhood: per level from the floor down to one under the
+        // eye's, the tiles nearest the view's footprint, preloaded by the
+        // progressive score.
+        if let Some(eye) = self.views.first().map(ViewState::position) {
+            let cfg = self.budget.config();
+            let (rho, pinned) = (cfg.reach_tiles, cfg.pinned_level);
+            self.hood
+                .update(tree, drawn.iter().copied(), eye, rho, pinned);
+        }
+        // The neighbourhood's tiles outside the chain: the ring around the
+        // view, never protected — the chain of what is drawn stays the
+        // fallback, the rest is best effort.
+        let hood: BTreeSet<TileId> = self
+            .hood
+            .tiles()
+            .iter()
+            .map(|(t, _)| *t)
+            .filter(|t| {
+                !drawn.contains(t)
+                    && !blockers.contains(t)
+                    && !ancestors.contains(t)
+                    && tree.properties(*t).has_content
+            })
+            .collect();
         // The ring: what the views ahead select and ask for, beyond what
         // the current ones need — loaded when they leave a slot, never drawn.
         let ring: BTreeSet<TileId> = if self.ahead.is_empty() {
@@ -1479,11 +1508,28 @@ impl State {
                 .collect()
         };
         let views = &self.views;
+        let mut ancestors = list(&ancestors, views);
+        let ring_set = ring;
+        let mut ring = list(&ring_set, &self.ahead);
+        let hood: BTreeSet<TileId> = hood.difference(&ring_set).copied().collect();
+        ring.extend(list(&hood, views));
+        // Each preload's place against the present need: the level the view
+        // needs and the distance in tiles of the preload's own level.
+        if let Some(n) = self.hood.need_level() {
+            for (t, need) in ancestors.iter_mut().chain(ring.iter_mut()) {
+                if let Some(d) = self.hood.away(tree, *t) {
+                    need.proximity = Some(crate::budget::Proximity {
+                        need_level: n,
+                        tiles_away: d,
+                    });
+                }
+            }
+        }
         NeedSet {
             drawn: list(&drawn, views),
             blockers: list(&blockers, views),
-            ancestors: list(&ancestors, views),
-            ring: list(&ring, &self.ahead),
+            ancestors,
+            ring,
         }
     }
 
@@ -1837,6 +1883,9 @@ impl State {
                 .is_none_or(|at| now.since(at) >= PUBLISH_EVERY)
             {
                 self.published_at = Some(now);
+                // The held set by score: a walk of the budget's resources,
+                // once a publish, never in a step.
+                meter.set_held(self.budget.held_report());
                 let mut signals = meter.publish();
                 // The disk tier, from the loader's stores' ledgers: no I/O.
                 let mut disk = crate::budget::DiskTiers::default();
