@@ -277,7 +277,22 @@ impl Occluder {
     /// than the planet is therefore never culled, which is right: a coarse tile
     /// straddling the horizon must be visited so its children can be judged
     /// one by one.
+    ///
+    /// A box is also hidden when its eight corners are: the points the sphere
+    /// hides from the eye — inside the cone of its tangents and beyond the
+    /// plane of its horizon — make a convex set, so a box whose corners are
+    /// all in it is in it whole. Shrinking the sphere by the radius of a
+    /// coarse tile's box gives up far more than that: a level-5 tile, some
+    /// 350 km round its sphere, moved the horizon from 486 km to over
+    /// 2 000 km for an eye 18 km up, and the coarse tiles in between were
+    /// selected, fetched, draped and drawn behind the planet (2026-11-24: the
+    /// level views wrote `T5 · I4` all over the foreground).
     pub fn hides(&self, volume: &BoundingVolume, eye: DVec3) -> bool {
+        if let BoundingVolume::Obb(b) = volume {
+            if b.corners().iter().all(|c| self.hides_point(*c, eye)) {
+                return true;
+            }
+        }
         let (center, radius) = volume.bounding_sphere();
         let shrunk = self.radius - radius;
         if shrunk <= 0.0 {
@@ -297,6 +312,20 @@ impl Occluder {
         // Beyond the horizon plane, and inside the shadow cone. Both, or the
         // test would hide ground that is merely far away off to one side.
         depth > horizon_sq && depth * depth > horizon_sq * to_volume.length_squared()
+    }
+
+    /// Whether the point `p` is behind this sphere, seen from `eye`: beyond
+    /// the plane of the horizon and inside the cone of the tangents — the
+    /// convex set [`Self::hides`] tests a box's corners against.
+    fn hides_point(&self, p: DVec3, eye: DVec3) -> bool {
+        let to_eye = eye - self.center;
+        let horizon_sq = to_eye.length_squared() - self.radius * self.radius;
+        if horizon_sq <= 0.0 {
+            return false;
+        }
+        let to_point = p - eye;
+        let depth = -to_point.dot(to_eye);
+        depth > horizon_sq && depth * depth > horizon_sq * to_point.length_squared()
     }
 }
 
@@ -498,6 +527,92 @@ mod tests {
             radius: planet.radius * 1.1,
         });
         assert!(!planet.hides(&huge, eye));
+    }
+
+    /// A box on the ground `angle` radians round the planet from the eye's
+    /// foot (in the x-y plane), `half` metres across each side and from
+    /// `low` to `high` metres over the sphere, its axes east, north and up.
+    fn ground_box(radius: f64, angle: f64, half: f64, low: f64, high: f64) -> Obb {
+        let up = DVec3::new(angle.cos(), angle.sin(), 0.0);
+        let east = DVec3::new(-angle.sin(), angle.cos(), 0.0);
+        let north = DVec3::Z;
+        let mid = (low + high) / 2.0;
+        Obb {
+            center: up * (radius + mid),
+            half_axes: DMat3::from_cols(east * half, north * half, up * ((high - low) / 2.0)),
+        }
+    }
+
+    /// A coarse tile's box wholly behind the planet is hidden: its sphere
+    /// is hundreds of kilometres across, and shrinking the planet by it put
+    /// the horizon thousands of kilometres out — the level-5 tiles drawn
+    /// behind the planet from 18 km up (2026-11-24).
+    #[test]
+    fn a_coarse_box_wholly_behind_the_planet_is_hidden() {
+        let planet = earth();
+        let eye = DVec3::new(planet.radius + 18_500.0, 0.0, 0.0);
+        // The horizon from 18.5 km is 4.4° round; a 600 km box, -1 to 9 km
+        // high, centred 15° round, is 1 000 km past it on its near side.
+        let far = ground_box(
+            planet.radius,
+            15f64.to_radians(),
+            300_000.0,
+            -1_000.0,
+            9_000.0,
+        );
+        assert!(planet.hides(&BoundingVolume::Obb(far), eye));
+    }
+
+    /// Never a box with any point in sight: every point of a box called
+    /// hidden — corners, faces, inside — is behind the planet by the line
+    /// of sight, for boxes from a few hundred metres to a hemisphere's
+    /// tile, all round the curve, and eyes from the ground to orbit.
+    #[test]
+    fn a_box_is_hidden_only_when_every_point_of_it_is() {
+        let planet = earth();
+        let mut hidden = 0;
+        for altitude in [5.0, 1_000.0, 18_500.0, 400_000.0] {
+            let eye = DVec3::new(planet.radius + altitude, 0.0, 0.0);
+            for step in 0..=90 {
+                let angle = f64::from(step) * std::f64::consts::PI / 90.0;
+                for half in [300.0, 20_000.0, 300_000.0, 2_000_000.0] {
+                    for (low, high) in [(1.0, 9_000.0), (-1_000.0, 9_000.0), (1.0, 2.0)] {
+                        let b = ground_box(planet.radius, angle, half, low, high);
+                        if !planet.hides(&BoundingVolume::Obb(b), eye) {
+                            continue;
+                        }
+                        hidden += 1;
+                        let n = 6;
+                        for i in 0..=n {
+                            for j in 0..=n {
+                                for k in 0..=n {
+                                    let f = |v: i32| f64::from(v) / f64::from(n) * 2.0 - 1.0;
+                                    let p = b.center
+                                        + b.half_axes.col(0) * f(i)
+                                        + b.half_axes.col(1) * f(j)
+                                        + b.half_axes.col(2) * f(k);
+                                    if p.length() < planet.radius {
+                                        // Inside the planet: hidden by it.
+                                        continue;
+                                    }
+                                    assert_ne!(
+                                        segment_meets_sphere(eye, p, planet.center, planet.radius),
+                                        Some(false),
+                                        "a box {half} m across at {:.1}° from an eye {altitude} m \
+                                         up is called hidden, and {p:?} of it is in sight",
+                                        angle.to_degrees()
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            hidden > 300,
+            "only {hidden} boxes were hidden: the test sees little"
+        );
     }
 
     #[test]
