@@ -122,6 +122,17 @@ impl App {
                     tracing::info!("view: {name} — {reads}");
                 }
             }
+            Command::Lighting(lighting) => {
+                if self.views.lighting != lighting {
+                    self.views.lighting = lighting;
+                    tracing::info!(lighting = lighting.name(), "lighting switched");
+                }
+                // Kept even when unchanged: a link that says what the
+                // person already sees is still their choice.
+                if self.keeps_choices {
+                    crate::shell::keep_lighting(lighting);
+                }
+            }
             Command::CopyLink => self.copy_the_link(),
             Command::Snapshot => self.take_a_snapshot(),
             Command::PasteLink => self.go_to_the_copied_link(),
@@ -271,6 +282,7 @@ impl App {
                 budget_window_tables: self.budget_window.tables(),
                 budget_window_issues: self.budget_window.issues_only(),
                 compressed: self.imagery_compression != tuile_wgpu::ImageryCompression::Off,
+                lit: self.views.lighting.is_on(),
             },
             |snapshot| crate::menu::State::of(&snapshot, layers),
         )
@@ -310,6 +322,7 @@ impl App {
             budget_window_tables: self.budget_window.tables(),
             budget_window_issues: self.budget_window.issues_only(),
             compression: self.imagery_compression,
+            lighting: self.views.lighting,
             ..Snapshot::of(&self.controller, size)
         };
         crate::snapshot::publish(snapshot);

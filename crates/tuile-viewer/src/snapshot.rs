@@ -85,6 +85,9 @@ pub(crate) struct Snapshot {
     pub budget_window_issues: bool,
     /// How the imagery is held on the GPU: the person's choice in force.
     pub compression: tuile_wgpu::ImageryCompression,
+    /// Whether the ground is lit: the person's choice in force
+    /// (`crate::lighting`).
+    pub lighting: crate::lighting::Lighting,
 }
 
 impl Snapshot {
@@ -132,6 +135,7 @@ impl Snapshot {
             budget_window_tables: false,
             budget_window_issues: false,
             compression: tuile_wgpu::ImageryCompression::Off,
+            lighting: crate::lighting::Lighting::Off,
         }
     }
 }

@@ -295,6 +295,7 @@ impl super::App {
             budget: Some(budget),
             view: super::DIAGNOSTICS[self.views.diagnostic % super::DIAGNOSTICS.len()].0,
             wireframe: self.views.wireframe,
+            lighting: self.views.lighting.name(),
             adapter: info.name,
             backend: info.backend.to_string(),
             layers: self.shutter.layers(),

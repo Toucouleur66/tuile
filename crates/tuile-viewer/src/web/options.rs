@@ -62,6 +62,12 @@ pub(crate) struct Options {
     /// [`tuile_wgpu::MAX_ENCODE_LEVEL`]. See `--imagery-encode-level`.
     #[serde(default = "default_encode_level", deserialize_with = "encode_level")]
     pub imagery_encode_level: u32,
+    /// Whether the ground is lit: `off` (the default — the imagery as
+    /// sampled) or `on` (lit by the sun and seen through the air), as
+    /// `--lighting`. Left out, the person's last choice in the menu holds,
+    /// else off: see [`Options::lighting`] and `crate::lighting`.
+    #[serde(default, deserialize_with = "lighting")]
+    pub lighting: Option<crate::lighting::Lighting>,
     /// The instant the scene is lit for: `now` (the default), `sunset`,
     /// `sunrise` or an RFC 3339 instant — as the `--time` flag.
     #[serde(default)]
@@ -201,6 +207,16 @@ impl Options {
             .unwrap_or_else(|| Ok(tuile_camera::default_max_altitude()))
     }
 
+    /// The lighting the viewer opens with: what the page said, else what
+    /// the person last chose (`kept`), else off — as a desktop reads its
+    /// flag, then its kept choice.
+    pub(crate) fn lighting(
+        &self,
+        kept: impl FnOnce() -> Option<crate::lighting::Lighting>,
+    ) -> crate::lighting::Lighting {
+        crate::lighting::Lighting::chosen(self.lighting, kept)
+    }
+
     /// The scene's clock these options state, or the sentence that says
     /// which of them is wrong.
     pub(crate) fn clock(&self) -> Result<tuile_atmosphere::ClockSettings, String> {
@@ -219,6 +235,17 @@ fn compression<'de, D: serde::Deserializer<'de>>(
 ) -> Result<tuile_wgpu::ImageryCompression, D::Error> {
     let name = String::deserialize(d)?;
     tuile_wgpu::compression_named(&name).map_err(serde::de::Error::custom)
+}
+
+/// A lighting named as the flag names it: `off` or `on`. Left undefined, as
+/// the package passes an option the host did not give, it is none.
+fn lighting<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<crate::lighting::Lighting>, D::Error> {
+    Option::<String>::deserialize(d)?
+        .map(|name| crate::lighting::Lighting::named(&name))
+        .transpose()
+        .map_err(serde::de::Error::custom)
 }
 
 fn default_encode_level() -> u32 {
@@ -772,6 +799,12 @@ mod tests {
             tuile_wgpu::ImageryCompression::Off,
             "compression is off unless the page asks"
         );
+        assert_eq!(o.lighting, None, "the page said nothing of the lighting");
+        assert_eq!(
+            o.lighting(|| None),
+            crate::lighting::Lighting::Off,
+            "the ground is unlit unless the page or the person asks"
+        );
         assert_eq!(
             template.tiling(),
             tuile_core::raster::TilingScheme::web_mercator()
@@ -912,6 +945,31 @@ mod tests {
         assert_eq!(set.start, tuile_atmosphere::Start::Sunset);
         assert_eq!((set.offset, set.rate), (-1800.0, 30.0));
         assert!(with(r#""time": "teatime","#).is_err());
+    }
+
+    /// `lighting` is `off` or `on`; the page's word wins over the person's
+    /// last choice, which wins over off — the desktop's order, flag first.
+    #[test]
+    fn lighting_is_named_and_off_by_default() {
+        use crate::lighting::Lighting;
+        let with = |value: &str| {
+            options(&CATALOG.replacen(
+                r#""name": "Atlas","#,
+                &format!(r#""name": "Atlas", "lighting": {value},"#),
+                1,
+            ))
+        };
+        let on = || Some(Lighting::On);
+        let none = || None;
+        assert_eq!(with(r#""on""#).expect("on").lighting(none), Lighting::On);
+        assert_eq!(with(r#""OFF""#).expect("off").lighting(on), Lighting::Off);
+        assert_eq!(with("null").expect("null").lighting(none), Lighting::Off);
+        let page = options(CATALOG).expect("valid");
+        assert_eq!(page.lighting(on), Lighting::On, "the last choice");
+        assert_eq!(page.lighting(none), Lighting::Off);
+        let refused = with(r#""dim""#).expect_err("not a lighting");
+        assert!(refused.contains("on or off"), "{refused}");
+        assert!(with("true").is_err());
     }
 
     #[test]

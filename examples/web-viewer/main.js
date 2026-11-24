@@ -14,6 +14,10 @@
 // `?compression=auto` (or `bc7`, `astc`; `off` by default) holds the imagery
 // block-compressed: see the package's `imageryCompression`.
 //
+// `?lighting=on` lights the ground by the sun and draws the air over it
+// (the package's `lighting`); left out, the person's last choice holds,
+// else the ground is the imagery as sampled.
+//
 // The photorealistic 3D Tiles (catalog asset 2275207) are offered in the
 // menu, off until turned on; `?tileset=on` turns them on from the start, as
 // the desktop's `--tileset 2275207` does.
@@ -24,6 +28,7 @@ const PHOTOGRAPHY = "© Microsoft and its data suppliers";
 const params = new URLSearchParams(location.search);
 const backend = params.get("backend") ?? "auto";
 const imageryCompression = params.get("compression") ?? "off";
+const lighting = params.get("lighting") ?? undefined;
 // `?maxAltitude=500000`: the camera's ceiling, metres (the package's option).
 const maxAltitude = params.has("maxAltitude") ? Number(params.get("maxAltitude")) : undefined;
 // `?time=sunset&timeOffset=-30m&timeRate=30`: the scene's clock, as the
@@ -72,6 +77,7 @@ try {
     name: "Tuile",
     backend,
     imageryCompression,
+    lighting,
     maxAltitude,
     time,
     timeOffset,

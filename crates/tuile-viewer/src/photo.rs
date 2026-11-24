@@ -233,6 +233,8 @@ pub(crate) struct Exposure {
     /// wireframe.
     pub view: &'static str,
     pub wireframe: bool,
+    /// Whether the ground was lit (`crate::lighting`): `on` or `off`.
+    pub lighting: &'static str,
     /// The GPU and its backend.
     pub adapter: String,
     pub backend: String,
@@ -341,6 +343,7 @@ pub(crate) fn state_json(e: &Exposure) -> serde_json::Value {
         "budget": e.budget,
         "view": e.view,
         "wireframe": e.wireframe,
+        "lighting": e.lighting,
         "layers": e.layers.names(),
         "adapter": e.adapter,
         "backend": e.backend,
@@ -587,6 +590,7 @@ pub(crate) mod tests {
             budget: Some(serde_json::json!({ "drawn_by_level": [[12, 40]] })),
             view: "Normal",
             wireframe: false,
+            lighting: "off",
             adapter: "Test GPU".into(),
             backend: "Metal".into(),
             layers: Layers::default(),
@@ -720,6 +724,7 @@ pub(crate) mod tests {
         assert_eq!(state["target"]["range_m"], target.range);
         assert!(state["scene"]["solar"].as_str().is_some());
         assert_eq!(state["imagery_compression"], e.compression.as_str());
+        assert_eq!(state["lighting"], e.lighting);
         assert_eq!(state["sse_px"], e.sse);
         assert_eq!(state["software"], super::software().as_str());
         if let Some(imagery) = &e.imagery {

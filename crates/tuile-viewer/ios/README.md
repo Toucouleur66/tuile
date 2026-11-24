@@ -82,6 +82,14 @@ dev.lapoule.tuile.viewer --imagery-compression auto` on a phone, or the
 scheme's *Arguments Passed On Launch* in Xcode. The caption at the bottom
 says what is held: `imagery ASTC 4x4 23 MiB (276 × 85 KiB)`.
 
+## Lighting
+
+Off by default, as on every viewer: the ground is the imagery as sampled,
+with no sun shading and no air — the lit ground is most of the GPU's work at
+rest. **Settings › Tuile › Lighting** turns it on at the next launch; a
+`tuile://view?lighting=on` link turns it on now and keeps the choice, and
+`--lighting on|off` as a launch argument wins over both.
+
 ## What it does differently on a phone
 
 - **Launch**: the window opens at once on the globe's shell — the launch

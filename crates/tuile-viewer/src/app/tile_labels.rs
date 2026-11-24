@@ -222,12 +222,19 @@ mod tests {
     #[test]
     fn labels_alone_outline_the_tiles_over_the_real_picture() {
         use super::super::frame::view_params;
-        let normal = view_params(0, true);
+        use crate::lighting::Lighting;
+        let normal = view_params(0, Lighting::On, true);
         assert_eq!((normal[1], normal[2]), (0.0, 1.0));
-        assert_eq!(view_params(0, false)[2], 0.0, "no labels, no outlines");
-        for view in WITH_LEVEL_VIEWS {
-            let p = view_params(view, true);
-            assert_eq!((p[1], p[2]), (view as f32, 0.0));
+        assert_eq!(
+            view_params(0, Lighting::On, false)[2],
+            0.0,
+            "no labels, no outlines"
+        );
+        for lighting in [Lighting::Off, Lighting::On] {
+            for view in WITH_LEVEL_VIEWS {
+                let p = view_params(view, lighting, true);
+                assert_eq!((p[1], p[2]), (view as f32, 0.0));
+            }
         }
     }
 

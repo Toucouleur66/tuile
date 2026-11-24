@@ -147,6 +147,9 @@ fn start_viewer_with(
     // the page's option — the host's default — else off.
     let compression =
         super::system::compression_kept(&options.name).unwrap_or(options.imagery_compression);
+    // Whether the ground is lit: what the page said, else what the person
+    // last chose in the menu, else off — the desktop's order.
+    let lighting = options.lighting(|| super::system::lighting_kept(&options.name));
     let handheld = options.profile == ProfileChoice::Handheld;
     let profile = Profile::browser(handheld, options.device_memory);
     tracing::info!(
@@ -209,6 +212,7 @@ fn start_viewer_with(
         // start message.
         imagery_compression: compression,
         imagery_encode_level: options.imagery_encode_level,
+        lighting,
         // A page has no file to record into.
         record: Default::default(),
         tilesets: offered,
@@ -342,6 +346,17 @@ impl WebViewer {
             })?;
         if self.current() {
             crate::desktop::queue(Request::Do(Command::Diagnostic(index)));
+        }
+        self.wake(Wake::Poke(self.id))
+    }
+
+    /// Lights the ground (`on`) or draws the imagery as sampled (`off`),
+    /// from now on and for the next session — as the menu's View >
+    /// Lighting does. An unknown word is an error that says so.
+    pub fn lighting(&self, mode: &str) -> Result<(), JsError> {
+        let lighting = crate::lighting::Lighting::named(mode).map_err(|e| JsError::new(&e))?;
+        if self.current() {
+            crate::desktop::queue(Request::Do(Command::Lighting(lighting)));
         }
         self.wake(Wake::Poke(self.id))
     }

@@ -352,7 +352,11 @@ impl App {
                 // the same clearance.
                 view_proj: eye.view_proj_with_clearance(origin, aspect, clearance),
                 sun_dir: [sun.x, sun.y, sun.z, 0.0],
-                params: view_params(self.views.diagnostic, self.tile_labels.forced),
+                params: view_params(
+                    self.views.diagnostic,
+                    self.views.lighting,
+                    self.tile_labels.forced,
+                ),
                 // Strength 0 is what turns it off, so the checkbox needs no
                 // second path through the renderer — the shader already
                 // short-circuits on it.
@@ -1000,19 +1004,31 @@ impl App {
     }
 }
 
+/// The unlit view's index among [`super::DIAGNOSTICS`]: what the shader
+/// draws for the real picture when the lighting is off.
+pub(super) const UNLIT: usize = 1;
+
 /// The view's parameters for the shader: the ambient term, the diagnostic
 /// view, and the tiles' outlines over the real picture when the levels are
 /// written on the tiles without a level view (`tuile://view?labels=on`) —
 /// the imagery stays, the edges and the labels go over it. The level views
 /// draw their own edges, over their own colours.
-pub(super) fn view_params(diagnostic: usize, labels: bool) -> [f32; 4] {
+///
+/// With the lighting off (`crate::lighting`), the real picture is the one
+/// the unlit view draws — the imagery as sampled, the shader's lit path and
+/// its march through the air never run. The other views are unchanged.
+pub(super) fn view_params(
+    diagnostic: usize,
+    lighting: crate::lighting::Lighting,
+    labels: bool,
+) -> [f32; 4] {
     let outlines = labels && !super::tile_labels::WITH_LEVEL_VIEWS.contains(&diagnostic);
-    [
-        AMBIENT,
-        diagnostic as f32,
-        if outlines { 1.0 } else { 0.0 },
-        0.0,
-    ]
+    let drawn = if diagnostic == 0 && !lighting.is_on() {
+        UNLIT
+    } else {
+        diagnostic
+    };
+    [AMBIENT, drawn as f32, if outlines { 1.0 } else { 0.0 }, 0.0]
 }
 
 /// The budget's signals in one clause of the status line: what the GPU holds
@@ -1147,6 +1163,30 @@ impl fmt::Display for Sharpness {
         match self {
             Self::Sharp => f.write_str("sharp"),
             Self::Coarse(n) => write!(f, "{n} tiles still coarse"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lighting::Lighting;
+
+    /// **The lighting off draws the real picture unlit**: the view the
+    /// shader is told is the unlit one, the imagery as sampled; on, it is
+    /// the real picture, lit. Every diagnostic view is drawn as asked
+    /// either way.
+    #[test]
+    fn the_lighting_off_draws_the_real_picture_unlit() {
+        assert_eq!(super::super::DIAGNOSTICS[UNLIT].0, "unlit");
+        assert_eq!(view_params(0, Lighting::Off, false)[1], UNLIT as f32);
+        assert_eq!(view_params(0, Lighting::On, false)[1], 0.0);
+        // The viewers' default.
+        assert_eq!(view_params(0, Lighting::default(), false)[1], UNLIT as f32);
+        for view in 1..super::super::DIAGNOSTICS.len() {
+            for lighting in [Lighting::Off, Lighting::On] {
+                assert_eq!(view_params(view, lighting, false)[1], view as f32);
+            }
         }
     }
 }

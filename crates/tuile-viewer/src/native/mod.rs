@@ -88,6 +88,31 @@ pub(crate) fn compression_kept() -> Option<tuile_wgpu::ImageryCompression> {
         .and_then(|text| tuile_wgpu::compression_named(text.trim()).ok())
 }
 
+/// Keeps `lighting`, whether the person last asked for the ground lit, for
+/// the next session — a file in the application's support directory,
+/// removed when it is off, the default.
+pub(crate) fn keep_lighting(lighting: crate::lighting::Lighting) {
+    let Some(file) = host::lighting_file(&host::Machine) else {
+        return;
+    };
+    if !lighting.is_on() {
+        let _ = std::fs::remove_file(&file);
+        return;
+    }
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&file, format!("{}\n", lighting.name()));
+}
+
+/// The lighting the last session left, if it left one: a file that does not
+/// read as one is no choice at all.
+pub(crate) fn lighting_kept() -> Option<crate::lighting::Lighting> {
+    host::lighting_file(&host::Machine)
+        .and_then(|file| std::fs::read_to_string(file).ok())
+        .and_then(|text| crate::lighting::Lighting::named(&text).ok())
+}
+
 /// The 3D Tiles tilesets the last session left switched on. A file that
 /// does not read as asset numbers is no choice at all.
 pub(crate) fn tilesets_kept_on() -> Vec<i64> {
@@ -218,43 +243,55 @@ fn session(
 ) -> anyhow::Result<()> {
     // The command line, read by `main`. Exit code 2 is the usual one for a
     // command that was not understood.
-    let (view, here, imagery, compression, encode_level, clock, max_altitude, record, tilesets) =
-        match invocation {
-            Ok(start::Invocation::Run {
-                view,
-                here,
-                imagery,
-                compression,
-                encode_level,
-                clock,
-                max_altitude,
-                record,
-                tilesets,
-                ..
-            }) => (
-                view,
-                here,
-                imagery,
-                compression,
-                encode_level,
-                clock,
-                max_altitude,
-                record,
-                tilesets,
-            ),
-            Ok(start::Invocation::Help) => {
-                println!("{}", start::usage());
-                return Ok(());
-            }
-            Err(error) => {
-                eprintln!(
-                    "{}: {error}\n\n{}",
-                    embed::identity().executable,
-                    start::usage()
-                );
-                std::process::exit(2);
-            }
-        };
+    let (
+        view,
+        here,
+        imagery,
+        compression,
+        encode_level,
+        clock,
+        max_altitude,
+        record,
+        tilesets,
+        lighting,
+    ) = match invocation {
+        Ok(start::Invocation::Run {
+            view,
+            here,
+            imagery,
+            compression,
+            encode_level,
+            clock,
+            max_altitude,
+            record,
+            tilesets,
+            lighting,
+            ..
+        }) => (
+            view,
+            here,
+            imagery,
+            compression,
+            encode_level,
+            clock,
+            max_altitude,
+            record,
+            tilesets,
+            lighting,
+        ),
+        Ok(start::Invocation::Help) => {
+            println!("{}", start::usage());
+            return Ok(());
+        }
+        Err(error) => {
+            eprintln!(
+                "{}: {error}\n\n{}",
+                embed::identity().executable,
+                start::usage()
+            );
+            std::process::exit(2);
+        }
+    };
     // Which layer `--imagery` meant is the host's list to say, and a name
     // that is not on it is a command that was not understood — said here,
     // with the list, before anything is connected to.
@@ -294,6 +331,15 @@ fn session(
                 std::process::exit(2);
             }
         };
+    // Whether the ground is lit: the flag, else the phone's settings
+    // switch, else the menu's last choice, else off (`crate::lighting`).
+    let lighting = match settings::lighting(lighting, &host::Machine, lighting_kept) {
+        Ok(lighting) => lighting,
+        Err(why) => {
+            eprintln!("{}: {why}", embed::identity().executable);
+            std::process::exit(2);
+        }
+    };
     // How hard the GPU encoder searches each block: the flag, else the
     // settings page, else the default.
     let encode_level = match settings::imagery_encode_level(encode_level, &host::Machine) {
@@ -482,6 +528,7 @@ fn session(
         backends,
         imagery_compression: compression,
         imagery_encode_level: encode_level,
+        lighting,
         record,
         tilesets: offered,
         tilesets_on: on.clone(),

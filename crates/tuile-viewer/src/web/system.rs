@@ -342,6 +342,33 @@ pub(crate) fn compression_kept(name: &str) -> Option<tuile_wgpu::ImageryCompress
         .and_then(|text| tuile_wgpu::compression_named(&text).ok())
 }
 
+/// Where the lighting a person chose in the menu is kept for the next
+/// session of the viewer named `name`.
+fn lighting_key(name: &str) -> String {
+    format!("tuile-viewer/lighting/{name}")
+}
+
+/// Keeps `lighting` for the next session; off, the default, forgets it.
+pub(crate) fn keep_lighting(lighting: crate::lighting::Lighting) {
+    let Some(storage) = storage() else {
+        return;
+    };
+    let key = lighting_key(&name());
+    let _ = if lighting.is_on() {
+        storage.set_item(&key, lighting.name())
+    } else {
+        storage.remove_item(&key)
+    };
+}
+
+/// The lighting the last session of the viewer named `name` left, if it
+/// left one that reads as one.
+pub(crate) fn lighting_kept(name: &str) -> Option<crate::lighting::Lighting> {
+    storage()
+        .and_then(|s| s.get_item(&lighting_key(name)).ok().flatten())
+        .and_then(|text| crate::lighting::Lighting::named(&text).ok())
+}
+
 /// Keeps `link` as the view the next session of this viewer opens on, or —
 /// with `None` — forgets the last one.
 pub(crate) fn keep_the_view(link: Option<&str>) {
