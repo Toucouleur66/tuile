@@ -109,6 +109,8 @@ export async function createViewer(container, options) {
     decodeWorkers: o.decodeWorkers,
     imageryCompression: o.imageryCompression ?? "off",
     imageryEncodeLevel: o.imageryEncodeLevel,
+    // Left out, the person's last choice holds, else off: the ground unlit.
+    lighting: o.lighting,
     time: o.time,
     timeOffset: o.timeOffset,
     timeRate: o.timeRate,
@@ -235,6 +237,15 @@ class Viewer {
    */
   diagnostic(view) {
     this.#live().diagnostic(String(view));
+  }
+
+  /**
+   * Lights the ground — `"on"`, by the sun and the Moon, seen through the
+   * air — or draws the imagery as sampled, `"off"` (the default), from now
+   * on and for the next session, as the menu's View › Lighting does.
+   */
+  lighting(mode) {
+    this.#live().lighting(String(mode));
   }
 
   /** Releases the GPU, the worker and every listener. The viewer is unusable after. */

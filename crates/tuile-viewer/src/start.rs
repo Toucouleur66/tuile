@@ -74,6 +74,12 @@ IMAGERY_LAYERS
                        default) is the fastest, each level more GPU time for
                        sharper blocks. The encodes per frame shrink to keep
                        the frame's GPU time
+    --lighting <off|on>
+                       whether the ground is lit: off (the default) draws the
+                       imagery as sampled, on lights it by the sun and the
+                       Moon and draws the air over it — most of the GPU's
+                       work at rest. Without it, the last choice of the
+                       menu's View > Lighting holds
 
 SOURCES BY ADDRESS (no catalog, no token; each replaces the host's own):
     --terrain-url <url>          quantized-mesh terrain: the URL of its layer.json.
@@ -314,6 +320,9 @@ pub(crate) enum Invocation {
         /// `--tileset`: the host's 3D Tiles tilesets to draw over the globe,
         /// by asset number, when the flag was given.
         tilesets: Option<Vec<i64>>,
+        /// `--lighting`: whether the ground is lit, when the flag was given
+        /// (`crate::lighting`).
+        lighting: Option<crate::lighting::Lighting>,
     },
     /// Print [`usage`] and leave.
     Help,
@@ -500,7 +509,7 @@ where
     let mut here = false;
     let mut imagery: Option<String> = None;
     // The flags that take text: each at most once.
-    let mut texts: [(&str, Option<String>); 15] = [
+    let mut texts: [(&str, Option<String>); 16] = [
         ("--terrain-url", None),
         ("--imagery-template", None),
         ("--imagery-scheme", None),
@@ -516,6 +525,7 @@ where
         ("--config", None),
         ("--tileset", None),
         ("--imagery-encode-level", None),
+        ("--lighting", None),
     ];
     let mut compression: Option<tuile_wgpu::ImageryCompression> = None;
     let mut seen = [false; FLAGS.len()];
@@ -602,8 +612,11 @@ where
     if here && (seen[0] || seen[1]) {
         return Err("--here and --lon/--lat both say where to start; give one".to_owned());
     }
-    let [(_, terrain), (_, template), (_, scheme), (_, max_level), (_, time), (_, offset), (_, rate), (_, ceiling), (_, record), (_, record_fps), (_, record_scale), (_, record_codec), (_, config), (_, tileset), (_, encode_level)] =
+    let [(_, terrain), (_, template), (_, scheme), (_, max_level), (_, time), (_, offset), (_, rate), (_, ceiling), (_, record), (_, record_fps), (_, record_scale), (_, record_codec), (_, config), (_, tileset), (_, encode_level), (_, lighting)] =
         texts;
+    let lighting = lighting
+        .map(|text| crate::lighting::Lighting::named(&text).map_err(|why| format!("--{why}")))
+        .transpose()?;
     // Read as an altitude is, with the same bounds: it is one.
     let max_altitude = ceiling
         .map(|text| {
@@ -641,6 +654,7 @@ where
         clock,
         max_altitude,
         tilesets,
+        lighting,
         record: crate::recording::RecordSettings {
             path: record.map(std::path::PathBuf::from),
             pictures: crate::recording::PictureSettings::parse(
@@ -737,6 +751,7 @@ mod tests {
             record: _,
             config: None,
             tilesets: None,
+            lighting: None,
         }) = parsed
         else {
             unreachable!("{args:?} should start a session, got {parsed:?}");
@@ -1059,6 +1074,28 @@ mod tests {
         assert!(FLAGS_TEXT.contains("--imagery-compression <off|auto|bc7|astc>"));
     }
 
+    /// `--lighting` is on or off, once; without it nothing is said, and the
+    /// session takes the last choice, else off (`crate::lighting`).
+    #[test]
+    fn lighting_is_named_once() {
+        use crate::lighting::Lighting;
+        let said = |args: &[&str]| match parse(args) {
+            Ok(Invocation::Run { lighting, .. }) => lighting,
+            other => unreachable!("{args:?} should start a session, got {other:?}"),
+        };
+        assert_eq!(said(&[]), None);
+        assert_eq!(said(&["--lighting", "on"]), Some(Lighting::On));
+        assert_eq!(said(&["--lighting=off", "--lat", "3"]), Some(Lighting::Off));
+        for bad in [
+            &["--lighting"][..],
+            &["--lighting", "dim"],
+            &["--lighting", "on", "--lighting", "off"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+        assert!(FLAGS_TEXT.contains("--lighting <off|on>"));
+    }
+
     /// `--imagery-encode-level` is a number from 0 to the encoder's highest,
     /// once; without it nothing is said and the default level holds.
     #[test]
@@ -1178,6 +1215,7 @@ mod tests {
                 record: Default::default(),
                 config: None,
                 tilesets: None,
+                lighting: None,
             })
         );
         // Either order, either coordinate.

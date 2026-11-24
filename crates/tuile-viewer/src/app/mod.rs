@@ -134,6 +134,10 @@ pub struct ViewerConfig {
     /// (`--imagery-encode-level`, or the phone's settings page):
     /// [`tuile_wgpu::DEFAULT_ENCODE_LEVEL`] unless asked.
     pub(crate) imagery_encode_level: u32,
+    /// Whether the ground is lit: the person's choice, off unless they
+    /// asked (`--lighting`, a page's option, the phone's settings page, the
+    /// menu's last choice) — see `crate::lighting`. A headless run is lit.
+    pub(crate) lighting: crate::lighting::Lighting,
     /// Where the session is recorded (`--record`): the camera and, frame by
     /// frame, what the picture was drawn under — see `tuile_tape::session`.
     /// `TUILE_RECORD` says the same where there is no command line.
@@ -576,7 +580,10 @@ impl App {
             refresh_hz: 60,
             pressure_read: None,
             pointer: input::Pointer::default(),
-            views: input::Views::default(),
+            views: input::Views {
+                lighting: config.lighting,
+                ..input::Views::default()
+            },
             budget_ask: crate::steer::BudgetAsk::default(),
             budget_window: budget_window::BudgetWindow::default(),
             budget_screen: None,

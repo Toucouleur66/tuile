@@ -140,6 +140,28 @@ pub(crate) fn tilesets_on(
     kept()
 }
 
+/// The key of the phone's settings switch that lights the ground: a
+/// boolean, off by default (`crate::lighting`).
+pub(crate) const LIGHTING_KEY: &str = "lighting";
+
+/// Whether the ground is lit: what `--lighting` said, else the phone's
+/// settings switch, else what the person last chose in the menu (`kept`),
+/// else off — see [`crate::lighting`]. A value nobody can read is an error
+/// that says what it takes.
+pub(crate) fn lighting(
+    flag: Option<crate::lighting::Lighting>,
+    host: &dyn crate::host::Host,
+    kept: impl FnOnce() -> Option<crate::lighting::Lighting>,
+) -> Result<crate::lighting::Lighting, String> {
+    let page = host
+        .setting(LIGHTING_KEY)
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| crate::lighting::Lighting::named(&v))
+        .transpose()
+        .map_err(|why| format!("the setting {LIGHTING_KEY:?}: {why}"))?;
+    Ok(crate::lighting::Lighting::chosen(flag.or(page), kept))
+}
+
 /// The scene's clock: what the command line said (`--time`, `--time-offset`,
 /// `--time-rate`), or — where it named no instant — `TUILE_LIT_AT`, UTC
 /// seconds since the Unix epoch, a session pinned to a stated moment for
@@ -343,6 +365,67 @@ mod tests {
             vec![2275207],
             "the last session's choice"
         );
+    }
+
+    /// A machine whose settings page holds the lighting switch.
+    struct LightSwitch(Option<&'static str>);
+
+    impl crate::host::Host for LightSwitch {
+        fn var(&self, _name: &str) -> Option<String> {
+            None
+        }
+        fn read(&self, path: &std::path::Path) -> std::io::Result<String> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                path.display().to_string(),
+            ))
+        }
+        fn is_macos(&self) -> bool {
+            true
+        }
+        fn setting(&self, key: &str) -> Option<String> {
+            (key == LIGHTING_KEY)
+                .then_some(self.0)
+                .flatten()
+                .map(str::to_owned)
+        }
+    }
+
+    /// **The ground unlit unless the person chose**: the flag, then the
+    /// settings switch (a boolean, `1` or `0`), then the menu's last
+    /// choice, then off.
+    #[test]
+    fn lighting_is_off_unless_chosen() {
+        use crate::lighting::Lighting;
+        let none = || None;
+        let on = || Some(Lighting::On);
+        assert_eq!(lighting(None, &LightSwitch(None), none), Ok(Lighting::Off));
+        assert_eq!(
+            lighting(None, &LightSwitch(Some("")), none),
+            Ok(Lighting::Off)
+        );
+        assert_eq!(
+            lighting(None, &LightSwitch(None), on),
+            Ok(Lighting::On),
+            "the menu's last choice"
+        );
+        assert_eq!(
+            lighting(None, &LightSwitch(Some("1")), none),
+            Ok(Lighting::On),
+            "the settings switch"
+        );
+        assert_eq!(
+            lighting(None, &LightSwitch(Some("0")), on),
+            Ok(Lighting::Off),
+            "the settings switch over the menu's last choice"
+        );
+        assert_eq!(
+            lighting(Some(Lighting::Off), &LightSwitch(Some("1")), on),
+            Ok(Lighting::Off),
+            "the command line wins"
+        );
+        let why = lighting(None, &LightSwitch(Some("dim")), none).expect_err("not a lighting");
+        assert!(why.contains(LIGHTING_KEY), "{why}");
     }
 
     /// **Off unless the person chose**: the flag first, then the settings

@@ -47,6 +47,9 @@ pub(super) struct Views {
     pub(super) freeze: bool,
     /// Whether the budget's line is shown over the view (`Command::BudgetLine`).
     pub(super) budget_line: bool,
+    /// Whether the ground is lit (`Command::Lighting`, `crate::lighting`):
+    /// off, the real picture is the imagery as sampled.
+    pub(super) lighting: crate::lighting::Lighting,
 }
 
 impl App {

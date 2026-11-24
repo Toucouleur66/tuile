@@ -608,6 +608,10 @@ impl Headless {
             backends: None,
             imagery_compression: start.imagery_compression,
             imagery_encode_level: tuile_wgpu::DEFAULT_ENCODE_LEVEL,
+            // Lit, always: a run's pictures and digests are the renderer's
+            // whole picture, and the viewers' default (off) is a person's
+            // choice, not a scenario's.
+            lighting: crate::lighting::Lighting::On,
             // A headless run writes its own session log (`Start::log`).
             record: Default::default(),
             // The run's, all on, and a switch never kept: a run leaves the

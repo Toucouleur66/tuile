@@ -19,6 +19,9 @@ scripts/try-viewer.sh web          # builds the package, then http://localhost:8
 - `?compression=auto` holds the imagery block-compressed (`off`, the default, `auto`, `bc7`
   or `astc`: the package's `imageryCompression`). With `&backend=webgl2` the decode workers
   encode it on the CPU. The caption says what is held: `imagery ASTC 4x4 23 MiB (276 × 85 KiB)`.
+- `?lighting=on` lights the ground by the sun and draws the air over it (the package's
+  `lighting`); without it the person's last choice holds, else the ground is the imagery as
+  sampled.
 - `?terrain=<layer.json URL>&imagery=<template>` shows a terrain and an imagery template named
   by address instead, with no catalog: `scheme=geographic|webmercator` and `maxLevel=N`
   describe the template's grid, `lon`, `lat`, `altitude`, `heading` and `pitch` the view.

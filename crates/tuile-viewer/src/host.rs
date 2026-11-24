@@ -267,6 +267,13 @@ pub(crate) fn compression_file(host: &dyn Host) -> Option<PathBuf> {
     Some(support_dir(host)?.join("imagery-compression"))
 }
 
+/// Where the lighting a person chose in the menu is kept for the next
+/// session: the word `on`; none when it is off, the default.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn lighting_file(host: &dyn Host) -> Option<PathBuf> {
+    Some(support_dir(host)?.join("lighting"))
+}
+
 /// The file a token is read from, and the one a person is told to create.
 ///
 /// On a phone that is `Documents/token`: the one directory of an application

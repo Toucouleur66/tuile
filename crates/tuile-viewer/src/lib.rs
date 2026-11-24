@@ -18,6 +18,7 @@ mod host;
 mod import;
 mod journal;
 mod launch;
+mod lighting;
 mod location;
 mod menu;
 mod open;

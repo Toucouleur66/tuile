@@ -248,6 +248,10 @@ pub(crate) const IMAGERY_COMPRESSION_KEY: &str = "imagery_compression";
 /// `tuile_viewer`'s `SHOW_TILESETS_KEY`.
 pub(crate) const SHOW_TILESETS_KEY: &str = "show_tilesets";
 
+/// The key the settings page keeps the lighting switch under: the same as
+/// `tuile_viewer`'s `LIGHTING_KEY`.
+pub(crate) const LIGHTING_KEY: &str = "lighting";
+
 /// The settings page: one secure text field for the credential, under the
 /// key the application reads first, and the choice of how imagery is held on
 /// the GPU — off unless the person picks otherwise, read at launch.
@@ -335,6 +339,28 @@ fn settings_bundle(credential: &Credential, out: &Path) -> anyhow::Result<()> {
     ] {
         tiles.insert(key.into(), value);
     }
+    // The ground lit by the sun and seen through the air: off unless turned
+    // on — on a desktop and a page, View > Lighting.
+    let mut lighting_group = plist::Dictionary::new();
+    lighting_group.insert("Type".into(), text("PSGroupSpecifier"));
+    lighting_group.insert("Title".into(), text("Lighting"));
+    lighting_group.insert(
+        "FooterText".into(),
+        text(
+            "The ground lit by the sun and the Moon, seen through the air. \
+             Off, the imagery is drawn as it is, for about a quarter of \
+             the GPU's work. Applies at the next launch.",
+        ),
+    );
+    let mut lighting = plist::Dictionary::new();
+    for (key, value) in [
+        ("Type", text("PSToggleSwitchSpecifier")),
+        ("Title", text("Lighting")),
+        ("Key", text(LIGHTING_KEY)),
+        ("DefaultValue", Boolean(false)),
+    ] {
+        lighting.insert(key.into(), value);
+    }
     let mut root = plist::Dictionary::new();
     root.insert(
         "PreferenceSpecifiers".into(),
@@ -345,6 +371,8 @@ fn settings_bundle(credential: &Credential, out: &Path) -> anyhow::Result<()> {
             Dictionary(compression),
             Dictionary(tiles_group),
             Dictionary(tiles),
+            Dictionary(lighting_group),
+            Dictionary(lighting),
         ]),
     );
     Dictionary(root).to_file_xml(settings.join("Root.plist"))?;
@@ -582,24 +610,29 @@ mod tests {
             .filter_map(plist::Value::as_string)
             .collect();
         assert_eq!(values, ["off", "auto", "bc7", "astc"]);
-        // The 3D Tiles: a switch, off by default.
-        let switch = fields
-            .iter()
-            .filter_map(plist::Value::as_dictionary)
-            .find(|f| {
-                f.get("Type").and_then(plist::Value::as_string) == Some("PSToggleSwitchSpecifier")
-            })
-            .expect("a 3D Tiles switch");
-        assert_eq!(
-            switch.get("Key").and_then(plist::Value::as_string),
-            Some(SHOW_TILESETS_KEY)
-        );
-        assert_eq!(
-            switch
-                .get("DefaultValue")
-                .and_then(plist::Value::as_boolean),
-            Some(false)
-        );
+        // The 3D Tiles and the lighting: each a switch, off by default.
+        for key in [SHOW_TILESETS_KEY, LIGHTING_KEY] {
+            let switch = fields
+                .iter()
+                .filter_map(plist::Value::as_dictionary)
+                .find(|f| f.get("Key").and_then(plist::Value::as_string) == Some(key))
+                .unwrap_or_else(|| panic!("a {key} switch"));
+            assert_eq!(
+                switch.get("Type").and_then(plist::Value::as_string),
+                Some("PSToggleSwitchSpecifier"),
+                "{key}"
+            );
+            assert_eq!(
+                switch
+                    .get("DefaultValue")
+                    .and_then(plist::Value::as_boolean),
+                Some(false),
+                "{key} is off by default"
+            );
+        }
+        // The viewer reads the switch under the same key.
+        assert!(include_str!("../../tuile-viewer/src/native/settings.rs")
+            .contains("pub(crate) const LIGHTING_KEY: &str = \"lighting\";"));
         let info = plist::Value::from_file(dir.path().join("Info.plist")).expect("a plist");
         let key = bundled_key("SOME_TOKEN");
         assert!(info.as_dictionary().is_some_and(|d| !d.contains_key(&key)));

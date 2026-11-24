@@ -63,7 +63,7 @@ something the other does not.
 | menu | items (key) |
 |---|---|
 | *application* | About, Services, Hide, Hide Others, Show All, Quit (⌘Q) |
-| View | Wireframe (W) ✓, Freeze Selection (F) ✓, Diagnostic View: Normal / Unlit / Coverage / Geometry ✓, Next Diagnostic View (D), Save Snapshot (S), Record Session (O) ✓ |
+| View | Lighting ✓ (off by default: the imagery as sampled; on, lit by the sun and seen through the air — kept for the next session), Wireframe (W) ✓, Freeze Selection (F) ✓, Diagnostic View: Normal / Unlit / Coverage / Geometry ✓, Next Diagnostic View (D), Save Snapshot (S), Record Session (O) ✓ |
 | Go | North Up (N), Centre on Current Location (L), Copy Link to This View (C), Go to Copied Link (V) |
 | Imagery | one item per layer ✓, Next Layer (I) |
 | Window | Minimize, Zoom, Enter Full Screen, Bring All to Front |
@@ -116,6 +116,7 @@ osascript -e 'tell application "Tuile" to go to longitude -4.02 latitude 5.34 al
 | `tuile://here` | centres on the current location |
 | `tuile://snapshot` | saves the picture drawn, with the view in its EXIF, into `~/Pictures/Tuile` (`[snapshot]` of the configuration file moves it) |
 | `tuile://view?freeze=on\|off&wireframe=on\|off` | the two display switches |
+| `tuile://view?lighting=on\|off` | the ground lit by the sun and seen through the air, or the imagery as sampled (the default); kept for the next session |
 | `tuile://imagery?name=<layer>` | drapes another imagery layer; `name=next` takes the one after the present |
 | `tuile://import?src=https://…` | fetches a configuration file and imports it, as opening it would |
 

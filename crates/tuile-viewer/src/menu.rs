@@ -93,6 +93,9 @@ pub(crate) enum Ask {
     ToggleProfiling,
     /// The imagery held block-compressed on the GPU, or as RGBA8.
     ToggleCompression,
+    /// The ground lit by the sun and seen through the air, or drawn as
+    /// sampled (`crate::lighting`).
+    ToggleLighting,
 }
 
 /// The rates the clock steps through, scene seconds a second: backwards an
@@ -145,6 +148,8 @@ pub(crate) struct State {
     pub budget_window_issues: bool,
     /// The imagery held compressed: any choice but off.
     pub compressed: bool,
+    /// The ground lit (`crate::lighting`): off by default.
+    pub lit: bool,
 }
 
 impl State {
@@ -167,6 +172,7 @@ impl State {
             budget_window_tables: snapshot.budget_window_tables,
             budget_window_issues: snapshot.budget_window_issues,
             compressed: snapshot.compression != tuile_wgpu::ImageryCompression::Off,
+            lit: snapshot.lighting.is_on(),
         }
     }
 
@@ -224,6 +230,11 @@ impl Ask {
                 tuile_wgpu::ImageryCompression::Off
             } else {
                 tuile_wgpu::ImageryCompression::Auto
+            }),
+            Self::ToggleLighting => Command::Lighting(if now.lit {
+                crate::lighting::Lighting::Off
+            } else {
+                crate::lighting::Lighting::On
             }),
             Self::Diagnostic(view) => Command::Diagnostic(view),
             Self::NextDiagnostic => Command::Diagnostic((now.diagnostic + 1) % DIAGNOSTICS.len()),
@@ -287,6 +298,7 @@ impl Ask {
             Self::ToggleMetrics => Some(now.metrics),
             Self::ToggleProfiling => Some(now.profiling),
             Self::ToggleCompression => Some(now.compressed),
+            Self::ToggleLighting => Some(now.lit),
             Self::Do(_)
             | Self::NextDiagnostic
             | Self::NextImagery
@@ -376,6 +388,10 @@ pub(crate) fn layout(
         key: KEYS.iter().find(|(_, a)| *a == ask).map(|(key, _)| *key),
     };
     let mut view = vec![
+        // The ground lit by the sun and seen through the air: off by
+        // default, most of the GPU's work at rest (`crate::lighting`).
+        item("Lighting", Ask::ToggleLighting),
+        Entry::Separator,
         item("Wireframe", Ask::ToggleWireframe),
         item("Freeze Selection", Ask::ToggleFreeze),
         Entry::Separator,
@@ -783,6 +799,7 @@ impl Default for State {
             budget_window_tables: false,
             budget_window_issues: false,
             compressed: false,
+            lit: false,
         }
     }
 }
@@ -907,6 +924,8 @@ mod tests {
         });
         // The imagery compressed, from the state it is in: off by default.
         wanted.push(Command::Compression(tuile_wgpu::ImageryCompression::Auto));
+        // The ground lit, from the state it is in: off by default.
+        wanted.push(Command::Lighting(crate::lighting::Lighting::On));
         for command in wanted {
             assert!(reachable.contains(&command), "{command:?} is on no menu");
         }
@@ -938,6 +957,7 @@ mod tests {
             budget_window_tables: false,
             budget_window_issues: false,
             compressed: true,
+            lit: true,
         };
         let marked: Vec<String> = items(&layers)
             .into_iter()
@@ -947,6 +967,7 @@ mod tests {
         assert_eq!(
             marked,
             [
+                "Lighting",
                 "Wireframe",
                 "Diagnostic View: Coverage",
                 "Aerial with labels",
@@ -1042,6 +1063,7 @@ mod tests {
             budget_window_tables: false,
             budget_window_issues: false,
             compressed: true,
+            lit: true,
         };
         for (ask, command) in [
             (Ask::ToggleWireframe, Command::Wireframe(true)),
@@ -1063,6 +1085,10 @@ mod tests {
             (
                 Ask::ToggleCompression,
                 Command::Compression(tuile_wgpu::ImageryCompression::Off),
+            ),
+            (
+                Ask::ToggleLighting,
+                Command::Lighting(crate::lighting::Lighting::Off),
             ),
         ] {
             assert_eq!(ask.command(&now), command);

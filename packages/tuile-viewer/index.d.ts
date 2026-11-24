@@ -115,6 +115,15 @@ export interface ViewerOptions {
    */
   imageryEncodeLevel?: 0 | 1 | 2 | 3 | 4;
   /**
+   * Whether the ground is lit. `"off"` unless said, or unless the person
+   * turned it on (**View › Lighting**, kept in the page's local storage):
+   * the imagery as sampled, no sun shading, no air. `"on"` lights it by the
+   * sun and the Moon and draws the air between the eye and the ground — the
+   * physical picture, and most of the GPU's work at rest (about four times
+   * the GPU time a frame). Said here, it wins over the person's last choice.
+   */
+  lighting?: "off" | "on";
+  /**
    * The instant the scene is lit for — where the sun, the Moon and the stars
    * stand: `"now"` (the default), `"sunset"` or `"sunrise"` (the next one over
    * the opening view), or an RFC 3339 instant (`"2026-06-21T19:42:00Z"`).
@@ -219,6 +228,12 @@ export interface Viewer {
    * it, yellow one under, orange two, red three or more, blue finer).
    */
   diagnostic(view: DiagnosticView): void;
+  /**
+   * Lights the ground (`"on"`) or draws the imagery as sampled (`"off"`,
+   * the default), from now on and for the next session — as the menu's
+   * **View › Lighting** does.
+   */
+  lighting(mode: "off" | "on"): void;
   /** Releases the GPU, the worker and every listener. The viewer is unusable after. */
   destroy(): void;
   /**
