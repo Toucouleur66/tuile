@@ -967,6 +967,25 @@ mod tests {
         assert_ne!(s.digest(), Specification::fpv().digest());
     }
 
+    /// **The margin between levels is a number of the specification**
+    /// (Laurent, 2026-11-24): every kind carries one, 15 % by default (the
+    /// traversal's deadband before it was specified), a query sets it, and
+    /// it is bounded. Red without the key.
+    #[test]
+    fn the_margin_between_levels_is_specified() {
+        for k in SpecKind::ALL {
+            let q = Specification::of_kind(k).to_query();
+            assert!(q.contains("&level_margin=150"), "{}: {q}", k.label());
+        }
+        let s = Specification::from_query("level_margin=300").unwrap();
+        assert!(s.to_query().contains("&level_margin=300"));
+        assert_ne!(s, Specification::interactive());
+        assert!(matches!(
+            Specification::from_query("level_margin=1001").unwrap_err(),
+            SpecError::OutOfBounds("level_margin")
+        ));
+    }
+
     #[test]
     fn a_bad_query_is_refused() {
         let e = |q| Specification::from_query(q).unwrap_err();

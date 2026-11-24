@@ -3845,6 +3845,35 @@ mod tests {
         );
     }
 
+    /// **The need prices a tile by its view depth, as the traversal refines
+    /// it**: two tiles at one depth, one dead ahead and one at the screen's
+    /// edge, have the same screen-space excess — the budget scores what the
+    /// traversal decides. Red with the distance to the eye.
+    #[test]
+    fn the_need_prices_a_tile_by_its_view_depth() {
+        use crate::traversal::tests::BandTree;
+        let scene = Composite::new();
+        let loader: Arc<dyn TileLoader> = Arc::new(scene.loader());
+        let tree = BandTree;
+        let clock = default_clock();
+        let host = Host {
+            tree: &tree,
+            loader: &loader,
+            clock: &clock,
+            composite: None,
+        };
+        let views = [BandTree::view(0.0)];
+        let excess =
+            |t: u64| State::need_of(&host, &HashMap::new(), &views, 16.0, TileId(t)).sse_excess;
+        assert_eq!(
+            excess(0).to_bits(),
+            excess(1).to_bits(),
+            "{} against {}",
+            excess(0),
+            excess(1)
+        );
+    }
+
     /// **A drape is a load of its own, and every drawn item is dressed.**
     /// Once the view has settled, every drawn tile wears a drape of the layer
     /// it needs (I1 extended by D-A1), the drapes were loaded beside the

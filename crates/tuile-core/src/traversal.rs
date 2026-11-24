@@ -1457,11 +1457,164 @@ fn request(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::tileset::Tileset;
     use glam::{dvec2, dvec3};
     use url::Url;
+
+    /// Two REPLACE roots of radius 10 at one depth, 1000 m in front of an
+    /// eye at the origin looking down −z: one dead ahead, one 1500 m to the
+    /// side (56° off axis, inside a 2:1 screen's 63° half-width). Each has
+    /// two leaf children. The ahead root is 990 m from the eye, the side
+    /// one 1793 m, and both are 990 m deep.
+    pub(crate) struct BandTree;
+
+    impl BandTree {
+        /// The roots' geometric error: an SSE of 20 px at 990 m through
+        /// [`BandTree::view`]'s 512 px focal — over the default 16 px — and
+        /// of 11 px at the side root's 1793 m.
+        pub(crate) const ERROR: f64 = 20.0 * 990.0 / 512.0;
+
+        fn centre(id: TileId) -> DVec3 {
+            let root = if id.0 == 0 || id.0 == 2 || id.0 == 3 {
+                dvec3(0.0, 0.0, -1000.0)
+            } else {
+                dvec3(1500.0, 0.0, -1000.0)
+            };
+            match id.0 {
+                2 | 4 => root - dvec3(5.0, 0.0, 0.0),
+                3 | 5 => root + dvec3(5.0, 0.0, 0.0),
+                _ => root,
+            }
+        }
+
+        /// The eye at `(0, 0, z)` looking down −z through a 2048 × 1024
+        /// screen, 90° high: a focal of 512 px.
+        pub(crate) fn view(z: f64) -> ViewState {
+            ViewState::perspective(
+                dvec3(0.0, 0.0, z),
+                dvec3(0.0, 0.0, -1.0),
+                dvec3(0.0, 1.0, 0.0),
+                dvec2(2048.0, 1024.0),
+                std::f64::consts::FRAC_PI_2,
+            )
+        }
+
+        pub(crate) fn residency() -> ResidentSet {
+            let mut r = ResidentSet::default();
+            for t in 0..6 {
+                r.insert(TileId(t));
+            }
+            r
+        }
+    }
+
+    impl crate::source::TileTree for BandTree {
+        fn roots(&self) -> Vec<TileId> {
+            vec![TileId(0), TileId(1)]
+        }
+        fn children(&self, id: TileId) -> Vec<TileId> {
+            match id.0 {
+                0 => vec![TileId(2), TileId(3)],
+                1 => vec![TileId(4), TileId(5)],
+                _ => Vec::new(),
+            }
+        }
+        fn properties(&self, id: TileId) -> crate::source::TileProperties {
+            let root = id.0 < 2;
+            crate::source::TileProperties {
+                bounding_volume: crate::math::BoundingVolume::Sphere(crate::math::Sphere {
+                    center: Self::centre(id),
+                    radius: if root { 10.0 } else { 5.0 },
+                }),
+                geometric_error: if root { Self::ERROR } else { 0.0 },
+                refine: crate::tileset::Refine::Replace,
+                has_content: true,
+            }
+        }
+    }
+
+    fn select(
+        view: ViewState,
+        config: &Config,
+        chosen_before: &HashSet<TileId>,
+    ) -> HashSet<TileId> {
+        let mut out = TraversalOutput::default();
+        traverse(
+            &BandTree,
+            &BandTree::residency(),
+            &[view],
+            config,
+            0,
+            &HashSet::new(),
+            chosen_before,
+            &mut out,
+        );
+        out.selected.iter().map(|(t, _)| *t).collect()
+    }
+
+    /// **Two tiles at one view depth are refined alike, however far apart
+    /// across the screen** (Laurent, 2026-11-24). Priced by the distance to
+    /// the eye, the level changes in rings round the camera: the tile dead
+    /// ahead is refined, its neighbour at the screen's edge — as deep, as
+    /// big on screen — is not, and a layer is ready in arcs. Priced by its
+    /// depth along the view axis, the two decide the same, and the level
+    /// changes in bands parallel to the screen. Red with the distance.
+    #[test]
+    fn two_tiles_at_one_view_depth_are_refined_alike() {
+        let none = HashSet::new();
+        let near = select(BandTree::view(0.0), &Config::default(), &none);
+        for (root, kids) in [(0, [2, 3]), (1, [4, 5])] {
+            assert!(
+                !near.contains(&TileId(root)) && kids.iter().all(|k| near.contains(&TileId(*k))),
+                "root {root} refined at 990 m deep: {near:?}"
+            );
+        }
+        // Twice as far: both at 10 px, neither refined.
+        let far = select(BandTree::view(990.0), &Config::default(), &none);
+        assert!(
+            far.contains(&TileId(0)) && far.contains(&TileId(1)),
+            "{far:?}"
+        );
+    }
+
+    /// **The margin between levels holds a tile within it and lets it go
+    /// beyond it** (Laurent, 2026-11-24). A tile chosen at its level last
+    /// time is refined only once its error passes `τ (1 + m)`; a tile
+    /// refined last time comes back only once it falls under `τ / (1 + m)`.
+    /// Deterministic: the memory is the previous pass's choice, no clock.
+    #[test]
+    fn the_margin_holds_a_tile_within_it_and_switches_beyond_it() {
+        let m = 0.3;
+        let config = Config {
+            refine_hysteresis: m,
+            ..Config::default()
+        };
+        let tau = config.maximum_screen_space_error;
+        // The ahead root's error is ERROR × 512 / depth; its depth is
+        // 990 + z.
+        let at = |sse: f64| BandTree::view(BandTree::ERROR * 512.0 / sse - 990.0);
+        let at_level: HashSet<TileId> = [TileId(0), TileId(1)].into();
+        let refined: HashSet<TileId> = [2, 3, 4, 5].map(TileId).into();
+        // Chosen at its level: held inside the margin, refined past it.
+        let held = select(at(tau * (1.0 + m / 2.0)), &config, &at_level);
+        assert!(held.contains(&TileId(0)), "held inside: {held:?}");
+        let split = select(at(tau * (1.0 + 2.0 * m)), &config, &at_level);
+        assert!(!split.contains(&TileId(0)), "refined past: {split:?}");
+        // Refined: kept refined inside the margin, merged past it.
+        let kept = select(at(tau / (1.0 + m / 2.0)), &config, &refined);
+        assert!(!kept.contains(&TileId(0)), "kept refined inside: {kept:?}");
+        let merged = select(at(tau / (1.0 + 2.0 * m)), &config, &refined);
+        assert!(merged.contains(&TileId(0)), "merged past: {merged:?}");
+        // No margin: the bare comparison either way.
+        let bare = Config {
+            refine_hysteresis: 0.0,
+            ..config
+        };
+        let flips = select(at(tau * (1.0 + m / 2.0)), &bare, &at_level);
+        assert!(!flips.contains(&TileId(0)), "no margin: {flips:?}");
+    }
 
     /// Two leaves on a planet: one under the eye, one on the far side. Both
     /// inside the frustum, only one of them visible.
