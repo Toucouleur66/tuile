@@ -4,14 +4,14 @@
 //! The mechanism of [`crate::compress`]: what the policy proposes, checked
 //! against the ledger, decided, and its acknowledgement applied.
 
-use super::compress::{eligible, ranks_before, CompressStats, Flight};
+use super::compress::Waiting;
+use super::compress::{eligible, ranks_before, track, CompressStats, Flight, Survival};
 use super::cost::{within_drift, Cost};
 use super::decisions::Decisions;
 use super::state::Gpu;
+use super::state::{EvictKey, Slot};
 use super::stats::BudgetStats;
 use super::types::{Bytes, Class, Generation, Micros, PerClass, ResourceId};
-use super::compress::Waiting;
-use super::state::{EvictKey, Slot};
 use super::{Budget, Ledger};
 
 /// An eligible copy, as the pass found it: its eviction key, resource,
@@ -19,23 +19,18 @@ use super::{Budget, Ledger};
 pub(super) type Found = (EvictKey, ResourceId, Slot, Waiting, Gpu, Class);
 
 impl Budget {
-    /// A GPU copy of `r` at `gen` became drawable at `now`, delivered at
-    /// `cost` and acknowledged at `actual`: waiting to be compressed when
-    /// its cost says it can be into less than it holds, forgotten
-    /// otherwise.
+    /// A GPU copy of `r` at `gen` became drawable, delivered at `cost` and
+    /// acknowledged at `actual`: waiting to be compressed when its cost says
+    /// it can be into less than it holds, forgotten otherwise.
     pub(super) fn compress_admit(
         &mut self,
         r: ResourceId,
         gen: Generation,
-        now: Micros,
         cost: Cost,
         actual: Bytes,
     ) {
         match cost.compresses_to() {
-            Some(to) if to < actual => {
-                self.compress
-                    .admit(r, gen, now, to, cost.compress_blocks)
-            }
+            Some(to) if to < actual => self.compress.admit(r, gen, to, cost.compress_blocks),
             _ => {
                 if !self.compress.waiting.is_empty() || !self.compress.flights.is_empty() {
                     self.compress.waiting.remove(&r);
@@ -99,13 +94,15 @@ impl Budget {
     }
 
     /// One step's compressions (laws 2–6): the waiting copies the visit
-    /// reaches, those the policy finds eligible — `pressed` per class over
-    /// its high watermark — highest value first, while the lane has blocks
-    /// (`lane`, one compression always admitted when none is in flight)
-    /// and the transient stays under `hard`.
+    /// reaches, their score sampled into their window, those the policy
+    /// finds eligible — `pressed` per class over its low watermark —
+    /// highest value first, while the compressions in flight write at most
+    /// `lane` blocks (one always admitted when none is in flight) and the
+    /// transient stays under `hard`.
     pub(super) fn compress_pass(
         &mut self,
         now: Micros,
+        still: bool,
         lane: u64,
         hard: &PerClass<Bytes>,
         pressed: &PerClass<bool>,
@@ -115,6 +112,15 @@ impl Budget {
         if self.compress.waiting.is_empty() && self.compress.flights.is_empty() {
             return;
         }
+        // Law 2 at rest: since when the need has not changed.
+        let still_since = if still {
+            *self.compress.still_since.get_or_insert(now)
+        } else {
+            self.compress.still_since = None;
+            now
+        };
+        let still_for = now.since(still_since);
+        let step = self.steps;
         // The flights whose copy left the GPU, or was delivered again, are
         // over: nothing of them is acknowledged.
         let a = &self.arena;
@@ -150,7 +156,19 @@ impl Budget {
             }
             let (_, probability, _) = a.place(s);
             let class = a.class(s);
-            if !eligible(&p, probability, now.since(w.since), pressed[class]) {
+            let high_from = track(&p, probability, w.high_from, step);
+            if high_from != w.high_from {
+                if let Some(e) = self.compress.waiting.get_mut(&r) {
+                    e.high_from = high_from;
+                }
+            }
+            let survival = Survival {
+                probability,
+                high_from,
+                step,
+                still_for,
+            };
+            if !eligible(&p, survival, pressed[class]) {
                 continue;
             }
             c.eligible += 1;

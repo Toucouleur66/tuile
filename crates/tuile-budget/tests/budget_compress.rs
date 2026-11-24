@@ -14,8 +14,7 @@ mod budget_common;
 use budget_common::*;
 use tuile_budget::cost::{chain_blocks, drape_cost, Cost, TextureFormat};
 use tuile_budget::{
-    BudgetConfig, Bytes, Class, Decisions, Generation, Micros, NeedSet, ResourceId,
-    Specification,
+    BudgetConfig, Bytes, Class, Decisions, Generation, Micros, NeedSet, ResourceId, Specification,
 };
 
 const RED: &str = "red until the compression pass decides";
@@ -93,31 +92,53 @@ fn level4() -> Vec<tuile_budget::TileId> {
     (0..4).map(|x| t(4, x, 0)).collect()
 }
 
-/// **Display at once:** nothing waits for an encode — a compressible drape
-/// is delivered, uploaded and drawn as RGBA8, charged RGBA8; **compress
-/// what lasts:** a drape drawn for the specification's time (2 s) is
-/// compressed, not before, and charged its blocks once acknowledged.
-#[test]
-fn a_drawn_drape_is_compressed_once_it_has_lasted_and_not_before() {
+/// The decisions from the first that drew every drape of `need` to the
+/// first that asked for a compression, on `h` going on with `need`.
+fn decisions_to_compress(h: &mut Host, need: &NeedSet, max: usize) -> Option<usize> {
+    let mut drawn_at = None;
+    for i in 0..max {
+        let d = h.step(need);
+        h.answer(BLOCKS);
+        let dressed = !d.draw.items.is_empty() && d.draw.items.iter().all(|i| !i.drapes.is_empty());
+        if dressed && drawn_at.is_none() {
+            drawn_at = Some(i);
+        }
+        if !d.compress.is_empty() {
+            return drawn_at.map(|at| i - at);
+        }
+    }
+    None
+}
+
+/// A host whose specification is the interactive one with `edit` applied.
+fn specified(edit: impl FnOnce(&mut tuile_budget::spec::Compress)) -> Host {
     let mut h = Host::new(Rig::interactive_config());
+    let mut s = Specification::interactive();
+    edit(&mut s.params.compress);
+    h.r.b.specify(s).unwrap();
+    h
+}
+
+/// **Display at once:** nothing waits for an encode — a compressible drape
+/// is delivered, uploaded and drawn as RGBA8, charged RGBA8; **it survives
+/// its decisions:** compressed once it has kept a very high score over the
+/// specification's decisions (10), not before, and charged its blocks
+/// once acknowledged. The still need's clock is set out of reach here.
+#[test]
+fn a_drawn_drape_is_compressed_once_it_survives_its_decisions_and_not_before() {
+    let mut h = specified(|c| c.still = Micros::from_secs(600));
     let need = drawn_draped(&level4(), 4);
-    let early = h.run(&need, Micros::from_millis(1_500));
-    let drawn = early.last().unwrap();
+    let n = decisions_to_compress(&mut h, &need, 600).expect(RED);
+    assert!(n >= 10, "compressed {n} decisions after it was drawn");
     assert!(
-        drawn.draw.items.iter().all(|i| !i.drapes.is_empty()),
-        "drawn dressed at once"
+        n <= 12,
+        "compressed {n} decisions after it was drawn: {RED}"
     );
-    assert!(
-        early.iter().all(|d| d.compress.is_empty()),
-        "a hot, fresh copy stays RGBA8"
-    );
-    assert_eq!(h.r.b.ledger().gpu[Class::Drape], Bytes(4 * RGBA8.0));
     let late = h.run(&need, Micros::from_secs(2));
     let asked: Vec<ResourceId> = late
         .iter()
         .flat_map(|d| d.compress.iter().map(|(r, _)| *r))
         .collect();
-    assert_eq!(asked.len(), 4, "every drape compressed once: {RED}");
     assert!(asked.iter().all(|r| matches!(r, ResourceId::Drape { .. })));
     assert_eq!(
         h.r.b.ledger().gpu[Class::Drape],
@@ -125,6 +146,22 @@ fn a_drawn_drape_is_compressed_once_it_has_lasted_and_not_before() {
         "charged its blocks once acknowledged"
     );
     h.r.b.audit().unwrap();
+}
+
+/// **At rest, a still need stands for the decisions:** with a count out of
+/// reach, the drapes are compressed once the need has been still for the
+/// specification's time (1 s of the steps' clock), not before.
+#[test]
+fn at_rest_a_still_need_compresses_what_scores_high() {
+    let mut h = specified(|c| c.decisions = 10_000);
+    let need = drawn_draped(&level4(), 4);
+    let early = h.run(&need, Micros::from_millis(900));
+    assert!(
+        early.iter().all(|d| d.compress.is_empty()),
+        "before the still time"
+    );
+    let late = h.run(&need, Micros::from_millis(600));
+    assert!(late.iter().any(|d| !d.compress.is_empty()), "{RED}");
 }
 
 /// **Charged as held (law 5):** from the decision until its
@@ -135,7 +172,6 @@ fn a_drawn_drape_is_compressed_once_it_has_lasted_and_not_before() {
 fn a_compression_in_flight_is_charged_both_copies() {
     let mut h = Host::new(Rig::interactive_config());
     let need = drawn_draped(&level4(), 4);
-    h.run(&need, Micros::from_millis(1_900));
     let mut d = h.step(&need);
     while d.compress.is_empty() && h.r.now < Micros::from_secs(5) {
         d = h.step(&need);
@@ -180,7 +216,12 @@ fn a_compression_in_flight_is_charged_both_copies() {
 /// time to certainty alone keeps compressing the drawn ones.
 #[test]
 fn a_copy_the_score_gives_up_stays_rgba8_whatever_its_age() {
-    let mut h = Host::new(Rig::interactive_config());
+    // Sixty decisions, the still need out of reach: the first view leaves
+    // before its drapes have survived theirs.
+    let mut h = specified(|c| {
+        c.decisions = 60;
+        c.still = Micros::from_secs(600);
+    });
     let here = drawn_draped(&level4(), 4);
     h.run(&here, Micros::from_millis(500));
     let there: Vec<_> = (0..4).map(|x| t(4, x, 8)).collect();
@@ -197,11 +238,9 @@ fn a_copy_the_score_gives_up_stays_rgba8_whatever_its_age() {
         "a copy the view left is not compressed: {asked:?}"
     );
     // The left copies are still resident: kept as cache, as RGBA8.
-    assert!(level4().iter().all(|t| h
-        .r
-        .b
-        .resource(dr(*t, 4))
-        .is_some_and(|v| v.gpu == RGBA8)));
+    assert!(level4()
+        .iter()
+        .all(|t| h.r.b.resource(dr(*t, 4)).is_some_and(|v| v.gpu == RGBA8)));
     let mut s = Specification::interactive();
     s.params.compress.probability_permille = 1_000;
     h.r.b.specify(s).unwrap();
@@ -217,7 +256,9 @@ fn a_copy_the_score_gives_up_stays_rgba8_whatever_its_age() {
 
 /// The scene of the pressure tests: rows of four tiles at level 4, each
 /// drawn for `dwell`, the drapes' class targeted at `target` drapes.
-fn rows(compress: bool, target: u64, dwell: Micros, rows: u64) -> (usize, Option<Micros>) {
+/// Returns the evictions, and the decisions from the first upload to the
+/// first compression.
+fn rows(compress: bool, target: u64, dwell: Micros, rows: u64) -> (usize, Option<usize>) {
     let mut cfg = Rig::interactive_config();
     cfg.target[Class::Drape] = Bytes(target * RGBA8.0);
     cfg.overflow[Class::Drape] = Bytes(4 * RGBA8.0);
@@ -225,7 +266,7 @@ fn rows(compress: bool, target: u64, dwell: Micros, rows: u64) -> (usize, Option
     cfg.pool = tuile_budget::Pool::NONE;
     let mut h = Host::new(cfg);
     let mut evicted = 0;
-    let mut first_compress = None;
+    let (mut step, mut uploaded, mut first_compress) = (0usize, None, None);
     for row in 0..rows {
         let tiles: Vec<_> = (0..4).map(|x| t(4, x, row * 2)).collect();
         let need = drawn_draped(&tiles, 4);
@@ -242,9 +283,18 @@ fn rows(compress: bool, target: u64, dwell: Micros, rows: u64) -> (usize, Option
                 d
             };
             evicted += d.evict.len();
-            if !d.compress.is_empty() {
-                first_compress.get_or_insert(h.r.now);
+            if uploaded.is_none()
+                && d.upload_plan
+                    .items
+                    .iter()
+                    .any(|r| matches!(r, ResourceId::Drape { .. }))
+            {
+                uploaded = Some(step);
             }
+            if !d.compress.is_empty() && first_compress.is_none() {
+                first_compress = uploaded.map(|u| step - u);
+            }
+            step += 1;
             h.answer(BLOCKS);
         }
     }
@@ -270,18 +320,21 @@ fn what_lasts_compressed_keeps_more_resident() {
 }
 
 /// **Compression before eviction (law 4):** over its low watermark — where
-/// evictions start — a class compresses its drawn drapes at once, the age
-/// waived; under it, a fresh copy waits for its age.
+/// evictions start — a class compresses its drawn drapes at once, both
+/// waits waived; with room, a fresh copy survives its decisions first.
 #[test]
-fn under_pressure_the_age_is_waived() {
+fn under_pressure_the_waits_are_waived() {
     let half = Micros::from_millis(500);
     let (_, pressed) = rows(true, 4, half, 3);
     assert!(
-        pressed.is_some_and(|t| t < Micros::from_secs(2)),
+        pressed.is_some_and(|n| n < 10),
         "over the low watermark, compressed at once: {pressed:?} — {RED}"
     );
     let (_, roomy) = rows(true, 40, half, 3);
-    assert_eq!(roomy, None, "with room, a fresh copy stays RGBA8");
+    assert!(
+        roomy.is_some_and(|n| n >= 10),
+        "with room, after its decisions: {roomy:?}"
+    );
 }
 
 /// **What compressions in flight give back counts as given back (law 4):**
@@ -297,8 +350,14 @@ fn a_sweep_counts_what_the_compressions_in_flight_give_back() {
     cfg.pool = tuile_budget::Pool::NONE;
     let mut h = Host::new(cfg);
     let a: Vec<_> = (0..4).map(|x| t(4, x, 0)).collect();
+    // The second view's drapes reach their count while their first
+    // compressions are still in flight.
     h.run(&drawn_draped(&a, 4), Micros::from_millis(2_500));
-    assert_eq!(h.r.b.ledger().gpu[Class::Drape], Bytes(4 * BLOCKS.0), "{RED}");
+    assert_eq!(
+        h.r.b.ledger().gpu[Class::Drape],
+        Bytes(4 * BLOCKS.0),
+        "{RED}"
+    );
     // The view moves; its new drapes are compressed, and the GPU is slow
     // to say it is done.
     let b: Vec<_> = (0..4).map(|x| t(4, x, 2)).collect();
@@ -321,12 +380,11 @@ fn a_sweep_counts_what_the_compressions_in_flight_give_back() {
 }
 
 /// **Spare time only (law 6):** the compressions in flight never write
-/// more blocks than the step's encode lane, one always admitted.
+/// more blocks than the specification's tiles in flight, one always
+/// admitted.
 #[test]
 fn the_compressions_in_flight_fit_the_lane() {
-    let mut cfg = Rig::interactive_config();
-    cfg.encode_blocks_per_step = 2 * chain_blocks(256, 256);
-    let mut h = Host::new(cfg);
+    let mut h = specified(|c| c.flight_tiles = 2);
     let tiles: Vec<_> = (0..8).map(|x| t(4, x, 0)).collect();
     let need = drawn_draped(&tiles, 4);
     h.run(&need, Micros::from_millis(2_000));

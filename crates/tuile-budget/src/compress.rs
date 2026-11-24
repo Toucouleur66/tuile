@@ -15,27 +15,32 @@
 //!
 //! 1. **Upload first.** A delivery never waits for an encode: it crosses,
 //!    is held and is charged as RGBA8 until compressed.
-//! 2. **Compress what lasts.** A GPU copy is compressed when its
-//!    probability of use (the progressive score's `P`) is at least
-//!    [`Compress::probability_permille`] **and** it has been drawable for
-//!    [`Compress::after`] — its expected residency, read off its age: a copy
-//!    that has lasted is likely to last. A hot, freshly needed copy, or one
-//!    the score already gives up, stays RGBA8 and leaves as such.
+//! 2. **It survives the decisions with a very high score.** A GPU copy is
+//!    compressed once its probability of use — the progressive score's `P`
+//!    — has stayed at least [`Compress::probability_permille`] (90 % by
+//!    default) over [`Compress::decisions`] decisions (10), as the pass
+//!    samples it at its visits; a dip starts the count again. Decisions,
+//!    not time: it follows how fast the view changes, and in a film a
+//!    decision is a frame. At rest, where decisions may stop coming, a copy
+//!    whose score is that high is also compressed once the need has been
+//!    still for [`Compress::still`] (1 s, the steps' own time). A fresh
+//!    copy, or one whose score dipped, stays RGBA8 and leaves as such.
 //! 3. **Highest value first.** Among those, the copies the release order
 //!    keeps longest go first (the eviction key, highest first): what is due
 //!    for release soonest is never encoded before it.
-//! 4. **Compression before eviction.** When a class is over its high
-//!    watermark, the age is waived, and the bytes the compressions in
+//! 4. **Compression before eviction.** When a class is over its low
+//!    watermark, both waits are waived — never the score — and the bytes
+//!    the compressions in
 //!    flight will give back count as given back: a sweep evicts only what
 //!    compression cannot free.
 //! 5. **Charged as held.** A copy is charged RGBA8 until compressed; from
 //!    the decision until the consumer acknowledges the compressed copy it
 //!    is charged both (the new copy is made before the old one goes); then
 //!    the compressed bytes the consumer reports.
-//! 6. **Spare time only.** The compressions in flight are capped by the
-//!    step's encode lane (`BudgetConfig::encode_blocks_per_step`) and by
-//!    the hard limit; the consumer runs them in its frames' measured
-//!    headroom, never before an upload or a draw.
+//! 6. **Spare time only.** The compressions in flight are capped
+//!    ([`Compress::flight_tiles`], scaled with the thermal state as the
+//!    encode lane is) and by the hard limit; the consumer runs them in its
+//!    frames' measured headroom, never before an upload or a draw.
 //!
 //! The numbers are the specification's ([`Compress`]): re-specifiable at
 //! run time, recorded, never a switch. Without a compressible copy nothing
@@ -52,12 +57,47 @@ use super::spec::Compress;
 use super::types::{Bytes, Class, Generation, Micros, PerClass, ResourceId};
 use super::value::CERTAIN;
 
-/// Law 2: whether a copy of probability of use `probability` ([`CERTAIN`]
-/// units), drawable for `age`, is compressed — `pressed`, when its class
-/// is over its high watermark (law 4).
-pub fn eligible(p: &Compress, probability: u32, age: Micros, pressed: bool) -> bool {
+/// Whether a probability of use `probability` ([`CERTAIN`] units) is as
+/// high as law 2 asks.
+pub fn high(p: &Compress, probability: u32) -> bool {
     let p_min = u64::from(p.probability_permille) * u64::from(CERTAIN / 1_000);
-    u64::from(probability) >= p_min && (pressed || age >= p.after)
+    u64::from(probability) >= p_min
+}
+
+/// Law 2's count, sampled: the decision from which the copy's score has
+/// stayed high, given what it was (`high_from`) and its probability at
+/// decision `step` — kept while high, started at `step` when it rises,
+/// cleared when it dips.
+pub fn track(p: &Compress, probability: u32, high_from: Option<u64>, step: u64) -> Option<u64> {
+    if high(p, probability) {
+        Some(high_from.unwrap_or(step))
+    } else {
+        None
+    }
+}
+
+/// What law 2 reads of a copy and of the step: its probability of use, the
+/// decision its score has stayed high from, the step, and how long the
+/// need has been still.
+#[derive(Clone, Copy, Debug)]
+pub struct Survival {
+    /// Its probability of use now, [`CERTAIN`] units.
+    pub probability: u32,
+    /// The decision its score has stayed high from ([`track`]).
+    pub high_from: Option<u64>,
+    /// This decision.
+    pub step: u64,
+    /// How long the need has not changed, in the steps' time.
+    pub still_for: Micros,
+}
+
+/// Law 2: whether a copy is compressed — `pressed`, when its class is over
+/// its low watermark (law 4): then both waits are waived, never the score.
+pub fn eligible(p: &Compress, s: Survival, pressed: bool) -> bool {
+    let survived = s
+        .high_from
+        .is_some_and(|from| s.step.saturating_sub(from) >= u64::from(p.decisions));
+    high(p, s.probability) && (pressed || survived || s.still_for >= p.still)
 }
 
 /// Law 3: `a` goes before `b`, given their eviction keys: the copy the
@@ -71,8 +111,9 @@ pub fn ranks_before<K: Ord>(a: (&K, ResourceId), b: (&K, ResourceId)) -> std::cm
 pub(crate) struct Waiting {
     /// The generation of the GPU copy it is of.
     pub gen: Generation,
-    /// When it became drawable.
-    pub since: Micros,
+    /// The decision from which its score has stayed high, as sampled (law
+    /// 2): `None` fresh, or after a dip.
+    pub high_from: Option<u64>,
     /// What it holds once compressed, and the blocks that writes.
     pub to: Bytes,
     pub blocks: u64,
@@ -102,19 +143,22 @@ pub(crate) struct Compressions {
     pub cursor: Option<ResourceId>,
     /// The compressions in flight.
     pub flights: BTreeMap<ResourceId, Flight>,
+    /// Since when the need has not changed, in the steps' time: law 2 at
+    /// rest.
+    pub still_since: Option<Micros>,
 }
 
 impl Compressions {
-    /// A GPU copy of `gen`, drawable from `now`, that may be compressed
-    /// into `to` by writing `blocks` blocks: waiting from now on, whatever
+    /// A GPU copy of `gen` that may be compressed into `to` by writing
+    /// `blocks` blocks: waiting from now on, its count not begun, whatever
     /// it was (a copy delivered again starts over).
-    pub fn admit(&mut self, r: ResourceId, gen: Generation, now: Micros, to: Bytes, blocks: u64) {
+    pub fn admit(&mut self, r: ResourceId, gen: Generation, to: Bytes, blocks: u64) {
         self.flights.remove(&r);
         self.waiting.insert(
             r,
             Waiting {
                 gen,
-                since: now,
+                high_from: None,
                 to,
                 blocks,
             },
@@ -150,12 +194,7 @@ impl Compressions {
         out.extend(self.waiting.range(after).map(|(r, _)| *r).take(n));
         if let Some(c) = self.cursor.filter(|_| out.len() < n) {
             let left = n - out.len();
-            out.extend(
-                self.waiting
-                    .range(..=c)
-                    .map(|(r, _)| *r)
-                    .take(left),
-            );
+            out.extend(self.waiting.range(..=c).map(|(r, _)| *r).take(left));
         }
         self.cursor = out.last().copied();
     }
@@ -199,27 +238,101 @@ mod tests {
         ResourceId::drape(TileId(n), crate::LayerId(0), 3)
     }
 
+    fn at(probability: u32, high_from: Option<u64>, step: u64, still_for: Micros) -> Survival {
+        Survival {
+            probability,
+            high_from,
+            step,
+            still_for,
+        }
+    }
+
     #[test]
-    fn a_low_score_stays_rgba8_whatever_its_age() {
+    fn a_score_under_the_threshold_stays_rgba8_whatever_it_survives() {
         let low = u32::from(COMPRESS.probability_permille) * (CERTAIN / 1_000) - 1;
-        assert!(!eligible(&COMPRESS, low, Micros::from_secs(3_600), false));
-        assert!(!eligible(&COMPRESS, low, Micros::from_secs(3_600), true));
+        let long = Micros::from_secs(3_600);
+        assert!(!eligible(
+            &COMPRESS,
+            at(low, Some(0), 1_000_000, long),
+            false
+        ));
+        assert!(!eligible(
+            &COMPRESS,
+            at(low, Some(0), 1_000_000, long),
+            true
+        ));
+        assert_eq!(track(&COMPRESS, low, Some(0), 99), None);
     }
 
     #[test]
-    fn a_high_score_is_compressed_once_it_has_lasted() {
-        assert!(!eligible(&COMPRESS, CERTAIN, Micros::from_millis(1_999), false));
-        assert!(eligible(&COMPRESS, CERTAIN, Micros::from_secs(2), false));
+    fn a_very_high_score_is_compressed_once_it_survives_its_decisions() {
+        let n = u64::from(COMPRESS.decisions);
+        let from = track(&COMPRESS, CERTAIN, None, 100);
+        assert_eq!(from, Some(100));
+        assert!(!eligible(
+            &COMPRESS,
+            at(CERTAIN, from, 100 + n - 1, Micros::ZERO),
+            false
+        ));
+        assert!(eligible(
+            &COMPRESS,
+            at(CERTAIN, from, 100 + n, Micros::ZERO),
+            false
+        ));
+        // A dip starts the count again.
+        let dipped = track(&COMPRESS, CERTAIN / 2, from, 105);
+        assert_eq!(dipped, None);
+        let again = track(&COMPRESS, CERTAIN, dipped, 106);
+        assert!(!eligible(
+            &COMPRESS,
+            at(CERTAIN, again, 100 + n, Micros::ZERO),
+            false
+        ));
+        assert!(eligible(
+            &COMPRESS,
+            at(CERTAIN, again, 106 + n, Micros::ZERO),
+            false
+        ));
     }
 
     #[test]
-    fn under_pressure_the_age_is_waived() {
-        assert!(eligible(&COMPRESS, CERTAIN, Micros::ZERO, true));
+    fn at_rest_a_still_need_stands_for_the_decisions() {
+        let still = COMPRESS.still;
+        assert!(!eligible(
+            &COMPRESS,
+            at(CERTAIN, Some(0), 1, Micros(still.0 - 1)),
+            false
+        ));
+        assert!(eligible(&COMPRESS, at(CERTAIN, Some(0), 1, still), false));
+        assert!(!eligible(
+            &COMPRESS,
+            at(CERTAIN / 2, Some(0), 1, still),
+            false
+        ));
+    }
+
+    #[test]
+    fn under_pressure_the_waits_are_waived_not_the_score() {
+        assert!(eligible(
+            &COMPRESS,
+            at(CERTAIN, None, 0, Micros::ZERO),
+            true
+        ));
+        assert!(!eligible(
+            &COMPRESS,
+            at(CERTAIN / 2, None, 0, Micros::ZERO),
+            true
+        ));
     }
 
     #[test]
     fn the_copy_kept_longest_goes_first() {
-        let mut v = [(1u64, drape(1)), (9, drape(2)), (9, drape(0)), (5, drape(3))];
+        let mut v = [
+            (1u64, drape(1)),
+            (9, drape(2)),
+            (9, drape(0)),
+            (5, drape(3)),
+        ];
         v.sort_by(|a, b| ranks_before((&a.0, a.1), (&b.0, b.1)));
         assert_eq!(
             v.iter().map(|x| x.1).collect::<Vec<_>>(),
@@ -231,7 +344,7 @@ mod tests {
     fn the_visit_wraps_round_the_waiting_copies() {
         let mut c = Compressions::default();
         for n in 0..5 {
-            c.admit(drape(n), Generation(1), Micros::ZERO, Bytes(1), 1);
+            c.admit(drape(n), Generation(1), Bytes(1), 1);
         }
         let mut out = Vec::new();
         c.visit(3, &mut out);
@@ -245,7 +358,7 @@ mod tests {
     #[test]
     fn a_copy_delivered_again_starts_over() {
         let mut c = Compressions::default();
-        c.admit(drape(1), Generation(1), Micros::ZERO, Bytes(1), 1);
+        c.admit(drape(1), Generation(1), Bytes(1), 1);
         c.flights.insert(
             drape(1),
             Flight {
@@ -256,9 +369,9 @@ mod tests {
                 blocks: 1,
             },
         );
-        c.admit(drape(1), Generation(2), Micros(7), Bytes(1), 1);
+        c.admit(drape(1), Generation(2), Bytes(1), 1);
         assert!(c.flights.is_empty());
-        assert_eq!(c.waiting[&drape(1)].since, Micros(7));
+        assert_eq!(c.waiting[&drape(1)].high_from, None);
         assert_eq!(c.saving()[Class::Drape], Bytes::ZERO);
     }
 }

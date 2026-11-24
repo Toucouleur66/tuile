@@ -5,7 +5,7 @@
 //! (`docs/explorations/compress-what-lasts.md`). Every step is held to
 //! `Sim::check`'s compression invariants besides these.
 
-use tuile_budget::{Class, Micros, ResourceId};
+use tuile_budget::{Class, ResourceId};
 
 use super::motion::fast_dive;
 use super::scenarios::home;
@@ -26,32 +26,36 @@ fn pressed(l: &super::server::StepLog, low_percent: u64) -> bool {
     l.stats.gpu[Class::Drape].0 > target.0 / 100 * low_percent
 }
 
-/// **A still view compresses what lasts, and nothing before it lasted:**
-/// on a desktop holding BC7, no compression is decided in the first two
-/// seconds a drape is drawable unless the drapes are over their low
-/// watermark; by the end, the drapes drawn are held compressed — but the
-/// few the encoder refused.
+/// **A still view compresses what survives:** on a desktop holding BC7,
+/// the drapes drawn are compressed once they have survived their decisions
+/// with a very high score, and by the end are held compressed — but the
+/// few the encoder refused. No compression is decided in the steps before
+/// the first drape could have survived its count, unless the drapes are
+/// over their low watermark.
 #[test]
 #[cfg_attr(
     debug_assertions,
     ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
-fn a_still_view_compresses_what_lasts_and_nothing_fresh() {
+fn a_still_view_compresses_what_survives() {
     let profile = clean(Profile::desktop_bc7());
     let low = u64::from(profile.budget.watermarks.low_percent);
+    let n = usize::from(tuile_budget::spec::COMPRESS.decisions);
     let mut sim = Sim::new(profile, 241);
     sim.run(8.0, &|_| home());
+    let first_drawn = sim
+        .log
+        .iter()
+        .position(|l| l.stats.gpu[Class::Drape].0 > 0)
+        .expect("drapes drawn");
     let first = sim
         .log
         .iter()
-        .find(|l| l.stats.compress.started > 0)
-        .map(|l| (l.now, pressed(l, low)));
-    let Some((at, under_pressure)) = first else {
-        panic!("nothing compressed in eight still seconds: {RED}");
-    };
+        .position(|l| l.stats.compress.started > 0)
+        .unwrap_or_else(|| panic!("nothing compressed in eight still seconds: {RED}"));
     assert!(
-        at >= Micros::from_secs(2) || under_pressure,
-        "compressed at {at:?}, before anything lasted, with room"
+        first >= first_drawn + n || pressed(&sim.log[first], low),
+        "compressed at step {first}, {n} decisions after {first_drawn} not yet passed, with room"
     );
     let last = sim.log.last().unwrap();
     assert_eq!(last.stats.compress.in_flight, 0, "all done once still");

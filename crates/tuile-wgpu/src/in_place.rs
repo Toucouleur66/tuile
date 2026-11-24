@@ -107,9 +107,7 @@ impl Queue {
             let mut all = true;
             for l in drape.layers.iter().filter(|l| l.charge.0 > 0) {
                 let key = (l.source, l.coord);
-                if !l.texture.compresses_into(format)
-                    || picked.iter().any(|p| (p.0, p.1) == key)
-                {
+                if !l.texture.compresses_into(format) || picked.iter().any(|p| (p.0, p.1) == key) {
                     continue;
                 }
                 if bucket.carry <= 0 {
@@ -193,7 +191,10 @@ fn held(drape: &PreparedDrape) -> u64 {
 
 /// The compressed copies of `tiles`, in one compute pass recorded in the
 /// frame's uploads: `None` for a tile the encoder refused.
-fn encode(gpu: &GpuContext, tiles: &[(u32, ImageryCoord, Arc<GpuImagery>)]) -> Vec<Option<GpuImagery>> {
+fn encode(
+    gpu: &GpuContext,
+    tiles: &[(u32, ImageryCoord, Arc<GpuImagery>)],
+) -> Vec<Option<GpuImagery>> {
     let Some(compressor) = gpu.compressor.as_ref() else {
         return tiles.iter().map(|_| None).collect();
     };

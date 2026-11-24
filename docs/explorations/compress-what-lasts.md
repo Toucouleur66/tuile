@@ -32,21 +32,26 @@ here is taken from those implementations beyond the idea.
 
 1. **Upload first.** A decoded imagery tile goes to the GPU as RGBA8 at once and is drawn.
    No upload ever waits for an encode. Until it is compressed it is charged as RGBA8.
-2. **Compress what lasts.** The budget asks for a GPU copy to be compressed when both:
-   - its probability of use — the progressive score's `P` (#289) — is at least
-     `compress_p` (25 % of certainty by default: a neighbour one radius away, two levels
-     above the need, the graded coarse levels; a copy the view left keeps a 64th of its
-     `P` and falls under it);
-   - it has been drawable for at least `compress_after_ms` (2 s by default) — its expected
-     residency, read off its age: a copy that has lasted is likely to last (the
-     operating systems' "inactive" pages). A fresh copy during a zoom is likely replaced
-     before it would pay back its encode.
+2. **A tile survives its decisions with a very high score** (Laurent, 2026-11-24). The
+   budget asks for a GPU copy to be compressed once its probability of use — the
+   progressive score's `P` (#289) — has stayed at least `compress_p` (90 % of certainty)
+   over `compress_decisions` decisions (10): each decision the pass samples it in the
+   high-score set counts one, a dip starts the count again. **Decisions, not time**: the
+   count follows how fast the view changes — a fast zoom replaces its copies before they
+   survive, a still view keeps them — and in a film a decision is a frame. **At rest** the
+   decisions may stop coming (with prediction and conflation, a host decides only when the
+   predicted view moves), so a copy whose score is that high is also compressed once the
+   need has been still for `compress_still_ms` (1 s). Why a still time rather than a count
+   of idle steps: idle steps are exactly what may not happen at rest, while the steps' own
+   time is an input of every step that does run, recorded and replayed — nothing reads a
+   clock inside `decide`. The still need is a need that changed nothing since the step
+   before (an empty delta).
 3. **Highest value first.** Among the eligible copies the budget asks first for those the
    release order keeps longest (the eviction key, highest first: the floor, then the
    score `P × R / bytes` over GreedyDual's `L`). A copy due for eviction soonest is never
    encoded before it.
 4. **Compression before eviction.** When a class is over its low watermark — where
-   evictions start — the age is waived: everything eligible by score is compressed at
+   evictions start — both waits are waived (never the score): everything eligible by score is compressed at
    once. And the bytes the compressions in flight will give back count as given back:
    an eviction sweep evicts only what compression cannot free (the cache the view left
    stays).
@@ -55,19 +60,23 @@ here is taken from those implementations beyond the idea.
    GPU); then what the consumer reports. On the GPU, the compressed texture is made,
    then bound to every drape that names it, then the RGBA8 texture is let go: never a
    frame without a texture, at most one frame with both.
-6. **Spare GPU time only.** The compressions in flight are capped by the step's encode
-   lane (`BudgetConfig::encode_blocks_per_step`, thermal-scaled) and never push a class
-   over its hard limit. The consumer runs them on its encode lane (CB5/CB6), in the frame's
+6. **Spare GPU time only.** The compressions in flight are capped by `compress_flight_tiles`
+   (16 tiles of 256² with their chains, scaled with the thermal state as the encode lane
+   is) and never push a class over its hard limit. The cap is the transient's bound and
+   the consumer's queue: it must hold a few frames of the consumer's encode lane, or the
+   round trip idles the lane — the first measurement capped it at the per-step upload
+   encode lane (three tiles), one multi-tile drape at a time, and compressed 1.5 tiles a
+   second where the lane allowed twenty. The consumer runs them on its encode lane (CB5/CB6), in the frame's
    measured headroom (#311), **after** the frame's uploads.
 7. **No switch, Off unchanged.** The thresholds are specification numbers
-   (`compress_p`, `compress_after_ms`, `compress_visits`: re-specifiable at run time by
+   (`compress_p`, `compress_decisions`, `compress_still_ms`, `compress_visits`, `compress_flight_tiles`: re-specifiable at run time by
    `tuile://budget?…`, recorded with the step, in the digest). A cost that cannot be
    compressed — every cost under `Off`, the film, the bake — makes nothing here run: the
    decisions, their digests and the goldens are the ones they were.
 
 ## Policy and mechanism
 
-- **Policy** (`tuile-budget/src/compress.rs`): `eligible(spec, P, age, pressed)` and
+- **Policy** (`tuile-budget/src/compress.rs`): `track` (the decision the score has stayed high from), `eligible(spec, survival, pressed)` and
   `ranks_before` — pure functions, integers only.
 - **Mechanism** (`tuile-budget/src/compress_pass.rs`): visits up to `compress_visits`
   (64) waiting copies a step, round robin; checks what the policy proposes against the
@@ -104,5 +113,5 @@ its own compression then encodes nothing.
 - The CB2–CB6 fields of `Cost` for an encode on the way (`transfer`, `transient`,
   `encode_blocks`) are still read by the budget, and no producer sets them any more: their
   removal is a follow-up once Laurent agrees.
-- The expected residency is the copy's age (Lindy). A next-use estimate from the views
+- The expected residency is read off the decisions survived, sampled at the pass's visits (64 a step, round robin): a dip between two visits goes unseen. A next-use estimate from the views
   ahead (step C of the roadmap) or the films' known schedule would replace it there.

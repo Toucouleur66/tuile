@@ -839,7 +839,7 @@ impl Budget {
                         st.stale += 1;
                     }
                     if let Some(cost) = landed {
-                        self.compress_admit(r, g, now, cost, actual);
+                        self.compress_admit(r, g, cost, actual);
                     }
                 }
                 Event::Compressed(r, g, actual) => {
@@ -2003,10 +2003,22 @@ impl Budget {
         st.work = st.work.saturating_add(sat_u32(self.arena.transits_len()));
 
         // 9. Compression before eviction (CB9, law 4), then eviction and
-        // release.
-        if !eff.batch {
+        // release. Both policies: in a film a decision is a frame (law 2);
+        // nothing runs without a compressible copy.
+        {
             let (pressed, hard) = self.compress_limits(&eff);
-            self.compress_pass(now, eff.encode, &hard, &pressed, d, &mut st);
+            // The compressions in flight: the specification's tiles, scaled
+            // with the thermal state as the encode lane is (CB9, law 6).
+            let tiles = u64::from(self.costed.params.compress.flight_tiles);
+            let flight = tiles.saturating_mul(super::cost::chain_blocks(256, 256));
+            let lane = if eff.encode == u64::MAX || self.cfg.encode_blocks_per_step == 0 {
+                flight
+            } else {
+                flight.saturating_mul(eff.encode) / self.cfg.encode_blocks_per_step
+            };
+            // A step whose need changed nothing: the view at rest (law 2).
+            let still = named.is_empty();
+            self.compress_pass(now, still, lane, &hard, &pressed, d, &mut st);
         }
         if !eff.batch {
             self.evict(now, &eff, wants, d, &mut st);
