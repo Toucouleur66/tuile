@@ -544,7 +544,13 @@ fn a_fast_zoom_out_returns_under_target_within_the_bound() {
     ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_cold_climb_never_shows_a_hole() {
-    for (profile, seed) in [(Profile::desktop(), 97), (Profile::handheld(), 98)] {
+    // How many levels the climb must coarsen by. One on the phone
+    // (Laurent, 2026-11-24: the simulation's bounds follow the
+    // whole-or-nothing replacement, #324): its coarse drapes arrive over a
+    // phone's network after the fine is let go only once its replacement
+    // is whole, and it ends one level coarser (9 → 8), not two. A hole is
+    // still checked every step (`Sim::check`), never relaxed.
+    for (profile, seed, coarser) in [(Profile::desktop(), 97, 2), (Profile::handheld(), 98, 1)] {
         let name = profile.name;
         let climb = |t: f64| Camera {
             h: (200.0 * detmath::exp2(detmath::log2(250.0) * (t - 3.0).max(0.0) / 5.0))
@@ -570,7 +576,7 @@ fn a_cold_climb_never_shows_a_hole() {
         sim.run(3.0, &|_| climb(10.0));
         let (_, last) = sim.step(climb(10.0));
         assert!(
-            deepest(&last) + 2 <= start,
+            deepest(&last) + coarser <= start,
             "{RED}: {name} did not coarsen ({start} → {})",
             deepest(&last)
         );
