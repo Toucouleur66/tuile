@@ -268,11 +268,11 @@ fn window_numbers(s: &mut tuile_core::budget::BudgetSignals, f: &mut dyn FnMut(&
                 small(&mut v.in_flight[c][l][k], f);
                 small(&mut v.queued[c][l][k], f);
             }
-            for k in 0..2 {
-                f(&mut s.bytes_by_level[c][l][k]);
+            for n in &mut s.bytes_by_level[c][l] {
+                f(n);
             }
-            for k in 0..4 {
-                f(&mut s.level_events_total[c][l][k]);
+            for n in &mut s.level_events_total[c][l] {
+                f(n);
             }
             f(&mut s.evictions_by_level_total[c][l]);
         }
@@ -295,14 +295,14 @@ fn window_numbers(s: &mut tuile_core::budget::BudgetSignals, f: &mut dyn FnMut(&
         f(&mut y.gpu_bytes[i].0);
         small(&mut y.drawn[i], f);
         small(&mut y.in_flight[i], f);
-        for k in 0..2 {
-            small(&mut y.requests[i][k], f);
+        for r in &mut y.requests[i] {
+            small(r, f);
         }
         small(&mut y.ram_hits[i], f);
         small(&mut y.completions[i], f);
         small(&mut y.failures[i], f);
-        for k in 0..5 {
-            f(&mut s.layer_loads_total[i][k]);
+        for n in &mut s.layer_loads_total[i] {
+            f(n);
         }
     }
     small(&mut s.layers_seen, f);
