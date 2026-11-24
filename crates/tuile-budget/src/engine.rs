@@ -1096,7 +1096,7 @@ impl Budget {
         };
         let floor = self.cfg.pinned_level.unwrap_or(0);
         let cap = self.cfg.imagery_cap();
-        let fp = img.footprint.at_threshold(tn.need.sse_excess);
+        let fp = img.footprint.at_threshold_milli(tn.q.sse_excess);
         for reach in layers(img) {
             self.walk(1);
             let clamp = LevelClamp {

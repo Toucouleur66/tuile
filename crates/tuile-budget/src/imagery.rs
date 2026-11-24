@@ -100,6 +100,14 @@ impl TexelFootprint {
         }
     }
 
+    /// [`Self::at_threshold`] from the quantised excess the ledger keeps
+    /// (thousandths, already within `[-16 000, 16 000]`): the budget's
+    /// engine holds integers only.
+    pub fn at_threshold_milli(self, sse_excess_milli: i32) -> Self {
+        let milli = i16::try_from(sse_excess_milli.clamp(-16_000, 16_000)).unwrap_or(0);
+        self.at_threshold(f32::from(milli) / 1000.0)
+    }
+
     /// The footprint of a tile whose screen-space error stands
     /// `sse_excess = log2(sse / τ)` over its threshold, seen from where
     /// that error meets the threshold — where the view draws the tile.
