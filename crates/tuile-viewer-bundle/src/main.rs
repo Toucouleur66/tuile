@@ -226,14 +226,48 @@ fn run(command: &mut Command) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Signs ad hoc, and asks the system whether it agrees with the result.
+/// The identity a local bundle is signed with.
 ///
-/// Ad hoc — an identity of `-` — is a signature with no signer: it seals the
-/// bundle and gives it a stable identity on *this* machine, which is what the
-/// system keys a permission grant on. It proves nothing to another machine.
+/// `TUILE_CODESIGN_IDENTITY` if set; otherwise the first "Apple Development"
+/// identity in the keychain; otherwise ad hoc (`-`). An ad hoc signature's
+/// designated requirement is the code's hash, so every rebuild is a different
+/// program to the keychain and macOS asks for the login password again before
+/// the viewer may read its stored token. A certificate-backed signature keeps
+/// the same requirement (identifier + signer) from one build to the next, so
+/// one "Always Allow" lasts.
+fn signing_identity() -> String {
+    if let Ok(id) = std::env::var("TUILE_CODESIGN_IDENTITY") {
+        if !id.trim().is_empty() {
+            return id;
+        }
+    }
+    Command::new("security")
+        .args(["find-identity", "-v", "-p", "codesigning"])
+        .output()
+        .ok()
+        .and_then(|out| apple_development_identity(&String::from_utf8_lossy(&out.stdout)))
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+/// The SHA-1 of the first "Apple Development" identity in `security
+/// find-identity -v` output.
+fn apple_development_identity(listing: &str) -> Option<String> {
+    listing.lines().find_map(|line| {
+        let line = line.trim();
+        if !line.contains("\"Apple Development:") {
+            return None;
+        }
+        let hash = line.split_whitespace().nth(1)?;
+        (hash.len() == 40 && hash.bytes().all(|b| b.is_ascii_hexdigit())).then(|| hash.to_owned())
+    })
+}
+
+/// Signs with [`signing_identity`], and asks the system whether it agrees
+/// with the result.
 fn sign_and_verify(bundle: &Bundle, app: &Path) -> anyhow::Result<()> {
+    let identity = signing_identity();
     run(Command::new("codesign")
-        .args(["--force", "--sign", "-", "--identifier", &bundle.identifier])
+        .args(["--force", "--sign", &identity, "--identifier", &bundle.identifier])
         .arg(app))?;
     run(Command::new("codesign")
         .args(["--verify", "--strict", "--verbose=2"])
@@ -391,6 +425,22 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_apple_development_identity_is_picked_from_the_listing() {
+        let listing = "  1) 7E5D9583C22199B2A3AA2D4F3DCFCB7FDFE636A0 \"Apple Development: someone@example.com (6LZ8DR8XF3)\"\n     1 valid identities found\n";
+        assert_eq!(
+            apple_development_identity(listing).as_deref(),
+            Some("7E5D9583C22199B2A3AA2D4F3DCFCB7FDFE636A0")
+        );
+    }
+
+    #[test]
+    fn no_apple_development_identity_means_none() {
+        let listing = "  1) 0123456789ABCDEF0123456789ABCDEF01234567 \"Developer ID Application: X (T)\"\n     0 valid identities found\n";
+        assert_eq!(apple_development_identity(listing), None);
+        assert_eq!(apple_development_identity(""), None);
+    }
 
     fn info() -> plist::Dictionary {
         info_plist(&Bundle::default(), "1.2.3")
