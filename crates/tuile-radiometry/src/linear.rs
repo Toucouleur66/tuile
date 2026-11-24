@@ -407,9 +407,7 @@ mod tests {
     fn a_tile_with_too_little_ground_to_compare_has_no_line() {
         let mut bare = paired(|_, c| laid(c));
         // Thirty-one places of two hundred and fifty-six.
-        for k in 31..PAIRS * PAIRS {
-            bare.reference[k] = [f32::NAN; 3];
-        }
+        bare.reference[31..PAIRS * PAIRS].fill([f32::NAN; 3]);
         assert_eq!(bare.line(), None);
     }
 
