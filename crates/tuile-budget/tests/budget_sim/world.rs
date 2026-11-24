@@ -170,6 +170,13 @@ impl Lens {
         }
     }
 
+    /// `cos` of the angle between the axis and the screen's farthest corner.
+    pub fn cos_corner(&self) -> f64 {
+        let x = self.tan_left.abs().max(self.tan_right.abs());
+        let y = self.tan_up.abs().max(self.tan_down.abs());
+        1.0 / (1.0 + x * x + y * y).sqrt()
+    }
+
     /// The focal, logical pixels per unit of tangent, on the sharper axis
     /// (spec §13.2).
     pub fn focal(&self) -> f64 {
@@ -406,6 +413,12 @@ pub fn cost_for(r: ResourceId, plan: SimPlan) -> Cost {
 pub struct Sight {
     /// 3D distance to the closest point, metres.
     pub distance: f64,
+    /// The depth its error is priced at, metres, as the real traversal's
+    /// `ViewState::sse_depth`: the nearest corner's depth along the view
+    /// axis, floored at `distance × cos(corner)` (the screen's farthest
+    /// corner) so ground straddling the eye's plane is not refined to the
+    /// bottom; its distance when the whole tile is behind the eye.
+    pub depth: f64,
     /// Whether it is in view.
     pub visible: bool,
     /// `1 − off-axis`, `[0, 1]`.
@@ -482,8 +495,22 @@ pub fn sight(view: &View, id: TileId, margin: f64) -> Sight {
     let far = (60.0 * cam.h + 30_000.0).min(800_000.0);
     let centre = dot(v, v).sqrt().max(1e-6);
     let cos_off = (fz / centre).clamp(-1.0, 1.0);
+    // The square's corners' depths along the view axis: the nearest and
+    // the farthest.
+    let (mut near, mut deepest) = (f64::INFINITY, f64::NEG_INFINITY);
+    for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
+        let z = dot([x - cam.x, y - cam.y, -cam.h], forward);
+        near = near.min(z);
+        deepest = deepest.max(z);
+    }
+    let depth = if deepest <= 0.0 {
+        distance
+    } else {
+        near.max(distance * lens.cos_corner()).max(0.05)
+    };
     Sight {
         distance,
+        depth,
         visible: distance <= far && inside,
         centrality: (1.0 + cos_off) / 2.0,
         cos_obliquity: (cam.h / distance).clamp(0.05, 1.0),
@@ -500,7 +527,7 @@ pub fn geometric_error(id: TileId) -> f64 {
     SIDE / (128.0 * f64::from(1u32 << l)) * region(id).roughness()
 }
 
-/// The SSE of `id` at distance `d` through a focal of `focal` logical
+/// The SSE of `id` at depth `d` through a focal of `focal` logical
 /// pixels, logical pixels.
 pub fn sse(id: TileId, d: f64, focal: f64) -> f64 {
     geometric_error(id) * focal / d.max(1.0)
@@ -510,7 +537,7 @@ pub fn sse(id: TileId, d: f64, focal: f64) -> f64 {
 pub fn sse_max(views: &[View], id: TileId) -> f64 {
     views
         .iter()
-        .map(|v| sse(id, sight(v, id, 0.0).distance, v.lens.focal()))
+        .map(|v| sse(id, sight(v, id, 0.0).depth, v.lens.focal()))
         .fold(0.0, f64::max)
 }
 
@@ -631,7 +658,7 @@ fn need_of(views: &[View], id: TileId, tau: f64) -> Need {
     for v in views {
         let s = sight(v, id, 0.0);
         let focal = v.lens.focal();
-        sse_best = sse_best.max(sse(id, s.distance, focal));
+        sse_best = sse_best.max(sse(id, s.depth, focal));
         centrality = centrality.max(s.centrality);
         distance = distance.min(s.distance);
         if let Ok(fp) = TexelFootprint::new(s.distance, s.cos_obliquity, focal, SIDE / 256.0, 1.0) {

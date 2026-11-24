@@ -17,6 +17,7 @@
 
 mod alloc;
 mod compress;
+mod depth;
 mod detmath;
 mod gpu;
 mod motion;

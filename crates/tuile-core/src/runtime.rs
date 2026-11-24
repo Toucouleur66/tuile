@@ -810,6 +810,23 @@ impl Stop {
 }
 
 /// What a step reads but does not own.
+/// The traversal's configuration for one step: the session's, its threshold
+/// relaxed by the budget's `sse_scale` (thousandths), and its margin between
+/// levels the budget's specification's (`Params::level_margin_permille`) —
+/// one number, re-specifiable at runtime like the rest of the policy.
+fn traversal_config(
+    base: &Config,
+    sse_scale_milli: u32,
+    spec: &crate::budget::Specification,
+) -> Config {
+    Config {
+        maximum_screen_space_error: base.maximum_screen_space_error * f64::from(sse_scale_milli)
+            / 1000.0,
+        refine_hysteresis: f64::from(spec.params.level_margin_permille) / 1000.0,
+        ..base.clone()
+    }
+}
+
 struct Host<'a> {
     tree: &'a dyn TileTree,
     loader: &'a Arc<dyn TileLoader>,
@@ -1443,10 +1460,19 @@ impl State {
     /// One tile's need, over every view: the largest screen-space error and
     /// centrality, the smallest distance, and the finest imagery footprint
     /// any view gives it (spec §13.3).
+    ///
+    /// The error is priced at the tile's view depth (`ViewState::sse_depth`),
+    /// as the interactive traversal refines it, so the budget scores what the
+    /// traversal decides; `by_depth` false (the batch decree,
+    /// `Config::uniform_detail`) keeps the distance. The imagery footprint
+    /// and the distance the need carries stay the distance to the eye:
+    /// pricing the drapes by depth too was measured in budget_sim to leave a
+    /// headset's newly turned-to ground covered eight levels up (P4.1).
     fn need_of(
         host: &Host<'_>,
         steepest: &HashMap<TileId, f64>,
         views: &[ViewState],
+        by_depth: bool,
         tau: f64,
         tile: TileId,
     ) -> Need {
@@ -1465,7 +1491,12 @@ impl State {
         for v in views {
             let d = props.bounding_volume.distance_to_point(v.position());
             distance = distance.min(d);
-            sse = sse.max(v.screen_space_error(props.geometric_error, d));
+            let deep = if by_depth {
+                v.sse_depth(&props.bounding_volume)
+            } else {
+                d
+            };
+            sse = sse.max(v.screen_space_error(props.geometric_error, deep));
             let to = center - v.position();
             let len = to.length();
             let cos_off = if len > 1e-9 {
@@ -1628,9 +1659,13 @@ impl State {
                 })
                 .collect()
         };
+        let by_depth = !self.config.uniform_detail;
         let list = |set: &BTreeSet<TileId>, views: &[ViewState]| -> Vec<(TileId, Need)> {
             set.iter()
-                .map(|t| (*t, Self::need_of(host, &self.steepest, views, tau, *t)))
+                .map(|t| {
+                    let need = Self::need_of(host, &self.steepest, views, by_depth, tau, *t);
+                    (*t, need)
+                })
                 .collect()
         };
         let views = &self.views;
@@ -1818,14 +1853,14 @@ impl State {
             self.events.push(BudgetEvent::Measured(m));
         }
         self.budget.apply_arrivals(now);
-        // The traversal, relaxed as the budget asks, against the budget's
-        // residency: what is drawable (interactive) or loaded (batch).
-        let config = Config {
-            maximum_screen_space_error: self.config.maximum_screen_space_error
-                * f64::from(self.sse_scale_milli)
-                / 1000.0,
-            ..self.config.clone()
-        };
+        // The traversal, relaxed as the budget asks, with the margin between
+        // levels its specification says, against the budget's residency:
+        // what is drawable (interactive) or loaded (batch).
+        let config = traversal_config(
+            &self.config,
+            self.sse_scale_milli,
+            self.budget.specification(),
+        );
         let started = crate::metrics::stamp();
         {
             let residency = self.budget.residency();
@@ -3835,13 +3870,64 @@ mod tests {
         )];
         let roots = tree.roots();
         let root = |tag: u8| *roots.iter().find(|r| r.tag() == tag).expect("a root");
-        let excess =
-            |tag: u8| State::need_of(&host, &HashMap::new(), &views, 16.0, root(tag)).sse_excess;
+        let excess = |tag: u8| {
+            State::need_of(&host, &HashMap::new(), &views, true, 16.0, root(tag)).sse_excess
+        };
         assert!(
             (excess(one) - excess(four) - 2.0).abs() < 1e-4,
             "{} against {}",
             excess(one),
             excess(four)
+        );
+    }
+
+    /// **The session's margin between levels is its specification's**
+    /// (Laurent, 2026-11-24): the traversal of a step refines against the
+    /// budget's `level_margin`, whatever the session's own configuration
+    /// says, and a re-specification moves it. Red with the configuration's.
+    #[test]
+    fn the_margin_between_levels_comes_from_the_specification() {
+        let base = Config {
+            refine_hysteresis: 0.5,
+            ..Config::interactive_globe()
+        };
+        let spec = crate::budget::Specification::interactive();
+        let config = traversal_config(&base, 1_500, &spec);
+        assert_eq!(config.refine_hysteresis, 0.15);
+        assert_eq!(config.maximum_screen_space_error, 3.0);
+        let wide = crate::budget::Specification::from_query("level_margin=300").expect("valid");
+        assert_eq!(traversal_config(&base, 1_000, &wide).refine_hysteresis, 0.3);
+        let none = crate::budget::Specification::from_query("level_margin=0").expect("valid");
+        assert_eq!(traversal_config(&base, 1_000, &none).refine_hysteresis, 0.0);
+    }
+
+    /// **The need prices a tile by its view depth, as the traversal refines
+    /// it**: two tiles at one depth, one dead ahead and one at the screen's
+    /// edge, have the same screen-space excess — the budget scores what the
+    /// traversal decides. Red with the distance to the eye.
+    #[test]
+    fn the_need_prices_a_tile_by_its_view_depth() {
+        use crate::traversal::tests::BandTree;
+        let scene = Composite::new();
+        let loader: Arc<dyn TileLoader> = Arc::new(scene.loader());
+        let tree = BandTree;
+        let clock = default_clock();
+        let host = Host {
+            tree: &tree,
+            loader: &loader,
+            clock: &clock,
+            composite: None,
+        };
+        let views = [BandTree::view(0.0)];
+        let excess = |t: u64| {
+            State::need_of(&host, &HashMap::new(), &views, true, 16.0, TileId(t)).sse_excess
+        };
+        assert_eq!(
+            excess(0).to_bits(),
+            excess(1).to_bits(),
+            "{} against {}",
+            excess(0),
+            excess(1)
         );
     }
 

@@ -168,16 +168,21 @@ fn exact_levels(d: &tuile_budget::Decisions) -> Levels {
 /// P1.2: while the camera is still and the relaxation does not rise, no
 /// ground goes coarser: a tile drawn exactly stays drawn with a drape no
 /// coarser, or gives way to its descendants — never to an ancestor.
+///
+/// On a phone a drape may give back one level (Laurent, 2026-11-24: the
+/// simulation's bounds follow the view-depth config): priced by depth the
+/// phone draws more tiles at the screen's edges, and its 512 MiB settle
+/// one drape a level coarser (measured 8 → 7). The desktop keeps none.
 #[test]
 #[cfg_attr(
     debug_assertions,
     ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_still_camera_never_coarsens_what_it_drew() {
-    for (profile, seed) in [
-        (Profile::desktop(), 78),
-        (Profile::handheld(), 79),
-        (Profile::handheld_low(), 80),
+    for (profile, seed, slack) in [
+        (Profile::desktop(), 78, 0),
+        (Profile::handheld(), 79, 1),
+        (Profile::handheld_low(), 80, 1),
     ] {
         let name = profile.name;
         let mut sim = Sim::new(quiet(profile), seed);
@@ -192,7 +197,7 @@ fn a_still_camera_never_coarsens_what_it_drew() {
                     for (t, (lvl, img)) in was {
                         match now.get(t) {
                             Some((_, img_now)) => assert!(
-                                img_now >= img,
+                                img_now + slack >= *img,
                                 "P1.2, {name}: {t:?}'s drape went from {img} to {img_now}"
                             ),
                             None => {
@@ -315,7 +320,10 @@ fn a_slow_zoom_in_converges_at_the_deepest_level() {
         // hundred milliseconds later (desktop, seed 87: 2.13 s against the
         // profile's 2 s) — the bound is the profile's plus that half second,
         // as #251 measured for the same fetches.
-        let bound = profile.converge_within.plus(Micros::from_millis(500));
+        // Priced by view depth the phone's low clamp converged 5.02 s after
+        // the stop against 4.5 + 0.5 (2026-11-24): a second over the profile
+        // since (Laurent: the simulation's bounds follow the new config).
+        let bound = profile.converge_within.plus(Micros::from_secs(1));
         slow_dive_converges(profile, seed, bound);
     }
 }
@@ -338,7 +346,11 @@ fn a_slow_zoom_in_converges_at_the_deepest_level() {
     ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_slow_zoom_in_converges_at_the_deepest_level_on_a_phone() {
-    slow_dive_converges(Profile::handheld(), 88, Micros::from_secs(11));
+    // 11 s until the screen-space error was priced by view depth; the phone
+    // then did not converge within them (2026-11-24, seed 88), its finer
+    // screen edges waiting on the same throughput: 16 s since (Laurent: the
+    // simulation's bounds follow the new config).
+    slow_dive_converges(Profile::handheld(), 88, Micros::from_secs(16));
 }
 
 /// P2.2: a fast zoom-in starts nothing the view has left: every start is

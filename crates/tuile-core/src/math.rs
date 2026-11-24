@@ -124,6 +124,17 @@ impl Obb {
         (p - closest).length()
     }
 
+    /// The nearest and the farthest depth of the box along `axis` from
+    /// `eye`: the least and the greatest `(q − eye) · axis` over its points.
+    /// `axis` is assumed normalised.
+    pub fn depth_range(&self, eye: DVec3, axis: DVec3) -> (f64, f64) {
+        let centre = (self.center - eye).dot(axis);
+        let reach = (0..3)
+            .map(|i| self.half_axes.col(i).dot(axis).abs())
+            .sum::<f64>();
+        (centre - reach, centre + reach)
+    }
+
     /// A sphere that bounds this box.
     pub fn bounding_sphere(&self) -> Sphere {
         let r = (self.half_axes.col(0) + self.half_axes.col(1) + self.half_axes.col(2)).length();
@@ -166,6 +177,13 @@ impl Sphere {
     /// Distance from a point to the surface of the sphere (0 if inside).
     pub fn distance_to_point(&self, p: DVec3) -> f64 {
         ((p - self.center).length() - self.radius).max(0.0)
+    }
+
+    /// The nearest and the farthest depth of the sphere along `axis` from
+    /// `eye`. `axis` is assumed normalised.
+    pub fn depth_range(&self, eye: DVec3, axis: DVec3) -> (f64, f64) {
+        let centre = (self.center - eye).dot(axis);
+        (centre - self.radius, centre + self.radius)
     }
 }
 
@@ -344,6 +362,15 @@ impl BoundingVolume {
         match self {
             Self::Obb(b) => b.distance_to_point(p),
             Self::Sphere(s) => s.distance_to_point(p),
+        }
+    }
+
+    /// The nearest and the farthest depth of the volume along `axis` from
+    /// `eye` (a view's forward axis): see [`Obb::depth_range`].
+    pub fn depth_range(&self, eye: DVec3, axis: DVec3) -> (f64, f64) {
+        match self {
+            Self::Obb(b) => b.depth_range(eye, axis),
+            Self::Sphere(s) => s.depth_range(eye, axis),
         }
     }
 
@@ -643,6 +670,31 @@ mod tests {
             center: DVec3::ZERO,
             half_axes: DMat3::from_diagonal(dvec3(1.0, 2.0, 3.0)),
         }
+    }
+
+    /// The depth range is the box's extent along the axis, wherever across
+    /// it the box sits: a box beside the axis is as deep as one on it.
+    #[test]
+    fn a_volumes_depth_range_is_its_extent_along_the_axis() {
+        let eye = dvec3(0.0, 0.0, 10.0);
+        let down = dvec3(0.0, 0.0, -1.0);
+        assert_eq!(unit_obb().depth_range(eye, down), (7.0, 13.0));
+        let aside = Obb {
+            center: dvec3(40.0, -7.0, 0.0),
+            ..unit_obb()
+        };
+        assert_eq!(aside.depth_range(eye, down), (7.0, 13.0));
+        // Turned: the half-axes' projections add up.
+        let turned = Obb {
+            center: DVec3::ZERO,
+            half_axes: DMat3::from_cols(dvec3(1.0, 0.0, 1.0), DVec3::ZERO, DVec3::ZERO),
+        };
+        assert_eq!(turned.depth_range(eye, down), (9.0, 11.0));
+        let ball = Sphere {
+            center: dvec3(3.0, 4.0, 0.0),
+            radius: 2.0,
+        };
+        assert_eq!(ball.depth_range(eye, down), (8.0, 12.0));
     }
 
     #[test]

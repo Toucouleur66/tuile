@@ -47,6 +47,23 @@ pub struct ViewState {
     /// lens of four angles (whose denominator is then 1).
     sse_numerator_px: f64,
     sse_denominator: f64,
+    /// The cosine of the angle between the forward axis and the screen's
+    /// farthest corner (the field of view itself, not the culling margin's):
+    /// every point on screen is at least this fraction of its distance deep.
+    /// See [`ViewState::sse_depth`].
+    cos_corner: f64,
+}
+
+/// The least depth a tile's screen-space error is priced at, metres: the
+/// culling frustum's near plane. Only a volume the eye is inside, or one
+/// grazing it, reaches it; its error is then huge and it always refines,
+/// as with the distance's own clamp.
+pub const SSE_NEAR_DEPTH: f64 = 0.05;
+
+/// `cos` of the angle whose tangents along the two screen axes are `x` and
+/// `y`: `1 / √(1 + x² + y²)`.
+fn cos_of_corner(x: f64, y: f64) -> f64 {
+    1.0 / (1.0 + x * x + y * y).sqrt()
 }
 
 /// A lens's field of view as four angles, radians, OpenXR's convention:
@@ -217,6 +234,10 @@ impl ViewState {
             frustum: Frustum::from_view_proj(&(proj * view)),
             sse_numerator_px: viewport_px.y,
             sse_denominator: 2.0 * libm::tan(fovy_rad / 2.0),
+            cos_corner: {
+                let up = libm::tan(fovy_rad / 2.0).abs();
+                cos_of_corner(aspect * up, up)
+            },
         }
     }
 
@@ -258,6 +279,10 @@ impl ViewState {
             frustum: Frustum::from_view_proj(&(proj * view)),
             sse_numerator_px: across.max(high),
             sse_denominator: 1.0,
+            cos_corner: cos_of_corner(
+                libm::tan(fov.left).abs().max(libm::tan(fov.right).abs()),
+                libm::tan(fov.up).abs().max(libm::tan(fov.down).abs()),
+            ),
         }
     }
 
@@ -305,6 +330,49 @@ impl ViewState {
         // same, bit for bit, as before lenses had a scale.
         (geometric_error * (self.sse_numerator_px / self.scale))
             / (distance.max(1e-7) * self.sse_denominator)
+    }
+
+    /// The depth a tile's screen-space error is priced at: the nearest point
+    /// of its bounding volume along the view's forward axis (Laurent,
+    /// 2026-11-24), not its distance to the eye.
+    ///
+    /// **Why depth.** A perspective projection divides by depth: two
+    /// patches of ground at one depth are drawn the same size wherever they
+    /// sit across the screen. Priced by the distance to the eye, the level
+    /// changes in rings round the camera, and a layer stands half ready in
+    /// arcs; priced by depth, the level changes in straight bands parallel
+    /// to the screen, and the screen's edges are as sharp as its middle at
+    /// the same depth — finer than the distance gave them, which is the cost
+    /// (a few more tiles at the edges, never fewer anywhere: the depth is
+    /// never more than the distance).
+    ///
+    /// **The floor under it.** A volume that straddles the plane of the eye
+    /// — the ground under a camera looking at the horizon — has a nearest
+    /// depth at or below zero, and pricing it there would refine it to the
+    /// bottom of its tree for ground nobody sees. Every point *on screen* is
+    /// at least `cos(corner)` of its distance deep, the corner being the
+    /// screen's farthest from the axis; the volume's on-screen points are at
+    /// least its distance away, so its on-screen depth is at least
+    /// `distance · cos(corner)`. That is the floor: it bounds what a
+    /// straddling volume costs to `1 / cos(corner)` times the distance's
+    /// price (1.2 on a desktop's 60°, 2.1 on a headset's eye), and it never
+    /// raises the depth of a volume that lies on screen, which is already
+    /// that deep. [`SSE_NEAR_DEPTH`] stands under both, for an eye inside
+    /// the volume.
+    ///
+    /// **Behind the eye**, a volume whose farthest depth is at or below zero
+    /// keeps its distance: it is culled anyway, and a frustum's margin or a
+    /// disabled cull is all that brings it here.
+    ///
+    /// Each view prices with its own depth: a stereo rig's need is the
+    /// largest over its eyes (the traversal's `max`).
+    pub fn sse_depth(&self, volume: &crate::math::BoundingVolume) -> f64 {
+        let distance = volume.distance_to_point(self.position);
+        let (near, far) = volume.depth_range(self.position, self.direction);
+        if far <= 0.0 {
+            return distance;
+        }
+        near.max(distance * self.cos_corner).max(SSE_NEAR_DEPTH)
     }
 }
 
@@ -363,6 +431,12 @@ pub struct Config {
     pub uniform_detail_radius: f64,
     /// The width of the deadband around [`Self::maximum_screen_space_error`],
     /// as a fraction of it. Default 0.15; zero restores the bare comparison.
+    ///
+    /// **In a session it is the budget's specification's**
+    /// (`Params::level_margin_permille`, Laurent 2026-11-24): the geometry
+    /// server sets it from the specification in force on every step, so it
+    /// is re-specified at runtime with the rest of the policy; this field's
+    /// own value is for a traversal run on its own.
     ///
     /// **Why a bare comparison is not enough.** `sse > τ` has no memory, so a
     /// tile whose error sits at τ splits on one frame, merges on the next, and
@@ -1088,13 +1162,15 @@ fn visit(
             // Uniform detail by threshold: inside `radius × d_near` every
             // tile is priced at d_near (one level, no LOD wall in the
             // foreground); beyond, the shifted true distance takes over,
-            // continuously.
+            // continuously. The batch decree keeps the distance its disc is
+            // measured in; the interactive pass prices by view depth
+            // (`ViewState::sse_depth`).
             let d = match uniform_distance {
                 Some(near) => {
                     let d = props.bounding_volume.distance_to_point(v.position());
                     near.max(d - (config.uniform_detail_radius - 1.0).max(0.0) * near)
                 }
-                None => props.bounding_volume.distance_to_point(v.position()),
+                None => v.sse_depth(&props.bounding_volume),
             };
             v.screen_space_error(props.geometric_error, d)
         })
@@ -1457,11 +1533,164 @@ fn request(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::tileset::Tileset;
     use glam::{dvec2, dvec3};
     use url::Url;
+
+    /// Two REPLACE roots of radius 10 at one depth, 1000 m in front of an
+    /// eye at the origin looking down −z: one dead ahead, one 1500 m to the
+    /// side (56° off axis, inside a 2:1 screen's 63° half-width). Each has
+    /// two leaf children. The ahead root is 990 m from the eye, the side
+    /// one 1793 m, and both are 990 m deep.
+    pub(crate) struct BandTree;
+
+    impl BandTree {
+        /// The roots' geometric error: an SSE of 20 px at 990 m through
+        /// [`BandTree::view`]'s 512 px focal — over the default 16 px — and
+        /// of 11 px at the side root's 1793 m.
+        pub(crate) const ERROR: f64 = 20.0 * 990.0 / 512.0;
+
+        fn centre(id: TileId) -> DVec3 {
+            let root = if id.0 == 0 || id.0 == 2 || id.0 == 3 {
+                dvec3(0.0, 0.0, -1000.0)
+            } else {
+                dvec3(1500.0, 0.0, -1000.0)
+            };
+            match id.0 {
+                2 | 4 => root - dvec3(5.0, 0.0, 0.0),
+                3 | 5 => root + dvec3(5.0, 0.0, 0.0),
+                _ => root,
+            }
+        }
+
+        /// The eye at `(0, 0, z)` looking down −z through a 2048 × 1024
+        /// screen, 90° high: a focal of 512 px.
+        pub(crate) fn view(z: f64) -> ViewState {
+            ViewState::perspective(
+                dvec3(0.0, 0.0, z),
+                dvec3(0.0, 0.0, -1.0),
+                dvec3(0.0, 1.0, 0.0),
+                dvec2(2048.0, 1024.0),
+                std::f64::consts::FRAC_PI_2,
+            )
+        }
+
+        pub(crate) fn residency() -> ResidentSet {
+            let mut r = ResidentSet::default();
+            for t in 0..6 {
+                r.insert(TileId(t));
+            }
+            r
+        }
+    }
+
+    impl crate::source::TileTree for BandTree {
+        fn roots(&self) -> Vec<TileId> {
+            vec![TileId(0), TileId(1)]
+        }
+        fn children(&self, id: TileId) -> Vec<TileId> {
+            match id.0 {
+                0 => vec![TileId(2), TileId(3)],
+                1 => vec![TileId(4), TileId(5)],
+                _ => Vec::new(),
+            }
+        }
+        fn properties(&self, id: TileId) -> crate::source::TileProperties {
+            let root = id.0 < 2;
+            crate::source::TileProperties {
+                bounding_volume: crate::math::BoundingVolume::Sphere(crate::math::Sphere {
+                    center: Self::centre(id),
+                    radius: if root { 10.0 } else { 5.0 },
+                }),
+                geometric_error: if root { Self::ERROR } else { 0.0 },
+                refine: crate::tileset::Refine::Replace,
+                has_content: true,
+            }
+        }
+    }
+
+    fn select(
+        view: ViewState,
+        config: &Config,
+        chosen_before: &HashSet<TileId>,
+    ) -> HashSet<TileId> {
+        let mut out = TraversalOutput::default();
+        traverse(
+            &BandTree,
+            &BandTree::residency(),
+            &[view],
+            config,
+            0,
+            &HashSet::new(),
+            chosen_before,
+            &mut out,
+        );
+        out.selected.iter().map(|(t, _)| *t).collect()
+    }
+
+    /// **Two tiles at one view depth are refined alike, however far apart
+    /// across the screen** (Laurent, 2026-11-24). Priced by the distance to
+    /// the eye, the level changes in rings round the camera: the tile dead
+    /// ahead is refined, its neighbour at the screen's edge — as deep, as
+    /// big on screen — is not, and a layer is ready in arcs. Priced by its
+    /// depth along the view axis, the two decide the same, and the level
+    /// changes in bands parallel to the screen. Red with the distance.
+    #[test]
+    fn two_tiles_at_one_view_depth_are_refined_alike() {
+        let none = HashSet::new();
+        let near = select(BandTree::view(0.0), &Config::default(), &none);
+        for (root, kids) in [(0, [2, 3]), (1, [4, 5])] {
+            assert!(
+                !near.contains(&TileId(root)) && kids.iter().all(|k| near.contains(&TileId(*k))),
+                "root {root} refined at 990 m deep: {near:?}"
+            );
+        }
+        // Twice as far: both at 10 px, neither refined.
+        let far = select(BandTree::view(990.0), &Config::default(), &none);
+        assert!(
+            far.contains(&TileId(0)) && far.contains(&TileId(1)),
+            "{far:?}"
+        );
+    }
+
+    /// **The margin between levels holds a tile within it and lets it go
+    /// beyond it** (Laurent, 2026-11-24). A tile chosen at its level last
+    /// time is refined only once its error passes `τ (1 + m)`; a tile
+    /// refined last time comes back only once it falls under `τ / (1 + m)`.
+    /// Deterministic: the memory is the previous pass's choice, no clock.
+    #[test]
+    fn the_margin_holds_a_tile_within_it_and_switches_beyond_it() {
+        let m = 0.3;
+        let config = Config {
+            refine_hysteresis: m,
+            ..Config::default()
+        };
+        let tau = config.maximum_screen_space_error;
+        // The ahead root's error is ERROR × 512 / depth; its depth is
+        // 990 + z.
+        let at = |sse: f64| BandTree::view(BandTree::ERROR * 512.0 / sse - 990.0);
+        let at_level: HashSet<TileId> = [TileId(0), TileId(1)].into();
+        let refined: HashSet<TileId> = [2, 3, 4, 5].map(TileId).into();
+        // Chosen at its level: held inside the margin, refined past it.
+        let held = select(at(tau * (1.0 + m / 2.0)), &config, &at_level);
+        assert!(held.contains(&TileId(0)), "held inside: {held:?}");
+        let split = select(at(tau * (1.0 + 2.0 * m)), &config, &at_level);
+        assert!(!split.contains(&TileId(0)), "refined past: {split:?}");
+        // Refined: kept refined inside the margin, merged past it.
+        let kept = select(at(tau / (1.0 + m / 2.0)), &config, &refined);
+        assert!(!kept.contains(&TileId(0)), "kept refined inside: {kept:?}");
+        let merged = select(at(tau / (1.0 + 2.0 * m)), &config, &refined);
+        assert!(merged.contains(&TileId(0)), "merged past: {merged:?}");
+        // No margin: the bare comparison either way.
+        let bare = Config {
+            refine_hysteresis: 0.0,
+            ..config
+        };
+        let flips = select(at(tau * (1.0 + m / 2.0)), &bare, &at_level);
+        assert!(!flips.contains(&TileId(0)), "no margin: {flips:?}");
+    }
 
     /// Two leaves on a planet: one under the eye, one on the far side. Both
     /// inside the frustum, only one of them visible.
