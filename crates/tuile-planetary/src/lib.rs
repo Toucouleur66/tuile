@@ -1324,7 +1324,23 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> PlanetaryLoader<T
             // not reach, drowned the server in failures; availability is already
             // here and answers without one.
             let known = self.availability.range_count() > 0;
-            let has_data = !known || self.availability.is_available(coord);
+            // But only once it *can* answer. A metadata-driven layer tells
+            // whether a tile exists in the `metadata` of an ancestor; until
+            // that ancestor has loaded, the tile is not known yet — which is
+            // not absent. Deciding then built the tile from its parent, kept
+            // that copy for good and recorded its relief, so what a tile was
+            // made of depended on whether its ancestor happened to land first:
+            // the same track grounded 300 m apart from one run to the next
+            // (the pinned floor's loads and the runtime's worker count
+            // decided the order). The ancestor is loaded first — cached, and
+            // a load of the ground anyway — and its reveal read at once,
+            // held for the tree's next pass or not.
+            if known {
+                if let Some(by) = self.availability.revealed_by(coord) {
+                    self.terrain_mesh(by).await?;
+                }
+            }
+            let has_data = !known || self.availability.is_available_or_held(coord);
 
             let mesh = if has_data {
                 // Only the network counts. A cache hit returned above and an
@@ -2507,6 +2523,194 @@ mod tests {
             4,
             "two siblings, their parent and the root, once each"
         );
+    }
+
+    /// A metadata-driven terrain, Cesium World Terrain's shape in small: the
+    /// layer knows the two roots, and each root's `metadata` reveals levels
+    /// 1 to 3 everywhere. Every tile has data of its own, its maximum height
+    /// its own ([`Revealing::max_of`]), and answers after its own number of
+    /// executor turns: the order tiles land in is the test's to choose.
+    struct Revealing {
+        turns: HashMap<TileCoord, usize>,
+        fetched: Mutex<Vec<TileCoord>>,
+    }
+
+    impl Revealing {
+        const LAYER: &'static str = r#"{ "format": "quantized-mesh-1.0",
+            "tiles": ["{z}/{x}/{y}.terrain"], "maxzoom": 3, "metadataAvailability": 10,
+            "available": [[{"startX": 0, "startY": 0, "endX": 1, "endY": 0}]] }"#;
+
+        /// A tile's own maximum height: higher at every level, so a tile
+        /// built from its parent can never carry it.
+        fn max_of(c: TileCoord) -> f32 {
+            (100 * (c.level + 1)) as f32 + (c.x + c.y) as f32
+        }
+
+        /// Two triangles over the tile, rising from 0 to its maximum, and
+        /// for a root the `metadata` extension revealing levels 1 to 3.
+        fn tile(c: TileCoord) -> Vec<u8> {
+            let scheme = GeographicTilingScheme::default();
+            let rect = scheme.tile_rect(c);
+            let (lon, lat) = rect.center();
+            let centre = tuile_core::geo::geodetic_to_ecef(tuile_core::geo::Geodetic {
+                lon,
+                lat,
+                height: 0.0,
+            })
+            .to_array();
+            let header = tuile_terrain::Header {
+                center: centre,
+                min_height: 0.0,
+                max_height: Self::max_of(c),
+                bounding_sphere_center: centre,
+                bounding_sphere_radius: rect.height().max(rect.width()) * WGS84_A,
+                horizon_occlusion: [0.0; 3],
+            };
+            let (u, v, height) = ([0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0], [0.0, 1.0, 0.0, 1.0]);
+            let edges = [vec![0, 2], vec![0, 1], vec![1, 3], vec![2, 3]];
+            let mut bytes = tuile_terrain::decode::encode(
+                &header,
+                &u,
+                &v,
+                &height,
+                &[0, 1, 2, 2, 1, 3],
+                None,
+                &edges,
+            );
+            if c.level == 0 {
+                let levels: Vec<String> = (1..=3)
+                    .map(|level| {
+                        format!(
+                            r#"[{{"startX": 0, "startY": 0, "endX": {}, "endY": {}}}]"#,
+                            scheme.tiles_x(level) - 1,
+                            scheme.tiles_y(level) - 1
+                        )
+                    })
+                    .collect();
+                let json = format!(r#"{{"available": [{}]}}"#, levels.join(","));
+                let len = u32::try_from(json.len()).expect("short");
+                bytes.push(4);
+                bytes.extend_from_slice(&(len + 4).to_le_bytes());
+                bytes.extend_from_slice(&len.to_le_bytes());
+                bytes.extend_from_slice(json.as_bytes());
+            }
+            bytes
+        }
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl tuile_terrain::TerrainSource for Revealing {
+        async fn fetch_tile(
+            &self,
+            coord: TileCoord,
+        ) -> Result<tuile_core::fetch::Fetched<Vec<u8>>, tuile_terrain::TerrainSourceError>
+        {
+            self.fetched.lock().expect("fetched").push(coord);
+            let mut left = self.turns.get(&coord).copied().unwrap_or(0);
+            futures_util::future::poll_fn(|cx| {
+                if left == 0 {
+                    std::task::Poll::Ready(())
+                } else {
+                    left -= 1;
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+            Ok(tuile_core::fetch::Fetched::undated(Self::tile(coord)))
+        }
+    }
+
+    /// Every ordering of `n` items.
+    fn permutations(n: usize) -> Vec<Vec<usize>> {
+        if n == 0 {
+            return vec![Vec::new()];
+        }
+        let mut out = Vec::new();
+        for rest in permutations(n - 1) {
+            for at in 0..=rest.len() {
+                let mut p = rest.clone();
+                p.insert(at, n - 1);
+                out.push(p);
+            }
+        }
+        out
+    }
+
+    /// **A tile is made of its own data whatever order the tiles land in.**
+    ///
+    /// Whether a metadata-driven layer has a tile is told by an ancestor's
+    /// `metadata`. A tile asked for before that ancestor had landed — or
+    /// after, while its reveal was held for the tree's next pass — was taken
+    /// for absent, built from its parent, and kept that way: its relief, the
+    /// ground a camera is placed over, was its parent's. The same flight
+    /// grounded 300 m apart from one run to the next. Here every ordering of
+    /// four answers, the root's included, with reveals folded at once and
+    /// held as a session holds them, gives every tile its own maximum, each
+    /// fetched once.
+    #[test]
+    fn a_tile_is_made_of_its_own_data_whatever_order_the_tiles_land_in() {
+        let root = TileCoord::new(0, 0, 0);
+        let wanted = [
+            TileCoord::new(3, 5, 2),
+            TileCoord::new(2, 2, 1),
+            TileCoord::new(1, 1, 0),
+        ];
+        let tiles: Vec<TileCoord> = std::iter::once(root).chain(wanted).collect();
+        let layer = LayerJson::from_slice(Revealing::LAYER.as_bytes()).expect("layer");
+        for deferred in [false, true] {
+            for order in permutations(tiles.len()) {
+                let scheme = GeographicTilingScheme::default();
+                let availability = Arc::new(Availability::from_layer(
+                    &layer,
+                    scheme.root_tiles_x,
+                    scheme.root_tiles_y,
+                ));
+                if deferred {
+                    availability.defer();
+                }
+                let loader = PlanetaryLoader {
+                    terrain: Revealing {
+                        turns: tiles.iter().zip(&order).map(|(c, k)| (*c, 3 * k)).collect(),
+                        fetched: Mutex::default(),
+                    },
+                    imagery: CountingImagery(std::sync::atomic::AtomicUsize::new(0)),
+                    scheme,
+                    opts: GlobeOptions::default(),
+                    cache: Mutex::new(ImageryCache::new(8)),
+                    meshes: Mutex::new(MeshCache::new(8)),
+                    fetching: ImageryInFlight::default(),
+                    substitute: None,
+                    building: TerrainInFlight::default(),
+                    changes: store_log::StoreLog::default(),
+                    availability,
+                    provenance: Arc::default(),
+                    heights: Arc::new(TerrainHeights::new(scheme)),
+                    offload: offload::inline(),
+                };
+                let meshes = futures_executor::block_on(futures_util::future::join_all(
+                    wanted.iter().map(|c| loader.terrain_mesh(*c)),
+                ));
+                for (c, mesh) in wanted.iter().zip(meshes) {
+                    let mesh = mesh.expect("every tile has data");
+                    assert_eq!(
+                        mesh.header.max_height,
+                        Revealing::max_of(*c),
+                        "{c:?}, answers landing in the order {order:?}, reveals {}: \
+                         made of its own data, not its parent's",
+                        if deferred { "held" } else { "folded" }
+                    );
+                }
+                let fetched = loader.terrain.fetched.lock().expect("fetched").clone();
+                for c in &tiles {
+                    assert_eq!(
+                        fetched.iter().filter(|f| *f == c).count(),
+                        1,
+                        "{c:?} fetched once, order {order:?}; fetched {fetched:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// A terrain source that is never reached: `drape` does not touch it.
