@@ -1215,6 +1215,7 @@ mod tests {
                 record: Default::default(),
                 config: None,
                 tilesets: None,
+                lighting: None,
             })
         );
         // Either order, either coordinate.
