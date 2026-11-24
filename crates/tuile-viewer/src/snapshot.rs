@@ -138,6 +138,10 @@ impl Snapshot {
 
 /// The type a property has in the scripting dictionary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(all(target_os = "macos", feature = "application")),
+    allow(dead_code)
+)]
 pub(crate) enum Kind {
     Real,
     Integer,
@@ -147,6 +151,10 @@ pub(crate) enum Kind {
 
 /// The answer to a property.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(
+    not(all(target_os = "macos", feature = "application")),
+    allow(dead_code)
+)]
 pub(crate) enum Value {
     Real(f64),
     Integer(i64),
@@ -160,6 +168,10 @@ pub(crate) enum Value {
 
 /// Every property of the view, by the key the dictionary's `cocoa key` names:
 /// the key, its type, and whether a script may set it.
+#[cfg_attr(
+    not(all(target_os = "macos", feature = "application")),
+    allow(dead_code)
+)]
 pub(crate) const PROPERTIES: [(&str, Kind, bool); 20] = [
     ("longitude", Kind::Real, false),
     ("latitude", Kind::Real, false),
@@ -186,6 +198,10 @@ pub(crate) const PROPERTIES: [(&str, Kind, bool); 20] = [
 ];
 
 /// Answers one property from a snapshot; `None` for a key that is not one.
+#[cfg_attr(
+    not(all(target_os = "macos", feature = "application")),
+    allow(dead_code)
+)]
 pub(crate) fn property(s: &Snapshot, key: &str) -> Option<Value> {
     // The four that say where, and the URL that says it too.
     let place = |degrees: f64| {
