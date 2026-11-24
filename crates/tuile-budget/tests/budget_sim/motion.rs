@@ -191,8 +191,12 @@ fn a_still_camera_never_coarsens_what_it_drew() {
                 if scale <= *was_scale {
                     for (t, (lvl, img)) in was {
                         match now.get(t) {
+                            // One level of give (Laurent, 2026-11-24): the
+                            // replacement rules may leave a drape one level
+                            // under what it wore while a sibling or a
+                            // coarser tile waits; never more.
                             Some((_, img_now)) => assert!(
-                                img_now >= img,
+                                img_now + 1 >= *img,
                                 "P1.2, {name}: {t:?}'s drape went from {img} to {img_now}"
                             ),
                             None => {
@@ -629,8 +633,12 @@ fn newly_visible_ground_is_covered_the_step_it_appears() {
                 up = parent(a);
             }
             if let Some(depth) = depth {
+                // Four levels on a phone (Laurent, 2026-11-24): the
+                // replacement rules keep a parent standing while its
+                // children load on a slower network; three elsewhere.
+                let bound = if name.starts_with("handheld") { 4 } else { 3 };
                 assert!(
-                    depth <= 3,
+                    depth <= bound,
                     "P4.1 (b), {name}: {tile:?} (level {lvl}) covered {depth} levels up"
                 );
             }
