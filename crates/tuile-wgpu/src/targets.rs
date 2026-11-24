@@ -16,6 +16,18 @@
 //! comes from [`crate::SAMPLES`], which is the same constant the pipelines are
 //! built against.
 //!
+//! # Kept for one pass
+//!
+//! Both are written by one pass and read by nothing after it but the
+//! resolve: the frame's pass discards them ([`crate::HostPass`]'s `Kept`).
+//! Where wgpu can, they are also **transient**: on a tiled GPU (Apple's, a
+//! phone's) they then live in tile memory alone and are never allocated at
+//! all — about 110 MB of depth and stencil and 55 MB of colour at
+//! 2400×1436 with four samples. The one exception is a pass after the frame that loads the
+//! samples to draw over them (the overlays with a depth of their own): that
+//! frame draws into a second, kept colour target, made the first time one
+//! is asked for ([`FrameTargets::samples`]).
+//!
 //! The surface itself is **not** here. This crate creates no window and no
 //! surface — the host owns those, and owns the resolve into them.
 
@@ -25,9 +37,15 @@ use crate::surface::SurfaceFormat;
 
 /// The multisampled colour target and its depth buffer.
 pub struct FrameTargets {
-    /// Draw into this; resolve into the surface texture.
+    /// Draw into this; resolve into the surface texture. Transient where the
+    /// device allows it: cleared, drawn, resolved and discarded by one pass.
     pub colour: wgpu::TextureView,
+    /// Transient like `colour`, and discarded by the frame's pass.
     pub depth: wgpu::TextureView,
+    /// The colour a frame draws into when a pass after it loads its samples:
+    /// made when first asked for, and `colour` itself where that is not
+    /// transient.
+    kept: std::sync::OnceLock<wgpu::TextureView>,
     format: wgpu::TextureFormat,
     size: (u32, u32),
     /// The surface's format, when the frame reaches it through an encoding
@@ -41,9 +59,10 @@ impl FrameTargets {
     /// not what a stylesheet would call a point.
     pub fn new(gpu: &GpuContext, format: wgpu::TextureFormat, size: (u32, u32)) -> Self {
         let size = (size.0.max(1), size.1.max(1));
-        Self {
-            colour: attachment(gpu, format, size, "tuile frame colour"),
-            depth: attachment(gpu, DEPTH_FORMAT, size, "tuile frame depth"),
+                Self {
+            colour: attachment(gpu, format, size, "tuile frame colour", TRANSIENT),
+            depth: attachment(gpu, DEPTH_FORMAT, size, "tuile frame depth", TRANSIENT),
+            kept: std::sync::OnceLock::new(),
             format,
             size,
             surface: None,
@@ -86,6 +105,9 @@ impl FrameTargets {
                     surface,
                     render: self.format,
                     encode: true,
+                    // Not the targets' business: only the surface's
+                    // configuration reads it.
+                    alpha: wgpu::CompositeAlphaMode::Auto,
                 },
                 size,
             ),
@@ -98,6 +120,24 @@ impl FrameTargets {
         self.size
     }
 
+    /// The multisampled colour a frame draws into: [`FrameTargets::colour`],
+    /// or — when a pass after the frame loads its samples (`kept`) — a target
+    /// that outlives the frame's pass.
+    pub(crate) fn samples(&self, gpu: &GpuContext, kept: bool) -> &wgpu::TextureView {
+        if !kept || !TRANSIENT {
+            return &self.colour;
+        }
+        self.kept.get_or_init(|| {
+            attachment(
+                gpu,
+                self.format,
+                self.size,
+                "tuile frame colour (kept)",
+                false,
+            )
+        })
+    }
+
     /// The colour format the frame is drawn in — and so the format the
     /// drawable it resolves into is viewed as.
     pub fn format(&self) -> wgpu::TextureFormat {
@@ -105,11 +145,22 @@ impl FrameTargets {
     }
 }
 
+/// Whether the frame's attachments are made transient.
+///
+/// Every native backend accepts the usage — memoryless on Apple GPUs, lazily
+/// allocated where Vulkan has such memory, a plain texture elsewhere — and
+/// validates the discard it requires, so a stored or loaded frame attachment
+/// fails on every native test run rather than only on a phone. A browser's
+/// WebGPU may not know the usage bit yet, and a texture it refuses is a black
+/// frame: on the web the attachments stay plain (and still discarded).
+const TRANSIENT: bool = !cfg!(target_arch = "wasm32");
+
 fn attachment(
     gpu: &GpuContext,
     format: wgpu::TextureFormat,
     size: (u32, u32),
     label: &str,
+    transient: bool,
 ) -> wgpu::TextureView {
     gpu.device
         .create_texture(&wgpu::TextureDescriptor {
@@ -124,7 +175,11 @@ fn attachment(
             sample_count: SAMPLES,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: if transient {
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TRANSIENT_ATTACHMENT
+            } else {
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+            },
             view_formats: &[],
         })
         .create_view(&wgpu::TextureViewDescriptor::default())

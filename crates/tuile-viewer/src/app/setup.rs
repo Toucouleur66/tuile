@@ -411,6 +411,8 @@ impl App {
             surface: super::offscreen::FORMAT,
             render: super::offscreen::FORMAT,
             encode: false,
+            // No surface to configure: a texture has no compositor.
+            alpha: wgpu::CompositeAlphaMode::Opaque,
         };
         let screen = super::screen::Screen::Offscreen(super::offscreen::Offscreen::new(
             &gpu, size, rig.eyes,
@@ -606,7 +608,9 @@ pub(super) fn configure(
             height: size.1,
             present_mode: wgpu::PresentMode::AutoVsync,
             desired_maximum_frame_latency: 2,
-            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            // Opaque wherever the surface offers it: the compositor copies
+            // the frame instead of blending it over the desktop.
+            alpha_mode: format.alpha,
             // What every frame has been shown in so far: sRGB for the 8-bit
             // formats chosen here, on every backend. Wide gamut and HDR change
             // how a frame must be encoded, and are a choice of their own.

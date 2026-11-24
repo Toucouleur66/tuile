@@ -333,7 +333,7 @@ impl PanelScreen {
                         overlay.render(pass);
                         on_top.render(pass);
                     },
-                    |_, _| {},
+                    tuile_wgpu::NOTHING_AFTER,
                 );
                 if presented == tuile_wgpu::Presented::Invalid {
                     tracing::warn!("the budget window's surface refused a frame");
@@ -358,7 +358,7 @@ impl PanelScreen {
                         overlay.render(pass);
                         on_top.render(pass);
                     },
-                    |_, _| {},
+                    tuile_wgpu::NOTHING_AFTER,
                 );
                 *tag += 1;
                 let mut encoder = gpu.device.create_command_encoder(&Default::default());

@@ -166,6 +166,36 @@ pub struct HostFrame<'a> {
     pub clear: Option<wgpu::Color>,
 }
 
+/// What of a frame's attachments outlives its pass.
+///
+/// A host's attachments are the host's: whatever it reads after tuile's pass
+/// is there, so [`HostPass::encode`] stores both. Our own frame knows what
+/// follows it, and keeps only that: its multisampled colour when a pass
+/// after it draws over the same samples, its depth never. On a tiled GPU a
+/// stored attachment is a full-size write to memory every frame — four
+/// samples a pixel — that nothing would read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Kept {
+    /// The multisampled colour; the resolve is always written.
+    pub samples: bool,
+    pub depth: bool,
+}
+
+impl Kept {
+    const ALL: Self = Self {
+        samples: true,
+        depth: true,
+    };
+}
+
+fn store(kept: bool) -> wgpu::StoreOp {
+    if kept {
+        wgpu::StoreOp::Store
+    } else {
+        wgpu::StoreOp::Discard
+    }
+}
+
 /// tuile's pass in a host's frame, for one [`TargetLayout`].
 ///
 /// Built once per layout and kept: it holds the companion depth and the two
@@ -196,6 +226,19 @@ impl HostPass {
         frame: HostFrame<'_>,
         paint: impl FnOnce(&mut wgpu::RenderPass<'_>),
     ) {
+        self.encode_kept(gpu, encoder, frame, Kept::ALL, paint);
+    }
+
+    /// [`HostPass::encode`], keeping of the host's attachments only what
+    /// `kept` says.
+    pub(crate) fn encode_kept(
+        &mut self,
+        gpu: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: HostFrame<'_>,
+        kept: Kept,
+        paint: impl FnOnce(&mut wgpu::RenderPass<'_>),
+    ) {
         let layout = self.layout;
         let colour_load = match frame.clear {
             Some(c) => wgpu::LoadOp::Clear(c),
@@ -212,7 +255,8 @@ impl HostPass {
                 depth_slice: None,
                 ops: wgpu::Operations {
                     load,
-                    store: wgpu::StoreOp::Store,
+                    // The resolve is written either way.
+                    store: store(kept.samples),
                 },
             })]
         };
@@ -231,7 +275,7 @@ impl HostPass {
                     view: frame.depth,
                     depth_ops: Some(wgpu::Operations {
                         load: depth_load,
-                        store: wgpu::StoreOp::Store,
+                        store: store(kept.depth),
                     }),
                     stencil_ops: stencil,
                 }),
@@ -278,7 +322,7 @@ impl HostPass {
                 view: frame.depth,
                 depth_ops: Some(wgpu::Operations {
                     load: depth_load,
-                    store: wgpu::StoreOp::Store,
+                    store: store(kept.depth),
                 }),
                 stencil_ops: None,
             }),

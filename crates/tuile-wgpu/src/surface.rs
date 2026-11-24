@@ -23,7 +23,7 @@
 //!   removed half of that trap; this removes the other half.
 
 use crate::context::GpuContext;
-use crate::host::{HostFrame, HostPass, TargetLayout};
+use crate::host::{HostFrame, HostPass, Kept, TargetLayout};
 use crate::readback::Readback;
 use crate::targets::FrameTargets;
 
@@ -83,6 +83,13 @@ pub struct FramePass<'a> {
     pub size: (u32, u32),
 }
 
+/// What follows a frame when nothing does: the `after` of [`draw_to_surface`]
+/// and [`draw_to_texture`] for a host with no second pass.
+pub type After = fn(&mut wgpu::CommandEncoder, &FramePass<'_>);
+
+/// No pass after the frame: its samples are discarded once resolved.
+pub const NOTHING_AFTER: Option<After> = None;
+
 /// Draws one frame onto the surface and presents it.
 ///
 /// `paint` receives a render pass whose colour attachment is the multisampled
@@ -92,9 +99,11 @@ pub struct FramePass<'a> {
 /// `on_lost` reconfigures the surface. It is a callback because only the host
 /// knows the configuration it wants — usage flags, present mode, size.
 ///
-/// `after` runs on the same encoder once the frame's pass has closed, with the
-/// attachments it used ([`FramePass`]): that is where a second pass belongs. A
-/// host with none passes `|_, _| {}`.
+/// `after`, when given, runs on the same encoder once the frame's pass has
+/// closed, with the attachments it used ([`FramePass`]): that is where a
+/// second pass belongs. A host with none passes [`NOTHING_AFTER`] — and it
+/// matters which: the frame's samples are kept for a pass after it and
+/// discarded otherwise (see [`FrameTargets`]).
 ///
 /// `before_present` is the one place a windowing library still gets a word in:
 /// winit's `pre_present_notify`, which lets the compositor start its own work.
@@ -109,7 +118,7 @@ pub fn draw_to_surface(
     on_lost: impl FnOnce(),
     before_present: impl FnOnce(),
     paint: impl FnOnce(&mut wgpu::RenderPass<'_>),
-    after: impl FnOnce(&mut wgpu::CommandEncoder, &FramePass<'_>),
+    after: Option<impl FnOnce(&mut wgpu::CommandEncoder, &FramePass<'_>)>,
 ) -> Presented {
     let FrameOnSurface {
         gpu,
@@ -194,7 +203,7 @@ pub struct FrameOnTexture<'a> {
 pub fn draw_to_texture(
     into: FrameOnTexture<'_>,
     paint: impl FnOnce(&mut wgpu::RenderPass<'_>),
-    after: impl FnOnce(&mut wgpu::CommandEncoder, &FramePass<'_>),
+    after: Option<impl FnOnce(&mut wgpu::CommandEncoder, &FramePass<'_>)>,
 ) {
     let FrameOnTexture {
         gpu,
@@ -221,7 +230,7 @@ fn encode_frame(
     encoded: Option<&wgpu::TextureView>,
     clear: wgpu::Color,
     paint: impl FnOnce(&mut wgpu::RenderPass<'_>),
-    after: impl FnOnce(&mut wgpu::CommandEncoder, &FramePass<'_>),
+    after: Option<impl FnOnce(&mut wgpu::CommandEncoder, &FramePass<'_>)>,
 ) -> wgpu::CommandEncoder {
     let drawable_view;
     let resolve = match targets.encode.as_ref() {
@@ -235,35 +244,46 @@ fn encode_frame(
         }
     };
     let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    // The samples outlive the frame's pass only when a pass after it draws
+    // over them; otherwise the resolve is all that leaves the GPU's tiles.
+    let colour = targets.samples(gpu, after.is_some());
     // Our own frame is a host like any other: the pass a host's frame gets is
     // this one. It lends its depth's stencil, so the pass is drawn straight
     // into it, and it asks for a fresh frame.
-    HostPass::new(gpu, TargetLayout::own(targets.format())).encode(
+    HostPass::new(gpu, TargetLayout::own(targets.format())).encode_kept(
         gpu,
         &mut encoder,
         HostFrame {
             // Draw into the multisampled target and resolve into the
             // drawable: the samples are averaged on the way out, which is
             // where the staircase on the limb disappears.
-            colour: &targets.colour,
+            colour,
             resolve: Some(resolve),
             depth: &targets.depth,
             size: targets.size(),
             clear: Some(clear),
+        },
+        // Nothing reads the depth after the frame: a pass after it brings
+        // its own ([`FramePass`]).
+        Kept {
+            samples: after.is_some(),
+            depth: false,
         },
         paint,
     );
     // A pass of its own, on the same encoder and before the frame is
     // encoded: what needs a depth attachment the frame's own pass cannot
     // offer. See [`FramePass`].
-    after(
-        &mut encoder,
-        &FramePass {
-            colour: &targets.colour,
-            resolve,
-            size: targets.size(),
-        },
-    );
+    if let Some(after) = after {
+        after(
+            &mut encoder,
+            &FramePass {
+                colour,
+                resolve,
+                size: targets.size(),
+            },
+        );
+    }
     if let (Some(encode), Some(view)) = (targets.encode.as_ref(), encoded) {
         encode.encode(&mut encoder, view);
     }
@@ -300,6 +320,9 @@ pub struct SurfaceFormat {
     /// resolved into a texture of its own and the transfer curve applied by
     /// one more pass ([`FrameTargets::for_surface`] builds it).
     pub encode: bool,
+    /// How the compositor blends the surface with what is behind it:
+    /// [`opaque_alpha`].
+    pub alpha: wgpu::CompositeAlphaMode,
 }
 
 impl SurfaceFormat {
@@ -336,6 +359,29 @@ pub fn surface_format(
         render,
         encode: render != surface
             && !downlevel.contains(wgpu::DownlevelFlags::SURFACE_VIEW_FORMATS),
+        alpha: opaque_alpha(caps),
+    }
+}
+
+/// The surface is opaque wherever the platform offers it: a window's
+/// compositor (macOS, Windows, Wayland, X11) then copies the frame rather
+/// than blending it over the desktop, and a canvas is configured
+/// `alphaMode: "opaque"`.
+///
+/// Nothing is behind the globe to show through: a frame covers every pixel —
+/// sky, ground, the clear of the bars around a held aspect — and a pixel the
+/// ground left uncovered is a bug, not a window onto the desktop. Where a
+/// surface does not offer `Opaque`, wgpu's own choice ([`Auto`]) stands.
+///
+/// [`Auto`]: wgpu::CompositeAlphaMode::Auto
+pub fn opaque_alpha(caps: &wgpu::SurfaceCapabilities) -> wgpu::CompositeAlphaMode {
+    if caps
+        .alpha_modes
+        .contains(&wgpu::CompositeAlphaMode::Opaque)
+    {
+        wgpu::CompositeAlphaMode::Opaque
+    } else {
+        wgpu::CompositeAlphaMode::Auto
     }
 }
 
@@ -408,5 +454,28 @@ mod tests {
             wgpu::DownlevelFlags::empty(),
         );
         assert!(!srgb.encode);
+    }
+
+    /// Opaque whenever it is on offer, whatever order the platform lists
+    /// its modes in; wgpu's own choice only where it is not.
+    #[test]
+    fn the_surface_is_opaque_wherever_it_can_be() {
+        let with = |modes: &[wgpu::CompositeAlphaMode]| {
+            surface_format(
+                &wgpu::SurfaceCapabilities {
+                    formats: vec![wgpu::TextureFormat::Bgra8UnormSrgb],
+                    alpha_modes: modes.to_vec(),
+                    ..Default::default()
+                },
+                wgpu::DownlevelFlags::empty(),
+            )
+            .alpha
+        };
+        use wgpu::CompositeAlphaMode::{Auto, Inherit, Opaque, PostMultiplied, PreMultiplied};
+        // Metal's list, and a compositor that lists blending first.
+        assert_eq!(with(&[Opaque, PostMultiplied]), Opaque);
+        assert_eq!(with(&[PreMultiplied, PostMultiplied, Opaque]), Opaque);
+        // A surface that cannot be opaque is left to wgpu.
+        assert_eq!(with(&[Inherit, PreMultiplied]), Auto);
     }
 }

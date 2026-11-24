@@ -121,7 +121,7 @@ impl Shutter {
         clear: wgpu::Color,
         draw: (
             impl FnOnce(&mut wgpu::RenderPass<'_>),
-            impl FnOnce(&mut wgpu::CommandEncoder, &tuile_wgpu::FramePass<'_>),
+            Option<impl FnOnce(&mut wgpu::CommandEncoder, &tuile_wgpu::FramePass<'_>)>,
         ),
         exposure: Exposure,
         picture: Letterbox,
@@ -440,7 +440,7 @@ mod tests {
             clear,
             (
                 |_: &mut wgpu::RenderPass<'_>| {},
-                |_: &mut wgpu::CommandEncoder, _: &tuile_wgpu::FramePass<'_>| {},
+                tuile_wgpu::NOTHING_AFTER,
             ),
             exposure(),
             picture,
