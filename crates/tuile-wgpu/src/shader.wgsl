@@ -407,11 +407,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
         return vec4f(c, opacity);
     }
     if (atmosphere.shape.w != 0.0) {
-        // The physical atmosphere (`ground_seen`, the film's own): the
-        // fragment lit by the sun and the Moon where it is, and seen through
-        // the air between it and the eye. From the eye; the ground it means
-        // is the drawn point moved to the height its vertices interpolate —
-        // a coarse tile's flat facet is a chord kilometres under it.
+        // The physical atmosphere (`ground_seen_through`, the film's own):
+        // the fragment lit by the sun and the Moon where it is, and seen
+        // through the air between it and the eye. From the eye; the ground
+        // it means is the drawn point moved to the height its vertices
+        // interpolate — a coarse tile's flat facet is a chord kilometres
+        // under it. The air is the frame's aerial table read at that
+        // ground (`air_seen`): the march the film makes for each pixel,
+        // made once a frame at the table's nodes.
         let p = in.world - atmosphere.eye.xyz;
         var facing = n;
         if (dot(facing, p) > 0.0) { facing = -facing; }
@@ -422,7 +425,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
                 + atmosphere.sh_z.xyz * facing.z,
             vec3f(0.0),
         );
-        var seen = graded(ground_seen(albedo.rgb, p, ground, facing, ambient, 1.0));
+        let air = air_seen(ground);
+        var seen = graded(ground_seen_through(
+            albedo.rgb, p, ground, facing, ambient, 1.0, air.veil, air.through,
+        ));
         if (outlines) { seen = outlined(seen, in.uv, uv_d); }
         return vec4f(seen, albedo.a);
     }

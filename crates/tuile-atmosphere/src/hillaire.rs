@@ -39,8 +39,9 @@ pub const WGSL: &str = include_str!("hillaire.wgsl");
 
 /// The bindings [`WGSL`] reads, at `group`: what any renderer — a film's or
 /// a viewer's — declares before including it, its bind group laid out the
-/// same. Binding 4 is a filtering sampler; 7, the night lights, a filterable
-/// texture; every other a 32-bit float table, read by hand.
+/// same. Binding 4 is a filtering sampler; 7, the night lights, and 9, the
+/// aerial table ([`crate::gpu::AERIAL_TABLE_SIZE`]), filterable textures;
+/// every other a 32-bit float table, read by hand.
 pub fn wgsl_bindings(group: u32) -> String {
     format!(
         "@group({group}) @binding(0) var<uniform> atmosphere: Atmosphere;\n\
@@ -51,7 +52,8 @@ pub fn wgsl_bindings(group: u32) -> String {
          @group({group}) @binding(5) var irradiance_lut: texture_2d<f32>;\n\
          @group({group}) @binding(6) var moon_view_lut: texture_2d<f32>;\n\
          @group({group}) @binding(7) var night_lights_lut: texture_2d<f32>;\n\
-         @group({group}) @binding(8) var star_table: texture_2d<f32>;\n"
+         @group({group}) @binding(8) var star_table: texture_2d<f32>;\n\
+         @group({group}) @binding(9) var aerial_lut: texture_2d<f32>;\n"
     )
 }
 

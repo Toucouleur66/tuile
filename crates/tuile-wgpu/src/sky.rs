@@ -21,6 +21,15 @@
 //!   to cross, no interval to wait, nothing kept from the frame before;
 //! - **the sky-view tables** (Hillaire's per-eye table) are made on the
 //!   GPU every frame, from the frame's own eye;
+//! - **the aerial table** — the air between the eye and the ground along
+//!   every line of sight, which every ground fragment reads where it used
+//!   to march its own — is made on the GPU every frame after the light,
+//!   from the frame's own eye;
+//! - a frame whose inputs are the last frame's to the bit — a still camera
+//!   under a still clock — is the last frame's light and tables: nothing is
+//!   worked out again, and the picture is the same picture. Any change at
+//!   all, however small, works everything out again: there is no threshold
+//!   to cross;
 //! - the tables of the air itself are a clear day's, read rather than
 //!   computed ([`tuile_atmosphere::LutAtmosphere::of`]).
 //!
@@ -396,9 +405,20 @@ pub(crate) struct Sky {
     look: SkyLook,
     on: bool,
     /// How many times the light was worked out, and the sky-view made:
-    /// once a frame each.
+    /// once a frame each, but for a frame the same as the last.
     pub(crate) lights: u64,
     pub(crate) views: u64,
+    /// What the light and the tables on the GPU were last made from: a
+    /// frame made from the same is not made again.
+    made_from: Option<MadeFrom>,
+}
+
+/// Everything a frame's light, sky-view and aerial table are made from.
+#[derive(PartialEq)]
+struct MadeFrom {
+    params: AtmosphereParams,
+    placed: tuile_atmosphere::gpu::AtmosphereUniform,
+    inputs: FrameLightInputs,
 }
 
 impl Sky {
@@ -420,6 +440,7 @@ impl Sky {
             on: false,
             lights: 0,
             views: 0,
+            made_from: None,
         }
     }
 
@@ -433,6 +454,7 @@ impl Sky {
     }
 
     pub(crate) fn off(&mut self, queue: &wgpu::Queue) {
+        self.made_from = None;
         if self.on {
             self.on = false;
             queue.write_buffer(
@@ -443,11 +465,12 @@ impl Sky {
         }
     }
 
-    /// The frame's uniform, its light and its sky-view, all of this frame:
-    /// the geometry written from the CPU, the light made on the GPU over
-    /// it, the sky-view made from it — nothing kept from the last frame,
-    /// so that the picture follows the eye, the view and the clock
-    /// continuously.
+    /// The frame's uniform, its light, its sky-view and its aerial table,
+    /// all of this frame: the geometry written from the CPU, the light made
+    /// on the GPU over it, the tables made from both — nothing kept from
+    /// the last frame, so that the picture follows the eye, the view and
+    /// the clock continuously. Only a frame made from exactly what the last
+    /// was made from keeps what the last made, which is what it would make.
     pub(crate) fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &SkyFrame) {
         let bodies = frame.bodies;
         let frame = &frame.view;
@@ -492,6 +515,15 @@ impl Sky {
             .uniform(&self.params, frame.eye, stars, &self.look)
             .with_planets(&bodies.planets)
             .with_eye_from_origin((frame.eye - frame.render_origin).as_vec3());
+        let made_from = MadeFrom {
+            params: self.params,
+            placed,
+            inputs,
+        };
+        if self.on && self.made_from.as_ref() == Some(&made_from) {
+            return;
+        }
+        let MadeFrom { placed, inputs, .. } = made_from;
         // The geometry, written for this frame's submissions; the light
         // copied over it on the GPU, then the sky-view made from both.
         queue.write_buffer(&self.atmosphere.uniform, 0, bytemuck::bytes_of(&placed));
@@ -504,12 +536,19 @@ impl Sky {
             .copy_into_uniform(&mut encoder, &self.atmosphere.uniform);
         self.atmosphere.sky_view_stale = true;
         self.atmosphere.record_sky_view(&mut encoder);
+        self.atmosphere.aerial_stale = true;
+        self.atmosphere.record_aerial(&mut encoder);
         queue.submit([encoder.finish()]);
         self.atmosphere.light = Some(inputs.light);
         self.atmosphere.frame_uniform = placed;
         self.lights += 1;
         self.views += 1;
         self.on = true;
+        self.made_from = Some(MadeFrom {
+            params: self.params,
+            placed,
+            inputs,
+        });
     }
 }
 

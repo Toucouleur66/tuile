@@ -507,28 +507,52 @@ fn sky_view_uv_of(d: vec3f, light: vec3f) -> vec2f {
     return sky_view_uv(atmosphere.sun.w, mu, c);
 }
 
-// The light a ground fragment at `height`, up `up`, facing `normal`, is lit
-// by, in the renderer's units: its own sun and Moon through the air above
-// it and its own sky — the frame's harmonic scaled by how its level
-// ground's sky stands against the frame's — the night floor on all of it,
-// and never less than the least light. `lit` takes the sun's share a
-// shadow leaves.
-fn ground_light(height: f32, up: vec3f, normal: vec3f, frame_sky: vec3f, lit: f32) -> vec3f {
+// The lights over a ground point at `height`, up `up`, in the renderer's
+// units, whatever its facing: level ground's sky light, under the sun and
+// the Moon, the night floor on it; and the sun's and the Moon's light
+// through the air above it, before the cosine of a facing.
+struct GroundLights {
+    level: vec3f,
+    sun: vec3f,
+    moon: vec3f,
+}
+
+fn ground_lights(height: f32, up: vec3f) -> GroundLights {
     let sun_dir = atmosphere.sun.xyz;
     let moon_dir = atmosphere.moon.xyz;
     let mu_s = dot(up, sun_dir);
     let mu_m = dot(up, moon_dir);
     let g = atmosphere.ground.xyz;
-    var level = g * level_irradiance(height, mu_s) + atmosphere.added.xyz;
-    var direct = g * sunlight(height, mu_s) * max(dot(normal, sun_dir), 0.0) * lit;
+    var l: GroundLights;
+    l.level = g * level_irradiance(height, mu_s) + atmosphere.added.xyz;
+    l.sun = g * sunlight(height, mu_s);
+    l.moon = vec3f(0.0);
     if (atmosphere.moon.w > 0.0) {
-        level += g * level_irradiance(height, mu_m) * atmosphere.moon.w;
-        direct += g * body_light(height, mu_m, atmosphere.moon_disc.w) * atmosphere.moon.w
-            * max(dot(normal, moon_dir), 0.0);
+        l.level += g * level_irradiance(height, mu_m) * atmosphere.moon.w;
+        l.moon = g * body_light(height, mu_m, atmosphere.moon_disc.w) * atmosphere.moon.w;
     }
-    let ratio = level / max(atmosphere.level_ref.xyz, vec3f(1e-30));
+    return l;
+}
+
+// The light a ground point under `lights` is lit by, facing `normal`, in
+// the renderer's units: its own sun and Moon through the air above it and
+// its own sky — the frame's harmonic scaled by how its level ground's sky
+// stands against the frame's — the night floor on all of it, and never
+// less than the least light. `lit` takes the sun's share a shadow leaves.
+fn ground_light_of(lights: GroundLights, normal: vec3f, frame_sky: vec3f, lit: f32) -> vec3f {
+    var direct = lights.sun * max(dot(normal, atmosphere.sun.xyz), 0.0) * lit;
+    if (atmosphere.moon.w > 0.0) {
+        direct += lights.moon * max(dot(normal, atmosphere.moon.xyz), 0.0);
+    }
+    let ratio = lights.level / max(atmosphere.level_ref.xyz, vec3f(1e-30));
     let sky = max(frame_sky, vec3f(0.0)) * ratio;
     return max(sky + direct, atmosphere.least.xyz);
+}
+
+// The light a ground fragment at `height`, up `up`, facing `normal`, is lit
+// by: `ground_light_of` the lights over it.
+fn ground_light(height: f32, up: vec3f, normal: vec3f, frame_sky: vec3f, lit: f32) -> vec3f {
+    return ground_light_of(ground_lights(height, up), normal, frame_sky, lit);
 }
 
 // A camera's point-spread function, as a share of a source's light per

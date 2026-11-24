@@ -933,10 +933,11 @@ impl TileRenderer {
 /// hoping the order matches.
 pub fn ground_wgsl(slots: u32) -> String {
     let air = format!(
-        "{}{}\n{}",
+        "{}{}\n{}\n{}",
         tuile_atmosphere::hillaire::wgsl_bindings(3),
         tuile_atmosphere::hillaire::WGSL,
-        tuile_atmosphere::gpu::SEEN_WGSL
+        tuile_atmosphere::gpu::SEEN_WGSL,
+        tuile_atmosphere::gpu::aerial_wgsl(),
     );
     let mut bindings = String::from("struct ImageryUniform {\n");
     // Two vec4 per slot: coverage, then placement. One array rather than an
