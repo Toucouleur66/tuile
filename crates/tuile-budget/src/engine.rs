@@ -1809,6 +1809,9 @@ impl Budget {
         ranked.clear();
         self.ranked_last = ranked;
         self.steps += 1;
+        // A step is a camera pose: the sweep's horizon counts them.
+        self.arena
+            .set_pose(self.steps, self.spec.params.sweep_keep_poses);
 
         let arrivals = self.events.len();
         self.apply_events(now, &mut st);
@@ -3093,7 +3096,7 @@ impl Budget {
                 Some(room) => room,
                 None => self.room(wants, st),
             };
-            let mut law = self.sweep_law(now);
+            let mut law = self.sweep_law();
             let grouped: &[_] = if law.walks_grouped() {
                 &room.grouped
             } else {
@@ -3117,7 +3120,7 @@ impl Budget {
                     continue;
                 }
                 // Not what the view wants now or wanted within the horizon.
-                match law.judge(wants.contains_key(&r), self.arena.last_needed(s)) {
+                match law.judge(wants.contains_key(&r), self.arena.poses_since_wanted(s)) {
                     Verdict::Release => {}
                     Verdict::Keep => continue,
                     Verdict::Stop => break,
@@ -3395,7 +3398,7 @@ impl Budget {
         // over its high watermark (the target) back within it, the law's
         // keepers included: they fit the target (`Reason::Fit`), as I2's
         // pass below.
-        let mut law = self.sweep_law(now);
+        let mut law = self.sweep_law();
         for lawful in [true, false] {
             let mut over: PerClass<bool> =
                 PerClass::from_fn(|c| p.members[c] && self.ledger.gpu[c] > ceiling_high(c));
@@ -3423,7 +3426,7 @@ impl Budget {
                     continue;
                 }
                 if lawful {
-                    match law.judge(wants.contains_key(&r), self.arena.last_needed(s)) {
+                    match law.judge(wants.contains_key(&r), self.arena.poses_since_wanted(s)) {
                         Verdict::Release => {}
                         Verdict::Keep => continue,
                         Verdict::Stop => break,
@@ -3468,12 +3471,11 @@ impl Budget {
         self.scratch.room = Some(room);
     }
 
-    /// The proactive sweep's law at `now` (`sweep`): bound but under a
-    /// memory signal.
-    fn sweep_law(&self, now: Micros) -> super::sweep::SweepLaw {
+    /// The proactive sweep's law (`sweep`): its horizon in camera poses,
+    /// bound but under a memory signal.
+    fn sweep_law(&self) -> super::sweep::SweepLaw {
         super::sweep::SweepLaw::new(
-            now,
-            self.spec.params.sweep_keep,
+            self.spec.params.sweep_keep_poses,
             self.spec.params.release_visits,
             self.pressure == Pressure::Normal,
         )

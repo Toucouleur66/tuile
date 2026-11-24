@@ -950,11 +950,12 @@ fn a_wait_is_classified_first_load_or_reload_after_an_eviction() {
 #[test]
 fn the_sweep_never_takes_what_the_view_wants_within_the_horizon() {
     use tuile_budget::score::Reason;
-    use tuile_budget::Micros;
     let mut r = Rig::new(config(Bytes::mib(24), 4));
-    let keep = tuile_budget::spec::Specification::interactive()
-        .params
-        .sweep_keep;
+    let keep = u64::from(
+        tuile_budget::spec::Specification::interactive()
+            .params
+            .sweep_keep_poses,
+    );
     let (fx, fy) = (0.6213, 0.3149);
     let east = View {
         reach: 3.0,
@@ -965,7 +966,7 @@ fn the_sweep_never_takes_what_the_view_wants_within_the_horizon() {
         look: Some((-1.0, 0.0)),
         ..east
     };
-    let mut last: std::collections::BTreeMap<TileId, Micros> = Default::default();
+    let mut last: std::collections::BTreeMap<TileId, u64> = Default::default();
     let (mut swept, mut bad, mut reloaded) = (0, Vec::new(), 0);
     let mut gone: BTreeSet<ResourceId> = BTreeSet::new();
     let mut over = 0;
@@ -981,7 +982,7 @@ fn the_sweep_never_takes_what_the_view_wants_within_the_horizon() {
             .map(|x| x.0)
             .collect();
         for _ in 0..60 {
-            let now = r.now;
+            let (now, pose) = (r.now, r.frame);
             let d = r.step(&need);
             // Over the low watermark of its target: the sweep's to trim.
             let l = r.b.ledger();
@@ -996,7 +997,7 @@ fn the_sweep_never_takes_what_the_view_wants_within_the_horizon() {
                 }
                 swept += 1;
                 let tile = e.resource.tile();
-                let recent = last.get(&tile).is_some_and(|t| now.since(*t) < keep);
+                let recent = last.get(&tile).is_some_and(|p| pose - p < keep);
                 if listed.contains(&tile) || recent {
                     bad.push((now, e.resource));
                     gone.insert(e.resource);
@@ -1006,14 +1007,14 @@ fn the_sweep_never_takes_what_the_view_wants_within_the_horizon() {
                 reloaded += usize::from(gone.remove(&s.resource));
             }
             for t in &listed {
-                last.insert(*t, now);
+                last.insert(*t, pose);
             }
             r.complete(&d);
         }
     }
     assert!(
         bad.is_empty(),
-        "the sweep took {} copies the view wanted now or within {keep:?} (of {swept} swept), \
+        "the sweep took {} copies the view wanted now or within {keep} poses (of {swept} swept), \
          {reloaded} loaded again; first {:?}",
         bad.len(),
         bad.first()

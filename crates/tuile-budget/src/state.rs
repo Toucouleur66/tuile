@@ -60,7 +60,7 @@
 #![deny(clippy::float_arithmetic)]
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hash::BuildHasher;
 
 use foldhash::fast::FixedState;
@@ -552,6 +552,15 @@ pub(super) struct Arena {
     /// Re-keys of the release index by a change of place since the step
     /// last took them ([`Arena::take_rekeys`]).
     rekeys: u32,
+    /// The step's camera pose: the decisions taken so far, this one
+    /// included ([`Arena::set_pose`]).
+    pose: u64,
+    /// The pose each recent time of need was last a step's at, in time
+    /// order: a resource's last pose wanted is its last time needed's here
+    /// ([`Arena::poses_since_wanted`]). Only the times the sweep may still
+    /// ask about are kept — about its horizon's poses — in room reserved
+    /// when the horizon is set: a step allocates nothing for it.
+    poses: VecDeque<(Micros, u64)>,
 }
 
 /// The bytes one slot holds across the columns, its index and free-list
@@ -624,6 +633,8 @@ impl Default for Arena {
             gpu_epochs: BTreeMap::new(),
             emptied: Vec::new(),
             rekeys: 0,
+            pose: 0,
+            poses: VecDeque::new(),
         }
     }
 }
@@ -963,6 +974,60 @@ impl Arena {
         }
     }
 
+    /// The step's camera pose is `pose` — the decisions taken so far, this
+    /// one included — and the sweep asks about the last `keep` poses at
+    /// most: the times of need last a step's further back are forgotten,
+    /// a resource last needed at one of them wanted too long ago to keep.
+    /// A view's step costs O(1) amortised: one time noted a step, each
+    /// forgotten once.
+    pub fn set_pose(&mut self, pose: u64, keep: u32) {
+        self.pose = pose;
+        let bound = 2 * usize::try_from(keep).unwrap_or(usize::MAX / 4) + 16;
+        // The room, once per horizon: a step then allocates nothing.
+        if self.poses.capacity() < bound + 1 {
+            self.poses.reserve_exact(bound + 1 - self.poses.len());
+        }
+        let keep = u64::from(keep);
+        let stale = |p: u64| pose.saturating_sub(p) >= keep;
+        while self.poses.front().is_some_and(|(_, p)| stale(*p)) {
+            self.poses.pop_front();
+        }
+        // A time gone back puts a recent pose first, older ones behind it.
+        if self.poses.len() >= bound {
+            self.poses.retain(|(_, p)| !stale(*p));
+        }
+    }
+
+    /// The step's time of need `t` is the step's pose's: the last entry
+    /// when time went on, in its place when it went back.
+    fn note_pose(&mut self, t: Micros) {
+        let pose = self.pose;
+        match self.poses.back_mut() {
+            Some((last, p)) if *last == t => *p = pose,
+            Some((last, _)) if *last > t => {
+                match self.poses.binary_search_by_key(&t, |(at, _)| *at) {
+                    Ok(i) => self.poses[i].1 = pose,
+                    Err(i) => self.poses.insert(i, (t, pose)),
+                }
+            }
+            _ => self.poses.push_back((t, pose)),
+        }
+    }
+
+    /// How many camera poses ago the resource of `s` was last wanted: 0
+    /// this step's, `None` longer ago than [`Arena::set_pose`]'s horizon.
+    /// Read through its last time needed — the slot holds no pose of its
+    /// own ([`SLOT_BYTES`] is at its bound) — so the steps of one time are
+    /// one pose, its last: what a step at an unchanged time stops wanting
+    /// counts from that time's last step, as its time does.
+    pub fn poses_since_wanted(&self, s: Slot) -> Option<u64> {
+        let t = self.last_needed(s);
+        self.poses
+            .binary_search_by_key(&t, |(at, _)| *at)
+            .ok()
+            .map(|i| self.pose.saturating_sub(self.poses[i].1))
+    }
+
     /// Whether `s` is a member of the newest group.
     fn is_cur(&self, s: Slot) -> bool {
         let f = self.flags[s.i()];
@@ -1082,10 +1147,14 @@ impl Arena {
         debug_assert!(!self.evict.explicit, "a time gone back is settled first");
         let at = self.evict.cur.at;
         match at {
-            Some(a) if t == a => return Advance::Same,
+            Some(a) if t == a => {
+                self.note_pose(t);
+                return Advance::Same;
+            }
             Some(a) if t < a => return Advance::Back,
             _ => {}
         }
+        self.note_pose(t);
         let old = std::mem::take(&mut self.evict.prev);
         if let Some(pat) = old.at {
             for &s in &old.slots {
@@ -1182,6 +1251,7 @@ impl Arena {
     /// group's resources still last needed at its time, and the newer group
     /// becomes the older.
     fn group_at(&mut self, t: Micros) {
+        self.note_pose(t);
         let e = &mut self.evict;
         if e.cur.at == Some(t) || e.prev.at == Some(t) {
             return;
@@ -2246,6 +2316,39 @@ mod tests {
             filed(&a, Class::TerrainMesh, &Held::GPU[..]),
             vec![mesh(2), mesh(3), mesh(4), mesh(1)]
         );
+    }
+
+    /// A resource's last pose wanted is its last time needed's (Laurent,
+    /// 2026-11-24): counted in steps, whatever their times, and forgotten
+    /// once the sweep's horizon has run.
+    #[test]
+    fn the_poses_since_a_resource_was_wanted_count_steps_not_time() {
+        const KEEP: u32 = 4;
+        let mut a = Arena::new(None);
+        a.set_pose(1, KEEP);
+        a.advance(Micros(10), &[]);
+        let x = a.find_or_insert(mesh(1), Class::TerrainMesh, 5, Micros(10));
+        let y = a.find_or_insert(mesh(2), Class::TerrainMesh, 5, Micros(10));
+        assert_eq!(a.poses_since_wanted(x), Some(0), "wanted this pose");
+        // Pose 2, a second later: `x` left the need, `y` stays.
+        a.set_pose(2, KEEP);
+        a.advance(Micros(1_000_010), &[x]);
+        a.touch(y, Micros(1_000_010));
+        assert_eq!(a.poses_since_wanted(x), Some(1));
+        assert_eq!(a.poses_since_wanted(y), Some(0));
+        // Two poses a microsecond apart, one at the same time as the last.
+        a.set_pose(3, KEEP);
+        a.advance(Micros(1_000_011), &[]);
+        a.set_pose(4, KEEP);
+        assert_eq!(a.advance(Micros(1_000_011), &[]), Advance::Same);
+        assert_eq!(a.poses_since_wanted(x), Some(KEEP as u64 - 1), "N - 1");
+        assert_eq!(a.poses_since_wanted(y), Some(0));
+        a.set_pose(5, KEEP);
+        assert_eq!(a.poses_since_wanted(x), None, "N: past the horizon");
+        a.advance(Micros(1_000_012), &[y]);
+        assert_eq!(a.poses_since_wanted(y), Some(1));
+        a.set_pose(6, KEEP);
+        assert_eq!(a.poses_since_wanted(x), None, "N + 1");
     }
 
     #[test]

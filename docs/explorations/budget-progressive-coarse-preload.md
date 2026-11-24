@@ -133,7 +133,9 @@ The score orders the value band only. Before it, in this order and whatever the 
   swept in the one order, in two parts. Under the target, down to the low watermark, the
   sweep is proactive: it runs ahead of any delivery, and it never takes a copy the need wants
   this step, at any urgency — the ring is the need's own prediction of what comes next — nor
-  one it wanted less than the horizon ago (`sweep_keep_ms`, 5 s). What the law keeps stays; a
+  one it wanted within the horizon, its last camera poses (`sweep_keep_poses`, 300: a pose is a
+  step of the decider, one camera handed to it — the law counts steps and reads no clock;
+  300 poses are the 5 s it was in time at the viewers' 60 steps a second). What the law keeps stays; a
   delivery makes its room by admission (worth less than the work), and the class may sit
   between its watermarks meanwhile. That part runs first; then whatever is still over the
   target goes back within it, the law's keepers included (reason `fit_target`, as I2's pass,
@@ -175,7 +177,7 @@ The score orders the value band only. Before it, in this order and whatever the 
   ahead and coarsened a still view).
 - Never released: what is drawn, a swap, the pinned floor, the chain of what is drawn, what
   is in transit; never released by the sweep under the target: what is wanted this step or
-  was within `sweep_keep_ms`. The window and the metrics count the releases per step
+  was within the last `sweep_keep_poses` poses. The window and the metrics count the releases per step
   by reason — `headroom`, `below_floor_value`, `make_room` — by level × distance
   (`released_by_level_distance{level,distance,reason}`, `released_total{reason}`), GPU and
   decoded (`side` evict | decoded), and the dynamic headroom (`ScoreStats::headroom_bytes`).

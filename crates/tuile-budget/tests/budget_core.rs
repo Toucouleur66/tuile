@@ -1593,8 +1593,8 @@ mod protection {
 
     /// C3: a sweep starts above the high watermark and trims to the low one
     /// — under the target, only what has been out of the need for the
-    /// horizon (`Params::sweep_keep`); what was needed within it is only
-    /// brought back within the target.
+    /// horizon (`Params::sweep_keep_poses`); what was needed within it is
+    /// only brought back within the target.
     #[test]
     fn eviction_trims_to_the_low_watermark_and_waits_for_the_high_one() {
         let mut c = small(10);
@@ -1609,8 +1609,10 @@ mod protection {
         assert_eq!(r.b.ledger().gpu[held], Bytes(MESH.0 * 10), "{RED}");
         let keep = tuile_budget::spec::Specification::interactive()
             .params
-            .sweep_keep;
-        r.idle_for(&drawn(&row(1, 2)), keep);
+            .sweep_keep_poses;
+        for _ in 0..keep {
+            r.step(&drawn(&row(1, 2)));
+        }
         // Past the horizon, the next crossing trims row 0 to the low mark.
         r.settle(&drawn(&row(2, 2)), 30);
         assert_eq!(r.b.ledger().gpu[held], Bytes(MESH.0 * 8), "{RED}");
@@ -1620,6 +1622,64 @@ mod protection {
             Bytes(MESH.0 * 10),
             "no sweep at the high mark"
         );
+    }
+
+    /// The GPU meshes once a sweep crossed the high watermark `since`
+    /// poses of `dt` after the last pose that wanted row 0, under a horizon
+    /// of [`KEEP_POSES`] poses: 10 when row 0 was kept, 8 when it was swept
+    /// down to the low watermark.
+    fn swept_after(dt: Micros, since: u64) -> Bytes {
+        let mut c = small(10);
+        c.watermarks.high_percent = 100;
+        c.watermarks.low_percent = 80;
+        let mut r = Rig::new(c);
+        r.dt = dt;
+        let mut s = tuile_budget::spec::Specification::interactive();
+        s.params.sweep_keep_poses = KEEP_POSES;
+        r.b.specify(s).expect("a valid specification");
+        let row = |y: u64, n: u64| (0..n).map(|x| t(4, x, y)).collect::<Vec<_>>();
+        r.settle(&drawn(&row(0, 9)), 30);
+        // The last pose that wanted row 0.
+        let wanted = r.frame - 1;
+        r.settle(&drawn(&row(1, 2)), 30);
+        // Row 2's first step starts its loads; the next one takes them in,
+        // over the high watermark, and sweeps: at `wanted + since`.
+        let sweep = wanted + since;
+        let idle = sweep
+            .checked_sub(r.frame + 1)
+            .expect("row 1 settled within the poses asked");
+        for _ in 0..idle {
+            r.step(&drawn(&row(1, 2)));
+        }
+        let first = r.step(&drawn(&row(2, 2)));
+        r.complete(&first);
+        assert_eq!(r.frame, sweep, "the sweep's pose");
+        let d = r.step(&drawn(&row(2, 2)));
+        assert!(
+            !d.evict.iter().any(|e| row(2, 2).contains(&e.tile())),
+            "row 2 is wanted"
+        );
+        r.b.ledger().gpu[Class::TerrainMesh]
+    }
+
+    /// The horizon of [`swept_after`].
+    const KEEP_POSES: u32 = 40;
+
+    /// C3 (Laurent, 2026-11-24): the sweep's horizon counts camera poses,
+    /// not seconds. A copy wanted N − 1 poses ago is not swept, though the
+    /// poses were a second apart: 39 s.
+    #[test]
+    fn a_copy_wanted_within_the_horizon_poses_is_not_swept_however_long_ago() {
+        let held = swept_after(Micros::from_secs(1), u64::from(KEEP_POSES) - 1);
+        assert_eq!(held, Bytes(MESH.0 * 10), "{RED}");
+    }
+
+    /// C3: a copy wanted N + 1 poses ago is swept to the low watermark,
+    /// though the poses were a millisecond apart: 41 ms.
+    #[test]
+    fn a_copy_wanted_beyond_the_horizon_poses_is_swept_however_recently() {
+        let held = swept_after(Micros(1_000), u64::from(KEEP_POSES) + 1);
+        assert_eq!(held, Bytes(MESH.0 * 8), "{RED}");
     }
 
     /// C9, I2: eviction outpaces admission: after every step, what is not

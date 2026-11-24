@@ -406,7 +406,7 @@ pub struct Sim {
     evicted_why: BTreeMap<ResourceId, &'static str>,
     /// When each tile was last listed by the need, any membership: the
     /// sweep's horizon is read against it (I19).
-    listed_at: BTreeMap<TileId, Micros>,
+    listed_at: BTreeMap<TileId, u64>,
     /// Wanted-to-drawable times of meshes, ms, with their time: the
     /// latency the budget's scheduling adds to the network's (I6).
     pub waits: Vec<(Micros, f64)>,
@@ -871,12 +871,13 @@ impl Sim {
 
     /// I19 (Laurent, 2026-11-24): the proactive sweep never takes a mesh
     /// the need lists this step, or listed within the specification's
-    /// horizon (`Params::sweep_keep`). Meshes only: a drape's tile listed
+    /// horizon (`Params::sweep_keep_poses`: the last poses, a step each).
+    /// Meshes only: a drape's tile listed
     /// says nothing of which of its levels is wanted. Then records the
     /// step's listing.
     fn check_sweep(&mut self, need: &NeedSet, d: &Decisions) {
         use tuile_budget::score::{Reason, Side};
-        let keep = self.budget.specification().params.sweep_keep;
+        let keep = u64::from(self.budget.specification().params.sweep_keep_poses);
         let listed: BTreeSet<TileId> = need
             .drawn
             .iter()
@@ -895,7 +896,7 @@ impl Sim {
             let recent = self
                 .listed_at
                 .get(&t)
-                .is_some_and(|at| self.now.since(*at) < keep);
+                .is_some_and(|at| self.frame - at < keep);
             if listed.contains(&t) || recent {
                 self.fail(&format!(
                     "I19: the sweep took {t:?}, listed {}",
@@ -907,12 +908,12 @@ impl Sim {
                 ));
             }
         }
-        let now = self.now;
+        let pose = self.frame;
         for t in listed {
-            self.listed_at.insert(t, now);
+            self.listed_at.insert(t, pose);
         }
         if self.frame.is_multiple_of(600) {
-            self.listed_at.retain(|_, at| now.since(*at) < keep);
+            self.listed_at.retain(|_, at| pose - *at < keep);
         }
     }
 
