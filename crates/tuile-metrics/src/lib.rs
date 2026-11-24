@@ -324,6 +324,10 @@ pub fn describe() {
     );
     describe_gauge!("tuile_imagery_textures", "Distinct imagery textures held.");
     describe_gauge!(
+        "tuile_imagery_compressed_textures",
+        "Of the imagery textures held, those block-compressed."
+    );
+    describe_gauge!(
         "tuile_pending_uploads",
         "Decoded tiles waiting for a frame's upload budget."
     );
@@ -556,6 +560,8 @@ pub fn publish(m: &Metrics) {
     gauge!("tuile_resident_bytes").set(m.resident_bytes.get() as f64);
     gauge!("tuile_imagery_bytes").set(m.imagery_bytes.get() as f64);
     gauge!("tuile_imagery_textures").set(m.imagery_textures.get() as f64);
+    gauge!("tuile_imagery_compressed_textures")
+        .set(m.imagery_compressed_textures.get() as f64);
     gauge!("tuile_pending_uploads").set(m.pending_uploads.get() as f64);
     gauge!("tuile_prepared_tiles").set(m.prepared_tiles.get() as f64);
     gauge!("tuile_ground_reads_pending").set(m.ground_reads_pending.get() as f64);

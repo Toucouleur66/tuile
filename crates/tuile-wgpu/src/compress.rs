@@ -11,25 +11,29 @@
 //! The loader marks what it decodes with the same plan, so the budget charges
 //! each texture in the format it will be held in.
 //!
-//! At upload, RGBA8 marked for a block format is encoded on the GPU by
-//! `texcomp`'s compute kernels, mip chain included, into a texture of that
-//! format. **Any encode that cannot be done uploads RGBA8 instead**: a size
-//! that is not whole blocks, a tile too large for the device, a context with
-//! no encoder. The ground is never left without a texture, and the swap
-//! order is the RGBA8 path's: the texture is complete before anything binds
-//! it.
+//! **Display at once, compress what lasts (CB9).** RGBA8 marked for a
+//! block format is uploaded and drawn as RGBA8 at once, its texture kept
+//! readable (`COPY_SRC`). When the graphics budget decides a drape is worth
+//! compressing (`ServerMessage::Compress`), `texcomp`'s compute kernels read
+//! each of its resident textures, mip chain included, straight from the GPU
+//! — no readback, no re-upload — into a new texture of the block format;
+//! the new one is bound to every drape that names it, and only then is the
+//! RGBA8 one let go: never a gap, at most one frame of both. **A tile that
+//! cannot be encoded stays RGBA8**: never a hole.
 //!
-//! The encodes are paced by the pump on the core's encode lane
+//! The compressions are paced by the pump on the core's encode lane
 //! (`tuile_core::budget::EncodeBucket`, CB6): a frame's share of blocks,
-//! its time over the cost of a block — measured with timestamps where the
-//! device has them, assumed from the viewer's measure elsewhere.
+//! its measured headroom over the cost of a block — measured with
+//! timestamps where the device has them, assumed from the viewer's measure
+//! elsewhere — after the frame's uploads, which never wait for it.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 use crate::ops::OpCounters;
-use texcomp::gpu::{EncodeError, EncoderScratch, GpuEncoder, Level, Quality};
-use tuile_core::content::DecodedTexture;
+use texcomp::gpu::{
+    Destination, EncodeError, EncoderScratch, GpuEncoder, Quality, Source, SourceLevel, TileInto,
+};
 use tuile_core::texels::{
     BlockFormat, GpuTextureCaps, ImageryEncode, ImageryFormat, ImageryPlan, StoredPlan,
 };
@@ -261,7 +265,16 @@ pub struct EncodeStats {
     pub measured_ns_per_block: Option<f64>,
 }
 
-/// The GPU encoder of a context whose plan encodes on the GPU, with the
+/// One resident RGBA8 texture to compress in place: its texture (with
+/// `COPY_SRC`), its size and its levels.
+pub(crate) struct InPlace<'a> {
+    pub(crate) texture: &'a wgpu::Texture,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) levels: u32,
+}
+
+/// The GPU encoder of a context whose plan compresses on the GPU, with the
 /// buffers it reuses and its stopwatch.
 pub(crate) struct Compressor {
     format: BlockFormat,
@@ -361,37 +374,87 @@ impl Compressor {
             .unwrap_or_else(|| assumed_ns_per_block(self.format, self.level))
     }
 
-    /// Records the encode of each tile — a base and its mips — into `cmd`:
-    /// one compute pass for them all, and the copies into their textures.
-    /// The texels land with `cmd`'s submit, which must come before the next
-    /// record ([`Self::busy`]); [`Self::submitted`] is told of it. An error
-    /// is a tile to upload as RGBA8.
+    /// Records the compression in place of each tile — an RGBA8 texture
+    /// already resident, every level of its chain — into `cmd`: one compute
+    /// pass for them all, reading each level straight from its texture (no
+    /// readback, no upload), and the copies into a new texture of the
+    /// encoder's format per tile. The new textures hold their blocks once
+    /// `cmd` is submitted, which must come before the next record
+    /// ([`Self::busy`]); [`Self::submitted`] is told of it. An error is a
+    /// tile to keep as it is.
     ///
     /// The pass is timed when the stopwatch is free: one measure per pass,
     /// whatever it holds.
-    pub(crate) fn record(
+    pub(crate) fn record_in_place(
         &mut self,
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
         ops: &OpCounters,
+        queue: &wgpu::Queue,
         cmd: &mut wgpu::CommandEncoder,
-        tiles: &[(&DecodedTexture, &[DecodedTexture])],
+        tiles: &[InPlace<'_>],
     ) -> Vec<Result<wgpu::Texture, EncodeError>> {
         self.collect();
-        let levels: Vec<Vec<Level<'_>>> = tiles
+        let format = texcomp::gpu::texture_format(to_texcomp(self.format), true);
+        let targets: Vec<wgpu::Texture> = tiles
             .iter()
-            .map(|(base, mips)| {
-                std::iter::once(*base)
-                    .chain(mips.iter())
-                    .map(|t| Level {
+            .map(|t| {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("tuile base color, compressed in place"),
+                    size: wgpu::Extent3d {
                         width: t.width,
                         height: t.height,
-                        rgba8: t.rgba8().unwrap_or_default(),
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: t.levels,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                })
+            })
+            .collect();
+        let size = |t: &InPlace<'_>, l: u32| ((t.width >> l).max(1), (t.height >> l).max(1));
+        let sources: Vec<Vec<SourceLevel<'_>>> = tiles
+            .iter()
+            .map(|t| {
+                (0..t.levels)
+                    .map(|l| {
+                        let (width, height) = size(t, l);
+                        SourceLevel {
+                            width,
+                            height,
+                            source: Source::Texture {
+                                texture: t.texture,
+                                mip_level: l,
+                                origin: wgpu::Origin3d::ZERO,
+                            },
+                        }
                     })
                     .collect()
             })
             .collect();
-        let chains: Vec<&[Level<'_>]> = levels.iter().map(Vec::as_slice).collect();
+        let destinations: Vec<Vec<Destination<'_>>> = tiles
+            .iter()
+            .zip(&targets)
+            .map(|(t, to)| {
+                (0..t.levels)
+                    .map(|l| Destination {
+                        texture: to,
+                        mip_level: l,
+                        origin: wgpu::Origin3d::ZERO,
+                    })
+                    .collect()
+            })
+            .collect();
+        let into: Vec<TileInto<'_>> = sources
+            .iter()
+            .zip(&destinations)
+            .map(|(levels, destinations)| TileInto {
+                levels,
+                destinations,
+            })
+            .collect();
         let timed = self
             .timing
             .as_ref()
@@ -403,31 +466,31 @@ impl Compressor {
         });
         let results =
             self.encoder
-                .encode_with(&mut self.scratch, device, queue, cmd, &chains, true, writes);
+                .encode_into_with(&mut self.scratch, device, queue, cmd, &into, writes);
         let mut blocks = 0;
         let mut any = false;
-        for ((base, _), (result, chain)) in tiles.iter().zip(results.iter().zip(&chains)) {
+        let mut out = Vec::with_capacity(tiles.len());
+        for ((t, result), to) in tiles.iter().zip(results).zip(targets) {
             match result {
-                Ok(_) => {
+                Ok(()) => {
                     any = true;
                     self.stats.encoded += 1;
-                    blocks += tile_blocks(self.format, base.width, base.height);
-                    // The encoder's texture, and its writes: one per level
-                    // of texels.
+                    blocks += tile_blocks(self.format, t.width, t.height);
                     OpCounters::add(&ops.textures_created, 1);
                     OpCounters::add(&ops.encoded_tiles, 1);
-                    for level in chain.iter() {
-                        ops.staged(&ops.write_buffer, level.rgba8.len() as u64);
-                    }
+                    out.push(Ok(to));
                 }
-                Err(_) => self.stats.fell_back += 1,
+                Err(e) => {
+                    self.stats.fell_back += 1;
+                    out.push(Err(e));
+                }
             }
         }
         self.stats.blocks += blocks;
         if any {
             // The pass, and the encoder's table of jobs.
             OpCounters::add(&ops.encode_passes, 1);
-            ops.staged(&ops.write_buffer, 256 * chains.len() as u64);
+            ops.staged(&ops.write_buffer, 256 * tiles.len() as u64);
             self.busy = true;
             if timed.is_some() {
                 if let Some(t) = &mut self.timing {
@@ -438,7 +501,7 @@ impl Compressor {
                 }
             }
         }
-        results
+        out
     }
 
     /// Whether a record is waiting for its submit: the scratch holds its

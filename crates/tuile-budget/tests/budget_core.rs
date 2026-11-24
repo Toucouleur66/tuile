@@ -4119,6 +4119,7 @@ mod cost_per_path {
             transfer: rgba8.gpu,
             transient: rgba8.gpu,
             encode_blocks: chain_blocks(256, 256),
+            ..Cost::default()
         }
     }
 
