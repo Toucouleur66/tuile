@@ -31,6 +31,7 @@ mod sorted;
 pub mod spec;
 mod state;
 pub mod stats;
+mod sweep;
 pub mod tier;
 pub mod tile_id;
 pub mod tiers;

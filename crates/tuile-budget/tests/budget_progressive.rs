@@ -938,3 +938,90 @@ fn a_wait_is_classified_first_load_or_reload_after_an_eviction() {
     let (long, _) = run(40);
     assert!(long[0] > 0 && long[1] + long[2] == 0, "back after 40 s: first loads again, {long:?}");
 }
+
+/// The proactive sweep never takes what the view wants now or wanted within
+/// the horizon (Laurent, 2026-11-24): a view swinging between east and west
+/// every second under a budget its need and ring overfill. Before the law
+/// (#289 at a7a4f720) every copy the sweep took was of a tile the need
+/// listed that very step (335 of 335), and every one was loaded again. With
+/// it the proactive sweep takes none; what the need holds over the target
+/// still goes back within it (192 copies, `fit_target`): at 24 MiB this
+/// need does not fit.
+#[test]
+fn the_sweep_never_takes_what_the_view_wants_within_the_horizon() {
+    use tuile_budget::score::Reason;
+    use tuile_budget::Micros;
+    let mut r = Rig::new(config(Bytes::mib(24), 4));
+    let keep = tuile_budget::spec::Specification::interactive()
+        .params
+        .sweep_keep;
+    let (fx, fy) = (0.6213, 0.3149);
+    let east = View {
+        reach: 3.0,
+        look: Some((1.0, 0.0)),
+        ..View::at(fx, fy, 13)
+    };
+    let west = View {
+        look: Some((-1.0, 0.0)),
+        ..east
+    };
+    let mut last: std::collections::BTreeMap<TileId, Micros> = Default::default();
+    let (mut swept, mut bad, mut reloaded) = (0, Vec::new(), 0);
+    let mut gone: BTreeSet<ResourceId> = BTreeSet::new();
+    let mut over = 0;
+    for k in 0..20 {
+        let v = if k % 2 == 0 { east } else { west };
+        let need = v.need(4);
+        let listed: BTreeSet<TileId> = need
+            .drawn
+            .iter()
+            .chain(&need.blockers)
+            .chain(&need.ancestors)
+            .chain(&need.ring)
+            .map(|x| x.0)
+            .collect();
+        for _ in 0..60 {
+            let now = r.now;
+            let d = r.step(&need);
+            // Over the low watermark of its target: the sweep's to trim.
+            let l = r.b.ledger();
+            over += usize::from(
+                Class::ALL
+                    .iter()
+                    .any(|c| l.gpu[*c] > d.stats.target[*c].scaled(9, 10)),
+            );
+            for e in d.scores.iter().filter(|e| e.side == Side::Evict) {
+                if e.reason != Reason::Sweep {
+                    continue;
+                }
+                swept += 1;
+                let tile = e.resource.tile();
+                let recent = last.get(&tile).is_some_and(|t| now.since(*t) < keep);
+                if listed.contains(&tile) || recent {
+                    bad.push((now, e.resource));
+                    gone.insert(e.resource);
+                }
+            }
+            for s in &d.start {
+                reloaded += usize::from(gone.remove(&s.resource));
+            }
+            for t in &listed {
+                last.insert(*t, now);
+            }
+            r.complete(&d);
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "the sweep took {} copies the view wanted now or within {keep:?} (of {swept} swept), \
+         {reloaded} loaded again; first {:?}",
+        bad.len(),
+        bad.first()
+    );
+    // Not vacuous: the need and its ring held a class over its low
+    // watermark — what the sweep took before the law, it now keeps.
+    assert!(
+        over > 100,
+        "{over} steps over a low watermark: the sweep had nothing to do"
+    );
+}

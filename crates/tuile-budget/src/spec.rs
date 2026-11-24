@@ -309,6 +309,14 @@ pub const HEADROOM: u16 = 0;
 pub const FLOOR_VALUE: u16 = 10;
 /// The copies the floor value's release looks at a step.
 pub const RELEASE_VISITS: u16 = 16;
+/// How long the proactive sweep keeps what the view needed
+/// (`Params::sweep_keep`): five seconds, the waits' first reload kind
+/// (`waits::kind`). Measured: ten seconds kept so much of a settled
+/// headset's recent past between the watermarks that its ring could not
+/// load, and a 20° flick found ground covered eight levels up (P4.1 (b));
+/// at two and five seconds it is covered within three, and the
+/// five-minute soak's waits are the same at 0, 2 and 5 seconds.
+pub const SWEEP_KEEP: Micros = Micros::from_secs(5);
 /// An over-need gap weighs half an under-need one.
 pub const FINER_GAP: u16 = 500;
 
@@ -352,9 +360,18 @@ pub struct Params {
     /// wanted is released even with room left: the pools hold what is
     /// useful, not what is old.
     pub floor_value_permille: u16,
-    /// The copies the floor value's release looks at a step: the bound of
-    /// a frame's proactive releases.
+    /// The copies the floor value's release looks at a step, and the kept
+    /// copies the sweep passes over before it leaves the rest to the next
+    /// step (`sweep`): the bound of a frame's proactive releases.
     pub release_visits: u16,
+    /// The horizon of the proactive sweep (Laurent, 2026-11-24): under
+    /// the target, the sweep down to the low watermark releases only a copy
+    /// the need does not want this step and has not wanted for at least
+    /// this long — never what the view wants now or wanted within the
+    /// horizon, which it is the likeliest to want again within it. Room for
+    /// a delivery is made by admission, under its own law; a memory signal,
+    /// the way back within the target and I2 are not bound by it.
+    pub sweep_keep: Micros,
     /// The neighbourhood's radius `ρ`, tiles, when not 0: overrides the
     /// profile's (`BudgetConfig::reach_tiles`).
     pub rho_tiles: u16,
@@ -449,6 +466,7 @@ impl Specification {
                 headroom_permille: HEADROOM,
                 floor_value_permille: FLOOR_VALUE,
                 release_visits: RELEASE_VISITS,
+                sweep_keep: SWEEP_KEEP,
                 rho_tiles: 0,
                 finer_gap_permille: FINER_GAP,
             },
@@ -504,6 +522,7 @@ impl Specification {
                 headroom_permille: HEADROOM,
                 floor_value_permille: FLOOR_VALUE,
                 release_visits: RELEASE_VISITS,
+                sweep_keep: SWEEP_KEEP,
                 rho_tiles: 0,
                 finer_gap_permille: FINER_GAP,
             },
@@ -566,6 +585,7 @@ impl Specification {
                 headroom_permille: HEADROOM,
                 floor_value_permille: FLOOR_VALUE,
                 release_visits: RELEASE_VISITS,
+                sweep_keep: SWEEP_KEEP,
                 rho_tiles: 0,
                 finer_gap_permille: FINER_GAP,
             },
@@ -675,6 +695,7 @@ impl Specification {
             ("headroom", u64::from(p.headroom_permille), 500),
             ("floor_value", u64::from(p.floor_value_permille), 1_000),
             ("release_visits", u64::from(p.release_visits), 4_096),
+            ("sweep_keep_ms", p.sweep_keep.0 / 1_000, 600_000),
             ("rho", u64::from(p.rho_tiles), 16),
             ("finer_gap", u64::from(p.finer_gap_permille), 1_000),
         ];
@@ -712,7 +733,8 @@ impl Specification {
              &speculation_slots={}&speculation_memory={}&coarse_through={}\
              &restore_decoded_ms={}&restore_stored_ms={}&restore_http_cache_ms={}\
              &restore_remote_ms={}&p_ring={}&p_ancestor={}&a0={}&a_desc={}&headroom={}&floor_value={}\
-             &release_visits={}&rho={}&finer_gap={}&coarse_from={}&coarse_boost={}",
+             &release_visits={}&rho={}&finer_gap={}&coarse_from={}&coarse_boost={}\
+             &sweep_keep_ms={}",
             self.kind.label(),
             p.margin_permille,
             ms(p.min_dwell),
@@ -736,6 +758,7 @@ impl Specification {
             p.finer_gap_permille,
             p.progressive.coarse_from,
             p.progressive.coarse_boost_permille,
+            ms(p.sweep_keep),
         );
         // A term's weight when all its rules share one; a term weighed
         // differently by predicate (FPV's recency) keeps its kind's rules.
@@ -794,6 +817,7 @@ impl Specification {
                 "headroom" => p.headroom_permille = n16,
                 "floor_value" => p.floor_value_permille = n16,
                 "release_visits" => p.release_visits = n16,
+                "sweep_keep_ms" => p.sweep_keep = millis,
                 "rho" => p.rho_tiles = n16,
                 "finer_gap" => p.finer_gap_permille = n16,
                 "coarse_from" => p.progressive.coarse_from = n16,

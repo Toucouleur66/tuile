@@ -308,6 +308,10 @@ pub enum Reason {
     BelowFloorValue,
     /// The sweep, under a memory signal.
     Pressure,
+    /// What the sweep takes to bring a class (or the pool) back within its
+    /// target, and what I2 takes when a member's target shrinks under its
+    /// unprotected bytes: past the proactive sweep's law (`sweep`).
+    Fit,
     /// What an epoch's change left behind.
     Recycled,
 }
@@ -322,6 +326,7 @@ impl Reason {
             Reason::Sweep => "headroom",
             Reason::BelowFloorValue => "below_floor_value",
             Reason::Pressure => "pressure",
+            Reason::Fit => "fit_target",
             Reason::Recycled => "recycled",
         }
     }
@@ -534,7 +539,8 @@ pub struct ScoreStats {
 }
 
 /// The reasons of [`ScoreStats::released`]: the headroom's sweep (and a
-/// memory signal's), the floor value, room made for a delivery.
+/// memory signal's), the floor value, room made for a delivery or for a
+/// shrunk target (I2's fit).
 pub const RELEASE_REASONS: [&str; 3] = ["headroom", "below_floor_value", "make_room"];
 
 /// The [`RELEASE_REASONS`] index of `r`; `None` for an epoch's recycling.
@@ -542,7 +548,7 @@ pub fn release_reason(r: Reason) -> Option<usize> {
     match r {
         Reason::Sweep | Reason::Pressure => Some(0),
         Reason::BelowFloorValue => Some(1),
-        Reason::Admission | Reason::Swap => Some(2),
+        Reason::Admission | Reason::Swap | Reason::Fit => Some(2),
         Reason::Preload | Reason::Recycled => None,
     }
 }

@@ -1491,6 +1491,7 @@ impl BudgetObserver for BudgetMeter {
                     e.reason,
                     crate::score::Reason::Sweep
                         | crate::score::Reason::Pressure
+                        | crate::score::Reason::Fit
                         | crate::score::Reason::Admission
                         | crate::score::Reason::Swap
                 )

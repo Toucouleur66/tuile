@@ -1591,7 +1591,10 @@ mod protection {
         assert!(r.b.residency().drawable(p));
     }
 
-    /// C3: a sweep starts above the high watermark and trims to the low one.
+    /// C3: a sweep starts above the high watermark and trims to the low one
+    /// — under the target, only what has been out of the need for the
+    /// horizon (`Params::sweep_keep`); what was needed within it is only
+    /// brought back within the target.
     #[test]
     fn eviction_trims_to_the_low_watermark_and_waits_for_the_high_one() {
         let mut c = small(10);
@@ -1599,11 +1602,19 @@ mod protection {
         c.watermarks.low_percent = 80;
         let mut r = Rig::new(c);
         let row = |y: u64, n: u64| (0..n).map(|x| t(4, x, y)).collect::<Vec<_>>();
+        let held = Class::TerrainMesh;
         r.settle(&drawn(&row(0, 9)), 30);
         r.settle(&drawn(&row(1, 2)), 30);
-        let held = Class::TerrainMesh;
-        assert_eq!(r.b.ledger().gpu[held], Bytes(MESH.0 * 8), "{RED}");
+        // Row 0 was needed a step ago: back to the target, not under it.
+        assert_eq!(r.b.ledger().gpu[held], Bytes(MESH.0 * 10), "{RED}");
+        let keep = tuile_budget::spec::Specification::interactive()
+            .params
+            .sweep_keep;
+        r.idle_for(&drawn(&row(1, 2)), keep);
+        // Past the horizon, the next crossing trims row 0 to the low mark.
         r.settle(&drawn(&row(2, 2)), 30);
+        assert_eq!(r.b.ledger().gpu[held], Bytes(MESH.0 * 8), "{RED}");
+        r.settle(&drawn(&row(3, 2)), 30);
         assert_eq!(
             r.b.ledger().gpu[held],
             Bytes(MESH.0 * 10),

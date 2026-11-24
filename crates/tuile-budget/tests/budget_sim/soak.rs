@@ -247,6 +247,21 @@ fn soak(minutes: u64) {
         outside(Micros(span), Micros(2 * span)),
         outside(end.since(Micros(span)), end)
     );
+    // The reloads by their eviction's reason, as its decision record says.
+    let reasons = |from: Micros, to: Micros| {
+        let mut by: std::collections::BTreeMap<&str, u32> = Default::default();
+        for ((t, _), why) in sim.waits.iter().zip(&sim.wait_reasons) {
+            if *t >= from && *t < to && !why.is_empty() {
+                *by.entry(*why).or_default() += 1;
+            }
+        }
+        by
+    };
+    eprintln!(
+        "soak {minutes} min: reloads by eviction reason, first window: {:?}; last window: {:?}",
+        reasons(Micros(span), Micros(2 * span)),
+        reasons(end.since(Micros(span)), end)
+    );
     assert!(first.p95_ms > 0.0, "nothing loaded");
     // The last window draws at full detail: before the progressive score,
     // its flat latency came from a picture relaxed on every one of its

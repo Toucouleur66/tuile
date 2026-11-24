@@ -57,6 +57,7 @@ use super::stats::{
     layer_index, level_index, prefetch_index, BudgetStats, CancelReason, EvictReason,
     LATENCY_BUCKETS,
 };
+use super::sweep::Verdict;
 use super::tier::{Presence, PresenceOracle, Source, Tier};
 use super::types::{
     sat_u32, Bytes, Class, Failure, Generation, LayerId, Micros, PerClass, Policy, Pressure,
@@ -3092,9 +3093,15 @@ impl Budget {
                 Some(room) => room,
                 None => self.room(wants, st),
             };
+            let mut law = self.sweep_law(now);
+            let grouped: &[_] = if law.walks_grouped() {
+                &room.grouped
+            } else {
+                &[]
+            };
             let mut walk = Walk::default();
-            while let Some((_, s)) =
-                walk.next(&self.arena, &room.grouped, |c| c == class, &Held::GPU)
+            while let Some(((.., r), s)) =
+                walk.next(&self.arena, grouped, |c| c == class, &Held::GPU)
             {
                 if self.ledger.gpu[class] <= low {
                     break;
@@ -3109,7 +3116,33 @@ impl Budget {
                 if !evictable {
                     continue;
                 }
+                // Not what the view wants now or wanted within the horizon.
+                match law.judge(wants.contains_key(&r), self.arena.last_needed(s)) {
+                    Verdict::Release => {}
+                    Verdict::Keep => continue,
+                    Verdict::Stop => break,
+                }
                 self.evict_one(now, s, class, d, st);
+            }
+            // Still over the target: back within it, the law's keepers
+            // included (`Reason::Fit`).
+            let mut walk = Walk::default();
+            while let Some((_, s)) =
+                walk.next(&self.arena, &room.grouped, |c| c == class, &Held::GPU)
+            {
+                if self.ledger.gpu[class] <= high {
+                    break;
+                }
+                st.work = st.work.saturating_add(1);
+                let a = &self.arena;
+                if self.kept(s)
+                    || self.is_floor(a.class(s), a.level(s))
+                    || !a.has_gpu(s)
+                    || a.has_transit(s)
+                {
+                    continue;
+                }
+                self.evict_as(now, s, class, Some(Reason::Fit), d, st);
             }
             self.scratch.room = Some(room);
         }
@@ -3327,11 +3360,13 @@ impl Budget {
         // to its own low one, as a class outside the pool is.
         let ceiling_high = |c: Class| pct(p.ceil_target[c], w.high_percent);
         let ceiling_low = |c: Class| pct(p.ceil_target[c], w.low_percent);
-        let mut over: PerClass<bool> =
-            PerClass::from_fn(|c| p.members[c] && self.ledger.gpu[c] > ceiling_high(c));
         let high = pct(p.target, w.high_percent);
         let pool_over = used(&self.ledger) > high;
-        if !pool_over && Class::ALL.iter().all(|c| !over[*c]) {
+        if !pool_over
+            && Class::ALL
+                .iter()
+                .all(|c| !(p.members[*c] && self.ledger.gpu[*c] > ceiling_high(*c)))
+        {
             return;
         }
         let low = pct(p.target, w.low_percent);
@@ -3354,29 +3389,65 @@ impl Budget {
             let a = &b.arena;
             a.has_gpu(s) && !a.has_transit(s) && !b.kept(s) && !b.is_floor(a.class(s), a.level(s))
         };
-        let mut walk = Walk::default();
-        while let Some((_, s)) = walk.next(&self.arena, &room.grouped, member, &Held::GPU) {
-            st.work = st.work.saturating_add(1);
-            if !candidate(self, s) {
-                continue;
-            }
-            let (class, bytes) = (
-                self.arena.class(s),
-                self.arena.gpu(s).map_or(Bytes::ZERO, |g| g.bytes),
-            );
-            for c in Class::ALL {
-                over[c] &= self.ledger.gpu[c] > ceiling_low(c);
-            }
-            let pool_trim = pool_over && used(&self.ledger) > low;
-            if !pool_trim && Class::ALL.iter().all(|c| !over[*c]) {
+        // Two passes in the one order. The first is proactive: down to the
+        // low watermarks, under the law (`sweep`) — not what the view wants
+        // now or wanted within the horizon. The second brings what is still
+        // over its high watermark (the target) back within it, the law's
+        // keepers included: they fit the target (`Reason::Fit`), as I2's
+        // pass below.
+        let mut law = self.sweep_law(now);
+        for lawful in [true, false] {
+            let mut over: PerClass<bool> =
+                PerClass::from_fn(|c| p.members[c] && self.ledger.gpu[c] > ceiling_high(c));
+            let pool_over = used(&self.ledger) > high;
+            if !pool_over && Class::ALL.iter().all(|c| !over[*c]) {
                 break;
             }
-            // Over its ceiling it goes; for the pool's sake, only down to
-            // its floor.
-            let goes =
-                over[class] || (pool_trim && self.ledger.gpu[class].minus(bytes) >= floor(class));
-            if goes {
-                self.evict_one(now, s, class, d, st);
+            let pool_bound = if lawful { low } else { high };
+            let ceiling = |c: Class| {
+                if lawful {
+                    ceiling_low(c)
+                } else {
+                    ceiling_high(c)
+                }
+            };
+            let grouped: &[_] = if !lawful || law.walks_grouped() {
+                &room.grouped
+            } else {
+                &[]
+            };
+            let mut walk = Walk::default();
+            while let Some(((.., r), s)) = walk.next(&self.arena, grouped, member, &Held::GPU) {
+                st.work = st.work.saturating_add(1);
+                if !candidate(self, s) {
+                    continue;
+                }
+                if lawful {
+                    match law.judge(wants.contains_key(&r), self.arena.last_needed(s)) {
+                        Verdict::Release => {}
+                        Verdict::Keep => continue,
+                        Verdict::Stop => break,
+                    }
+                }
+                let (class, bytes) = (
+                    self.arena.class(s),
+                    self.arena.gpu(s).map_or(Bytes::ZERO, |g| g.bytes),
+                );
+                for c in Class::ALL {
+                    over[c] &= self.ledger.gpu[c] > ceiling(c);
+                }
+                let pool_trim = pool_over && used(&self.ledger) > pool_bound;
+                if !pool_trim && Class::ALL.iter().all(|c| !over[*c]) {
+                    break;
+                }
+                // Over its ceiling it goes; for the pool's sake, only down to
+                // its floor.
+                let goes = over[class]
+                    || (pool_trim && self.ledger.gpu[class].minus(bytes) >= floor(class));
+                if goes {
+                    let why = (!lawful).then_some(Reason::Fit);
+                    self.evict_as(now, s, class, why, d, st);
+                }
             }
         }
         // The floor yields to I2 (Laurent, 2026-10-21), and only as far as
@@ -3391,18 +3462,44 @@ impl Budget {
             st.work = st.work.saturating_add(1);
             let class = self.arena.class(s);
             if candidate(self, s) && short(&self.ledger, class) {
-                self.evict_one(now, s, class, d, st);
+                self.evict_as(now, s, class, Some(Reason::Fit), d, st);
             }
         }
         self.scratch.room = Some(room);
     }
 
-    /// Evicts the resource of `s`, of `class`, from the GPU, and counts it.
+    /// The proactive sweep's law at `now` (`sweep`): bound but under a
+    /// memory signal.
+    fn sweep_law(&self, now: Micros) -> super::sweep::SweepLaw {
+        super::sweep::SweepLaw::new(
+            now,
+            self.spec.params.sweep_keep,
+            self.spec.params.release_visits,
+            self.pressure == Pressure::Normal,
+        )
+    }
+
+    /// Evicts the resource of `s`, of `class`, from the GPU for the sweep,
+    /// and counts it.
     fn evict_one(
         &mut self,
         now: Micros,
         s: Slot,
         class: Class,
+        d: &mut Decisions,
+        st: &mut BudgetStats,
+    ) {
+        self.evict_as(now, s, class, None, d, st);
+    }
+
+    /// Evicts the resource of `s`, of `class`, from the GPU, and counts it:
+    /// for the sweep (or a memory signal's) when `reason` is `None`.
+    fn evict_as(
+        &mut self,
+        now: Micros,
+        s: Slot,
+        class: Class,
+        reason: Option<Reason>,
         d: &mut Decisions,
         st: &mut BudgetStats,
     ) {
@@ -3412,10 +3509,10 @@ impl Budget {
         } else {
             EvictReason::Pressure
         };
-        let reason = match why {
+        let reason = reason.unwrap_or(match why {
             EvictReason::Sweep => Reason::Sweep,
             _ => Reason::Pressure,
-        };
+        });
         d.scores.push(self.held_event(s, Side::Evict, reason));
         self.arena.take_gpu(s, &mut self.ledger);
         d.evict.push(r);

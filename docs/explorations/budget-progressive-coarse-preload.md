@@ -128,6 +128,25 @@ The score orders the value band only. Before it, in this order and whatever the 
   to its low watermark, lowest scores first, not bounded per step, so need never waits while
   low scores hold the pools; the decoded tier over its target is released down to it (a turn
   back finds its demoted copies there).
+- **The sweep takes only what will not be needed soon** (Laurent, 2026-11-24;
+  `tuile_budget::sweep`). A class (or the pool) over its high watermark — its target — is
+  swept in the one order, in two parts. Under the target, down to the low watermark, the
+  sweep is proactive: it runs ahead of any delivery, and it never takes a copy the need wants
+  this step, at any urgency — the ring is the need's own prediction of what comes next — nor
+  one it wanted less than the horizon ago (`sweep_keep_ms`, 5 s). What the law keeps stays; a
+  delivery makes its room by admission (worth less than the work), and the class may sit
+  between its watermarks meanwhile. That part runs first; then whatever is still over the
+  target goes back within it, the law's keepers included (reason `fit_target`, as I2's pass,
+  counted with `make_room`): the budget holds its size. Since grouped copies (needed at the
+  step's time or the one before) are within any horizon of a step, the proactive part walks
+  the filed copies alone and passes over at most `release_visits` kept copies a step: a
+  still view's step does not grow with what it holds. A memory signal is not bound by the
+  law (reason `pressure`). Before the law, a view swinging east–west every second under a
+  budget its need and ring overfill had 335 copies swept as headroom, every one of a tile
+  listed that very step, every one loaded again; with it, none as headroom, and 192 still go
+  back within the target — that need does not fit 24 MiB. Ten seconds of horizon kept so much
+  of a settled headset's recent past that its ring could not load (a 20° flick found ground
+  eight levels up, P4.1); two and five seconds keep it within three.
 - **What left the need goes.** A copy that leaves the need keeps a 64th of its probability
   (a copy drawn without being wanted — a stand-in for another tile — counts as certain while
   drawn). Once out of the need for the thrash window (10 s: a turn and back finds it still),
@@ -155,7 +174,8 @@ The score orders the value band only. Before it, in this order and whatever the 
   missed its bound), and a 75 % cap on the preloads' share of the slots (it starved the views
   ahead and coarsened a still view).
 - Never released: what is drawn, a swap, the pinned floor, the chain of what is drawn, what
-  is in transit or wanted this step. The window and the metrics count the releases per step
+  is in transit; never released by the sweep under the target: what is wanted this step or
+  was within `sweep_keep_ms`. The window and the metrics count the releases per step
   by reason — `headroom`, `below_floor_value`, `make_room` — by level × distance
   (`released_by_level_distance{level,distance,reason}`, `released_total{reason}`), GPU and
   decoded (`side` evict | decoded), and the dynamic headroom (`ScoreStats::headroom_bytes`).
@@ -292,6 +312,22 @@ opens: a **first load**, or a **reload** of a mesh evicted (`Decisions::evict`) 
 (`RELOAD_MEMORY`), past that a reload counts as a first load. A reload carries the
 eviction's reason from the step's `Decisions::scores`: headroom sweep, below the floor
 value, room made, or the rest (an epoch's recycling).
+
+**What the soak's reloads are** (measured 2026-11-24 on #289). In the last window (the
+tour's orbit again: a full turn a minute at full detail) 812 of 1 753 mesh waits are
+reloads, about half after the sweep, half after admission. Every mesh the sweep took there
+had last been wanted — by any list of the need, ring and ancestors included — 30 to 120 s
+before; none was wanted that step or within the horizon (an in-engine trace: 656 of 656).
+The orbit's own working set (290 MB of meshes and at least 650 MB of drapes drawn over the turn) does not fit
+beside what the view holds now in the pool's 1.27 GB: the oldest copies are the next to come
+back, the textbook worst case of a least-recently-needed order on a loop longer than the
+cache. Nothing in the need predicts their return — the ring is around the footprint, not
+along the turn — so no law on the present need keeps them; the sweep's law leaves the
+soak's numbers unchanged (identical waits at a horizon of 0, 2 and 5 s). What moves them,
+measured on a7a4f720 and not kept: the low watermark at 100 % instead of 90 % (no proactive band) —
+reloads 812 → 568; sweeping only down to the dynamic headroom — 812 → 861. The step that
+should keep them is a prediction of the views ahead along the turn (#282's `Need.ahead`),
+whose tiles the need would then want, and the law would keep.
 
 `BudgetSignals::waits` totals them by class, level and kind, their durations by kind on the
 load latencies' power-of-two ms buckets, and the reloads by reason. Series:
