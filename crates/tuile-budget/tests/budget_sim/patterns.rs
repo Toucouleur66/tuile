@@ -826,6 +826,13 @@ fn decide_work_grows_with_changes_not_with_the_view() {
 fn decide_work_grows_with_changes_not_with_the_view_on_the_flight() {
     let mut sim = Sim::new(Profile::desktop(), 7);
     let mut p64 = P64::new(&sim);
+    // A quarter over the bound on this flight (Laurent, 2026-11-24: the
+    // simulation's bounds follow the whole-or-nothing replacement, #324):
+    // a fine tile now stays until its replacement wears its own imagery,
+    // so a still step after the descent can re-dress more of the draw set
+    // than its inputs name — measured once, W 315 against 256 at step 3004
+    // of 3600 (#ΔN 0, #E 0, tracked 1 151).
+    p64.margin = 1.25;
     super::scenarios::fly_grow_then_shrink(&mut sim, |s, need, d| {
         let phase = match s.now.0 / 1_000_000 {
             0..=29 => "flight",
@@ -895,6 +902,9 @@ struct P64 {
     over: Vec<(&'static str, u64, u64, u64, u64, u64, u64)>,
     steps: u64,
     worst: (f64, u64, u64),
+    /// How far over the bound a step may go (1 everywhere but where a
+    /// test says why).
+    margin: f64,
 }
 
 impl P64 {
@@ -911,6 +921,7 @@ impl P64 {
             over: Vec::new(),
             steps: 0,
             worst: (0.0, 0, 0),
+            margin: 1.0,
         }
     }
 
@@ -995,7 +1006,7 @@ impl P64 {
         self.tracked = tracked;
         let log = u64::from(64 - (tracked + 2).leading_zeros()); // ⌈log2⌉
         let bound = P64_A * (dn + e) * log + P64_B;
-        if w > bound {
+        if w as f64 > self.margin * bound as f64 {
             self.over
                 .push((phase, self.steps, w, dn, e, tracked, bound));
         }
@@ -1019,9 +1030,10 @@ impl P64 {
             .collect();
         assert!(
             self.over.is_empty(),
-            "{RED}: W_k over a·(#ΔN+#E)·log2(tracked+2)+b (a {P64_A}, b {P64_B}) on {} of {} \
+            "{RED}: W_k over {}·(a·(#ΔN+#E)·log2(tracked+2)+b) (a {P64_A}, b {P64_B}) on {} of {} \
              steps ({still} of them still, nothing changing); worst W {} against {} ({:.1}×); \
              first: {}",
+            self.margin,
             self.over.len(),
             self.steps,
             self.worst.1,

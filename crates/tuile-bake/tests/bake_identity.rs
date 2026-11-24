@@ -41,19 +41,25 @@ use tuile_film::ground::Ground;
 /// libm's rather than the platform's: Apple's libm and glibc differ in their
 /// last bits, so the line first recorded on Linux had never held on a Mac.
 /// The same line now comes out of both, bit for bit.
+///
+/// Recorded again after the budget's deliberate changes of 2026-11-24 —
+/// the screen-space error priced by view depth (#323), a fine tile let go
+/// only once its replacement is whole (#324), the compression of what
+/// lasts (#312): the survey's and the bake's selections and so the pack
+/// move; every frame's ground is the same, bit for bit.
 const RECORDED: &str = concat!(
-    "{\"frames\":12,\"viewport\":[960,540],\"scene\":\"cb6dbb6b0f25b499\",\"pack_sha256\":\"",
-    "a073f98284adf121046b953d3b46691d979b4e848124413a2bd16ffdacdb3db0\",\"pack_bytes\":2764",
-    "08,\"survey_selections\":[\"19adb3d41723caa0\",\"b4879f3f9e6c2af7\",\"dd2d755e5c18b770",
-    "\",\"d118ab7d241ba867\",\"4671d8fab96d1d5d\",\"962255ab19c23e10\",\"a24e598ad5f01791\"",
-    ",\"88bc520ac19b797a\",\"d5237d54142d4696\",\"d59163f861c4ae79\",\"729331bcffe91daf\",\"",
-    "8e87029f9110e4bd\"],\"grounds\":[\"41ef35e9ac9beed8\",\"738744d005755792\",\"f6878e21c",
-    "ca4a5d5\",\"f34e250855f7e60c\",\"b474d80745827c16\",\"1db1d149f3a98d91\",\"a87838404bf",
-    "2ffbd\",\"9e6179bc49716b7f\",\"defff811dd2fe618\",\"e3b864ac882bc92f\",\"fa6b053081bf2",
-    "102\",\"354138c150626494\"],\"bake_selections\":[\"37cf57d6f04843d4\",\"b5d21a375aae8b",
-    "b4\",\"50db4c96cded2843\",\"e38bfeae4d803f20\",\"cb77927e21ed0c4f\",\"62cb517f577e915a",
-    "\",\"e3d0e6538429dcd3\",\"62e6c88cf844d638\",\"76bd5dd09034afd8\",\"15d924223b1980a3\"",
-    ",\"729331bcffe91daf\",\"8e87029f9110e4bd\"]}",
+    "{\"frames\":12,\"viewport\":[960,540],\"scene\":\"cb6dbb6b0f25b499\",\"pack_sha256\":\"9ada",
+    "009402656cd3ac4b9be0343720d7882f38931bad761bdd767987041e655f\",\"pack_bytes\":24747",
+    "2,\"survey_selections\":[\"234d658eb1bc893d\",\"e1996e439b9e1a5a\",\"a228670483cb67ad\",",
+    "\"ed15d6e63102e802\",\"12affd49c30bbe38\",\"82b539bfc86dadcd\",\"94e9a6652bdb0814\",\"978",
+    "e4f34d3fdbc87\",\"a70812ed2b993543\",\"fe08c3a03d1cac80\",\"c2f73448bb9bab96\",\"0354ec6",
+    "05271e8c8\"],\"grounds\":[\"41ef35e9ac9beed8\",\"738744d005755792\",\"f6878e21cca4a5d5\",",
+    "\"f34e250855f7e60c\",\"b474d80745827c16\",\"1db1d149f3a98d91\",\"a87838404bf2ffbd\",\"9e6",
+    "179bc49716b7f\",\"defff811dd2fe618\",\"e3b864ac882bc92f\",\"fa6b053081bf2102\",\"354138c",
+    "150626494\"],\"bake_selections\":[\"4c4f3f214ce50df5\",\"00fe1b70e5159359\",\"8b6b14595b",
+    "6c9c9e\",\"8ff7c05bc1353ec1\",\"f6246a7d9dbf8c9e\",\"7e0cd6ba39db57eb\",\"c457b1672e8ecd",
+    "d2\",\"d798edc2a98f0319\",\"5086f159bcdddc29\",\"702b40b81f82f2b6\",\"c2f73448bb9bab96\",",
+    "\"0354ec605271e8c8\"]}",
 );
 
 /// Places a side the ground's height is read at, each frame.
