@@ -126,16 +126,6 @@ pub fn encode_client(message: &ClientMessage) -> Vec<u8> {
             w.u8(class.index() as u8);
             w.u64(*bytes);
         }
-        ClientMessage::Compressed {
-            resource,
-            gen,
-            bytes,
-        } => {
-            w.u8(11);
-            w.resource(resource);
-            w.u64(gen.0);
-            w.u64(*bytes);
-        }
     }
     w.0
 }
@@ -276,11 +266,6 @@ pub fn decode_client(bytes: &[u8]) -> Result<ClientMessage, WireError> {
             },
             bytes: r.u64()?,
         },
-        11 => ClientMessage::Compressed {
-            resource: r.resource()?,
-            gen: Generation(r.u64()?),
-            bytes: r.u64()?,
-        },
         tag => {
             return Err(WireError::Tag {
                 what: "a client message",
@@ -391,14 +376,6 @@ pub fn encode_server(message: &ServerMessage) -> Vec<u8> {
             w.u32(p.total);
             w.u32(p.unavailable);
             w.u32(p.outstanding);
-        }
-        ServerMessage::Compress { resources } => {
-            w.u8(6);
-            w.len(resources.len());
-            for (r, g) in resources {
-                w.resource(r);
-                w.u64(g.0);
-            }
         }
     }
     w.0
@@ -517,14 +494,6 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerMessage, WireError> {
             unavailable: r.u32()?,
             outstanding: r.u32()?,
         }),
-        6 => {
-            let n = r.len()?;
-            let mut resources = Vec::with_capacity(n.min(1 << 16));
-            for _ in 0..n {
-                resources.push((r.resource()?, Generation(r.u64()?)));
-            }
-            ServerMessage::Compress { resources }
-        }
         tag => {
             return Err(WireError::Tag {
                 what: "a server message",
@@ -1566,11 +1535,6 @@ mod tests {
             round_trip(&ServerMessage::Cancel { resources: cancelled.clone() }),
             ServerMessage::Cancel { resources: r } if r == cancelled
         ));
-        // CB9: the compressions in place the budget asks for.
-        assert!(matches!(
-            round_trip(&ServerMessage::Compress { resources: cancelled.clone() }),
-            ServerMessage::Compress { resources: r } if r == cancelled
-        ));
     }
 
     #[test]
@@ -1695,12 +1659,6 @@ mod tests {
             ClientMessage::Reserve {
                 class: Class::Drape,
                 bytes: 0,
-            },
-            // CB9: a drape compressed in place, at what it now holds.
-            ClientMessage::Compressed {
-                resource: drape,
-                gen: Generation(7),
-                bytes: 87_408,
             },
         ];
         messages.extend(

@@ -341,11 +341,6 @@ impl Lockstep {
         self.real.on_drawable(r, gen, actual);
     }
 
-    /// A compression in place acknowledged (CB9).
-    pub fn on_compressed(&mut self, r: ResourceId, gen: Generation, actual: Bytes) {
-        self.real.on_compressed(r, gen, actual);
-    }
-
     /// An upload dropped.
     pub fn on_discarded(&mut self, r: ResourceId, gen: Generation) {
         self.real.on_discarded(r, gen);

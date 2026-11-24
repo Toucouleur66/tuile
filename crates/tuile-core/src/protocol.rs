@@ -64,16 +64,6 @@ pub enum ClientMessage {
         resource: ResourceId,
         gen: Generation,
     },
-    /// The consumer compressed `resource` of generation `gen` in place, as
-    /// a [`ServerMessage::Compress`] asked: the compressed copy is bound,
-    /// the RGBA8 one released, the GPU done with both, and it now holds
-    /// `bytes`. No fewer bytes than before is a compression the consumer
-    /// could not do (CB9).
-    Compressed {
-        resource: ResourceId,
-        gen: Generation,
-        bytes: u64,
-    },
     /// The platform's memory signal: a warning, a critical warning, the
     /// background, or back to normal.
     Pressure(Pressure),
@@ -225,14 +215,6 @@ pub enum ServerMessage {
     /// These GPU copies leave: release them, after the draw of the step
     /// that announced them — which no longer uses them.
     Evict { resources: Vec<ResourceId> },
-    /// Compress these GPU copies in place, in this order, in the frames'
-    /// spare GPU time: each compressed copy made and bound before its
-    /// RGBA8 one is released, then acknowledged with
-    /// [`ClientMessage::Compressed`] (CB9: display at once, compress what
-    /// lasts). A copy evicted or replaced meanwhile is dropped from it.
-    Compress {
-        resources: Vec<(ResourceId, Generation)>,
-    },
     /// A failure: a resource that could not be loaded (the budget retries it
     /// interactively), or the reason a batch session ends.
     Error {

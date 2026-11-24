@@ -67,18 +67,12 @@ pub(crate) const IMAGERY_BINDING_0: u32 = 4;
 /// is the whole eviction policy — see [`ImageryTextures`].
 pub struct GpuImagery {
     pub(crate) view: wgpu::TextureView,
-    texture: wgpu::Texture,
+    _texture: wgpu::Texture,
     /// What this cost to upload, mip chain included.
     pub(crate) bytes: usize,
-    /// The format it is held in: RGBA8 or blocks as uploaded, or blocks
-    /// once compressed in place.
+    /// The format it went resident in: the one its texels asked for, or
+    /// RGBA8 where that could not be done.
     pub(crate) format: ImageryFormat,
-    /// The block format it may be compressed into in place (CB9): RGBA8
-    /// marked for this context's encoder, whole blocks, kept readable.
-    /// `None` once compressed, or never compressible.
-    pub(crate) compressible: Option<tuile_core::texels::BlockFormat>,
-    /// Its compression was tried and refused: it stays as it is.
-    pub(crate) refused: std::sync::atomic::AtomicBool,
 }
 
 impl GpuImagery {
@@ -90,29 +84,10 @@ impl GpuImagery {
     ) -> Self {
         Self {
             view,
-            texture,
+            _texture: texture,
             bytes,
             format,
-            compressible: None,
-            refused: std::sync::atomic::AtomicBool::new(false),
         }
-    }
-
-    /// `self`, compressible in place into `format` (CB9).
-    pub(crate) fn compressible_into(mut self, format: tuile_core::texels::BlockFormat) -> Self {
-        self.compressible = Some(format);
-        self
-    }
-
-    /// The texture, for a compression in place to read.
-    pub(crate) fn texture(&self) -> &wgpu::Texture {
-        &self.texture
-    }
-
-    /// Whether it waits to be compressed in place into `format`.
-    pub(crate) fn compresses_into(&self, format: tuile_core::texels::BlockFormat) -> bool {
-        self.compressible == Some(format)
-            && !self.refused.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -178,11 +153,9 @@ impl ImageryTextures {
         out
     }
 
-    /// Tile `coord` of imagery `source` is held as `with` from now on: its
-    /// compressed copy (CB9). The holders of the old one keep it until they
-    /// are bound to the new one.
-    pub(crate) fn replace(&mut self, source: u32, coord: ImageryCoord, with: &Arc<GpuImagery>) {
-        self.0.replace(source, coord, with);
+    /// Whether tile `coord` of imagery `source` is on the GPU now.
+    pub(crate) fn holds(&self, source: u32, coord: ImageryCoord) -> bool {
+        self.0.holds(source, coord)
     }
 }
 
@@ -229,6 +202,10 @@ pub struct GpuContext {
     /// The frame's uploads, recorded and not yet submitted: see
     /// [`crate::upload`].
     uploads: Mutex<crate::upload::Uploads>,
+    /// Textures the frame's encode pass made, by the address of the texels
+    /// they were made from, for the uploads that follow it to take: see
+    /// [`crate::prepare::encode_frame`].
+    pub(crate) encoded: Mutex<std::collections::HashMap<usize, crate::prepare::Encoded>>,
 }
 
 impl GpuContext {
@@ -367,6 +344,7 @@ impl GpuContext {
             ops: crate::ops::OpCounters::default(),
             chains: crate::chains::Chains::default(),
             uploads: Mutex::new(uploads),
+            encoded: Mutex::default(),
         }
     }
 
@@ -414,6 +392,9 @@ impl GpuContext {
             ImageryPlan::RGBA8
         };
         self.flush_uploads();
+        if let Ok(mut filed) = self.encoded.lock() {
+            filed.clear();
+        }
         let keeps = |c: &Mutex<Compressor>| {
             c.lock()
                 .is_ok_and(|c| Some(c.format()) == plan.target.block())

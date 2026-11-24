@@ -379,10 +379,9 @@ pub fn cost(r: ResourceId) -> Cost {
 pub enum SimPlan {
     /// RGBA8, as every profile before compression.
     Rgba8,
-    /// RGBA8 crosses and is held, and the GPU may compress it in place
-    /// into 16-byte blocks (BC7, ASTC 4×4) once the budget decides so
-    /// (CB9): RGBA8 moved and held until then, blocks after, the chain's
-    /// blocks written.
+    /// RGBA8 crosses and the GPU encodes it into 16-byte blocks (BC7, ASTC
+    /// 4×4): resident blocks, RGBA8 moved and held while it encodes, the
+    /// chain's blocks written.
     Gpu,
     /// Blocks encoded on the CPU (a decode worker, WebGL2): blocks cross
     /// and are held.
@@ -402,7 +401,13 @@ pub fn cost_for(r: ResourceId, plan: SimPlan) -> Cost {
             match plan {
                 SimPlan::Rgba8 => rgba8,
                 SimPlan::Cpu => blocks,
-                SimPlan::Gpu => rgba8.compressible(blocks.gpu, chain_blocks(side, side)),
+                SimPlan::Gpu => Cost {
+                    gpu: blocks.gpu,
+                    staging: rgba8.staging,
+                    transfer: rgba8.gpu,
+                    transient: rgba8.gpu,
+                    encode_blocks: chain_blocks(side, side),
+                },
             }
         }
     }

@@ -8,7 +8,6 @@ mod compress;
 mod context;
 mod encode;
 mod host;
-mod in_place;
 mod ops;
 mod overlay;
 mod prepare;

@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use glam::{DVec2, DVec3};
 
-use support::{gpu_with, painted, poll, Server, PLANS};
+use support::{encoded_as_planned, gpu_with, painted, poll, Server, PLANS};
 use tuile_core::budget::{BudgetConfig, Bytes};
 use tuile_core::content::DecodedTexture;
 use tuile_core::geo::{geodetic_to_ecef, Geodetic};
@@ -413,8 +413,8 @@ fn a_fast_zoom_never_leaves_a_tile_empty() {
     }
 }
 
-/// The zoom, with every tile's imagery marked as `gpu`'s plan says —
-/// uploaded at once as it comes, whatever the plan (CB9).
+/// The zoom, with every tile's imagery held as `gpu`'s plan says — encoded
+/// at upload, under the pump's encode pace, for a block plan.
 fn a_fast_zoom_under(plan: &str, gpu: &GpuContext) {
     // Bright, never near the clear colour. 32², not a real tile's 256²: the
     // pinned pyramid alone is 682 tiles, each with its chain built on the CPU
@@ -544,12 +544,5 @@ fn a_fast_zoom_under(plan: &str, gpu: &GpuContext) {
         worst_in.0 * 100.0,
         worst_in.1 / 1000.0
     );
-    // A mesh's own imagery — what this loader gives — is uploaded as it
-    // comes under every plan and never compressed in place: only a drape's
-    // shared imagery is, when the budget asks (CB9). Nothing encoded.
-    assert_eq!(
-        gpu.imagery_encode_stats().map_or(0, |s| s.encoded),
-        0,
-        "{plan}"
-    );
+    encoded_as_planned(plan, gpu, 1);
 }

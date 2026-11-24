@@ -490,9 +490,6 @@ pub struct Metrics {
     pub resident_bytes: Gauge,
     pub imagery_bytes: Gauge,
     pub imagery_textures: Gauge,
-    /// Of them, those held block-compressed (CB9: compressed in place, or
-    /// uploaded as blocks).
-    pub imagery_compressed_textures: Gauge,
 
     // --- 3D Tiles beside the globe (the `Tiles3dMesh` class) ---
     /// Their meshes in the last draw set: of `tiles_selected`.
@@ -987,7 +984,6 @@ snapshot! {
         resident_bytes,
         imagery_bytes,
         imagery_textures,
-        imagery_compressed_textures,
         tiles3d_selected,
         tiles3d_bytes,
         pending_uploads,

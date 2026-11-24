@@ -217,11 +217,6 @@ impl Feed for tuile_budget::cost::Cost {
             self.transfer.feed(h);
             self.transient.feed(h);
             h.u64(self.encode_blocks);
-            // CB9's, only where a cost may be compressed in place.
-            if self.compress_blocks > 0 {
-                self.compressed.feed(h);
-                h.u64(self.compress_blocks);
-            }
         }
     }
 }
@@ -325,14 +320,6 @@ impl Feed for BudgetStats {
         };
         let text = if self.transient == zero {
             text.replace(&format!(", transfer: {:?}", self.transfer), "")
-        } else {
-            text
-        };
-        // And the compression in place (CB9), recorded after the reference
-        // was: out of the text while nothing is compressible.
-        let none = tuile_budget::compress::CompressStats::default();
-        let text = if self.compress == none {
-            text.replace(&format!(", compress: {none:?}"), "")
         } else {
             text
         };

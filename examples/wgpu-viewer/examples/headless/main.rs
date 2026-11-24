@@ -272,26 +272,6 @@ fn play(
         let held = run.wait_until(bound, |_| false).unwrap_or_else(|s| s);
         println!("  held still {held:.1} s");
     }
-    // The imagery the GPU holds at the end — what lasted, compressed in
-    // place where the budget chose to (CB9) — and its peak over the whole
-    // run, the transient of display-at-once included.
-    if let Some(last) = run.history().last() {
-        let m = &last.metrics;
-        let peak = run
-            .history()
-            .iter()
-            .map(|s| s.metrics.texture_bytes)
-            .max()
-            .unwrap_or(0);
-        println!(
-            "  imagery at the end {:.1} MB, {} textures ({} compressed), {} bytes each; at its peak over the run {:.1} MB",
-            m.texture_bytes as f64 / 1e6,
-            m.textures,
-            m.imagery_compressed_textures,
-            m.texture_bytes.checked_div(m.textures).unwrap_or(0),
-            peak as f64 / 1e6
-        );
-    }
     // The settled picture, as the run's own offscreen eye drew it.
     if let Some(dir) = pictures {
         let path = dir.join(format!("{}.png", pattern.key));

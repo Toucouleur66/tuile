@@ -12,20 +12,13 @@
 //!   what a decoded copy holds and what a frame's upload plan is capped on;
 //! - `transient`: the GPU bytes held beside `gpu` until an encode on the
 //!   GPU has finished (the RGBA8 the encoder reads);
-//! - `encode_blocks`: the 4×4 blocks that encode writes;
-//! - `compressed`: the bytes it is held in once the GPU compresses it **in
-//!   place**, later, if the budget decides so (CB9: display at once,
-//!   compress what lasts) — zero when it cannot be;
-//! - `compress_blocks`: the 4×4 blocks that compression writes.
+//! - `encode_blocks`: the 4×4 blocks that encode writes.
 //!
-//! For RGBA8 and meshes `transfer == gpu` and the rest is zero
+//! For RGBA8 and meshes `transfer == gpu` and the other two are zero
 //! ([`Cost::is_identity`]): nothing compressed costs what it always did. A
-//! texture the GPU may compress (CB9) crosses and is held as RGBA8 (349,524
-//! bytes for 256² with its chain): `compressed` says it would hold 87,408
-//! once compressed in place, and `compress_blocks` that compressing it
-//! writes 5,463 blocks. An encode on the way to the GPU (CB2–CB6:
-//! `transfer`, `transient`, `encode_blocks`) is still a cost the budget
-//! reads, whatever produces it.
+//! texture the GPU encodes into BC7 or ASTC 4×4 crosses as RGBA8 (349,524
+//! bytes for 256² with its chain), holds blocks (87,408), peaks at both
+//! until its encode is done, and writes 5,463 blocks.
 //!
 //! The consumer reports the actual GPU bytes in its acknowledgement; a drift
 //! above 5 % means this estimator is wrong — unless the actual lies in
@@ -65,11 +58,6 @@ pub struct Cost {
     pub transient: Bytes,
     /// The 4×4 blocks the GPU's encode writes.
     pub encode_blocks: u64,
-    /// The bytes held once the GPU compresses it in place, on `gpu`'s
-    /// basis; zero when it cannot be (CB9).
-    pub compressed: Bytes,
-    /// The 4×4 blocks that compression writes.
-    pub compress_blocks: u64,
 }
 
 impl Cost {
@@ -87,38 +75,13 @@ impl Cost {
             transfer: gpu,
             transient: Bytes::ZERO,
             encode_blocks: 0,
-            compressed: Bytes::ZERO,
-            compress_blocks: 0,
         }
     }
 
-    /// `self`, compressible in place into `to` bytes by writing `blocks`
-    /// blocks (CB9).
-    pub const fn compressible(mut self, to: Bytes, blocks: u64) -> Self {
-        self.compressed = to;
-        self.compress_blocks = blocks;
-        self
-    }
-
-    /// Whether the GPU may compress it in place, and into how many bytes:
-    /// `Some` only when that holds less than it does now.
-    pub const fn compresses_to(&self) -> Option<Bytes> {
-        if self.compress_blocks > 0 && self.compressed.0 < self.gpu.0 {
-            Some(self.compressed)
-        } else {
-            None
-        }
-    }
-
-    /// Crosses as it is held, and nothing is encoded on the GPU, on the way
-    /// or later: what every cost was before compression, and every cost
-    /// under `Off`.
+    /// Crosses as it is held, and nothing is encoded on the GPU: what every
+    /// cost was before compression, and every cost under `Off`.
     pub const fn is_identity(&self) -> bool {
-        self.transfer.0 == self.gpu.0
-            && self.transient.0 == 0
-            && self.encode_blocks == 0
-            && self.compressed.0 == 0
-            && self.compress_blocks == 0
+        self.transfer.0 == self.gpu.0 && self.transient.0 == 0 && self.encode_blocks == 0
     }
 
     /// Whether `actual` acknowledged against this estimate is an encode
@@ -136,8 +99,6 @@ impl Cost {
             transfer: self.transfer.plus(o.transfer),
             transient: self.transient.plus(o.transient),
             encode_blocks: self.encode_blocks.saturating_add(o.encode_blocks),
-            compressed: self.compressed.plus(o.compressed),
-            compress_blocks: self.compress_blocks.saturating_add(o.compress_blocks),
         }
     }
 }

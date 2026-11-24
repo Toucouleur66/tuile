@@ -17,6 +17,7 @@ use glam::{DVec3, Mat4, Vec3};
 use std::sync::Arc;
 use tuile_core::budget::{LayerId, ResourceId, UvTransform};
 use tuile_core::content::{DecodedMesh, DecodedTexture, DecodedTileContent, DrapeContent};
+use tuile_core::protocol::ResourceContent;
 use tuile_core::raster::{self, ImageryCoord, Placement};
 use tuile_core::texels::{BlockFormat, ImageryFormat, Texels};
 
@@ -540,7 +541,6 @@ pub(crate) fn prepare_in(
             texture: gpu.shared_imagery(l.source, l.coord, || upload_texture_in(gpu, &l.texture)),
             coord: l.coord,
             source: l.source,
-            charge: (0, 0),
         })
         .collect();
     let worn: Vec<(Placement, &Arc<GpuImagery>, ImageryCoord, u32)> = own
@@ -613,9 +613,6 @@ pub(crate) struct DrapedLayer {
     pub(crate) texture: Arc<GpuImagery>,
     pub(crate) coord: ImageryCoord,
     pub(crate) source: u32,
-    /// What the drape is charged for it as uploaded, and once compressed
-    /// in place (CB9): its share of the tile, zero for the shared floor.
-    pub(crate) charge: (u64, u64),
 }
 
 /// A drape on the GPU: its imagery tiles' textures, shared with every other
@@ -635,7 +632,7 @@ pub struct PreparedDrape {
 }
 
 /// The next [`PreparedDrape::serial`].
-pub(crate) fn next_drape_serial() -> u64 {
+fn next_drape_serial() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
@@ -644,8 +641,8 @@ pub(crate) fn next_drape_serial() -> u64 {
 /// it (keyed by imagery set and coord), and its placements.
 ///
 /// Its charge is the budget's estimate in the format each tile really went
-/// resident in: what [`DrapeContent::cost`] says wherever a tile went up as
-/// it came, and the share of what it is held in otherwise.
+/// resident in: what [`DrapeContent::cost`] says wherever the plan was
+/// followed, and RGBA8's share for a tile that had to stay RGBA8.
 pub fn prepare_drape(gpu: &GpuContext, drape: &DrapeContent) -> PreparedDrape {
     let prepared = prepare_drape_in(gpu, drape);
     gpu.flush_uploads();
@@ -668,38 +665,12 @@ pub(crate) fn prepare_drape_in(gpu: &GpuContext, drape: &DrapeContent) -> Prepar
             texture,
             coord: l.coord,
             source: l.source,
-            charge: (0, 0),
         });
     }
-    let whole = |i: usize, l: &tuile_core::raster::ImageryLayer| match held
-        .get(i)
-        .copied()
-        .flatten()
-    {
-        // Held otherwise than it crosses: blocks shown by a stand-in, or a
-        // tile another drape had compressed already.
-        Some(format) if format != l.texture.uploaded_format() => l.texture.cost_as(format),
+    let charged = drape.cost_with(|i, l| match held.get(i).copied().flatten() {
+        Some(format) if format != l.texture.resident_format() => l.texture.cost_as(format),
         _ => l.texture.cost(),
-    };
-    let charged = drape.cost_with(whole);
-    // Each visible tile's share, as uploaded and once compressed.
-    let mut at = 0;
-    for (i, l) in drape.tiles.iter().enumerate() {
-        if !l.is_visible() {
-            continue;
-        }
-        let one = drape.cost_with(|j, l| {
-            if j == i {
-                whole(j, l)
-            } else {
-                tuile_core::budget::cost::Cost::default()
-            }
-        });
-        if let Some(layer) = layers.get_mut(at) {
-            layer.charge = (one.gpu.0, one.compresses_to().unwrap_or(one.gpu).0);
-        }
-        at += 1;
-    }
+    });
     PreparedDrape {
         layer: drape.layer,
         level: drape.level,
@@ -756,14 +727,16 @@ fn passes(
     }
 }
 
-/// Uploads a base-color texture with its full mip chain, as its texels
-/// come.
+/// Uploads a base-color texture with its full mip chain, in the format its
+/// texels ask for when this context can hold it so, in RGBA8 otherwise.
 ///
-/// - **RGBA8**: the chain built on the CPU and uploaded, as it always was —
-///   also when it is marked for a block format the context's GPU encoder
-///   writes (CB9: display at once). Then it is kept readable (`COPY_SRC`)
-///   and marked compressible: the graphics budget may later have it
-///   compressed in place ([`crate::in_place`]).
+/// - **RGBA8 held as RGBA8**: the chain built on the CPU and uploaded, as it
+///   always was.
+/// - **RGBA8 headed for a block format** the context's GPU encoder writes:
+///   the chain is built on the CPU, encoded on the GPU and copied into a
+///   texture of that format ([`crate::plan_for`], [`crate::GpuContext::with_imagery_plan`]). An encode that cannot be
+///   done — a size that is not whole blocks, a tile too large for the device,
+///   a context without that encoder — uploads RGBA8 instead.
 /// - **Blocks**, already encoded with their chain: uploaded block row by
 ///   block row where the device samples the format and the levels are whole;
 ///   the stand-in slate otherwise — ground shown flat, never a hole and never
@@ -788,13 +761,171 @@ pub(crate) fn upload_texture(gpu: &GpuContext, t: &DecodedTexture) -> GpuImagery
     imagery
 }
 
-/// Uploads a texture as it comes: RGBA8 with its chain, or blocks. Nothing
-/// encodes on the way (CB9: display at once); RGBA8 marked for this
-/// context's encoder stays readable, to be compressed in place later.
+/// What the frame's encode pass made of one texture: its texture, or the
+/// chain to upload as RGBA8 when the encoder refused it.
+pub(crate) enum Encoded {
+    Texture(GpuImagery),
+    Refused(Vec<DecodedTexture>),
+}
+
+/// A texture's address: what the frame's encode pass files its result by.
+fn texels_key(t: &DecodedTexture) -> usize {
+    t as *const DecodedTexture as usize
+}
+
+/// Encodes every texture of `contents` the frame will encode in **one**
+/// compute pass, recorded in the frame's uploads: what `upload_texture`
+/// then takes instead of encoding each texture on its own — one pass and
+/// one submit a frame instead of one per texture. Imagery the GPU already
+/// holds is not encoded, nor imagery named twice. `begun` adds tiles of
+/// drapes that wait (CB6): encoded in the same pass, for
+/// [`hold_imagery`] to take. Returns the tiles encoded.
+pub(crate) fn encode_frame(
+    gpu: &GpuContext,
+    contents: &[&ResourceContent],
+    begun: &[&raster::ImageryLayer],
+) -> usize {
+    let Some(compressor) = gpu.compressor.as_ref() else {
+        return 0;
+    };
+    let Some(format) = compressor.lock().ok().map(|c| c.format()) else {
+        return 0;
+    };
+    let wanted =
+        |t: &DecodedTexture| t.resident_format().block() == Some(format) && t.rgba8().is_some();
+    let mut picked: Vec<&DecodedTexture> = Vec::new();
+    {
+        let Ok(pool) = gpu.imagery.lock() else {
+            return 0;
+        };
+        let mut named: std::collections::HashSet<(u32, ImageryCoord)> =
+            std::collections::HashSet::new();
+        for content in contents {
+            let layers: &[raster::ImageryLayer] = match content {
+                ResourceContent::Mesh(m) => {
+                    picked.extend(m.textures.iter().filter(|t| wanted(t)));
+                    &m.imagery
+                }
+                ResourceContent::Drape(d) => &d.tiles,
+            };
+            for l in layers {
+                if l.is_visible()
+                    && wanted(&l.texture)
+                    && !pool.holds(l.source, l.coord)
+                    && named.insert((l.source, l.coord))
+                {
+                    picked.push(&l.texture);
+                }
+            }
+        }
+        for l in begun {
+            if wanted(&l.texture)
+                && !pool.holds(l.source, l.coord)
+                && named.insert((l.source, l.coord))
+            {
+                picked.push(&l.texture);
+            }
+        }
+    }
+    if picked.len() < 2 {
+        // One texture is encoded where it would have been.
+        return 0;
+    }
+    let chains: Vec<Vec<DecodedTexture>> = picked
+        .iter()
+        .map(|t| match gpu.chains.take(t) {
+            Some(mips) => {
+                crate::ops::OpCounters::add(&gpu.ops.chains_ready, 1);
+                mips
+            }
+            None => {
+                crate::ops::OpCounters::add(&gpu.ops.chains_inline, 1);
+                raster::mip_chain(t)
+            }
+        })
+        .collect();
+    // The scratch must not hold a record not yet submitted.
+    if compressor.lock().is_ok_and(|c| c.busy()) {
+        gpu.flush_uploads();
+    }
+    let Ok(mut c) = compressor.lock() else {
+        return 0;
+    };
+    let tiles: Vec<(&DecodedTexture, &[DecodedTexture])> = picked
+        .iter()
+        .zip(&chains)
+        .map(|(t, mips)| (*t, mips.as_slice()))
+        .collect();
+    let results = gpu.record(|cmd| c.record(&gpu.device, &gpu.queue, &gpu.ops, cmd, &tiles));
+    drop(c);
+    let mut encoded = 0;
+    let Ok(mut filed) = gpu.encoded.lock() else {
+        return 0;
+    };
+    for ((t, mips), result) in picked.iter().zip(chains).zip(results) {
+        let entry = match result {
+            Ok(texture) => {
+                encoded += 1;
+                Encoded::Texture(encoded_imagery(texture, t, &mips, format))
+            }
+            Err(_) => Encoded::Refused(mips),
+        };
+        filed.insert(texels_key(t), entry);
+    }
+    encoded
+}
+
+/// Imagery tile `l` on the GPU, in the shared pool, for a drape that waits
+/// for the rest of its tiles (CB6): the frame's encode of it when there was
+/// one, else uploaded as any — RGBA8 where its encode could not be done.
+/// The caller holds it; the drape's upload finds it in the pool.
+pub(crate) fn hold_imagery(gpu: &GpuContext, l: &raster::ImageryLayer) -> Arc<GpuImagery> {
+    gpu.shared_imagery(l.source, l.coord, || upload_texture_in(gpu, &l.texture))
+}
+
+/// Lets go of what the frame's encode pass made and no upload took: a
+/// delivery refused at its class's hard limit.
+pub(crate) fn forget_encoded(gpu: &GpuContext) {
+    if let Ok(mut filed) = gpu.encoded.lock() {
+        filed.clear();
+    }
+}
+
+/// The texture an encode made, as the imagery it is.
+fn encoded_imagery(
+    texture: wgpu::Texture,
+    t: &DecodedTexture,
+    mips: &[DecodedTexture],
+    format: BlockFormat,
+) -> GpuImagery {
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let bytes = BlockFormat::level_bytes(t.width, t.height)
+        + mips
+            .iter()
+            .map(|m| BlockFormat::level_bytes(m.width, m.height))
+            .sum::<usize>();
+    GpuImagery::new(texture, view, bytes, format.into())
+}
+
+/// What the frame's encode pass made of `t`, if it took it.
+fn take_encoded(gpu: &GpuContext, t: &DecodedTexture) -> Option<Encoded> {
+    gpu.encoded.lock().ok()?.remove(&texels_key(t))
+}
+
+/// Uploads a texture: the frame's encode of it when there was one.
 fn upload_texture_in(gpu: &GpuContext, t: &DecodedTexture) -> GpuImagery {
+    match take_encoded(gpu, t) {
+        Some(Encoded::Texture(imagery)) => imagery,
+        Some(Encoded::Refused(mips)) => upload_rgba8(gpu, t, &mips),
+        None => upload_texture_one(gpu, t),
+    }
+}
+
+/// [`upload_texture`] when nothing was encoded for it ahead.
+fn upload_texture_one(gpu: &GpuContext, t: &DecodedTexture) -> GpuImagery {
     match &t.texels {
         Texels::Blocks { format, levels } => upload_blocks(gpu, t, *format, levels)
-            .unwrap_or_else(|| upload_rgba8(gpu, &DecodedTexture::stand_in(), &[], None)),
+            .unwrap_or_else(|| upload_rgba8(gpu, &DecodedTexture::stand_in(), &[])),
         Texels::Rgba8 { resident, .. } => {
             // Built off the render thread when it could be (`crate::chains`):
             // the same chain either way.
@@ -808,26 +939,41 @@ fn upload_texture_in(gpu: &GpuContext, t: &DecodedTexture) -> GpuImagery {
                     raster::mip_chain(t)
                 }
             };
-            upload_rgba8(gpu, t, &mips, compressible(gpu, t, resident.block()))
+            if let Some(format) = resident.block() {
+                if let Some(encoded) = encode(gpu, t, &mips, format) {
+                    return encoded;
+                }
+            }
+            upload_rgba8(gpu, t, &mips)
         }
     }
 }
 
-/// The block format `t` may be compressed into in place: the one it is
-/// marked for, when this context's encoder writes it and level 0 is whole
-/// blocks — the size the cost said it could be compressed at.
-fn compressible(
+/// RGBA8 encoded into `format` by the context's GPU encoder, or `None` for a
+/// texture to upload as RGBA8.
+fn encode(
     gpu: &GpuContext,
     t: &DecodedTexture,
-    marked: Option<BlockFormat>,
-) -> Option<BlockFormat> {
-    let format = marked?;
-    let encodes = gpu
-        .compressor
-        .as_ref()
-        .and_then(|c| c.lock().ok().map(|c| c.format()))
-        == Some(format);
-    (encodes && t.cost().compresses_to().is_some()).then_some(format)
+    mips: &[DecodedTexture],
+    format: BlockFormat,
+) -> Option<GpuImagery> {
+    let mut compressor = gpu.compressor.as_ref()?.lock().ok()?;
+    if compressor.format() != format {
+        return None;
+    }
+    // One texture on its own, in the frame's uploads: a record still
+    // waiting for its submit is submitted first, before this one reuses
+    // the scratch.
+    if compressor.busy() {
+        drop(compressor);
+        gpu.flush_uploads();
+        compressor = gpu.compressor.as_ref()?.lock().ok()?;
+    }
+    let texture = gpu
+        .record(|cmd| compressor.record(&gpu.device, &gpu.queue, &gpu.ops, cmd, &[(t, mips)]))
+        .pop()?
+        .ok();
+    Some(encoded_imagery(texture?, t, mips, format))
 }
 
 /// Blocks, uploaded as they are, level by level: `None` where the device was
@@ -903,21 +1049,8 @@ fn upload_blocks(
     Some(GpuImagery::new(texture, view, bytes, format.into()))
 }
 
-/// RGBA8 and its chain, as they are; readable by a copy when it may be
-/// compressed in place into `compressible`.
-fn upload_rgba8(
-    gpu: &GpuContext,
-    t: &DecodedTexture,
-    mips: &[DecodedTexture],
-    compressible: Option<BlockFormat>,
-) -> GpuImagery {
-    // Read by the encoder's copy only when it may be compressed: under
-    // `Off`, the texture it always was.
-    let read = if compressible.is_some() {
-        wgpu::TextureUsages::COPY_SRC
-    } else {
-        wgpu::TextureUsages::empty()
-    };
+/// RGBA8 and its chain, as they are.
+fn upload_rgba8(gpu: &GpuContext, t: &DecodedTexture, mips: &[DecodedTexture]) -> GpuImagery {
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("tuile base color"),
         size: wgpu::Extent3d {
@@ -930,7 +1063,7 @@ fn upload_rgba8(
         dimension: wgpu::TextureDimension::D2,
         format: TEXTURE_FORMAT,
         // No RENDER_ATTACHMENT: nothing draws into this texture any more.
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | read,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
 
@@ -953,11 +1086,7 @@ fn upload_rgba8(
     }
 
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    let imagery = GpuImagery::new(texture, view, bytes, ImageryFormat::Rgba8);
-    match compressible {
-        Some(format) => imagery.compressible_into(format),
-        None => imagery,
-    }
+    GpuImagery::new(texture, view, bytes, ImageryFormat::Rgba8)
 }
 
 fn prepare_mesh(
@@ -1156,12 +1285,11 @@ mod tests {
         assert_eq!(unplanned.bytes, 4 * (64 + 16 + 4 + 1));
     }
 
-    /// **Display at once (CB9): under each block plan, RGBA8 marked for it
-    /// is uploaded as RGBA8** — nothing encodes on the way — kept readable
-    /// and marked compressible into the plan's format; a size that is not
-    /// whole blocks is not compressible. Nothing is encoded at upload.
+    /// **Under each block plan, RGBA8 marked for it is encoded on the GPU**,
+    /// its chain in whole blocks; a size that is not whole blocks is refused
+    /// by the encoder and uploaded as RGBA8 — never a missing texture.
     #[test]
-    fn marked_rgba8_is_uploaded_whole_and_compressible_later() {
+    fn marked_rgba8_is_encoded_or_falls_back_to_rgba8() {
         for format in [BlockFormat::Bc7, BlockFormat::Astc4x4] {
             let Some(gpu) = gpu_with(ImageryCompression::Format(format)) else {
                 return;
@@ -1170,30 +1298,28 @@ mod tests {
                 eprintln!("SKIP {format:?}: this adapter does not sample it");
                 continue;
             }
-            let marked = upload_texture(&gpu, &planned(256, 256, format.into()));
-            assert_eq!(marked.format, ImageryFormat::Rgba8, "{format:?}");
-            assert_eq!(marked.bytes, 349_524, "{format:?}: RGBA8 with its chain");
-            assert!(marked.compresses_into(format), "{format:?}");
-            assert!(marked
-                .texture()
-                .usage()
-                .contains(wgpu::TextureUsages::COPY_SRC));
-            let odd = upload_texture(&gpu, &planned(250, 250, format.into()));
-            assert_eq!(odd.format, ImageryFormat::Rgba8, "{format:?}");
-            assert!(!odd.compresses_into(format), "{format:?}: not whole blocks");
+            let encoded = upload_texture(&gpu, &planned(256, 256, format.into()));
+            assert_eq!(encoded.format, ImageryFormat::from(format));
+            assert_eq!(
+                encoded.bytes, 87_408,
+                "{format:?}: a quarter, in whole blocks"
+            );
+            // 250 is not whole blocks: the encoder refuses it.
+            let refused = upload_texture(&gpu, &planned(250, 250, format.into()));
+            assert_eq!(refused.format, ImageryFormat::Rgba8, "{format:?}");
+            assert_eq!(
+                refused.bytes as u64,
+                tuile_core::budget::cost::drape_cost(
+                    250,
+                    250,
+                    tuile_core::budget::cost::TextureFormat::Rgba8
+                )
+                .gpu
+                .0
+            );
             let stats = gpu.imagery_encode_stats().expect("an encoder");
-            assert_eq!((stats.encoded, stats.fell_back), (0, 0), "{format:?}");
+            assert_eq!((stats.encoded, stats.fell_back), (1, 1), "{format:?}");
         }
-        // Off: no copy usage added, nothing compressible.
-        let Some(off) = gpu_with(ImageryCompression::Off) else {
-            return;
-        };
-        let plain = upload_texture(&off, &planned(256, 256, ImageryFormat::Bc7));
-        assert!(!plain.compresses_into(BlockFormat::Bc7));
-        assert!(!plain
-            .texture()
-            .usage()
-            .contains(wgpu::TextureUsages::COPY_SRC));
     }
 
     /// **Blocks upload as blocks** where the device samples them; a broken

@@ -76,8 +76,6 @@ pub enum BudgetEvent {
     /// A fallback specification put in force: its digest
     /// ([`crate::FallbackSpec::digest`]).
     Fallbacks(u64),
-    /// `on_compressed` (CB9).
-    Compressed(ResourceId, Generation, Bytes),
 }
 
 /// One decision step, as the host saw it.

@@ -1233,15 +1233,6 @@ impl<T> ImageryPool<T> {
         entry
     }
 
-    /// Puts `with` in place of the resource of tile `coord` of imagery
-    /// `source`: what a later [`ImageryPool::get_or_insert_from`] hands
-    /// out. The resource it replaces lives on for as long as its holders
-    /// keep it — a backend that compresses a texture in place binds the
-    /// new one to every holder before letting the old one go.
-    pub fn replace(&mut self, source: u32, coord: ImageryCoord, with: &Arc<T>) {
-        self.entries.insert((source, coord), Arc::downgrade(with));
-    }
-
     /// Whether tile `coord` of imagery `source` is held by some tile now: a
     /// [`ImageryPool::get_or_insert_from`] for it would build nothing. What a
     /// consumer asks before it schedules work that only a miss costs.

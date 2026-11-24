@@ -1259,15 +1259,6 @@ impl State {
                 self.budget.on_discarded(resource, gen);
                 self.events.push(BudgetEvent::Discarded(resource, gen));
             }
-            ClientMessage::Compressed {
-                resource,
-                gen,
-                bytes,
-            } => {
-                self.budget.on_compressed(resource, gen, Bytes(bytes));
-                self.events
-                    .push(BudgetEvent::Compressed(resource, gen, Bytes(bytes)));
-            }
             ClientMessage::Pressure(p) => {
                 self.pressure = p;
                 self.budget.set_pressure(p);
@@ -2245,12 +2236,6 @@ impl State {
             })
             .map_err(|_| Stop::Gone)?;
         }
-        if !d.compress.is_empty() {
-            tx.unbounded_send(ServerMessage::Compress {
-                resources: d.compress.clone(),
-            })
-            .map_err(|_| Stop::Gone)?;
-        }
         if let Some(fatal) = &d.fatal {
             let resource = fatal.resource();
             let message = fatal.to_string();
@@ -2475,12 +2460,6 @@ mod tests {
         converged: bool,
         /// Acks withheld while true.
         hold_back: bool,
-        /// The compressions in place asked (CB9), answered at a quarter of
-        /// what the copy held.
-        compress_asked: Vec<(ResourceId, Generation)>,
-        compressed: BTreeMap<ResourceId, u64>,
-        /// What each held copy was acknowledged at.
-        bytes: BTreeMap<ResourceId, u64>,
     }
 
     impl Consumer {
@@ -2549,25 +2528,11 @@ mod tests {
                         self.errors.push((resource, message))
                     }
                     ServerMessage::Priming(_) => {}
-                    ServerMessage::Compress { resources } => {
-                        for (r, g) in resources {
-                            assert_eq!(self.held.get(&r), Some(&g), "{r:?} not held");
-                            self.compress_asked.push((r, g));
-                            let bytes = self.bytes.get(&r).copied().unwrap_or(0) / 4;
-                            self.compressed.insert(r, bytes);
-                            let _ = stream.send(ClientMessage::Compressed {
-                                resource: r,
-                                gen: g,
-                                bytes,
-                            });
-                        }
-                    }
                 }
             }
             if !self.hold_back {
                 for (r, (gen, bytes)) in std::mem::take(&mut self.queued) {
                     self.held.insert(r, gen);
-                    self.bytes.insert(r, bytes);
                     let _ = stream.send(ClientMessage::Ack {
                         resource: r,
                         gen,
@@ -3248,9 +3213,6 @@ mod tests {
         /// The substitutes it reports: none, but for the tests of the
         /// fallback specification.
         substitutes: Vec<LayerReach>,
-        /// Its drapes' imagery marked for BC7 on the GPU: compressible in
-        /// place (CB9).
-        compressible: bool,
     }
 
     impl Draped {
@@ -3310,18 +3272,11 @@ mod tests {
                 .lock()
                 .expect("drapes")
                 .push(ResourceId::drape(id, layer, level));
-            let mut texture = crate::content::DecodedTexture::from_rgba8(
+            let texture = Arc::new(crate::content::DecodedTexture::from_rgba8(
                 4,
                 4,
                 vec![self.epoch.load(Ordering::SeqCst) as u8; 64],
-            );
-            if self.compressible {
-                texture = texture.planned(crate::texels::ImageryPlan {
-                    target: crate::texels::ImageryFormat::Bc7,
-                    encode: crate::texels::ImageryEncode::Gpu,
-                });
-            }
-            let texture = Arc::new(texture);
+            ));
             let tile = crate::raster::GeoRect {
                 west: 0.0,
                 south: 0.0,
@@ -3371,21 +3326,6 @@ mod tests {
         Arc<AtomicUsize>,
         Arc<Mutex<Vec<ResourceId>>>,
     ) {
-        draped_session_of(dir, substitutes, false)
-    }
-
-    #[allow(clippy::type_complexity)]
-    fn draped_session_of(
-        dir: &std::path::Path,
-        substitutes: Vec<LayerReach>,
-        compressible: bool,
-    ) -> (
-        InProcessStream,
-        GeometryServer,
-        Arc<AtomicU64>,
-        Arc<AtomicUsize>,
-        Arc<Mutex<Vec<ResourceId>>>,
-    ) {
         let tileset = deep_tileset(dir);
         let arena = Arc::new(RwLock::new(tileset));
         let tree: Box<dyn TileTree> = Box::new(TilesetTree::new(Arc::clone(&arena)));
@@ -3399,7 +3339,6 @@ mod tests {
             meshes: Arc::clone(&meshes),
             drapes: Arc::clone(&drapes),
             substitutes: substitutes.clone(),
-            compressible,
         });
         // With substitutes, imagery free to climb over its terrain: the
         // levels then follow the distance alone, and differ over the view.
@@ -3564,7 +3503,6 @@ mod tests {
                     meshes: Arc::new(AtomicUsize::new(0)),
                     drapes: Arc::new(Mutex::new(Vec::new())),
                     substitutes: Vec::new(),
-                    compressible: false,
                 }),
                 crate::source::SourceOptions::default(),
             )
@@ -4006,55 +3944,6 @@ mod tests {
         }
     }
 
-    /// **Display at once, compress what lasts, through the session (CB9).**
-    /// Drapes marked compressible are delivered and drawn at once; once they
-    /// have lasted — the age re-specified to zero by the host, at run time —
-    /// the session asks the consumer to compress them in place, each once,
-    /// drapes only, and takes its acknowledgements: asked once, never again.
-    /// Drapes that cannot be compressed are never asked.
-    #[test]
-    fn a_session_asks_for_what_lasts_to_be_compressed_in_place() {
-        for compressible in [false, true] {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let (mut stream, server, _, _, _) =
-                draped_session_of(dir.path(), Vec::new(), compressible);
-            let mut server = Box::pin(server.run());
-            let mut consumer = Consumer::default();
-            stream
-                .send(ClientMessage::Specify {
-                    query: "compress_decisions=0&compress_still_poses=0".to_owned(),
-                    overridden: false,
-                })
-                .expect("send");
-            look(&stream, near_view(), 1);
-            assert!(settle(&mut server, &mut stream, &mut consumer));
-            look(&stream, near_view(), 2);
-            assert!(settle(&mut server, &mut stream, &mut consumer));
-            assert!(consumer.converged, "{compressible}");
-            let asked = &consumer.compress_asked;
-            if !compressible {
-                assert!(asked.is_empty(), "{asked:?}");
-                continue;
-            }
-            assert!(!asked.is_empty(), "nothing asked to be compressed");
-            assert!(asked
-                .iter()
-                .all(|(r, _)| matches!(r, ResourceId::Drape { .. })));
-            let once: BTreeSet<_> = asked.iter().map(|(r, _)| *r).collect();
-            assert_eq!(once.len(), asked.len(), "a copy asked twice: {asked:?}");
-            let drawn: BTreeSet<ResourceId> = consumer
-                .draw
-                .items
-                .iter()
-                .flat_map(|i| i.drapes.iter().map(|d| d.resource))
-                .collect();
-            assert!(
-                drawn.iter().all(|r| once.contains(r)),
-                "every drape worn compressed once still: {drawn:?} {once:?}"
-            );
-        }
-    }
-
     /// **A fallback specification is the host's to declare, at runtime, and
     /// to remove** (`docs/explorations/imagery-layer-substitution.md`). By
     /// default no substitute drape is ever asked for, even of a loader that
@@ -4232,7 +4121,6 @@ mod tests {
                 meshes: Arc::new(AtomicUsize::new(0)),
                 drapes: Arc::new(Mutex::new(Vec::new())),
                 substitutes: Vec::new(),
-                compressible: false,
             },
             stored: Arc::clone(&stored),
             asked: Arc::clone(&asked),

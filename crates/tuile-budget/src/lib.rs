@@ -9,8 +9,6 @@
 #![deny(clippy::iter_over_hash_type)]
 #![deny(clippy::cast_possible_truncation)]
 
-pub mod compress;
-mod compress_pass;
 pub mod config;
 pub mod cost;
 pub mod deadline;
@@ -168,7 +166,6 @@ enum Event {
     StoreMiss(ResourceId, Generation),
     Drawable(ResourceId, Generation, Bytes),
     Discarded(ResourceId, Generation),
-    Compressed(ResourceId, Generation, Bytes),
 }
 
 /// Recently evicted resources, for the thrash count, bounded.
@@ -379,9 +376,6 @@ pub struct Budget {
     /// load gain, the deficit and the release key read
     /// (`docs/explorations/budget-progressive-coarse-preload.md` §2, `R`).
     costed: spec::Specification,
-    /// The copies that may be compressed in place, and the compressions
-    /// in flight (CB9, [`compress`]).
-    compress: compress::Compressions,
 }
 
 impl Budget {
@@ -413,7 +407,6 @@ impl Budget {
             upload_rate: inputs::Ema::default(),
             down: Default::default(),
             scratch: Default::default(),
-            compress: Default::default(),
             recent: Default::default(),
             recent_horizon: Micros::ZERO,
             epochs: PerClass::splat(0),
@@ -601,15 +594,6 @@ impl Budget {
     /// upload that failed): it stays undrawn, and is delivered again later.
     pub fn on_discarded(&mut self, r: ResourceId, gen: Generation) {
         self.events.push(Event::Discarded(r, gen));
-    }
-
-    /// The consumer compressed `r` of generation `gen` in place, as
-    /// [`Decisions::compress`] asked, and it now holds `actual` bytes — the
-    /// RGBA8 copy released. `actual` no less than what it held is a
-    /// compression the consumer could not do: held as it is, never asked
-    /// again (CB9).
-    pub fn on_compressed(&mut self, r: ResourceId, gen: Generation, actual: Bytes) {
-        self.events.push(Event::Compressed(r, gen, actual));
     }
 
     /// The content of `class` changed upstream (imagery epoch, radiometric

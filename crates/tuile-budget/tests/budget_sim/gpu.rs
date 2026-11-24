@@ -41,19 +41,12 @@ pub struct SimGpu {
     pub lagging: bool,
     /// How it holds imagery (CB3).
     pub plan: SimPlan,
-    /// Of its GPU encodes — compressions in place since CB9 — how many in a
-    /// thousand are refused and stay RGBA8: a resource's fate is a hash of
-    /// it and its generation, so a run is reproducible.
+    /// Of its GPU encodes, how many in a thousand fall back to RGBA8: a
+    /// resource's fate is a hash of it and its generation, so a run is
+    /// reproducible.
     pub fallback_permille: u32,
     /// Its encodes that fell back, total.
     pub fallbacks: u64,
-    /// Compressions in place begun (CB9): the copy compressed, and what it
-    /// held before and will hold after. Finished at the next frame, the
-    /// compressed copy made in this one beside the RGBA8 one.
-    pub compressing: Vec<(ResourceId, Generation, Bytes, Bytes)>,
-    /// The compressions finished at the last frame, to acknowledge: the
-    /// copy, and what it was charged and holds now.
-    pub compressed: Vec<(ResourceId, Generation, Bytes, Bytes)>,
 }
 
 impl SimGpu {
@@ -73,8 +66,6 @@ impl SimGpu {
             plan: SimPlan::Rgba8,
             fallback_permille: 0,
             fallbacks: 0,
-            compressing: Vec::new(),
-            compressed: Vec::new(),
         }
     }
 }
@@ -109,27 +100,6 @@ impl SimGpu {
         d: &Decisions,
         frame: u64,
     ) -> Result<Vec<(ResourceId, Generation, Bytes)>, String> {
-        // The compressions begun last frame are done: the RGBA8 copy goes
-        // (or, one in a hundred under a fallback rate, the compressed one,
-        // the encode refused); a copy evicted meanwhile went whole.
-        self.compressed.clear();
-        for (r, g, from, to) in std::mem::take(&mut self.compressing) {
-            let refused = self.falls_back(r, g);
-            let Some(b) = self.drawable.get_mut(&r) else {
-                continue;
-            };
-            let now = if refused {
-                self.fallbacks += 1;
-                from
-            } else {
-                to
-            };
-            let charged = *b;
-            *b = now;
-            let c = class(r);
-            self.bytes[c] = self.bytes[c].minus(charged).plus(now);
-            self.compressed.push((r, g, charged, now));
-        }
         for (r, g) in &d.cancel {
             if self.pending.get(r) == Some(g) {
                 self.pending.remove(r);
@@ -201,19 +171,6 @@ impl SimGpu {
             self.bytes[c] = self.bytes[c].plus(b);
             self.uploads += 1;
             acks.push((*r, g, b));
-        }
-        // Compressions in place: the compressed copy made now, beside the
-        // RGBA8 one it replaces.
-        for (r, g) in &d.compress {
-            let Some(b) = self.drawable.get_mut(r) else {
-                return Err(format!("{r:?} compressed but not on the GPU"));
-            };
-            let to = cost_for(*r, self.plan).compressed;
-            let from = *b;
-            *b = from.plus(to);
-            let c = class(*r);
-            self.bytes[c] = self.bytes[c].plus(to);
-            self.compressing.push((*r, *g, from, to));
         }
         Ok(acks)
     }

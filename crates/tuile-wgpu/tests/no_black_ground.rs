@@ -28,8 +28,8 @@ mod support;
 use glam::{DVec3, Vec3};
 
 use support::{
-    ask_compress, drape, encoded_as_planned, exact, fallback, gpu, gpu_with, mesh, painted,
-    select, wearing, whole_drape, Scripted, PLANS,
+    drape, encoded_as_planned, exact, fallback, gpu, gpu_with, mesh, painted, select, wearing,
+    whole_drape, Scripted, PLANS,
 };
 use tuile_core::budget::{FrameDeadline, LayerId, ResourceId, UvTransform};
 use tuile_core::content::DecodedTileContent;
@@ -366,15 +366,10 @@ fn draped_ground_under_the_camera_is_never_black_under_every_plan() {
         ]);
         let eye = centre_of(grandparent) * 1.25;
         let mut pump = ContentPump::new(eye);
-        // Displayed at once, as RGBA8, whatever the plan: drawn whole.
+        // Two frames: under a block plan the second encode may wait for one.
+        pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
         pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
         assert_eq!(pump.pending_uploads(), 0, "{plan}: every upload landed");
-        let black = black_fraction_in_the_middle(&gpu, &mut pump, eye);
-        assert!(black < 0.01, "{plan}: {:.1}% black before compressing", black * 100.0);
-        // Then compressed in place, as the budget asks once they have
-        // lasted (CB9): the frame of the swap draws the ground too.
-        ask_compress(&mut stream, &[(here_r, 3), (grand_r, 4)]);
-        pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
         encoded_as_planned(plan, &gpu, 2);
 
         let black = black_fraction_in_the_middle(&gpu, &mut pump, eye);
@@ -475,8 +470,6 @@ fn compression_switched_under_a_session_keeps_the_ground_drawn() {
     ]);
     let mut pump = ContentPump::new(eye);
     pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
-    assert_eq!(formats(&gpu), [ImageryFormat::Rgba8], "displayed at once");
-    ask_compress(&mut stream, &[(worn, 2)]);
     pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
     assert_eq!(formats(&gpu), [compressed.target], "held compressed");
     ground_drawn(&gpu, &mut pump, "compressed");
@@ -494,17 +487,13 @@ fn compression_switched_under_a_session_keeps_the_ground_drawn() {
     assert_eq!(formats(&gpu), [compressed.target], "the old drape kept");
 
     // A tile decoded before the switch, still marked for the old form, then
-    // its replacement under the new plan: both RGBA8, nothing encoded — a
-    // compression asked of the late one finds no encoder and leaves it.
+    // its replacement under the new plan: both RGBA8, nothing encoded.
     stream
         .inbox
         .push_back(drape(here, 3, drape_of(rgba().planned(compressed), 1)));
     stream.inbox.push_back(wear(2));
     pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
     ground_drawn(&gpu, &mut pump, "the late tile");
-    ask_compress(&mut stream, &[(worn, 3)]);
-    pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
-    ground_drawn(&gpu, &mut pump, "the late tile, asked to compress");
     stream
         .inbox
         .push_back(drape(here, 4, drape_of(rgba().planned(off), 2)));
@@ -530,7 +519,6 @@ fn compression_switched_under_a_session_keeps_the_ground_drawn() {
     stream.inbox.push_back(wear(4));
     pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
     ground_drawn(&gpu, &mut pump, "a frame of the replacement");
-    ask_compress(&mut stream, &[(worn, 5)]);
     pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
     ground_drawn(&gpu, &mut pump, "on again");
     assert_eq!(pump.pending_uploads(), 0);

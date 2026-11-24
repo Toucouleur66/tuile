@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) lapoule.dev
 
-//! Imagery held block-compressed, through the pump (CB9: display at once,
-//! compress what lasts): a compressible drape uploaded and drawn as RGBA8
-//! at once; compressed in place when the budget asks, a tile at a time on
-//! the encode lane, every drape naming a tile rebound to its compressed
-//! copy; what the budget is told, and when.
+//! Imagery held block-compressed, through the pump: what the budget is told,
+//! what happens when an encode cannot be done, and how the encodes are paced.
 //!
 //! Compression is the consumer's choice and off by default; these scenarios
 //! are the consumer that chose it, against the one that did not.
@@ -18,9 +15,9 @@ mod support;
 
 use support::{drape, gpu_with, painted, whole_drape, Scripted, PLANS};
 use tuile_core::budget::{FrameDeadline, LayerId, ResourceId};
-use tuile_core::protocol::{ClientMessage, ServerMessage};
+use tuile_core::protocol::ClientMessage;
 
-const RED: &str = "the compression in place regressed";
+const RED: &str = "the encode lane regressed";
 use tuile_core::source::TileId;
 use tuile_core::texels::ImageryFormat;
 use tuile_wgpu::{ContentPump, GpuContext};
@@ -71,43 +68,67 @@ fn upload_one(gpu: &GpuContext, size: u32) -> (Scripted, ContentPump, ResourceId
     (stream, pump, ResourceId::drape(tile, LayerId(0), 4))
 }
 
-/// The bytes the pump said `resource` holds once compressed in place.
-fn compressed(stream: &Scripted, resource: ResourceId) -> Option<u64> {
-    stream
-        .sent
-        .lock()
-        .expect("sent")
-        .iter()
-        .find_map(|m| match m {
-            ClientMessage::Compressed {
-                resource: r, bytes, ..
-            } if *r == resource => Some(*bytes),
-            _ => None,
-        })
-}
-
-/// The budget asks for `resources` (each of generation `gen`) to be
-/// compressed in place.
-fn ask(stream: &mut Scripted, resources: &[(ResourceId, u64)]) {
-    stream.inbox.push_back(ServerMessage::Compress {
-        resources: resources
-            .iter()
-            .map(|(r, g)| (*r, tuile_core::budget::Generation(*g)))
-            .collect(),
-    });
-}
-
-/// Whether `gpu`'s plan compresses on the GPU.
-fn compresses(gpu: &GpuContext) -> bool {
-    gpu.imagery_plan().target != ImageryFormat::Rgba8
-}
-
-/// **Display at once:** a compressible drape is uploaded, acknowledged and
-/// held as RGBA8 in the frame it arrives — 349,524 bytes for a 256² tile
-/// with its chain, whatever the plan — and three of them go in one frame
-/// however small the encode lane: no upload waits for an encode.
+/// **The ack carries what the drape really holds**: a 256² tile with its
+/// chain is 349,524 bytes as RGBA8 and 87,408 as blocks — a quarter, read
+/// from what the pump told the budget, not computed here.
 #[test]
-fn a_compressible_drape_goes_up_as_rgba8_at_once() {
+fn the_ack_carries_the_block_size() {
+    for (plan, compression) in PLANS {
+        let Some(gpu) = gpu_with(compression) else {
+            continue;
+        };
+        let (stream, _held, resource) = upload_one(&gpu, 256);
+        let bytes = acked(&stream, resource).expect("acknowledged");
+        let want = match gpu.imagery_plan().target {
+            ImageryFormat::Rgba8 => 349_524,
+            ImageryFormat::Bc7 | ImageryFormat::Astc4x4 => 87_408,
+        };
+        assert_eq!(bytes, want, "{plan}");
+        let (count, live) = gpu.imagery.lock().expect("imagery").live();
+        assert_eq!(count, 1, "{plan}");
+        assert_eq!(
+            live as u64, want,
+            "{plan}: the GPU holds what was acknowledged"
+        );
+    }
+}
+
+/// **An encode that cannot be done uploads RGBA8, and says so.** 250 is not
+/// whole blocks, so the encoder refuses the tile: it is held, drawn and
+/// acknowledged as RGBA8 — never missing, never charged a quarter of what it
+/// holds.
+#[test]
+fn a_refused_encode_falls_back_to_rgba8() {
+    for (plan, compression) in PLANS {
+        let Some(gpu) = gpu_with(compression) else {
+            continue;
+        };
+        let (stream, _held, resource) = upload_one(&gpu, 250);
+        let rgba8 = tuile_core::budget::cost::drape_cost(
+            250,
+            250,
+            tuile_core::budget::cost::TextureFormat::Rgba8,
+        )
+        .gpu
+        .0;
+        assert_eq!(acked(&stream, resource), Some(rgba8), "{plan}");
+        let formats = gpu.imagery.lock().expect("imagery").live_by_format();
+        assert_eq!(
+            formats,
+            vec![(ImageryFormat::Rgba8, rgba8 as usize)],
+            "{plan}"
+        );
+        if let Some(stats) = gpu.imagery_encode_stats() {
+            assert_eq!((stats.encoded, stats.fell_back), (0, 1), "{plan}");
+        }
+    }
+}
+
+/// **The encodes are paced by their own share**: with a share too small for
+/// one tile, a frame takes its first encode and leaves the others queued, one
+/// a frame; without an encoder — Off — the same frame takes all three.
+#[test]
+fn the_encodes_take_one_frame_each_under_a_tiny_share() {
     for (plan, compression) in PLANS {
         let Some(gpu) = gpu_with(compression) else {
             continue;
@@ -122,96 +143,177 @@ fn a_compressible_drape_goes_up_as_rgba8_at_once() {
             drape(*t, i as u64 + 1, whole_drape(*t, 4, texture))
         }));
         let mut pump = ContentPump::new(glam::DVec3::ZERO);
-        assert_eq!(pump.pump(&mut stream, &gpu, one_tile()), 3, "{plan}: {RED}");
-        for t in tiles {
-            let r = ResourceId::drape(t, LayerId(0), 4);
-            assert_eq!(acked(&stream, r), Some(349_524), "{plan}: acknowledged at once");
+        let per_frame: Vec<usize> = (0..3)
+            .map(|_| pump.pump(&mut stream, &gpu, one_tile()))
+            .collect();
+        let want = match gpu.imagery_plan().target {
+            ImageryFormat::Rgba8 => vec![3, 0, 0],
+            _ => vec![1, 1, 1],
+        };
+        assert_eq!(per_frame, want, "{plan}");
+        assert_eq!(pump.pending_uploads(), 0, "{plan}: nothing waits for ever");
+    }
+}
+
+/// A flat mesh over `tile`.
+fn flat(tile: TileId) -> tuile_core::content::DecodedTileContent {
+    let (z, x, y) = tile.terrain_coord();
+    let rect = tuile_terrain::GeographicTilingScheme::default()
+        .tile_rect(tuile_terrain::TileCoord::new(z, x, y));
+    tuile_terrain::fill_content(&rect, [Some(0.0); 4], 0.0)
+}
+
+/// **The encode pacing never splits a swap group.** A drape takes the
+/// frame's first encode; behind it, a tile's mesh and its drape form a swap
+/// group. The drape does not fit the encodes' share — and the mesh, which
+/// encodes nothing, waits with it rather than be drawn bare. Both go the
+/// next frame, together. Off: everything goes at once.
+#[test]
+fn encode_pacing_never_splits_a_swap_group() {
+    use support::{mesh, select};
+    use tuile_core::budget::{Bytes, SwapGroup, UploadPlan};
+    use tuile_core::protocol::ServerMessage;
+    for (plan, compression) in PLANS {
+        let Some(gpu) = gpu_with(compression) else {
+            continue;
+        };
+        let (first, paired) = (TileId::from_terrain(4, 3, 2), TileId::from_terrain(4, 4, 2));
+        let texture = |seed: u8| painted(&gpu, 256, 256, move |x, _| [x as u8, seed, 50, 255]);
+        let lead = ResourceId::drape(first, LayerId(0), 4);
+        let (m, d) = (
+            ResourceId::Mesh(paired),
+            ResourceId::drape(paired, LayerId(0), 4),
+        );
+        let mut members = vec![m, d];
+        members.sort_unstable();
+        let mut selected = select(Vec::new(), 1);
+        if let ServerMessage::Select { plan, .. } = &mut selected {
+            *plan = UploadPlan {
+                items: vec![lead, m, d],
+                bytes: Bytes::ZERO,
+                encode_blocks: 0,
+                groups: vec![SwapGroup { members }],
+            };
         }
-        assert_eq!(pump.acks_waiting_for_the_gpu(), 0, "{plan}");
+        let mut stream = Scripted::new([
+            drape(first, 1, whole_drape(first, 4, texture(10))),
+            mesh(paired, 2, flat(paired)),
+            drape(paired, 3, whole_drape(paired, 4, texture(20))),
+            selected,
+        ]);
+        let mut pump = ContentPump::new(glam::DVec3::ZERO);
+        pump.pump(&mut stream, &gpu, one_tile());
+        acks_landed(&mut pump, &mut stream, &gpu);
+        let first_frame = (acked(&stream, m).is_some(), acked(&stream, d).is_some());
+        let uploads = pump.last_uploads();
+        if gpu.imagery_plan().target == ImageryFormat::Rgba8 {
+            assert_eq!(first_frame, (true, true), "{plan}");
+            assert_eq!(uploads.deferred_encode, 0, "{plan}");
+            continue;
+        }
+        assert!(
+            acked(&stream, lead).is_some(),
+            "{plan}: the first encode goes"
+        );
+        assert_eq!(
+            first_frame,
+            (false, false),
+            "{plan}: the group was split — its mesh went without its drape"
+        );
+        assert_eq!(uploads.deferred_encode, 2, "{plan}: the whole group waits");
+        assert_eq!(uploads.deferred, 0, "{plan}: not the byte lane's");
+        pump.pump(&mut stream, &gpu, one_tile());
+        acks_landed(&mut pump, &mut stream, &gpu);
+        assert!(
+            acked(&stream, m).is_some() && acked(&stream, d).is_some(),
+            "{plan}: the group goes whole the next frame"
+        );
+        assert_eq!(pump.pending_uploads(), 0, "{plan}");
+    }
+}
+
+/// **A frame's encodes are counted, and its deferrals by lane.** Three
+/// drapes under a share too small for one tile: the first frame encodes one
+/// 256² tile — 5,463 blocks, mip chain included — and defers two to the
+/// encode lane, none to the byte lane. Off encodes and defers nothing.
+#[test]
+fn a_frames_encodes_and_deferrals_are_counted_by_lane() {
+    for (plan, compression) in PLANS {
+        let Some(gpu) = gpu_with(compression) else {
+            continue;
+        };
+        let tiles = [
+            TileId::from_terrain(4, 3, 2),
+            TileId::from_terrain(4, 4, 2),
+            TileId::from_terrain(4, 5, 2),
+        ];
+        let mut stream = Scripted::new(tiles.iter().enumerate().map(|(i, t)| {
+            let texture = painted(&gpu, 256, 256, |x, _| [x as u8, 100, 50, 255]);
+            drape(*t, i as u64 + 1, whole_drape(*t, 4, texture))
+        }));
+        let mut pump = ContentPump::new(glam::DVec3::ZERO);
+        pump.pump(&mut stream, &gpu, one_tile());
         let u = pump.last_uploads();
-        assert_eq!((u.encoded_tiles, u.deferred_encode), (0, 0), "{plan}");
-        let formats = gpu.imagery.lock().expect("imagery").live_by_format();
-        assert_eq!(formats, vec![(ImageryFormat::Rgba8, 3 * 349_524)], "{plan}");
+        let want = match gpu.imagery_plan().target {
+            ImageryFormat::Rgba8 => (3, 0, 0, 0, 0),
+            _ => (1, 0, 2, 1, 5_463),
+        };
+        assert_eq!(
+            (
+                u.uploaded,
+                u.deferred,
+                u.deferred_encode,
+                u.encoded_tiles,
+                u.encode_blocks
+            ),
+            want,
+            "{plan}"
+        );
+        assert_eq!(u.encode_gpu_micros > 0, want.4 > 0, "{plan}");
+        let totals = pump.totals();
+        assert_eq!(
+            (totals.deferred_encode, totals.encode_blocks),
+            (u64::from(want.2), want.4),
+            "{plan}"
+        );
     }
 }
 
-/// **Compressed in place when asked:** the drape's texture is read on the
-/// GPU into a block texture, which replaces it in the pool; the drape is
-/// acknowledged at a quarter — 87,408 bytes — once the GPU has finished,
-/// not before; the GPU then holds only the blocks. Off has no encoder: the
-/// drape stays as it is and says so.
+/// **A GPU-encoded acknowledgement waits for the GPU** (CB4): until the
+/// GPU has run the encode, the encoder's RGBA8 is held beside the blocks,
+/// and the budget must go on charging both. So the pump that uploads a
+/// drape it encodes does not acknowledge it; once the frame is submitted
+/// and the GPU has finished, the next acknowledgement round does. Off is
+/// acknowledged in the frame that uploads it, as always.
 #[test]
-fn a_compression_asked_replaces_the_texture_and_acks_a_quarter() {
+fn a_gpu_encoded_ack_waits_for_the_gpu() {
     for (plan, compression) in PLANS {
         let Some(gpu) = gpu_with(compression) else {
             continue;
         };
-        let (mut stream, mut pump, resource) = upload_one(&gpu, 256);
-        ask(&mut stream, &[(resource, 1)]);
-        pump.pump(&mut stream, &gpu, one_tile());
-        let _ = pump.resolve(&gpu);
-        if compresses(&gpu) {
-            assert_eq!(
-                compressed(&stream, resource),
-                None,
-                "{plan}: acknowledged before the GPU ran the encode"
-            );
-            assert_eq!(pump.acks_waiting_for_the_gpu(), 1, "{plan}");
-        }
+        let tile = TileId::from_terrain(4, 3, 2);
+        let texture = painted(&gpu, 256, 256, |x, y| [x as u8, 90, y as u8, 255]);
+        let mut stream = Scripted::new([drape(tile, 1, whole_drape(tile, 4, texture))]);
+        let mut pump = ContentPump::new(glam::DVec3::ZERO);
+        pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
+        let resource = ResourceId::drape(tile, LayerId(0), 4);
+        let encoded = gpu.imagery_plan().target != ImageryFormat::Rgba8;
+        assert_eq!(
+            acked(&stream, resource).is_some(),
+            !encoded,
+            "{plan}: acknowledged before the GPU ran its encode"
+        );
+        assert_eq!(
+            pump.acks_waiting_for_the_gpu(),
+            usize::from(encoded),
+            "{plan}"
+        );
         acks_landed(&mut pump, &mut stream, &gpu);
-        let want = if compresses(&gpu) { 87_408 } else { 349_524 };
-        assert_eq!(compressed(&stream, resource), Some(want), "{plan}: {RED}");
-        let (count, live) = gpu.imagery.lock().expect("imagery").live();
-        assert_eq!((count, live as u64), (1, want), "{plan}");
-        assert_eq!(pump.held_bytes()[tuile_core::budget::Class::Drape], want, "{plan}");
-    }
-}
-
-/// **A tile the encoder does not take stays RGBA8:** 250² is not whole
-/// blocks — never compressible, never missing; asked anyway, the drape is
-/// acknowledged at what it holds.
-#[test]
-fn a_tile_that_cannot_be_compressed_stays_rgba8() {
-    for (plan, compression) in PLANS {
-        let Some(gpu) = gpu_with(compression) else {
-            continue;
-        };
-        let (mut stream, mut pump, resource) = upload_one(&gpu, 250);
-        let rgba8 = tuile_core::budget::cost::drape_cost(
-            250,
-            250,
-            tuile_core::budget::cost::TextureFormat::Rgba8,
-        )
-        .gpu
-        .0;
-        assert_eq!(acked(&stream, resource), Some(rgba8), "{plan}");
-        ask(&mut stream, &[(resource, 1)]);
-        pump.pump(&mut stream, &gpu, one_tile());
-        acks_landed(&mut pump, &mut stream, &gpu);
-        assert_eq!(compressed(&stream, resource), Some(rgba8), "{plan}");
-        let formats = gpu.imagery.lock().expect("imagery").live_by_format();
-        assert_eq!(formats, vec![(ImageryFormat::Rgba8, rgba8 as usize)], "{plan}");
-    }
-}
-
-/// **A compression of a drape no longer held is dropped:** evicted, or of
-/// another generation, nothing is encoded and nothing acknowledged.
-#[test]
-fn a_compression_of_a_drape_gone_is_dropped() {
-    for (plan, compression) in PLANS {
-        let Some(gpu) = gpu_with(compression) else {
-            continue;
-        };
-        let (mut stream, mut pump, resource) = upload_one(&gpu, 256);
-        ask(&mut stream, &[(resource, 2)]);
-        stream.inbox.push_back(ServerMessage::Evict {
-            resources: vec![resource],
-        });
-        ask(&mut stream, &[(resource, 1)]);
-        pump.pump(&mut stream, &gpu, one_tile());
-        acks_landed(&mut pump, &mut stream, &gpu);
-        assert_eq!(compressed(&stream, resource), None, "{plan}");
-        assert_eq!(pump.last_uploads().encoded_tiles, 0, "{plan}");
+        assert!(
+            acked(&stream, resource).is_some(),
+            "{plan}: never acknowledged"
+        );
+        assert_eq!(pump.acks_waiting_for_the_gpu(), 0, "{plan}");
     }
 }
 
@@ -263,12 +365,12 @@ fn mosaic(gpu: &GpuContext, tile: TileId, n: u32, seed: u8) -> tuile_core::conte
     d
 }
 
-/// **Compressed over frames, a share at a time; drawn throughout.** A
-/// drape of four tiles at a one-tile share: a tile a frame, each swapped in
-/// as soon as it is made — the drape is never without a texture — and
-/// acknowledged once, after its last. Off acknowledges it at once.
+/// **A drape of many tiles encodes over many frames, a share at a time**
+/// (CB6). Four tiles at a one-tile share: one tile a frame, four frames,
+/// the drape acknowledged once, after the last — and until then the drape
+/// it replaces stays bound. Off uploads it in one frame.
 #[test]
-fn a_four_tile_drape_compresses_a_tile_a_frame() {
+fn a_four_tile_drape_at_a_one_tile_share_encodes_over_four_frames() {
     for (plan, compression) in PLANS {
         let Some(gpu) = gpu_with(compression) else {
             continue;
@@ -277,19 +379,19 @@ fn a_four_tile_drape_compresses_a_tile_a_frame() {
         let resource = ResourceId::drape(tile, LayerId(0), 4);
         let mut stream = Scripted::new([drape(tile, 1, mosaic(&gpu, tile, 4, 7))]);
         let mut pump = ContentPump::new(glam::DVec3::ZERO);
-        pump.pump(&mut stream, &gpu, one_tile());
-        acks_landed(&mut pump, &mut stream, &gpu);
-        assert!(acked(&stream, resource).is_some(), "{plan}: uploaded at once");
-        ask(&mut stream, &[(resource, 1)]);
+        let mut frames = 0;
         let mut per_frame = Vec::new();
-        for _ in 0..8 {
+        while pump.pending_uploads() > 0 || frames == 0 {
             pump.pump(&mut stream, &gpu, one_tile());
             per_frame.push(pump.last_uploads().encoded_tiles);
             let _ = pump.resolve(&gpu);
-            let (count, _) = gpu.imagery.lock().expect("imagery").live();
-            assert_eq!(count, 4, "{plan}: every tile held, old or new");
-            if compressed(&stream, resource).is_none() {
-                acks_landed(&mut pump, &mut stream, &gpu);
+            frames += 1;
+            assert!(frames < 20, "{plan}: never landed");
+            if pump.pending_uploads() > 0 {
+                assert!(
+                    acked(&stream, resource).is_none(),
+                    "{plan}: acknowledged before its last tile"
+                );
             }
         }
         acks_landed(&mut pump, &mut stream, &gpu);
@@ -298,63 +400,91 @@ fn a_four_tile_drape_compresses_a_tile_a_frame() {
             .lock()
             .expect("sent")
             .iter()
-            .filter(|m| matches!(m, ClientMessage::Compressed { resource: r, .. } if *r == resource))
+            .filter(|m| matches!(m, ClientMessage::Ack { resource: r, .. } if *r == resource))
             .count();
         assert_eq!(acks, 1, "{plan}: acknowledged once");
-        if compresses(&gpu) {
-            assert!(per_frame.iter().all(|n| *n <= 2), "{plan}: {per_frame:?}");
-            assert_eq!(per_frame.iter().sum::<u32>(), 4, "{plan}: each tile once: {RED}");
-            let formats = gpu.imagery.lock().expect("imagery").live_by_format();
-            assert_eq!(formats.len(), 1, "{plan}: {formats:?}");
-            assert_eq!(formats[0].1, 4 * 87_408, "{plan}");
+        if gpu.imagery_plan().target == ImageryFormat::Rgba8 {
+            assert_eq!(frames, 1, "{plan}");
         } else {
-            assert_eq!(per_frame.iter().sum::<u32>(), 0, "{plan}");
+            assert!(frames >= 4, "{plan}: {frames} frames, {per_frame:?}: {RED}");
+            assert!(per_frame.iter().all(|n| *n <= 2), "{plan}: {per_frame:?}");
+            assert_eq!(per_frame.iter().sum::<u32>(), 4, "{plan}: each tile once");
         }
     }
 }
 
-/// **A tile shared by two drapes is compressed once, and both wear it.**
-/// Two drapes over neighbouring tiles name one imagery tile: compressing
-/// the first rebinds the second to the compressed copy — the RGBA8 one
-/// let go — and compressing the second encodes nothing more.
+/// **No frame encodes more than its share and one tile** (CB6): three
+/// drapes of four tiles queued at once, a one-tile share — never two tiles
+/// in a frame, whatever is queued; every tile encoded once in the end.
 #[test]
-fn a_shared_tile_is_compressed_once_for_every_drape() {
+fn no_frame_encodes_more_than_its_share_and_one_tile() {
     for (plan, compression) in PLANS {
         let Some(gpu) = gpu_with(compression) else {
             continue;
         };
-        if !compresses(&gpu) {
+        if gpu.imagery_plan().target == ImageryFormat::Rgba8 {
             continue;
         }
-        let (a, b) = (TileId::from_terrain(4, 3, 2), TileId::from_terrain(4, 4, 2));
-        let shared = std::sync::Arc::new(painted(&gpu, 256, 256, |x, y| [x as u8, y as u8, 3, 255]));
-        let over = |t: TileId| {
-            let mut d = whole_drape(t, 4, painted(&gpu, 4, 4, |_, _| [0; 4]));
-            d.tiles[0].texture = std::sync::Arc::clone(&shared);
-            d.tiles[0].coord.x = 99;
-            d
-        };
-        let (ra, rb) = (
-            ResourceId::drape(a, LayerId(0), 4),
-            ResourceId::drape(b, LayerId(0), 4),
+        let tiles = [
+            TileId::from_terrain(4, 3, 2),
+            TileId::from_terrain(4, 4, 2),
+            TileId::from_terrain(4, 5, 2),
+        ];
+        let mut stream = Scripted::new(
+            tiles
+                .iter()
+                .enumerate()
+                .map(|(i, t)| drape(*t, i as u64 + 1, mosaic(&gpu, *t, 4, i as u8 * 40))),
         );
-        let mut stream = Scripted::new([drape(a, 1, over(a)), drape(b, 2, over(b))]);
         let mut pump = ContentPump::new(glam::DVec3::ZERO);
-        pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
-        acks_landed(&mut pump, &mut stream, &gpu);
-        ask(&mut stream, &[(ra, 1)]);
-        pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
-        let _ = pump.resolve(&gpu);
-        acks_landed(&mut pump, &mut stream, &gpu);
-        let (count, live) = gpu.imagery.lock().expect("imagery").live();
-        assert_eq!((count, live), (1, 87_408), "{plan}: one compressed copy");
-        ask(&mut stream, &[(rb, 2)]);
-        pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
-        acks_landed(&mut pump, &mut stream, &gpu);
-        assert_eq!(pump.last_uploads().encoded_tiles, 0, "{plan}: nothing more");
-        assert_eq!(compressed(&stream, rb), Some(87_408), "{plan}");
-        let stats = gpu.imagery_encode_stats().expect("an encoder");
-        assert_eq!(stats.encoded, 1, "{plan}");
+        let mut per_frame = Vec::new();
+        for _ in 0..40 {
+            pump.pump(&mut stream, &gpu, one_tile());
+            per_frame.push(pump.last_uploads().encoded_tiles);
+            let _ = pump.resolve(&gpu);
+            if pump.pending_uploads() == 0 {
+                break;
+            }
+        }
+        assert_eq!(pump.pending_uploads(), 0, "{plan}: {per_frame:?}");
+        assert!(
+            per_frame.iter().all(|n| *n <= 2),
+            "{plan}: a frame encoded more than its share and one tile: {per_frame:?} {RED}"
+        );
+        assert_eq!(per_frame.iter().sum::<u32>(), 12, "{plan}: {per_frame:?}");
     }
 }
 
+/// **A mesh's own imagery resumes as a drape's does** (CB6, found by the
+/// upload bench: two tiles in 400 frames). A mesh wearing two tiles of its
+/// own at a one-tile share: a tile a frame, held for it between frames, and
+/// the mesh lands — never re-encoding its first tile for ever.
+#[test]
+fn a_meshs_own_imagery_resumes_across_frames() {
+    use support::mesh;
+    for (plan, compression) in PLANS {
+        let Some(gpu) = gpu_with(compression) else {
+            continue;
+        };
+        let tile = TileId::from_terrain(4, 3, 2);
+        let mut content = flat(tile);
+        content.imagery = mosaic(&gpu, tile, 2, 11).tiles;
+        let mut stream = Scripted::new([mesh(tile, 1, content)]);
+        let mut pump = ContentPump::new(glam::DVec3::ZERO);
+        let mut frames = 0;
+        let mut encoded = 0;
+        while pump.pending_uploads() > 0 || frames == 0 {
+            pump.pump(&mut stream, &gpu, one_tile());
+            encoded += pump.last_uploads().encoded_tiles;
+            let _ = pump.resolve(&gpu);
+            frames += 1;
+            if frames > 12 {
+                break;
+            }
+        }
+        assert_eq!(pump.pending_uploads(), 0, "{plan}: never landed: {RED}");
+        if gpu.imagery_plan().target != ImageryFormat::Rgba8 {
+            assert_eq!(encoded, 2, "{plan}: each tile once");
+        }
+    }
+}

@@ -79,9 +79,7 @@ impl SceneState {
                     self.resident.remove(r);
                 }
             }
-            ServerMessage::Error { .. }
-            | ServerMessage::Priming(_)
-            | ServerMessage::Compress { .. } => {}
+            ServerMessage::Error { .. } | ServerMessage::Priming(_) => {}
         }
     }
 
@@ -291,19 +289,6 @@ pub async fn drive_until_complete<S: GeometryStream + Unpin>(
                 for r in resources {
                     held.remove(&r);
                     forget(&mut meshes, &mut drapes, r);
-                }
-            }
-            ServerMessage::Compress { resources } => {
-                // Held decoded, never compressed: each is told so, at what
-                // it holds, and is not asked again (CB9).
-                for (r, g) in resources {
-                    if let Some(d) = drapes.get(&r).filter(|_| held.get(&r) == Some(&g)) {
-                        stream.send(ClientMessage::Compressed {
-                            resource: r,
-                            gen: g,
-                            bytes: d.cost().gpu.0,
-                        })?;
-                    }
                 }
             }
             ServerMessage::Error { resource, message } => errors.push((resource, message)),
