@@ -395,8 +395,12 @@ pub(crate) struct Sky {
     params: AtmosphereParams,
     look: SkyLook,
     on: bool,
+    /// What the light and the sky-view on the GPU were last made for: the
+    /// lights, the view, the air and the look. A frame asking for the same
+    /// again finds them made.
+    made_for: Option<(Bodies, SkyView, AtmosphereParams, SkyLook)>,
     /// How many times the light was worked out, and the sky-view made:
-    /// once a frame each.
+    /// once a frame each, unless nothing they are made of changed.
     pub(crate) lights: u64,
     pub(crate) views: u64,
 }
@@ -418,6 +422,7 @@ impl Sky {
             params: AtmosphereParams::default(),
             look: SkyLook::default(),
             on: false,
+            made_for: None,
             lights: 0,
             views: 0,
         }
@@ -433,6 +438,7 @@ impl Sky {
     }
 
     pub(crate) fn off(&mut self, queue: &wgpu::Queue) {
+        self.made_for = None;
         if self.on {
             self.on = false;
             queue.write_buffer(
@@ -451,6 +457,14 @@ impl Sky {
     pub(crate) fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &SkyFrame) {
         let bodies = frame.bodies;
         let frame = &frame.view;
+        // The same lights, eye, view, air and look as the frame before: the
+        // uniform, the light and the sky-view on the GPU are already this
+        // frame's, bit for bit. A function of its inputs, made again only
+        // when one of them moves.
+        let made_for = Some((bodies, *frame, self.params, self.look));
+        if self.on && self.made_for == made_for {
+            return;
+        }
         let to_sun = bodies.to_sun;
         if !to_sun.is_finite() || !frame.eye.is_finite() {
             self.off(queue);
@@ -510,6 +524,7 @@ impl Sky {
         self.lights += 1;
         self.views += 1;
         self.on = true;
+        self.made_for = made_for;
     }
 }
 

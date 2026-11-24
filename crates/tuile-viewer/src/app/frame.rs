@@ -32,12 +32,20 @@ impl App {
     /// it. Skipping the frame entirely is the workaround the ecosystem settled
     /// on (the wgpu examples carry the same guard).
     pub(super) fn render(&mut self) {
+        self.render_as(false);
+    }
+
+    /// [`Self::render`], drawing the frame even when it would show the
+    /// picture already on screen when `force` says so: a headless run that
+    /// asks for a frame and reads it back.
+    pub(super) fn render_as(&mut self, force: bool) {
         // Covered on a desktop, or not in front on a phone — where the system
         // ends an application that uses the GPU from the background.
         if self.occluded || !self.lifecycle.may_draw() {
             return;
         }
         let dt = self.start_the_frame();
+        let after_a_frame = self.presented_last;
         let began = web_time::Instant::now();
         let uploads = tuile_core::metrics::metrics().uploads.get();
         // Before anything reads the viewport: the bar decides how much of
@@ -48,22 +56,49 @@ impl App {
             return;
         }
         self.take_this_frames_share_of_the_stream();
-        self.upload_the_view();
         // After the eye has moved for this frame — the host's drive, the
         // ease, a glide, a tape — so the packing origin is where it is drawn.
         self.upload_the_world_overlays();
         let indicator = self.the_loading_indicator();
         self.upload_the_control(indicator);
-        let drew = self.draw_and_present();
+        // The instant this frame is lit for, and its sun: read whether or
+        // not it is drawn, since the view published and the tape read them.
+        self.light_the_frame();
+        // Drawn only when the picture is not the one on screen: everything
+        // a picture is made of has been brought up to date above, so the
+        // comparison is of this frame's inputs against those of the
+        // picture shown. When they agree, nothing is encoded, submitted or
+        // presented, and the surface keeps its image.
+        let picture = self.picture_inputs();
+        let draw = force || self.records_every_frame() || self.repaint.due(&picture);
+        let drew = if draw {
+            self.upload_the_view();
+            let drew = self.draw_and_present();
+            if drew.is_some() {
+                self.repaint.shown(picture);
+            }
+            drew
+        } else {
+            None
+        };
+        self.presented_last = drew.is_some();
         self.develop_the_snapshots();
         self.note_what_needs_frames(indicator);
         let Some((rendered, resolution, old_imagery)) = drew else {
+            // Nothing new on screen: the once-a-second line still speaks,
+            // of the picture that is there.
+            if !draw {
+                if let Some(resolution) = self.resolution {
+                    self.report_once_a_second(self.drawn.0, resolution);
+                }
+            }
             return;
         };
         #[cfg(feature = "control")]
         {
             self.presented += 1;
         }
+        self.count_the_frame(dt, after_a_frame);
         self.read_the_eyes();
         self.resolution = Some(resolution);
         self.note_the_turn_over(old_imagery);
@@ -82,13 +117,60 @@ impl App {
         // work took, how far apart frames were, what one uploaded. Through
         // the facade, into the endpoint and the push alike.
         metrics::histogram!("tuile_frame_time_seconds").record(began.elapsed().as_secs_f64());
-        metrics::histogram!("tuile_frame_interval_seconds").record(dt.as_secs_f64());
         metrics::histogram!("tuile_frame_uploads").record(
             tuile_core::metrics::metrics()
                 .uploads
                 .get()
                 .saturating_sub(uploads) as f64,
         );
+    }
+
+    /// Whether every frame is drawn, changed or not: a session being
+    /// recorded or traced keeps a picture of each, and a tape flown or held
+    /// moves the camera one recorded frame at a time.
+    pub(super) fn records_every_frame(&self) -> bool {
+        self.recording.tape.is_some()
+            || self.recording.trace.is_some()
+            || self.recording.replay.is_some()
+            || self.shutter.busy()
+    }
+
+    /// Whether the session still has work to do for the view: the server
+    /// has not said the view converged (I3), or what it delivered waits for
+    /// an upload. While it has, every turn looks for what lands.
+    pub(super) fn loading_now(&self) -> bool {
+        self.session.is_some()
+            && self
+                .active
+                .as_ref()
+                .is_some_and(|a| !a.pump.converged || a.pump.pending_uploads() > 0)
+    }
+
+    /// What this frame's picture would be drawn from: see
+    /// [`super::demand::Picture`].
+    fn picture_inputs(&self) -> super::demand::Picture {
+        let picture = self.picture();
+        let atmosphere = self.atmosphere;
+        super::demand::Picture {
+            eyes: self.eyes(),
+            instant: self.instant,
+            settings: super::demand::Settings {
+                size: self.active.as_ref().map_or((0, 0), |a| a.size),
+                picture: (picture.x, picture.y, picture.width, picture.height),
+                clearance: self.controller.height_above_ground(),
+                content: self.active.as_ref().map_or(0, |a| a.pump.revision()),
+                overlays: self.overlays_made_of.unwrap_or(0),
+                shapes: self.shapes_revision,
+                atmosphere,
+                air: self.air,
+                air_shown: self.nav.atmosphere_enabled(),
+                view: (
+                    self.views.diagnostic,
+                    self.tile_labels.forced,
+                    self.views.wireframe,
+                ),
+            },
+        }
     }
 
     /// Closes the previous frame's clock and opens this one's.
@@ -98,11 +180,20 @@ impl App {
     fn start_the_frame(&mut self) -> std::time::Duration {
         let dt = self.pacing.last_frame.elapsed();
         self.pacing.last_frame = web_time::Instant::now();
+        dt
+    }
+
+    /// Counts a frame that reached the screen, `dt` after the top of the
+    /// turn before. The interval is a frame's only when that turn presented
+    /// too: the time a still view spent showing one picture is no stutter.
+    fn count_the_frame(&mut self, dt: std::time::Duration, after_a_frame: bool) {
         let m = tuile_core::metrics::metrics();
         m.frames.inc();
-        m.frame_seconds.record(dt);
-        m.worst_frame_millis.record(dt.as_secs_f64() * 1000.0);
-        dt
+        if after_a_frame {
+            m.frame_seconds.record(dt);
+            m.worst_frame_millis.record(dt.as_secs_f64() * 1000.0);
+            metrics::histogram!("tuile_frame_interval_seconds").record(dt.as_secs_f64());
+        }
     }
 
     /// Gives an embedding application the frame before it is prepared, and
@@ -199,8 +290,10 @@ impl App {
             if let Err(e) = world.set_meshes(&active.gpu, &meshes, eye, None) {
                 tracing::warn!("the host's overlays were refused, keeping the last set: {e}");
             }
+            self.shapes_revision += 1;
         } else if !world.is_empty() && super::overlays_need_rebase(eye, world.origin()) {
             world.rebase(&active.gpu, eye);
+            self.shapes_revision += 1;
         }
     }
 
@@ -260,12 +353,22 @@ impl App {
         // camera, take this frame's share of uploads, rebase. Freezing simply
         // withholds the camera, which is what makes `F` a test of the renderer
         // against a fixed selection.
-        let uploaded = if self.views.freeze {
-            active.pump.pump(&mut session.stream, &active.gpu, deadline)
-        } else {
+        // The camera goes to the server when it moved, while the view has
+        // work left, and once a heartbeat otherwise: a still, converged
+        // view's step answers nothing new, and each one costs the server a
+        // traversal and a decision (`demand::ViewSends`).
+        let now = web_time::Instant::now();
+        let loading = !active.pump.converged || active.pump.pending_uploads() > 0;
+        let send = !self.views.freeze && self.view_sends.due(&views, loading, now);
+        let uploaded = if send {
+            self.view_sends.sent(&views, now);
             active
                 .pump
                 .advance(&mut session.stream, &active.gpu, &views, origin, deadline)
+        } else {
+            let uploaded = active.pump.pump(&mut session.stream, &active.gpu, deadline);
+            active.pump.rebase(&active.gpu.queue, origin);
+            uploaded
         };
         self.uploaded = uploaded;
         self.stats.uploads += uploaded as u64;
@@ -274,28 +377,16 @@ impl App {
         // former than the latter once the view settles.
         self.stats.evictions +=
             (before + uploaded).saturating_sub(active.pump.prepared_count()) as u64;
-        if self.views.freeze {
-            active.pump.rebase(&active.gpu.queue, origin);
-        }
     }
 
     /// Uploads the view matrix, the sun and the air — the first eye's, which
     /// is a window's only one.
     fn upload_the_view(&mut self) {
-        // The frame's instant, from the scene's clock — after the host, which
-        // may have set it. The wall a replayed frame was drawn at, in a
-        // replay.
-        let wall = self.frame_wall();
-        self.instant = self.atmosphere.instant(wall);
+        let wall = self.recording.wall;
         let sky = self.sky_view();
         let mut atmosphere = self.atmosphere;
         // The atmosphere checkbox, over what the host asked.
         atmosphere.enabled &= self.nav.atmosphere_enabled();
-        // The flat light's sun, for the path without an atmosphere, is the
-        // atmosphere's own.
-        self.sun = tuile_atmosphere::Sun::from_direction(
-            atmosphere.lights.at(self.instant, sky.eye).to_sun,
-        );
         let views = self.view_uniforms();
         let Some(active) = self.active.as_mut() else {
             return;
@@ -306,6 +397,20 @@ impl App {
         active
             .renderer
             .draw_atmosphere(&active.gpu, &atmosphere, &sky, wall);
+    }
+
+    /// The frame's instant, from the scene's clock — after the host, which
+    /// may have set it; the wall a replayed frame was drawn at, in a replay —
+    /// and the sun it puts in the sky.
+    fn light_the_frame(&mut self) {
+        let wall = self.frame_wall();
+        self.instant = self.atmosphere.instant(wall);
+        // The flat light's sun, for the path without an atmosphere, is the
+        // atmosphere's own.
+        let eye = self.controller.camera.position;
+        self.sun = tuile_atmosphere::Sun::from_direction(
+            self.atmosphere.lights.at(self.instant, eye).to_sun,
+        );
     }
 
     /// What the camera sees, for the sky: the first eye.
@@ -433,9 +538,6 @@ impl App {
                 color: v.color,
             }));
         }
-        active
-            .overlay
-            .set_geometry(&active.gpu, &nav_mesh, active.size);
         // And their text over their backgrounds: the bar's line, the
         // budget window's table.
         let masks: Vec<tuile_wgpu::OverlayMask<'_>> = bar
@@ -451,9 +553,27 @@ impl App {
                 color: label.color,
             })
             .collect();
-        active.overlay.set_masks(&active.gpu, &masks);
         // The budget panel's layer on top, after all of that.
         let top = self.budget_window.layout().map(|p| &p.on_top);
+        // Uploaded only when made of something else than what is on the
+        // GPU: a still frame's overlays are the last frame's, and writing
+        // them again would be GPU work for an identical picture. What they
+        // are made of is part of what the picture is (`demand::Settings`).
+        let made_of = overlays_digest(
+            active.size,
+            &nav_mesh,
+            &masks,
+            top.map_or(&[], |t| t.mesh.as_slice()),
+            top.map_or(&[], |t| t.labels.as_slice()),
+        );
+        if self.overlays_made_of == Some(made_of) {
+            return;
+        }
+        self.overlays_made_of = Some(made_of);
+        active
+            .overlay
+            .set_geometry(&active.gpu, &nav_mesh, active.size);
+        active.overlay.set_masks(&active.gpu, &masks);
         super::budget_screen::set_layer(
             &mut active.overlay_on_top,
             &active.gpu,
@@ -1149,4 +1269,49 @@ impl fmt::Display for Sharpness {
             Self::Coarse(n) => write!(f, "{n} tiles still coarse"),
         }
     }
+}
+
+/// What the 2-D overlays are made of, as one number: the frame's size, the
+/// triangles, each text's mask, place and colour, and the budget panel's
+/// layer on top. Two equal digests are the same overlays, to the bit.
+fn overlays_digest(
+    size: (u32, u32),
+    mesh: &[OverlayVertex],
+    masks: &[tuile_wgpu::OverlayMask<'_>],
+    top_mesh: &[tuile_ui::Vertex],
+    top_labels: &[tuile_ui::Label],
+) -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = foldhash::fast::FixedState::with_seed(0x7c0f_f1ce).build_hasher();
+    let floats = |h: &mut foldhash::fast::FoldHasher<'_>, values: &[f32]| {
+        for v in values {
+            h.write_u32(v.to_bits());
+        }
+    };
+    h.write_u32(size.0);
+    h.write_u32(size.1);
+    h.write_usize(mesh.len());
+    h.write(bytemuck::cast_slice(mesh));
+    h.write_usize(masks.len());
+    for m in masks {
+        h.write_u32(m.width);
+        h.write_u32(m.height);
+        h.write(m.coverage);
+        floats(&mut h, &m.position);
+        floats(&mut h, &m.color);
+    }
+    h.write_usize(top_mesh.len());
+    for v in top_mesh {
+        floats(&mut h, &v.position);
+        floats(&mut h, &v.color);
+    }
+    h.write_usize(top_labels.len());
+    for l in top_labels {
+        h.write_u32(l.mask.width);
+        h.write_u32(l.mask.height);
+        h.write(&l.mask.coverage);
+        floats(&mut h, &l.position);
+        floats(&mut h, &l.color);
+    }
+    h.finish()
 }

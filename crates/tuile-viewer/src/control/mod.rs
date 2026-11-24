@@ -461,6 +461,10 @@ pub struct Settled {
 
 /// Frames drawn the picture must hold still, complete, to count as settled.
 const STILL_FOR: usize = 3;
+/// Steps with nothing new to draw after a complete frame that also say the
+/// view converged: half a second of a display's refreshes, in which a
+/// selection still refining would have drawn.
+const QUIET_FOR: usize = 30;
 
 /// Whether a headless viewer is running in this process.
 static RUNNING: AtomicBool = AtomicBool::new(false);
@@ -784,11 +788,12 @@ impl Headless {
     }
 
     /// Whether the last few frames drawn were complete and drew the same
-    /// tiles: converged, as the specification has it (I3). Frames, not
-    /// steps: a phone at rest draws four times a second, and the steps
-    /// between draw nothing. Loads may still be in flight — what is
-    /// prefetched beside the view is not the picture; [`State::idle`] says
-    /// whether they are.
+    /// tiles — or the last one drawn was complete and nothing has needed
+    /// drawing for [`QUIET_FOR`] steps since: converged, as the specification has
+    /// it (I3). Frames, not steps: a view draws only when its picture
+    /// changes, and a still, complete one draws nothing more. Loads may
+    /// still be in flight — what is prefetched beside the view is not the
+    /// picture; [`State::idle`] says whether they are.
     fn still(&self) -> bool {
         let tail: Vec<&State> = self
             .history
@@ -797,11 +802,13 @@ impl Headless {
             .filter(|s| s.drew)
             .take(STILL_FOR)
             .collect();
-        tail.len() == STILL_FOR
+        let drawn_the_same = tail.len() == STILL_FOR
             && tail.iter().all(|s| s.complete())
             && tail
                 .windows(2)
-                .all(|w| w[0].metrics.frame_digest == w[1].metrics.frame_digest)
+                .all(|w| w[0].metrics.frame_digest == w[1].metrics.frame_digest);
+        let quiet = self.history.iter().rev().take_while(|s| !s.drew).count();
+        drawn_the_same || (quiet >= QUIET_FOR && tail.first().is_some_and(|s| s.complete()))
     }
 
     /// Does `action` now, before the next step.

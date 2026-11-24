@@ -372,6 +372,19 @@ pub struct App {
     lifecycle: lifecycle::Lifecycle,
     loading: loading::Loading,
     demand: demand::Demand,
+    /// The picture on screen, which a turn with nothing new does not draw
+    /// again (`demand::Repaint`).
+    repaint: demand::Repaint,
+    /// The views last sent to the server (`demand::ViewSends`).
+    view_sends: demand::ViewSends,
+    /// What the 2-D overlays were last made of, as uploaded: see
+    /// `upload_the_control`.
+    overlays_made_of: Option<u64>,
+    /// Moves each time the host's shapes in the world are set or rebased.
+    shapes_revision: u64,
+    /// Whether the last frame presented a picture: when it did not, nothing
+    /// waited for the display, and the next busy turn waits a refresh.
+    presented_last: bool,
     touches: touch::Touches,
     /// A scripted hand, when `TUILE_TOUCH_SCRIPT` names one.
     script: Option<script::TouchScript>,
@@ -563,6 +576,11 @@ impl App {
             lifecycle: lifecycle::Lifecycle::new(&config.profile),
             loading: loading::Loading::new(now),
             demand: demand::Demand::default(),
+            repaint: demand::Repaint::default(),
+            view_sends: demand::ViewSends::default(),
+            overlays_made_of: None,
+            shapes_revision: 0,
+            presented_last: false,
             touches: touch::Touches::default(),
             script: script::TouchScript::from_environment(),
             steer_script: script::SteerScript::from_environment(),
@@ -902,6 +920,11 @@ impl App {
             self.carry_out(steps);
         } else {
             self.occluded = hidden;
+            // Uncovered: what the compositor kept of the window is not
+            // trusted — the next frame is drawn whatever it shows.
+            if !hidden {
+                self.repaint.forget();
+            }
             if let Some(active) = self.active.as_ref() {
                 active.screen.request_redraw();
             }
@@ -911,6 +934,7 @@ impl App {
     /// Asks for a frame now, whatever the pacing was waiting for.
     pub(crate) fn draw_soon(&mut self) {
         self.demand.poke();
+        self.repaint.forget();
         if let Some(active) = self.active.as_ref() {
             active.screen.request_redraw();
         }
@@ -1041,20 +1065,13 @@ impl App {
             return Turn::Flow(ControlFlow::Poll);
         }
         self.play_the_steering(web_time::Instant::now());
-        // A phone draws on demand, and only in the foreground.
-        if self.profile.render_on_demand {
-            return Turn::Flow(self.pace_the_frames());
+        // Covered on a desktop: no frame, and no turn, until uncovered.
+        if self.occluded {
+            return Turn::Flow(ControlFlow::Wait);
         }
-        if !self.occluded {
-            if let Some(active) = self.active.as_ref() {
-                active.screen.request_redraw();
-            }
-        }
-        Turn::Flow(if self.occluded {
-            ControlFlow::Wait
-        } else {
-            ControlFlow::Poll
-        })
+        // A turn when one is due, and a frame drawn in it only when the
+        // picture changed: see `demand`. Every device alike.
+        Turn::Flow(self.pace_the_frames())
     }
 
     /// The 3D view, in device pixels: the frame above the credits bar, from
@@ -1152,10 +1169,11 @@ impl ApplicationHandler for App {
         self.end();
     }
 
-    /// Drives the animation: one redraw per loop iteration while the window is
-    /// visible. Requesting from here rather than from the `RedrawRequested`
-    /// handler is what lets an occluded window stop cleanly — the loop parks on
-    /// `Wait` until the next event instead of spinning.
+    /// Drives the animation: a redraw asked for when a turn is due (see
+    /// `demand`), and the loop parked until the next one otherwise.
+    /// Requesting from here rather than from the `RedrawRequested` handler is
+    /// what lets an occluded window stop cleanly — the loop parks on `Wait`
+    /// until the next event instead of spinning.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         match self.turn() {
             Turn::End => event_loop.exit(),

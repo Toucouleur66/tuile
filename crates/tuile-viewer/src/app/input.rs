@@ -55,6 +55,21 @@ impl App {
             return;
         }
         self.note_the_input(&event);
+        // A hand on the mouse, the keys or the glass: the turns come at the
+        // display's rate while it acts, so what it changes is drawn at once.
+        if matches!(
+            event,
+            WindowEvent::CursorMoved { .. }
+                | WindowEvent::MouseInput { .. }
+                | WindowEvent::MouseWheel { .. }
+                | WindowEvent::KeyboardInput { .. }
+                | WindowEvent::ModifiersChanged(_)
+                | WindowEvent::Touch(_)
+                | WindowEvent::PinchGesture { .. }
+                | WindowEvent::RotationGesture { .. }
+        ) {
+            self.demand.poke();
+        }
         match event {
             WindowEvent::CloseRequested => {
                 self.ended_by = Some("the window was closed");
@@ -170,6 +185,7 @@ impl App {
             active.scale = scale_factor.max(1.0);
             tracing::info!(scale = active.scale, "display density changed");
         }
+        self.repaint.forget();
     }
 
     /// The drawable has a new size, in device pixels — on a phone, a
@@ -185,6 +201,8 @@ impl App {
             }
             active.screen.request_redraw();
         }
+        // A surface configured again holds no picture yet.
+        self.repaint.forget();
         self.demand.poke();
     }
 

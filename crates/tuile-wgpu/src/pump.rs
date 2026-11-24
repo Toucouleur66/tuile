@@ -251,6 +251,10 @@ pub struct ContentPump {
     /// Deliveries dropped from the queue unuploaded — cancelled, evicted or
     /// replaced — whose chains the next upload step lets go of.
     dropped: Vec<ResourceContent>,
+    /// See [`Self::revision`].
+    revision: u64,
+    /// The revision the tiles were last stitched at: see [`Self::restitch`].
+    stitched_at: Option<u64>,
 }
 
 /// Frames a tile takes to slide to its new edge when what is drawn beside it
@@ -308,7 +312,25 @@ impl ContentPump {
             encode_acks: Vec::new(),
             acks_in_flight: Vec::new(),
             dropped: Vec::new(),
+            revision: 0,
+            stitched_at: None,
         }
+    }
+
+    /// A count that moves whenever what [`Self::resolve`] would draw may
+    /// have changed, from the content's side: a new draw set, an upload, an
+    /// eviction, a compression in place, an edge stitched or sliding, a
+    /// source hidden or shown, the backdrop's level. The camera is not part
+    /// of it — the host compares its own.
+    ///
+    /// Equal at two frames, with the same camera, means the same picture:
+    /// what lets a host that has nothing new to show not draw at all.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn changed(&mut self) {
+        self.revision += 1;
     }
 
     /// Lets go of the chains built for deliveries that left the queue.
@@ -366,6 +388,9 @@ impl ContentPump {
     /// set does not yet reach — a camera turned faster than the server
     /// answered. `None`, the default, draws none.
     pub fn set_backdrop_level(&mut self, level: Option<u32>) {
+        if self.backdrop_level != level {
+            self.changed();
+        }
         self.backdrop_level = level;
     }
 
@@ -377,10 +402,14 @@ impl ContentPump {
     /// comes up under the tag.
     pub fn hide_source(&mut self, tag: u8, hidden: bool) {
         let bit = 1u16 << (tag & 15);
+        let was = self.hidden_sources;
         if hidden {
             self.hidden_sources |= bit;
         } else {
             self.hidden_sources &= !bit;
+        }
+        if self.hidden_sources != was {
+            self.changed();
         }
     }
 
@@ -395,6 +424,9 @@ impl ContentPump {
             // Whatever was planned is for the other setting.
             self.stitched_for.clear();
         }
+        if self.stitching != slide_frames {
+            self.changed();
+        }
         self.stitching = slide_frames;
     }
 
@@ -408,6 +440,17 @@ impl ContentPump {
     /// sliding, and costs nothing once they have arrived.
     fn restitch(&mut self, gpu: &GpuContext) {
         self.frame += 1;
+        // Nothing the plan reads has changed since it was last worked out —
+        // the draw set, the meshes held, the setting — and nothing slides:
+        // the tiles are stitched as they will be drawn.
+        if self.stitched_at == Some(self.revision) && self.sliding.is_empty() {
+            return;
+        }
+        self.restitch_now(gpu);
+        self.stitched_at = Some(self.revision);
+    }
+
+    fn restitch_now(&mut self, gpu: &GpuContext) {
         let (frame, slide) = (self.frame, self.stitching);
         // The tiles that hold their own ground in the draw set: exact, and
         // the finer tiles held on a zoom-out. A fallback ancestor stands in
@@ -487,6 +530,8 @@ impl ContentPump {
             self.stitched_for = exact;
             m.stitch_plans.inc();
             m.stitch_seconds.record(began.elapsed());
+            // Edges may have moved: the picture is another one.
+            self.changed();
         }
         if !self.sliding.is_empty() {
             let slide = slide.unwrap_or(0);
@@ -496,6 +541,8 @@ impl ContentPump {
                     .get_mut(id)
                     .is_some_and(|tile| tile.slide(gpu, frame, slide))
             });
+            // A slide is a picture that moves, frame by frame.
+            self.changed();
         }
     }
 
@@ -828,6 +875,10 @@ impl ContentPump {
         if done.tiles > 0 {
             imagery_metrics(gpu);
         }
+        if done.tiles > 0 || !done.rebound.is_empty() || !done.drapes.is_empty() {
+            // Textures replaced under the meshes that wear them.
+            self.changed();
+        }
         self.undress_wearers.extend(done.rebound);
         for (r, gen, bytes) in done.drapes {
             if let Some(h) = self.held.get_mut(&r) {
@@ -917,6 +968,7 @@ impl ContentPump {
             return None;
         }
         store(self);
+        self.changed();
         self.held_bytes[q.class] = after;
         self.held.insert(
             r,
@@ -999,7 +1051,15 @@ impl ContentPump {
                 bare,
                 generation,
             } => {
-                self.ancestry.extend(ancestry);
+                // What resolving reads of a selection: its draw set, and the
+                // ancestry that says how each tile is drawn.
+                let mut changed = self.draw != draw;
+                for (tile, a) in ancestry {
+                    changed |= self.ancestry.insert(tile, a) != Some(a);
+                }
+                if changed {
+                    self.changed();
+                }
                 self.draw = draw;
                 self.plan = plan;
                 self.stats = stats;
@@ -1049,6 +1109,7 @@ impl ContentPump {
             ServerMessage::Evict { resources } => {
                 let m = tuile_core::metrics::metrics();
                 let mut drapes_gone = Vec::new();
+                let mut gone = false;
                 self.totals.evict_messages += 1;
                 for r in &resources {
                     if let Some(h) = self.held.remove(r) {
@@ -1062,6 +1123,7 @@ impl ContentPump {
                                 contents.remove(tile);
                             }
                             if let Some(p) = self.prepared.remove(tile) {
+                                gone = true;
                                 self.gpu_bytes -= p.gpu_bytes;
                                 let level = self.level(*tile);
                                 m.meshes_by_level.sub(level, 1);
@@ -1070,6 +1132,7 @@ impl ContentPump {
                         }
                         ResourceId::Drape { .. } => {
                             if self.drapes.remove(r).is_some() {
+                                gone = true;
                                 drapes_gone.push(*r);
                             }
                         }
@@ -1085,6 +1148,9 @@ impl ContentPump {
                 // textures: it is dressed again when it is next drawn.
                 if !drapes_gone.is_empty() {
                     self.undress_wearers.extend(drapes_gone);
+                }
+                if gone {
+                    self.changed();
                 }
                 m.prepared_tiles.set(self.prepared.len() as u64);
                 m.pending_uploads.set(self.queue.len() as u64);

@@ -15,7 +15,7 @@ use tuile_core::protocol::{ClientMessage, GeometryStream};
 use winit::event::TouchPhase;
 use winit::event_loop::ControlFlow;
 
-use super::demand::{Busy, Pace, IDLE_WAKE};
+use super::demand::{Busy, IDLE_WAKE};
 use super::lifecycle::Step;
 use super::loading::{Observed, Style};
 use super::touch::{Gesture, Phase};
@@ -206,12 +206,15 @@ impl App {
             uploaded: self.uploaded,
             pending_uploads: self.active.as_ref().map_or(0, |a| a.pump.pending_uploads()),
             sliding: self.active.as_ref().map_or(0, |a| a.pump.sliding()),
+            loading: self.loading_now(),
+            recording: self.records_every_frame(),
         };
         self.demand.saw(Instant::now(), busy);
     }
 
-    /// A phone's turn of the loop: a frame when one is due, and otherwise a
-    /// sleep until it is — never a spin.
+    /// A turn of the loop: a frame asked for when one is due, and otherwise
+    /// a sleep until it is — never a spin. The frame itself draws only what
+    /// changed (`render`).
     pub(super) fn pace_the_frames(&mut self) -> ControlFlow {
         let now = Instant::now();
         self.read_the_pressure(now);
@@ -242,10 +245,13 @@ impl App {
             self.gesture(held);
         }
         self.play_the_script(now);
-        let interval = match self.demand.pace(now) {
-            Pace::Continuous => self.profile.frame_interval(self.thermal, self.low_power),
-            Pace::Idle => IDLE_WAKE,
-        };
+        let refresh = std::time::Duration::from_secs(1) / self.refresh_hz.max(1);
+        let interval = super::demand::turn_interval(
+            self.demand.pace(now),
+            self.profile.frame_interval(self.thermal, self.low_power),
+            self.presented_last,
+            refresh,
+        );
         let interval = super::demand::while_waiting(
             interval,
             self.launching_since.map(|since| now.duration_since(since)),

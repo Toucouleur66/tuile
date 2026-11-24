@@ -14,6 +14,10 @@ workspace = true
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+# What the overlays are made of, hashed each turn to tell a changed picture
+# from the one on screen (`app::demand`).
+bytemuck = { workspace = true }
+foldhash = { workspace = true }
 glam = { workspace = true }
 # `sync` for the gate a paused session's loads wait on — on every target: the
 # browser's worker shuts the same gate.
