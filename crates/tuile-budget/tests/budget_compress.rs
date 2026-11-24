@@ -400,10 +400,9 @@ fn the_compressions_in_flight_fit_the_lane() {
     let mut h = specified(|c| c.flight_tiles = 2);
     let tiles: Vec<_> = (0..8).map(|x| t(4, x, 0)).collect();
     let need = drawn_draped(&tiles, 4);
-    h.run(&need, Micros::from_millis(2_000));
-    // Nothing answered: the flights stay.
+    // Nothing answered: the flights fill the lane and stay there.
     let mut most = 0;
-    for _ in 0..20 {
+    for _ in 0..120 {
         let d = h.step(&need);
         most = most.max(d.stats.compress.in_flight);
     }
