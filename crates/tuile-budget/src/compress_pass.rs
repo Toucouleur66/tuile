@@ -11,7 +11,7 @@ use super::decisions::Decisions;
 use super::state::Gpu;
 use super::state::{EvictKey, Slot};
 use super::stats::BudgetStats;
-use super::types::{Bytes, Class, Generation, Micros, PerClass, ResourceId};
+use super::types::{Bytes, Class, Generation, PerClass, ResourceId};
 use super::{Budget, Ledger};
 
 /// An eligible copy, as the pass found it: its eviction key, resource,
@@ -101,7 +101,6 @@ impl Budget {
     /// transient stays under `hard`.
     pub(super) fn compress_pass(
         &mut self,
-        now: Micros,
         still: bool,
         lane: u64,
         hard: &PerClass<Bytes>,
@@ -109,18 +108,22 @@ impl Budget {
         d: &mut Decisions,
         st: &mut BudgetStats,
     ) {
+        // Law 2 at rest: the consecutive poses, this one included, at which
+        // the need has not changed — counted at every pose, a copy waiting
+        // or not, so a copy that arrives into a still view finds the count
+        // already running.
+        let step = self.steps;
+        let still_for = if still {
+            step
+                .saturating_sub(*self.compress.still_since.get_or_insert(step))
+                .saturating_add(1)
+        } else {
+            self.compress.still_since = None;
+            0
+        };
         if self.compress.waiting.is_empty() && self.compress.flights.is_empty() {
             return;
         }
-        // Law 2 at rest: since when the need has not changed.
-        let still_since = if still {
-            *self.compress.still_since.get_or_insert(now)
-        } else {
-            self.compress.still_since = None;
-            now
-        };
-        let still_for = now.since(still_since);
-        let step = self.steps;
         // The flights whose copy left the GPU, or was delivered again, are
         // over: nothing of them is acknowledged.
         let a = &self.arena;

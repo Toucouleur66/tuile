@@ -123,10 +123,10 @@ fn specified(edit: impl FnOnce(&mut tuile_budget::spec::Compress)) -> Host {
 /// is delivered, uploaded and drawn as RGBA8, charged RGBA8; **it survives
 /// its decisions:** compressed once it has kept a very high score over the
 /// specification's decisions (10), not before, and charged its blocks
-/// once acknowledged. The still need's clock is set out of reach here.
+/// once acknowledged. The still need's poses are set out of reach here.
 #[test]
 fn a_drawn_drape_is_compressed_once_it_survives_its_decisions_and_not_before() {
-    let mut h = specified(|c| c.still = Micros::from_secs(600));
+    let mut h = specified(|c| c.still_poses = 36_000);
     let need = drawn_draped(&level4(), 4);
     let n = decisions_to_compress(&mut h, &need, 600).expect(RED);
     assert!(n >= 10, "compressed {n} decisions after it was drawn");
@@ -149,19 +149,32 @@ fn a_drawn_drape_is_compressed_once_it_survives_its_decisions_and_not_before() {
 }
 
 /// **At rest, a still need stands for the decisions:** with a count out of
-/// reach, the drapes are compressed once the need has been still for the
-/// specification's time (1 s of the steps' clock), not before.
+/// reach, the drapes are compressed once the need has been unchanged for
+/// the specification's still poses (Laurent, 2026-11-24: camera poses, not
+/// seconds) — at the N-th still pose, not at the one before — whether the
+/// poses are a second or a millisecond apart.
 #[test]
 fn at_rest_a_still_need_compresses_what_scores_high() {
-    let mut h = specified(|c| c.decisions = 10_000);
-    let need = drawn_draped(&level4(), 4);
-    let early = h.run(&need, Micros::from_millis(900));
-    assert!(
-        early.iter().all(|d| d.compress.is_empty()),
-        "before the still time"
-    );
-    let late = h.run(&need, Micros::from_millis(600));
-    assert!(late.iter().any(|d| !d.compress.is_empty()), "{RED}");
+    let n = Specification::interactive().params.compress.still_poses;
+    for dt in [Micros::from_secs(1), Micros(1_000)] {
+        let mut h = specified(|c| c.decisions = 10_000);
+        h.r.dt = dt;
+        let need = drawn_draped(&level4(), 4);
+        // The first pose reads the whole need; the still ones follow it.
+        for i in 0..n {
+            let d = h.step(&need);
+            h.answer(BLOCKS);
+            assert!(
+                d.compress.is_empty(),
+                "compressed after {i} still poses of {dt:?}: {RED}"
+            );
+        }
+        let d = h.step(&need);
+        assert!(
+            !d.compress.is_empty(),
+            "not compressed after {n} still poses of {dt:?}: {RED}"
+        );
+    }
 }
 
 /// **Charged as held (law 5):** from the decision until its
@@ -220,7 +233,7 @@ fn a_copy_the_score_gives_up_stays_rgba8_whatever_its_age() {
     // before its drapes have survived theirs.
     let mut h = specified(|c| {
         c.decisions = 60;
-        c.still = Micros::from_secs(600);
+        c.still_poses = 36_000;
     });
     let here = drawn_draped(&level4(), 4);
     h.run(&here, Micros::from_millis(500));

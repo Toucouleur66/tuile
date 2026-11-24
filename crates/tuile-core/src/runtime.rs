@@ -3936,7 +3936,7 @@ mod tests {
             let mut consumer = Consumer::default();
             stream
                 .send(ClientMessage::Specify {
-                    query: "compress_after_ms=0".to_owned(),
+                    query: "compress_decisions=0&compress_still_poses=0".to_owned(),
                     overridden: false,
                 })
                 .expect("send");

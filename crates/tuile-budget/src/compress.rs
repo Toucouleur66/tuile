@@ -19,12 +19,13 @@
 //!    compressed once its probability of use — the progressive score's `P`
 //!    — has stayed at least [`Compress::probability_permille`] (90 % by
 //!    default) over [`Compress::decisions`] decisions (10), as the pass
-//!    samples it at its visits; a dip starts the count again. Decisions,
-//!    not time: it follows how fast the view changes, and in a film a
-//!    decision is a frame. At rest, where decisions may stop coming, a copy
-//!    whose score is that high is also compressed once the need has been
-//!    still for [`Compress::still`] (1 s, the steps' own time). A fresh
-//!    copy, or one whose score dipped, stays RGBA8 and leaves as such.
+//!    samples it at its visits; a dip starts the count again. A decision
+//!    is a camera pose — one camera handed to the decider — never time
+//!    (Laurent, 2026-11-24): it follows how fast the view changes, and in
+//!    a film a decision is a frame. At rest, a copy whose score is that
+//!    high is also compressed once the need has been unchanged for
+//!    [`Compress::still_poses`] consecutive poses (60). A fresh copy, or
+//!    one whose score dipped, stays RGBA8 and leaves as such.
 //! 3. **Highest value first.** Among those, the copies the release order
 //!    keeps longest go first (the eviction key, highest first): what is due
 //!    for release soonest is never encoded before it.
@@ -54,7 +55,7 @@
 use std::collections::BTreeMap;
 
 use super::spec::Compress;
-use super::types::{Bytes, Class, Generation, Micros, PerClass, ResourceId};
+use super::types::{Bytes, Class, Generation, PerClass, ResourceId};
 use super::value::CERTAIN;
 
 /// Whether a probability of use `probability` ([`CERTAIN`] units) is as
@@ -77,8 +78,8 @@ pub fn track(p: &Compress, probability: u32, high_from: Option<u64>, step: u64) 
 }
 
 /// What law 2 reads of a copy and of the step: its probability of use, the
-/// decision its score has stayed high from, the step, and how long the
-/// need has been still.
+/// decision its score has stayed high from, the step, and for how many
+/// consecutive poses the need has been unchanged.
 #[derive(Clone, Copy, Debug)]
 pub struct Survival {
     /// Its probability of use now, [`CERTAIN`] units.
@@ -87,8 +88,9 @@ pub struct Survival {
     pub high_from: Option<u64>,
     /// This decision.
     pub step: u64,
-    /// How long the need has not changed, in the steps' time.
-    pub still_for: Micros,
+    /// The consecutive camera poses, this one included, at which the need
+    /// has not changed: 0 when it changed at this one.
+    pub still_for: u64,
 }
 
 /// Law 2: whether a copy is compressed — `pressed`, when its class is over
@@ -97,7 +99,7 @@ pub fn eligible(p: &Compress, s: Survival, pressed: bool) -> bool {
     let survived = s
         .high_from
         .is_some_and(|from| s.step.saturating_sub(from) >= u64::from(p.decisions));
-    high(p, s.probability) && (pressed || survived || s.still_for >= p.still)
+    high(p, s.probability) && (pressed || survived || s.still_for >= u64::from(p.still_poses))
 }
 
 /// Law 3: `a` goes before `b`, given their eviction keys: the copy the
@@ -143,9 +145,9 @@ pub(crate) struct Compressions {
     pub cursor: Option<ResourceId>,
     /// The compressions in flight.
     pub flights: BTreeMap<ResourceId, Flight>,
-    /// Since when the need has not changed, in the steps' time: law 2 at
-    /// rest.
-    pub still_since: Option<Micros>,
+    /// The first of the consecutive camera poses at which the need has not
+    /// changed: law 2 at rest.
+    pub still_since: Option<u64>,
 }
 
 impl Compressions {
@@ -238,7 +240,7 @@ mod tests {
         ResourceId::drape(TileId(n), crate::LayerId(0), 3)
     }
 
-    fn at(probability: u32, high_from: Option<u64>, step: u64, still_for: Micros) -> Survival {
+    fn at(probability: u32, high_from: Option<u64>, step: u64, still_for: u64) -> Survival {
         Survival {
             probability,
             high_from,
@@ -250,7 +252,7 @@ mod tests {
     #[test]
     fn a_score_under_the_threshold_stays_rgba8_whatever_it_survives() {
         let low = u32::from(COMPRESS.probability_permille) * (CERTAIN / 1_000) - 1;
-        let long = Micros::from_secs(3_600);
+        let long = u64::MAX;
         assert!(!eligible(
             &COMPRESS,
             at(low, Some(0), 1_000_000, long),
@@ -271,12 +273,12 @@ mod tests {
         assert_eq!(from, Some(100));
         assert!(!eligible(
             &COMPRESS,
-            at(CERTAIN, from, 100 + n - 1, Micros::ZERO),
+            at(CERTAIN, from, 100 + n - 1, 0),
             false
         ));
         assert!(eligible(
             &COMPRESS,
-            at(CERTAIN, from, 100 + n, Micros::ZERO),
+            at(CERTAIN, from, 100 + n, 0),
             false
         ));
         // A dip starts the count again.
@@ -285,22 +287,23 @@ mod tests {
         let again = track(&COMPRESS, CERTAIN, dipped, 106);
         assert!(!eligible(
             &COMPRESS,
-            at(CERTAIN, again, 100 + n, Micros::ZERO),
+            at(CERTAIN, again, 100 + n, 0),
             false
         ));
         assert!(eligible(
             &COMPRESS,
-            at(CERTAIN, again, 106 + n, Micros::ZERO),
+            at(CERTAIN, again, 106 + n, 0),
             false
         ));
     }
 
+    /// N − 1 still poses do not compress; N do (Laurent, 2026-11-24).
     #[test]
     fn at_rest_a_still_need_stands_for_the_decisions() {
-        let still = COMPRESS.still;
+        let still = u64::from(COMPRESS.still_poses);
         assert!(!eligible(
             &COMPRESS,
-            at(CERTAIN, Some(0), 1, Micros(still.0 - 1)),
+            at(CERTAIN, Some(0), 1, still - 1),
             false
         ));
         assert!(eligible(&COMPRESS, at(CERTAIN, Some(0), 1, still), false));
@@ -315,12 +318,12 @@ mod tests {
     fn under_pressure_the_waits_are_waived_not_the_score() {
         assert!(eligible(
             &COMPRESS,
-            at(CERTAIN, None, 0, Micros::ZERO),
+            at(CERTAIN, None, 0, 0),
             true
         ));
         assert!(!eligible(
             &COMPRESS,
-            at(CERTAIN / 2, None, 0, Micros::ZERO),
+            at(CERTAIN / 2, None, 0, 0),
             true
         ));
     }

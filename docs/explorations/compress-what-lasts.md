@@ -36,16 +36,17 @@ here is taken from those implementations beyond the idea.
    budget asks for a GPU copy to be compressed once its probability of use — the
    progressive score's `P` (#289) — has stayed at least `compress_p` (90 % of certainty)
    over `compress_decisions` decisions (10): each decision the pass samples it in the
-   high-score set counts one, a dip starts the count again. **Decisions, not time**: the
-   count follows how fast the view changes — a fast zoom replaces its copies before they
-   survive, a still view keeps them — and in a film a decision is a frame. **At rest** the
-   decisions may stop coming (with prediction and conflation, a host decides only when the
-   predicted view moves), so a copy whose score is that high is also compressed once the
-   need has been still for `compress_still_ms` (1 s). Why a still time rather than a count
-   of idle steps: idle steps are exactly what may not happen at rest, while the steps' own
-   time is an input of every step that does run, recorded and replayed — nothing reads a
-   clock inside `decide`. The still need is a need that changed nothing since the step
-   before (an empty delta).
+   high-score set counts one, a dip starts the count again. **Camera poses, not time**
+   (Laurent, 2026-11-24: the decider's timers count poses, not seconds): a decision is a
+   pose, one camera handed to the decider. The count follows how fast the view changes — a
+   fast zoom replaces its copies before they survive, a still view keeps them — and in a
+   film a decision is a frame. **At rest** a copy whose score is that high is also
+   compressed once the need has been unchanged for `compress_still_poses` consecutive poses
+   (60: the second it was in time, at the viewers' 60 steps a second — a viewer sends its
+   camera every frame and the geometry server steps on each, so a still view keeps
+   stepping). The still need is a need that changed nothing since the step before (an
+   empty delta); a pose at which it changed starts the count again. Nothing reads a clock
+   inside `decide`.
 3. **Highest value first.** Among the eligible copies the budget asks first for those the
    release order keeps longest (the eviction key, highest first: the floor, then the
    score `P × R / bytes` over GreedyDual's `L`). A copy due for eviction soonest is never
@@ -69,7 +70,7 @@ here is taken from those implementations beyond the idea.
    second where the lane allowed twenty. The consumer runs them on its encode lane (CB5/CB6), in the frame's
    measured headroom (#311), **after** the frame's uploads.
 7. **No switch, Off unchanged.** The thresholds are specification numbers
-   (`compress_p`, `compress_decisions`, `compress_still_ms`, `compress_visits`, `compress_flight_tiles`: re-specifiable at run time by
+   (`compress_p`, `compress_decisions`, `compress_still_poses`, `compress_visits`, `compress_flight_tiles`: re-specifiable at run time by
    `tuile://budget?…`, recorded with the step, in the digest). A cost that cannot be
    compressed — every cost under `Off`, the film, the bake — makes nothing here run: the
    decisions, their digests and the goldens are the ones they were.

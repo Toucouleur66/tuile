@@ -307,22 +307,23 @@ pub const PROGRESSIVE: Progressive = Progressive {
 /// it has **survived `decisions` decisions with a very high score** — its
 /// probability of use, the progressive score's `P`, at least
 /// `probability_permille` at every decision the pass sampled since it rose
-/// there (a dip starts the count again). Decisions, not time: the count
-/// follows how fast the view changes, and in a film a decision is a frame.
-/// At rest the decisions may stop coming (a host that decides only when
-/// the view moves), so a copy whose score is very high is also compressed
-/// once the need has not changed for `still` — the steps' own time, an
-/// input, recorded. Under pressure both waits are waived, never the score:
-/// compressing comes before evicting.
+/// there (a dip starts the count again). A decision is a camera pose, one
+/// camera handed to the decider (Laurent, 2026-11-24: the decider's timers
+/// count poses, not seconds): the count follows how fast the view changes,
+/// and in a film a decision is a frame. A copy whose score is very high is
+/// also compressed once the need has not changed for `still_poses`
+/// consecutive poses — the camera at rest. Under pressure both waits are
+/// waived, never the score: compressing comes before evicting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Compress {
     /// The least probability of use, ‰ of certainty, a copy's score keeps
     /// to be compressed: very high by default.
     pub probability_permille: u16,
-    /// The decisions it must survive with that score.
+    /// The decisions — camera poses — it must survive with that score.
     pub decisions: u16,
-    /// Or how long the need must have been still, the score that high.
-    pub still: Micros,
+    /// Or the consecutive camera poses the need must have been unchanged
+    /// for, the score that high.
+    pub still_poses: u32,
     /// The compressible copies a step looks at: the bound of the pass, and
     /// how often a copy's score is sampled.
     pub visits: u16,
@@ -336,11 +337,14 @@ pub struct Compress {
 
 /// The defaults: 90 % of certainty — what the view draws and its nearest
 /// neighbours, not a preload one radius out — kept over ten decisions, or
-/// a still need for a second; 64 copies a step, sixteen tiles in flight.
+/// a need unchanged for 60 poses (the second it was in time, at the
+/// viewers' 60 steps a second: a viewer sends its camera every frame, and
+/// the geometry server steps on each); 64 copies a step, sixteen tiles in
+/// flight.
 pub const COMPRESS: Compress = Compress {
     probability_permille: 900,
     decisions: 10,
-    still: Micros::from_secs(1),
+    still_poses: 60,
     visits: 64,
     flight_tiles: 16,
 };
@@ -756,7 +760,7 @@ impl Specification {
             ("finer_gap", u64::from(p.finer_gap_permille), 1_000),
             ("compress_p", u64::from(p.compress.probability_permille), 1_000),
             ("compress_decisions", u64::from(p.compress.decisions), 10_000),
-            ("compress_still_ms", p.compress.still.0 / 1_000, 600_000),
+            ("compress_still_poses", u64::from(p.compress.still_poses), 36_000),
             ("compress_flight_tiles", u64::from(p.compress.flight_tiles), 1_024),
             ("compress_visits", u64::from(p.compress.visits), 4_096),
         ];
@@ -795,7 +799,7 @@ impl Specification {
              &restore_decoded_ms={}&restore_stored_ms={}&restore_http_cache_ms={}\
              &restore_remote_ms={}&p_ring={}&p_ancestor={}&a0={}&a_desc={}&headroom={}&floor_value={}\
              &release_visits={}&rho={}&finer_gap={}&coarse_from={}&coarse_boost={}\
-             &sweep_keep_poses={}&compress_p={}&compress_decisions={}&compress_still_ms={}&compress_visits={}\
+             &sweep_keep_poses={}&compress_p={}&compress_decisions={}&compress_still_poses={}&compress_visits={}\
              &compress_flight_tiles={}",
             self.kind.label(),
             p.margin_permille,
@@ -823,7 +827,7 @@ impl Specification {
             p.sweep_keep_poses,
             p.compress.probability_permille,
             p.compress.decisions,
-            ms(p.compress.still),
+            p.compress.still_poses,
             p.compress.visits,
             p.compress.flight_tiles,
         );
@@ -891,7 +895,7 @@ impl Specification {
                 "coarse_boost" => p.progressive.coarse_boost_permille = n16,
                 "compress_p" => p.compress.probability_permille = n16,
                 "compress_decisions" => p.compress.decisions = n16,
-                "compress_still_ms" => p.compress.still = millis,
+                "compress_still_poses" => p.compress.still_poses = n32,
                 "compress_flight_tiles" => p.compress.flight_tiles = n16,
                 "compress_visits" => p.compress.visits = n16,
                 _ => match k

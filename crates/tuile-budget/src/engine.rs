@@ -2018,7 +2018,7 @@ impl Budget {
             };
             // A step whose need changed nothing: the view at rest (law 2).
             let still = named.is_empty();
-            self.compress_pass(now, still, lane, &hard, &pressed, d, &mut st);
+            self.compress_pass(still, lane, &hard, &pressed, d, &mut st);
         }
         if !eff.batch {
             self.evict(now, &eff, wants, d, &mut st);
