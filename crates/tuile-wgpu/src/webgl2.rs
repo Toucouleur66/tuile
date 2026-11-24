@@ -111,6 +111,12 @@ fn every_viewer_shader_runs_on_webgl2() {
             tuile_atmosphere::gpu::SKY_VIEW_RENDER_WGSL
         ),
     );
+    // The aerial table, made every frame, drawn by a render pass: the
+    // ground reads its air from it.
+    webgl2(
+        "aerial table",
+        &tuile_atmosphere::gpu::aerial_table_source(tuile_atmosphere::gpu::SkyViewPass::Render),
+    );
     // The frame's light, made every frame, drawn by two render passes.
     webgl2(
         "frame light",

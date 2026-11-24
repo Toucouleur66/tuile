@@ -196,28 +196,48 @@ fn disc_seen(n: vec3f, pixel: f32, b: Body) -> DiscSeen {
 // imagery's colour, `p` where it is drawn and `ground` the ground it means
 // (both from the eye: see `meant_ground` in a film's resolve), `normal`
 // its facing towards the eye, `ambient` the frame's sky light on that
-// facing and `lit` the sun's share a shadow leaves it.
+// facing and `lit` the sun's share a shadow leaves it. The air between the
+// eye and the ground marched for this point (`air_between`): the film's
+// way, every pixel its own march. A viewer reads the same air from the
+// frame's aerial table instead (`air_seen`) and calls `ground_seen_through`.
+fn ground_seen(base: vec3f, p: vec3f, ground: vec3f, normal: vec3f, ambient: vec3f, lit: f32) -> vec3f {
+    let air = air_between(ground);
+    return ground_seen_through(
+        base, p, ground, normal, ambient, lit,
+        air.inscattered * atmosphere.illuminance.xyz, air.transmittance,
+    );
+}
+
+// `ground_seen`, the air between the eye and the ground given: `veil` the
+// light it scatters towards the eye, in the renderer's units, and
+// `through` what it lets through of the ground.
 //
 // Its own light, where it is: its sun and Moon through the air above it,
 // its sky — so that a terminator a frame shows falls where it is, the night
 // side lit by the night — and never darker than ground of a fortieth's
 // reflectance: a night sea's imagery is all but black, and so would be its
-// picture. Then the air between the eye and the ground, marched over the
-// tables: what it lets through, and the light it scatters towards the eye
-// under the sun and the Moon — with, at night, the floor's share of the
-// sky's, so that far ground fades to the night sky.
-fn ground_seen(base: vec3f, p: vec3f, ground: vec3f, normal: vec3f, ambient: vec3f, lit: f32) -> vec3f {
+// picture. Then the air between the eye and the ground: what it lets
+// through, and the light it scatters towards the eye under the sun and the
+// Moon — with, at night, the floor's share of the sky's, so that far ground
+// fades to the night sky.
+fn ground_seen_through(
+    base: vec3f, p: vec3f, ground: vec3f, normal: vec3f, ambient: vec3f, lit: f32,
+    veil_in: vec3f, through: vec3f,
+) -> vec3f {
+    // The lights over the point, read once: its facing's light and level
+    // ground's, the veil's bound, are both made of them.
+    let x = ground - atmosphere.centre.xyz;
+    let r = length(x);
+    let up = x / r;
+    let lights = ground_lights(r - atmosphere.centre.w, up);
     var radiance = vec3f(0.0);
     {
-        let x = ground - atmosphere.centre.xyz;
-        let r = length(x);
-        let light = ground_light(r - atmosphere.centre.w, x / r, normal, ambient, lit);
+        let light = ground_light_of(lights, normal, ambient, lit);
         let texel_floor = 0.025 * atmosphere.illuminance.y
             / (ATMOSPHERE_PI * max(atmosphere.ground.y, 1e-30));
         radiance = max(base, vec3f(texel_floor)) * light + city_light(p, light);
     }
-    let air = air_between(ground);
-    var veil = air.inscattered * atmosphere.illuminance.xyz;
+    var veil = veil_in;
     {
         // The veil bounded: never more than a few times the light of the
         // ground under it, on ground of a tenth's reflectance. By day the
@@ -226,17 +246,15 @@ fn ground_seen(base: vec3f, p: vec3f, ground: vec3f, normal: vec3f, ambient: vec
         // little — and the relief would go. A soft bound: the veil it
         // leaves keeps its colour and its gradient with distance.
         let luma = vec3f(0.2126, 0.7152, 0.0722);
-        let x = ground - atmosphere.centre.xyz;
-        let r = length(x);
-        let lit = ground_light(r - atmosphere.centre.w, x / r, x / r, ambient, 1.0);
+        let lit = ground_light_of(lights, up, ambient, 1.0);
         let texel = 0.1 * atmosphere.illuminance.y / (ATMOSPHERE_PI * max(atmosphere.ground.y, 1e-30));
         let cap = atmosphere.tuning.x * texel * dot(lit, luma);
         let v = dot(veil, luma);
         veil /= sqrt(1.0 + (v / max(cap, 1e-30)) * (v / max(cap, 1e-30)));
     }
-    radiance = radiance * air.transmittance
+    radiance = radiance * through
         + veil
-        + atmosphere.floor.xyz * (vec3f(1.0) - air.transmittance);
+        + atmosphere.floor.xyz * (vec3f(1.0) - through);
     // Where the camera is exposed for a day side, the night side is shown
     // no darker than the night sky beside it: ground of a tenth's
     // reflectance at the sky's least, its own imagery scaling it (a sea
@@ -250,7 +268,7 @@ fn ground_seen(base: vec3f, p: vec3f, ground: vec3f, normal: vec3f, ambient: vec
         / (ATMOSPHERE_PI * max(atmosphere.ground.y, 1e-30));
     let tenths = dot(max(base, vec3f(texel_floor)), luma)
         / max(0.1 * atmosphere.illuminance.y / (ATMOSPHERE_PI * max(atmosphere.ground.y, 1e-30)), 1e-30);
-    let shown = atmosphere.least_sky.xyz * (min(tenths, 3.0) * air.transmittance + (vec3f(1.0) - air.transmittance));
+    let shown = atmosphere.least_sky.xyz * (min(tenths, 3.0) * through + (vec3f(1.0) - through));
     return max(radiance, shown);
 }
 

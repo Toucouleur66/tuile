@@ -39,6 +39,55 @@ pub const SKY_VIEW_RENDER_WGSL: &str = include_str!("sky_view_render.wgsl");
 /// (`sky_seen`, `ground_seen`), and the display's grade (`roll_off`,
 /// `graded`), after [`crate::hillaire::WGSL`].
 pub const SEEN_WGSL: &str = include_str!("seen.wgsl");
+/// The aerial table made in compute, after [`aerial_wgsl`].
+pub const AERIAL_TABLE_COMPUTE_WGSL: &str = include_str!("aerial_table_compute.wgsl");
+/// The aerial table drawn, after [`aerial_wgsl`].
+pub const AERIAL_TABLE_RENDER_WGSL: &str = include_str!("aerial_table_render.wgsl");
+
+/// The aerial table's nodes (`aerial_table.wgsl`): points all round the
+/// eye — columns of azimuth — at a distance from it — rows — in layers of
+/// height over the air's sphere, from a sea's depth to over the highest
+/// summits. The air between the eye and the ground, worked out once a frame
+/// at these nodes and read between them by every ground fragment, where
+/// each fragment used to march its own: a hundred and fifty thousand
+/// marches a frame rather than one a fragment of a picture of millions,
+/// for a picture within a code value or two of the fragment's own march
+/// (`tests/aerial_table.rs` holds it to that). Odd layers: one of them at
+/// the sphere itself.
+pub const AERIAL_TABLE_SIZE: [u32; 3] = [64, 96, 25];
+
+/// How many of the aerial table's layers stand side by side in its
+/// texture: a texture no wider than WebGL2 promises (2048).
+pub const AERIAL_GRID: u32 = 5;
+
+const _: () = assert!(
+    AERIAL_TABLE_SIZE[0] * AERIAL_GRID <= 2048
+        && AERIAL_TABLE_SIZE[2].is_multiple_of(AERIAL_GRID)
+        && 2 * AERIAL_TABLE_SIZE[1] * (AERIAL_TABLE_SIZE[2] / AERIAL_GRID) <= 2048
+        && !AERIAL_TABLE_SIZE[2].is_multiple_of(2),
+    "the aerial table's tiles fill whole rows of a texture WebGL2 can hold, a layer at the sphere"
+);
+
+/// The aerial table's texture: its width and height in texels.
+pub const fn aerial_texture_size() -> [u32; 2] {
+    let [w, h, d] = AERIAL_TABLE_SIZE;
+    [w * AERIAL_GRID, 2 * h * (d / AERIAL_GRID)]
+}
+
+/// The aerial table's texels: half floats, filtered by the sampler. Its
+/// veil is pre-exposed, as the picture is, so a night keeps its digits.
+pub const AERIAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// The aerial table's sums and its reading (`aerial_node`, `air_seen`),
+/// after [`crate::hillaire::WGSL`], with the table's size written in.
+pub fn aerial_wgsl() -> String {
+    let [w, h, d] = AERIAL_TABLE_SIZE;
+    format!(
+        "const AERIAL_WIDTH: u32 = {w}u;\nconst AERIAL_HEIGHT: u32 = {h}u;\n\
+         const AERIAL_SLICES: u32 = {d}u;\nconst AERIAL_GRID: u32 = {AERIAL_GRID}u;\n{}",
+        include_str!("aerial_table.wgsl")
+    )
+}
 
 /// `Atmosphere` in `hillaire.wgsl`, byte for byte.
 #[repr(C)]
@@ -313,6 +362,10 @@ pub struct AtmosphereGpu {
     pub irradiance: wgpu::Texture,
     pub sky_view: wgpu::Texture,
     pub moon_view: wgpu::Texture,
+    /// The aerial table ([`AERIAL_TABLE_SIZE`]): the air between the eye
+    /// and the ground over the frame's frustum, for a renderer that reads
+    /// it rather than marching every pixel.
+    pub aerial: wgpu::Texture,
     /// The atmosphere the tables hold, and a clear day's — the reference
     /// every light is calibrated against.
     pub model: Option<LutAtmosphere>,
@@ -323,6 +376,9 @@ pub struct AtmosphereGpu {
     /// Whether the sky-view table is to be made again before the next
     /// picture is drawn.
     pub sky_view_stale: bool,
+    /// Whether the aerial table is to be made again before the next
+    /// picture is drawn.
+    pub aerial_stale: bool,
     /// Everything bound, against the layout [`Self::new`] was given.
     pub bind: wgpu::BindGroup,
     /// What [`Self::bind`] binds, to bind it again when the night lights
@@ -336,10 +392,13 @@ pub struct AtmosphereGpu {
     /// whether it is uploaded yet.
     pub stars: wgpu::Texture,
     stars_held: bool,
-    maker: SkyViewMaker,
+    maker: TableMaker,
+    aerial_maker: TableMaker,
 }
 
-enum SkyViewMaker {
+/// How a table made every frame is made: its pipeline, in compute or
+/// drawn, and what it binds.
+enum TableMaker {
     Compute {
         bind: wgpu::BindGroup,
         pipeline: wgpu::ComputePipeline,
@@ -362,10 +421,12 @@ pub fn declarations(group: u32) -> String {
 }
 
 /// The layout of [`AtmosphereGpu::bind_group`], seen by `visibility`:
-/// every binding of [`declarations`], or — without `sky_view` — all but
-/// the two sky-view tables and the stars, which only the sky reads: textures fewer
-/// against a stage's limit, for a pass that has the ground's imagery to
-/// bind beside them.
+/// every binding of [`declarations`], or — without `sky_view` — the
+/// ground's: all but the two sky-view tables and the stars, which only the
+/// sky reads, and the multiple-scattering table, which only a march reads
+/// — the ground reads its air from the aerial table. Textures fewer against
+/// a stage's limit, for a pass that has the ground's imagery to bind beside
+/// them.
 pub fn layout(
     device: &wgpu::Device,
     visibility: wgpu::ShaderStages,
@@ -376,6 +437,16 @@ pub fn layout(
         visibility,
         ty: wgpu::BindingType::Texture {
             sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    };
+    let filtered = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
             view_dimension: wgpu::TextureViewDimension::D2,
             multisampled: false,
         },
@@ -393,7 +464,6 @@ pub fn layout(
             count: None,
         },
         lut(1),
-        lut(2),
         wgpu::BindGroupLayoutEntry {
             binding: 4,
             visibility,
@@ -401,19 +471,11 @@ pub fn layout(
             count: None,
         },
         lut(5),
-        wgpu::BindGroupLayoutEntry {
-            binding: 7,
-            visibility,
-            ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                view_dimension: wgpu::TextureViewDimension::D2,
-                multisampled: false,
-            },
-            count: None,
-        },
+        filtered(7),
+        filtered(9),
     ];
     if sky_view {
-        entries.extend([lut(3), lut(6), lut(8)]);
+        entries.extend([lut(2), lut(3), lut(6), lut(8)]);
         entries.sort_by_key(|e| e.binding);
     }
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -423,7 +485,9 @@ pub fn layout(
 }
 
 /// How many textures [`layout`] binds to a stage without the sky-view
-/// tables: what a pass drawing the ground has fewer of for its imagery.
+/// tables — the transmittance, the irradiance, the night lights and the
+/// aerial table: what a pass drawing the ground has fewer of for its
+/// imagery.
 pub const GROUND_TEXTURES: u32 = 4;
 
 impl AtmosphereGpu {
@@ -462,6 +526,20 @@ impl AtmosphereGpu {
         let irradiance = texture("atmosphere irradiance", IRRADIANCE_SIZE, U::COPY_DST);
         let sky_view = texture("atmosphere sky view", SKY_VIEW_SIZE, made);
         let moon_view = texture("atmosphere moon view", SKY_VIEW_SIZE, made);
+        let aerial = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("atmosphere aerial table"),
+            size: wgpu::Extent3d {
+                width: aerial_texture_size()[0],
+                height: aerial_texture_size()[1],
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: AERIAL_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | made,
+            view_formats: &[],
+        });
         let star_table = crate::stars::StarTable::catalogue();
         let stars = texture(
             "atmosphere stars",
@@ -484,12 +562,13 @@ impl AtmosphereGpu {
             ..Default::default()
         });
         let view = |t: &wgpu::Texture| t.create_view(&Default::default());
-        let (tv, mv, sv, iv, nv) = (
+        let (tv, mv, sv, iv, nv, av) = (
             view(&transmittance),
             view(&multi_scattering),
             view(&sky_view),
             view(&irradiance),
             view(&moon_view),
+            view(&aerial),
         );
         let night_lights = night_texture(device, 1, 1);
         let views = Views {
@@ -500,6 +579,7 @@ impl AtmosphereGpu {
             moon_view: nv.clone(),
             night_lights: night_lights.create_view(&Default::default()),
             stars: view(&stars),
+            aerial: av.clone(),
             sampler: sampler.clone(),
         };
         let bind = views.bind(device, layout, &uniform, true);
@@ -560,7 +640,7 @@ impl AtmosphereGpu {
                         entry(5, &nv),
                     ],
                 });
-                SkyViewMaker::Compute { bind, pipeline }
+                TableMaker::Compute { bind, pipeline }
             }
             SkyViewPass::Render => {
                 let source = format!("{}\n{}", tables(""), SKY_VIEW_RENDER_WGSL);
@@ -606,9 +686,10 @@ impl AtmosphereGpu {
                         entry(2, &mv),
                     ],
                 });
-                SkyViewMaker::Render { bind, pipeline }
+                TableMaker::Render { bind, pipeline }
             }
         };
+        let aerial_maker = aerial_maker(device, pass, &uniform, &tv, &mv, &av);
         Self {
             uniform,
             transmittance,
@@ -616,11 +697,13 @@ impl AtmosphereGpu {
             irradiance,
             sky_view,
             moon_view,
+            aerial,
             model: None,
             reference: None,
             light: None,
             frame_uniform: AtmosphereUniform::zeroed_off(),
             sky_view_stale: false,
+            aerial_stale: false,
             bind,
             views,
             layout: layout.clone(),
@@ -628,6 +711,7 @@ impl AtmosphereGpu {
             stars,
             stars_held: false,
             maker,
+            aerial_maker,
         }
     }
 
@@ -710,7 +794,7 @@ impl AtmosphereGpu {
         }
         self.sky_view_stale = false;
         match &self.maker {
-            SkyViewMaker::Compute { bind, pipeline } => {
+            TableMaker::Compute { bind, pipeline } => {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("atmosphere sky view"),
                     timestamp_writes: None,
@@ -723,7 +807,7 @@ impl AtmosphereGpu {
                     1,
                 );
             }
-            SkyViewMaker::Render { bind, pipeline } => {
+            TableMaker::Render { bind, pipeline } => {
                 let target = |view| {
                     Some(wgpu::RenderPassColorAttachment {
                         view,
@@ -754,6 +838,169 @@ impl AtmosphereGpu {
     }
 }
 
+impl AtmosphereGpu {
+    /// Makes the aerial table from the frame's eye, if it is stale: after
+    /// the frame's light is in the uniform, for its veil is pre-exposed.
+    pub fn record_aerial(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        if !self.aerial_stale {
+            return;
+        }
+        self.aerial_stale = false;
+        let [w, h] = aerial_texture_size();
+        match &self.aerial_maker {
+            TableMaker::Compute { bind, pipeline } => {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("atmosphere aerial table"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, bind, &[]);
+                pass.dispatch_workgroups(w.div_ceil(8), (h / 2).div_ceil(8), 1);
+            }
+            TableMaker::Render { bind, pipeline } => {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("atmosphere aerial table"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.views.aerial,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, bind, &[]);
+                pass.draw(0..3, 0..1);
+            }
+        }
+    }
+}
+
+/// The module that makes the aerial table in `pass`: what a node's march
+/// reads bound — the uniform, the transmittance and multiple-scattering
+/// tables at 0, 1 and 2 — the rest of what `hillaire.wgsl` asks declared,
+/// and in compute the table written at 5. Public for a test, or a
+/// translator, to ask for exactly what is compiled.
+pub fn aerial_table_source(pass: SkyViewPass) -> String {
+    let (out, entry) = match pass {
+        SkyViewPass::Compute => (
+            "@group(0) @binding(5) var aerial_out: texture_storage_2d<rgba16float, write>;\n",
+            AERIAL_TABLE_COMPUTE_WGSL,
+        ),
+        SkyViewPass::Render => ("", AERIAL_TABLE_RENDER_WGSL),
+    };
+    format!(
+        "@group(0) @binding(0) var<uniform> atmosphere: Atmosphere;\n\
+         @group(0) @binding(1) var transmittance_lut: texture_2d<f32>;\n\
+         @group(0) @binding(2) var multi_scattering_lut: texture_2d<f32>;\n\
+         @group(0) @binding(3) var aerial_lut: texture_2d<f32>;\n\
+         @group(0) @binding(4) var lut_sampler: sampler;\n\
+         {out}\
+         @group(0) @binding(6) var irradiance_lut: texture_2d<f32>;\n\
+         @group(0) @binding(7) var night_lights_lut: texture_2d<f32>;\n\
+         @group(0) @binding(8) var star_table: texture_2d<f32>;\n\
+         {}\n{}\n{entry}",
+        crate::hillaire::WGSL,
+        aerial_wgsl(),
+    )
+}
+
+/// The pass that makes the aerial table: in compute, or drawn.
+fn aerial_maker(
+    device: &wgpu::Device,
+    pass: SkyViewPass,
+    uniform: &wgpu::Buffer,
+    transmittance: &wgpu::TextureView,
+    multi_scattering: &wgpu::TextureView,
+    aerial: &wgpu::TextureView,
+) -> TableMaker {
+    let tables = |layout: &wgpu::BindGroupLayout, extra: Option<wgpu::BindGroupEntry<'_>>| {
+        let mut entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(transmittance),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(multi_scattering),
+            },
+        ];
+        entries.extend(extra);
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("atmosphere aerial table"),
+            layout,
+            entries: &entries,
+        })
+    };
+    match pass {
+        SkyViewPass::Compute => {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("atmosphere aerial table"),
+                source: wgpu::ShaderSource::Wgsl(aerial_table_source(pass).into()),
+            });
+            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("atmosphere aerial table"),
+                layout: None,
+                module: &module,
+                entry_point: Some("aerial_table"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+            let bind = tables(
+                &pipeline.get_bind_group_layout(0),
+                Some(wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(aerial),
+                }),
+            );
+            TableMaker::Compute { bind, pipeline }
+        }
+        SkyViewPass::Render => {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("atmosphere aerial table"),
+                source: wgpu::ShaderSource::Wgsl(aerial_table_source(pass).into()),
+            });
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("atmosphere aerial table"),
+                layout: None,
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("aerial_vertex"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("aerial_fragment"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: AERIAL_FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+            let bind = tables(&pipeline.get_bind_group_layout(0), None);
+            TableMaker::Render { bind, pipeline }
+        }
+    }
+}
+
 /// What the atmosphere's bind groups hold.
 struct Views {
     transmittance: wgpu::TextureView,
@@ -763,6 +1010,7 @@ struct Views {
     moon_view: wgpu::TextureView,
     night_lights: wgpu::TextureView,
     stars: wgpu::TextureView,
+    aerial: wgpu::TextureView,
     sampler: wgpu::Sampler,
 }
 
@@ -786,15 +1034,16 @@ impl Views {
                 resource: uniform.as_entire_binding(),
             },
             view(1, &self.transmittance),
-            view(2, &self.multi_scattering),
             wgpu::BindGroupEntry {
                 binding: 4,
                 resource: wgpu::BindingResource::Sampler(&self.sampler),
             },
             view(5, &self.irradiance),
             view(7, &self.night_lights),
+            view(9, &self.aerial),
         ];
         if sky_view {
+            entries.push(view(2, &self.multi_scattering));
             entries.push(view(3, &self.sky_view));
             entries.push(view(6, &self.moon_view));
             entries.push(view(8, &self.stars));
