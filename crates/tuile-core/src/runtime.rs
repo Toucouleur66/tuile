@@ -2395,6 +2395,8 @@ mod tests {
         );
     }
 
+    mod preload;
+
     use super::*;
     use crate::budget::{Bytes, DrawSet, GeoRect, LayerId, LayerReach, Policy, Role};
     use crate::fetch::FsFetcher;
