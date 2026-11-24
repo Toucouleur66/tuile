@@ -100,6 +100,11 @@ ENV CARGO_HOME=/cargo-home CARGO_TERM_COLOR=never CARGO_NET_GIT_FETCH_WITH_CLI=t
 FROM base AS test
 WORKDIR /repo
 COPY . .
+# The context's files carry their commit's time, and the target caches persist
+# per slot: a ref committed before a slot's last build would look unchanged to
+# cargo and run stale code. Stamp the tree now (this layer is only rebuilt when
+# the content changes, so an unchanged tree keeps its earlier stamp).
+RUN find . -path ./target -prune -o -type f -print0 | xargs -0 touch
 
 # The slot of the builder this run holds: one target directory per slot, so
 # two runs at once never share one (two trees in one target dir thrash it and
