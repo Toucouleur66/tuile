@@ -434,7 +434,8 @@ mod tests {
         let mut repaint = Repaint::default();
         let shown = picture();
         repaint.shown(shown.clone());
-        let changes: Vec<(&str, Box<dyn Fn(&mut Picture)>)> = vec![
+        type Change = (&'static str, Box<dyn Fn(&mut Picture)>);
+        let changes: Vec<Change> = vec![
             ("eye moved a millimetre", Box::new(|p| p.eyes[0].position.y += 1.0e-3)),
             ("view turned", Box::new(|p| {
                 p.eyes[0].direction = (p.eyes[0].direction + glam::DVec3::new(0.0, 0.0, 1.0e-5)).normalize()

@@ -622,14 +622,17 @@ fn sel_entries(
 /// finds, unless far finer than the need (`release_below_floor_value`).
 const LEFT_SHIFT: u32 = 6;
 
-/// Whether the prune keeps empty slot `s` at `now` — backing off after a
-/// failure (until 30 s after its want went), or wanted — and if so, the time
-/// from which it may let it go, as far as time alone tells
-/// (`Micros(u64::MAX)`: only when its want goes).
-/// The swap and chain marks of a resource, drawable or not, wanted at
+/// The swap and chain marks of resource `r`, drawable or not, wanted at
 /// urgency `u`: a drawable member of a swap the view waits on (a hole, a
-/// blocker, an ancestor), and of an ancestor's chain.
-fn swap_chain(drawable: bool, u: Option<Urgency>) -> (bool, bool) {
+/// blocker, an ancestor), and of an ancestor's chain. An ancestor's drape
+/// is neither: it is a preload of the ancestor's own score (`tile_wants`);
+/// the chain protects the ancestor's mesh, the fallback, and its drape is
+/// protected once drawn, as any drawn. The mark pass sets the marks by
+/// this rule and `check_marks` compares every slot's marks with it.
+fn swap_chain(r: ResourceId, drawable: bool, u: Option<Urgency>) -> (bool, bool) {
+    if matches!(r, ResourceId::Drape { .. }) && u == Some(Urgency::Ancestor) {
+        return (false, false);
+    }
     let swap = drawable
         && matches!(
             u,
@@ -638,6 +641,10 @@ fn swap_chain(drawable: bool, u: Option<Urgency>) -> (bool, bool) {
     (swap, drawable && u == Some(Urgency::Ancestor))
 }
 
+/// Whether the prune keeps empty slot `s` at `now` — backing off after a
+/// failure (until 30 s after its want went), or wanted — and if so, the time
+/// from which it may let it go, as far as time alone tells
+/// (`Micros(u64::MAX)`: only when its want goes).
 fn kept_until(a: &super::state::Arena, s: Slot, now: Micros, wants: Wants<'_>) -> Option<Micros> {
     let cold = a.cold(s);
     let unneeded = cold.unneeded_since();
@@ -2342,13 +2349,7 @@ impl Budget {
                 continue;
             };
             let u = wants.get(&r).map(|w| w.urgency);
-            let (mut swap, chain) = swap_chain(self.arena.has_gpu(s), u);
-            // An undrawn ancestor's drape is a preload of its own score
-            // (`tile_wants`): the chain protects the ancestor's mesh, the
-            // fallback; its drape is protected once drawn, as any drawn.
-            if matches!(r, ResourceId::Drape { .. }) && u == Some(Urgency::Ancestor) {
-                swap = false;
-            }
+            let (swap, chain) = swap_chain(r, self.arena.has_gpu(s), u);
             self.arena.mark(s, Mark::Swap, swap);
             self.arena.mark(s, Mark::Chain, chain);
         }
@@ -3390,7 +3391,7 @@ impl Budget {
             );
             assert_eq!(
                 (a.marked(s, Mark::Swap), a.marked(s, Mark::Chain)),
-                swap_chain(a.has_gpu(s), w.map(|w| w.urgency)),
+                swap_chain(r, a.has_gpu(s), w.map(|w| w.urgency)),
                 "the swap and chain marks of {r:?}"
             );
             // After a time gone back, the older group may hold what is
