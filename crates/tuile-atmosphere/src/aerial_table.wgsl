@@ -24,7 +24,13 @@
 // One 2D texture: its layers side by side, AERIAL_GRID a row of tiles of
 // AERIAL_WIDTH by AERIAL_HEIGHT texels; the veil — the light the air
 // scatters towards the eye, in the renderer's units — in the top half,
-// what it lets through in the bottom half. Filtered by the sampler within
+// the optical depth of what it lets through in the bottom half. The depth,
+// not the transmittance: along a line of sight that grazes the planet the
+// transmittance falls exponentially with the point's height and distance,
+// and read linearly between nodes it came out far too clear at the limb
+// (0.040 read for 0.023 marched, 21 code values, from 500 km); the depth
+// is the sum the march makes, close to linear between nodes, and the
+// transmittance is its exponential once read. Filtered by the sampler within
 // a layer: one texture unit against the ground's imagery, and half floats
 // — the veil is pre-exposed, as the picture is, so a night's air keeps its
 // digits.
@@ -197,8 +203,10 @@ fn aerial_veil(air: AirRay) -> vec4f {
     return vec4f(air.inscattered * atmosphere.illuminance.xyz, 1.0);
 }
 
+// What it lets through as an optical depth (`−ln T`), bounded so that an
+// opaque line of sight stays a finite half float.
 fn aerial_through(air: AirRay) -> vec4f {
-    return vec4f(air.transmittance, 1.0);
+    return vec4f(min(-log(max(air.transmittance, vec3f(1e-30))), vec3f(69.0)), 1.0);
 }
 
 // The air between the eye and `ground` (from the eye) as the table holds
@@ -209,10 +217,18 @@ struct AirSeen {
     through: vec3f,
 }
 
+// The air as the table holds it: the veil and the optical depth, both
+// read and blended linearly; the depth becomes a transmittance only once
+// blended (`air_seen`).
+struct AirDepth {
+    veil: vec3f,
+    depth: vec3f,
+}
+
 // The table's layer `k` read at azimuth coordinate `x` (0 to 1) and
 // distance `t`: bilinearly, by the sampler, between its four nodes about
 // the point.
-fn aerial_read(k: f32, x: f32, t: f32) -> AirSeen {
+fn aerial_read(k: f32, x: f32, t: f32) -> AirDepth {
     let y = aerial_row_at(aerial_layer(aerial_layer_height(k / f32(AERIAL_SLICES - 1u))), t);
     let w = f32(AERIAL_WIDTH);
     let h = f32(AERIAL_HEIGHT);
@@ -221,9 +237,9 @@ fn aerial_read(k: f32, x: f32, t: f32) -> AirSeen {
     // sampler never blends one layer into the next.
     let at = vec2f((k % grid) * w + x * (w - 1.0) + 0.5, floor(k / grid) * h + y * (h - 1.0) + 0.5);
     let size = vec2f(w * grid, 2.0 * f32(aerial_half_rows()));
-    var out: AirSeen;
+    var out: AirDepth;
     out.veil = textureSampleLevel(aerial_lut, lut_sampler, at / size, 0.0).rgb;
-    out.through = textureSampleLevel(aerial_lut, lut_sampler, at / size + vec2f(0.0, 0.5), 0.0).rgb;
+    out.depth = textureSampleLevel(aerial_lut, lut_sampler, at / size + vec2f(0.0, 0.5), 0.0).rgb;
     return out;
 }
 
@@ -253,9 +269,19 @@ fn aerial_crossing(l: AerialLayer, mu: f32) -> f32 {
 // perhaps into the sun's glare, and along its own the air grows with the
 // distance alone. Between the two, a blend over a few layers' spacings.
 fn air_seen(ground: vec3f) -> AirSeen {
+    let air = air_depth_seen(ground);
     var out: AirSeen;
+    out.veil = air.veil;
+    out.through = exp(-air.depth);
+    return out;
+}
+
+// `air_seen` before the depth's exponential: the veil and the optical
+// depth, blended between the table's nodes.
+fn air_depth_seen(ground: vec3f) -> AirDepth {
+    var out: AirDepth;
     out.veil = vec3f(0.0);
-    out.through = vec3f(1.0);
+    out.depth = vec3f(0.0);
     let t = length(ground);
     if (t <= 0.0) { return out; }
     let d = ground / t;
@@ -278,7 +304,7 @@ fn air_seen(ground: vec3f) -> AirSeen {
     let low = aerial_read(k0, x, t);
     let high = aerial_read(k1, x, t);
     out.veil = mix(low.veil, high.veil, fk);
-    out.through = mix(low.through, high.through, fk);
+    out.depth = mix(low.depth, high.depth, fk);
     // Along the line of sight, near the eye.
     let h0 = aerial_layer_height(k0 / (n - 1.0));
     let h1 = aerial_layer_height(k1 / (n - 1.0));
@@ -299,9 +325,9 @@ fn air_seen(ground: vec3f) -> AirSeen {
     let past = aerial_crossing(aerial_layer(aerial_layer_height(k_past / (n - 1.0))), mu);
     if (past < t) { return out; }
     var t_eye = 0.0;
-    var at_eye: AirSeen;
+    var at_eye: AirDepth;
     at_eye.veil = vec3f(0.0);
-    at_eye.through = vec3f(1.0);
+    at_eye.depth = vec3f(0.0);
     let h_eye = aerial_layer_height(k_eye / (n - 1.0));
     if ((h_eye - eye) * (height - eye) > 0.0) {
         t_eye = max(aerial_crossing(aerial_layer(h_eye), mu), 0.0);
@@ -310,6 +336,6 @@ fn air_seen(ground: vec3f) -> AirSeen {
     let at_past = aerial_read(k_past, x, past);
     let along = clamp((t - t_eye) / max(past - t_eye, 1e-3), 0.0, 1.0);
     out.veil = mix(out.veil, mix(at_eye.veil, at_past.veil, along), near);
-    out.through = mix(out.through, mix(at_eye.through, at_past.through, along), near);
+    out.depth = mix(out.depth, mix(at_eye.depth, at_past.depth, along), near);
     return out;
 }
