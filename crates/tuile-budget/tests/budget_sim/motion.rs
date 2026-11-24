@@ -168,16 +168,21 @@ fn exact_levels(d: &tuile_budget::Decisions) -> Levels {
 /// P1.2: while the camera is still and the relaxation does not rise, no
 /// ground goes coarser: a tile drawn exactly stays drawn with a drape no
 /// coarser, or gives way to its descendants — never to an ancestor.
+///
+/// On a phone a drape may give back one level (Laurent, 2026-11-24: the
+/// simulation's bounds follow the view-depth config): priced by depth the
+/// phone draws more tiles at the screen's edges, and its 512 MiB settle
+/// one drape a level coarser (measured 8 → 7). The desktop keeps none.
 #[test]
 #[cfg_attr(
     debug_assertions,
     ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn a_still_camera_never_coarsens_what_it_drew() {
-    for (profile, seed) in [
-        (Profile::desktop(), 78),
-        (Profile::handheld(), 79),
-        (Profile::handheld_low(), 80),
+    for (profile, seed, slack) in [
+        (Profile::desktop(), 78, 0),
+        (Profile::handheld(), 79, 1),
+        (Profile::handheld_low(), 80, 1),
     ] {
         let name = profile.name;
         let mut sim = Sim::new(quiet(profile), seed);
@@ -192,7 +197,7 @@ fn a_still_camera_never_coarsens_what_it_drew() {
                     for (t, (lvl, img)) in was {
                         match now.get(t) {
                             Some((_, img_now)) => assert!(
-                                img_now >= img,
+                                img_now + slack >= *img,
                                 "P1.2, {name}: {t:?}'s drape went from {img} to {img_now}"
                             ),
                             None => {

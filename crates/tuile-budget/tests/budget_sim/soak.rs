@@ -269,15 +269,19 @@ fn soak(minutes: u64) {
     // watermarks by copies nobody drew, the stall Laurent saw in Tuile.app
     // (`docs/explorations/budget-progressive-coarse-preload.md` §3). At full
     // detail the tour asks for more (1 753 waits) and waits a little longer:
-    // the bound is a third over the first window's, never a relaxed picture.
+    // the bound is over the first window's (below), never a relaxed picture.
     let relaxed_last = sim
         .log
         .iter()
         .filter(|l| l.now >= end.since(Micros(span)) && l.stats.sse_scale_milli > 1_000)
         .count();
     assert_eq!(relaxed_last, 0, "the last window is relaxed: the stall");
+    // A third over until the screen-space error was priced by view depth;
+    // 60 % since (Laurent, 2026-11-24: the simulation's time bounds follow
+    // the new config): the finer screen edges make the last window's tour
+    // ask for more, measured 150 → 233 ms.
     assert!(
-        last.p95_ms <= 1.4 * first.p95_ms,
+        last.p95_ms <= 1.6 * first.p95_ms,
         "I6: p95 {} → {} ms",
         first.p95_ms,
         last.p95_ms

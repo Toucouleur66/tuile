@@ -115,7 +115,10 @@ impl Profile {
         }
     }
 
-    /// A phone: 512 MiB, cellular, 60 fps, 4 s to converge.
+    /// A phone: 512 MiB, cellular, 60 fps, 4.5 s to converge — 4 s until
+    /// the screen-space error was priced by view depth (Laurent,
+    /// 2026-11-24: the simulation's time bounds follow the new config; a
+    /// still phone measured 4.15–4.32 s, the screen's edges being finer).
     pub fn handheld() -> Self {
         let mut b = BudgetConfig::interactive(Bytes::mib(512));
         b.max_in_flight = tuile_budget::PerClass([8, 4, 8, 2]);
@@ -128,7 +131,7 @@ impl Profile {
             budget: b,
             net: NetProfile::handheld(),
             dt: Micros(16_667),
-            converge_within: Micros::from_secs(4),
+            converge_within: Micros::from_millis(4_500),
             eyes: Eye::mono(Lens::portrait()),
             // A quarter of a 60 Hz frame at 1 MiB/ms: just above the cap.
             deadline: FrameDeadline::from_refresh(60, 250, 1 << 20),
