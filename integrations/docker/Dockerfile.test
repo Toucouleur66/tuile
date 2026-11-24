@@ -1,0 +1,154 @@
+# syntax=docker/dockerfile:1.10
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+#
+# The test suite of the workspace, run inside a BuildKit build: what the Linux
+# jobs of .github/workflows/ci.yml run, on the same stack, for a machine that
+# can build images but must not compile the workspace itself. The result is a
+# directory, not an image.
+#
+# Do not build this by hand: scripts/test-on-builder.sh makes the context (the
+# tracked files of a commit) and passes the arguments.
+#
+# The stack is CI's `test` job's (ubuntu-24.04):
+#   - Ubuntu 24.04, pinned by digest, because the Linux image is also the
+#     Vulkan driver: the GPU tests render through lavapipe, Mesa's software
+#     rasterizer (`mesa-vulkan-drivers libvulkan1`, as CI installs them).
+#     Ubuntu 26.04's lavapipe dies with SIGSEGV in tuile-film-gpu's headless
+#     and atmosphere tests (ci.yml, the `runs-on` comment): moving this base
+#     is a deliberate change, made with the driver it brings.
+#   - TUILE_REQUIRE_GPU=1: a GPU test that finds no adapter fails instead of
+#     passing empty.
+#   - RUSTFLAGS=-D warnings and CARGO_PROFILE_DEV_DEBUG=line-tables-only, as
+#     CI sets them; nextest at CI's version, with CI's profile (.config/nextest.toml).
+#
+# The steps (TEST_STEPS, space-separated; each one's log and exit code in the
+# output, every step run past a failure):
+#   test    cargo nextest run --profile ci ${CARGO_TEST_ARGS}    (CI: test)
+#   doc     cargo test --workspace --doc                         (CI: test)
+#   budget  the budget's simulation and properties, in release   (CI: budget-sim)
+#   clippy  cargo clippy --workspace --all-targets -D warnings   (CI: lint)
+#   wasm    the wasm32 check and clippy of CI's wasm-guard       (CI: wasm-guard)
+#
+# The output: <step>.log and <step>.exit for each step, junit.xml (the test
+# step's nextest report), junit-budget.xml, summary.txt, and exit-code (0, or
+# the first failing step's code).
+
+FROM ubuntu:24.04@sha256:562111b88caa79c71391c0c4d3c2114a7d5c35915c20561fd893cb1e07929e6b AS base
+
+# The compiler's needs (the -sys crates: aws-lc, jemalloc, zstd, lz4, webp,
+# alsa, wayland), git for the git dependencies, and the Vulkan loader with
+# lavapipe for the GPU tests.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       ca-certificates curl git build-essential cmake pkg-config python3 \
+       libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev \
+       mesa-vulkan-drivers libvulkan1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust: CI takes `stable`; here it is pinned to the stable of the day, so the
+# layer is not a stale `stable` cached forever. Move it with CI's stable.
+ARG RUSTUP_VERSION=1.29.3
+ARG RUSTUP_SHA256=b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55
+ARG RUST_VERSION=1.100.0
+ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
+RUN curl -fsSL -o /tmp/rustup-init \
+       "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init" \
+    && echo "${RUSTUP_SHA256}  /tmp/rustup-init" | sha256sum -c - \
+    && chmod +x /tmp/rustup-init \
+    && /tmp/rustup-init -y --no-modify-path --profile minimal \
+       --default-toolchain "${RUST_VERSION}" \
+       --component clippy --target wasm32-unknown-unknown \
+    && rm /tmp/rustup-init \
+    && rustc --version
+
+# cargo-nextest at CI's version (taiki-e/install-action, nextest@0.9.148),
+# pinned by checksum.
+ARG NEXTEST_VERSION=0.9.148
+ARG NEXTEST_SHA256=223ba936714cc861a9cdedad5a8eb664dfdd69d6fbdf6cea6aa8184f523290dc
+RUN curl -fsSL -o /tmp/nextest.tar.gz \
+       "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+    && echo "${NEXTEST_SHA256}  /tmp/nextest.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/nextest.tar.gz -C /usr/local/cargo/bin cargo-nextest \
+    && rm /tmp/nextest.tar.gz
+
+# sccache, used only when the build is given a bucket and a key
+# (sccache-env.sh): without them the steps compile as they would anyway.
+COPY integrations/docker/sccache-install.sh integrations/docker/sccache-env.sh /usr/local/share/tuile/
+RUN sh /usr/local/share/tuile/sccache-install.sh
+
+ENV CARGO_TERM_COLOR=never CARGO_NET_GIT_FETCH_WITH_CLI=true \
+    RUSTFLAGS="-D warnings" CARGO_PROFILE_DEV_DEBUG=line-tables-only \
+    TUILE_REQUIRE_GPU=1
+
+FROM base AS test
+WORKDIR /repo
+COPY . .
+
+ARG CARGO_TEST_ARGS="--workspace"
+ARG TEST_STEPS="test doc budget clippy wasm"
+ARG CARGO_JOBS=4
+ARG TEST_THREADS=4
+ARG SCCACHE_BUCKET=""
+ARG SCCACHE_REGION=""
+ARG SCCACHE_ENDPOINT=""
+ARG SCCACHE_PREFIX=""
+# Every step runs, whatever the one before it did; the build itself succeeds
+# whenever the steps could be started, so the logs always come out. The
+# result is in /out/exit-code, not in the build's status.
+RUN --mount=type=secret,id=sccache_key_id \
+    --mount=type=secret,id=sccache_secret \
+    --mount=type=cache,id=tuile-test-target,target=/repo/target \
+    --mount=type=cache,id=tuile-test-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=tuile-test-cargo-git,target=/usr/local/cargo/git \
+    <<'EOF'
+#!/bin/bash
+set -u
+mkdir -p /out
+export CARGO_BUILD_JOBS="${CARGO_JOBS}"
+. /usr/local/share/tuile/sccache-env.sh
+echo "=== $(rustc --version), $(cargo nextest --version | head -n1)"
+echo "=== vulkan: $(ls /usr/share/vulkan/icd.d/ 2>/dev/null | tr '\n' ' ')"
+echo "=== mesa: $(dpkg-query -W -f='${Version}' mesa-vulkan-drivers)"
+first_rc=0
+step() { # $1=name, then the commands, run by bash -c
+    local name="$1" rc
+    shift
+    echo "=== ${name}: start $(date +%T)" | tee "/out/${name}.log"
+    bash -c "$*" >> "/out/${name}.log" 2>&1; rc=$?
+    echo "$rc" > "/out/${name}.exit"
+    echo "=== ${name}: exit ${rc} $(date +%T)" | tee -a "/out/${name}.log" | tee -a /out/summary.txt
+    grep -E "Summary \[|^test result|^error(\[E[0-9]+\])?:|FAIL \[|TIMEOUT \[|SIGSEGV|panicked" "/out/${name}.log" \
+        | sort | uniq -c | sort -rn | sed -n 1,30p | sed "s/^/[${name}] /" | tee -a /out/summary.txt
+    [ "$first_rc" -ne 0 ] || first_rc=$rc
+}
+for s in ${TEST_STEPS}; do
+    case "$s" in
+        test)
+            step test "cargo nextest run --profile ci --test-threads ${TEST_THREADS} ${CARGO_TEST_ARGS}"
+            cp target/nextest/ci/junit.xml /out/junit.xml 2>/dev/null ;;
+        doc)
+            step doc "cargo test --workspace --doc" ;;
+        budget)
+            step budget "PROPTEST_CASES=10000 cargo nextest run --profile ci --cargo-profile release -p tuile-budget --test budget_sim --test budget_properties --test budget_core --test budget_signals \
+                && cp target/nextest/ci/junit.xml /out/junit-budget.xml \
+                && PROPTEST_CASES=10000 cargo nextest run --profile ci --cargo-profile release -p tuile-core --test budget_imagery" ;;
+        clippy)
+            step clippy "cargo clippy --workspace --all-targets -- -D warnings" ;;
+        wasm)
+            step wasm "cargo check --target wasm32-unknown-unknown -p tuile-budget -p tuile-ground -p tuile-core -p tuile-web -p tuile-wgpu -p tuile-planetary -p tuile-terrain -p tuile-camera -p tuile-atmosphere -p tuile-film-gpu -p tuile-ui -p tuile-film -p tuile-bevy \
+                && cargo clippy --target wasm32-unknown-unknown -p tuile-viewer -p tuile-web -p tuile-wgpu -p tuile-bevy -- -D warnings \
+                && cargo clippy --target wasm32-unknown-unknown -p tuile-bevy-viewer --features webgpu -- -D warnings \
+                && cargo clippy --target wasm32-unknown-unknown -p tuile-bevy-viewer --features webgl2 -- -D warnings" ;;
+        *)
+            echo "=== unknown step '${s}'" | tee -a /out/summary.txt
+            [ "$first_rc" -ne 0 ] || first_rc=2 ;;
+    esac
+done
+tuile_sccache_stop > /out/sccache.txt 2>&1
+echo "$first_rc" > /out/exit-code
+echo "=== tests: exit ${first_rc} $(date +%T)"
+EOF
+
+FROM scratch
+COPY --from=test /out /
