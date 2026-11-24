@@ -38,6 +38,7 @@
 use std::cmp::Reverse;
 use std::sync::atomic::Ordering::Relaxed;
 
+use super::blocked::{Blocked, BLOCKED};
 use super::config::FailurePolicy;
 use super::cost::within_drift;
 use super::decisions::{Decisions, DrapeChoice, DrawItem, Role, Start, UploadPlan};
@@ -277,12 +278,42 @@ fn walk_counts(st: &BudgetStats) -> (super::stats::Deficit, [u32; 4]) {
     (st.deficit, [st.exact, st.fallback, st.held, st.lost])
 }
 
+/// A tile under its need, waiting on `r` for `why`, counted at level `at`
+/// of class `c`: dated by the step it has been waited on since (`prev`,
+/// sorted by resource; `now` for a new one), listed for the next walk.
+#[allow(clippy::too_many_arguments)]
+fn note_blocked(
+    w: &mut WalkedLevels,
+    prev: &[(ResourceId, Micros)],
+    next: &mut Vec<(ResourceId, Micros)>,
+    r: ResourceId,
+    c: Class,
+    at: usize,
+    why: Blocked,
+    now: Micros,
+) {
+    let since = prev
+        .binary_search_by_key(&r, |e| e.0)
+        .map_or(now, |i| prev[i].1);
+    next.push((r, since));
+    let k = why.index();
+    let first = &mut w.blocked_since[c][at][k];
+    if w.blocked[c][at][k] == 0 || since < *first {
+        *first = since;
+    }
+    w.blocked[c][at][k] += 1;
+}
+
 /// What `Budget::level_stats` walks for: kept from one step to the next.
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct WalkedLevels {
     selected: PerClass<[u32; super::stats::LEVELS]>,
     drawn: PerClass<[u32; super::stats::LEVELS]>,
     under_need: PerClass<[u32; super::stats::LEVELS]>,
+    /// The tiles of `under_need` by why each waits, and the earliest
+    /// step each reason's tiles have been under their need since.
+    blocked: PerClass<[[u32; BLOCKED]; super::stats::LEVELS]>,
+    blocked_since: PerClass<[[Micros; BLOCKED]; super::stats::LEVELS]>,
     layer_drawn: [u32; super::stats::LAYERS],
 }
 
@@ -295,6 +326,11 @@ pub(super) struct Scratch {
     /// The walked part of the last step's statistics per level and
     /// layer (`level_stats`), kept for the still steps that read it again.
     walked_levels: Option<WalkedLevels>,
+    /// The resources the tiles under their need wait on, sorted, with the
+    /// step each has been waited on since (`walk_levels`); and the buffer
+    /// the next walk writes.
+    blocked_since: Vec<(ResourceId, Micros)>,
+    blocked_next: Vec<(ResourceId, Micros)>,
     walked_scale: u32,
     /// The deficit and the selection's counts the last walk was taken
     /// with: a step that moves them is not still for the walk, whatever
@@ -2027,7 +2063,7 @@ impl Budget {
             && self.scratch.walked_counts == Some(walk_counts(&st));
         self.scratch.walked_scale = d.sse_scale_milli;
         self.scratch.walked_counts = Some(walk_counts(&st));
-        self.level_stats(tiles, quiet, d, &mut st);
+        self.level_stats(tiles, quiet, d, wants, now, &mut st);
         self.put_back(taken);
         self.need = need;
 
@@ -2085,10 +2121,12 @@ impl Budget {
         tiles: &SortedMap<TileId, TileNeed>,
         quiet: bool,
         d: &Decisions,
+        wants: Wants<'_>,
+        now: Micros,
         st: &mut BudgetStats,
     ) {
         if !(quiet && self.scratch.walked_levels.is_some()) {
-            let walked = self.walk_levels(tiles, d);
+            let walked = self.walk_levels(tiles, d, wants, now);
             self.scratch.walked_levels = Some(walked);
         }
         let Some(w) = self.scratch.walked_levels.as_ref() else {
@@ -2103,6 +2141,18 @@ impl Budget {
         l.selected = w.selected;
         l.drawn = w.drawn;
         l.under_need = w.under_need;
+        l.blocked = w.blocked;
+        for c in Class::ALL {
+            for (lv, since) in w.blocked_since[c].iter().enumerate() {
+                for (k, at) in since.iter().enumerate() {
+                    l.blocked_oldest_ms[c][lv][k] = if w.blocked[c][lv][k] > 0 {
+                        u32::try_from(now.since(*at).0 / 1_000).unwrap_or(u32::MAX)
+                    } else {
+                        0
+                    };
+                }
+            }
+        }
         let y = &mut st.layers;
         y.drawn = w.layer_drawn;
         let (layer_tiles, layer_bytes) = a.gpu_by_layer();
@@ -2118,9 +2168,67 @@ impl Budget {
         }
     }
 
+    /// Why the tile waiting on `r` is not drawn at its need
+    /// ([`crate::blocked`]): read off `r`'s state as the step leaves it.
+    /// `mesh_class` is a mesh's class; `by_one`, a drape worn one level
+    /// under the level wanted, which waits for its deficit's dwell before
+    /// it is wanted (`tile_wants`).
+    fn blocked_of(
+        &self,
+        r: ResourceId,
+        mesh_class: Class,
+        wants: Wants<'_>,
+        now: Micros,
+        by_one: bool,
+    ) -> Blocked {
+        let a = &self.arena;
+        let class = self.class_of(r, mesh_class);
+        let epoch = self.epoch(r, class);
+        if let Some(s) = a.find(r) {
+            if let Load::Loading { source, .. } = a.load(s) {
+                return match source {
+                    Source::Local => Blocked::FetchingStore,
+                    Source::Network => Blocked::FetchingNetwork,
+                };
+            }
+            if a.has_transit(s) {
+                return Blocked::Uploading;
+            }
+            if a.gpu(s).is_some_and(|g| g.epoch == epoch) {
+                return Blocked::Swap;
+            }
+            if a.fresh_cpu(s, epoch).is_some() {
+                return Blocked::Decoded;
+            }
+            if a.backing_off(s, now) {
+                return Blocked::Backoff;
+            }
+        }
+        if wants.get(&r).is_none() {
+            return if by_one {
+                Blocked::Deferred
+            } else {
+                Blocked::NotRequested
+            };
+        }
+        if self.origin_holds_back(r, class, now) {
+            return Blocked::OriginDown;
+        }
+        Blocked::Queued
+    }
+
     /// The walked part of [`Self::level_stats`].
-    fn walk_levels(&mut self, tiles: &SortedMap<TileId, TileNeed>, d: &Decisions) -> WalkedLevels {
+    fn walk_levels(
+        &mut self,
+        tiles: &SortedMap<TileId, TileNeed>,
+        d: &Decisions,
+        wants: Wants<'_>,
+        now: Micros,
+    ) -> WalkedLevels {
         let mut chosen = std::mem::take(&mut self.scratch.chosen);
+        let since = std::mem::take(&mut self.scratch.blocked_since);
+        let mut next = std::mem::take(&mut self.scratch.blocked_next);
+        next.clear();
         let mut w = WalkedLevels::default();
         let a = &self.arena;
         for (t, n) in tiles.iter() {
@@ -2144,17 +2252,45 @@ impl Budget {
             if item.role == Role::Fallback {
                 for t in item.serves.iter() {
                     if let Some(n) = tiles.get(t) {
-                        w.under_need[n.need.class][level_index(n.need.level)] += 1;
+                        let at = level_index(n.need.level);
+                        w.under_need[n.need.class][at] += 1;
+                        let r = ResourceId::Mesh(*t);
+                        let why = self.blocked_of(r, n.need.class, wants, now, false);
+                        note_blocked(&mut w, &since, &mut next, r, n.need.class, at, why, now);
                     }
                 }
             }
         }
-        for (_, i) in self.down.items() {
+        for (k, i) in self.down.items() {
             let stats = i.item_stats();
             if i.role == Role::Exact && stats.under_levels > 0 {
-                w.under_need[Class::Drape][level_index(stats.tile_level)] += 1;
+                let at = level_index(stats.tile_level);
+                w.under_need[Class::Drape][at] += 1;
+                // The drape it waits on: its first layer worn under the
+                // level decided for it, at that level.
+                let t = k.tile();
+                if let Some(tn) = tiles.get(&t) {
+                    self.drapes_of(t, tn, &mut chosen);
+                }
+                let short = chosen.iter().find_map(|&(layer, n)| {
+                    let worn = i.drape(layer).map(|x| x.level);
+                    worn.is_none_or(|l| l < n).then_some((layer, n, worn))
+                });
+                let (r, by_one) = match short {
+                    Some((layer, n, worn)) => (
+                        ResourceId::drape(t, layer, n),
+                        worn.is_some_and(|l| l.saturating_add(1) == n),
+                    ),
+                    None => (*k, false),
+                };
+                let why = self.blocked_of(r, Class::Drape, wants, now, by_one);
+                note_blocked(&mut w, &since, &mut next, r, Class::Drape, at, why, now);
             }
         }
+        next.sort_unstable_by_key(|e| e.0);
+        next.dedup_by_key(|e| e.0);
+        self.scratch.blocked_since = next;
+        self.scratch.blocked_next = since;
         // The layers' GPU copies: kept by the arena (`gpu_by_layer`).
 
         self.scratch.chosen = chosen;

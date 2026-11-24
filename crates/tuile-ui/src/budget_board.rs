@@ -31,7 +31,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use tuile_core::budget::{BudgetSignals, Class, LAYERS, LEVELS};
+use tuile_core::budget::{BudgetSignals, Class, BLOCKED, BLOCKED_REASONS, LAYERS, LEVELS};
 
 use crate::text::{Font, Label, Mask};
 use crate::{Mesh, Vertex};
@@ -209,6 +209,10 @@ pub struct LevelCell {
     pub deficit: bool,
     /// The level holds waste ([`level_waste`]).
     pub waste: bool,
+    /// The tiles of `under` by why each waits
+    /// (`tuile_budget::Blocked`'s index), and the oldest one's age, ms.
+    pub blocked: [u32; BLOCKED],
+    pub blocked_oldest_ms: [u32; BLOCKED],
 }
 
 /// The budget's deficit for `c`'s kind this step: meshes for the meshes,
@@ -239,6 +243,16 @@ impl LevelCell {
             queued: v.queued[c][l],
             deficit: class_deficit(s, c) > 0,
             waste: level_waste(s, c, l).under != [0, 0],
+            blocked: if class_deficit(s, c) > 0 {
+                v.blocked[c][l]
+            } else {
+                [0; BLOCKED]
+            },
+            blocked_oldest_ms: if class_deficit(s, c) > 0 {
+                v.blocked_oldest_ms[c][l]
+            } else {
+                [0; BLOCKED]
+            },
         }
     }
 
@@ -2570,6 +2584,7 @@ pub fn explain_residency(
         out.push(line(Swatch::None, format!("selected: {}", x.selected)));
     }
     out.extend(row_mark(x, long));
+    out.extend(blocked_lines(x));
     out
 }
 
@@ -2629,6 +2644,36 @@ pub fn explain_under(c: Class, l: usize, x: &LevelCell, stalls: &StallWatch) -> 
         }
     }
     out.extend(row_mark(x, stalls.level_long(c, l)));
+    out.extend(blocked_lines(x));
+    out
+}
+
+/// Why a level's tiles under their need wait: a line per reason, the most
+/// tiles first, with how long the oldest has waited. Nothing when no tile
+/// is under its need.
+pub fn blocked_lines(x: &LevelCell) -> Vec<Legend> {
+    let mut why: Vec<(u32, usize)> = x
+        .blocked
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| **n > 0)
+        .map(|(k, n)| (*n, k))
+        .collect();
+    if why.is_empty() {
+        return Vec::new();
+    }
+    why.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let mut out = vec![line(Swatch::None, "why they wait:".to_owned())];
+    for (n, k) in why {
+        out.push(line(
+            Swatch::None,
+            format!(
+                "  {n} {} (oldest {:.1} s)",
+                BLOCKED_REASONS[k].words(),
+                f64::from(x.blocked_oldest_ms[k]) / 1_000.0
+            ),
+        ));
+    }
     out
 }
 
@@ -3276,6 +3321,17 @@ pub mod fixtures {
         for (l, under) in [(15, 80), (16, 70), (17, 59)] {
             s.levels.under_need[Class::Drape][l] = under;
         }
+        // Why they wait: at level 16, 52 drapes handed to the GPU and not
+        // acknowledged, 18 one level coarse and deferred.
+        use tuile_core::budget::Blocked;
+        let at16 = &mut s.levels.blocked[Class::Drape][16];
+        at16[Blocked::Uploading.index()] = 52;
+        at16[Blocked::Deferred.index()] = 18;
+        let age16 = &mut s.levels.blocked_oldest_ms[Class::Drape][16];
+        age16[Blocked::Uploading.index()] = 3_400;
+        age16[Blocked::Deferred.index()] = 12_000;
+        s.levels.blocked[Class::Drape][15][Blocked::Uploading.index()] = 80;
+        s.levels.blocked[Class::Drape][17][Blocked::NotRequested.index()] = 59;
         s.under_need_tiles = [0, 209];
         level(&mut s, Class::Drape, 21, 1522, 0, 0, 1522 * 2);
         s.layers.gpu_tiles[0] = 3900;
@@ -3674,6 +3730,33 @@ mod tests {
         assert!(attention(&few, &StallWatch::at_once())
             .iter()
             .all(|i| i.severity != Severity::Waste));
+    }
+
+    /// **The red triangle says why** (Laurent, 2026-11-24): hovering a
+    /// level's mark lists why its tiles under their need wait, the most
+    /// first, each with the oldest one's age — the residency region (the
+    /// mark's) and the under-need cell alike; a level with nothing under
+    /// its need says nothing of it.
+    #[test]
+    fn the_red_triangle_lists_why_its_tiles_wait() {
+        let s = fixtures::stalled();
+        let x = LevelCell::of(&s, Class::Drape, 16);
+        let stalls = StallWatch::at_once();
+        assert_eq!(level_severity(&x, true), Severity::Alert, "a red triangle");
+        let words = |v: Vec<Legend>| v.into_iter().map(|l| l.text).collect::<Vec<_>>();
+        let why = [
+            "why they wait:".to_owned(),
+            "  52 uploading or encoding on the GPU (oldest 3.4 s)".to_owned(),
+            "  18 one level coarse, deferred until worth its cost (oldest 12.0 s)".to_owned(),
+        ];
+        for legend in [
+            words(explain_residency(&s, Class::Drape, 16, &x, true)),
+            words(explain_under(Class::Drape, 16, &x, &stalls)),
+        ] {
+            assert!(legend.ends_with(&why), "{legend:#?}");
+        }
+        let ok = LevelCell::of(&s, Class::Drape, 12);
+        assert_eq!(blocked_lines(&ok), Vec::new());
     }
 
     /// A healthy step has nothing to look at.

@@ -86,6 +86,13 @@ pub struct LevelStats {
     /// level; exactly drawn tiles wearing a drape under the level needed,
     /// in the drape class at the tile's level.
     pub under_need: PerClass<[u32; LEVELS]>,
+    /// The tiles of `under_need`, by why each waits
+    /// ([`crate::blocked::Blocked`]'s index): a level's reasons sum to its
+    /// `under_need`.
+    pub blocked: PerClass<[[u32; crate::blocked::BLOCKED]; LEVELS]>,
+    /// The age of the oldest of them, by reason, milliseconds since the
+    /// step it first fell under its need (0 when none).
+    pub blocked_oldest_ms: PerClass<[[u32; crate::blocked::BLOCKED]; LEVELS]>,
     /// Loads in flight and loads ranked but not started, need and prefetch.
     pub in_flight: PerClass<[[u32; 2]; LEVELS]>,
     pub queued: PerClass<[[u32; 2]; LEVELS]>,

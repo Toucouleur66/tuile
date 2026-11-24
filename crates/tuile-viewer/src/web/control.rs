@@ -260,6 +260,10 @@ fn window_numbers(s: &mut tuile_core::budget::BudgetSignals, f: &mut dyn FnMut(&
             small(&mut v.drawn[c][l], f);
             small(&mut v.selected[c][l], f);
             small(&mut v.under_need[c][l], f);
+            for k in 0..tuile_core::budget::BLOCKED {
+                small(&mut v.blocked[c][l][k], f);
+                small(&mut v.blocked_oldest_ms[c][l][k], f);
+            }
             for k in 0..2 {
                 small(&mut v.in_flight[c][l][k], f);
                 small(&mut v.queued[c][l][k], f);
@@ -339,6 +343,11 @@ mod tests {
         use tuile_core::budget::Class;
         s.levels.queued[Class::Drape][14] = [3, 2];
         s.levels_seen[Class::Drape] = 1 << 14;
+        // Why its tiles under their need wait, and the oldest's age.
+        s.levels.under_need[Class::Drape][14] = 6;
+        s.levels.blocked[Class::Drape][14][tuile_core::budget::Blocked::Uploading.index()] = 6;
+        s.levels.blocked_oldest_ms[Class::Drape][14]
+            [tuile_core::budget::Blocked::Uploading.index()] = 2_400;
         s.layer_loads_total[1] = [1, 2, 3, 4, 5];
         s.layers_seen = 0b11;
         s.decide_micros.count = 9;

@@ -343,6 +343,13 @@ pub struct BudgetSignals {
     /// The levels of each class [`Self::levels`] has named since the
     /// meter's start, one bit each.
     pub levels_seen: PerClass<u32>,
+    /// The reasons ([`crate::blocked::Blocked`]) each level of each class
+    /// has had a tile under its need for since the meter's start, one bit
+    /// each: the gauges `blocked_tiles{class,level,reason}` (from
+    /// `levels.blocked`) and `blocked_oldest_seconds{class,reason}` (the
+    /// oldest of the class's levels, from `levels.blocked_oldest_ms`) are
+    /// exposed from a reason's first tile, and stay so.
+    pub blocked_seen: PerClass<[u16; LEVELS]>,
     /// `level_events_total{class,kind,level}`, the sums of
     /// [`Self::levels`]' counters: `[start, completion, wasted, release]`.
     pub level_events_total: PerClass<[[u64; 4]; LEVELS]>,
@@ -660,6 +667,8 @@ pub mod labels {
     pub const TERM: [&str; 5] = crate::score::TERM_LABELS;
     /// `kind` of `waits_total`, `wait_p50_ms`, `wait_p95_ms`.
     pub const WAIT_KIND: [&str; 3] = crate::waits::WAIT_KINDS;
+    /// `reason` of `blocked_tiles` and `blocked_oldest_seconds`.
+    pub const BLOCKED: [&str; crate::blocked::BLOCKED] = crate::blocked::BLOCKED_LABELS;
     /// `reason` of `reloads_total`.
     pub const RELOAD: [&str; 4] = ["headroom", "below_floor_value", "make_room", "recycled"];
     /// `q` of `score_quantile`.
@@ -783,6 +792,37 @@ impl BudgetSignals {
             }
         }
         let v = &self.levels;
+        // Why the tiles under their need wait (`crate::blocked`).
+        for c in Class::ALL {
+            let mut oldest = [None::<u32>; crate::blocked::BLOCKED];
+            for (l, seen) in self.blocked_seen[c].iter().enumerate() {
+                for (k, reason) in labels::BLOCKED.iter().enumerate() {
+                    if seen & (1 << k) == 0 {
+                        continue;
+                    }
+                    out.push((
+                        "blocked_tiles",
+                        vec![
+                            ("class", labels::class(c)),
+                            ("level", labels::LEVEL[l]),
+                            ("reason", reason),
+                        ],
+                        f64::from(v.blocked[c][l][k]),
+                    ));
+                    let ms = v.blocked_oldest_ms[c][l][k];
+                    oldest[k] = Some(oldest[k].unwrap_or(0).max(ms));
+                }
+            }
+            for (k, ms) in oldest.iter().enumerate() {
+                if let Some(ms) = ms {
+                    out.push((
+                        "blocked_oldest_seconds",
+                        vec![("class", labels::class(c)), ("reason", labels::BLOCKED[k])],
+                        f64::from(*ms) / 1_000.0,
+                    ));
+                }
+            }
+        }
         for c in Class::ALL {
             let seen = self.levels_seen[c];
             for l in (0..LEVELS).filter(|l| seen & (1 << l) != 0) {
@@ -1562,6 +1602,15 @@ impl BudgetObserver for BudgetMeter {
             s.transfer_bytes[c] = st.transfer[c].0;
         }
         s.levels = st.levels;
+        for c in Class::ALL {
+            for (l, seen) in s.blocked_seen[c].iter_mut().enumerate() {
+                for (k, n) in st.levels.blocked[c][l].iter().enumerate() {
+                    if *n > 0 {
+                        *seen |= 1 << k;
+                    }
+                }
+            }
+        }
         let y = &st.layers;
         s.layers = *y;
         for i in 0..LAYERS {

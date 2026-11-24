@@ -341,6 +341,29 @@ eviction's reason. The 5-minute soak prints the same split for its first and las
 told the same way from its mesh waits and the decisions' evictions — comparable with a
 budget that predates the classification.
 
+### Why a tile under its need is blocked (`tuile_budget::blocked`)
+
+A level's red triangle on the board says that tiles are under their need there with nothing
+in flight or queued at that level for a second; it did not say why. Every tile the per-level
+`under_need` counts — a wanted mesh drawn by an ancestor, at the wanted level; an exactly drawn
+tile wearing a drape under the level decided for it, at the tile's level — now carries one
+reason, read after the step from the state of the resource it waits on (its mesh; the drape
+of its first short layer at the decided level): `not_requested` (not among the wants),
+`deferred` (worn one level coarse: its own level is not wanted until the deficit's dwell is
+paid, §5.3), `queued`, `origin_down`, `backoff` (a failed load waiting out its retry),
+`fetching_store`, `fetching_network`, `decoded` (waiting for a delivery), `uploading` (handed to
+the consumer and not acknowledged: the upload or the GPU encode, deferred by the frame's lanes
+or under way), `swap` (drawable, its swap group not complete). A level's reasons sum to its
+`under_need`. A tile is dated by the step it fell under its need, whatever its reason since;
+the step's own time, never a clock, and none of it in `decide`: the walk that counts
+`under_need` classifies.
+
+`LevelStats::blocked` and `blocked_oldest_ms` carry them; series
+`tuile_budget_blocked_tiles{class,level,reason}` and
+`tuile_budget_blocked_oldest_seconds{class,reason}`, each exposed from its first tile. On the
+board, the hover of a level's mark (its residency region) and of its under-need cell lists the
+reasons, the most tiles first, each with the oldest one's age.
+
 ### Grafana panels (proposal, to port into the STL dashboards)
 
 ```json
