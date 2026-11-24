@@ -180,7 +180,7 @@ fn exact_levels(d: &tuile_budget::Decisions) -> Levels {
 )]
 fn a_still_camera_never_coarsens_what_it_drew() {
     for (profile, seed, slack) in [
-        (Profile::desktop(), 78, 1),
+        (Profile::desktop(), 78, 0),
         (Profile::handheld(), 79, 1),
         (Profile::handheld_low(), 80, 1),
     ] {
@@ -196,10 +196,6 @@ fn a_still_camera_never_coarsens_what_it_drew() {
                 if scale <= *was_scale {
                     for (t, (lvl, img)) in was {
                         match now.get(t) {
-                            // One level of give (Laurent, 2026-11-24): the
-                            // replacement rules may leave a drape one level
-                            // under what it wore while a sibling or a
-                            // coarser tile waits; never more.
                             Some((_, img_now)) => assert!(
                                 img_now + slack >= *img,
                                 "P1.2, {name}: {t:?}'s drape went from {img} to {img_now}"
@@ -564,10 +560,6 @@ fn a_cold_climb_never_shows_a_hole() {
         let start = low.last().map(|(_, d)| deepest(d)).expect("steps");
         let from = sim.now.0 as f64 / 1e6;
         sim.run(7.0, &|t| climb(3.0 + t - from));
-        // The fine stays until its replacement wears its own imagery
-        // (Laurent, 2026-11-24): on a phone's network the coarse drapes of
-        // the top of the climb come in over a few more seconds at rest.
-        sim.run(3.0, &|_| climb(10.0));
         let (_, last) = sim.step(climb(10.0));
         assert!(
             deepest(&last) + 2 <= start,
@@ -645,12 +637,8 @@ fn newly_visible_ground_is_covered_the_step_it_appears() {
                 up = parent(a);
             }
             if let Some(depth) = depth {
-                // Four levels on a phone (Laurent, 2026-11-24): the
-                // replacement rules keep a parent standing while its
-                // children load on a slower network; three elsewhere.
-                let bound = if name.starts_with("handheld") { 4 } else { 3 };
                 assert!(
-                    depth <= bound,
+                    depth <= 3,
                     "P4.1 (b), {name}: {tile:?} (level {lvl}) covered {depth} levels up"
                 );
             }
@@ -764,16 +752,9 @@ fn an_orbit_keeps_its_target_exact() {
                     panic!("P4.4, {name}: the target is not wanted");
                 };
                 let item = d.draw.get(ResourceId::Mesh(*tile));
-                // All or nothing (Laurent, 2026-11-24): while the target's
-                // tile refines, its parent, drawn, stands for it and its
-                // siblings until all of them are in.
-                let by_parent = parent(*tile).is_some_and(|p| {
-                    d.draw
-                        .get(ResourceId::Mesh(p))
-                        .is_some_and(|i| i.role == Role::Exact || i.serves.contains(tile))
-                });
-                assert!(
-                    item.map(|i| i.role) == Some(Role::Exact) || (item.is_none() && by_parent),
+                assert_eq!(
+                    item.map(|i| i.role),
+                    Some(Role::Exact),
                     "P4.4, {name}: the target's tile {tile:?} not exact at {:?}",
                     sim.now
                 );

@@ -89,18 +89,6 @@ pub(super) fn geometric_parent(t: TileId) -> Option<TileId> {
     (l > 0).then(|| TileId::from_terrain(l - 1, x / 2, y / 2).with_tag(t.tag()))
 }
 
-/// The quadtree's four children of `p`, when its id is a coordinate whose
-/// children are coordinates too.
-pub(super) fn geometric_children(p: TileId) -> Option<[TileId; 4]> {
-    let (l, x, y) = coord(p)?;
-    (l + 1 < DEPTH).then(|| {
-        let c = |dx: u64, dy: u64| {
-            TileId::from_terrain(l + 1, 2 * x + dx, 2 * y + dy).with_tag(p.tag())
-        };
-        [c(0, 0), c(1, 0), c(0, 1), c(1, 1)]
-    })
-}
-
 impl Budget {
     /// Whether the walk from `h` up the parent links `info` tells is
     /// geometric — each link the quadtree's own, each tile's level its id's
@@ -260,9 +248,6 @@ mod tests {
         }
         assert_eq!(geometric_parent(t(4, 11, 5)), Some(a));
         assert_eq!(geometric_parent(t(0, 0, 0)), None);
-        for c in geometric_children(a).unwrap() {
-            assert_eq!(geometric_parent(c), Some(a));
-        }
         // Another source's tiles are elsewhere.
         assert!(!r.contains(&morton(t(4, 11, 5).with_tag(1)).unwrap()));
         // Not a coordinate: no key.

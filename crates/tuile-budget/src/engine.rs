@@ -38,8 +38,6 @@
 use std::cmp::Reverse;
 use std::sync::atomic::Ordering::Relaxed;
 
-use smallvec::SmallVec;
-
 use super::blocked::{Blocked, BLOCKED};
 use super::config::FailurePolicy;
 use super::cost::within_drift;
@@ -452,14 +450,6 @@ pub(super) enum Job {
 /// The layers a need asks for, in stacking order.
 fn layers(img: &WantedImagery) -> &[LayerReach] {
     img.layers()
-}
-
-/// The layers `img` asks for, each once, in layer order.
-fn layers_of_need(img: &WantedImagery) -> SmallVec<[LayerId; 4]> {
-    let mut v: SmallVec<[LayerId; 4]> = layers(img).iter().map(|x| x.layer).collect();
-    v.sort_unstable();
-    v.dedup();
-    v
 }
 
 /// The floor swap group `r` belongs to (D-A1), if any: a floor tile's mesh
@@ -1318,65 +1308,31 @@ impl Budget {
 
     /// The meshes that stand for drawn tile `t`, at levels up to `cap`, into
     /// `out` as (mesh, role): the tile itself when drawable and dressed for
-    /// the layers of `needs` (its drape needs, (layer, level)); else the
-    /// finer tiles it held last step (zoom-out); else its nearest drawable,
-    /// dressed ancestor. `reach` gets the tiles read beyond the tile's own
-    /// mesh and drapes (the held tiles below it, read from the ancestry, are
-    /// its own: a change to them reads it again). A tile drawn by nothing is
-    /// lost only if it is ground (`class`, P1.1): where a 3D Tiles tile is
-    /// not drawn yet, the ground under it is.
-    ///
-    /// Two rules of replacement (Laurent, 2026-11-24) bound "drawn as
-    /// itself":
-    ///
-    /// - all or nothing on a refine: while its parent can stand in, a tile
-    ///   is not drawn as itself unless every wanted sibling can be
-    ///   ([`Self::siblings_drawable`]): the parent stands for all of them,
-    ///   then gives way to all of them in one step — never two levels inside
-    ///   one parent;
-    /// - the fine until its replacement on a zoom-out: while finer tiles
-    ///   are held under it, a tile replaces them only once it wears, for
-    ///   every layer, a drape at its need ([`Self::replaces_held`]); until
-    ///   then they stay, its nearest drawable ancestor standing for what
-    ///   they do not cover.
-    ///
-    /// All or nothing applies to a refine only: a tile drawn last step is
-    /// never taken back because a sibling entered the need (a view that
-    /// widens or turns keeps what it drew).
-    ///
-    /// Neither costs ground: a tile with no parent to stand for it and its
-    /// siblings is drawn as soon as it can be, and a tile with nothing held
-    /// under it is drawn in whatever drape it has.
-    // The selection's inputs, as each caller holds them: no struct of its
-    // own for three callers.
-    #[allow(clippy::too_many_arguments)]
+    /// `layers`; else the finer tiles it held last step (zoom-out); else its
+    /// nearest drawable, dressed ancestor. `reach` gets the tiles read
+    /// beyond the tile's own mesh and drapes (the held tiles below it, read
+    /// from the ancestry, are its own: a change to them reads it again).
+    /// A tile drawn by nothing is lost only if it is ground (`class`, P1.1):
+    /// where a 3D Tiles tile is not drawn yet, the ground under it is.
     pub(super) fn select_tile(
         &self,
         t: TileId,
         class: Class,
-        needs: &[(LayerId, u32)],
-        tiles: &SortedMap<TileId, TileNeed>,
+        layers: &[LayerId],
         cap: Option<u32>,
         out: &mut Vec<(ResourceId, Role)>,
         reach: &mut Reach,
     ) -> TileSelection {
         out.clear();
         let mut sel = TileSelection::default();
-        let own: SmallVec<[LayerId; 4]> = needs.iter().map(|x| x.0).collect();
-        let shown = |x: TileId, reach: &mut Reach| self.shown(x, &own, cap, reach);
-        // All or nothing applies to a refine: a tile drawn last step (as
-        // itself or held) is never taken back for a sibling.
-        let refining = !self.held_last.contains_key(&t);
-        // Held back only where an ancestor can stand for what the held
-        // tiles do not cover: never a hole.
-        if shown(t, reach)
-            && (!refining || self.siblings_drawable(t, &own, tiles, cap, reach))
-            && (!self
-                .held_below(t)
-                .fold(false, |any, h| shown(h, reach) | any)
-                || self.replaces_held(t, needs, reach)
-                || !self.ancestors(t).any(|a| shown(a, reach)))
-        {
+        let shown = |x: TileId, reach: &mut Reach| {
+            reach.saw(x, PLACE | MESH | DRAPES);
+            let level = self.tiles.get(&x).map_or(0, |i| i.level);
+            cap.is_none_or(|c| level <= c)
+                && self.drawable(ResourceId::Mesh(x))
+                && self.dressable(x, layers, reach)
+        };
+        if shown(t, reach) {
             out.push((ResourceId::Mesh(t), Role::Exact));
             sel.exact = true;
             return sel;
@@ -1402,81 +1358,6 @@ impl Budget {
         out.sort_unstable();
         out.dedup();
         sel
-    }
-
-    /// Whether `x` can be drawn, up to level `cap`: its mesh drawable and
-    /// dressed for `layers`. `reach` gets what it read.
-    fn shown(&self, x: TileId, layers: &[LayerId], cap: Option<u32>, reach: &mut Reach) -> bool {
-        reach.saw(x, PLACE | MESH | DRAPES);
-        let level = self.tiles.get(&x).map_or(0, |i| i.level);
-        cap.is_none_or(|c| level <= c)
-            && self.drawable(ResourceId::Mesh(x))
-            && self.dressable(x, layers, reach)
-    }
-
-    /// All or nothing on a refine: whether drawn tile `t` may be drawn as
-    /// itself as far as its siblings tell — its parent cannot stand in
-    /// (not drawn last step, not drawable and dressed for `layers`, or not
-    /// the quadtree's), or
-    /// every sibling the need wants drawn can be drawn too. A 3D Tiles
-    /// tile, whose siblings no quadtree names, is not held back. `reach`
-    /// gets the parent and the siblings read; a sibling's need is read
-    /// again through the selection pass (`downstream`: the siblings of a
-    /// tile named for its shape, place or membership are read again).
-    fn siblings_drawable(
-        &self,
-        t: TileId,
-        layers: &[LayerId],
-        tiles: &SortedMap<TileId, TileNeed>,
-        cap: Option<u32>,
-        reach: &mut Reach,
-    ) -> bool {
-        let Some(p) = self.tiles.get(&t).and_then(|i| i.parent()) else {
-            return true;
-        };
-        if super::held::geometric_parent(t) != Some(p) {
-            return true;
-        }
-        let Some(kids) = super::held::geometric_children(p) else {
-            return true;
-        };
-        // The parent stays (Laurent's words): it holds its children back
-        // only while it is drawn — a parent no longer on screen is not
-        // brought back for them.
-        if !self.held_last.contains_key(&p) || !self.shown(p, layers, cap, reach) {
-            return true;
-        }
-        kids.into_iter().filter(|s| *s != t).all(|s| {
-            self.walk(1);
-            let Some(tn) = tiles.get(&s).filter(|tn| tn.membership == Membership::Drawn) else {
-                return true;
-            };
-            if self.tiles.get(&s).and_then(|i| i.parent()) != Some(p) {
-                return true;
-            }
-            let own: SmallVec<[LayerId; 4]> = if Self::draped(tn) {
-                tn.need
-                    .imagery
-                    .as_ref()
-                    .map(layers_of_need)
-                    .unwrap_or_default()
-            } else {
-                SmallVec::new()
-            };
-            self.shown(s, &own, cap, reach)
-        })
-    }
-
-    /// The fine until its replacement: whether drawn tile `t` wears, for
-    /// every layer of `needs`, a drawable drape at its need or finer — on
-    /// itself or an ancestor, the drape `best_drape_for` would choose — so
-    /// that it may replace the finer tiles held under it. `reach` gets the
-    /// ancestors read.
-    fn replaces_held(&self, t: TileId, needs: &[(LayerId, u32)], reach: &mut Reach) -> bool {
-        needs.iter().all(|&(layer, n)| {
-            self.best_drape_for(t, layer, n, reach)
-                .is_some_and(|d| d.level >= n)
-        })
     }
 
     /// The draw item of `mesh`, drawn for `run` — (tile served, role) by
@@ -1661,12 +1542,6 @@ impl Budget {
                 let du = match tn.membership {
                     Membership::Blocker => Some(Urgency::Blocker),
                     _ if !mesh_drawable => Some(urgency),
-                    // Its mesh drawn only as a stand-in for other tiles
-                    // while it is held back itself (the fine until its
-                    // replacement): its own drape is wanted now.
-                    Membership::Drawn if item.is_some_and(|i| i.role == Role::Fallback) => {
-                        Some(Urgency::Drape)
-                    }
                     // A ring tile not drawn (the neighbourhood, the views
                     // ahead): its drapes are preloads too, of the tile's own
                     // score — never the present need's. An ancestor of what
