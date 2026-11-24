@@ -335,6 +335,19 @@ pub(crate) fn token(host: &dyn Host, variable: &str) -> Result<(String, TokenFro
     if let Some(token) = filled(host.configured()) {
         return Ok((token, TokenFrom::ConfigFile));
     }
+    // The person's token file before the Keychain (Laurent, 2026-11-24): a
+    // file on disk is read without asking anyone, while the Keychain asks
+    // for the login password every time a rebuilt viewer it has not seen
+    // reads its item. The Keychain is only touched when there is no file.
+    let file = token_file(host);
+    let found = file
+        .as_deref()
+        .and_then(|path| host.read(path).ok())
+        .as_deref()
+        .and_then(token_line);
+    if let (Some(token), Some(file)) = (found, file.clone()) {
+        return Ok((token, TokenFrom::File(file)));
+    }
     if let Some(token) = filled(host.secret(variable)) {
         return Ok((token, TokenFrom::SecureStorage));
     }
@@ -344,16 +357,7 @@ pub(crate) fn token(host: &dyn Host, variable: &str) -> Result<(String, TokenFro
     if let Some(token) = filled(host.bundled(&bundled_key(variable))) {
         return Ok((token, TokenFrom::Bundle));
     }
-    let file = token_file(host);
-    let found = file
-        .as_deref()
-        .and_then(|path| host.read(path).ok())
-        .as_deref()
-        .and_then(token_line);
-    match (found, file) {
-        (Some(token), Some(file)) => Ok((token, TokenFrom::File(file))),
-        (_, file) => Err(MissingToken { file }),
-    }
+    Err(MissingToken { file })
 }
 
 /// Whether this executable sits inside an application bundle — which is to
@@ -426,9 +430,28 @@ mod tests {
         }
     }
 
-    /// A configuration file opened in the application keeps its token in
-    /// secure storage, which comes after the environment and the session's
-    /// own file, and before everything a phone or a file on disk holds.
+    /// The token file comes before the Keychain, so a rebuilt viewer reads
+    /// its token without a Keychain dialog; the Keychain is read only when
+    /// there is no file, and it still comes before settings and the bundle.
+    #[test]
+    fn the_token_file_is_read_before_the_keychain() {
+        let mut host = mac(&[], Some("from-file"));
+        host.secrets.insert(TOKEN_VARIABLE.into(), "from-keychain");
+        assert_eq!(
+            token(&host, TOKEN_VARIABLE),
+            Ok(("from-file".into(), TokenFrom::File(PathBuf::from(FILE))))
+        );
+        let mut no_file = mac(&[], None);
+        no_file.secrets.insert(TOKEN_VARIABLE.into(), "from-keychain");
+        no_file.settings.insert(TOKEN_VARIABLE.into(), "from-settings");
+        assert_eq!(
+            token(&no_file, TOKEN_VARIABLE),
+            Ok(("from-keychain".into(), TokenFrom::SecureStorage))
+        );
+    }
+
+    /// A configuration file opened in the application, and the environment,
+    /// still come first.
     #[test]
     fn the_configured_and_kept_tokens_sit_between_the_environment_and_the_rest() {
         let mut host = mac(&[], Some("from-file"));
@@ -436,7 +459,7 @@ mod tests {
         host.settings.insert(TOKEN_VARIABLE.into(), "from-settings");
         assert_eq!(
             token(&host, TOKEN_VARIABLE),
-            Ok(("from-keychain".into(), TokenFrom::SecureStorage))
+            Ok(("from-file".into(), TokenFrom::File(PathBuf::from(FILE))))
         );
         host.configured = Some("from-config");
         assert_eq!(
