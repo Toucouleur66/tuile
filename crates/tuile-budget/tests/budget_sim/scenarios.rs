@@ -1142,6 +1142,12 @@ pub struct CentreTally {
     pub mixed_steps: u32,
     pub mixed_parents: u32,
     pub lost: u32,
+    /// Wanted tiles counted in the centre, all steps.
+    pub centre_tiles: u32,
+    /// Wanted tiles anywhere drawn by a coarser stand-in, all steps.
+    pub screen_fallback_tiles: u32,
+    /// Steps where any wanted tile anywhere was held finer.
+    pub screen_held_steps: u32,
 }
 
 impl CentreTally {
@@ -1160,8 +1166,11 @@ impl CentreTally {
         }
         let (mut fb, mut coarse, mut held) = (0u32, 0u32, 0u32);
         let mut kids: BTreeMap<TileId, (u32, u32)> = BTreeMap::new();
+        let (mut centre_n, mut screen_fb, mut screen_held) = (0u32, 0u32, 0u32);
         for (t, n) in &need.drawn {
             let role = by.get(t).copied();
+            screen_fb += u32::from(role == Some(Role::Fallback));
+            screen_held += u32::from(role == Some(Role::Held));
             if let Some(p) = n.parent {
                 let e = kids.entry(p).or_default();
                 if role == Some(Role::Exact) {
@@ -1173,6 +1182,7 @@ impl CentreTally {
             if f64::from(n.centrality) < centre {
                 continue;
             }
+            centre_n += 1;
             match role {
                 Some(Role::Exact) => {
                     let worn = d
@@ -1198,6 +1208,9 @@ impl CentreTally {
         self.mixed_parents += mixed;
         self.mixed_steps += u32::from(mixed > 0);
         self.lost += d.stats.lost;
+        self.centre_tiles += centre_n;
+        self.screen_fallback_tiles += screen_fb;
+        self.screen_held_steps += u32::from(screen_held > 0);
     }
 }
 
@@ -1206,7 +1219,8 @@ impl CentreTally {
     pub fn line(&self) -> String {
         format!(
             "steps {} | fallback {} steps, {} tiles | coarse {} steps, {} tiles | \
-             held {} steps | mixed {} steps, {} parents | lost {}",
+             held {} steps | mixed {} steps, {} parents | lost {} | \
+             centre tiles {} | screen: fallback {} tiles, held {} steps",
             self.steps,
             self.fallback_steps,
             self.fallback_tiles,
@@ -1215,7 +1229,10 @@ impl CentreTally {
             self.held_steps,
             self.mixed_steps,
             self.mixed_parents,
-            self.lost
+            self.lost,
+            self.centre_tiles,
+            self.screen_fallback_tiles,
+            self.screen_held_steps
         )
     }
 }
