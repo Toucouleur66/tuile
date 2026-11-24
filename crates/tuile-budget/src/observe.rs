@@ -1179,8 +1179,8 @@ impl BudgetSignals {
         // The waits, by kind (`crate::waits`).
         for (k, kind) in crate::waits::WAIT_KINDS.iter().enumerate() {
             for c in Class::ALL {
-                for l in 0..LEVELS {
-                    let n = self.waits.count[c][l][k];
+                for (l, per) in self.waits.count[c].iter().enumerate() {
+                    let n = per[k];
                     if n > 0 {
                         out.push((
                             "waits_total",

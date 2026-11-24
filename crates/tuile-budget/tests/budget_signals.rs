@@ -1125,8 +1125,8 @@ fn the_drapes_are_counted_per_layer() {
         s.bytes[Class::Drape][0],
         "{RED}: the layers' bytes are the drapes'"
     );
-    for i in 0..2 {
-        let [store, network, _, completion, _] = s.layer_loads_total[i];
+    for (i, loads) in s.layer_loads_total.iter().take(2).enumerate() {
+        let [store, network, _, completion, _] = *loads;
         assert_eq!(store + network, 3, "{RED}: layer {i} requested its three");
         assert_eq!(completion, 3, "{RED}: and they came");
     }
