@@ -3,7 +3,8 @@
 
 //! What a frame's light costs: on the CPU as `LutAtmosphere::light` works
 //! it out, and on the GPU as `frame_light` makes it every frame — in
-//! compute, and drawn as WebGL2 draws it — with the sky-view made after it.
+//! compute, and drawn as WebGL2 draws it — with the sky-view and the
+//! aerial table made after it.
 //!
 //! GPU times are the device's own (timestamp queries) where it has them,
 //! and wall time from submission to completion otherwise, less an empty
@@ -200,6 +201,10 @@ fn main() {
             pass.copy_into_uniform(e, &atmosphere.uniform);
             atmosphere.sky_view_stale = true;
             atmosphere.record_sky_view(e);
+        });
+        time(&format!("aerial table [{name}]"), &mut |e| {
+            atmosphere.aerial_stale = true;
+            atmosphere.record_aerial(e);
         });
     }
 }
