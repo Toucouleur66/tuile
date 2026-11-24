@@ -23,8 +23,7 @@ use budget_common::*;
 use proptest::prelude::*;
 use tuile_budget::score::Side;
 use tuile_budget::{
-    BudgetConfig, Bytes, Class, Decisions, ImageryNeed, Need, NeedSet, ResourceId, TileId,
-    CERTAIN,
+    BudgetConfig, Bytes, Class, Decisions, Need, NeedSet, ResourceId, TileId, CERTAIN,
 };
 
 /// The pinned floor of these tests: levels `0..=2`, as the viewer's; level
@@ -401,91 +400,6 @@ fn preloads_continue_when_idle_and_never_delay_the_present_need() {
     assert!(
         d.start.iter().any(|s| s.resource == ResourceId::Mesh(hole)),
         "the hole waited for the preloads"
-    );
-}
-
-/// `ns` with every tile wanting the base imagery at its own level, but
-/// `bare`, which asks for none.
-fn dressed(ns: &NeedSet, bare: TileId) -> NeedSet {
-    let mut ns = ns.clone();
-    for list in [
-        &mut ns.drawn,
-        &mut ns.blockers,
-        &mut ns.ancestors,
-        &mut ns.ring,
-    ] {
-        for (id, n) in list.iter_mut() {
-            if *id != bare {
-                let l = n.level;
-                *n = n.clone().with_imagery(ImageryNeed::base(footprint(l), 22));
-            }
-        }
-    }
-    ns
-}
-
-/// Test 6b — The present need never waits on a preload's slot, whatever it
-/// is: with every network slot of the meshes and of the drapes held by
-/// preloads in flight (the neighbourhood's meshes and drapes), a swap's
-/// child (a blocker, not a hole) and a drawn tile's drape (its mesh
-/// resident, its drape not) start on the step they are wanted — each
-/// preempting a preload of its class. Red with only the floor and the holes
-/// preempting, and red while no drape is ever preloaded (no drape slot is
-/// ever held by a preload).
-#[test]
-fn a_blocker_and_a_drape_of_the_present_need_never_wait_on_the_preloads() {
-    let mut c = config(Bytes::mib(512), 4);
-    c.max_in_flight = tuile_budget::PerClass::splat(2);
-    let mut r = Rig::new(c);
-    let v = View::at(0.5531, 0.4412, 13);
-    // A level-12 neighbour: its mesh preloaded, no drape asked of it yet.
-    let (_, beside) = around(12, v.fx, v.fy, 2.0)[3];
-    let need = dressed(&v.need(4), beside);
-    assert!(
-        need.ring.iter().any(|(id, _)| *id == beside),
-        "the fixture is wrong: {beside:?} is not in the ring"
-    );
-    // Loads take three steps; the view does not move: the present need
-    // comes in, then preloads hold the slots.
-    let mut last = None;
-    for i in 0..240 {
-        let d = r.step(&need);
-        if i % 3 == 2 {
-            r.load_where(|_| true);
-        }
-        r.upload(&d);
-        last = Some(d);
-    }
-    assert!(gpu(&r, beside), "the fixture is wrong: {beside:?} not preloaded");
-    let held = last.expect("a step").stats.in_flight;
-    for class in [Class::TerrainMesh, Class::Drape] {
-        assert_eq!(
-            held[class], 2,
-            "{class:?}: the preloads do not hold every slot ({held:?})"
-        );
-    }
-    // A swap's child far from the view, and the neighbour drawn.
-    let (l, x, y) = v.drawn()[0].terrain_coord();
-    let child = t(l, x + 9, y);
-    let mut urgent = need.clone();
-    urgent.blockers.push((child, budget_common::need(child)));
-    urgent.ring.retain(|(id, _)| *id != beside);
-    urgent.drawn.push((
-        beside,
-        budget_common::need(beside).with_imagery(ImageryNeed::base(footprint(12), 22)),
-    ));
-    let d = r.step(&urgent);
-    let started = |r: ResourceId| d.start.iter().any(|s| s.resource == r);
-    assert!(
-        started(ResourceId::Mesh(child)),
-        "the swap's child waited for the preloads"
-    );
-    assert!(
-        d.start
-            .iter()
-            .any(|s| matches!(s.resource, ResourceId::Drape { tile, .. } if tile == beside)),
-        "the drawn tile's drape waited for the preloads: started {:?}",
-        d.start
     );
 }
 

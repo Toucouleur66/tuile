@@ -429,9 +429,6 @@ const _: () = assert!(std::mem::size_of::<Cold>() == 48);
 
 const FIRST_WANTED: u8 = 1;
 const UNNEEDED: u8 = 1 << 1;
-/// Loaded as a preload (the ring, an ancestor) and not yet wanted by the
-/// present need: what `preload_hits` and `preload_unused` count.
-const PRELOADED: u8 = 1 << 2;
 
 impl Cold {
     fn time(&self, bit: u8, t: Micros) -> Option<Micros> {
@@ -473,16 +470,6 @@ impl Cold {
     /// Failed and waiting for its retry.
     pub fn backing_off(&self, now: Micros) -> bool {
         self.failures > 0 && self.retry_at > now
-    }
-
-    /// Whether its copy was loaded as a preload that the present need has
-    /// not wanted yet.
-    pub fn preloaded(&self) -> bool {
-        self.has & PRELOADED != 0
-    }
-
-    pub fn set_preloaded(&mut self, on: bool) {
-        self.has = (self.has & !PRELOADED) | if on { PRELOADED } else { 0 };
     }
 }
 
@@ -577,9 +564,6 @@ pub(super) struct Arena {
     /// ask about are kept — about its horizon's poses — in room reserved
     /// when the horizon is set: a step allocates nothing for it.
     poses: VecDeque<(Micros, u64)>,
-    /// The preloads served and the preloads let go unserved, per class,
-    /// since the step last took them ([`Arena::take_preload_counts`]).
-    preload_counts: PerClass<[u32; 2]>,
 }
 
 /// The bytes one slot holds across the columns, its index and free-list
@@ -654,7 +638,6 @@ impl Default for Arena {
             rekeys: 0,
             pose: 0,
             poses: VecDeque::new(),
-            preload_counts: PerClass::default(),
         }
     }
 }
@@ -666,27 +649,6 @@ impl Arena {
             pinned,
             ..Arena::default()
         }
-    }
-
-    /// The present need wants the resource of `s` (or draws it): a
-    /// preload resident by then is counted served; one still loading is
-    /// neither served nor unused. Either way it is a preload no more.
-    pub fn preload_wanted(&mut self, s: Slot) {
-        let i = s.i();
-        if !self.cold[i].preloaded() {
-            return;
-        }
-        self.cold[i].set_preloaded(false);
-        if self.has_gpu(s) || self.has_cpu(s) {
-            let c = &mut self.preload_counts[self.class[i]][0];
-            *c = c.saturating_add(1);
-        }
-    }
-
-    /// The preloads served (`[0]`) and let go unserved (`[1]`) per class
-    /// since the last call.
-    pub fn take_preload_counts(&mut self) -> PerClass<[u32; 2]> {
-        std::mem::take(&mut self.preload_counts)
     }
 
     /// What its maps spent keeping their order since the last call.
@@ -946,11 +908,6 @@ impl Arena {
             self.evict.cur_len -= 1;
         }
         self.ranks.remove(&s.0);
-        if self.cold[s.i()].preloaded() {
-            // A preload let go before the present need ever wanted it.
-            let c = &mut self.preload_counts[self.class[s.i()]][1];
-            *c = c.saturating_add(1);
-        }
         // Untracked, it is asked of the presence index again.
         self.changed.push((self.id[s.i()], Change::TIER));
         self.flags[s.i()] = 0;
