@@ -22,9 +22,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 # The camera's pose, read off the engine's own camera type.
-tuile-camera = { version = "0.17.1", path = "../tuile-camera" }
-tuile-core = { version = "0.17.1", path = "../tuile-core" }
-tuile-metrics = { version = "0.17.1", path = "../tuile-metrics" }
+tuile-camera = { version = "0.18.0", path = "../tuile-camera" }
+tuile-core = { version = "0.18.0", path = "../tuile-core" }
+tuile-metrics = { version = "0.18.0", path = "../tuile-metrics" }
 
 # A desktop or a phone: the push is a task on the host's runtime, over the
 # HTTP client the native fetchers already bring, with their TLS.

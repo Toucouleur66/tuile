@@ -23,10 +23,10 @@ serde = { workspace = true }
 tracing = { workspace = true }
 # The CPU encode's clock, in a browser's decode worker as natively.
 web-time = { workspace = true }
-tuile-core = { version = "0.17.1", path = "../tuile-core" }
+tuile-core = { version = "0.18.0", path = "../tuile-core" }
 # What an imagery source sends for "no imagery": stood over, never draped.
-tuile-bing = { version = "0.17.1", path = "../tuile-bing" }
-tuile-terrain = { version = "0.17.1", path = "../tuile-terrain" }
+tuile-bing = { version = "0.18.0", path = "../tuile-bing" }
+tuile-terrain = { version = "0.18.0", path = "../tuile-terrain" }
 # A tileset's root, in `TilesetSource`.
 url = { workspace = true }
 

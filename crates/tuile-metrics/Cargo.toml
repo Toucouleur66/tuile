@@ -19,7 +19,7 @@ workspace = true
 # target, a browser's included (`tuile-telemetry` publishes through it there).
 metrics = "0.24"
 tracing = { workspace = true }
-tuile-core = { version = "0.17.1", path = "../tuile-core" }
+tuile-core = { version = "0.18.0", path = "../tuile-core" }
 
 # The recorder and its exposition format, plus an HTTP listener — a desktop's
 # and a phone's. Both were briefly hand-written, which was a waste and worse
