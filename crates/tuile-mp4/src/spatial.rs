@@ -470,12 +470,24 @@ mod tests {
 
     fn segment(path: &std::path::Path, tag: u8, frames: u8, baseline_um: u32, hfov: u32) {
         let (hvcc, lhvc) = records();
+        segment_of(path, &hvcc, &lhvc, tag, frames, baseline_um, hfov);
+    }
+
+    fn segment_of(
+        path: &std::path::Path,
+        hvcc: &[u8],
+        lhvc: &[u8],
+        tag: u8,
+        frames: u8,
+        baseline_um: u32,
+        hfov: u32,
+    ) {
         let stereo = StereoInfo {
             baseline_um,
             hfov_millidegrees: hfov,
             disparity_adjustment: 0,
         };
-        let mut m = SpatialMuxer::new(64, 64, 30, &hvcc, &lhvc, stereo).expect("muxer");
+        let mut m = SpatialMuxer::new(64, 64, 30, hvcc, lhvc, stereo).expect("muxer");
         for i in 0..frames {
             // I P B, P B, …: offsets as an encoder that reorders says them.
             let offset = if i == 0 || i % 2 == 1 { 1 } else { -1 };
@@ -499,7 +511,9 @@ mod tests {
         segment(&a, 0xa, 6, 10_000_000, 72_489);
         // The field of its first frame's camera: a camera's field moves
         // during a film, so each segment says a little another.
-        segment(&b, 0xb, 5, 10_000_000, 72_269);
+        // Its baseline too: the eyes are set apart by how far the ground
+        // they converge on lies, which moves with the camera.
+        segment(&b, 0xb, 5, 12_500_000, 72_269);
         let out = dir.path().join("film.mp4");
         assert_eq!(
             crate::film::join(&[a.clone(), b.clone()], &out).expect("joined"),
@@ -555,13 +569,19 @@ mod tests {
         );
         assert_eq!(
             track.entry, alone.entry,
-            "the stream described as the first segment does, its field too"
+            "the stream described as the first segment does, its field and baseline too"
         );
 
-        segment(&c, 0xc, 3, 20_000_000, 72_489);
+        // Another encode — another profile in its hvcC — is another stream.
+        let (mut hvcc, lhvc) = records();
+        hvcc[1] = 2;
+        segment_of(&c, &hvcc, &lhvc, 0xc, 3, 10_000_000, 72_489);
         assert!(
-            crate::film::join(&[a, c], &out).is_err(),
-            "another baseline is another stream"
+            matches!(
+                crate::film::join(&[a, c], &out),
+                Err(Mp4Error::Mismatch("stream description"))
+            ),
+            "another encode is another stream"
         );
     }
 
