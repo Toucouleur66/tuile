@@ -2590,8 +2590,12 @@ impl Budget {
                 continue;
             }
             // Its own selection reads whether it was drawn (all or nothing
-            // applies to a refine only, `select_tile`): read again.
+            // applies to a refine only), and its children's whether their
+            // parent stays (`select_tile`): read again.
             add(&mut self.down.next_sels, [t]);
+            if let Some(kids) = geometric_children(t) {
+                add(&mut self.down.next_sels, kids);
+            }
             if !on {
                 // Its kept levels may go.
                 l.held.push(t);

@@ -1399,7 +1399,8 @@ impl Budget {
 
     /// All or nothing on a refine: whether drawn tile `t` may be drawn as
     /// itself as far as its siblings tell — its parent cannot stand in
-    /// (not drawable and dressed for `layers`, or not the quadtree's), or
+    /// (not drawn last step, not drawable and dressed for `layers`, or not
+    /// the quadtree's), or
     /// every sibling the need wants drawn can be drawn too. A 3D Tiles
     /// tile, whose siblings no quadtree names, is not held back. `reach`
     /// gets the parent and the siblings read; a sibling's need is read
@@ -1422,7 +1423,10 @@ impl Budget {
         let Some(kids) = super::held::geometric_children(p) else {
             return true;
         };
-        if !self.shown(p, layers, cap, reach) {
+        // The parent stays (Laurent's words): it holds its children back
+        // only while it is drawn — a parent no longer on screen is not
+        // brought back for them.
+        if !self.held_last.contains_key(&p) || !self.shown(p, layers, cap, reach) {
             return true;
         }
         kids.into_iter().filter(|s| *s != t).all(|s| {

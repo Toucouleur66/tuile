@@ -548,6 +548,10 @@ fn a_cold_climb_never_shows_a_hole() {
         let start = low.last().map(|(_, d)| deepest(d)).expect("steps");
         let from = sim.now.0 as f64 / 1e6;
         sim.run(7.0, &|t| climb(3.0 + t - from));
+        // The fine stays until its replacement wears its own imagery
+        // (Laurent, 2026-11-24): on a phone's network the coarse drapes of
+        // the top of the climb come in over a few more seconds at rest.
+        sim.run(3.0, &|_| climb(10.0));
         let (_, last) = sim.step(climb(10.0));
         assert!(
             deepest(&last) + 2 <= start,
