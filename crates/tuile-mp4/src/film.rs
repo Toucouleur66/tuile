@@ -422,12 +422,23 @@ impl Table {
 }
 
 /// Two entries describe the same stream when they differ at most in what
-/// says nothing of the encode: a spatial film's field of view (a camera's
-/// field moves during a film), and what [`dressed`] adds.
+/// says nothing of the encode: what a spatial film tells a player of its
+/// camera — its field of view, the eyes' baseline and their disparity
+/// adjustment, each taken from a segment's first frame while the camera's
+/// field and the ground its eyes converge on move during a film — and what
+/// [`dressed`] adds.
 fn same_stream(a: &Codec, b: &Codec) -> bool {
     let plain = |e: &Codec| match dressed(e.clone()) {
         Codec::Hvc1(mut h) => {
             h.hfov = None;
+            if let Some(eyes) = h.vexu.as_mut().and_then(|v| v.eyes.as_mut()) {
+                if let Some(cams) = eyes.cams.as_mut() {
+                    cams.blin = None;
+                }
+                if let Some(cmfy) = eyes.cmfy.as_mut() {
+                    cmfy.dadj = None;
+                }
+            }
             Codec::Hvc1(h)
         }
         other => other,
@@ -437,8 +448,8 @@ fn same_stream(a: &Codec, b: &Codec) -> bool {
 
 /// Films one after the other into one at `out`, streamed from file to file
 /// and laid out for a viewer (see the module): the same stream description
-/// in each — a spatial film's field of view aside, the first segment's kept
-/// — and the same timescale, or the join is refused. Returns the frames
+/// in each — a spatial film's field of view and eyes' baseline aside, the
+/// first segment's kept — and the same timescale, or the join is refused. Returns the frames
 /// written.
 pub fn join(segments: &[PathBuf], out: &Path) -> Result<u64, Mp4Error> {
     join_into(segments, out, false)
