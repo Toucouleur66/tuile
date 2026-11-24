@@ -1640,12 +1640,6 @@ impl Budget {
                 let du = match tn.membership {
                     Membership::Blocker => Some(Urgency::Blocker),
                     _ if !mesh_drawable => Some(urgency),
-                    // Drawable yet not drawn as itself: held back by a
-                    // replacement rule (all or nothing, the fine until its
-                    // replacement) until this drape is in.
-                    Membership::Drawn if item.is_none_or(|i| i.role != Role::Exact) => {
-                        Some(urgency)
-                    }
                     // A ring tile not drawn (the neighbourhood, the views
                     // ahead): its drapes are preloads too, of the tile's own
                     // score — never the present need's. An ancestor of what
