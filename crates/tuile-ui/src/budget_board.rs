@@ -1694,6 +1694,19 @@ fn levels_of(
     y + 8.0
 }
 
+/// A level's GPU bar: of its `resident` copies, the drawn ones (blue),
+/// then the ones held and not drawn (grey). The split is the bar's
+/// meaning: a flagged row (waste, a warning, a stall) keeps it, its flag
+/// being the marker in the gutter and the row's tint, never the bar's
+/// colours.
+pub fn residency_bar(x: &LevelCell, resident: u64) -> [(f64, [f32; 4]); 2] {
+    let drawn = u64::from(x.drawn).min(resident);
+    [
+        (drawn as f64, srgb(DRAWN, 1.0)),
+        ((resident - drawn) as f64, srgb(HELD, 1.0)),
+    ]
+}
+
 #[allow(clippy::too_many_arguments)]
 fn level_instant(
     p: &mut Painter<'_>,
@@ -1737,8 +1750,10 @@ fn level_instant(
         explain_loads(c, l, &x),
     );
     if sev != Severity::Ok {
+        // A tint under the row, faint for waste: a flag on numbers that
+        // stay readable, not a colour over them.
         let mut tint = sev.colour();
-        tint[3] = 0.16;
+        tint[3] = if sev == Severity::Waste { 0.07 } else { 0.16 };
         p.rect(
             x0,
             y - 1.0,
@@ -1748,20 +1763,12 @@ fn level_instant(
         );
         p.marker(sev, x0 + 6.0, y + ROW / 2.0 - 2.0, 8.0);
     }
-    let held = if sev == Severity::Waste {
-        Severity::Waste.colour()
-    } else {
-        srgb(HELD, 1.0)
-    };
     p.bar(
         x0 + 14.0,
         y + 3.0,
         RESIDENCY_BAR,
         9.0,
-        &[
-            (f64::from(x.drawn.min(x.gpu)), srgb(DRAWN, 1.0)),
-            (f64::from(x.gpu.saturating_sub(x.drawn)), held),
-        ],
+        &residency_bar(&x, u64::from(x.gpu)),
         copies,
     );
     // The selected tiles not drawn: a tick where the selection ends.
@@ -1982,20 +1989,7 @@ fn tiers_of(
                 let parts: Vec<(f64, [f32; 4])> = match t {
                     0 => vec![(n as f64, srgb(DIM, 1.0))],
                     1 => vec![(n as f64, srgb(LOADS, 1.0))],
-                    _ => {
-                        let drawn = u64::from(cell.drawn).min(n);
-                        vec![
-                            (drawn as f64, srgb(DRAWN, 1.0)),
-                            (
-                                (n - drawn) as f64,
-                                if cell.waste {
-                                    Severity::Waste.colour()
-                                } else {
-                                    srgb(HELD, 1.0)
-                                },
-                            ),
-                        ]
-                    }
+                    _ => residency_bar(&cell, n).to_vec(),
                 };
                 p.bar(x, y + 3.0, TIER_BAR, 9.0, &parts, *scale);
                 p.hit(x, y - 1.0, TIER, ROW - 1.0, explain_tier(s, t, *c, l));
@@ -2428,19 +2422,18 @@ pub fn explain_residency(
             format!("dark blue = drawn: {}", x.drawn),
         ),
     ];
+    out.push(line(
+        Swatch::Fill(srgb(HELD, 1.0)),
+        format!("grey = held on the GPU, not drawn: {held}"),
+    ));
     if x.waste {
         let w = level_waste(s, c, l);
         out.push(line(
-            Swatch::Fill(Severity::Waste.colour()),
+            Swatch::None,
             format!(
-                "purple = held for nothing: {held} ({} MiB)",
+                "of which held for nothing: {} MiB",
                 mib(w.under[0] + w.under[1])
             ),
-        ));
-    } else {
-        out.push(line(
-            Swatch::Fill(srgb(HELD, 1.0)),
-            format!("grey = held on the GPU, not drawn: {held}"),
         ));
     }
     if x.selected > x.drawn {
@@ -3525,6 +3518,42 @@ mod tests {
             ..LevelCell::default()
         };
         assert_eq!(level_severity(&waste, true), Severity::Waste);
+    }
+
+    /// A flag is a flag: a waste row's GPU bar — in the level table and
+    /// in the tiers' — is the same drawn | held split, in the same
+    /// colours, as the same row unflagged; only its severity (the marker,
+    /// the tint) says waste.
+    #[test]
+    fn a_waste_row_keeps_its_gpu_split() {
+        let s = fixtures::stalled();
+        let captured = LevelCell::of(&s, Class::Drape, 21);
+        assert!(captured.waste, "the fixture holds waste at level 21");
+        let some_drawn = LevelCell {
+            gpu: 200,
+            drawn: 30,
+            waste: true,
+            ..LevelCell::default()
+        };
+        for flagged in [captured, some_drawn] {
+            assert_eq!(level_severity(&flagged, false), Severity::Waste);
+            let plain = LevelCell {
+                waste: false,
+                ..flagged
+            };
+            assert_eq!(level_severity(&plain, false), Severity::Ok);
+            for resident in [u64::from(flagged.gpu), u64::from(flagged.gpu) / 2, 0] {
+                assert_eq!(
+                    residency_bar(&flagged, resident),
+                    residency_bar(&plain, resident),
+                    "{flagged:?}, {resident} resident"
+                );
+            }
+        }
+        assert_eq!(
+            residency_bar(&some_drawn, 200),
+            [(30.0, srgb(DRAWN, 1.0)), (170.0, srgb(HELD, 1.0))]
+        );
     }
 
     /// Waste is what [`level_waste`] says a level holds for nothing — the
