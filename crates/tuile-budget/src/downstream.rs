@@ -2589,6 +2589,9 @@ impl Budget {
             if !changed {
                 continue;
             }
+            // Its own selection reads whether it was drawn (all or nothing
+            // applies to a refine only, `select_tile`): read again.
+            add(&mut self.down.next_sels, [t]);
             if !on {
                 // Its kept levels may go.
                 l.held.push(t);

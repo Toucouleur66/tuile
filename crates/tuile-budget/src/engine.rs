@@ -1322,8 +1322,12 @@ impl Budget {
     /// - the fine until its replacement on a zoom-out: while finer tiles
     ///   are held under it, a tile replaces them only once it wears, for
     ///   every layer, a drape at its need ([`Self::replaces_held`]); until
-    ///   then they stay, and the tile itself stands, as a fallback, for what
+    ///   then they stay, its nearest drawable ancestor standing for what
     ///   they do not cover.
+    ///
+    /// All or nothing applies to a refine only: a tile drawn last step is
+    /// never taken back because a sibling entered the need (a view that
+    /// widens or turns keeps what it drew).
     ///
     /// Neither costs ground: a tile with no parent to stand for it and its
     /// siblings is drawn as soon as it can be, and a tile with nothing held
@@ -1345,26 +1349,16 @@ impl Budget {
         let mut sel = TileSelection::default();
         let own: SmallVec<[LayerId; 4]> = needs.iter().map(|x| x.0).collect();
         let shown = |x: TileId, reach: &mut Reach| self.shown(x, &own, cap, reach);
-        if shown(t, reach) && self.siblings_drawable(t, &own, tiles, cap, reach) {
-            // The finer tiles held under it stay until it is dressed at its
-            // need; with none held, it is drawn as itself in whatever it
-            // wears (blurry beats bare).
-            for h in self.held_below(t) {
-                if shown(h, reach) {
-                    out.push((ResourceId::Mesh(h), Role::Held));
-                }
-            }
-            if out.is_empty() || self.replaces_held(t, needs, reach) {
-                out.clear();
-                out.push((ResourceId::Mesh(t), Role::Exact));
-                sel.exact = true;
-                return sel;
-            }
-            // It stands, as a fallback, for what they do not cover.
-            out.push((ResourceId::Mesh(t), Role::Fallback));
-            sel.held = true;
-            out.sort_unstable();
-            out.dedup();
+        // All or nothing applies to a refine: a tile drawn last step (as
+        // itself or held) is never taken back for a sibling.
+        let refining = !self.held_last.contains_key(&t);
+        if shown(t, reach)
+            && (!refining || self.siblings_drawable(t, &own, tiles, cap, reach))
+            && (self.held_below(t).all(|h| !shown(h, reach))
+                || self.replaces_held(t, needs, reach))
+        {
+            out.push((ResourceId::Mesh(t), Role::Exact));
+            sel.exact = true;
             return sel;
         }
         let mut held = false;
@@ -1643,6 +1637,12 @@ impl Budget {
                 let du = match tn.membership {
                     Membership::Blocker => Some(Urgency::Blocker),
                     _ if !mesh_drawable => Some(urgency),
+                    // Drawable yet not drawn as itself: held back by a
+                    // replacement rule (all or nothing, the fine until its
+                    // replacement) until this drape is in.
+                    Membership::Drawn if item.is_none_or(|i| i.role != Role::Exact) => {
+                        Some(urgency)
+                    }
                     // A ring tile not drawn (the neighbourhood, the views
                     // ahead): its drapes are preloads too, of the tile's own
                     // score — never the present need's. An ancestor of what
