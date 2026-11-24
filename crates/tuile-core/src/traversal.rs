@@ -47,6 +47,23 @@ pub struct ViewState {
     /// lens of four angles (whose denominator is then 1).
     sse_numerator_px: f64,
     sse_denominator: f64,
+    /// The cosine of the angle between the forward axis and the screen's
+    /// farthest corner (the field of view itself, not the culling margin's):
+    /// every point on screen is at least this fraction of its distance deep.
+    /// See [`ViewState::sse_depth`].
+    cos_corner: f64,
+}
+
+/// The least depth a tile's screen-space error is priced at, metres: the
+/// culling frustum's near plane. Only a volume the eye is inside, or one
+/// grazing it, reaches it; its error is then huge and it always refines,
+/// as with the distance's own clamp.
+pub const SSE_NEAR_DEPTH: f64 = 0.05;
+
+/// `cos` of the angle whose tangents along the two screen axes are `x` and
+/// `y`: `1 / √(1 + x² + y²)`.
+fn cos_of_corner(x: f64, y: f64) -> f64 {
+    1.0 / (1.0 + x * x + y * y).sqrt()
 }
 
 /// A lens's field of view as four angles, radians, OpenXR's convention:
@@ -217,6 +234,10 @@ impl ViewState {
             frustum: Frustum::from_view_proj(&(proj * view)),
             sse_numerator_px: viewport_px.y,
             sse_denominator: 2.0 * libm::tan(fovy_rad / 2.0),
+            cos_corner: {
+                let up = libm::tan(fovy_rad / 2.0).abs();
+                cos_of_corner(aspect * up, up)
+            },
         }
     }
 
@@ -258,6 +279,10 @@ impl ViewState {
             frustum: Frustum::from_view_proj(&(proj * view)),
             sse_numerator_px: across.max(high),
             sse_denominator: 1.0,
+            cos_corner: cos_of_corner(
+                libm::tan(fov.left).abs().max(libm::tan(fov.right).abs()),
+                libm::tan(fov.up).abs().max(libm::tan(fov.down).abs()),
+            ),
         }
     }
 
@@ -305,6 +330,49 @@ impl ViewState {
         // same, bit for bit, as before lenses had a scale.
         (geometric_error * (self.sse_numerator_px / self.scale))
             / (distance.max(1e-7) * self.sse_denominator)
+    }
+
+    /// The depth a tile's screen-space error is priced at: the nearest point
+    /// of its bounding volume along the view's forward axis (Laurent,
+    /// 2026-11-24), not its distance to the eye.
+    ///
+    /// **Why depth.** A perspective projection divides by depth: two
+    /// patches of ground at one depth are drawn the same size wherever they
+    /// sit across the screen. Priced by the distance to the eye, the level
+    /// changes in rings round the camera, and a layer stands half ready in
+    /// arcs; priced by depth, the level changes in straight bands parallel
+    /// to the screen, and the screen's edges are as sharp as its middle at
+    /// the same depth — finer than the distance gave them, which is the cost
+    /// (a few more tiles at the edges, never fewer anywhere: the depth is
+    /// never more than the distance).
+    ///
+    /// **The floor under it.** A volume that straddles the plane of the eye
+    /// — the ground under a camera looking at the horizon — has a nearest
+    /// depth at or below zero, and pricing it there would refine it to the
+    /// bottom of its tree for ground nobody sees. Every point *on screen* is
+    /// at least `cos(corner)` of its distance deep, the corner being the
+    /// screen's farthest from the axis; the volume's on-screen points are at
+    /// least its distance away, so its on-screen depth is at least
+    /// `distance · cos(corner)`. That is the floor: it bounds what a
+    /// straddling volume costs to `1 / cos(corner)` times the distance's
+    /// price (1.2 on a desktop's 60°, 2.1 on a headset's eye), and it never
+    /// raises the depth of a volume that lies on screen, which is already
+    /// that deep. [`SSE_NEAR_DEPTH`] stands under both, for an eye inside
+    /// the volume.
+    ///
+    /// **Behind the eye**, a volume whose farthest depth is at or below zero
+    /// keeps its distance: it is culled anyway, and a frustum's margin or a
+    /// disabled cull is all that brings it here.
+    ///
+    /// Each view prices with its own depth: a stereo rig's need is the
+    /// largest over its eyes (the traversal's `max`).
+    pub fn sse_depth(&self, volume: &crate::math::BoundingVolume) -> f64 {
+        let distance = volume.distance_to_point(self.position);
+        let (near, far) = volume.depth_range(self.position, self.direction);
+        if far <= 0.0 {
+            return distance;
+        }
+        near.max(distance * self.cos_corner).max(SSE_NEAR_DEPTH)
     }
 }
 
@@ -363,6 +431,12 @@ pub struct Config {
     pub uniform_detail_radius: f64,
     /// The width of the deadband around [`Self::maximum_screen_space_error`],
     /// as a fraction of it. Default 0.15; zero restores the bare comparison.
+    ///
+    /// **In a session it is the budget's specification's**
+    /// (`Params::level_margin_permille`, Laurent 2026-11-24): the geometry
+    /// server sets it from the specification in force on every step, so it
+    /// is re-specified at runtime with the rest of the policy; this field's
+    /// own value is for a traversal run on its own.
     ///
     /// **Why a bare comparison is not enough.** `sse > τ` has no memory, so a
     /// tile whose error sits at τ splits on one frame, merges on the next, and
@@ -1088,13 +1162,15 @@ fn visit(
             // Uniform detail by threshold: inside `radius × d_near` every
             // tile is priced at d_near (one level, no LOD wall in the
             // foreground); beyond, the shifted true distance takes over,
-            // continuously.
+            // continuously. The batch decree keeps the distance its disc is
+            // measured in; the interactive pass prices by view depth
+            // (`ViewState::sse_depth`).
             let d = match uniform_distance {
                 Some(near) => {
                     let d = props.bounding_volume.distance_to_point(v.position());
                     near.max(d - (config.uniform_detail_radius - 1.0).max(0.0) * near)
                 }
-                None => props.bounding_volume.distance_to_point(v.position()),
+                None => v.sse_depth(&props.bounding_volume),
             };
             v.screen_space_error(props.geometric_error, d)
         })

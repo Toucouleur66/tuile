@@ -83,6 +83,12 @@ pub struct ViewStateParams {           // ALL in f64, ECEF frame
     pub scale: f64,                    // detail scale
 }
 // derived at construction: frustum, SSE factors
+// The SSE of an interactive pass is priced at the tile's VIEW DEPTH
+// (`ViewState::sse_depth`): its bounding volume's nearest depth along the
+// forward axis, floored at distance × cos(screen corner); levels change in
+// bands parallel to the screen, not in rings round the eye. The batch decree
+// (`Config::uniform_detail`) keeps the distance. The margin between levels is
+// the budget specification's `level_margin` (‰, default 150).
 
 pub enum PriorityGroup { Preload, Normal, Urgent }  // inter-group sort of requests
 pub struct ContentRequest { /* tile, group, priority */ }

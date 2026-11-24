@@ -372,6 +372,10 @@ pub const RELEASE_VISITS: u16 = 16;
 pub const SWEEP_KEEP_POSES: u32 = 300;
 /// An over-need gap weighs half an under-need one.
 pub const FINER_GAP: u16 = 500;
+/// The margin between levels, ‰: 15 %, the traversal's deadband before it
+/// was specified, measured wider than the frame-to-frame jitter of a
+/// tile's error (the flicker it cures, `refine_hysteresis`).
+pub const LEVEL_MARGIN: u16 = 150;
 
 /// The defaults: the ring before the ancestors, as the tiers were.
 const ANTICIPATION: Anticipation = Anticipation {
@@ -435,6 +439,14 @@ pub struct Params {
     pub finer_gap_permille: u16,
     /// When a texture held RGBA8 is compressed in place (CB9).
     pub compress: Compress,
+    /// The margin between levels, ‰ of the screen-space error threshold
+    /// (Laurent, 2026-11-24): a tile the traversal chose at its level last
+    /// time is refined only once its error passes `τ (1 + m)`, a tile it
+    /// refined comes back only once its error falls under `τ / (1 + m)`, so
+    /// a tile on a band's edge does not flip level every frame. Its memory
+    /// is the previous pass's choice — recorded state, no clock. Read by the
+    /// session's traversal (`tuile_core::traversal::Config::refine_hysteresis`).
+    pub level_margin_permille: u16,
 }
 
 /// The policy of the decider: rules and numbers. See the [module
@@ -527,6 +539,7 @@ impl Specification {
                 rho_tiles: 0,
                 finer_gap_permille: FINER_GAP,
                 compress: COMPRESS,
+                level_margin_permille: LEVEL_MARGIN,
             },
         }
     }
@@ -584,6 +597,7 @@ impl Specification {
                 rho_tiles: 0,
                 finer_gap_permille: FINER_GAP,
                 compress: COMPRESS,
+                level_margin_permille: LEVEL_MARGIN,
             },
         }
     }
@@ -648,6 +662,7 @@ impl Specification {
                 rho_tiles: 0,
                 finer_gap_permille: FINER_GAP,
                 compress: COMPRESS,
+                level_margin_permille: LEVEL_MARGIN,
             },
         }
     }
@@ -763,6 +778,7 @@ impl Specification {
             ("compress_still_poses", u64::from(p.compress.still_poses), 36_000),
             ("compress_flight_tiles", u64::from(p.compress.flight_tiles), 1_024),
             ("compress_visits", u64::from(p.compress.visits), 4_096),
+            ("level_margin", u64::from(p.level_margin_permille), 1_000),
         ];
         if let Some((name, ..)) = bounded.iter().find(|(_, v, max)| v > max) {
             return Err(SpecError::OutOfBounds(name));
@@ -800,7 +816,7 @@ impl Specification {
              &restore_remote_ms={}&p_ring={}&p_ancestor={}&a0={}&a_desc={}&headroom={}&floor_value={}\
              &release_visits={}&rho={}&finer_gap={}&coarse_from={}&coarse_boost={}\
              &sweep_keep_poses={}&compress_p={}&compress_decisions={}&compress_still_poses={}&compress_visits={}\
-             &compress_flight_tiles={}",
+             &compress_flight_tiles={}&level_margin={}",
             self.kind.label(),
             p.margin_permille,
             ms(p.min_dwell),
@@ -830,6 +846,7 @@ impl Specification {
             p.compress.still_poses,
             p.compress.visits,
             p.compress.flight_tiles,
+            p.level_margin_permille,
         );
         // A term's weight when all its rules share one; a term weighed
         // differently by predicate (FPV's recency) keeps its kind's rules.
@@ -898,6 +915,7 @@ impl Specification {
                 "compress_still_poses" => p.compress.still_poses = n32,
                 "compress_flight_tiles" => p.compress.flight_tiles = n16,
                 "compress_visits" => p.compress.visits = n16,
+                "level_margin" => p.level_margin_permille = n16,
                 _ => match k
                     .strip_prefix("w_")
                     .and_then(|t| Term::ALL.into_iter().find(|x| term_key(*x) == t))
