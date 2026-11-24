@@ -1028,9 +1028,10 @@ fn pattern_goldens_hold() {
     assert_eq!(got, want);
 }
 
-/// CB3: the compressed clients hold their drapes in blocks — a quarter of
-/// RGBA8 a drape, give or take the small levels and the fallbacks — and every encode that fell back
-/// reaches the budget as a fallback, one for one, never as drift (checked
+/// CB3, CB9: the compressed clients hold their drapes in blocks once they
+/// have lasted — a quarter of RGBA8 a drape, give or take the small levels,
+/// the refusals and the preloads the score leaves RGBA8 — and every
+/// compression refused reaches the budget as refused, one for one (checked
 /// every step by `Sim::check`), on a desktop, a phone, a page on WebGL2 and
 /// a 90 Hz headset.
 #[test]
@@ -1048,26 +1049,32 @@ fn compressed_clients_hold_blocks_and_their_fallbacks_are_counted() {
         let name = profile.name;
         let gpu_plan = profile.plan == super::world::SimPlan::Gpu;
         let mut sim = Sim::new(clean(profile), seed);
-        sim.run(6.0, &|_| home());
+        sim.run(8.0, &|_| home());
         let counted: u64 = sim
             .log
             .iter()
-            .map(|l| u64::from(l.stats.fallbacks[Class::Drape]))
+            .map(|l| u64::from(l.stats.fallbacks[Class::Drape] + l.stats.compress.refused))
             .sum();
-        // The drapes it holds, against the same drapes as RGBA8.
-        let as_rgba8 = sim
-            .gpu
-            .drawable
-            .keys()
-            .filter(|r| matches!(r, ResourceId::Drape { .. }))
-            .fold(0u64, |a, r| a + super::world::cost(*r).gpu.0);
-        let held = sim.gpu.bytes[Class::Drape].0;
+        // The drapes drawn, against the same drapes as RGBA8 and as blocks:
+        // a GPU plan compresses what has lasted (CB9) — the drawn drapes
+        // after eight still seconds, under a third of RGBA8 with the few
+        // refused or still fresh; a CPU plan holds blocks from the start.
+        let drawn = sim.drawn_drapes();
+        let (held, as_rgba8, as_blocks) = drawn.iter().fold((0u64, 0u64, 0u64), |a, r| {
+            let c = super::world::cost_for(*r, super::world::SimPlan::Gpu);
+            (
+                a.0 + sim.gpu.drawable.get(r).map_or(0, |b| b.0),
+                a.1 + c.gpu.0,
+                a.2 + c.compressed.0,
+            )
+        });
         assert!(
             held > 0 && held * 3 < as_rgba8,
-            "{name}: drapes hold {held} bytes, {as_rgba8} as RGBA8"
+            "{name}: drawn drapes hold {held} bytes, {as_blocks} as blocks, {as_rgba8} as RGBA8"
         );
         let fell = sim.gpu.fallbacks;
         assert_eq!(counted, fell, "{name}: a fallback not counted as one");
-        assert_eq!(fell > 0, gpu_plan, "{name}: fallbacks {fell}");
+        // A CPU plan never refuses: its blocks come encoded.
+        assert!(gpu_plan || fell == 0, "{name}: fallbacks {fell}");
     }
 }

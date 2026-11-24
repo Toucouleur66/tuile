@@ -83,7 +83,7 @@ pub fn gpu_with(compression: ImageryCompression) -> Option<GpuContext> {
 }
 
 /// Holds a scenario to the plan it ran under: under a block plan, imagery
-/// really was encoded — `at_least` tiles, none fallen back to RGBA8 — so a
+/// really was compressed in place — `at_least` tiles, none refused — so a
 /// scenario cannot pass "under BC7" on RGBA8 textures.
 pub fn encoded_as_planned(plan: &str, gpu: &GpuContext, at_least: u64) {
     match gpu.imagery_encode_stats() {
@@ -101,6 +101,17 @@ pub fn encoded_as_planned(plan: &str, gpu: &GpuContext, at_least: u64) {
             assert_eq!(stats.fell_back, 0, "{plan}: a 256² tile fell back to RGBA8");
         }
     }
+}
+
+/// The budget asks for `drapes` — each at its generation — to be
+/// compressed in place (CB9): what a session sends once they have lasted.
+pub fn ask_compress(stream: &mut Scripted, drapes: &[(ResourceId, u64)]) {
+    stream.inbox.push_back(ServerMessage::Compress {
+        resources: drapes
+            .iter()
+            .map(|(r, g)| (*r, tuile_core::budget::Generation(*g)))
+            .collect(),
+    });
 }
 
 /// A `width × height` imagery texture painted by `paint(x, y)`, held as

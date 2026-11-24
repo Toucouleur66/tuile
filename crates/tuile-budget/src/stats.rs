@@ -191,6 +191,9 @@ pub struct BudgetStats {
     /// evictions by level and distance band, and its parameters. Not in
     /// [`BudgetStats::digest`].
     pub score: crate::score::ScoreStats,
+    /// The compression in place (CB9): what was decided and acknowledged,
+    /// and what waits.
+    pub compress: crate::compress::CompressStats,
     /// The step per level, per class: what the budget window and the
     /// telemetry's per-level series read.
     pub levels: LevelStats,

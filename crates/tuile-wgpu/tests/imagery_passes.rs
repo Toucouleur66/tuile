@@ -108,6 +108,14 @@ fn layer(gpu: &GpuContext, index: u32, colour: [u8; 3], coverage: [f32; 4]) -> I
     }
 }
 
+/// A mesh's own imagery is uploaded as it comes and never compressed in
+/// place — only a drape's shared imagery is, when the budget asks (CB9):
+/// under every plan, nothing was encoded for it.
+fn held_as_uploaded(plan: &str, gpu: &GpuContext) {
+    let encoded = gpu.imagery_encode_stats().map_or(0, |s| s.encoded);
+    assert_eq!(encoded, 0, "{plan}");
+}
+
 /// Renders the quad head-on and returns the resolved frame, RGBA8.
 fn render(gpu: &GpuContext, content: &DecodedTileContent) -> Vec<u8> {
     let make = |label, format, usage, samples| {
@@ -300,7 +308,7 @@ fn a_layer_past_the_first_batch_under(plan: &str, gpu: &GpuContext) {
     );
 
     let pixels = render(gpu, &content);
-    support::encoded_as_planned(plan, gpu, u64::from(slots) + 1);
+    held_as_uploaded(plan, gpu);
     let left = sample(&pixels, 0.25);
     let right = sample(&pixels, 0.75);
 
@@ -336,7 +344,7 @@ fn a_drape_that_fits_in_one_draw_is_drawn_exactly_once() {
         ];
 
         let pixels = render(&gpu, &content);
-        support::encoded_as_planned(plan, &gpu, 2);
+        held_as_uploaded(plan, &gpu);
         assert!(
             close(sample(&pixels, 0.25), GREEN),
             "{plan}: two layers in one pass: the later one must win where it covers"

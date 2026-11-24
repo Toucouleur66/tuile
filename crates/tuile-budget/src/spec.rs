@@ -301,6 +301,54 @@ pub const PROGRESSIVE: Progressive = Progressive {
     coarse_boost_permille: 950,
 };
 
+/// When a texture held RGBA8 is compressed in place on the GPU (CB9:
+/// display at once, compress what lasts): the laws of
+/// `docs/explorations/compress-what-lasts.md`. A copy is compressed once
+/// it has **survived `decisions` decisions with a very high score** — its
+/// probability of use, the progressive score's `P`, at least
+/// `probability_permille` at every decision the pass sampled since it rose
+/// there (a dip starts the count again). A decision is a camera pose, one
+/// camera handed to the decider (Laurent, 2026-11-24: the decider's timers
+/// count poses, not seconds): the count follows how fast the view changes,
+/// and in a film a decision is a frame. A copy whose score is very high is
+/// also compressed once the need has not changed for `still_poses`
+/// consecutive poses — the camera at rest. Under pressure both waits are
+/// waived, never the score: compressing comes before evicting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Compress {
+    /// The least probability of use, ‰ of certainty, a copy's score keeps
+    /// to be compressed: very high by default.
+    pub probability_permille: u16,
+    /// The decisions — camera poses — it must survive with that score.
+    pub decisions: u16,
+    /// Or the consecutive camera poses the need must have been unchanged
+    /// for, the score that high.
+    pub still_poses: u32,
+    /// The compressible copies a step looks at: the bound of the pass, and
+    /// how often a copy's score is sampled.
+    pub visits: u16,
+    /// The compressions in flight, in 256² tiles with their chains (5,463
+    /// blocks each): the transient's bound, and the consumer's queue —
+    /// enough for a few frames of its encode lane, so that its round trip
+    /// never idles the lane. Scaled down with the thermal state as the
+    /// encode lane is.
+    pub flight_tiles: u16,
+}
+
+/// The defaults: 90 % of certainty — what the view draws and its nearest
+/// neighbours, not a preload one radius out — kept over ten decisions, or
+/// a need unchanged for 60 poses (the second it was in time, at the
+/// viewers' 60 steps a second: a viewer sends its camera every frame, and
+/// the geometry server steps on each); 64 copies a step, sixteen tiles in
+/// flight.
+pub const COMPRESS: Compress = Compress {
+    probability_permille: 900,
+    decisions: 10,
+    still_poses: 60,
+    visits: 64,
+    flight_tiles: 16,
+};
+
 /// The room kept free under each target by default, ‰: none until a value
 /// is chosen — 12.5 % was measured to cost the soak's revisits (the
 /// cache it keeps out), `tuile://budget?headroom=125` tries it.
@@ -385,6 +433,8 @@ pub struct Params {
     /// What a drape worn finer than its need weighs against one worn as
     /// much coarser, ‰ (#277's over-need deficit).
     pub finer_gap_permille: u16,
+    /// When a texture held RGBA8 is compressed in place (CB9).
+    pub compress: Compress,
 }
 
 /// The policy of the decider: rules and numbers. See the [module
@@ -476,6 +526,7 @@ impl Specification {
                 sweep_keep_poses: SWEEP_KEEP_POSES,
                 rho_tiles: 0,
                 finer_gap_permille: FINER_GAP,
+                compress: COMPRESS,
             },
         }
     }
@@ -532,6 +583,7 @@ impl Specification {
                 sweep_keep_poses: SWEEP_KEEP_POSES,
                 rho_tiles: 0,
                 finer_gap_permille: FINER_GAP,
+                compress: COMPRESS,
             },
         }
     }
@@ -595,6 +647,7 @@ impl Specification {
                 sweep_keep_poses: SWEEP_KEEP_POSES,
                 rho_tiles: 0,
                 finer_gap_permille: FINER_GAP,
+                compress: COMPRESS,
             },
         }
     }
@@ -705,6 +758,11 @@ impl Specification {
             ("sweep_keep_poses", u64::from(p.sweep_keep_poses), 36_000),
             ("rho", u64::from(p.rho_tiles), 16),
             ("finer_gap", u64::from(p.finer_gap_permille), 1_000),
+            ("compress_p", u64::from(p.compress.probability_permille), 1_000),
+            ("compress_decisions", u64::from(p.compress.decisions), 10_000),
+            ("compress_still_poses", u64::from(p.compress.still_poses), 36_000),
+            ("compress_flight_tiles", u64::from(p.compress.flight_tiles), 1_024),
+            ("compress_visits", u64::from(p.compress.visits), 4_096),
         ];
         if let Some((name, ..)) = bounded.iter().find(|(_, v, max)| v > max) {
             return Err(SpecError::OutOfBounds(name));
@@ -741,7 +799,8 @@ impl Specification {
              &restore_decoded_ms={}&restore_stored_ms={}&restore_http_cache_ms={}\
              &restore_remote_ms={}&p_ring={}&p_ancestor={}&a0={}&a_desc={}&headroom={}&floor_value={}\
              &release_visits={}&rho={}&finer_gap={}&coarse_from={}&coarse_boost={}\
-             &sweep_keep_poses={}",
+             &sweep_keep_poses={}&compress_p={}&compress_decisions={}&compress_still_poses={}&compress_visits={}\
+             &compress_flight_tiles={}",
             self.kind.label(),
             p.margin_permille,
             ms(p.min_dwell),
@@ -766,6 +825,11 @@ impl Specification {
             p.progressive.coarse_from,
             p.progressive.coarse_boost_permille,
             p.sweep_keep_poses,
+            p.compress.probability_permille,
+            p.compress.decisions,
+            p.compress.still_poses,
+            p.compress.visits,
+            p.compress.flight_tiles,
         );
         // A term's weight when all its rules share one; a term weighed
         // differently by predicate (FPV's recency) keeps its kind's rules.
@@ -829,6 +893,11 @@ impl Specification {
                 "finer_gap" => p.finer_gap_permille = n16,
                 "coarse_from" => p.progressive.coarse_from = n16,
                 "coarse_boost" => p.progressive.coarse_boost_permille = n16,
+                "compress_p" => p.compress.probability_permille = n16,
+                "compress_decisions" => p.compress.decisions = n16,
+                "compress_still_poses" => p.compress.still_poses = n32,
+                "compress_flight_tiles" => p.compress.flight_tiles = n16,
+                "compress_visits" => p.compress.visits = n16,
                 _ => match k
                     .strip_prefix("w_")
                     .and_then(|t| Term::ALL.into_iter().find(|x| term_key(*x) == t))

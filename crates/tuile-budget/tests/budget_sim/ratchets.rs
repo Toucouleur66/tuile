@@ -115,6 +115,12 @@ fn still() -> (u64, u64, u32, u64) {
 /// the events a step drains and in the copies in transit — kept buffers,
 /// sized by the busiest step, not by the tracked set. The decoded copies'
 /// extras live apart and allocate nothing without compression.
+///
+/// And by two, 902 -> 904, with the compression in place (CB9, for
+/// review): a `Cost` also says what it would hold compressed and the
+/// blocks that writes (40 -> 56 B), in the same kept buffers — the events
+/// and the transits — sized by the busiest step. Nothing else of CB9
+/// allocates without a compressible cost.
 fn motion() -> (u64, u64, i64, i64, usize) {
     let mut sim = Sim::new(Profile::desktop(), 11);
     sim.count_output = true;

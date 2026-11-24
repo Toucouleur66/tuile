@@ -16,6 +16,7 @@
 #![allow(unsafe_code)]
 
 mod alloc;
+mod compress;
 mod detmath;
 mod gpu;
 mod motion;

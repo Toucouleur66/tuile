@@ -358,8 +358,10 @@ pub enum Texels {
     Rgba8 {
         /// The pixels, row-major, 4 bytes each.
         pixels: Vec<u8>,
-        /// The format the consumer holds them in once uploaded: RGBA8, or a
-        /// block format its GPU encodes them into on the way.
+        /// The format the consumer holds them in once settled: RGBA8, or a
+        /// block format its GPU may compress them into **in place**, after
+        /// they were uploaded and drawn as RGBA8, when the graphics budget
+        /// decides so (CB9: display at once, compress what lasts).
         resident: ImageryFormat,
     },
     /// Block-compressed, every mip level already encoded, level 0 first.
@@ -404,32 +406,36 @@ impl Texels {
         }
     }
 
-    /// What a `width × height` texture of these texels costs once resident,
-    /// mip chain included, and what its upload moves.
-    ///
-    /// Held: the whole chain in the resident format. Moved: the texels as
-    /// they cross — RGBA8 for a texture the GPU encodes on the way, blocks
-    /// for one the worker already encoded.
-    ///
-    /// The GPU's encode is the one path whose parts differ: it crosses as
-    /// RGBA8 (`transfer`), holds that RGBA8 beside its blocks until the
-    /// encode has run (`transient`), and writes the chain's blocks
-    /// (`encode_blocks`). Every other path crosses as it is held.
-    pub fn cost(&self, width: u32, height: u32) -> Cost {
-        let held = drape_cost(width, height, self.resident().cost_format());
-        let crossing = match self {
-            Texels::Rgba8 { .. } => TextureFormat::Rgba8,
-            Texels::Blocks { format, .. } => format.cost_format(),
-        };
-        let crossed = drape_cost(width, height, crossing);
-        let mut cost = Cost::new(held.gpu, crossed.staging);
-        if crossing != self.resident().cost_format() {
-            // RGBA8 the GPU encodes into blocks.
-            cost.transfer = crossed.gpu;
-            cost.transient = crossed.gpu;
-            cost.encode_blocks = crate::budget::cost::chain_blocks(width, height);
+    /// The format these texels are uploaded in: what they cross as, and
+    /// are held in until anything compresses them.
+    pub fn uploaded(&self) -> ImageryFormat {
+        match self {
+            Texels::Rgba8 { .. } => ImageryFormat::Rgba8,
+            Texels::Blocks { format, .. } => (*format).into(),
         }
-        cost
+    }
+
+    /// What a `width × height` texture of these texels costs once uploaded,
+    /// mip chain included, and what its upload moves: the chain in the
+    /// format it crosses in — RGBA8, or the blocks a worker already
+    /// encoded.
+    ///
+    /// RGBA8 headed for a block format the GPU compresses (CB9) is held as
+    /// RGBA8 until the budget decides to compress it in place: its cost
+    /// says what it would hold then (`compressed`) and the blocks that
+    /// writes (`compress_blocks`) — only when level 0 is whole blocks, the
+    /// one size the encoder takes.
+    pub fn cost(&self, width: u32, height: u32) -> Cost {
+        let crossed = drape_cost(width, height, self.uploaded().cost_format());
+        let cost = Cost::new(crossed.gpu, crossed.staging);
+        let side = BlockFormat::BLOCK_SIDE;
+        let whole = width > 0 && height > 0 && width.is_multiple_of(side) && height.is_multiple_of(side);
+        if self.resident() != self.uploaded() && whole {
+            let held = drape_cost(width, height, self.resident().cost_format());
+            cost.compressible(held.gpu, crate::budget::cost::chain_blocks(width, height))
+        } else {
+            cost
+        }
     }
 }
 
@@ -782,9 +788,11 @@ mod tests {
         }
     }
 
-    /// Encoded on the GPU: held as blocks, but RGBA8 crosses.
+    /// Compressible on the GPU (CB9): uploaded, held and charged as RGBA8
+    /// — nothing encodes on the way — and compressible in place into
+    /// blocks later, by writing the chain's blocks.
     #[test]
-    fn a_gpu_encoded_texture_is_held_small_and_moved_whole() {
+    fn a_gpu_compressible_texture_is_uploaded_whole_and_compressible_later() {
         let rgba = Texels::rgba8(vec![0; 256 * 256 * 4]).cost(256, 256);
         for resident in [ImageryFormat::Bc7, ImageryFormat::Astc4x4] {
             let t = Texels::Rgba8 {
@@ -792,18 +800,26 @@ mod tests {
                 resident,
             };
             assert_eq!(t.resident(), resident);
+            assert_eq!(t.uploaded(), ImageryFormat::Rgba8);
             let c = t.cost(256, 256);
-            assert_eq!(c.gpu, Bytes(87_408), "{resident:?}");
+            assert_eq!(c.gpu, Bytes(349_524), "{resident:?}");
             assert_eq!(c.staging, rgba.staging, "{resident:?}");
-            // CB2: it crosses as RGBA8, holds that RGBA8 beside its blocks
-            // until the encode has run, and writes the chain's blocks.
             assert_eq!(
                 (c.transfer, c.transient, c.encode_blocks),
-                (Bytes(349_524), Bytes(349_524), 5_463),
-                "{resident:?}"
+                (Bytes(349_524), Bytes::ZERO, 0),
+                "{resident:?}: nothing encodes on the way"
             );
+            assert_eq!(c.compresses_to(), Some(Bytes(87_408)), "{resident:?}");
+            assert_eq!(c.compress_blocks, 5_463, "{resident:?}");
             assert!(!c.is_identity());
         }
+        // A size the encoder does not take is not compressible.
+        let odd = Texels::Rgba8 {
+            pixels: vec![0; 250 * 250 * 4],
+            resident: ImageryFormat::Bc7,
+        };
+        assert_eq!(odd.cost(250, 250).compresses_to(), None);
+        assert!(odd.cost(250, 250).is_identity());
     }
 
     /// **The web CPU path's accounting** (CB7): each decode worker holds,

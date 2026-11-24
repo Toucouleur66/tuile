@@ -2,8 +2,8 @@
 // Copyright (c) lapoule.dev
 
 //! A frame's uploads are one batch: one encoder, one submit, their bytes
-//! through reused staging, every encode in one pass, and nothing read back
-//! or waited for on the way.
+//! through reused staging, every compression in place in one pass, and
+//! nothing read back or waited for on the way.
 //!
 //! Counted with the context's own counters (`GpuContext::upload_ops`), on a
 //! real device: a skip without one, a failure under `TUILE_REQUIRE_GPU=1`.
@@ -98,11 +98,13 @@ fn a_frame_of_uploads_is_one_submit_through_reused_staging() {
     }
 }
 
-/// **A frame's encodes are one pass and one submit**, under each block
-/// plan: sixteen drapes encoded together, nothing polled, at most one
-/// timestamp read started — without waiting for it.
+/// **A frame's compressions in place are one pass and one submit**, under
+/// each block plan (CB9): sixteen drapes uploaded as RGBA8 in one frame —
+/// nothing encoded on the way — then compressed together in one pass,
+/// their wearers dressed again in the same submit, nothing polled, at most
+/// one timestamp read started — without waiting for it.
 #[test]
-fn a_frames_encodes_are_one_pass() {
+fn a_frames_compressions_are_one_pass() {
     for compression in [
         ImageryCompression::Format(tuile_core::texels::BlockFormat::Bc7),
         ImageryCompression::Format(tuile_core::texels::BlockFormat::Astc4x4),
@@ -111,11 +113,28 @@ fn a_frames_encodes_are_one_pass() {
             continue;
         };
         let mut pump = ContentPump::new(glam::DVec3::ZERO);
-        // Room for every encode of the frame: an unbounded deadline has no
-        // encode lane.
         let mut stream = deliveries(&gpu, 16, 7);
         let before = gpu.upload_ops();
         assert_eq!(pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED), 32);
+        let _ = pump.resolve(&gpu);
+        let ops = gpu.upload_ops() - before;
+        assert_eq!(ops.encode_passes, 0, "{compression:?}: display at once {ops:?}");
+        // The budget asks for the sixteen drapes to be compressed in place.
+        stream
+            .inbox
+            .push_back(tuile_core::protocol::ServerMessage::Compress {
+                resources: (0..16u64)
+                    .map(|i| {
+                        let tile = TileId::from_terrain(8, i, 7);
+                        (
+                            ResourceId::drape(tile, LayerId(0), 8),
+                            tuile_core::budget::Generation(1000 + i),
+                        )
+                    })
+                    .collect(),
+            });
+        let before = gpu.upload_ops();
+        pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
         let _ = pump.resolve(&gpu);
         let ops = gpu.upload_ops() - before;
         assert_eq!(ops.encoded_tiles, 16, "{compression:?} {ops:?}");

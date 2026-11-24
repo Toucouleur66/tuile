@@ -387,13 +387,16 @@ struct CpuPayload {
 }
 
 /// The parts of a cost that are not an identity's ([`Cost::is_identity`]):
-/// a texture the GPU encodes on the way. Kept by slot beside the column, so
-/// that nothing compressed costs a slot more.
+/// a texture the GPU encodes on the way, or may compress in place later.
+/// Kept by slot beside the column, so that nothing compressed costs a slot
+/// more.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct CostExtra {
     transfer: Bytes,
     transient: Bytes,
     encode_blocks: u64,
+    compressed: Bytes,
+    compress_blocks: u64,
 }
 
 /// A load's payload; its source is a flag.
@@ -1813,6 +1816,8 @@ impl Arena {
                 cost.transfer = x.transfer;
                 cost.transient = x.transient;
                 cost.encode_blocks = x.encode_blocks;
+                cost.compressed = x.compressed;
+                cost.compress_blocks = x.compress_blocks;
             }
             CpuCopy {
                 gen: c.gen,
@@ -1831,7 +1836,9 @@ impl Arena {
                 && self.has_cpu(s)
                 && (x.transfer != self.cpu[s.i()].gpu
                     || x.transient != Bytes::ZERO
-                    || x.encode_blocks != 0)
+                    || x.encode_blocks != 0
+                    || x.compressed != Bytes::ZERO
+                    || x.compress_blocks != 0)
         })
     }
 
@@ -1929,6 +1936,8 @@ impl Arena {
                 transfer: c.cost.transfer,
                 transient: c.cost.transient,
                 encode_blocks: c.cost.encode_blocks,
+                compressed: c.cost.compressed,
+                compress_blocks: c.cost.compress_blocks,
             };
             self.cpu_extra
                 .get_or_insert_with(SortedMap::default)
