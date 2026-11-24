@@ -26,6 +26,16 @@ fn mesh(id: tuile_budget::TileId) -> ResourceId {
     ResourceId::Mesh(id)
 }
 
+/// The role `tile`'s mesh is drawn in by one more step of `need`.
+fn d_role(
+    r: &mut Rig,
+    need: &NeedSet,
+    tile: tuile_budget::TileId,
+) -> Option<Role> {
+    let d = r.step(need);
+    d.draw.get(mesh(tile)).map(|i| i.role)
+}
+
 /// Every step of `ds` asked to start `r`?
 fn started(ds: &[tuile_budget::Decisions], r: ResourceId) -> bool {
     ds.iter().any(|d| d.start.iter().any(|s| s.resource == r))
@@ -2128,21 +2138,139 @@ mod draw {
         assert!(kids.iter().all(|&k| !d.draw.draws(k)));
     }
 
-    /// I9 (refining), C19: the parent stays drawn while any wanted child is
-    /// missing.
+    /// I9 (refining), C19, all or nothing (Laurent, 2026-11-24): the parent
+    /// stays drawn for all of its wanted children while any of them is
+    /// missing — three children drawn beside their parent standing in for
+    /// the fourth is two levels painted inside one parent — then gives way
+    /// to all of them in one step.
     #[test]
-    fn the_parent_stays_drawn_while_any_wanted_child_is_missing() {
+    fn the_parent_stands_for_all_its_children_while_any_is_missing() {
         let mut r = Rig::interactive();
         let p = t(2, 1, 1);
         let kids = children(p);
         r.settle(&drawn(&[p]), 10);
-        r.settle(&drawn(&[p, kids[0], kids[1], kids[2]]), 10);
+        // Three children resident, waited on by their parent, not drawn.
+        let hold = NeedSet {
+            drawn: vec![(p, need_of_tile(p))],
+            blockers: kids[..3].iter().map(|&k| (k, need_of_tile(k))).collect(),
+            ..NeedSet::new()
+        };
+        r.settle(&hold, 10);
         let d = r.step(&drawn(&kids));
         let item = d.draw.get(mesh(p)).expect(RED);
         assert_eq!(item.role, Role::Fallback);
-        assert_eq!(item.serves.to_vec(), vec![kids[3]]);
+        let mut all = kids.to_vec();
+        all.sort();
+        assert_eq!(
+            item.serves.to_vec(),
+            all,
+            "the parent stands for every child while one is missing"
+        );
+        for k in kids {
+            assert!(
+                !d.draw.draws(k),
+                "{k:?} drawn beside its parent standing in for a sibling"
+            );
+        }
+        assert_eq!((d.stats.exact, d.stats.lost), (0, 0));
         let d = r.settle(&drawn(&kids), 10);
         assert!(!d.draw.draws(p));
+        for k in kids {
+            assert_eq!(d.draw.get(mesh(k)).map(|i| i.role), Some(Role::Exact));
+        }
+    }
+
+    /// All or nothing never costs ground: with no drawable parent to stand
+    /// for them all, the children that are drawable are drawn, and only the
+    /// missing one stands on a farther ancestor (blurry beats bare, and a
+    /// grandparent standing for all four would be blurrier still).
+    #[test]
+    fn without_a_drawable_parent_the_ready_children_are_drawn() {
+        let mut r = Rig::interactive();
+        let root = t(0, 0, 0);
+        let p = children(root)[3];
+        let kids = children(p);
+        r.settle(&drawn(&[root]), 10);
+        r.settle(&drawn(&[root, kids[0], kids[1], kids[2]]), 10);
+        let mut want = drawn(&kids);
+        want.ancestors.push((p, need_of_tile(p)));
+        r.step(&want);
+        // The parent's mesh never arrives: only what was resident draws.
+        let d = r.step(&want);
+        assert!(!r.b.residency().drawable(p), "the parent is not drawable");
+        for k in &kids[..3] {
+            assert_eq!(
+                d.draw.get(mesh(*k)).map(|i| i.role),
+                Some(Role::Exact),
+                "{RED}: {k:?}"
+            );
+        }
+        let item = d.draw.get(mesh(root)).expect("the root stands for the fourth");
+        assert_eq!(item.role, Role::Fallback);
+        assert_eq!(item.serves.to_vec(), vec![kids[3]]);
+        assert_eq!(d.stats.lost, 0);
+    }
+
+    /// Zoom-out, the fine until its replacement (Laurent, 2026-11-24): the
+    /// finer tiles held on screen stay until the coarser tile wanted in
+    /// their place wears a drape at its need. Its mesh dressed in an
+    /// ancestor's coarser drape is no replacement: it would paint a blurry
+    /// patch where sharp ground was drawn. Meanwhile it stands, as a
+    /// fallback, for what the held tiles do not cover.
+    #[test]
+    fn held_children_stay_until_the_parent_wears_its_needed_drape() {
+        let mut r = Rig::interactive();
+        let root = t(0, 0, 0);
+        let mid = children(root)[0];
+        let p = children(mid)[3];
+        let kids = children(p);
+        // The coarse ancestors resident, meshes and drapes, then the
+        // children drawn sharp.
+        let ancestors = vec![(root, draped(root, 0)), (mid, draped(mid, 1))];
+        let first = NeedSet {
+            drawn: ancestors.clone(),
+            ..NeedSet::new()
+        };
+        r.settle(&first, 20);
+        let mut fine = drawn_draped(&kids, 3);
+        fine.ancestors = ancestors.clone();
+        r.settle(&fine, 20);
+        for k in kids {
+            assert_eq!(d_role(&mut r, &fine, k), Some(Role::Exact), "{k:?} drawn first");
+        }
+        // Zoom-out: the parent is wanted at imagery level 2. Its mesh
+        // arrives, its own drape does not; the ancestors' coarser drapes
+        // would dress it.
+        let mut out = drawn_draped(&[p], 2);
+        out.ancestors = ancestors;
+        r.step(&out);
+        r.load_where(|x| x == mesh(p));
+        for _ in 0..4 {
+            let d = r.step(&out);
+            r.upload(&d);
+        }
+        let d = r.step(&out);
+        assert!(r.b.residency().drawable(p), "the parent's mesh is drawable");
+        for k in kids {
+            assert_eq!(
+                d.draw.get(mesh(k)).map(|i| i.role),
+                Some(Role::Held),
+                "{RED}: {k:?} gave way to a parent dressed in an ancestor's coarser drape"
+            );
+        }
+        assert_ne!(
+            d.draw.get(mesh(p)).map(|i| i.role),
+            Some(Role::Exact),
+            "the parent drawn as itself in a drape under its need"
+        );
+        assert_eq!((d.stats.lost, d.stats.bare), (0, 0));
+        // Its drape arrives: one swap, the children gone in the same step.
+        r.load_where(|x| x == dr(p, 2));
+        let d = r.settle(&out, 10);
+        let item = d.draw.get(mesh(p)).expect("drawn");
+        assert_eq!(item.role, Role::Exact);
+        assert_eq!(base_drape(item).map(|x| x.resource), Some(dr(p, 2)));
+        assert!(kids.iter().all(|&k| !d.draw.draws(k)));
     }
 
     /// I9, C20: the old drape is worn until the new one is drawable.
