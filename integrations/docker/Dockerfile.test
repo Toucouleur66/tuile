@@ -8,7 +8,9 @@
 # directory, not an image.
 #
 # Do not build this by hand: scripts/test-on-builder.sh makes the context (the
-# tracked files of a commit) and passes the arguments.
+# tracked files of a commit, plus .test-on-builder/: this file and the sccache
+# helpers from the checkout that runs it, and the commands) and passes the
+# arguments.
 #
 # The stack is CI's `test` job's (ubuntu-24.04):
 #   - Ubuntu 24.04, pinned by digest, because the Linux image is also the
@@ -77,7 +79,7 @@ RUN curl -fsSL -o /tmp/nextest.tar.gz \
 
 # sccache, used only when the build is given a bucket and a key
 # (sccache-env.sh): without them the steps compile as they would anyway.
-COPY integrations/docker/sccache-install.sh integrations/docker/sccache-env.sh /usr/local/share/tuile/
+COPY .test-on-builder/sccache-install.sh .test-on-builder/sccache-env.sh /usr/local/share/tuile/
 RUN sh /usr/local/share/tuile/sccache-install.sh
 
 ENV CARGO_TERM_COLOR=never CARGO_NET_GIT_FETCH_WITH_CLI=true \

@@ -92,14 +92,19 @@ OUT="${REPO_ROOT}/target/test-on-builder/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$OUT"
 CTX="${OUT}/context.tar"
 git -C "$REPO_ROOT" archive --format=tar -o "$CTX" "$REF"
-# The commands travel in the context, beside the tree: a file the image reads
-# line by line, never a build argument re-parsed on the way.
-if [ -n "$COMMANDS" ]; then
-    mkdir -p "${OUT}/ctx-extra/.test-on-builder"
-    cp "$COMMANDS" "${OUT}/ctx-extra/.test-on-builder/commands"
-    tar -rf "$CTX" -C "${OUT}/ctx-extra" .test-on-builder/commands
-    rm -rf "${OUT}/ctx-extra"
-fi
+# The runner travels in the context beside the tree, from THIS checkout: a
+# commit older than this script (a branch under test) has no Dockerfile.test.
+# So do the commands, a file the image reads line by line, never a build
+# argument re-parsed on the way. The image removes .test-on-builder/ before
+# the steps run.
+EXTRA="${OUT}/ctx-extra/.test-on-builder"
+mkdir -p "$EXTRA"
+cp "${REPO_ROOT}/integrations/docker/Dockerfile.test" \
+    "${REPO_ROOT}/integrations/docker/sccache-install.sh" \
+    "${REPO_ROOT}/integrations/docker/sccache-env.sh" "$EXTRA/"
+if [ -n "$COMMANDS" ]; then cp "$COMMANDS" "${EXTRA}/commands"; fi
+tar -rf "$CTX" -C "${OUT}/ctx-extra" .test-on-builder
+rm -rf "${OUT}/ctx-extra"
 
 BUILD_ARGS=(
     --build-arg "CARGO_TEST_ARGS=${TEST_ARGS}"
@@ -128,7 +133,7 @@ echo "=== ${STEPS}${COMMANDS:+ + commands of ${COMMANDS}} (cargo nextest run ${T
 # No pipefail for this one pipeline: PIPESTATUS keeps buildx's own status.
 set +o pipefail
 docker buildx build --builder "$TUILE_BUILDER" --platform linux/amd64 --progress plain \
-    -f integrations/docker/Dockerfile.test \
+    -f .test-on-builder/Dockerfile.test \
     "${BUILD_ARGS[@]}" \
     --output "type=local,dest=${OUT}" \
     - < "$CTX" 2>&1 | tee "${OUT}/build.log" \
