@@ -29,10 +29,13 @@
 #   budget  the budget's simulation and properties, in release   (CI: budget-sim)
 #   clippy  cargo clippy --workspace --all-targets -D warnings   (CI: lint)
 #   wasm    the wasm32 check and clippy of CI's wasm-guard       (CI: wasm-guard)
+# then, when the context carries .test-on-builder/commands, each of its lines
+# as a step of its own (cmd-1, cmd-2…), run by bash from the workspace root.
 #
 # The output: <step>.log and <step>.exit for each step, junit.xml (the test
-# step's nextest report), junit-budget.xml, summary.txt, and exit-code (0, or
-# the first failing step's code).
+# step's nextest report), junit-budget.xml, summary.txt, changes.patch (every
+# change the steps made to the tree: blessed references come back that way),
+# and exit-code (0, or the first failing step's code).
 
 FROM ubuntu:24.04@sha256:562111b88caa79c71391c0c4d3c2114a7d5c35915c20561fd893cb1e07929e6b AS base
 
@@ -110,12 +113,20 @@ export CARGO_BUILD_JOBS="${CARGO_JOBS}"
 echo "=== $(rustc --version), $(cargo nextest --version | head -n1)"
 echo "=== vulkan: $(ls /usr/share/vulkan/icd.d/ 2>/dev/null | tr '\n' ' ')"
 echo "=== mesa: $(dpkg-query -W -f='${Version}' mesa-vulkan-drivers)"
+# The tree as it came, in a git directory OUTSIDE the tree (no .git appears in
+# /repo for a build script to read): what the steps change is diffed against it.
+# The commands leave the tree first: they are not part of what is tested.
+if [ -f .test-on-builder/commands ]; then mv .test-on-builder/commands /tmp/commands; fi
+rm -rf .test-on-builder
+snap() { git --git-dir=/tmp/tree.git --work-tree=/repo -c core.autocrlf=false "$@"; }
+snap init -q && snap add -A && snap -c user.name=t -c user.email=t@t commit -qm tree \
+    || echo "=== no snapshot of the tree: changes.patch will be missing"
 first_rc=0
 step() { # $1=name, then the commands, run by bash -c
     local name="$1" rc
     shift
     echo "=== ${name}: start $(date +%T)" | tee "/out/${name}.log"
-    bash -c "$*" >> "/out/${name}.log" 2>&1; rc=$?
+    bash -c "$*" < /dev/null >> "/out/${name}.log" 2>&1; rc=$?
     echo "$rc" > "/out/${name}.exit"
     echo "=== ${name}: exit ${rc} $(date +%T)" | tee -a "/out/${name}.log" | tee -a /out/summary.txt
     grep -E "Summary \[|^test result|^error(\[E[0-9]+\])?:|FAIL \[|TIMEOUT \[|SIGSEGV|panicked" "/out/${name}.log" \
@@ -145,6 +156,17 @@ for s in ${TEST_STEPS}; do
             [ "$first_rc" -ne 0 ] || first_rc=2 ;;
     esac
 done
+if [ -f /tmp/commands ]; then
+    n=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in ''|'#'*) continue ;; esac
+        n=$((n + 1))
+        echo "cmd-${n}: ${line}" >> /out/commands.txt
+        step "cmd-${n}" "$line"
+    done < /tmp/commands
+fi
+snap add -A 2>/dev/null && snap diff --cached --binary > /out/changes.patch 2>/dev/null
+echo "=== changes: $(snap diff --cached --stat 2>/dev/null | tail -n1)" | tee -a /out/summary.txt
 tuile_sccache_stop > /out/sccache.txt 2>&1
 echo "$first_rc" > /out/exit-code
 echo "=== tests: exit ${first_rc} $(date +%T)"

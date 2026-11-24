@@ -11,18 +11,26 @@
 #   scripts/test-on-builder.sh -p tuile-budget --lib  # `cargo nextest run` with these arguments
 #   scripts/test-on-builder.sh -p tuile-wgpu -E 'test(no_black_ground)'
 #   TUILE_TEST_STEPS="clippy wasm" scripts/test-on-builder.sh
+#   TUILE_TEST_REF=origin/my-branch TUILE_TEST_COMMANDS=commands.txt scripts/test-on-builder.sh
 #
 # Arguments are `cargo nextest run`'s (after `--profile ci`); with arguments
 # only the `test` step runs, unless TUILE_TEST_STEPS says otherwise. Each one
 # reaches the image as it was given here (quoted with printf %q, parsed again
 # by the step's shell): a filter expression with spaces survives.
 #
+# TUILE_TEST_COMMANDS names a file of shell commands, one per line (blank
+# lines and # comments skipped): each runs as a step of its own, cmd-1,
+# cmd-2…, from the workspace root, after the named steps; with it and no
+# TUILE_TEST_STEPS, only the commands run. A command that writes files of the
+# tree (blessed references, regenerated fixtures) brings them back: every
+# change to the tree is in changes.patch (`git apply` it at the commit tested).
+#
 # What is tested: the working tree's tracked files (committed or not;
-# untracked files are not included), or TUILE_TEST_REF=<commit> if set.
+# untracked files are not included), or TUILE_TEST_REF=<commit or branch>.
 #
 # The logs land in target/test-on-builder/<time>/: <step>.log and <step>.exit
-# per step, junit.xml, junit-budget.xml, summary.txt, exit-code and build.log.
-# The script exits with the steps' code (the first failing one's).
+# per step, junit.xml, junit-budget.xml, summary.txt, changes.patch, exit-code
+# and build.log. The script exits with the steps' code (the first failing one's).
 #
 # # Configuration
 #
@@ -31,7 +39,8 @@
 #   TUILE_BUILDER          buildx builder to run on                  (always)
 #   TUILE_TEST_STEPS       the steps, space-separated (default: all of them
 #                          without arguments, `test` with arguments)
-#   TUILE_TEST_REF         the commit to test instead of the working tree
+#   TUILE_TEST_REF         the commit or branch to test instead of the working tree
+#   TUILE_TEST_COMMANDS    a file of commands, one step each (above)
 #   TUILE_CARGO_JOBS       CARGO_BUILD_JOBS on the builder (default 4)
 #   TUILE_TEST_THREADS     nextest --test-threads (default 4)
 #
@@ -52,13 +61,21 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-case "${1:-}" in -h|--help) sed -n '5,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
+case "${1:-}" in -h|--help) sed -n '5,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
 if [ -z "${TUILE_BUILDER:-}" ]; then
     echo "error: TUILE_BUILDER is not set — the buildx builder to run the tests on" >&2
     exit 2
 fi
 
-if [ "$#" -gt 0 ]; then
+COMMANDS="${TUILE_TEST_COMMANDS:-}"
+if [ -n "$COMMANDS" ] && [ ! -f "$COMMANDS" ]; then
+    echo "error: TUILE_TEST_COMMANDS=${COMMANDS} is not a file" >&2
+    exit 2
+fi
+if [ -n "$COMMANDS" ]; then
+    STEPS="${TUILE_TEST_STEPS:-}"
+    TEST_ARGS="$(printf '%q ' "${@:---workspace}")"
+elif [ "$#" -gt 0 ]; then
     STEPS="${TUILE_TEST_STEPS:-test}"
     TEST_ARGS="$(printf '%q ' "$@")"
 else
@@ -75,6 +92,14 @@ OUT="${REPO_ROOT}/target/test-on-builder/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$OUT"
 CTX="${OUT}/context.tar"
 git -C "$REPO_ROOT" archive --format=tar -o "$CTX" "$REF"
+# The commands travel in the context, beside the tree: a file the image reads
+# line by line, never a build argument re-parsed on the way.
+if [ -n "$COMMANDS" ]; then
+    mkdir -p "${OUT}/ctx-extra/.test-on-builder"
+    cp "$COMMANDS" "${OUT}/ctx-extra/.test-on-builder/commands"
+    tar -rf "$CTX" -C "${OUT}/ctx-extra" .test-on-builder/commands
+    rm -rf "${OUT}/ctx-extra"
+fi
 
 BUILD_ARGS=(
     --build-arg "CARGO_TEST_ARGS=${TEST_ARGS}"
@@ -98,7 +123,7 @@ else
     echo "   sccache: off (TUILE_SCCACHE_BUCKET / _KEY_ID / _SECRET not all set)"
 fi
 
-echo "=== ${STEPS} (cargo nextest run ${TEST_ARGS}) on ${TUILE_BUILDER} (${COMMIT}) → ${OUT}"
+echo "=== ${STEPS}${COMMANDS:+ + commands of ${COMMANDS}} (cargo nextest run ${TEST_ARGS}) on ${TUILE_BUILDER} (${COMMIT}) → ${OUT}"
 # Only what buildx prints of the steps: the "===" lines and the summaries.
 # No pipefail for this one pipeline: PIPESTATUS keeps buildx's own status.
 set +o pipefail
