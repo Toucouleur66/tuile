@@ -28,6 +28,10 @@
 # What is tested: the working tree's tracked files (committed or not;
 # untracked files are not included), or TUILE_TEST_REF=<commit or branch>.
 #
+# A build cut short (the builder restarted, the connection dropped) exports
+# nothing; the script then rebuilds the step logs and the last changes.patch
+# from what the build printed (build.log).
+#
 # The logs land in target/test-on-builder/<time>/: <step>.log and <step>.exit
 # per step, junit.xml, junit-budget.xml, summary.txt, changes.patch, exit-code
 # and build.log. The script exits with the steps' code (the first failing one's).
@@ -43,6 +47,8 @@
 #   TUILE_TEST_COMMANDS    a file of commands, one step each (above)
 #   TUILE_CARGO_JOBS       CARGO_BUILD_JOBS on the builder (default 4)
 #   TUILE_TEST_THREADS     nextest --test-threads (default 4)
+#   TUILE_TEST_SLOT        the builder slot the run holds, when a scheduler
+#                          gives one: one target directory per slot (default 0)
 #
 # The shared compilation cache, all optional (integrations/docker/sccache-env.sh);
 # with no bucket or no key the steps compile without it:
@@ -61,7 +67,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-case "${1:-}" in -h|--help) sed -n '5,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
+case "${1:-}" in -h|--help) sed -n '5,36p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
 if [ -z "${TUILE_BUILDER:-}" ]; then
     echo "error: TUILE_BUILDER is not set — the buildx builder to run the tests on" >&2
     exit 2
@@ -111,6 +117,7 @@ BUILD_ARGS=(
     --build-arg "TEST_STEPS=${STEPS}"
     --build-arg "CARGO_JOBS=${TUILE_CARGO_JOBS:-4}"
     --build-arg "TEST_THREADS=${TUILE_TEST_THREADS:-4}"
+    --build-arg "TARGET_SLOT=${TUILE_TEST_SLOT:-0}"
 )
 # The compilation cache: its bucket as build args, its key as secrets read by
 # buildx from this environment (the value never appears on a command line).
@@ -137,14 +144,27 @@ docker buildx build --builder "$TUILE_BUILDER" --platform linux/amd64 --progress
     "${BUILD_ARGS[@]}" \
     --output "type=local,dest=${OUT}" \
     - < "$CTX" 2>&1 | tee "${OUT}/build.log" \
-    | { grep --line-buffered -E '^#[0-9]+ [0-9.]+ (===|\[[a-z]+\] )' || true; }
+    | { grep --line-buffered -E '^#[0-9]+ [0-9.]+ (=== [a-z0-9-]+: |\[[a-z0-9-]+\] )' || true; }
 build_rc="${PIPESTATUS[0]}"
 set -o pipefail
 rm -f "$CTX"
 
 if [ "$build_rc" -ne 0 ] || [ ! -f "${OUT}/exit-code" ]; then
     echo "test-on-builder: the build itself failed (${OUT}/build.log)" >&2
-    grep -E 'ERROR|error:' "${OUT}/build.log" | sed -n 1,20p >&2 || true
+    grep -E 'ERROR|error:' "${OUT}/build.log" | grep -v '^#[0-9]* [0-9.]* |' | sed -n 1,20p >&2 || true
+    # What the steps printed before the cut: each step's lines from the
+    # progress (`|name| line`), and the last patch block.
+    sed -nE 's/^#[0-9]+ [0-9.]+ === ([a-z0-9-]+): start .*/\1/p' "${OUT}/build.log" | sort -u \
+        | while IFS= read -r name; do
+            sed -nE "s/^#[0-9]+ [0-9.]+ \\|${name}\\| ?//p" "${OUT}/build.log" > "${OUT}/${name}.log"
+        done
+    awk '/^#[0-9]+ [0-9.]+ === patch-begin /{b=""; on=1; next}
+         /^#[0-9]+ [0-9.]+ === patch-end /{last=b; on=0; next}
+         on{sub(/^#[0-9]+ [0-9.]+ /, ""); b=b $0 "\n"}
+         END{printf "%s", last}' "${OUT}/build.log" | base64 -d 2>/dev/null | gunzip -c > "${OUT}/changes.patch" 2>/dev/null \
+        || rm -f "${OUT}/changes.patch"
+    [ -s "${OUT}/changes.patch" ] || rm -f "${OUT}/changes.patch"
+    echo "test-on-builder: step logs$([ -f "${OUT}/changes.patch" ] && echo ' and changes.patch') recovered from the progress into ${OUT}" >&2
     exit 1
 fi
 rc="$(cat "${OUT}/exit-code")"

@@ -34,6 +34,11 @@
 # then, when the context carries .test-on-builder/commands, each of its lines
 # as a step of its own (cmd-1, cmd-2…), run by bash from the workspace root.
 #
+# Every line of every step is also printed to the build's progress, and the
+# tree's changes after each step that made any: a build cut short leaves them
+# in the client's build.log (BuildKit keeps at most its step log limit,
+# 2 MiB by default, of the one RUN that holds every step).
+#
 # The output: <step>.log and <step>.exit for each step, junit.xml (the test
 # step's nextest report), junit-budget.xml, summary.txt, changes.patch (every
 # change the steps made to the tree: blessed references come back that way),
@@ -82,7 +87,13 @@ RUN curl -fsSL -o /tmp/nextest.tar.gz \
 COPY .test-on-builder/sccache-install.sh .test-on-builder/sccache-env.sh /usr/local/share/tuile/
 RUN sh /usr/local/share/tuile/sccache-install.sh
 
-ENV CARGO_TERM_COLOR=never CARGO_NET_GIT_FETCH_WITH_CLI=true \
+# CARGO_HOME in one shared cache mount (`id=tuile-cargo-home`): the registry,
+# the git checkouts AND cargo's own download lock (`$CARGO_HOME/.package-cache`)
+# live together, so two runs on one builder fetching the same crate or git
+# dependency wait on cargo's lock instead of racing (a checkout left without
+# its Cargo.toml broke every later run). The tools stay in /usr/local/cargo/bin,
+# on PATH (rustup's proxies, cargo-nextest).
+ENV CARGO_HOME=/cargo-home CARGO_TERM_COLOR=never CARGO_NET_GIT_FETCH_WITH_CLI=true \
     RUSTFLAGS="-D warnings" CARGO_PROFILE_DEV_DEBUG=line-tables-only \
     TUILE_REQUIRE_GPU=1
 
@@ -90,6 +101,10 @@ FROM base AS test
 WORKDIR /repo
 COPY . .
 
+# The slot of the builder this run holds: one target directory per slot, so
+# two runs at once never share one (two trees in one target dir thrash it and
+# wait on its lock). Without a scheduler, slot 0.
+ARG TARGET_SLOT=0
 ARG CARGO_TEST_ARGS="--workspace"
 ARG TEST_STEPS="test doc budget clippy wasm"
 ARG CARGO_JOBS=4
@@ -103,9 +118,8 @@ ARG SCCACHE_PREFIX=""
 # result is in /out/exit-code, not in the build's status.
 RUN --mount=type=secret,id=sccache_key_id \
     --mount=type=secret,id=sccache_secret \
-    --mount=type=cache,id=tuile-test-target,target=/repo/target \
-    --mount=type=cache,id=tuile-test-cargo-registry,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=tuile-test-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=tuile-test-target-${TARGET_SLOT},target=/repo/target \
+    --mount=type=cache,id=tuile-cargo-home,target=/cargo-home \
     <<'EOF'
 #!/bin/bash
 set -u
@@ -128,12 +142,23 @@ step() { # $1=name, then the commands, run by bash -c
     local name="$1" rc
     shift
     echo "=== ${name}: start $(date +%T)" | tee "/out/${name}.log"
-    bash -c "$*" < /dev/null >> "/out/${name}.log" 2>&1; rc=$?
+    # Each line also goes to the build's progress, as `|name| line`: the client
+    # keeps it in build.log as it comes, so a build cut short (its output never
+    # exported) still leaves its logs (scripts/test-on-builder.sh recovers them).
+    bash -c "$*" < /dev/null 2>&1 | tee -a "/out/${name}.log" | sed -u "s/^/|${name}| /"
+    rc=${PIPESTATUS[0]}
     echo "$rc" > "/out/${name}.exit"
     echo "=== ${name}: exit ${rc} $(date +%T)" | tee -a "/out/${name}.log" | tee -a /out/summary.txt
     grep -E "Summary \[|^test result|^error(\[E[0-9]+\])?:|FAIL \[|TIMEOUT \[|SIGSEGV|panicked" "/out/${name}.log" \
         | sort | uniq -c | sort -rn | sed -n 1,30p | sed "s/^/[${name}] /" | tee -a /out/summary.txt
     [ "$first_rc" -ne 0 ] || first_rc=$rc
+    # And the tree's changes so far, when there are any: gzip, base64, between
+    # markers, recovered the same way. The last block is the whole patch.
+    if snap add -A 2>/dev/null && ! snap diff --cached --quiet 2>/dev/null; then
+        echo "=== patch-begin ${name}"
+        snap diff --cached --binary | gzip -9 | base64 -w 76
+        echo "=== patch-end ${name}"
+    fi
 }
 for s in ${TEST_STEPS}; do
     case "$s" in
