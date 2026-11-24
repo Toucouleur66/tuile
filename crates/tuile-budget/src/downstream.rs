@@ -55,7 +55,7 @@ use super::decisions::{DrapeChoice, DrawItem, DrawSet, Role};
 use super::engine::{
     DrapeLevel, ItemBufs, ItemStats, Reach, TileSelection, Want, DRAPES, MESH, PLACE, WORN,
 };
-use super::held::{morton, Morton};
+use super::held::{geometric_children, geometric_parent, morton, Morton};
 use super::need::Membership;
 use super::need_state::{Named, TileNeed};
 use super::priority::Urgency;
@@ -1111,6 +1111,23 @@ impl Budget {
         #[cfg(debug_assertions)]
         self.check_levels(tiles, presence, &last.0, &last.1);
         self.floor_pass(tiles, &mut l);
+        if !full {
+            // A selection reads its tile's drape levels (the fine until its
+            // replacement) and its quadtree siblings' (all or nothing): it
+            // is read again when its levels moved, and when a sibling was
+            // named for its shape, place or membership.
+            add(&mut l.sels, l.moved.iter().copied());
+            for x in named {
+                if x.shaped() || x.moved() || x.was_wanted() != tiles.get(&x.tile).is_some() {
+                    self.walk(1);
+                    if let Some(kids) = geometric_parent(x.tile).and_then(geometric_children) {
+                        add(&mut l.sels, kids);
+                    }
+                }
+            }
+            l.sels.sort_unstable();
+            l.sels.dedup();
+        }
         self.selection_pass(tiles, full, &mut l);
         #[cfg(debug_assertions)]
         self.check_selection(tiles);
@@ -1364,7 +1381,8 @@ impl Budget {
                     let c = self.select_tile(
                         t,
                         tn.need.class,
-                        &l.layers,
+                        &l.drapes,
+                        tiles,
                         None,
                         &mut l.entries,
                         &mut l.reach,
@@ -1476,7 +1494,15 @@ impl Budget {
                 // be: it holds no ground back, and no ground holds it back.
                 let class = tn.need.class;
                 let cap = class.is_ground().then_some(p);
-                let c = self.select_tile(*t, class, &l.layers, cap, &mut l.entries, &mut l.reach);
+                let c = self.select_tile(
+                    *t,
+                    class,
+                    &l.drapes,
+                    tiles,
+                    cap,
+                    &mut l.entries,
+                    &mut l.reach,
+                );
                 sums.selection(&c, true);
                 if c.held {
                     coarsening.insert(*t, ());
@@ -2563,6 +2589,13 @@ impl Budget {
             if !changed {
                 continue;
             }
+            // Its own selection reads whether it was drawn (all or nothing
+            // applies to a refine only), and its children's whether their
+            // parent stays (`select_tile`): read again.
+            add(&mut self.down.next_sels, [t]);
+            if let Some(kids) = geometric_children(t) {
+                add(&mut self.down.next_sels, kids);
+            }
             if !on {
                 // Its kept levels may go.
                 l.held.push(t);
@@ -3165,7 +3198,7 @@ impl Budget {
             self.layers_of(t, tn, &mut drapes, &mut layers);
             reach.clear();
             let counts =
-                self.select_tile(t, tn.need.class, &layers, None, &mut entries, &mut reach);
+                self.select_tile(t, tn.need.class, &drapes, tiles, None, &mut entries, &mut reach);
             reach.beyond(t, &mut beyond);
             self.reach_of(Unit::sel(t), &mut kept_reach);
             assert_eq!(kept_reach, beyond, "what {t:?}'s selection reads");
