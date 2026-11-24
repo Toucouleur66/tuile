@@ -702,12 +702,17 @@ mod tests {
             got(phone(Some("e"), Some("s"), Some("b"), Some("f"))),
             Ok(("e".into(), TokenFrom::Environment))
         );
+        // The token file comes before settings and the bundle (#327).
         assert_eq!(
             got(phone(None, Some("s"), Some("b"), Some("f"))),
+            Ok(("f".into(), TokenFrom::File(file.clone())))
+        );
+        assert_eq!(
+            got(phone(None, Some("s"), Some("b"), None)),
             Ok(("s".into(), TokenFrom::Settings))
         );
         assert_eq!(
-            got(phone(None, Some("  "), Some("b"), Some("f"))),
+            got(phone(None, Some("  "), Some("b"), None)),
             Ok(("b".into(), TokenFrom::Bundle)),
             "a cleared settings field falls through"
         );
