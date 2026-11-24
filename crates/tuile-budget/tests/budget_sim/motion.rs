@@ -752,9 +752,16 @@ fn an_orbit_keeps_its_target_exact() {
                     panic!("P4.4, {name}: the target is not wanted");
                 };
                 let item = d.draw.get(ResourceId::Mesh(*tile));
-                assert_eq!(
-                    item.map(|i| i.role),
-                    Some(Role::Exact),
+                // All or nothing (Laurent, 2026-11-24): while the target's
+                // tile refines, its parent, drawn, stands for it and its
+                // siblings until all of them are in.
+                let by_parent = parent(*tile).is_some_and(|p| {
+                    d.draw
+                        .get(ResourceId::Mesh(p))
+                        .is_some_and(|i| i.role == Role::Exact || i.serves.contains(tile))
+                });
+                assert!(
+                    item.map(|i| i.role) == Some(Role::Exact) || (item.is_none() && by_parent),
                     "P4.4, {name}: the target's tile {tile:?} not exact at {:?}",
                     sim.now
                 );

@@ -1356,7 +1356,9 @@ impl Budget {
         // tiles do not cover: never a hole.
         if shown(t, reach)
             && (!refining || self.siblings_drawable(t, &own, tiles, cap, reach))
-            && (self.held_below(t).all(|h| !shown(h, reach))
+            && (!self
+                .held_below(t)
+                .fold(false, |any, h| shown(h, reach) | any)
                 || self.replaces_held(t, needs, reach)
                 || !self.ancestors(t).any(|a| shown(a, reach)))
         {
@@ -1644,6 +1646,12 @@ impl Budget {
                 let du = match tn.membership {
                     Membership::Blocker => Some(Urgency::Blocker),
                     _ if !mesh_drawable => Some(urgency),
+                    // Its mesh drawn only as a stand-in for other tiles
+                    // while it is held back itself (the fine until its
+                    // replacement): its own drape is wanted now.
+                    Membership::Drawn if item.is_some_and(|i| i.role == Role::Fallback) => {
+                        Some(Urgency::Drape)
+                    }
                     // A ring tile not drawn (the neighbourhood, the views
                     // ahead): its drapes are preloads too, of the tile's own
                     // score — never the present need's. An ancestor of what
