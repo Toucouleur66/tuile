@@ -39,11 +39,13 @@ pub mod types;
 mod value;
 pub mod score;
 pub mod waits;
+pub mod blocked;
 pub mod view;
 
 pub use config::{
     BudgetConfig, FailurePolicy, OriginBackoff, Pool, PressureFractions, Relaxation, Watermarks,
 };
+pub use blocked::{Blocked, BLOCKED, BLOCKED_LABELS, REASONS as BLOCKED_REASONS};
 pub use deadline::{swap_unit, EncodeBucket, FrameDeadline};
 pub use decisions::{
     Decisions, DrapeChoice, Drapes, DrawItem, DrawSet, Role, Serves, Start, SwapGroup, UploadPlan,

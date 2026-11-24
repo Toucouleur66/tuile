@@ -1105,6 +1105,239 @@ fn the_step_per_level_sums_back_to_the_totals() {
     assert_eq!(v.under_need[mesh][4], 4, "{RED}: drawn by their parent");
 }
 
+/// Why each tile under its need waits (`levels.blocked`,
+/// `blocked_tiles`, `blocked_oldest_seconds`, Laurent 2026-11-24: "far too
+/// many tiles stay red, and why is unknown"): every tile `under_need`
+/// counts has exactly one reason, read off the resource it waits on — so
+/// a level's reasons sum to its `under_need` — and the oldest of each
+/// reason is aged from the step it fell under its need.
+mod blocked {
+    use super::*;
+    use tuile_budget::{Blocked, Failure, TileId, BLOCKED};
+
+    const TERRAIN: Class = Class::TerrainMesh;
+
+    fn reasons(s: &BudgetSignals, c: Class, l: usize) -> [u32; BLOCKED] {
+        s.levels.blocked[c][l]
+    }
+
+    fn n(s: &BudgetSignals, c: Class, l: usize, why: Blocked) -> u32 {
+        reasons(s, c, l)[why.index()]
+    }
+
+    /// Every level of every class: its reasons sum to its `under_need`.
+    fn sums_back(s: &BudgetSignals) {
+        for c in Class::ALL {
+            for l in 0..25 {
+                let sum: u32 = reasons(s, c, l).iter().sum();
+                assert_eq!(
+                    sum,
+                    s.levels.under_need[c][l],
+                    "{RED}: {c:?} level {l}: {:?}",
+                    reasons(s, c, l)
+                );
+            }
+        }
+    }
+
+    /// Steps on `need`, completing nothing, until `want` tiles at level 4
+    /// wait for `why` (at most 20 steps); the signals then.
+    fn until(m: &mut Metered, need: &NeedSet, why: Blocked, want: u32) -> BudgetSignals {
+        for _ in 0..20 {
+            m.step(need);
+            let s = m.s();
+            if n(&s, TERRAIN, 4, why) >= want {
+                return s;
+            }
+        }
+        m.s()
+    }
+
+    /// A parent at level 3 drawn, its four children wanted with two load
+    /// slots: the rig, the children and the need.
+    fn four_children(slots: u32) -> (Metered, [TileId; 4], NeedSet) {
+        let p = t(3, 0, 0);
+        let mut c = Rig::interactive_config();
+        c.max_in_flight[TERRAIN] = slots;
+        let mut m = Metered::new(c);
+        m.settle(&drawn(&[p]), 40);
+        let kids = children(p);
+        let mut need = drawn(&kids);
+        need.ancestors.push((p, super::need(p)));
+        (m, kids, need)
+    }
+
+    /// Two in flight, two queued; loaded and handed over, uploading; once
+    /// acknowledged, drawn and no longer counted; handed over and
+    /// discarded, decoded and waiting for a delivery — the ones left aged
+    /// from the step the children were first wanted.
+    #[test]
+    fn a_mesh_reports_each_state_it_is_stuck_in() {
+        let (mut m, kids, need) = four_children(2);
+        let first = m.r.now;
+        m.step(&need);
+        let s = m.s();
+        assert_eq!(s.levels.under_need[TERRAIN][4], 4, "drawn by their parent");
+        assert_eq!(n(&s, TERRAIN, 4, Blocked::FetchingNetwork), 2, "{RED}");
+        assert_eq!(n(&s, TERRAIN, 4, Blocked::Queued), 2, "{RED}");
+        sums_back(&s);
+
+        // The two loads land and are handed to the consumer, one delivery
+        // a step at most: uploading until it acknowledges them.
+        let mut first_two = m.r.pending.keys().copied();
+        let (a, b) = (first_two.next().unwrap(), first_two.next().unwrap());
+        assert!(kids.iter().any(|k| ResourceId::Mesh(*k) == a));
+        m.r.load_where(|r| r == a || r == b);
+        let s = until(&mut m, &need, Blocked::Uploading, 2);
+        assert_eq!(
+            n(&s, TERRAIN, 4, Blocked::Uploading),
+            2,
+            "{RED}: {:?}",
+            reasons(&s, TERRAIN, 4)
+        );
+        sums_back(&s);
+
+        // Acknowledged: drawn as themselves, no longer under their need;
+        // the two left still in flight, aged from the step they were first
+        // wanted.
+        for r in [a, b] {
+            let g = m.r.delivered[&r];
+            m.r.b.on_drawable(r, g, est(r).gpu);
+        }
+        let now = m.r.now;
+        m.step(&need);
+        let s = m.s();
+        assert_eq!(s.levels.under_need[TERRAIN][4], 2, "two drawn");
+        assert_eq!(
+            n(&s, TERRAIN, 4, Blocked::FetchingNetwork),
+            2,
+            "{RED}: {:?}",
+            reasons(&s, TERRAIN, 4)
+        );
+        sums_back(&s);
+        let ms = u32::try_from(now.since(first).0 / 1_000).unwrap();
+        assert_eq!(
+            s.levels.blocked_oldest_ms[TERRAIN][4][Blocked::FetchingNetwork.index()],
+            ms,
+            "{RED}: aged from the step they fell under their need"
+        );
+
+        // The last two land, are handed over, and the consumer discards
+        // them: decoded again, their delivery backing off.
+        let mut rest = kids
+            .iter()
+            .map(|k| ResourceId::Mesh(*k))
+            .filter(|r| *r != a && *r != b);
+        let (c, e) = (rest.next().unwrap(), rest.next().unwrap());
+        let s = until(&mut m, &need, Blocked::FetchingNetwork, 2);
+        assert_eq!(
+            n(&s, TERRAIN, 4, Blocked::FetchingNetwork),
+            2,
+            "{:?}",
+            reasons(&s, TERRAIN, 4)
+        );
+        m.r.load_where(|r| r == c || r == e);
+        let s = until(&mut m, &need, Blocked::Uploading, 2);
+        assert_eq!(
+            n(&s, TERRAIN, 4, Blocked::Uploading),
+            2,
+            "{:?}",
+            reasons(&s, TERRAIN, 4)
+        );
+        for r in [c, e] {
+            let g = m.r.delivered[&r];
+            m.r.b.on_discarded(r, g);
+        }
+        m.step(&need);
+        let s = m.s();
+        assert_eq!(
+            n(&s, TERRAIN, 4, Blocked::Decoded),
+            2,
+            "{RED}: {:?}",
+            reasons(&s, TERRAIN, 4)
+        );
+        sums_back(&s);
+        assert!(s
+            .series()
+            .iter()
+            .any(|(name, l, v)| *name == "blocked_tiles"
+                && l.contains(&("level", "4"))
+                && l.contains(&("reason", "decoded"))
+                && *v == 2.0));
+        assert!(s
+            .series()
+            .iter()
+            .any(|(name, l, v)| *name == "blocked_oldest_seconds"
+                && l.contains(&("class", "terrain_mesh"))
+                && l.contains(&("reason", "decoded"))
+                && *v > 0.0));
+    }
+
+    /// A load from the local store reads it; a failed one waits out its
+    /// backoff; with its origin down, a wanted one waits for the probe.
+    #[test]
+    fn a_mesh_reports_the_store_the_backoff_and_a_down_origin() {
+        let (mut m, kids, need) = four_children(2);
+        for k in &kids[..2] {
+            m.r.store.0.insert(ResourceId::Mesh(*k));
+        }
+        m.step(&need);
+        let s = m.s();
+        assert_eq!(
+            n(&s, TERRAIN, 4, Blocked::FetchingStore),
+            2,
+            "{RED}: {:?}",
+            reasons(&s, TERRAIN, 4)
+        );
+        sums_back(&s);
+
+        let mut c = Rig::interactive_config();
+        c.max_in_flight[TERRAIN] = 2;
+        c.origin.down_after = 1;
+        let mut m = Metered::new(c);
+        let p = t(3, 0, 0);
+        m.settle(&drawn(&[p]), 40);
+        m.step(&need);
+        let flying: Vec<_> = m.r.pending.iter().map(|(r, g)| (*r, *g)).collect();
+        assert_eq!(flying.len(), 2);
+        for (r, g) in flying {
+            m.r.pending.remove(&r);
+            m.r.b.on_failed(r, g, Failure::Transient);
+        }
+        m.step(&need);
+        let s = m.s();
+        let at = reasons(&s, TERRAIN, 4);
+        assert_eq!(n(&s, TERRAIN, 4, Blocked::Backoff), 2, "{RED}: {at:?}");
+        assert!(n(&s, TERRAIN, 4, Blocked::OriginDown) >= 1, "{RED}: {at:?}");
+        assert_eq!(
+            n(&s, TERRAIN, 4, Blocked::OriginDown) + n(&s, TERRAIN, 4, Blocked::FetchingNetwork),
+            2,
+            "the others wait for the origin, or are its probe: {at:?}"
+        );
+        sums_back(&s);
+    }
+
+    /// A drape worn one level under its new need: its own level is not
+    /// wanted yet (the deficit's dwell) — deferred, not stalled for nothing.
+    #[test]
+    fn a_drape_a_level_coarse_is_deferred() {
+        let mut m = Metered::interactive();
+        let a = t(3, 2, 2);
+        m.settle(&drawn_draped(&[a], 3), 20);
+        m.step(&drawn_draped(&[a], 4));
+        let s = m.s();
+        let under: u32 = s.levels.under_need[Class::Drape].iter().sum();
+        assert_eq!(under, 1, "a level under its need");
+        assert_eq!(
+            n(&s, Class::Drape, 3, Blocked::Deferred),
+            1,
+            "{RED}: {:?}",
+            reasons(&s, Class::Drape, 3)
+        );
+        sums_back(&s);
+    }
+}
+
 /// The drapes per imagery layer (`layers`, `drapes_by_layer`,
 /// `layer_loads_total`): two layers on the same tiles, each counted under
 /// its own index — its GPU copies and bytes, the drapes worn, its requests
