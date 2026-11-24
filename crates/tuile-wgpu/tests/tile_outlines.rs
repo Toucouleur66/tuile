@@ -288,3 +288,92 @@ fn the_outlines_are_drawn_over_the_imagery_and_leave_it_alone() {
         "an outline without asking for one: {bare:?}"
     );
 }
+
+/// The level views (`DIAGNOSTIC_LEVELS`, `shader.wgsl`): each tile in a
+/// flat colour with a dark edge round it.
+const LEVELS_VIEW: [f32; 4] = [1.0, 4.0, 0.0, 0.0];
+
+/// The quad with its corners at `positions` and its uvs at `uvs`, bare.
+fn shaped(positions: [[f32; 3]; 4], uvs: [[f32; 2]; 4]) -> DecodedTileContent {
+    let mut content = quad();
+    content.meshes[0].positions = positions.to_vec();
+    content.meshes[0].uvs = Some(uvs.to_vec());
+    content
+}
+
+/// Darker than `than` by far more than the relief's shading: an edge.
+fn dark(p: [u8; 3], than: [u8; 3]) -> bool {
+    let sum = |p: [u8; 3]| p.iter().map(|v| u32::from(*v)).sum::<u32>();
+    sum(p) * 4 < sum(than) * 3
+}
+
+/// The level views' edge is a pixel and a half wide along each side,
+/// measured across that side: a tile seen at a grazing angle — its uv
+/// changing ten times faster down the screen than across it — kept the
+/// edge its steep axis set on the other one too, a band many pixels wide
+/// (the thick dark strokes of the 2026-11-24 level view).
+#[test]
+fn the_level_view_edge_is_a_pixel_and_a_half_on_every_side() {
+    let Some(gpu) = gpu_with(tuile_wgpu::ImageryCompression::Off) else {
+        return;
+    };
+    // Wide and short: uv.y runs ten times faster per pixel than uv.x.
+    let flat = shaped(
+        [
+            [-1.0, -0.1, 0.0],
+            [1.0, -0.1, 0.0],
+            [1.0, 0.1, 0.0],
+            [-1.0, 0.1, 0.0],
+        ],
+        [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+    );
+    let pixels = render(&gpu, &flat, LEVELS_VIEW);
+    let inside = at(&pixels, SIZE / 2, SIZE / 2);
+    let row = SIZE / 2;
+    let first = (0..SIZE)
+        .find(|&c| at(&pixels, c, row).iter().any(|v| *v > 8))
+        .expect("the quad is drawn");
+    let band = (first..SIZE / 2)
+        .take_while(|&c| dark(at(&pixels, c, row), inside))
+        .count();
+    assert!(band >= 1, "the tile has an edge");
+    assert!(
+        band <= 3,
+        "the left edge is {band} pixels wide, its width set by the other axis"
+    );
+}
+
+/// A skirt hangs from a tile's side and carries that side's uv all the way
+/// down: across it, the uv along the side does not change. It has no edge
+/// there — the level views painted the whole wall dark, dark ridges along
+/// every seam between two levels.
+#[test]
+fn a_skirt_is_not_painted_as_an_edge_in_the_level_views() {
+    let Some(gpu) = gpu_with(tuile_wgpu::ImageryCompression::Off) else {
+        return;
+    };
+    let corners = [
+        [-1.0, -1.0, 0.0],
+        [1.0, -1.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [-1.0, 1.0, 0.0],
+    ];
+    let surface = render(
+        &gpu,
+        &shaped(corners, [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]]),
+        LEVELS_VIEW,
+    );
+    // The wall under the west side: u is 0 all over it.
+    let skirt = render(
+        &gpu,
+        &shaped(corners, [[0.0, 1.0], [0.0, 1.0], [0.0, 0.0], [0.0, 0.0]]),
+        LEVELS_VIEW,
+    );
+    let middle = (SIZE / 2, SIZE / 2);
+    let want = at(&surface, middle.0, middle.1);
+    let got = at(&skirt, middle.0, middle.1);
+    assert!(
+        close(got, want),
+        "the skirt is painted as an edge: {got:?} against the tile's {want:?}"
+    );
+}

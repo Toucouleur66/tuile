@@ -274,12 +274,19 @@ fn cap_colour(worn: f32, capped: f32) -> vec3f {
 // What the level views draw over a tile's colour: the relief, faintly,
 // so the ground stays readable; a dark edge round the tile, so tiles can
 // be counted; hatching on a mesh drawn in another's place (held, or
-// standing in). `uv_px` is the uv a pixel spans, for an edge a pixel and
-// a half wide at every distance.
-fn tile_marks(colour: vec3f, uv: vec2f, role: f32, lambert: f32, uv_px: f32) -> vec3f {
+// standing in). The edge is a pixel and a half wide at every distance,
+// measured along each axis of the tile's uv (`d` its change across a
+// pixel) as `outlined` measures it: one axis's change sets the width of
+// that axis's sides only — taken for both, a tile seen at a grazing angle
+// had bands many pixels wide on the sides running into the view — and a
+// skirt, whose uv along its side does not change, has no edge there and
+// is not painted dark all the way down.
+fn tile_marks(colour: vec3f, uv: vec2f, role: f32, lambert: f32, d: vec2f) -> vec3f {
     var c = colour * (0.65 + 0.35 * lambert);
-    let edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
-    if (edge < 1.5 * uv_px) { c *= 0.3; }
+    var px = 1e9;
+    if (d.x > 0.0) { px = min(px, min(uv.x, 1.0 - uv.x) / d.x); }
+    if (d.y > 0.0) { px = min(px, min(uv.y, 1.0 - uv.y) / d.y); }
+    if (px < 1.5) { c *= 0.3; }
     if (role > 0.5 && fract((uv.x + uv.y) * 6.0) < 0.5) { c *= 0.6; }
     return c;
 }
@@ -353,22 +360,21 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
     // The uv a pixel spans: taken here, in uniform control flow, for the
     // level views' tile edges.
     let uv_d = fwidth(in.uv);
-    let uv_px = max(uv_d.x, uv_d.y);
     // The role and the capped levels share the last lane.
     let role = material.levels.w % 4.0;
     let capped = floor(material.levels.w / 4.0);
     if (mode == DIAGNOSTIC_LEVELS) {
         var c = vec3f(0.25);
         if (material.levels.x > 0.5) { c = level_hue(material.levels.x); }
-        return vec4f(tile_marks(c, in.uv, role, lambert, uv_px), first);
+        return vec4f(tile_marks(c, in.uv, role, lambert, uv_d), first);
     }
     if (mode == DIAGNOSTIC_LAG) {
         let c = lag_colour(material.levels.x, material.levels.y);
-        return vec4f(tile_marks(c, in.uv, role, lambert, uv_px), first);
+        return vec4f(tile_marks(c, in.uv, role, lambert, uv_d), first);
     }
     if (mode == DIAGNOSTIC_CAP) {
         let c = cap_colour(material.levels.x, capped);
-        return vec4f(tile_marks(c, in.uv, role, lambert, uv_px), first);
+        return vec4f(tile_marks(c, in.uv, role, lambert, uv_d), first);
     }
     // Geometry: a flat lit surface, imagery and air removed. Anything visible
     // here IS a mesh. Black here means nothing was drawn at all, which is a

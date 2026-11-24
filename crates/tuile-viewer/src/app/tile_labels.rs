@@ -16,10 +16,19 @@
 //! tile too small on screen for its label simply has none. The text is the
 //! renderer's own [`tuile_wgpu::Levels`] — what the colours are made of —
 //! drawn by the overlay as coverage masks, the same on every shell.
+//!
+//! A label is pinned to the ground over its tile's origin ([`anchor`]), and
+//! left out where the planet stands between that point and the eye. The
+//! overlay has no depth: a coarse tile kept at the horizon has its origin
+//! hundreds of kilometres down the curve, and projected through the planet
+//! it lands on the near ground, where finer tiles are drawn — measured on
+//! 2026-11-24, `T5 · I4` written all over a `T11` foreground from 18 km up.
 
 use std::collections::HashMap;
 
 use glam::{DVec3, Mat4, Vec4};
+use tuile_core::geo::{ecef_to_geodetic, geodetic_to_ecef, WGS84_B};
+use tuile_core::math::{BoundingVolume, Occluder, Sphere};
 use tuile_wgpu::Levels;
 
 /// The diagnostic views the labels come with (`app::DIAGNOSTICS`):
@@ -69,6 +78,28 @@ pub(super) fn project(view_proj: &Mat4, at: DVec3, size: (f64, f64)) -> Option<(
     ))
 }
 
+/// Where a tile's label is pinned, seen from `eye`: the ground over its
+/// origin — a coarse tile's origin is its mesh's centre, kilometres under
+/// the curve of the ground it spans — or `None` where the planet hides that
+/// point. The planet is the sphere inscribed in it, as the traversal's
+/// horizon test takes it: a label is only ever dropped where the real
+/// planet hides its point too. Relief is not looked at: a label behind a
+/// ridge is still written.
+pub(super) fn anchor(origin: DVec3, eye: DVec3) -> Option<DVec3> {
+    let mut ground = ecef_to_geodetic(origin);
+    ground.height = ground.height.max(0.0);
+    let at = geodetic_to_ecef(ground);
+    let planet = Occluder {
+        center: DVec3::ZERO,
+        radius: WGS84_B,
+    };
+    let point = BoundingVolume::Sphere(Sphere {
+        center: at,
+        radius: 0.0,
+    });
+    (!planet.hides(&point, eye)).then_some(at)
+}
+
 /// The labels of the tiles drawn last, and the masks of the texts seen.
 #[derive(Default)]
 pub(super) struct TileLabels {
@@ -102,7 +133,10 @@ impl TileLabels {
         let mut taken: Vec<(f64, f64, f64, f64)> = Vec::new();
         for i in order {
             let (origin, levels) = self.tiles[i];
-            let Some((x, y)) = project(view_proj, origin - eye, size) else {
+            let Some(at) = anchor(origin, eye) else {
+                continue;
+            };
+            let Some((x, y)) = project(view_proj, at - eye, size) else {
                 continue;
             };
             let text = text(&levels);
@@ -197,30 +231,83 @@ mod tests {
         }
     }
 
+    /// An eye `height` metres over 45° N 6° E, looking north and `pitch`
+    /// degrees down through a square view `fov` degrees high: the eye, the
+    /// view built about it, and the ground point `north` metres ahead.
+    fn over_the_ground(
+        height: f64,
+        pitch: f64,
+        fov: f32,
+    ) -> (DVec3, Mat4, impl Fn(f64, f64) -> DVec3) {
+        let place = |lat: f64, lon: f64, height: f64| {
+            geodetic_to_ecef(tuile_core::geo::Geodetic {
+                lon: lon.to_radians(),
+                lat: lat.to_radians(),
+                height,
+            })
+        };
+        let eye = place(45.0, 6.0, height);
+        let (lat, lon) = (45f64.to_radians(), 6f64.to_radians());
+        let north = DVec3::new(-lat.sin() * lon.cos(), -lat.sin() * lon.sin(), lat.cos());
+        let up = DVec3::new(lat.cos() * lon.cos(), lat.cos() * lon.sin(), lat.sin());
+        let p = pitch.to_radians();
+        let ahead = north * p.cos() - up * p.sin();
+        let vp = glam::camera::rh::proj::directx::perspective(fov.to_radians(), 1.0, 1.0, 1e7)
+            * glam::camera::rh::view::look_at_mat4(glam::Vec3::ZERO, ahead.as_vec3(), up.as_vec3());
+        // Metres north along the meridian, at a height over the ellipsoid.
+        let ground = move |metres: f64, height: f64| {
+            place(45.0 + (metres / 6_367_000.0).to_degrees(), 6.0, height)
+        };
+        (eye, vp, ground)
+    }
+
     /// Two tiles whose labels would cover each other: the coarser keeps its
     /// label, the finer has none.
     #[test]
     fn labels_never_cover_each_other() {
-        let vp = glam::camera::rh::proj::directx::perspective(1.0, 2.0, 1.0, 1e6)
-            * glam::camera::rh::view::look_at_mat4(
-                glam::Vec3::ZERO,
-                glam::Vec3::NEG_Z,
-                glam::Vec3::Y,
-            );
+        let (eye, vp, ground) = over_the_ground(1_000.0, 20.0, 50.0);
+        let ahead = ground(2_700.0, 0.0);
+        let east = DVec3::new(-6f64.to_radians().sin(), 6f64.to_radians().cos(), 0.0);
         let mut l = TileLabels {
             tiles: vec![
-                (DVec3::new(0.1, 0.0, -100.0), levels(14, 13, 13)),
-                (DVec3::new(0.0, 0.0, -100.0), levels(12, 11, 11)),
-                (DVec3::new(60.0, 0.0, -100.0), levels(13, 12, 14)),
+                (ahead + east * 2.0, levels(14, 13, 13)),
+                (ahead, levels(12, 11, 11)),
+                (ahead + east * 900.0, levels(13, 12, 14)),
             ],
             ..TileLabels::default()
         };
-        l.place(&vp, DVec3::ZERO, (800.0, 400.0), 1.0);
+        l.place(&vp, eye, (800.0, 800.0), 1.0);
         assert_eq!(l.placed.len(), 2, "the fine one gives way");
         assert_eq!(l.background.len(), 12);
-        let first = &l.placed[0];
+    }
+
+    /// A coarse tile kept at the horizon: its origin, the middle of its mesh,
+    /// lies far down the curve of the planet. Seen through the planet that
+    /// point lands on the near ground, where the finer tiles are drawn, and
+    /// its label with it — `T5 · I4` written over a `T11` foreground from
+    /// 18 km up (2026-11-24). It has no label; the near tile keeps its own.
+    #[test]
+    fn a_tile_whose_ground_is_beyond_the_horizon_has_no_label() {
+        let (eye, vp, ground) = over_the_ground(18_500.0, 22.7, 35.0);
+        // A level-5 tile 2 200 km north, 5.6° of latitude across: its mesh's
+        // centre is the middle of the chord under its ground.
+        let span = 5.625f64.to_radians() * 6_367_000.0;
+        let coarse =
+            (ground(2_217_000.0 - span / 2.0, 0.0) + ground(2_217_000.0 + span / 2.0, 0.0)) / 2.0;
+        // The point would be on screen, through the planet.
+        assert!(project(&vp, coarse - eye, (1000.0, 1000.0)).is_some());
+        let near = ground(44_000.0, 300.0);
+        let mut l = TileLabels {
+            tiles: vec![(coarse, levels(5, 4, 4)), (near, levels(11, 11, 11))],
+            ..TileLabels::default()
+        };
+        l.place(&vp, eye, (1000.0, 1000.0), 1.0);
+        assert_eq!(l.placed.len(), 1, "the tile over the horizon has no label");
+        assert!(anchor(coarse, eye).is_none());
+        let at = anchor(near, eye).expect("the near tile is in sight");
         assert!(
-            (f64::from(first.position[0]) + f64::from(first.mask.width) / 2.0 - 400.0).abs() < 1.0
+            (at - near).length() < 1e-3,
+            "a tile above the ground is pinned where it is"
         );
     }
 }
