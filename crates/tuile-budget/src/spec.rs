@@ -757,6 +757,7 @@ impl Specification {
              &restore_decoded_ms={}&restore_stored_ms={}&restore_http_cache_ms={}\
              &restore_remote_ms={}&p_ring={}&p_ancestor={}&a0={}&a_desc={}&headroom={}&floor_value={}\
              &release_visits={}&rho={}&finer_gap={}&coarse_from={}&coarse_boost={}\
+             &sweep_keep_poses={}&level_margin={}",
             self.kind.label(),
             p.margin_permille,
             ms(p.min_dwell),
