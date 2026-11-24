@@ -1352,10 +1352,13 @@ impl Budget {
         // All or nothing applies to a refine: a tile drawn last step (as
         // itself or held) is never taken back for a sibling.
         let refining = !self.held_last.contains_key(&t);
+        // Held back only where an ancestor can stand for what the held
+        // tiles do not cover: never a hole.
         if shown(t, reach)
             && (!refining || self.siblings_drawable(t, &own, tiles, cap, reach))
             && (self.held_below(t).all(|h| !shown(h, reach))
-                || self.replaces_held(t, needs, reach))
+                || self.replaces_held(t, needs, reach)
+                || !self.ancestors(t).any(|a| shown(a, reach)))
         {
             out.push((ResourceId::Mesh(t), Role::Exact));
             sel.exact = true;
