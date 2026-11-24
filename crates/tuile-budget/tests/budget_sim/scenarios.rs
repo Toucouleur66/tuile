@@ -1292,9 +1292,15 @@ pub fn nadir_flight(t: f64) -> Camera {
     ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
 fn the_screen_centre_through_a_nadir_flight() {
+    // The imagery an order of magnitude slower than the meshes, as a tile
+    // server under load serves it: meshes refine before their drapes.
+    let mut slow = Profile::desktop();
+    slow.net.imagery.base_ms = 600.0;
+    slow.net.imagery.jitter_ms = 400.0;
     for (name, profile) in [
         ("desktop", Profile::desktop()),
         ("handheld", Profile::handheld()),
+        ("desktop-slow-imagery", slow),
     ] {
         let mut sim = Sim::new(profile, 17);
         let phases: [(&str, f64); 5] = [
