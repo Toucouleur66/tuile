@@ -202,6 +202,11 @@ pub struct Decisions {
     pub fatal: Option<SessionError>,
     /// The step's statistics.
     pub stats: BudgetStats,
+    /// Every preload started and every GPU copy evicted, with its score's
+    /// terms (`docs/explorations/budget-progressive-coarse-preload.md` §7):
+    /// what the budget window, the score metrics and the log records read.
+    /// Statistics: out of [`Decisions::digest`].
+    pub scores: Vec<crate::score::ScoreEvent>,
 }
 
 impl Decisions {
@@ -221,6 +226,7 @@ impl Decisions {
         self.frame_ready = false;
         self.fatal = None;
         self.stats = BudgetStats::default();
+        self.scores.clear();
     }
 
     /// The relaxation as a factor on the SSE threshold.

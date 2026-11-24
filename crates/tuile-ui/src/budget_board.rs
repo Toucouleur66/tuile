@@ -816,6 +816,71 @@ const LEVEL_COLUMN: f64 = 40.0;
 const RESIDENCY_BAR: f64 = 110.0;
 const LOADS_BAR: f64 = 50.0;
 
+/// The present need's waits (`tuile_budget::waits`): first loads and
+/// reloads after an eviction — evicted under 5 s, under 30 s before — each
+/// its rate since the last publish and its 50th and 95th percentiles since
+/// the start. Nothing until a wait ended.
+fn waits(p: &mut Painter<'_>, s: &BudgetSignals, y: f64) -> f64 {
+    use tuile_core::budget::waits::{percentile_ms, WAIT_KINDS};
+    let total: u64 = s.waits.millis.iter().flatten().sum();
+    if total == 0 {
+        return y;
+    }
+    let text = srgb(TEXT, 1.0);
+    let dim = srgb(DIM, 1.0);
+    let mut y = y;
+    p.text(MARGIN, y, "Waits", 12.0, text);
+    y += ROW;
+    let secs = (s.waits_recent_micros as f64 / 1e6).max(1e-3);
+    let names = ["first loads", "reloads < 5 s", "reloads < 30 s"];
+    for (k, kind) in WAIT_KINDS.iter().enumerate() {
+        let n: u64 = s.waits.millis[k].iter().sum();
+        let rate = s.waits_recent[k] as f64 / secs;
+        let q =
+            |q| percentile_ms(&s.waits.millis[k], q).map_or("·".to_owned(), |v| format!("{v} ms"));
+        let line = format!(
+            "{}: {rate:.1}/s · p50 {} · p95 {} · {n} since the start",
+            names[k],
+            q(50),
+            q(95)
+        );
+        let why = match k {
+            0 => "a tile the view asks for, loaded for the first time (or evicted over 30 s ago)".to_owned(),
+            1 => "a tile the view asks for again under 5 s after the budget let it go: an eviction undone at once".to_owned(),
+            _ => "a tile the view asks for again 5 to 30 s after the budget let it go".to_owned(),
+        };
+        let mut legend = vec![
+            self::line(Swatch::None, format!("waits, {kind}")),
+            self::line(Swatch::None, why),
+            self::line(
+                Swatch::None,
+                "a wait runs from the step the present need asks for a tile not on the GPU to the step it is drawable".to_owned(),
+            ),
+            self::line(Swatch::None, "rate: since the last publish; percentiles: since the start".to_owned()),
+        ];
+        if k > 0 {
+            let r = s.waits.reload_reasons;
+            legend.push(self::line(
+                Swatch::None,
+                format!(
+                    "reloads by the eviction they undo: headroom {}, below the floor value {}, room made {}, recycled {}",
+                    r[0], r[1], r[2], r[3]
+                ),
+            ));
+        }
+        p.hit(
+            MARGIN,
+            y - 1.0,
+            p.width(&line, EM) + 14.0,
+            ROW - 1.0,
+            legend,
+        );
+        p.text(MARGIN + 14.0, y, &line, EM, if n == 0 { dim } else { text });
+        y += ROW;
+    }
+    y + 8.0
+}
+
 /// Draws the board for `s` (none yet: a line saying so) at `scale` device
 /// pixels per point, its top-left corner at the origin.
 pub fn draw(
@@ -851,6 +916,7 @@ pub fn draw(
             y = levels(&mut p, s, view, y);
             y = tiers(&mut p, s, view, y);
             y = scores(&mut p, s, view, y);
+            y = waits(&mut p, s, y);
             layers(&mut p, s, view, y);
         }
     }
@@ -2073,6 +2139,30 @@ pub struct LevelWaste {
 
 /// See [`LevelWaste`].
 pub fn level_waste(s: &BudgetSignals, c: Class, l: usize) -> LevelWaste {
+    // Scored: the held copies under λ are the waste — the bytes of the
+    // level's held score histogram's share under λ (all classes counted
+    // together in the boards, prorated to this class's bytes).
+    if let (Some(lambda), Some(h)) = (s.score_lambda, s.score_held.as_ref()) {
+        use tuile_core::budget::score::{score_bucket, Cell, Side, DISTANCE_BANDS};
+        let mut cell = Cell::default();
+        for b in 0..DISTANCE_BANDS {
+            cell.add(h.board.cell(l, b, Side::Held));
+        }
+        if cell.count > 0 {
+            let under: u64 = cell.histogram[..score_bucket(lambda)]
+                .iter()
+                .map(|n| u64::from(*n))
+                .sum();
+            let [drawable, transit] = s.bytes_by_level[c][l];
+            let bytes = drawable + transit;
+            let below = bytes * under / u64::from(cell.count);
+            return LevelWaste {
+                under: [below, 0],
+                over: [bytes - below, 0],
+                scored: true,
+            };
+        }
+    }
     let v = &s.levels;
     let (gpu, drawn, selected) = (v.gpu_tiles[c][l], v.drawn[c][l], v.selected[c][l]);
     let held = gpu.saturating_sub(drawn);
@@ -2103,8 +2193,33 @@ pub struct LevelScores {
 /// The scores of level `l` of `c`, once the budget publishes them; none
 /// before. The one place that reads them: the box plots follow.
 pub fn level_scores(s: &BudgetSignals, c: Class, l: usize) -> Option<LevelScores> {
-    let _ = (s, c, l);
-    None
+    use tuile_core::budget::score::{quantiles, Cell, Side, DISTANCE_BANDS};
+    // The score boards count every class together: a level's scores are
+    // the same under each class's row.
+    let _ = c;
+    let sum = |board: &tuile_core::budget::score::ScoreBoard, side: Side| {
+        let mut cell = Cell::default();
+        for b in 0..DISTANCE_BANDS {
+            cell.add(board.cell(l, b, side));
+        }
+        cell
+    };
+    let f = |q: Option<[u64; 3]>| q.map(|v| v.map(|x| x as f64));
+    let held = s
+        .score_held
+        .as_ref()
+        .and_then(|h| quantiles(&sum(&h.board, Side::Held)));
+    let preload = quantiles(&sum(&s.score_recent, Side::Preload));
+    let evicted = quantiles(&sum(&s.score_recent, Side::Evict));
+    if held.is_none() && preload.is_none() && evicted.is_none() {
+        return None;
+    }
+    Some(LevelScores {
+        preload: f(preload),
+        held: f(held),
+        evicted: f(evicted),
+        lambda: s.score_lambda.map(|v| v as f64),
+    })
 }
 
 /// The legend of a level's box plots.
@@ -3781,5 +3896,73 @@ mod tests {
             d2.size,
             d.size
         );
+    }
+
+    /// The scores the budget publishes reach the box plots and the waste:
+    /// the held copies under λ are the waste, by the held histogram's share.
+    #[test]
+    fn level_scores_and_waste_read_the_published_scores() {
+        use tuile_core::budget::score::{HeldReport, Side, Terms};
+        let mut s = BudgetSignals::default();
+        assert!(level_scores(&s, Class::Drape, 12).is_none());
+        let mut held = HeldReport::default();
+        for score in [10u64, 10, 10, 1_000] {
+            held.board.put(
+                12,
+                1,
+                Side::Held,
+                &Terms {
+                    score,
+                    ..Terms::default()
+                },
+            );
+        }
+        s.score_held = Some(held);
+        s.score_lambda = Some(100);
+        s.bytes_by_level[Class::Drape][12] = [4_000, 0];
+        let x = level_scores(&s, Class::Drape, 12).expect("scores");
+        assert_eq!(x.lambda, Some(100.0));
+        assert_eq!(x.held, Some([8.0, 8.0, 512.0]));
+        let w = level_waste(&s, Class::Drape, 12);
+        assert!(w.scored);
+        assert_eq!(w.under, [3_000, 0], "three of four held under λ");
+        assert_eq!(w.over, [1_000, 0]);
+    }
+
+    /// The waits reach the board: first loads and reloads, their rates and
+    /// percentiles, and nothing at all before a wait ended.
+    #[test]
+    fn the_board_shows_the_waits_split_by_first_load_and_reload() {
+        let mut s = fixtures::healthy();
+        let mut cache = TextCache::default();
+        let view = BoardView {
+            cumulative: false,
+            from: None,
+            layers: &["Aerial".to_owned()],
+            decide: None,
+            stalls: &StallWatch::default(),
+            width: None,
+            issues_only: false,
+        };
+        draw(Some(&s), &view, &mut cache, 1.0);
+        assert!(
+            !cache.masks.keys().any(|(t, _)| t == "Waits"),
+            "no wait yet, no section"
+        );
+        s.waits.millis[0][8] = 9; // nine first loads of 128–255 ms
+        s.waits.millis[0][10] = 1;
+        s.waits.millis[1][6] = 2; // two reloads of 32–63 ms, evicted < 5 s before
+        s.waits_recent = [5, 2, 0];
+        s.waits_recent_micros = 1_000_000;
+        draw(Some(&s), &view, &mut cache, 1.0);
+        let texts: Vec<&str> = cache.masks.keys().map(|(t, _)| t.as_str()).collect();
+        for t in [
+            "Waits",
+            "first loads: 5.0/s · p50 128 ms · p95 512 ms · 10 since the start",
+            "reloads < 5 s: 2.0/s · p50 32 ms · p95 32 ms · 2 since the start",
+            "reloads < 30 s: 0.0/s · p50 · · p95 · · 0 since the start",
+        ] {
+            assert!(texts.contains(&t), "{t} not drawn: {texts:?}");
+        }
     }
 }

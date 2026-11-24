@@ -50,12 +50,14 @@ use super::need::{LayerReach, Membership};
 use super::need_state::{NeedState, TileNeed, WantedImagery};
 use super::origin::Origin;
 use super::priority::{score, PriorityKey, Quantised, Urgency};
+use super::score::{Reason, ScoreEvent, Side, Terms};
 use super::sorted::SortedMap;
 use super::state::{Arena, CpuCopy, EvictKey, Gpu, Held, Load, Mark, Rank, Slot, Transit};
 use super::stats::{
     layer_index, level_index, prefetch_index, BudgetStats, CancelReason, EvictReason,
     LATENCY_BUCKETS,
 };
+use super::sweep::Verdict;
 use super::tier::{Presence, PresenceOracle, Source, Tier};
 use super::types::{
     sat_u32, Bytes, Class, Failure, Generation, LayerId, Micros, PerClass, Policy, Pressure,
@@ -1489,6 +1491,14 @@ impl Budget {
                 let du = match tn.membership {
                     Membership::Blocker => Some(Urgency::Blocker),
                     _ if !mesh_drawable => Some(urgency),
+                    // A ring tile not drawn (the neighbourhood, the views
+                    // ahead): its drapes are preloads too, of the tile's own
+                    // score — never the present need's. An ancestor of what
+                    // is drawn keeps its drapes in the present need's band:
+                    // a coarse drape serves every tile under it, and its
+                    // arrival re-reads them all — early, while the view
+                    // moves, not on a still step (the work bound).
+                    Membership::Ring if item.is_none() => Some(urgency),
                     _ => {
                         let worn = item.and_then(|i| i.drape(layer).copied());
                         let off = match worn {
@@ -1511,7 +1521,7 @@ impl Budget {
                                 // neighbours' own levels, a patch of another
                                 // colour: its own level is wanted the same
                                 // way, the gap weighed less than a missing
-                                // level's (`value::FINER_GAP_PERMILLE`), and
+                                // level's (`Params::finer_gap_permille`), and
                                 // at once under pressure (coarser is lighter).
                                 let finer = w.level > n;
                                 reads_pressure |= finer;
@@ -1584,7 +1594,7 @@ impl Budget {
                 predicted: false,
             },
         };
-        super::value::deficit_due(&self.spec, &input)
+        super::value::deficit_due(&self.costed, &input)
     }
 
     /// Whether Batch may want drapes this step: every mesh the frame draws
@@ -1757,10 +1767,13 @@ impl Budget {
         };
         let tier = self.tier(r, e, class, presence);
         let precedence = super::priority::Precedence::of(urgency);
-        let sc = if precedence == super::priority::Precedence::Value {
+        let sc = if precedence >= super::priority::Precedence::Value {
             // The one currency (spec §1b): what loading it gains, from its
             // arrival on.
-            let gain = super::value::load_gain(&self.spec, urgency, w.q.centrality, tier);
+            let p =
+                super::value::probability(&self.spec, self.reach_tiles(), urgency, w.level, &w.q);
+            let preload = urgency >= Urgency::Ring;
+            let gain = super::value::load_gain(&self.costed, p, w.q.centrality, tier, preload);
             i64::try_from(gain.0).unwrap_or(i64::MAX)
         } else {
             let mut sc = score(w.q, waited, self.cfg.age_full, cover);
@@ -1796,6 +1809,9 @@ impl Budget {
         ranked.clear();
         self.ranked_last = ranked;
         self.steps += 1;
+        // A step is a camera pose: the sweep's horizon counts them.
+        self.arena
+            .set_pose(self.steps, self.spec.params.sweep_keep_poses);
 
         let arrivals = self.events.len();
         self.apply_events(now, &mut st);
@@ -1950,6 +1966,7 @@ impl Budget {
             _ => 1_000,
         };
         d.sse_scale_milli = self.scale.max(thermal_floor);
+        self.measure_uploads(now);
         self.last_now = Some(now);
 
         // Batch completeness. What the view waits on: work ranked, or in
@@ -2052,6 +2069,7 @@ impl Budget {
         // events applied since the last.
         self.walk_upkeep();
         st.work = st.work.saturating_add(self.scratch.walked.swap(0, Relaxed));
+        self.score_stats(&d.scores, &mut st);
         d.stats = st;
     }
 
@@ -2199,6 +2217,8 @@ impl Budget {
             let keep = self.kept(s) || self.is_floor(class, self.arena.level(s));
             if self.arena.stale_gpu(s, epoch) && !self.arena.has_transit(s) && !keep {
                 let r = self.arena.id(s);
+                d.scores
+                    .push(self.held_event(s, Side::Evict, Reason::Recycled));
                 self.arena.take_gpu(s, &mut self.ledger);
                 d.evict.push(r);
                 st.evicted += 1;
@@ -2500,6 +2520,9 @@ impl Budget {
             let timeout =
                 Self::load_timeout_after(self.cfg.load_timeout, self.arena.cold(s).failures);
             self.deadline(now.plus(timeout), *r);
+            if w.urgency >= Urgency::Ring {
+                d.scores.push(self.load_event(*r, class, w, key.tier));
+            }
             match source {
                 Source::Network => {
                     self.in_flight[class] += 1;
@@ -2546,6 +2569,7 @@ impl Budget {
         bytes: Bytes,
         limit: Bytes,
         urgency: Urgency,
+        prob: u32,
         wants: Wants<'_>,
         d: &mut Decisions,
         st: &mut BudgetStats,
@@ -2582,10 +2606,56 @@ impl Budget {
                 .fold(Bytes::ZERO, |a, b| a.plus(b)),
             "the bytes counted evictable are those a scan finds"
         );
+        // A preload's swap (`docs/explorations/budget-progressive-coarse-preload.md`
+        // §3): another preload, not drawn, whose probability of use is
+        // under this one's by more than the margin, makes room for it —
+        // the progressive score's hysteresis.
+        let margin = u64::from(self.spec.params.margin_permille);
+        let swaps = |b: &Budget, r: &ResourceId, s: Slot| -> bool {
+            urgency >= Urgency::Ring
+                && prob > 0
+                && wants.get(r).is_some_and(|w| w.urgency >= Urgency::Ring)
+                && {
+                    let (_, old, _) = b.arena.place(s);
+                    u64::from(old) * (1_000 + margin) < u64::from(prob) * 1_000
+                }
+        };
+        let mut swapping = false;
         if self.ledger.gpu[class].minus(freeable).plus(bytes) > limit {
-            *strained = true;
-            self.scratch.room = Some(room);
-            return false;
+            if urgency >= Urgency::Ring && prob > 0 {
+                let a = &self.arena;
+                // Lowest scores first, until enough: the scan stops as soon
+                // as the room is found (a step's work stays bounded by it).
+                let need = self.ledger.gpu[class]
+                    .minus(freeable)
+                    .plus(bytes)
+                    .minus(limit);
+                let mut extra = Bytes::ZERO;
+                let mut looked = 0u32;
+                for &((.., r), s) in &room.grouped {
+                    if extra >= need {
+                        break;
+                    }
+                    looked += 1;
+                    let ok = a.class(s) == class
+                        && a.has_gpu(s)
+                        && !a.has_transit(s)
+                        && !self.kept(s)
+                        && !self.is_floor(class, a.level(s))
+                        && victim(self, &r, s).is_none()
+                        && swaps(self, &r, s);
+                    if ok {
+                        extra = extra.plus(a.gpu(s).map_or(Bytes::ZERO, |g| g.bytes));
+                    }
+                }
+                st.work = st.work.saturating_add(looked);
+                swapping = extra >= need;
+            }
+            if !swapping {
+                *strained = true;
+                self.scratch.room = Some(room);
+                return false;
+            }
         }
         let mut walk = Walk::default();
         while let Some(((.., r), s)) =
@@ -2599,8 +2669,15 @@ impl Budget {
             if self.kept(s) || self.is_floor(self.arena.class(s), self.arena.level(s)) {
                 continue;
             }
-            let Some(b) = victim(self, &r, s) else {
-                continue;
+            let (b, reason) = match victim(self, &r, s) {
+                Some(b) => (b, Reason::Admission),
+                None if swapping && !self.arena.has_transit(s) && swaps(self, &r, s) => {
+                    let Some(g) = self.arena.gpu(s) else {
+                        continue;
+                    };
+                    (g.bytes, Reason::Swap)
+                }
+                None => continue,
             };
             if wants.contains_key(&r) {
                 // Wanted work displaces wanted work: the view asks for more
@@ -2611,6 +2688,7 @@ impl Budget {
                 let i = want_bucket(wants.get(&r));
                 room.bytes[class][i] = room.bytes[class][i].minus(b);
             }
+            d.scores.push(self.held_event(s, Side::Evict, reason));
             self.arena.take_gpu(s, &mut self.ledger);
             d.evict.push(r);
             st.evicted += 1;
@@ -2744,7 +2822,10 @@ impl Budget {
         if !eff.batch {
             let shrinking = matches!(r, ResourceId::Mesh(t) if coarsening.contains_key(&t));
             let urgent = matches!(w.urgency, Urgency::Floor | Urgency::Hole | Urgency::Drape);
-            let preload = w.urgency >= Urgency::Ring;
+            // Speculation — the ring, a refresh — waits under the headroom;
+            // the chain of ancestors is what is drawn's fallback (coverage)
+            // and takes the room the present need takes.
+            let preload = matches!(w.urgency, Urgency::Ring | Urgency::Refresh);
             let mut limit = if shrinking {
                 eff.hard[class]
             } else if urgent {
@@ -2775,7 +2856,18 @@ impl Budget {
             if preload && (*strained || *blocked) {
                 return;
             }
+            // Speculation waits while the specification's fixed headroom
+            // is short (0 by default) — it never evicts to make that room.
+            if preload {
+                let h = u64::from(self.spec.params.headroom_permille.min(1_000));
+                let line = eff.target[class].scaled(1_000 - h, 1_000);
+                if h > 0 && self.ledger.gpu[class].plus(c.cost.gpu) > line {
+                    return;
+                }
+            }
             let mut strain = false;
+            let prob =
+                super::value::probability(&self.spec, self.reach_tiles(), w.urgency, w.level, &w.q);
             // Room for its peak: resident, and what an encode on the GPU
             // holds beside it until it has run.
             let ok = self.make_room(
@@ -2784,6 +2876,7 @@ impl Budget {
                 c.cost.gpu.plus(c.cost.transient),
                 limit,
                 w.urgency,
+                prob,
                 wants,
                 d,
                 st,
@@ -2832,6 +2925,7 @@ impl Budget {
             }
         }
         st.delivered += 1;
+        self.delivered_bytes = self.delivered_bytes.plus(c.cost.gpu);
         d.deliver.push((r, c.gen));
     }
 
@@ -2868,7 +2962,7 @@ impl Budget {
                 continue;
             };
             let k = key(self, r).unwrap_or(PriorityKey {
-                precedence: super::priority::Precedence::Value,
+                precedence: super::priority::Precedence::Anticipation,
                 urgency: Urgency::Refresh,
                 score: Reverse(i64::MIN),
                 tier: Tier::Remote,
@@ -2994,17 +3088,23 @@ impl Budget {
             }
             let used = self.ledger.gpu[class];
             let high = eff.target[class].scaled(u64::from(w.high_percent), 100);
+            let low = eff.target[class].scaled(u64::from(w.low_percent), 100);
             if used <= high {
                 continue;
             }
-            let low = eff.target[class].scaled(u64::from(w.low_percent), 100);
             let room = match self.scratch.room.take() {
                 Some(room) => room,
                 None => self.room(wants, st),
             };
+            let mut law = self.sweep_law();
+            let grouped: &[_] = if law.walks_grouped() {
+                &room.grouped
+            } else {
+                &[]
+            };
             let mut walk = Walk::default();
-            while let Some((_, s)) =
-                walk.next(&self.arena, &room.grouped, |c| c == class, &Held::GPU)
+            while let Some(((.., r), s)) =
+                walk.next(&self.arena, grouped, |c| c == class, &Held::GPU)
             {
                 if self.ledger.gpu[class] <= low {
                     break;
@@ -3019,12 +3119,42 @@ impl Budget {
                 if !evictable {
                     continue;
                 }
+                // Not what the view wants now or wanted within the horizon.
+                match law.judge(wants.contains_key(&r), self.arena.poses_since_wanted(s)) {
+                    Verdict::Release => {}
+                    Verdict::Keep => continue,
+                    Verdict::Stop => break,
+                }
                 self.evict_one(now, s, class, d, st);
+            }
+            // Still over the target: back within it, the law's keepers
+            // included (`Reason::Fit`).
+            let mut walk = Walk::default();
+            while let Some((_, s)) =
+                walk.next(&self.arena, &room.grouped, |c| c == class, &Held::GPU)
+            {
+                if self.ledger.gpu[class] <= high {
+                    break;
+                }
+                st.work = st.work.saturating_add(1);
+                let a = &self.arena;
+                if self.kept(s)
+                    || self.is_floor(a.class(s), a.level(s))
+                    || !a.has_gpu(s)
+                    || a.has_transit(s)
+                {
+                    continue;
+                }
+                self.evict_as(now, s, class, Some(Reason::Fit), d, st);
             }
             self.scratch.room = Some(room);
         }
         // Only a step under pressure built one: nothing kept across steps.
         self.scratch.room = None;
+        self.release_below_floor_value(now, d, st);
+        // The decoded tier: over its target, down to it — a copy demoted
+        // from the GPU is what a turn back finds without the network, so it
+        // is not released below the target for room's sake alone.
         if self.ledger.decoded > eff.decoded {
             self.release_decoded(eff.decoded, d, st);
         }
@@ -3082,8 +3212,126 @@ impl Budget {
         }
     }
 
+    /// Whether `s`, no longer wanted, is of a level more than one finer than
+    /// what the view needs now: nothing selects it soon, it goes once out
+    /// of the need for the thrash window, whatever it was.
+    fn far_finer(&self, s: Slot) -> bool {
+        self.need_level
+            .is_some_and(|n| self.arena.level(s) > n.saturating_add(1))
+    }
+
+    /// The dynamic headroom, bytes: the smoothed upload rate over the
+    /// specification's horizon, plus what is in transit.
+    pub(super) fn dynamic_headroom(&self) -> Bytes {
+        let rate = self.upload_rate.get().unwrap_or(0);
+        let over = u128::from(rate) * u128::from(self.costed.params.horizon.0) / 1_000_000;
+        Bytes(u64::try_from(over).unwrap_or(u64::MAX)).plus(self.ledger.in_transit)
+    }
+
+    /// Takes the step's delivered bytes into the upload rate.
+    pub(super) fn measure_uploads(&mut self, now: Micros) {
+        let dt = self.last_now.map_or(Micros::ZERO, |l| now.since(l));
+        let bytes = std::mem::take(&mut self.delivered_bytes);
+        if dt.0 == 0 {
+            return;
+        }
+        let rate = u128::from(bytes.0) * 1_000_000 / u128::from(dt.0);
+        self.upload_rate.take(
+            u64::try_from(rate).unwrap_or(u64::MAX),
+            dt,
+            Micros::from_millis(500),
+        );
+    }
+
+    /// Releases, from the bottom of the release order, the GPU copies no
+    /// longer wanted whose probability of use fell under the
+    /// specification's floor value, room or not: far, fine, out of the ring.
+    /// At most the specification's `release_visits` copies looked at a
+    /// step: a frame's
+    /// releases stay small; the next step goes on.
+    fn release_below_floor_value(&mut self, now: Micros, d: &mut Decisions, st: &mut BudgetStats) {
+        let floor =
+            super::value::CERTAIN / 1_000 * u32::from(self.spec.params.floor_value_permille);
+        if floor == 0 {
+            return;
+        }
+        let mut after: Option<(EvictKey, Slot)> = None;
+        let mut low: Vec<(Slot, Class)> = Vec::new();
+        let visits = self.spec.params.release_visits;
+        let mut looked = 0u32;
+        for _ in 0..visits {
+            let Some(e) = self.arena.next_filed(after.as_ref(), |_| true, &Held::GPU) else {
+                break;
+            };
+            looked += 1;
+            after = Some(e);
+            let s = e.1;
+            let a = &self.arena;
+            let (_, p, _) = a.place(s);
+            let long_gone = a
+                .cold(s)
+                .unneeded_since()
+                .is_some_and(|t| now.since(t) >= super::THRASH_WINDOW);
+            if (p < floor || self.far_finer(s))
+                && long_gone
+                && a.has_gpu(s)
+                && !a.has_transit(s)
+                && !self.kept(s)
+                && !self.is_floor(a.class(s), a.level(s))
+            {
+                low.push((s, a.class(s)));
+            }
+        }
+        // The decoded copies of the same kind, held without a GPU copy.
+        let mut after: Option<(EvictKey, Slot)> = None;
+        let mut low_cpu: Vec<Slot> = Vec::new();
+        for _ in 0..visits {
+            let Some(e) = self
+                .arena
+                .next_filed(after.as_ref(), |_| true, &[Held::Cpu])
+            else {
+                break;
+            };
+            looked += 1;
+            after = Some(e);
+            let s = e.1;
+            let a = &self.arena;
+            let (_, p, _) = a.place(s);
+            let long_gone = a
+                .cold(s)
+                .unneeded_since()
+                .is_some_and(|t| now.since(t) >= super::THRASH_WINDOW);
+            if (p < floor || self.far_finer(s)) && long_gone && a.has_cpu(s) && !a.has_transit(s) {
+                low_cpu.push(s);
+            }
+        }
+        st.work = st.work.saturating_add(looked);
+        for s in low_cpu {
+            d.scores
+                .push(self.held_event(s, Side::Decoded, Reason::BelowFloorValue));
+            self.arena.take_cpu(s, &mut self.ledger);
+            d.release.push(self.arena.id(s));
+            st.released += 1;
+            st.releases[self.arena.class(s)] += 1;
+            st.levels.releases[self.arena.class(s)][level_index(self.arena.level(s))] += 1;
+        }
+        for (s, class) in low {
+            d.scores
+                .push(self.held_event(s, Side::Evict, Reason::BelowFloorValue));
+            let r = self.arena.id(s);
+            self.arena.take_gpu(s, &mut self.ledger);
+            d.evict.push(r);
+            st.evicted += 1;
+            st.evictions[class][EvictReason::Sweep as usize] += 1;
+            st.evictions_by_level[class][level_index(self.arena.level(s))] += 1;
+            self.evicted(r, now);
+        }
+    }
+
     /// Releases the decoded copy of `s`, and counts it.
     fn release_one(&mut self, s: Slot, d: &mut Decisions, st: &mut BudgetStats) {
+        d.scores
+            .push(self.held_event(s, Side::Decoded, Reason::Sweep));
         self.arena.take_cpu(s, &mut self.ledger);
         d.release.push(self.arena.id(s));
         st.released += 1;
@@ -3115,11 +3363,13 @@ impl Budget {
         // to its own low one, as a class outside the pool is.
         let ceiling_high = |c: Class| pct(p.ceil_target[c], w.high_percent);
         let ceiling_low = |c: Class| pct(p.ceil_target[c], w.low_percent);
-        let mut over: PerClass<bool> =
-            PerClass::from_fn(|c| p.members[c] && self.ledger.gpu[c] > ceiling_high(c));
         let high = pct(p.target, w.high_percent);
         let pool_over = used(&self.ledger) > high;
-        if !pool_over && Class::ALL.iter().all(|c| !over[*c]) {
+        if !pool_over
+            && Class::ALL
+                .iter()
+                .all(|c| !(p.members[*c] && self.ledger.gpu[*c] > ceiling_high(*c)))
+        {
             return;
         }
         let low = pct(p.target, w.low_percent);
@@ -3142,29 +3392,65 @@ impl Budget {
             let a = &b.arena;
             a.has_gpu(s) && !a.has_transit(s) && !b.kept(s) && !b.is_floor(a.class(s), a.level(s))
         };
-        let mut walk = Walk::default();
-        while let Some((_, s)) = walk.next(&self.arena, &room.grouped, member, &Held::GPU) {
-            st.work = st.work.saturating_add(1);
-            if !candidate(self, s) {
-                continue;
-            }
-            let (class, bytes) = (
-                self.arena.class(s),
-                self.arena.gpu(s).map_or(Bytes::ZERO, |g| g.bytes),
-            );
-            for c in Class::ALL {
-                over[c] &= self.ledger.gpu[c] > ceiling_low(c);
-            }
-            let pool_trim = pool_over && used(&self.ledger) > low;
-            if !pool_trim && Class::ALL.iter().all(|c| !over[*c]) {
+        // Two passes in the one order. The first is proactive: down to the
+        // low watermarks, under the law (`sweep`) — not what the view wants
+        // now or wanted within the horizon. The second brings what is still
+        // over its high watermark (the target) back within it, the law's
+        // keepers included: they fit the target (`Reason::Fit`), as I2's
+        // pass below.
+        let mut law = self.sweep_law();
+        for lawful in [true, false] {
+            let mut over: PerClass<bool> =
+                PerClass::from_fn(|c| p.members[c] && self.ledger.gpu[c] > ceiling_high(c));
+            let pool_over = used(&self.ledger) > high;
+            if !pool_over && Class::ALL.iter().all(|c| !over[*c]) {
                 break;
             }
-            // Over its ceiling it goes; for the pool's sake, only down to
-            // its floor.
-            let goes =
-                over[class] || (pool_trim && self.ledger.gpu[class].minus(bytes) >= floor(class));
-            if goes {
-                self.evict_one(now, s, class, d, st);
+            let pool_bound = if lawful { low } else { high };
+            let ceiling = |c: Class| {
+                if lawful {
+                    ceiling_low(c)
+                } else {
+                    ceiling_high(c)
+                }
+            };
+            let grouped: &[_] = if !lawful || law.walks_grouped() {
+                &room.grouped
+            } else {
+                &[]
+            };
+            let mut walk = Walk::default();
+            while let Some(((.., r), s)) = walk.next(&self.arena, grouped, member, &Held::GPU) {
+                st.work = st.work.saturating_add(1);
+                if !candidate(self, s) {
+                    continue;
+                }
+                if lawful {
+                    match law.judge(wants.contains_key(&r), self.arena.poses_since_wanted(s)) {
+                        Verdict::Release => {}
+                        Verdict::Keep => continue,
+                        Verdict::Stop => break,
+                    }
+                }
+                let (class, bytes) = (
+                    self.arena.class(s),
+                    self.arena.gpu(s).map_or(Bytes::ZERO, |g| g.bytes),
+                );
+                for c in Class::ALL {
+                    over[c] &= self.ledger.gpu[c] > ceiling(c);
+                }
+                let pool_trim = pool_over && used(&self.ledger) > pool_bound;
+                if !pool_trim && Class::ALL.iter().all(|c| !over[*c]) {
+                    break;
+                }
+                // Over its ceiling it goes; for the pool's sake, only down to
+                // its floor.
+                let goes = over[class]
+                    || (pool_trim && self.ledger.gpu[class].minus(bytes) >= floor(class));
+                if goes {
+                    let why = (!lawful).then_some(Reason::Fit);
+                    self.evict_as(now, s, class, why, d, st);
+                }
             }
         }
         // The floor yields to I2 (Laurent, 2026-10-21), and only as far as
@@ -3179,13 +3465,24 @@ impl Budget {
             st.work = st.work.saturating_add(1);
             let class = self.arena.class(s);
             if candidate(self, s) && short(&self.ledger, class) {
-                self.evict_one(now, s, class, d, st);
+                self.evict_as(now, s, class, Some(Reason::Fit), d, st);
             }
         }
         self.scratch.room = Some(room);
     }
 
-    /// Evicts the resource of `s`, of `class`, from the GPU, and counts it.
+    /// The proactive sweep's law (`sweep`): its horizon in camera poses,
+    /// bound but under a memory signal.
+    fn sweep_law(&self) -> super::sweep::SweepLaw {
+        super::sweep::SweepLaw::new(
+            self.spec.params.sweep_keep_poses,
+            self.spec.params.release_visits,
+            self.pressure == Pressure::Normal,
+        )
+    }
+
+    /// Evicts the resource of `s`, of `class`, from the GPU for the sweep,
+    /// and counts it.
     fn evict_one(
         &mut self,
         now: Micros,
@@ -3194,15 +3491,34 @@ impl Budget {
         d: &mut Decisions,
         st: &mut BudgetStats,
     ) {
+        self.evict_as(now, s, class, None, d, st);
+    }
+
+    /// Evicts the resource of `s`, of `class`, from the GPU, and counts it:
+    /// for the sweep (or a memory signal's) when `reason` is `None`.
+    fn evict_as(
+        &mut self,
+        now: Micros,
+        s: Slot,
+        class: Class,
+        reason: Option<Reason>,
+        d: &mut Decisions,
+        st: &mut BudgetStats,
+    ) {
         let r = self.arena.id(s);
-        self.arena.take_gpu(s, &mut self.ledger);
-        d.evict.push(r);
-        st.evicted += 1;
         let why = if self.pressure == Pressure::Normal {
             EvictReason::Sweep
         } else {
             EvictReason::Pressure
         };
+        let reason = reason.unwrap_or(match why {
+            EvictReason::Sweep => Reason::Sweep,
+            _ => Reason::Pressure,
+        });
+        d.scores.push(self.held_event(s, Side::Evict, reason));
+        self.arena.take_gpu(s, &mut self.ledger);
+        d.evict.push(r);
+        st.evicted += 1;
         st.evictions[class][why as usize] += 1;
         st.evictions_by_level[class][super::stats::level_index(self.arena.level(s))] += 1;
         self.evicted(r, now);
@@ -3254,10 +3570,25 @@ impl Budget {
                 .saturating_add(rate.saturating_mul(dt))
                 .min(max);
         } else {
-            let calm = Class::ALL.iter().all(|&c| {
-                self.ledger.gpu[c]
-                    <= eff.target[c].scaled(u64::from(self.cfg.watermarks.low_percent), 100)
+            // Calm when what must be held — the protected bytes: drawn, in a
+            // swap, the floor — fits under the low watermarks again. The
+            // copies nobody draws are a cache the sweep and the admission
+            // let go of as the detail asks for room: counting them kept a
+            // class between its watermarks relaxed for ever (Laurent's stall,
+            // 2026-11-23: drapes at 97–99 % of target, imagery under need,
+            // nothing loading).
+            let low = |b: Bytes| b.scaled(u64::from(self.cfg.watermarks.low_percent), 100);
+            let high = |b: Bytes| b.scaled(u64::from(self.cfg.watermarks.high_percent), 100);
+            let mut calm = Class::ALL.iter().all(|&c| {
+                protected[c] <= low(eff.target[c]) && self.ledger.gpu[c] <= high(eff.target[c])
             });
+            if let Some(p) = eff.pool {
+                let pooled = Class::ALL
+                    .iter()
+                    .filter(|c| p.members[**c])
+                    .fold(Bytes::ZERO, |a, c| a.plus(protected[*c]));
+                calm &= pooled <= low(p.target);
+            }
             if calm {
                 let down = u64::from(r.down_per_second).saturating_mul(dt);
                 self.scale_fine = self.scale_fine.saturating_sub(down).max(one);
@@ -3476,6 +3807,232 @@ impl Budget {
             });
         }
         Ok(())
+    }
+}
+
+impl Budget {
+    /// The score of the GPU copy of `s` as the release key reads it, as a
+    /// decision record of `side` for `reason`
+    /// (`docs/explorations/budget-progressive-coarse-preload.md` §7). Read
+    /// before the copy goes.
+    pub(super) fn held_event(&self, s: Slot, side: Side, reason: Reason) -> ScoreEvent {
+        let a = &self.arena;
+        ScoreEvent {
+            resource: a.id(s),
+            class: a.class(s),
+            level: a.level(s),
+            band: u8::try_from(a.place(s).2).unwrap_or(u8::MAX),
+            side,
+            reason,
+            terms: self.held_terms(s),
+        }
+    }
+
+    /// The terms of the score of the copies `s` holds.
+    pub(super) fn held_terms(&self, s: Slot) -> Terms {
+        let a = &self.arena;
+        let v = a.valuation();
+        let (need, p, _) = a.place(s);
+        let certain = super::value::CERTAIN;
+        // `A` from the level and the need's level as the specification
+        // weighs them now; `D` what the probability leaves of it.
+        let pa = match need {
+            Some(n) => {
+                super::value::progressive_terms(
+                    &self.spec.params.progressive,
+                    a.level(s),
+                    n,
+                    0,
+                    self.reach_tiles(),
+                )
+                .0
+            }
+            None => p,
+        };
+        let d = if pa == 0 {
+            0
+        } else {
+            u32::try_from(u64::from(p) * u64::from(certain) / u64::from(pa))
+                .unwrap_or(certain)
+                .min(certain)
+        };
+        let at = level_index(a.level(s));
+        let held = a.held_copies(s).unwrap_or(Held::Gpu);
+        let bytes = match held {
+            Held::Cpu => a.cpu(s).map_or(0, |c| c.cost.gpu.0),
+            Held::Both | Held::Gpu => a.gpu(s).map_or(0, |g| g.bytes.0),
+        };
+        Terms::new(
+            pa,
+            d,
+            p,
+            u64::from(v.credit(a.class(s), at, held)),
+            bytes,
+            v.ref_bytes(),
+        )
+    }
+
+    /// A preload started, as a decision record: its want's terms, `R` the
+    /// restore cost of the tier it comes from, its bytes the reference size
+    /// (a load does not know its own yet).
+    pub(super) fn load_event(
+        &self,
+        r: ResourceId,
+        class: Class,
+        w: &Want,
+        tier: Tier,
+    ) -> ScoreEvent {
+        let (pa, pd) = super::value::probability_terms(
+            &self.spec,
+            self.reach_tiles(),
+            w.urgency,
+            w.level,
+            &w.q,
+        );
+        let p = if pd == super::value::CERTAIN {
+            pa
+        } else {
+            super::value::product(pa, pd)
+        };
+        let ref_bytes = self.spec.params.ref_bytes.0.max(1);
+        ScoreEvent {
+            resource: r,
+            class,
+            level: w.level,
+            band: u8::try_from(super::score::distance_band(w.q.away)).unwrap_or(u8::MAX),
+            side: Side::Preload,
+            reason: Reason::Preload,
+            terms: Terms::new(
+                pa,
+                pd,
+                p,
+                self.costed.params.restore.of(tier).0,
+                ref_bytes,
+                ref_bytes,
+            ),
+        }
+    }
+
+    /// The score's parameters in force.
+    pub(super) fn score_params(&self) -> super::score::ScoreParams {
+        let p = &self.spec.params;
+        super::score::ScoreParams {
+            a0_permille: u32::from(p.progressive.a0_permille),
+            descend_permille: u32::from(p.progressive.descend_permille),
+            coarse_from: u32::from(p.progressive.coarse_from),
+            coarse_boost_permille: u32::from(p.progressive.coarse_boost_permille),
+            rho: self.reach_tiles(),
+            margin_permille: p.margin_permille,
+            floor_level: self.cfg.pinned_level,
+            preload_slots_permille: u32::from(p.speculation.slots_permille),
+            need_level: self.need_level,
+            headroom_permille: u32::from(p.headroom_permille),
+            floor_value_permille: u32::from(p.floor_value_permille),
+            restore_us: {
+                let r = &self.costed.params.restore;
+                [r.decoded.0, r.stored.0, r.http_cache.0, r.remote.0]
+            },
+            restore_measured: {
+                let s = &self.smoothed;
+                let m = |t: &super::inputs::SmoothedTier| t.latency_us.get().is_some();
+                [
+                    false,
+                    m(&s.store) || m(&s.http_cache),
+                    m(&s.http_cache),
+                    m(&s.network),
+                ]
+            },
+        }
+    }
+
+    /// The step's score statistics read off the arena: the preloads in
+    /// flight by level and band, the evictions of `scores`.
+    pub(super) fn score_stats(&mut self, scores: &[ScoreEvent], st: &mut BudgetStats) {
+        let rekeys = self.arena.take_rekeys();
+        let places = std::mem::take(&mut self.places);
+        let a = &self.arena;
+        let mut out = super::score::ScoreStats {
+            params: self.score_params(),
+            places,
+            rekeys,
+            headroom_bytes: self.dynamic_headroom().0,
+            ..Default::default()
+        };
+        for &s in a.active() {
+            if a.loading(s) && a.urgency(s).is_some_and(|u| u >= Urgency::Ring) {
+                let band = a.place(s).2.min(super::score::DISTANCE_BANDS - 1);
+                out.preload_in_flight[level_index(a.level(s))][band] += 1;
+            }
+        }
+        for e in scores {
+            let band = usize::from(e.band).min(super::score::DISTANCE_BANDS - 1);
+            if e.side == Side::Evict {
+                out.evictions[level_index(e.level)][band] += 1;
+            }
+            if matches!(e.side, Side::Evict | Side::Decoded) {
+                if let Some(i) = super::score::release_reason(e.reason) {
+                    out.released[i][level_index(e.level)][band] += 1;
+                }
+            }
+        }
+        st.score = out;
+    }
+
+    /// [`Budget::held_report`]: the GPU copies by score, a walk of the
+    /// arena — statistics, never a decision's work.
+    pub(super) fn held_report_impl(&self) -> super::score::HeldReport {
+        use super::score::{HeldReport, HeldState, HeldTile, HELD_LISTED};
+        let a = &self.arena;
+        let mut report = HeldReport {
+            step: self.steps,
+            ..Default::default()
+        };
+        let mut tiles: Vec<HeldTile> = Vec::new();
+        for s in a.iter().filter(|&s| a.has_gpu(s)) {
+            let terms = self.held_terms(s);
+            let (_, _, band) = a.place(s);
+            let level = a.level(s);
+            report
+                .board
+                .put(level_index(level), band, Side::Held, &terms);
+            let state = if self.is_floor(a.class(s), level) {
+                HeldState::Floor
+            } else if self.kept(s) {
+                HeldState::Kept
+            } else if a.marked(s, Mark::Wanted) {
+                HeldState::Wanted
+            } else {
+                HeldState::Left
+            };
+            if state != HeldState::Floor {
+                tiles.push(HeldTile {
+                    resource: a.id(s),
+                    class: a.class(s),
+                    level,
+                    band: u8::try_from(band).unwrap_or(u8::MAX),
+                    terms,
+                    state,
+                });
+            }
+        }
+        let key = |t: &HeldTile| (t.terms.score, t.resource);
+        let n = HELD_LISTED.min(tiles.len());
+        if n > 0 {
+            if tiles.len() > n {
+                tiles.select_nth_unstable_by_key(n - 1, key);
+            }
+            let mut low = tiles[..n].to_vec();
+            low.sort_unstable_by_key(key);
+            report.lowest = low;
+            let len = tiles.len();
+            if len > n {
+                tiles.select_nth_unstable_by_key(len - n, key);
+            }
+            let mut high = tiles[len - n..].to_vec();
+            high.sort_unstable_by_key(|t| std::cmp::Reverse(key(t)));
+            report.highest = high;
+        }
+        report
     }
 }
 

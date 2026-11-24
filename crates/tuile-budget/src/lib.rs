@@ -31,11 +31,14 @@ mod sorted;
 pub mod spec;
 mod state;
 pub mod stats;
+mod sweep;
 pub mod tier;
 pub mod tile_id;
 pub mod tiers;
 pub mod types;
 mod value;
+pub mod score;
+pub mod waits;
 pub mod view;
 
 pub use config::{
@@ -49,14 +52,15 @@ pub use error::{AuditError, ConfigError, SessionError};
 pub use inputs::{Measured, Prediction, Smoothed, TierSample};
 pub use fallback::{FallbackContext, FallbackReport, FallbackRule, FallbackSpec, FallbackState};
 pub use imagery::{DrapeCandidate, GeoRect, LevelClamp, TexelFootprint, UvTransform};
-pub use need::{ImageryNeed, LayerReach, Membership, Need, NeedDelta, NeedSet};
+pub use need::{ImageryNeed, LayerReach, Membership, Need, NeedDelta, NeedSet, Proximity};
 pub use observe::{
     check, BudgetEvent, BudgetMeter, BudgetObserver, BudgetSignals, EyeCoverage, FrameRecord,
     Histogram, StepRecord, Violations,
 };
 pub use priority::{Precedence, PriorityKey, Quantised, Urgency};
 pub use spec::{
-    Anticipation, Band, Facts, Params, Predicate, RestoreCosts, Rule, SpecError, SpecKind, Specification,
+    Anticipation, Band, Facts, Params, Predicate, Progressive, RestoreCosts, Rule, SpecError, SpecKind,
+    Specification,
     Speculation, Term,
 };
 pub use tiers::{ByLevel, DiskTiers};
@@ -70,6 +74,7 @@ pub use types::{
     Thermal, TileId,
 };
 pub use view::{Protection, ResourceState, ResourceView};
+pub use value::{progressive, progressive_terms, CERTAIN};
 
 /// One decision step's input.
 #[derive(Clone, Copy)]
@@ -305,6 +310,16 @@ pub struct Budget {
     ranked_last: Vec<ResourceId>,
     /// Steps taken, for the amortised prune.
     steps: u64,
+    /// The level the view needs at its nearest point, as the last placed
+    /// want gave it (`docs/explorations/budget-progressive-coarse-preload.md`):
+    /// statistics only.
+    need_level: Option<u32>,
+    /// Places set this step (`score::ScoreStats::places`).
+    places: u32,
+    /// The bytes delivered this step, and their rate, bytes a second,
+    /// smoothed: the dynamic headroom's measure.
+    delivered_bytes: Bytes,
+    upload_rate: inputs::Ema,
     /// What the passes after the need keep from one step to the next: the
     /// draw set, the wants, the work, and what changed (O1.4).
     down: downstream::Downstream,
@@ -353,6 +368,12 @@ pub struct Budget {
     /// Whether each origin answers (`origin`): the ones whose loads failed
     /// since they last answered.
     origins: origin::Origins,
+    /// The specification in force with its restore costs replaced by the
+    /// measured ones where a tier has samples (quantised to an eighth of an
+    /// octave, so that noise does not re-file the release order): what the
+    /// load gain, the deficit and the release key read
+    /// (`docs/explorations/budget-progressive-coarse-preload.md` §2, `R`).
+    costed: spec::Specification,
 }
 
 impl Budget {
@@ -378,6 +399,10 @@ impl Budget {
             held_last: Default::default(),
             ranked_last: Vec::new(),
             steps: 0,
+            need_level: None,
+            places: 0,
+            delivered_bytes: Bytes::ZERO,
+            upload_rate: inputs::Ema::default(),
             down: Default::default(),
             scratch: Default::default(),
             recent: Default::default(),
@@ -400,9 +425,10 @@ impl Budget {
             smoothed: inputs::Smoothed::default(),
             measured_next: None,
             origins: Default::default(),
+            costed: spec::Specification::for_policy(policy),
         })
         .map(|mut b: Budget| {
-            let v = value::Valuation::of(&b.spec, b.cfg.pinned_level);
+            let v = value::Valuation::of(&b.costed, b.cfg.pinned_level);
             b.arena.set_valuation(v);
             b
         })
@@ -442,14 +468,40 @@ impl Budget {
     /// step, at its time.
     pub(crate) fn take_inputs(&mut self, now: Micros) {
         self.now = now;
+        let respecified = self.spec_next.is_some();
         if let Some(s) = self.spec_next.take() {
             self.spec = s;
-            let v = value::Valuation::of(&self.spec, self.cfg.pinned_level);
-            let refiled = self.arena.set_valuation(v);
-            self.walk(refiled);
         }
         if let Some(m) = self.measured_next.take() {
             self.smoothed.take(&m, now);
+        }
+        let restore = self.restore_costs();
+        if respecified || restore != self.costed.params.restore {
+            self.costed = self.spec.clone();
+            self.costed.params.restore = restore;
+            let v = value::Valuation::of(&self.costed, self.cfg.pinned_level);
+            let refiled = self.arena.set_valuation(v);
+            self.walk(refiled);
+        }
+    }
+
+    /// The restore costs in force: each tier's smoothed measurement for a
+    /// resource of the reference size, where the tier has samples, else the
+    /// specification's; quantised to three significant bits.
+    pub fn restore_costs(&self) -> spec::RestoreCosts {
+        let base = self.spec.params.restore;
+        let size = self.spec.params.ref_bytes;
+        let q = |m: Micros| {
+            let bits = 64 - m.0.leading_zeros();
+            Micros(if bits > 4 { m.0 & !((1u64 << (bits - 4)) - 1) } else { m.0 })
+        };
+        let of = |t: &inputs::SmoothedTier, or: Micros| t.cost(size).map_or(or, q);
+        let s = &self.smoothed;
+        spec::RestoreCosts {
+            decoded: base.decoded,
+            stored: of(&s.store, of(&s.http_cache, base.stored)),
+            http_cache: of(&s.http_cache, base.http_cache),
+            remote: of(&s.network, base.remote),
         }
     }
 
@@ -462,6 +514,24 @@ impl Budget {
     /// until one answers (`OriginBackoff`).
     pub fn origins_down(&self) -> usize {
         self.origins.down()
+    }
+
+    /// The neighbourhood's radius `ρ` in force, tiles: the specification's
+    /// when it sets one, the configuration's (the profile's) otherwise.
+    pub fn reach_tiles(&self) -> u32 {
+        match self.spec.params.rho_tiles {
+            0 => self.cfg.reach_tiles,
+            r => u32::from(r),
+        }
+    }
+
+    /// The GPU-held set by the progressive score
+    /// (`docs/explorations/budget-progressive-coarse-preload.md` §7): its
+    /// aggregates by level and distance band, and the lowest and highest
+    /// scored copies outside the floor. A walk of the tracked resources:
+    /// for a host's periodic report, never called by a step.
+    pub fn held_report(&self) -> score::HeldReport {
+        self.held_report_impl()
     }
 
     /// One decision step: applies the recorded arrivals, then decides.
@@ -784,6 +854,15 @@ impl Budget {
             steps: self.steps,
             events: self.events.len(),
         }
+    }
+
+    /// Takes the arena out, an empty one in its place, for a test to drop
+    /// it under a counting allocator: the heap the arena alone holds.
+    /// Leaves the budget unusable for decisions; measurement only.
+    #[doc(hidden)]
+    pub fn take_arena_to_measure(&mut self) -> Box<dyn std::any::Any> {
+        let empty = state::Arena::new(self.cfg.pinned_level);
+        Box::new(std::mem::replace(&mut self.arena, empty))
     }
 
     /// Drops the buffers a step reuses from one step to the next, which

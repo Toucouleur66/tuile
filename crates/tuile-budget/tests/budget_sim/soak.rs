@@ -217,9 +217,67 @@ fn soak(minutes: u64) {
         last.heap,
         sim.log.len()
     );
+    // The waits split by their kind, as the meter tells them
+    // (`tuile_budget::waits`): first loads, and reloads of a mesh evicted
+    // under 5 s or 30 s before, by `Decisions::evict` — told from the
+    // outside, so the same on any budget (`--nocapture`).
+    let outside = |from: Micros, to: Micros| {
+        let mut by: [Vec<f64>; 3] = Default::default();
+        for ((t, ms), k) in sim.waits.iter().zip(&sim.wait_kinds) {
+            if *t >= from && *t < to {
+                by[usize::from(*k)].push(*ms);
+            }
+        }
+        let parts: Vec<String> = by
+            .iter_mut()
+            .zip(["first", "reload_5s", "reload_30s"])
+            .map(|(v, kind)| {
+                v.sort_by(f64::total_cmp);
+                let q = |q: usize| {
+                    v.get(v.len() * q / 100)
+                        .map_or("-".to_owned(), |x| format!("{x:.0}"))
+                };
+                format!("{kind} {} (p50 {} p95 {} ms)", v.len(), q(50), q(95))
+            })
+            .collect();
+        parts.join(", ")
+    };
+    eprintln!(
+        "soak {minutes} min: mesh waits by eviction, first window: {}; last window: {}",
+        outside(Micros(span), Micros(2 * span)),
+        outside(end.since(Micros(span)), end)
+    );
+    // The reloads by their eviction's reason, as its decision record says.
+    let reasons = |from: Micros, to: Micros| {
+        let mut by: std::collections::BTreeMap<&str, u32> = Default::default();
+        for ((t, _), why) in sim.waits.iter().zip(&sim.wait_reasons) {
+            if *t >= from && *t < to && !why.is_empty() {
+                *by.entry(*why).or_default() += 1;
+            }
+        }
+        by
+    };
+    eprintln!(
+        "soak {minutes} min: reloads by eviction reason, first window: {:?}; last window: {:?}",
+        reasons(Micros(span), Micros(2 * span)),
+        reasons(end.since(Micros(span)), end)
+    );
     assert!(first.p95_ms > 0.0, "nothing loaded");
+    // The last window draws at full detail: before the progressive score,
+    // its flat latency came from a picture relaxed on every one of its
+    // steps (scale 1.93, 406 waits against 697) — a budget held between its
+    // watermarks by copies nobody drew, the stall Laurent saw in Tuile.app
+    // (`docs/explorations/budget-progressive-coarse-preload.md` §3). At full
+    // detail the tour asks for more (1 753 waits) and waits a little longer:
+    // the bound is a third over the first window's, never a relaxed picture.
+    let relaxed_last = sim
+        .log
+        .iter()
+        .filter(|l| l.now >= end.since(Micros(span)) && l.stats.sse_scale_milli > 1_000)
+        .count();
+    assert_eq!(relaxed_last, 0, "the last window is relaxed: the stall");
     assert!(
-        last.p95_ms <= 1.1 * first.p95_ms,
+        last.p95_ms <= 1.4 * first.p95_ms,
         "I6: p95 {} → {} ms",
         first.p95_ms,
         last.p95_ms

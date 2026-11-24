@@ -1005,11 +1005,52 @@ pub fn budget() -> Option<crate::budget::BudgetSignals> {
     budget_slot().lock().ok().and_then(|s| s.clone())
 }
 
-/// Publishes a session's budget signals: see [`budget`].
+/// Publishes a session's budget signals: see [`budget`]. The decisions
+/// they carry with their score (`score_events`) and the held set's picture
+/// also join the queue the telemetry's log records drain
+/// ([`take_score_records`]).
 pub fn publish_budget(signals: crate::budget::BudgetSignals) {
+    if let Ok(mut q) = score_queue().lock() {
+        let room = SCORE_RECORDS_KEPT.saturating_sub(q.decisions.len());
+        let take = signals.score_events.len().min(room);
+        q.decisions.extend_from_slice(&signals.score_events[..take]);
+        q.dropped += (signals.score_events.len() - take) as u64;
+        if let Some(h) = &signals.score_held {
+            q.held = Some(h.clone());
+        }
+    }
     if let Ok(mut slot) = budget_slot().lock() {
         *slot = Some(signals);
     }
+}
+
+/// The most decisions [`take_score_records`] hands over at once: the log
+/// records' rate limit, per push.
+pub const SCORE_RECORDS_KEPT: usize = 2_000;
+
+/// What the telemetry's log records read
+/// (`docs/explorations/budget-progressive-coarse-preload.md` §8): every
+/// preload started and copy evicted since the last take, with its score's
+/// terms, at most [`SCORE_RECORDS_KEPT`]; how many were dropped beyond; the
+/// last picture of the held set.
+#[derive(Debug, Default, Clone)]
+pub struct ScoreRecords {
+    pub decisions: Vec<crate::budget::score::ScoreEvent>,
+    pub dropped: u64,
+    pub held: Option<crate::budget::score::HeldReport>,
+}
+
+/// Takes the [`ScoreRecords`] queued since the last take.
+pub fn take_score_records() -> ScoreRecords {
+    score_queue()
+        .lock()
+        .map(|mut q| std::mem::take(&mut *q))
+        .unwrap_or_default()
+}
+
+fn score_queue() -> &'static std::sync::Mutex<ScoreRecords> {
+    static Q: std::sync::OnceLock<std::sync::Mutex<ScoreRecords>> = std::sync::OnceLock::new();
+    Q.get_or_init(Default::default)
 }
 
 fn budget_slot() -> &'static std::sync::Mutex<Option<crate::budget::BudgetSignals>> {

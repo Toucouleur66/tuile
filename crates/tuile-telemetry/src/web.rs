@@ -99,6 +99,7 @@ pub fn start_web(config: &Config, identity: Identity<'_>) -> bool {
     tuile_metrics::describe();
     follow_tile_requests();
     let url = format!("{endpoint}/v1/metrics");
+    let logs_url = format!("{endpoint}/v1/logs");
     let headers = config.headers.clone();
     let start_ns = crate::unix_nanos();
     let failing = std::rc::Rc::new(std::cell::Cell::new(false));
@@ -121,6 +122,17 @@ pub fn start_web(config: &Config, identity: Identity<'_>) -> bool {
                 return;
             }
         };
+        // The budget's decisions with their score, as log records
+        // (`crate::logs`): as a desktop sends them, fire and forget.
+        let records = tuile_core::metrics::take_score_records();
+        if let Some(body) = crate::logs::encode(&crate::resource(), &records, crate::unix_nanos()) {
+            if let Ok(logs) = crate::web::request(&logs_url, &headers, &body) {
+                let sent = scope.fetch(&logs);
+                wasm_bindgen_futures::spawn_local(async move {
+                    let _ = wasm_bindgen_futures::JsFuture::from(sent).await;
+                });
+            }
+        }
         let failing = std::rc::Rc::clone(&failing);
         let sent = scope.fetch(&request);
         wasm_bindgen_futures::spawn_local(async move {

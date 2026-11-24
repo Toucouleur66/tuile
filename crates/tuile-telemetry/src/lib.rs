@@ -5,6 +5,7 @@
 
 pub mod camera;
 pub mod config;
+pub mod logs;
 pub mod otlp;
 pub mod registry;
 pub mod resource;

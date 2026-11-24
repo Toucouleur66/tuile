@@ -825,6 +825,105 @@ struct Flight {
     /// Its tile is ground (`Class::is_ground`): a 3D Tiles mesh drapes
     /// nothing, so its slopes are not measured.
     ground: bool,
+    /// The step it started at, and whether from a local store: its time to
+    /// land is a sample of that tier's restore cost ([`Measuring`]).
+    started: Micros,
+    local: bool,
+}
+
+/// The tiers' restore costs as the loads measure them, gathered over one
+/// interval and handed to the budget as [`crate::budget::Measured`]
+/// (`docs/explorations/budget-progressive-coarse-preload.md` §2, `R`):
+/// each load's time to land, from the step that started it to the last
+/// step before it landed — a step's resolution — by the tier it read.
+#[derive(Debug, Default)]
+struct Measuring {
+    since: Option<Micros>,
+    interval: u64,
+    network: Vec<u32>,
+    local: Vec<u32>,
+    network_failed: u32,
+    local_failed: u32,
+}
+
+/// How often the measured costs reach the budget.
+const MEASURE_EVERY: Micros = Micros::from_secs(1);
+
+impl Measuring {
+    fn sample(&mut self, local: bool, took: Micros, ok: bool) {
+        let us = u32::try_from(took.0).unwrap_or(u32::MAX);
+        match (local, ok) {
+            (true, true) => self.local.push(us),
+            (false, true) => self.network.push(us),
+            (true, false) => self.local_failed += 1,
+            (false, false) => self.network_failed += 1,
+        }
+    }
+
+    /// The interval's samples, once it is over and has any.
+    fn due(&mut self, now: Micros) -> Option<crate::budget::Measured> {
+        let since = *self.since.get_or_insert(now);
+        if now.since(since) < MEASURE_EVERY {
+            return None;
+        }
+        self.since = Some(now);
+        if self.network.is_empty() && self.local.is_empty() {
+            return None;
+        }
+        let tier = |v: &mut Vec<u32>, failed: u32| {
+            v.sort_unstable();
+            let n = v.len();
+            let sample = crate::budget::TierSample {
+                latency_us: v.get(n / 2).copied().unwrap_or(0),
+                // Bytes moved are not seen here: the latency carries them.
+                bytes_per_ms: 0,
+                failures_permille: u16::try_from(
+                    u64::from(failed) * 1_000 / (n as u64 + u64::from(failed)).max(1),
+                )
+                .unwrap_or(1_000),
+                samples: u16::try_from(n).unwrap_or(u16::MAX),
+            };
+            v.clear();
+            sample
+        };
+        self.interval += 1;
+        let m = crate::budget::Measured {
+            interval: self.interval,
+            network: tier(&mut self.network, self.network_failed),
+            store: tier(&mut self.local, self.local_failed),
+            ..Default::default()
+        };
+        self.network_failed = 0;
+        self.local_failed = 0;
+        Some(m)
+    }
+}
+
+#[cfg(test)]
+mod measuring {
+    use super::*;
+
+    /// One sample a second per tier, the median of what landed: the
+    /// network's and the store's apart, failures as a share; nothing before
+    /// the interval is over, nothing for an interval without a load.
+    #[test]
+    fn the_tiers_are_measured_once_a_second_by_their_median() {
+        let mut m = Measuring::default();
+        assert_eq!(m.due(Micros::ZERO), None);
+        for ms in [100, 300, 200] {
+            m.sample(false, Micros::from_millis(ms), true);
+        }
+        m.sample(false, Micros::from_millis(5), false);
+        m.sample(true, Micros::from_millis(7), true);
+        assert_eq!(m.due(Micros::from_millis(500)), None, "not a second yet");
+        let s = m.due(Micros::from_secs(1)).unwrap();
+        assert_eq!(s.interval, 1);
+        assert_eq!(s.network.latency_us, 200_000);
+        assert_eq!(s.network.samples, 3);
+        assert_eq!(s.network.failures_permille, 250);
+        assert_eq!(s.store.latency_us, 7_000);
+        assert_eq!(m.due(Micros::from_secs(2)), None, "no load, no sample");
+    }
 }
 
 /// The loader's presence index, as the budget's oracle, with every answer
@@ -1021,6 +1120,12 @@ struct State {
     /// above the pinned level that has content.
     floor: Vec<TileId>,
     floor_revision: Option<Option<u64>>,
+    /// The neighbourhood preloaded around the view
+    /// (`docs/explorations/budget-progressive-coarse-preload.md`), walked
+    /// again only when what it depends on moved.
+    hood: crate::neighbourhood::Neighbourhood,
+    /// The loads' times to land, per tier, for the budget's `R`.
+    measuring: Measuring,
     priming_reported: Option<Priming>,
     frame: u64,
     steps: u64,
@@ -1077,6 +1182,8 @@ impl State {
             sse_scale_milli: 1_000,
             floor: Vec::new(),
             floor_revision: None,
+            hood: Default::default(),
+            measuring: Measuring::default(),
             priming_reported: None,
             frame: 0,
             steps: 0,
@@ -1203,14 +1310,16 @@ impl State {
         let m = crate::metrics::metrics();
         // Only the load the budget is waiting for: a result that lands after
         // its load was cancelled is not this generation's any more.
-        let ground = match self.in_flight.get(&r) {
+        let (ground, started, local) = match self.in_flight.get(&r) {
             Some(f) if f.gen == gen => {
-                let ground = f.ground;
+                let at = (f.ground, f.started, f.local);
                 self.in_flight.remove(&r);
-                ground
+                at
             }
             _ => return,
         };
+        self.measuring
+            .sample(local, self.last_now.since(started), result.is_ok());
         m.loads_in_flight.set(self.in_flight.len() as u64);
         match result {
             Ok(fetched) => {
@@ -1430,10 +1539,24 @@ impl State {
         }
         let blockers: BTreeSet<TileId> = blockers.difference(&drawn).copied().collect();
         let mut ancestors: BTreeSet<TileId> = BTreeSet::new();
+        // Under each ancestor of the drawn ground, the finest level drawn:
+        // the level the view needs at that place, from the actual pose — a
+        // grazing view's far ground needs coarse levels, and the ancestors
+        // there are scored against that, not against the eye's
+        // (`docs/explorations/budget-progressive-coarse-preload.md` §2).
+        let mut need_under: HashMap<TileId, u32> = HashMap::new();
         for t in drawn.iter().chain(&blockers) {
+            let level = tree.level(*t);
             let mut cur = tree.parent(*t);
             while let Some(p) = cur {
-                if drawn.contains(&p) || blockers.contains(&p) || !ancestors.insert(p) {
+                if drawn.contains(&p) || blockers.contains(&p) {
+                    break;
+                }
+                let finer = need_under.get(&p).is_none_or(|n| level > *n);
+                if finer {
+                    need_under.insert(p, level);
+                }
+                if !ancestors.insert(p) && !finer {
                     break;
                 }
                 cur = tree.parent(p);
@@ -1455,6 +1578,29 @@ impl State {
                 ancestors.insert(t);
             }
         }
+        // The neighbourhood: per level from the floor down to one under the
+        // eye's, the tiles nearest the view's footprint, preloaded by the
+        // progressive score.
+        if let Some(eye) = self.views.first().map(ViewState::position) {
+            let (rho, pinned) = (self.budget.reach_tiles(), self.budget.config().pinned_level);
+            self.hood
+                .update(tree, drawn.iter().copied(), eye, rho, pinned);
+        }
+        // The neighbourhood's tiles outside the chain: the ring around the
+        // view, never protected — the chain of what is drawn stays the
+        // fallback, the rest is best effort.
+        let hood: BTreeSet<TileId> = self
+            .hood
+            .tiles()
+            .iter()
+            .map(|(t, _)| *t)
+            .filter(|t| {
+                !drawn.contains(t)
+                    && !blockers.contains(t)
+                    && !ancestors.contains(t)
+                    && tree.properties(*t).has_content
+            })
+            .collect();
         // The ring: what the views ahead select and ask for, beyond what
         // the current ones need — loaded when they leave a slot, never drawn.
         let ring: BTreeSet<TileId> = if self.ahead.is_empty() {
@@ -1479,16 +1625,46 @@ impl State {
                 .collect()
         };
         let views = &self.views;
+        let mut ancestors = list(&ancestors, views);
+        let ring_set = ring;
+        let mut ring = list(&ring_set, &self.ahead);
+        let hood: BTreeSet<TileId> = hood.difference(&ring_set).copied().collect();
+        ring.extend(list(&hood, views));
+        // Each preload's place against the present need: the level the view
+        // needs and the distance in tiles of the preload's own level.
+        if let Some(n) = self.hood.need_level() {
+            for (t, need) in ancestors.iter_mut().chain(ring.iter_mut()) {
+                // An ancestor of what is drawn lies on the view's footprint:
+                // the need there is the finest level drawn under it.
+                let place = match need_under.get(t) {
+                    Some(&under) => Some((under, 0.0)),
+                    None => self.hood.away(tree, *t).map(|d| (n, d)),
+                };
+                if let Some((need_level, tiles_away)) = place {
+                    need.proximity = Some(crate::budget::Proximity {
+                        need_level,
+                        tiles_away,
+                    });
+                }
+            }
+        }
         NeedSet {
             drawn: list(&drawn, views),
             blockers: list(&blockers, views),
-            ancestors: list(&ancestors, views),
-            ring: list(&ring, &self.ahead),
+            ancestors,
+            ring,
         }
     }
 
     /// Starts one load the budget decided on.
-    fn start(&mut self, host: &Host<'_>, r: ResourceId, gen: Generation, loads: &mut Loads) {
+    fn start(
+        &mut self,
+        host: &Host<'_>,
+        r: ResourceId,
+        gen: Generation,
+        local: bool,
+        loads: &mut Loads,
+    ) {
         let loader = Arc::clone(host.loader);
         let (handle, registration) = AbortHandle::new_pair();
         // Named while it is polled: the work it hands a pool says which load
@@ -1518,6 +1694,8 @@ impl State {
                 gen,
                 handle,
                 ground,
+                started: self.last_now,
+                local,
             },
         );
         let m = crate::metrics::metrics();
@@ -1624,6 +1802,12 @@ impl State {
         // drawable; `decide` below, at the same instant, decides as if it had
         // applied them itself.
         let now = (host.clock)();
+        // The tiers' measured costs, once an interval: recorded with the
+        // step as any input, so a replay decides the same.
+        if let Some(m) = self.measuring.due(now) {
+            self.budget.measure(m);
+            self.events.push(BudgetEvent::Measured(m));
+        }
         self.budget.apply_arrivals(now);
         // The traversal, relaxed as the budget asks, against the budget's
         // residency: what is drawable (interactive) or loaded (batch).
@@ -1837,6 +2021,9 @@ impl State {
                 .is_none_or(|at| now.since(at) >= PUBLISH_EVERY)
             {
                 self.published_at = Some(now);
+                // The held set by score: a walk of the budget's resources,
+                // once a publish, never in a step.
+                meter.set_held(self.budget.held_report());
                 let mut signals = meter.publish();
                 // The disk tier, from the loader's stores' ledgers: no I/O.
                 let mut disk = crate::budget::DiskTiers::default();
@@ -1974,7 +2161,8 @@ impl State {
             self.decoded.remove(r);
         }
         for s in &d.start {
-            self.start(host, s.resource, s.gen, loads);
+            let local = s.source == crate::budget::Source::Local;
+            self.start(host, s.resource, s.gen, local, loads);
         }
         // The draw set, with the shape of the tree around it.
         let mut named: BTreeSet<TileId> = BTreeSet::new();
@@ -3195,6 +3383,8 @@ mod tests {
                     gen: Generation(1),
                     handle,
                     ground: is_ground,
+                    started: Micros::ZERO,
+                    local: false,
                 },
             );
             state.on_load_done(

@@ -16,10 +16,13 @@
 //!   tile's address or a layer's URL in it is stopped here rather than
 //!   shipped.
 //!
-//! What is never sent, by construction: the device's location, a tile's
-//! identity, a source's address, anything a person typed. The camera's pose
-//! is sent as gauges of its own (`crate::camera`), never as a label or an
-//! attribute.
+//! What is never sent, by construction: the device's location, a source's
+//! address, anything a person typed. The camera's pose is sent as gauges of
+//! its own (`crate::camera`), never as a label or an attribute. One
+//! exception, by Laurent's decision (2026-11-23): the graphics budget's
+//! decision log records (`crate::logs`) carry the address of the tile each
+//! decision is about (`level/x/y`), which reveals the place viewed — sent
+//! only when a collector endpoint is configured, and never a metric label.
 
 use std::collections::BTreeMap;
 
@@ -55,7 +58,7 @@ pub const ALLOWED: [&str; 16] = [
 ];
 
 /// The metric label keys a series may carry.
-pub const ALLOWED_LABELS: [&str; 20] = [
+pub const ALLOWED_LABELS: [&str; 26] = [
     // tuile_core::metrics: the per-level and per-eye series.
     "series",
     "level",
@@ -84,8 +87,20 @@ pub const ALLOWED_LABELS: [&str; 20] = [
     // labels: interactive, known_path, film, fpv, fpv_film, custom), with
     // `source` = context | override (`tuile_budget_spec_info`).
     "spec",
+    // The progressive score's closed sets (`tuile_budget::observe::labels`:
+    // `DISTANCE`, `SIDE`, `TERM`, `PARAM`): a band of tiles from the view,
+    // never a tile.
+    "distance",
+    "side",
+    "term",
+    "name",
+    // A score quantile's rank (`0.1`, `0.5`, `0.9`).
+    "q",
     "step",
     "quantile",
+    // The frame deadline's deferral lanes (`bytes`, `encode`:
+    // `tuile_budget_frame_deferred`, `tuile_budget_upload_deferred_total`).
+    "lane",
     // Histograms' bucket bound, where a recorder writes one as a label.
     "le",
 ];

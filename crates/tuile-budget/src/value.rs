@@ -18,7 +18,8 @@
 //!
 //! Nothing here reads a clock or a global: every input is a parameter.
 
-use crate::spec::{Facts, Specification, Term};
+use crate::priority::Quantised;
+use crate::spec::{Facts, Progressive, Specification, Term};
 use crate::state::Held;
 use crate::stats::LEVELS;
 use crate::priority::Urgency;
@@ -123,51 +124,194 @@ impl Valuation {
 
 
 impl Valuation {
+    /// `R`: the restore-cost credit of a resource of `class` at level
+    /// index `at` holding `held`, µs for a resource of the reference size.
+    pub fn credit(&self, class: Class, at: usize, held: Held) -> u32 {
+        self.credit[class][at][held.i()]
+    }
+
+    /// The size the credit is given for.
+    pub fn ref_bytes(&self) -> u64 {
+        self.ref_bytes
+    }
+
     /// Whether `level` is of the coarse band.
     pub fn coarse(&self, level: u32) -> bool {
         level <= self.coarse_through
     }
 
     /// The value of a held resource of `class` at level index `at`, last
-    /// needed at `last_needed`, holding `held` copies of `bytes`: recency
+    /// needed at `last_needed`, holding `held` copies of `bytes`, of
+    /// probability of use `probability` ([`CERTAIN`] units): recency
     /// weighed by the specification, plus the restore-cost credit scaled by
-    /// the reference size over its own (at most sixteen times). Law 6: a
-    /// dearer restore or a smaller resource is worth more per byte held.
+    /// the reference size over its own (at most sixteen times) and by the
+    /// probability — the progressive score `P × R / bytes`
+    /// (`docs/explorations/budget-progressive-coarse-preload.md` §2) over
+    /// GreedyDual-Size's `L`. Law 6: a dearer restore, a smaller resource
+    /// or a likelier use is worth more per byte held.
     pub fn held_value(
         &self,
         class: Class,
         at: usize,
         last_needed: Micros,
         held: Option<(Held, Bytes)>,
+        probability: u32,
     ) -> FlouzPerByte {
         let recency = u128::from(last_needed.0) * u128::from(self.recency[class][at]) / 1_000;
         let credit = held.map_or(0, |(h, bytes)| {
             let size = bytes.0.max(self.ref_bytes / 16).max(1);
-            u128::from(self.credit[class][at][h.i()]) * u128::from(self.ref_bytes)
-                / u128::from(size)
+            u128::from(self.credit[class][at][h.i()])
+                * u128::from(self.ref_bytes)
+                * u128::from(probability.min(CERTAIN))
+                / (u128::from(size) * u128::from(CERTAIN))
         });
         FlouzPerByte(u64::try_from(recency.saturating_add(credit)).unwrap_or(u64::MAX))
     }
 }
 
-/// What loading a missing resource of the value band gains (spec §1b), in
-/// flouz: `P × Δq × w × (H − T_fetch)⁺` — its probability of use (the
-/// present need's drape 1, the ring's and an ancestor's the
-/// specification's anticipation, a refresh a tenth), one level, the
-/// place's screen weight (‰ of the reference pixel), counted only from its
-/// arrival on over the specification's horizon: a slow fetch earns less, a
-/// local one is preferred at equal worth.
-pub fn load_gain(spec: &Specification, u: Urgency, centrality: i32, tier: Tier) -> Flouz {
+/// Certainty, the scale of a probability of use: a probability `p` is
+/// `p × CERTAIN`. A multiple of 1 000, so a probability in thousandths is
+/// exact on it; 2¹⁵ halvings of it reach one unit.
+pub const CERTAIN: u32 = 32_000;
+
+/// The progressive score's probability of use of a tile of `level`, the
+/// view needing `need_level` at its nearest point, `away` sixteenths of a
+/// tile of its own level from there, in a neighbourhood of radius `rho`
+/// tiles (`docs/explorations/budget-progressive-coarse-preload.md` §2):
+/// `A(ℓ, n) × D(d)`, in [`CERTAIN`] units, at least one unit.
+///
+/// - `A(ℓ, n)` is 1 at the need's level, `a0 × 2^−(n−1−ℓ)` above it,
+///   `a↓ × 2^−(ℓ−n−1)` below it;
+/// - `D(d)` is `ρ² / (ρ + d)²`: 1 at the footprint, ¼ at `d = ρ`.
+pub fn progressive(
+    p: &Progressive,
+    level: u32,
+    need_level: u32,
+    away: u32,
+    rho: u32,
+) -> u32 {
+    let (a, d) = progressive_terms(p, level, need_level, away, rho);
+    product(a, d)
+}
+
+/// `A × D` in [`CERTAIN`] units, at least one unit.
+pub fn product(a: u32, d: u32) -> u32 {
+    let c = u64::from(CERTAIN);
+    u32::try_from((u64::from(a) * u64::from(d) / c).max(1)).unwrap_or(CERTAIN)
+}
+
+/// [`progressive`]'s two terms, `A(ℓ, n)` and `D(d)`, each in [`CERTAIN`]
+/// units.
+pub fn progressive_terms(
+    p: &Progressive,
+    level: u32,
+    need_level: u32,
+    away: u32,
+    rho: u32,
+) -> (u32, u32) {
+    let c = u64::from(CERTAIN);
+    let a = match level.cmp(&need_level) {
+        std::cmp::Ordering::Equal => c,
+        std::cmp::Ordering::Less => {
+            (c * u64::from(p.a0_permille) / 1_000) >> (need_level - 1 - level).min(63)
+        }
+        std::cmp::Ordering::Greater => {
+            (c * u64::from(p.descend_permille) / 1_000) >> (level - need_level - 1).min(63)
+        }
+    };
+    // The graded coarse levels: at least the boost at `coarse_from`, halving
+    // per level finer.
+    let from = u32::from(p.coarse_from);
+    let a = if level >= from {
+        a.max((c * u64::from(p.coarse_boost_permille) / 1_000) >> (level - from).min(63))
+    } else {
+        a
+    };
+    let r = u64::from(rho) * 16;
+    let d = u64::from(away);
+    let near = if r == 0 {
+        if d == 0 {
+            c
+        } else {
+            0
+        }
+    } else {
+        c * r * r / ((r + d) * (r + d))
+    };
+    (
+        u32::try_from(a).unwrap_or(CERTAIN),
+        u32::try_from(near).unwrap_or(CERTAIN),
+    )
+}
+
+/// A want's `A` and `D` ([`probability`]'s terms), in [`CERTAIN`] units: a
+/// want the traversal did not place has `D` = 1 and its flat probability
+/// as `A`.
+pub fn probability_terms(
+    spec: &Specification,
+    rho: u32,
+    u: Urgency,
+    level: u32,
+    q: &Quantised,
+) -> (u32, u32) {
     let p = &spec.params;
-    let probability = u64::from(match u {
-        Urgency::Ring => p.anticipation.ring_permille,
-        Urgency::Ancestor => p.anticipation.ancestor_permille,
-        Urgency::Refresh => 100,
-        _ => 1_000,
-    });
+    let permille = |x: u16| u32::from(x) * (CERTAIN / 1_000);
+    match u {
+        Urgency::Ring | Urgency::Ancestor if q.placed() => progressive_terms(
+            &p.progressive,
+            level,
+            u32::from(q.need_level),
+            u32::from(q.away),
+            rho,
+        ),
+        Urgency::Ring => (permille(p.anticipation.ring_permille), CERTAIN),
+        Urgency::Ancestor => (permille(p.anticipation.ancestor_permille), CERTAIN),
+        Urgency::Refresh => (permille(100), CERTAIN),
+        _ => (CERTAIN, CERTAIN),
+    }
+}
+
+/// A want's probability of use, in [`CERTAIN`] units: the present need's
+/// is certain; a preload the traversal placed against the need takes the
+/// progressive score ([`progressive`]), one it did not the specification's
+/// flat anticipation; a refresh a tenth.
+pub fn probability(spec: &Specification, rho: u32, u: Urgency, level: u32, q: &Quantised) -> u32 {
+    let (a, d) = probability_terms(spec, rho, u, level, q);
+    if d == CERTAIN {
+        a
+    } else {
+        product(a, d)
+    }
+}
+
+/// What loading a missing resource of the value band gains (spec §1b), in
+/// flouz: `P × Δq × w × (H ∓ T_fetch)` — its probability of use
+/// `probability` ([`probability`], [`CERTAIN`] units), one level, the
+/// place's screen weight (‰ of the reference pixel), over the
+/// specification's horizon. For the present need, counted only from its
+/// arrival on, `(H − T)⁺`: a slow fetch earns less, a local one is
+/// preferred at equal worth. For a preload, `H + T`: the lead time a tier
+/// needs — what the measured network makes slow to come back is started
+/// sooner (`docs/explorations/budget-progressive-coarse-preload.md` §2).
+pub fn load_gain(
+    spec: &Specification,
+    probability: u32,
+    centrality: i32,
+    tier: Tier,
+    preload: bool,
+) -> Flouz {
+    let p = &spec.params;
     let screen = 500 + u64::try_from(centrality.clamp(0, 1_000)).unwrap_or(0) / 2;
-    let after = p.horizon.0.saturating_sub(p.restore.of(tier).0);
-    Flouz(probability.saturating_mul(screen).saturating_mul(after) / 1_000_000)
+    let t = p.restore.of(tier).0;
+    let after = if preload {
+        p.horizon.0.saturating_add(t)
+    } else {
+        p.horizon.0.saturating_sub(t)
+    };
+    Flouz(
+        u64::from(probability).saturating_mul(screen).saturating_mul(after)
+            / (u64::from(CERTAIN) * 1_000),
+    )
 }
 
 /// What [`deficit_due`] reads of a drawn tile.
@@ -181,7 +325,7 @@ pub struct DeficitInput {
     pub gap: u32,
     /// Whether the drape worn is finer than the level needed: a gap that
     /// costs colour consistency, not detail, weighed
-    /// [`FINER_GAP_PERMILLE`] of an under-need gap of the same size.
+    /// the specification's `finer_gap_permille` of an under-need gap.
     pub finer: bool,
     /// When the tile's need last changed.
     pub since: Micros,
@@ -189,19 +333,11 @@ pub struct DeficitInput {
     pub facts: Facts,
 }
 
-/// What a gap of levels over the need weighs against a gap under it, ‰.
-///
-/// A drape worn finer than its need — kept from a zoom-out because it was
-/// resident — shows more detail than the need, but another acquisition of
-/// the imagery than its neighbours, which wear their own level: a patch of
-/// another colour. Colour consistency comes before extra detail, so the gap
-/// is a want; it weighs less than a gap of detail missing, so an under-need
-/// tile falls due first.
-pub const FINER_GAP_PERMILLE: u64 = 500;
-
 /// When tile `d.tile`'s own drape becomes worth loading while it wears one
-/// `d.gap` levels under its need, or over it (`d.finer`, weighed
-/// [`FINER_GAP_PERMILLE`]) (spec §5.3, law 7): once `w × gap × dwell ≥
+/// `d.gap` levels under its need, or over it (`d.finer`, weighed the
+/// specification's `finer_gap_permille`: a drape worn finer than its need
+/// shows another acquisition than its neighbours — colour consistency
+/// before extra detail — but weighs less than missing detail) (spec §5.3, law 7): once `w × gap × dwell ≥
 /// cost × (1 + margin)`, the dwell counted from the last change of the
 /// tile's need (a moving camera is not expected to keep the level), `w` the
 /// place's screen weight times the specification's deficit weight, `cost`
@@ -216,7 +352,7 @@ pub fn deficit_due(spec: &Specification, d: &DeficitInput) -> Option<Micros> {
     let screen = 500 + u64::try_from(d.centrality.clamp(0, 1_000)).unwrap_or(0) / 2;
     let mut per_us = weight * screen * u64::from(d.gap.max(1)) / 1_000;
     if d.finer {
-        per_us = per_us * FINER_GAP_PERMILLE / 1_000;
+        per_us = per_us * u64::from(spec.params.finer_gap_permille) / 1_000;
     }
     if per_us == 0 {
         return None;
@@ -262,8 +398,10 @@ mod tests {
         let v = Valuation::of(&Specification::interactive(), None);
         let at = crate::stats::level_index(9);
         let bytes = Bytes(256 << 10);
-        let network = v.held_value(Class::Drape, at, Micros(1_000), Some((Held::Gpu, bytes)));
-        let decoded = v.held_value(Class::Drape, at, Micros(1_000), Some((Held::Both, bytes)));
+        let network =
+            v.held_value(Class::Drape, at, Micros(1_000), Some((Held::Gpu, bytes)), CERTAIN);
+        let decoded =
+            v.held_value(Class::Drape, at, Micros(1_000), Some((Held::Both, bytes)), CERTAIN);
         assert!(network > decoded, "{network:?} {decoded:?}");
         assert!(Flouz::loss(1, 1, Micros(150_000)) > Flouz::loss(1, 1, Micros(2_000)));
     }
@@ -273,7 +411,8 @@ mod tests {
     #[test]
     fn a_load_gains_by_probability_place_and_arrival() {
         let s = Specification::interactive();
-        let g = |u, c, t| load_gain(&s, u, c, t);
+        let q = Quantised::default();
+        let g = |u, c, t| load_gain(&s, probability(&s, 4, u, 9, &q), c, t, false);
         assert!(g(Urgency::Drape, 0, Tier::Remote) > g(Urgency::Ring, 0, Tier::Remote));
         assert!(g(Urgency::Ring, 0, Tier::Remote) > g(Urgency::Ancestor, 0, Tier::Remote));
         assert!(g(Urgency::Drape, 1_000, Tier::Remote) > g(Urgency::Drape, 0, Tier::Remote));

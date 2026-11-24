@@ -273,6 +273,58 @@ pub struct Anticipation {
     pub ancestor_permille: u16,
 }
 
+/// The level terms of the progressive score
+/// (`docs/explorations/budget-progressive-coarse-preload.md`), thousandths:
+/// `A(ℓ, n)` is 1 at the level the view needs, `a0 × 2^−(n−1−ℓ)` above it
+/// and `a↓ × 2^−(ℓ−n−1)` below it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Progressive {
+    /// `a0`: the level just above the need's.
+    pub a0_permille: u16,
+    /// `a↓`: the level just below it (a zoom-in anticipated).
+    pub descend_permille: u16,
+    /// The graded coarse levels: from `coarse_from` (the first level over
+    /// the pinned floor) a level weighs at least `coarse_boost`, halving per
+    /// level finer — under pressure the fine go first, then the
+    /// intermediate levels, then `coarse_from + 1`, `coarse_from` last.
+    pub coarse_from: u16,
+    /// `A` at `coarse_from`, ‰.
+    pub coarse_boost_permille: u16,
+}
+
+/// The defaults: the level above the need's at four fifths of it, halving
+/// per level up; the level below at a fifth.
+pub const PROGRESSIVE: Progressive = Progressive {
+    a0_permille: 800,
+    descend_permille: 200,
+    coarse_from: 3,
+    coarse_boost_permille: 950,
+};
+
+/// The room kept free under each target by default, ‰: none until a value
+/// is chosen — 12.5 % was measured to cost the soak's revisits (the
+/// cache it keeps out), `tuile://budget?headroom=125` tries it.
+pub const HEADROOM: u16 = 0;
+/// The probability under which a copy no longer wanted goes, ‰.
+pub const FLOOR_VALUE: u16 = 10;
+/// The copies the floor value's release looks at a step.
+pub const RELEASE_VISITS: u16 = 16;
+/// How many camera poses the proactive sweep keeps what the view needed
+/// (`Params::sweep_keep_poses`; Laurent, 2026-11-24: the decider's timers
+/// count camera poses, not seconds). A pose is a step: one camera handed
+/// to the decider. 300 is the five seconds this horizon was in time at
+/// the rate the viewers decide: a viewer sends its camera every frame and
+/// the geometry server steps on each (the arrivals between two frames add
+/// steps of their own), 60 a second on a 60 Hz display — the simulation's
+/// step too. Five seconds was measured (P4.1 (b)): ten kept so much of a
+/// settled headset's recent past between the watermarks that its ring
+/// could not load, and a 20° flick found ground covered eight levels up;
+/// at two and five it is covered within three, and the five-minute soak's
+/// waits are the same at 0, 2 and 5 seconds (0, 120 and 300 poses).
+pub const SWEEP_KEEP_POSES: u32 = 300;
+/// An over-need gap weighs half an under-need one.
+pub const FINER_GAP: u16 = 500;
+
 /// The defaults: the ring before the ancestors, as the tiers were.
 const ANTICIPATION: Anticipation = Anticipation {
     ring_permille: 500,
@@ -300,8 +352,39 @@ pub struct Params {
     pub speculation: Speculation,
     /// How long a re-specification blends (law 12).
     pub blend: Micros,
-    /// Anticipation's probabilities in the value band.
+    /// Anticipation's probabilities in the value band, for a preload the
+    /// traversal gives no place against the need.
     pub anticipation: Anticipation,
+    /// The progressive score's level terms.
+    pub progressive: Progressive,
+    /// The room kept free under each target, ‰: the release of the lowest
+    /// scores runs every step down to `target × (1 − headroom)`, in both
+    /// tiers (GPU and decoded), not only when a load needs room.
+    pub headroom_permille: u16,
+    /// The probability of use, ‰, under which an undrawn copy no longer
+    /// wanted is released even with room left: the pools hold what is
+    /// useful, not what is old.
+    pub floor_value_permille: u16,
+    /// The copies the floor value's release looks at a step, and the kept
+    /// copies the sweep passes over before it leaves the rest to the next
+    /// step (`sweep`): the bound of a frame's proactive releases.
+    pub release_visits: u16,
+    /// The horizon of the proactive sweep, camera poses (Laurent,
+    /// 2026-11-24): under the target, the sweep down to the low watermark
+    /// releases only a copy the need does not want this step and has not
+    /// wanted in the last this many poses — never what the view wants now
+    /// or wanted within the horizon, which it is the likeliest to want
+    /// again within it. A pose is a step of the decider, whatever its
+    /// time: the law reads no clock. Room for a delivery is made by
+    /// admission, under its own law; a memory signal, the way back within
+    /// the target and I2 are not bound by it.
+    pub sweep_keep_poses: u32,
+    /// The neighbourhood's radius `ρ`, tiles, when not 0: overrides the
+    /// profile's (`BudgetConfig::reach_tiles`).
+    pub rho_tiles: u16,
+    /// What a drape worn finer than its need weighs against one worn as
+    /// much coarser, ‰ (#277's over-need deficit).
+    pub finer_gap_permille: u16,
 }
 
 /// The policy of the decider: rules and numbers. See the [module
@@ -381,11 +464,18 @@ impl Specification {
                 restore: RESTORE,
                 ref_bytes: Bytes(256 << 10),
                 speculation: Speculation {
-                    slots_permille: 250,
+                    slots_permille: 750,
                     memory_permille: 200,
                 },
                 blend: Micros::from_secs(2),
                 anticipation: ANTICIPATION,
+                progressive: PROGRESSIVE,
+                headroom_permille: HEADROOM,
+                floor_value_permille: FLOOR_VALUE,
+                release_visits: RELEASE_VISITS,
+                sweep_keep_poses: SWEEP_KEEP_POSES,
+                rho_tiles: 0,
+                finer_gap_permille: FINER_GAP,
             },
         }
     }
@@ -398,7 +488,7 @@ impl Specification {
         s.set_weight(Term::NextUse, 2_000);
         s.params.horizon = Micros::from_secs(8);
         s.params.speculation = Speculation {
-            slots_permille: 500,
+            slots_permille: 750,
             memory_permille: 300,
         };
         s
@@ -435,6 +525,13 @@ impl Specification {
                 },
                 blend: Micros::ZERO,
                 anticipation: ANTICIPATION,
+                progressive: PROGRESSIVE,
+                headroom_permille: HEADROOM,
+                floor_value_permille: FLOOR_VALUE,
+                release_visits: RELEASE_VISITS,
+                sweep_keep_poses: SWEEP_KEEP_POSES,
+                rho_tiles: 0,
+                finer_gap_permille: FINER_GAP,
             },
         }
     }
@@ -483,7 +580,7 @@ impl Specification {
                 restore: RESTORE,
                 ref_bytes: Bytes(256 << 10),
                 speculation: Speculation {
-                    slots_permille: 450,
+                    slots_permille: 750,
                     memory_permille: 350,
                 },
                 blend: Micros::from_secs(1),
@@ -491,6 +588,13 @@ impl Specification {
                     ring_permille: 700,
                     ancestor_permille: 250,
                 },
+                progressive: PROGRESSIVE,
+                headroom_permille: HEADROOM,
+                floor_value_permille: FLOOR_VALUE,
+                release_visits: RELEASE_VISITS,
+                sweep_keep_poses: SWEEP_KEEP_POSES,
+                rho_tiles: 0,
+                finer_gap_permille: FINER_GAP,
             },
         }
     }
@@ -591,6 +695,16 @@ impl Specification {
             ("restore_remote_ms", p.restore.remote.0 / 1_000, 60_000),
             ("p_ring", u64::from(p.anticipation.ring_permille), 1_000),
             ("p_ancestor", u64::from(p.anticipation.ancestor_permille), 1_000),
+            ("a0", u64::from(p.progressive.a0_permille), 1_000),
+            ("a_desc", u64::from(p.progressive.descend_permille), 1_000),
+            ("coarse_from", u64::from(p.progressive.coarse_from), 30),
+            ("coarse_boost", u64::from(p.progressive.coarse_boost_permille), 1_000),
+            ("headroom", u64::from(p.headroom_permille), 500),
+            ("floor_value", u64::from(p.floor_value_permille), 1_000),
+            ("release_visits", u64::from(p.release_visits), 4_096),
+            ("sweep_keep_poses", u64::from(p.sweep_keep_poses), 36_000),
+            ("rho", u64::from(p.rho_tiles), 16),
+            ("finer_gap", u64::from(p.finer_gap_permille), 1_000),
         ];
         if let Some((name, ..)) = bounded.iter().find(|(_, v, max)| v > max) {
             return Err(SpecError::OutOfBounds(name));
@@ -625,7 +739,9 @@ impl Specification {
             "spec={}&margin={}&min_dwell_ms={}&horizon_ms={}&blend_ms={}\
              &speculation_slots={}&speculation_memory={}&coarse_through={}\
              &restore_decoded_ms={}&restore_stored_ms={}&restore_http_cache_ms={}\
-             &restore_remote_ms={}&p_ring={}&p_ancestor={}",
+             &restore_remote_ms={}&p_ring={}&p_ancestor={}&a0={}&a_desc={}&headroom={}&floor_value={}\
+             &release_visits={}&rho={}&finer_gap={}&coarse_from={}&coarse_boost={}\
+             &sweep_keep_poses={}",
             self.kind.label(),
             p.margin_permille,
             ms(p.min_dwell),
@@ -640,6 +756,16 @@ impl Specification {
             ms(p.restore.remote),
             p.anticipation.ring_permille,
             p.anticipation.ancestor_permille,
+            p.progressive.a0_permille,
+            p.progressive.descend_permille,
+            p.headroom_permille,
+            p.floor_value_permille,
+            p.release_visits,
+            p.rho_tiles,
+            p.finer_gap_permille,
+            p.progressive.coarse_from,
+            p.progressive.coarse_boost_permille,
+            p.sweep_keep_poses,
         );
         // A term's weight when all its rules share one; a term weighed
         // differently by predicate (FPV's recency) keeps its kind's rules.
@@ -693,6 +819,16 @@ impl Specification {
                 "restore_remote_ms" => p.restore.remote = millis,
                 "p_ring" => p.anticipation.ring_permille = n16,
                 "p_ancestor" => p.anticipation.ancestor_permille = n16,
+                "a0" => p.progressive.a0_permille = n16,
+                "a_desc" => p.progressive.descend_permille = n16,
+                "headroom" => p.headroom_permille = n16,
+                "floor_value" => p.floor_value_permille = n16,
+                "release_visits" => p.release_visits = n16,
+                "sweep_keep_poses" => p.sweep_keep_poses = n32,
+                "rho" => p.rho_tiles = n16,
+                "finer_gap" => p.finer_gap_permille = n16,
+                "coarse_from" => p.progressive.coarse_from = n16,
+                "coarse_boost" => p.progressive.coarse_boost_permille = n16,
                 _ => match k
                     .strip_prefix("w_")
                     .and_then(|t| Term::ALL.into_iter().find(|x| term_key(*x) == t))

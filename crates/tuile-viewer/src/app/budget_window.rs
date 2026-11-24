@@ -413,7 +413,7 @@ pub(super) fn rows(
     };
     let work = since(s.decide_work_total, |f| f.decide_work_total);
     out.push(line(format!(
-        "spec {}{} · SSE scale {:.2} · pressure {} · thermal {} · decide mean {:.2} ms, max {:.2} ms · work {} this step, {:.0} mean · {} steps",
+        "spec {}{} · SSE scale {:.2} · pressure {} · thermal {} · decide mean {:.2} ms over {}, peak {:.2} ms over the last publish (0.5 s) · work {} this step, {:.0} mean · {} steps",
         s.spec.label(),
         if s.spec_overridden { " (override)" } else { " (context)" },
         f64::from(s.sse_scale_milli) / 1000.0,
@@ -422,6 +422,11 @@ pub(super) fn rows(
             .unwrap_or(&"?"),
         s.thermal_level,
         sum as f64 / count.max(1) as f64 / 1000.0,
+        if from.is_some() {
+            "the window"
+        } else {
+            "the session"
+        },
         s.decide_peak_micros as f64 / 1000.0,
         s.decide_work,
         work as f64 / count.max(1) as f64,
@@ -621,10 +626,232 @@ pub(super) fn rows(
         }
         out.push(row);
     }
+    score_rows(s, from, cumulative, &mut out);
     // An empty row is a blank line.
     out.into_iter()
         .map(|r| if r.is_empty() { vec![String::new()] } else { r })
         .collect()
+}
+
+/// A resource as the held-tiles table names it: its tile `level/x/y` (a
+/// terrain tile's address; another's id), and its kind.
+fn resource_name(r: tuile_core::budget::ResourceId) -> String {
+    use tuile_core::budget::ResourceId;
+    let tile = |t: tuile_core::budget::TileId| {
+        let (l, x, y) = t.payload().terrain_coord();
+        format!("{l}/{x}/{y}")
+    };
+    match r {
+        ResourceId::Mesh(t) => format!("{} mesh", tile(t)),
+        ResourceId::Drape {
+            tile: t,
+            layer,
+            level,
+        } => {
+            format!("{} drape L{} z{level}", tile(t), layer.0)
+        }
+    }
+}
+
+/// A probability in `CERTAIN` units, as a fraction.
+fn frac(v: u64) -> String {
+    format!("{:.3}", v as f64 / f64::from(tuile_core::budget::CERTAIN))
+}
+
+/// The progressive score's rows
+/// (`docs/explorations/budget-progressive-coarse-preload.md` §7), the
+/// numbers the `tuile_budget_score_*`, `preload_by_level_distance`,
+/// `evictions_by_level_distance` and `param` series carry, in the same
+/// units: the formula and its parameters; preloads and evictions by level
+/// and distance band; the score's terms per level and side; the GPU-held
+/// copies the release order takes next, and those it keeps longest.
+fn score_rows(
+    s: &BudgetSignals,
+    from: Option<(&BudgetSignals, f64)>,
+    cumulative: bool,
+    out: &mut Vec<Vec<String>>,
+) {
+    use tuile_core::budget::score::{Cell, Side, DISTANCE_BANDS, DISTANCE_BAND_LABELS};
+    let p = &s.score_params;
+    out.push(Vec::new());
+    out.push(vec![format!(
+        "{} · n = {}",
+        p.formula(),
+        p.need_level.map_or("?".to_owned(), |n| n.to_string())
+    )]);
+    out.push(vec![p.restore_line()]);
+    // Preloads and evictions by level × distance band.
+    let mut head = vec!["level × d".to_owned()];
+    for b in DISTANCE_BAND_LABELS {
+        head.push(format!(
+            "d{b} {}",
+            if cumulative { "pre/ev" } else { "fly/ev" }
+        ));
+    }
+    out.push(Vec::new());
+    out.push(head);
+    let cell = |sig: &BudgetSignals, l: usize, b: usize, side: Side| -> u64 {
+        u64::from(sig.score_total.cell(l, b, side).count)
+    };
+    for l in 0..LEVELS {
+        let mut row = vec![l.to_string()];
+        let mut any = false;
+        for b in 0..DISTANCE_BANDS {
+            let (pre, ev) = if cumulative {
+                let base = |side| from.map_or(0, |(f, _)| cell(f, l, b, side));
+                (
+                    cell(s, l, b, Side::Preload).saturating_sub(base(Side::Preload)),
+                    cell(s, l, b, Side::Evict).saturating_sub(base(Side::Evict)),
+                )
+            } else {
+                (
+                    u64::from(s.preload_by_level_distance[l][b]),
+                    u64::from(s.evictions_by_level_distance[l][b]),
+                )
+            };
+            any |= pre != 0 || ev != 0;
+            row.push(pair(pre, ev));
+        }
+        if any {
+            out.push(row);
+        }
+    }
+    // Releases, GPU and decoded, by reason and level: this step's, or
+    // since the start in the cumulative view.
+    {
+        use tuile_core::budget::score::RELEASE_REASONS;
+        let r = &s.released_by_level_distance;
+        let totals: Vec<String> = RELEASE_REASONS
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let n = if cumulative {
+                    s.released_total[i].saturating_sub(from.map_or(0, |(f, _)| f.released_total[i]))
+                } else {
+                    r[i].iter().flatten().map(|v| u64::from(*v)).sum()
+                };
+                format!("{name} {n}")
+            })
+            .collect();
+        out.push(Vec::new());
+        out.push(vec![format!(
+            "released {}: {} · kept under target − {:.1} %",
+            if cumulative {
+                "since the start"
+            } else {
+                "this step"
+            },
+            totals.join(", "),
+            f64::from(p.headroom_permille) / 10.0
+        )]);
+        if !cumulative {
+            out.push(
+                ["level", "headroom", "below floor value", "make room"]
+                    .map(str::to_owned)
+                    .to_vec(),
+            );
+            for l in 0..LEVELS {
+                let row: Vec<u64> = r
+                    .iter()
+                    .map(|reason| reason[l].iter().map(|v| u64::from(*v)).sum())
+                    .collect();
+                if row.iter().any(|v| *v > 0) {
+                    let mut cells = vec![format!("{l} rel")];
+                    cells.extend(row.into_iter().map(n));
+                    out.push(cells);
+                }
+            }
+        }
+    }
+    // The terms per level and side: count, then the score's mean and range,
+    // and the means of A, D, R and the bytes.
+    out.push(Vec::new());
+    out.push(
+        [
+            "level",
+            "side",
+            "count",
+            "score mean",
+            "score min",
+            "score max",
+            "A",
+            "D",
+            "R µs",
+            "MiB",
+        ]
+        .map(str::to_owned)
+        .to_vec(),
+    );
+    let mean = |a: u64, n: u32| if n == 0 { 0 } else { a / u64::from(n) };
+    for l in 0..LEVELS {
+        for side in Side::ALL {
+            let mut c = Cell::default();
+            match side {
+                Side::Held => {
+                    if let Some(h) = &s.score_held {
+                        for b in 0..DISTANCE_BANDS {
+                            c.add(h.board.cell(l, b, side));
+                        }
+                    }
+                }
+                _ => {
+                    let board = if cumulative {
+                        &s.score_total
+                    } else {
+                        &s.score_recent
+                    };
+                    for b in 0..DISTANCE_BANDS {
+                        c.add(board.cell(l, b, side));
+                    }
+                }
+            }
+            if c.count == 0 {
+                continue;
+            }
+            out.push(vec![
+                l.to_string(),
+                side.label().to_owned(),
+                c.count.to_string(),
+                mean(c.score.sum, c.count).to_string(),
+                c.score.min.to_string(),
+                c.score.max.to_string(),
+                frac(mean(c.a.sum, c.count)),
+                frac(mean(c.d.sum, c.count)),
+                mean(c.r_us.sum, c.count).to_string(),
+                mib(mean(c.bytes.sum, c.count)),
+            ]);
+        }
+    }
+    // The held copies: the next to go, and the last.
+    if let Some(h) = &s.score_held {
+        for (title, list) in [
+            ("held: next released (lowest score)", &h.lowest),
+            ("held: kept longest (highest score)", &h.highest),
+        ] {
+            out.push(Vec::new());
+            out.push(vec![format!("{title}, step {}", h.step)]);
+            out.push(
+                [
+                    "tile", "level", "d", "A", "D", "R µs", "MiB", "score", "state",
+                ]
+                .map(str::to_owned)
+                .to_vec(),
+            );
+            for t in list.iter().take(12) {
+                out.push(vec![
+                    resource_name(t.resource),
+                    t.level.to_string(),
+                    DISTANCE_BAND_LABELS[usize::from(t.band).min(DISTANCE_BANDS - 1)].to_owned(),
+                    frac(u64::from(t.terms.a)),
+                    frac(u64::from(t.terms.d)),
+                    t.terms.r_us.to_string(),
+                    mib(t.terms.bytes),
+                    t.terms.score.to_string(),
+                    t.state.label().to_owned(),
+                ]);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -832,5 +1059,79 @@ mod tests {
         let (w2, h2) = w.natural_size(Some(&s), 2.0, &[]);
         assert!(width > 300 && height > 100, "{width}x{height}");
         assert!(w2 > width * 3 / 2 && h2 > height * 3 / 2, "denser, larger");
+    }
+
+    /// The score's rows are the signals' numbers, in the series' units:
+    /// the formula with its parameters, the level × band counts, the terms
+    /// per level and side, the held copies by score.
+    #[test]
+    fn the_score_rows_are_the_series_numbers() {
+        use tuile_core::budget::score::{
+            board_of, HeldReport, HeldState, HeldTile, Reason, ScoreEvent, Side, Terms,
+        };
+        use tuile_core::budget::{ResourceId, TileId, CERTAIN};
+        let mut s = signals();
+        s.score_params.a0_permille = 800;
+        s.score_params.rho = 4;
+        s.score_params.margin_permille = 250;
+        s.score_params.floor_level = Some(3);
+        s.score_params.need_level = Some(13);
+        let e = ScoreEvent {
+            resource: ResourceId::Mesh(TileId::from_terrain(12, 10, 20)),
+            class: Class::TerrainMesh,
+            level: 12,
+            band: 1,
+            side: Side::Evict,
+            reason: Reason::Sweep,
+            terms: Terms::new(
+                CERTAIN * 8 / 10,
+                CERTAIN / 2,
+                CERTAIN * 4 / 10,
+                150_000,
+                256 << 10,
+                256 << 10,
+            ),
+        };
+        board_of(&[e, e], &mut s.score_total);
+        board_of(&[e], &mut s.score_recent);
+        s.evictions_by_level_distance[12][1] = 1;
+        s.preload_by_level_distance[12][0] = 3;
+        let mut held = HeldReport::default();
+        held.lowest.push(HeldTile {
+            resource: e.resource,
+            class: e.class,
+            level: 12,
+            band: 1,
+            terms: e.terms,
+            state: HeldState::Wanted,
+        });
+        s.score_held = Some(held);
+        let instant = rows(&s, None, false, &[]);
+        assert!(
+            instant.iter().any(|r| r[0].contains("a0=0.80")
+                && r[0].contains("ρ=4")
+                && r[0].contains("n = 13")),
+            "{instant:?}"
+        );
+        let by_band = instant
+            .iter()
+            .find(|r| r.len() == 6 && r[0] == "12")
+            .unwrap();
+        assert_eq!(&by_band[1..3], ["3/0", "0/1"]);
+        let terms = instant
+            .iter()
+            .find(|r| r.len() == 10 && r[0] == "12" && r[1] == "evict")
+            .unwrap();
+        assert_eq!(terms[2], "1");
+        assert_eq!(terms[3], e.terms.score.to_string());
+        assert_eq!(terms[6], "0.800");
+        let tile = instant.iter().find(|r| r[0] == "12/10/20 mesh").unwrap();
+        assert_eq!(tile[7], e.terms.score.to_string());
+        let cumulative = rows(&s, None, true, &[]);
+        let terms = cumulative
+            .iter()
+            .find(|r| r.len() == 10 && r[0] == "12" && r[1] == "evict")
+            .unwrap();
+        assert_eq!(terms[2], "2");
     }
 }

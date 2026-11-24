@@ -287,34 +287,55 @@ fn grown_then_shrunk() -> (usize, usize, i64) {
     (peak, tracked, -t.live)
 }
 
-/// A ratchet's recorded value (`alloc_ratchets.txt`).
-fn ratchet(name: &str) -> i64 {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/budget_sim/alloc_ratchets.txt");
-    let text = std::fs::read_to_string(path).expect("ratchets recorded");
-    text.lines()
-        .find_map(|l| l.strip_prefix(name).and_then(|v| v.trim().parse().ok()))
-        .unwrap_or_else(|| panic!("no ratchet {name}"))
+/// The flight that grows the tracked set, then shrinks it: the tracked
+/// peak, the tracked at the end, and the heap the arena alone — the
+/// per-resource columns, their index and free list — frees when dropped.
+fn arena_after_shrinking() -> (usize, usize, i64) {
+    let mut sim = Sim::new(Profile::desktop(), 7);
+    let peak = super::scenarios::fly_grow_then_shrink(&mut sim, |_, _, _| {});
+    let tracked = sim.budget.tracked();
+    let arena = sim.budget.real.take_arena_to_measure();
+    let ((), t) = super::alloc::counted(|| drop(arena));
+    (peak, tracked, -t.live)
+}
+
+/// The arena's heap per tracked resource on a steady view: the ratchets'
+/// tour (`motion`), a minute, its arena alone dropped under the counter.
+fn arena_on_a_steady_view() -> (usize, i64) {
+    let mut sim = Sim::new(Profile::desktop(), 11);
+    let end = Micros::from_secs(60);
+    while sim.now < end {
+        let t = sim.now.0 as f64 / 1e6;
+        sim.step(super::soak::tour(t));
+    }
+    let tracked = sim.budget.tracked();
+    let arena = sim.budget.real.take_arena_to_measure();
+    let ((), t) = super::alloc::counted(|| drop(arena));
+    (tracked, -t.live / tracked.max(1) as i64)
 }
 
 /// The arena gives its room back: after the tracked set grew five times
-/// over and fell back, the budget holds at most twice what the ratchet
-/// allows a steady view per tracked resource (`bytes-per-tracked-resource`):
-/// the arena keeps twice its tracked resources' room once it shrank
-/// (`state::SHRINK_TO`), and a kept map's blocks stay at least near half
-/// full. Before the arena shrank, 1 664 B.
+/// over and fell back, the ARENA — the per-resource columns, their index
+/// and free list — holds at most twice per tracked resource what it holds
+/// on a steady view (the ratchets' tour): it keeps twice its tracked
+/// resources' room once it shrank (`state::SHRINK_TO`). The arena alone,
+/// on both sides: the budget's other maps hold what the flight left (the
+/// eviction memory, the drape levels' blocks), and a smaller tracked set
+/// divides them by less — measured whole by
+/// `bytes-per-tracked-resource-after-shrinking`. An arena that keeps its
+/// peak room (columns not cut) holds 817 B per tracked resource here.
 #[test]
 #[cfg_attr(
     debug_assertions,
     ignore = "release only: cargo test --release -p tuile-budget --test budget_sim"
 )]
-fn a_tracked_set_that_shrinks_gives_its_room_back() {
-    let (peak, tracked, held) = grown_then_shrunk();
+fn the_arena_of_a_tracked_set_that_shrinks_gives_its_room_back() {
+    let (peak, tracked, held) = arena_after_shrinking();
     let per = held / tracked.max(1) as i64;
-    let steady = ratchet("bytes-per-tracked-resource");
+    let (steady_tracked, steady) = arena_on_a_steady_view();
     eprintln!(
-        "grown to {peak}, shrunk to {tracked} tracked: {held} B held, {per} B per tracked resource \
-         ({steady} for a steady view)"
+        "grown to {peak}, shrunk to {tracked} tracked: the arena holds {held} B, {per} B per \
+         tracked resource ({steady} on a steady view of {steady_tracked})"
     );
     assert!(
         peak >= 3 * tracked,
@@ -322,6 +343,7 @@ fn a_tracked_set_that_shrinks_gives_its_room_back() {
     );
     assert!(
         per <= 2 * steady,
-        "{per} B per tracked resource after the set shrank from {peak} to {tracked}: the room is kept"
+        "the arena holds {per} B per tracked resource after the set shrank from {peak} to \
+         {tracked}, against {steady} on a steady view: its room is kept"
     );
 }

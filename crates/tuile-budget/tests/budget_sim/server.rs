@@ -392,6 +392,21 @@ pub struct Sim {
     pub floor_at: Option<Micros>,
     /// When each wanted mesh was first wanted, until it is drawable.
     wanted_at: BTreeMap<ResourceId, Micros>,
+    /// When each mesh was last evicted: a wait for it within 30 s is a
+    /// reload, told apart from the outside — the same on any budget.
+    evicted_at: BTreeMap<ResourceId, Micros>,
+    /// The kind of each of [`Sim::waits`] by the time since the mesh's
+    /// eviction when its wait began (`tuile_budget::waits::kind`'s).
+    pub wait_kinds: Vec<u8>,
+    /// The reason of the eviction a reload of [`Sim::waits`] follows (its
+    /// decision record's label), `""` for a first load.
+    pub wait_reasons: Vec<&'static str>,
+    wait_kind_open: BTreeMap<ResourceId, (u8, &'static str)>,
+    /// Why each mesh was last evicted, as its decision record says.
+    evicted_why: BTreeMap<ResourceId, &'static str>,
+    /// When each tile was last listed by the need, any membership: the
+    /// sweep's horizon is read against it (I19).
+    listed_at: BTreeMap<TileId, u64>,
     /// Wanted-to-drawable times of meshes, ms, with their time: the
     /// latency the budget's scheduling adds to the network's (I6).
     pub waits: Vec<(Micros, f64)>,
@@ -485,6 +500,12 @@ impl Sim {
             floor_in: false,
             floor_at: None,
             wanted_at: BTreeMap::new(),
+            evicted_at: BTreeMap::new(),
+            wait_kinds: Vec::new(),
+            wait_reasons: Vec::new(),
+            wait_kind_open: BTreeMap::new(),
+            evicted_why: BTreeMap::new(),
+            listed_at: BTreeMap::new(),
             waits: Vec::new(),
             decide_us: Vec::new(),
             decide_cpu_us: Vec::new(),
@@ -639,6 +660,7 @@ impl Sim {
             acks = self.execute(old, self.frame - self.profile.lag as u64);
         }
         self.check(&need, &d, &views);
+        self.check_sweep(&need, &d);
         for (r, g) in &d.cancel {
             self.net.cancel(*r, *g);
         }
@@ -656,15 +678,47 @@ impl Sim {
         for (t, _) in need.drawn.iter().chain(&need.blockers) {
             let r = ResourceId::Mesh(*t);
             seen.insert(r);
-            if !self.gpu.drawable.contains_key(&r) {
-                self.wanted_at.entry(r).or_insert(self.now);
+            if !self.gpu.drawable.contains_key(&r) && !self.wanted_at.contains_key(&r) {
+                self.wanted_at.insert(r, self.now);
+                let since = self.evicted_at.get(&r).map(|t| self.now.since(*t));
+                // 0 a first load, 1 a reload evicted < 5 s before, 2 < 30 s.
+                let kind = match since {
+                    Some(t) if t < Micros::from_secs(5) => 1,
+                    Some(t) if t < Micros::from_secs(30) => 2,
+                    _ => 0,
+                };
+                let why = if kind > 0 {
+                    self.evicted_why.get(&r).copied().unwrap_or("?")
+                } else {
+                    ""
+                };
+                self.wait_kind_open.insert(r, (kind, why));
             }
         }
         self.wanted_at.retain(|r, _| seen.contains(r));
+        self.wait_kind_open.retain(|r, _| seen.contains(r));
+        for r in &d.evict {
+            self.evicted_at.insert(*r, self.now);
+        }
+        for e in &d.scores {
+            if e.side == tuile_budget::score::Side::Evict {
+                self.evicted_why.insert(e.resource, e.reason.label());
+            }
+        }
+        if self.frame.is_multiple_of(600) {
+            let now = self.now;
+            self.evicted_at
+                .retain(|_, t| now.since(*t) < Micros::from_secs(30));
+            let at = &self.evicted_at;
+            self.evicted_why.retain(|r, _| at.contains_key(r));
+        }
         for (r, g, b) in acks {
             if let Some(at) = self.wanted_at.remove(&r) {
                 self.waits
                     .push((self.now, self.now.since(at).0 as f64 / 1_000.0));
+                let (kind, why) = self.wait_kind_open.remove(&r).unwrap_or((0, ""));
+                self.wait_kinds.push(kind);
+                self.wait_reasons.push(why);
             }
             self.fed += 1;
             self.budget.on_drawable(r, g, b);
@@ -813,6 +867,54 @@ impl Sim {
             "{} frame {} t={:?}: {what}",
             self.profile.name, self.frame, self.now
         )
+    }
+
+    /// I19 (Laurent, 2026-11-24): the proactive sweep never takes a mesh
+    /// the need lists this step, or listed within the specification's
+    /// horizon (`Params::sweep_keep_poses`: the last poses, a step each).
+    /// Meshes only: a drape's tile listed
+    /// says nothing of which of its levels is wanted. Then records the
+    /// step's listing.
+    fn check_sweep(&mut self, need: &NeedSet, d: &Decisions) {
+        use tuile_budget::score::{Reason, Side};
+        let keep = u64::from(self.budget.specification().params.sweep_keep_poses);
+        let listed: BTreeSet<TileId> = need
+            .drawn
+            .iter()
+            .chain(&need.blockers)
+            .chain(&need.ancestors)
+            .chain(&need.ring)
+            .map(|(t, _)| *t)
+            .collect();
+        for e in &d.scores {
+            let ResourceId::Mesh(t) = e.resource else {
+                continue;
+            };
+            if e.side != Side::Evict || e.reason != Reason::Sweep {
+                continue;
+            }
+            let recent = self
+                .listed_at
+                .get(&t)
+                .is_some_and(|at| self.frame - at < keep);
+            if listed.contains(&t) || recent {
+                self.fail(&format!(
+                    "I19: the sweep took {t:?}, listed {}",
+                    if listed.contains(&t) {
+                        "now"
+                    } else {
+                        "within the horizon"
+                    }
+                ));
+            }
+        }
+        let pose = self.frame;
+        for t in listed {
+            self.listed_at.insert(t, pose);
+        }
+        if self.frame.is_multiple_of(600) {
+            self.listed_at.retain(|_, at| pose - *at < keep);
+        }
     }
 
     /// The per-step invariants.

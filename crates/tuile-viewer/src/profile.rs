@@ -54,6 +54,17 @@ impl DeviceMemory {
     }
 }
 
+/// The budget's pinned floor on every profile: levels `0..=2`, mesh and
+/// drape, loaded first and never evicted — the backdrop's level
+/// ([`crate::backdrop::BASE_LEVEL`]). Level 3 and up are graded inside the
+/// progressive score (Laurent, 2026-11-23): level 3 weighs 0.95 of a tile of
+/// the present need, level 4 half that, halving finer, so under pressure the
+/// fine go first, then the intermediate levels, level 4, level 3 last
+/// (`docs/explorations/budget-progressive-coarse-preload.md`).
+/// `TUILE_PIN_LEVEL` sets another floor.
+pub(crate) const FLOOR_LEVEL: u32 = 2;
+const _: () = assert!(FLOOR_LEVEL >= crate::backdrop::BASE_LEVEL);
+
 /// The numbers a session runs with. See the module.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Profile {
@@ -66,6 +77,12 @@ pub(crate) struct Profile {
     /// first and never evicted — what every fallback lands on, and what the
     /// backdrop draws.
     pub pinned_level: u32,
+    /// The radius `ρ` of the neighbourhood preloaded around the view, in
+    /// tiles of each level (`docs/explorations/budget-progressive-coarse-preload.md`):
+    /// `⌊π(ρ+1)²⌋` tiles per level between the floor and the eye's, the
+    /// bound of what is preloaded. A desktop's 4 (78 a level, about 300 MiB
+    /// at level 13), a phone's 2 (28 a level, about 105 MiB).
+    pub reach_tiles: u32,
     /// Reads of the local tile store in flight at once, a quota of their own
     /// beside the network's (I15): a desktop's store answers 32 at a time —
     /// at 8 a warm start converged later than a cold one (D5, 2026-10-20).
@@ -137,7 +154,8 @@ impl Profile {
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
         Self {
             gpu_bytes: (physical / 4).clamp(1024 * MIB, 4096 * MIB),
-            pinned_level: crate::backdrop::BASE_LEVEL,
+            pinned_level: FLOOR_LEVEL,
+            reach_tiles: 4,
             max_local_reads: 32,
             imagery_over_terrain_cap: 2,
             sse_threshold: 1.0,
@@ -169,7 +187,8 @@ impl Profile {
         let gpu_bytes = (memory.usable() / 5).clamp(160 * MIB, 768 * MIB);
         Self {
             gpu_bytes,
-            pinned_level: crate::backdrop::BASE_LEVEL,
+            pinned_level: FLOOR_LEVEL,
+            reach_tiles: 2,
             max_local_reads: 8,
             // The low clamp drapes one level over its terrain, the rest two.
             imagery_over_terrain_cap: if gpu_bytes <= 192 * MIB { 1 } else { 2 },
@@ -282,6 +301,7 @@ impl Profile {
     pub(crate) fn budget(&self) -> BudgetConfig {
         let mut b = BudgetConfig::interactive(Bytes(self.gpu_bytes));
         b.pinned_level = Some(self.pinned_level);
+        b.reach_tiles = self.reach_tiles;
         b.max_local_reads = self.max_local_reads;
         b.imagery_over_terrain_cap = self.imagery_over_terrain_cap;
         b.load_timeout = tuile_core::budget::Micros((self.load_timeout_s * 1e6) as u64);
@@ -329,7 +349,8 @@ mod tests {
         let p = Profile::desktop_with(16 * GIB);
         let b = p.budget();
         assert_eq!(b.max_local_reads, 32);
-        assert_eq!(b.pinned_level, Some(crate::backdrop::BASE_LEVEL));
+        assert_eq!(b.pinned_level, Some(FLOOR_LEVEL));
+        assert_eq!(b.reach_tiles, 4);
         assert!(b.validate().is_ok());
         assert!(p.hold_window_until_warm && !p.render_on_demand);
         assert!(p.owns_its_window && !p.pause_loads_when_hidden);
@@ -405,7 +426,7 @@ mod tests {
         // meshes' CPU copies, the worker its decoded tier (a quarter).
         assert!(desktop.gpu_bytes <= 1536 * MIB);
         for p in [&desktop, &phone] {
-            assert_eq!(p.pinned_level, crate::backdrop::BASE_LEVEL);
+            assert_eq!(p.pinned_level, FLOOR_LEVEL);
             assert!(!p.hold_window_until_warm && p.render_on_demand);
             assert!(p.pause_loads_when_hidden && !p.release_surface_in_background);
             assert!(!p.owns_its_window && !p.metrics_endpoint);

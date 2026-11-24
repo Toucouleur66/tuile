@@ -28,6 +28,7 @@ use super::cost::Cost;
 use super::deadline::FrameDeadline;
 use super::decisions::{Decisions, Role};
 use super::need::NeedSet;
+use super::score::DISTANCE_BANDS;
 use super::stats::{
     CancelReason, EvictReason, LayerStats, LevelStats, GAP_BUCKETS, LATENCY_BUCKETS, LAYERS, LEVELS,
 };
@@ -520,6 +521,50 @@ pub struct BudgetSignals {
     pub batch_fatal_total: u64,
     /// `invariant_violations_total{invariant}`, I1 to I18.
     pub invariant_violations_total: [u64; 18],
+    /// The progressive score (`docs/explorations/budget-progressive-coarse-preload.md`
+    /// §7): `param{name}` and `need_level`, the parameters in force.
+    pub score_params: crate::score::ScoreParams,
+    /// `preload_by_level_distance{level,distance}`: preloads in flight
+    /// after the last step.
+    pub preload_by_level_distance: [[u32; DISTANCE_BANDS]; LEVELS],
+    /// `evictions_by_level_distance{level,distance}`: the last step's GPU
+    /// evictions.
+    pub evictions_by_level_distance: [[u32; DISTANCE_BANDS]; LEVELS],
+    /// `released_by_level_distance{level,distance,reason}`: the last
+    /// step's releases, GPU and decoded, by reason.
+    pub released_by_level_distance: [[[u32; DISTANCE_BANDS]; LEVELS]; 3],
+    /// `released_total{reason}`.
+    pub released_total: [u64; 3],
+    /// `score_decisions_total{level,distance,side}` and
+    /// `score_sum_total{level,distance,side,term}`: every preload started
+    /// and copy evicted since the meter's start, with its terms (sides
+    /// preload and evict).
+    pub score_total: crate::score::ScoreBoard,
+    /// `score_min{…}` and `score_max{…}`: the same since the last publish.
+    pub score_recent: crate::score::ScoreBoard,
+    /// The present need's waits since the meter's start, first loads and
+    /// reloads after an eviction (`crate::waits`): `waits_total{kind,
+    /// class,level}`, `wait_p50_ms{kind}`, `wait_p95_ms{kind}` (from the
+    /// durations' histogram by kind) and `reloads_total{reason}`.
+    pub waits: crate::waits::WaitTotals,
+    /// The waits ended since the last publish, by kind, and the time they
+    /// span, µs: a rate per second.
+    pub waits_recent: [u64; 3],
+    pub waits_recent_micros: u64,
+    /// `exchange_threshold`: λ, the score at the memory boundary since
+    /// the last publish — the highest score released to make room or keep
+    /// the target (sweep, pressure, admission, swap): what is held under it
+    /// would be released, a candidate over it loaded. `None` without
+    /// pressure.
+    pub score_lambda: Option<u64>,
+    /// The decisions since the last publish, each with its terms, at most
+    /// [`SCORE_EVENTS_KEPT`]: the log records' source.
+    pub score_events: Vec<crate::score::ScoreEvent>,
+    /// `score_events_dropped_total`: decisions not kept in `score_events`.
+    pub score_events_dropped_total: u64,
+    /// The GPU-held set by score as the host last reported it
+    /// ([`BudgetMeter::set_held`]): `score_held_*{level,distance,term}`.
+    pub score_held: Option<crate::score::HeldReport>,
     /// `rejected_inputs_total`.
     pub rejected_inputs_total: u64,
     /// `under_need_tiles{kind}`: mesh, imagery — drawn tiles under the level
@@ -550,6 +595,10 @@ pub struct BudgetSignals {
 }
 
 /// The closed label sets of spec §16.5.
+/// The decisions [`BudgetSignals::score_events`] keeps between two
+/// publishes: the log records' rate limit.
+pub const SCORE_EVENTS_KEPT: usize = 512;
+
 pub mod labels {
     use super::super::types::Class;
 
@@ -586,6 +635,37 @@ pub mod labels {
     pub const SWAP: [&str; 4] = ["refine", "coarsen", "mesh_drape", "layer"];
     /// `eye`.
     pub const EYE: [&str; 4] = ["0", "1", "2", "3"];
+    /// `name` of a `param`: the progressive score's parameters
+    /// (`crate::score::ScoreParams::pairs`).
+    pub const PARAM: [&str; 11] = [
+        "a0_permille",
+        "a_desc_permille",
+        "rho_tiles",
+        "margin_permille",
+        "floor_level",
+        "preload_slots_permille",
+        "need_level",
+        "headroom_permille",
+        "floor_value_permille",
+        "coarse_from",
+        "coarse_boost_permille",
+    ];
+    /// `reason` of `released_by_level_distance`.
+    pub const RELEASE: [&str; 3] = crate::score::RELEASE_REASONS;
+    /// `distance`: a band of tiles from the view's footprint.
+    pub const DISTANCE: [&str; crate::score::DISTANCE_BANDS] = crate::score::DISTANCE_BAND_LABELS;
+    /// `side` of the score.
+    pub const SIDE: [&str; 4] = ["preload", "evict", "held", "decoded"];
+    /// `term` of the score.
+    pub const TERM: [&str; 5] = crate::score::TERM_LABELS;
+    /// `kind` of `waits_total`, `wait_p50_ms`, `wait_p95_ms`.
+    pub const WAIT_KIND: [&str; 3] = crate::waits::WAIT_KINDS;
+    /// `reason` of `reloads_total`.
+    pub const RELOAD: [&str; 4] = ["headroom", "below_floor_value", "make_room", "recycled"];
+    /// `q` of `score_quantile`.
+    pub const QUANTILE: [&str; 3] = ["0.1", "0.5", "0.9"];
+    /// `tier` of `restore_cost_seconds`.
+    pub const RESTORE_TIER: [&str; 4] = crate::score::RESTORE_TIERS;
     /// `level`, 0 to 24: a level of the budget's per-level series
     /// (`stats::level_index`; deeper levels count in the last).
     /// A copy's tier in `copies_by_level`.
@@ -1081,7 +1161,163 @@ impl BudgetSignals {
             vec![],
             self.rejected_inputs_total as f64,
         ));
+        self.score_series(&mut out);
         out
+    }
+
+    /// The progressive score's series
+    /// (`docs/explorations/budget-progressive-coarse-preload.md` §7): labels
+    /// `level`, `distance`, `side`, `term` and `name` only, never a tile.
+    fn score_series(&self, out: &mut Vec<Series>) {
+        use crate::score::{Side, DISTANCE_BAND_LABELS, TERM_LABELS};
+        for (name, v) in self.score_params.pairs() {
+            out.push(("param", vec![("name", name)], v as f64));
+        }
+        if let Some(n) = self.score_params.need_level {
+            out.push(("need_level", vec![], f64::from(n)));
+        }
+        // The waits, by kind (`crate::waits`).
+        for (k, kind) in crate::waits::WAIT_KINDS.iter().enumerate() {
+            for c in Class::ALL {
+                for (l, per) in self.waits.count[c].iter().enumerate() {
+                    let n = per[k];
+                    if n > 0 {
+                        out.push((
+                            "waits_total",
+                            vec![
+                                ("kind", kind),
+                                ("class", labels::class(c)),
+                                ("level", labels::LEVEL[l]),
+                            ],
+                            n as f64,
+                        ));
+                    }
+                }
+            }
+            for (q, name) in [(50, "wait_p50_ms"), (95, "wait_p95_ms")] {
+                if let Some(ms) = crate::waits::percentile_ms(&self.waits.millis[k], q) {
+                    out.push((name, vec![("kind", kind)], ms as f64));
+                }
+            }
+        }
+        for (i, reason) in labels::RELOAD.iter().enumerate() {
+            out.push((
+                "reloads_total",
+                vec![("reason", reason)],
+                self.waits.reload_reasons[i] as f64,
+            ));
+        }
+        if let Some(l) = self.score_lambda {
+            out.push(("exchange_threshold", vec![], l as f64));
+        }
+        // The score's quantiles per level and side, from the histograms:
+        // `score_quantile{side,q,level}`.
+        let qs = |out: &mut Vec<Series>, side: Side, l: usize, c: &crate::score::Cell| {
+            if let Some(q) = crate::score::quantiles(c) {
+                for (name, v) in labels::QUANTILE.iter().zip(q) {
+                    out.push((
+                        "score_quantile",
+                        vec![("side", side.label()), ("q", name), ("level", labels::LEVEL[l])],
+                        v as f64,
+                    ));
+                }
+            }
+        };
+        for (tier, us) in crate::score::RESTORE_TIERS
+            .iter()
+            .zip(self.score_params.restore_us)
+        {
+            out.push(("restore_cost_seconds", vec![("tier", tier)], us as f64 / 1e6));
+        }
+        for l in 0..LEVELS {
+            for (b, band) in DISTANCE_BAND_LABELS.iter().enumerate() {
+                let at = vec![("level", labels::LEVEL[l]), ("distance", *band)];
+                let p = self.preload_by_level_distance[l][b];
+                let e = self.evictions_by_level_distance[l][b];
+                let total = |side| self.score_total.cell(l, b, side).count;
+                // A level and band is exposed from its first decision on:
+                // a gauge left behind keeps its last value.
+                if total(Side::Preload) > 0 || p > 0 {
+                    out.push(("preload_by_level_distance", at.clone(), f64::from(p)));
+                }
+                if total(Side::Evict) > 0 || e > 0 {
+                    out.push(("evictions_by_level_distance", at.clone(), f64::from(e)));
+                }
+                for side in [Side::Preload, Side::Evict] {
+                    let c = self.score_total.cell(l, b, side);
+                    if c.count == 0 {
+                        continue;
+                    }
+                    let mut k = at.clone();
+                    k.push(("side", side.label()));
+                    out.push(("score_decisions_total", k.clone(), f64::from(c.count)));
+                    let r = self.score_recent.cell(l, b, side);
+                    for (t, term) in TERM_LABELS.iter().enumerate() {
+                        let mut kt = k.clone();
+                        kt.push(("term", term));
+                        out.push(("score_sum_total", kt.clone(), c.term(t).sum as f64));
+                        if r.count > 0 {
+                            out.push(("score_min", kt.clone(), r.term(t).min as f64));
+                            out.push(("score_max", kt, r.term(t).max as f64));
+                        }
+                    }
+                }
+                if let Some(h) = &self.score_held {
+                    let c = h.board.cell(l, b, Side::Held);
+                    let mut k = at.clone();
+                    k.push(("side", Side::Held.label()));
+                    out.push(("score_held_tiles", k.clone(), f64::from(c.count)));
+                    if c.count == 0 {
+                        continue;
+                    }
+                    for (t, term) in TERM_LABELS.iter().enumerate() {
+                        let mut kt = k.clone();
+                        kt.push(("term", term));
+                        out.push(("score_held_sum", kt.clone(), c.term(t).sum as f64));
+                        out.push(("score_held_min", kt.clone(), c.term(t).min as f64));
+                        out.push(("score_held_max", kt, c.term(t).max as f64));
+                    }
+                }
+            }
+        }
+        for (i, reason) in crate::score::RELEASE_REASONS.iter().enumerate() {
+            out.push(("released_total", vec![("reason", reason)], self.released_total[i] as f64));
+            for l in 0..LEVELS {
+                for (b, band) in DISTANCE_BAND_LABELS.iter().enumerate() {
+                    let v = self.released_by_level_distance[i][l][b];
+                    if v > 0 || self.score_total.cell(l, b, Side::Evict).count > 0 {
+                        out.push((
+                            "released_by_level_distance",
+                            vec![
+                                ("level", labels::LEVEL[l]),
+                                ("distance", *band),
+                                ("reason", reason),
+                            ],
+                            f64::from(v),
+                        ));
+                    }
+                }
+            }
+        }
+        for l in 0..LEVELS {
+            let mut held = crate::score::Cell::default();
+            let (mut pre, mut ev) = (crate::score::Cell::default(), crate::score::Cell::default());
+            for b in 0..DISTANCE_BANDS {
+                if let Some(h) = &self.score_held {
+                    held.add(h.board.cell(l, b, Side::Held));
+                }
+                pre.add(self.score_recent.cell(l, b, Side::Preload));
+                ev.add(self.score_recent.cell(l, b, Side::Evict));
+            }
+            qs(out, Side::Held, l, &held);
+            qs(out, Side::Preload, l, &pre);
+            qs(out, Side::Evict, l, &ev);
+        }
+        out.push((
+            "score_events_dropped_total",
+            vec![],
+            self.score_events_dropped_total as f64,
+        ));
     }
 }
 
@@ -1124,6 +1360,8 @@ pub struct BudgetMeter {
     scratch: MeterScratch,
     batch_steps: u64,
     violations: Violations,
+    /// The present need's waits, followed (`crate::waits`).
+    waits: crate::waits::WaitTracker,
 }
 
 /// The meter's per-step buffers.
@@ -1189,7 +1427,18 @@ impl BudgetMeter {
         let s = self.signals();
         self.s.decide_peak_micros = 0;
         self.s.fallback_depth_max = 0;
+        self.s.score_recent = crate::score::ScoreBoard::default();
+        self.s.score_lambda = None;
+        self.s.waits_recent = [0; 3];
+        self.s.waits_recent_micros = 0;
+        self.s.score_events.clear();
         s
+    }
+
+    /// The GPU-held set by score ([`crate::Budget::held_report`]), as the
+    /// host took it: published with the next signals.
+    pub fn set_held(&mut self, report: crate::score::HeldReport) {
+        self.s.score_held = Some(report);
     }
 
     /// The violations `check` counted.
@@ -1226,6 +1475,36 @@ impl BudgetObserver for BudgetMeter {
         let d = r.decisions;
         let st = &d.stats;
         let s = &mut self.s;
+        // The progressive score: one source, the step's records.
+        s.score_params = st.score.params;
+        s.preload_by_level_distance = st.score.preload_in_flight;
+        s.evictions_by_level_distance = st.score.evictions;
+        s.released_by_level_distance = st.score.released;
+        for (i, r) in st.score.released.iter().enumerate() {
+            s.released_total[i] += r.iter().flatten().map(|v| u64::from(*v)).sum::<u64>();
+        }
+        crate::score::board_of(&d.scores, &mut s.score_total);
+        crate::score::board_of(&d.scores, &mut s.score_recent);
+        for e in d.scores.iter().filter(|e| {
+            e.side == crate::score::Side::Evict
+                && matches!(
+                    e.reason,
+                    crate::score::Reason::Sweep
+                        | crate::score::Reason::Pressure
+                        | crate::score::Reason::Fit
+                        | crate::score::Reason::Admission
+                        | crate::score::Reason::Swap
+                )
+        }) {
+            s.score_lambda = Some(s.score_lambda.map_or(e.terms.score, |l| l.max(e.terms.score)));
+        }
+        for e in &d.scores {
+            if s.score_events.len() < SCORE_EVENTS_KEPT {
+                s.score_events.push(*e);
+            } else {
+                s.score_events_dropped_total += 1;
+            }
+        }
         let start = *self.start.get_or_insert(r.now);
         let dt = self.last_now.map_or(0, |l| r.now.since(l).0);
         self.last_now = Some(r.now);
@@ -1465,6 +1744,16 @@ impl BudgetObserver for BudgetMeter {
             .extend(d.draw.items.iter().flat_map(|i| i.serves.iter().copied()));
         x.served.sort_unstable();
         x.served.dedup();
+        // The waits: the draw ends them, the need opens them.
+        s.waits_recent_micros += dt;
+        self.waits.step(
+            r.now,
+            r.need,
+            d,
+            &x.drawn,
+            &mut s.waits,
+            &mut s.waits_recent,
+        );
         let drawn = &x.drawn;
         let parents = &x.parents;
         x.swapped.clear();
