@@ -1497,6 +1497,13 @@ fn imagery_metrics(gpu: &GpuContext) {
         }
         let (count, _) = imagery.live();
         m.imagery_textures.set(count as u64);
+        let blocks: usize = imagery
+            .live_textures_by_format()
+            .iter()
+            .filter(|(f, _, _)| *f != tuile_core::texels::ImageryFormat::Rgba8)
+            .map(|(_, _, n)| n)
+            .sum();
+        m.imagery_compressed_textures.set(blocks as u64);
     }
 }
 

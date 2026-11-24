@@ -284,9 +284,10 @@ fn play(
             .max()
             .unwrap_or(0);
         println!(
-            "  imagery at the end {:.1} MB, {} textures, {} bytes each; at its peak over the run {:.1} MB",
+            "  imagery at the end {:.1} MB, {} textures ({} compressed), {} bytes each; at its peak over the run {:.1} MB",
             m.texture_bytes as f64 / 1e6,
             m.textures,
+            m.imagery_compressed_textures,
             m.texture_bytes.checked_div(m.textures).unwrap_or(0),
             peak as f64 / 1e6
         );
