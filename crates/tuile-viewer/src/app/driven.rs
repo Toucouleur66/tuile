@@ -126,7 +126,7 @@ impl App {
     /// whether it reached the eyes.
     pub(crate) fn draw_now(&mut self) -> bool {
         let before = self.presented;
-        self.render();
+        self.render_as(true);
         self.presented > before
     }
 

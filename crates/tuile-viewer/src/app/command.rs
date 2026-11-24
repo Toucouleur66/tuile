@@ -56,6 +56,8 @@ impl App {
     }
 
     pub(super) fn apply(&mut self, command: Command) {
+        // Whatever it changes is seen at once, not on the next wake-up.
+        self.demand.poke();
         match command {
             Command::Goto(goto) => {
                 // Where it leads, before the eye leaves: a sunset in the

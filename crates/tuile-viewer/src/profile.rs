@@ -115,8 +115,11 @@ pub(crate) struct Profile {
     /// desktop), or opens at once with a loading indicator over the globe
     /// (a phone, where the system ends an application that shows nothing).
     pub hold_window_until_warm: bool,
-    /// Whether frames are drawn only while something changes on screen.
-    pub render_on_demand: bool,
+    /// Whether the frame rate is held to sixty frames a second and lowered as
+    /// the device heats or saves power — a phone's battery and heat. A
+    /// desktop is never held back. Every device draws only what changed
+    /// (`app::demand`); this is how fast it may draw while something does.
+    pub paced_by_heat: bool,
     /// Whether the surface and its render targets are let go of while the
     /// application is in the background.
     pub release_surface_in_background: bool,
@@ -168,7 +171,7 @@ impl Profile {
             // not fit, and is never used there.
             store_disk_bytes: 4096usize.saturating_mul(MIB as usize),
             hold_window_until_warm: true,
-            render_on_demand: false,
+            paced_by_heat: false,
             release_surface_in_background: false,
             pause_loads_when_hidden: false,
             owns_its_window: true,
@@ -201,7 +204,7 @@ impl Profile {
             store_memory_bytes: 32 * MIB as usize,
             store_disk_bytes: 768 * MIB as usize,
             hold_window_until_warm: false,
-            render_on_demand: true,
+            paced_by_heat: true,
             release_surface_in_background: true,
             pause_loads_when_hidden: true,
             owns_its_window: true,
@@ -267,7 +270,7 @@ impl Profile {
             store_memory_bytes: 0,
             store_disk_bytes: 0,
             hold_window_until_warm: false,
-            render_on_demand: true,
+            paced_by_heat: true,
             release_surface_in_background: false,
             pause_loads_when_hidden: true,
             owns_its_window: false,
@@ -320,7 +323,7 @@ impl Profile {
     /// The shortest interval between two frames, for how hot the device runs
     /// and whether it is saving power. A desktop is never held back.
     pub(crate) fn frame_interval(&self, thermal: Thermal, low_power: bool) -> Duration {
-        if !self.render_on_demand {
+        if !self.paced_by_heat {
             return Duration::ZERO;
         }
         let fps = match thermal {
@@ -352,7 +355,7 @@ mod tests {
         assert_eq!(b.pinned_level, Some(FLOOR_LEVEL));
         assert_eq!(b.reach_tiles, 4);
         assert!(b.validate().is_ok());
-        assert!(p.hold_window_until_warm && !p.render_on_demand);
+        assert!(p.hold_window_until_warm && !p.paced_by_heat);
         assert!(p.owns_its_window && !p.pause_loads_when_hidden);
         assert_eq!(p.frame_interval(Thermal::Critical, true), Duration::ZERO);
     }
@@ -386,7 +389,7 @@ mod tests {
             assert!(p.budget().validate().is_ok());
             assert!(p.runtime_workers <= 2 && p.decode_threads <= 3);
             assert!(p.decode_threads >= 1);
-            assert!(!p.hold_window_until_warm && p.render_on_demand);
+            assert!(!p.hold_window_until_warm && p.paced_by_heat);
             assert!(p.release_surface_in_background && !p.metrics_endpoint);
             assert!(p.pause_loads_when_hidden && p.owns_its_window);
         }
@@ -427,7 +430,7 @@ mod tests {
         assert!(desktop.gpu_bytes <= 1536 * MIB);
         for p in [&desktop, &phone] {
             assert_eq!(p.pinned_level, FLOOR_LEVEL);
-            assert!(!p.hold_window_until_warm && p.render_on_demand);
+            assert!(!p.hold_window_until_warm && p.paced_by_heat);
             assert!(p.pause_loads_when_hidden && !p.release_surface_in_background);
             assert!(!p.owns_its_window && !p.metrics_endpoint);
             assert_eq!((p.store_memory_bytes, p.store_disk_bytes), (0, 0));

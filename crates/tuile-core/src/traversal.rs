@@ -299,6 +299,19 @@ impl ViewState {
         self
     }
 
+    /// Whether `other` is this very view: the same pose, lens, viewport and
+    /// scale, bit for bit. Everything else a view holds is derived from
+    /// those, so two views that are the same here select the same tiles.
+    pub fn same_as(&self, other: &ViewState) -> bool {
+        self.position == other.position
+            && self.direction == other.direction
+            && self.up == other.up
+            && self.viewport_px == other.viewport_px
+            && self.fovy_rad == other.fovy_rad
+            && self.fov == other.fov
+            && self.scale == other.scale
+    }
+
     /// The focal length in logical pixels per unit of tangent (spec §13.2):
     /// `max(w / (tan r − tan l), h / (tan u − tan d)) / scale`; for a
     /// symmetric perspective, `h / (2 tan(fovy / 2)) / scale`.
