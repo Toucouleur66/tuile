@@ -1074,6 +1074,49 @@ impl Budget {
         }
     }
 
+    /// Tile `t`'s preloaded drapes — each layer it would wear, in layer
+    /// order (a layer listed twice at its last listing's level) — when it
+    /// is a preload of the interactive view (the ring, an ancestor) above
+    /// the floor; into `out`. The level is the one the tile needs once the
+    /// view draws it ([`TexelFootprint::at_threshold`]), a function of its
+    /// need alone: no hysteresis, no stand-in, no presence asked. Batch
+    /// preloads meshes only: a frame's ring holds no drape back.
+    ///
+    /// [`TexelFootprint::at_threshold`]: super::imagery::TexelFootprint::at_threshold
+    pub(super) fn preload_drapes_of(&self, tn: &TileNeed, out: &mut Vec<(LayerId, u32)>) {
+        out.clear();
+        if self.cfg.policy == Policy::Batch
+            || !matches!(tn.membership, Membership::Ring | Membership::Ancestor)
+            || self.is_floor(tn.need.class, tn.need.level)
+        {
+            return;
+        }
+        let Some(img) = tn.need.imagery.as_ref() else {
+            return;
+        };
+        let floor = self.cfg.pinned_level.unwrap_or(0);
+        let cap = self.cfg.imagery_cap();
+        let fp = img.footprint.at_threshold(tn.need.sse_excess);
+        for reach in layers(img) {
+            self.walk(1);
+            let clamp = LevelClamp {
+                floor,
+                terrain_level: tn.need.level,
+                over_terrain_cap: cap,
+                source_max: reach.max_level,
+            };
+            out.push((reach.layer, needed_level(None, fp, clamp)));
+        }
+        out.sort_by_key(|e| e.0);
+        out.dedup_by(|later, earlier| {
+            let same = later.0 == earlier.0;
+            if same {
+                earlier.1 = later.1;
+            }
+            same
+        });
+    }
+
     /// The levels the terrain's level denies tile `tn`'s imagery, the most
     /// over its layers: how far the level the footprint alone asks (the
     /// source's deepest at most) lies above the tile's terrain level plus
@@ -1667,14 +1710,6 @@ impl Budget {
                     Membership::Drawn if item.is_some_and(|i| i.role == Role::Fallback) => {
                         Some(Urgency::Drape)
                     }
-                    // A ring tile not drawn (the neighbourhood, the views
-                    // ahead): its drapes are preloads too, of the tile's own
-                    // score — never the present need's. An ancestor of what
-                    // is drawn keeps its drapes in the present need's band:
-                    // a coarse drape serves every tile under it, and its
-                    // arrival re-reads them all — early, while the view
-                    // moves, not on a still step (the work bound).
-                    Membership::Ring if item.is_none() => Some(urgency),
                     _ => {
                         let worn = item.and_then(|i| i.drape(layer).copied());
                         let off = match worn {
@@ -1732,6 +1767,26 @@ impl Budget {
                         },
                     );
                 }
+            }
+            // A preload's drapes (the neighbourhood, the views ahead, the
+            // chain above what is drawn): preloads too, of the tile's own
+            // urgency and score — below every present need, under the same
+            // quotas and delivery gates as its mesh — at the level the tile
+            // will need once drawn. Wanted while it is listed, so that what
+            // was preloaded stays as its mesh does.
+            self.preload_drapes_of(tn, drapes);
+            for &(layer, n) in drapes.iter() {
+                self.walk(1);
+                put(
+                    out,
+                    ResourceId::drape(t, layer, n),
+                    Want {
+                        urgency,
+                        q: tn.q,
+                        class: Class::Drape,
+                        level: tn.need.level,
+                    },
+                );
             }
         }
         // Per resource the most urgent, then the best scored; of equals,
@@ -2258,6 +2313,12 @@ impl Budget {
             }
         }
         st.protected = protected;
+        // The preloads the present need found resident, and those let go
+        // unserved, since the last step.
+        for (c, [hits, unused]) in self.arena.take_preload_counts().iter() {
+            st.preload_hits[c] = st.preload_hits[c].saturating_add(hits);
+            st.preload_unused[c] = st.preload_unused[c].saturating_add(unused);
+        }
         // What keeping the kept maps in order cost, this step and the
         // events applied since the last.
         self.walk_upkeep();
@@ -2756,14 +2817,16 @@ impl Budget {
                         continue;
                     }
                     if self.in_flight[class] >= eff.quota[class] {
-                        if w.urgency > Urgency::Hole {
+                        if w.urgency >= Urgency::Ring {
                             if key.tier == Tier::Stored {
                                 skipped_stored += 1;
                             }
                             continue;
                         }
-                        // Preempt the least urgent in-flight preload. Every
-                        // load is indexed in `active` (`start`).
+                        // The present need — the floor, a hole, a swap's
+                        // child, a drawn tile's drape — never waits on a
+                        // preload: it preempts the least urgent in-flight
+                        // one. Every load is indexed in `active` (`start`).
                         st.work = st.work.saturating_add(sat_u32(self.arena.active().len()));
                         let victim = self
                             .arena
@@ -2841,6 +2904,12 @@ impl Budget {
             );
             if self.is_floor(w.class, w.level) {
                 self.arena.mark(s, Mark::FloorSet, true);
+            }
+            // Loaded for what the view may want next (the ring, an
+            // ancestor): served or not, `preload_hits`/`preload_unused`
+            // tell once the present need wants it or it is let go.
+            if matches!(w.urgency, Urgency::Ring | Urgency::Ancestor) {
+                self.arena.cold_mut(s).set_preloaded(true);
             }
             self.arena.list_active(s);
             st.levels.starts[class][level_index(w.level)] += 1;

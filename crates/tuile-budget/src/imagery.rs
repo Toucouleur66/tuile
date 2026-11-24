@@ -99,6 +99,38 @@ impl TexelFootprint {
             ratio: self.ratio * 1_000.0 / s,
         }
     }
+
+    /// The footprint of a tile whose screen-space error stands
+    /// `sse_excess = log2(sse / τ)` over its threshold, seen from where
+    /// that error meets the threshold — where the view draws the tile.
+    /// Both the error and the footprint fall as one over the distance, so
+    /// the ratio scales by `τ / sse`: a preload's imagery level is the one
+    /// the tile needs once drawn, not the one its place now asks (an
+    /// ancestor under the eye would ask the finest; a far neighbour the
+    /// coarsest). Nearly constant as the view moves: a level that does not
+    /// flap.
+    ///
+    /// The excess is taken to the nearest half level, within `[-16, 16]`
+    /// (0 when not a number), so that the scale is a power of two times
+    /// `√2` at most: exact operations only, the same level everywhere.
+    pub fn at_threshold(self, sse_excess: f32) -> Self {
+        let e = if sse_excess.is_nan() {
+            0.0
+        } else {
+            sse_excess.clamp(-16.0, 16.0)
+        };
+        // Half levels to scale by: within [-32, 32], so the cast is exact.
+        #[allow(clippy::cast_possible_truncation)]
+        let halves = -((2.0 * e).round() as i32);
+        let whole = halves.div_euclid(2);
+        let mut scale = f64::from_bits(u64::from((1023 + whole).unsigned_abs()) << 52);
+        if halves.rem_euclid(2) == 1 {
+            scale *= std::f64::consts::SQRT_2;
+        }
+        TexelFootprint {
+            ratio: self.ratio * scale,
+        }
+    }
 }
 
 /// The bounds a needed imagery level is clamped to.

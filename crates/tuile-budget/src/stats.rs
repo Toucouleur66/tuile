@@ -178,6 +178,13 @@ pub struct BudgetStats {
     /// Loads started, then cancelled for leaving the need before they were
     /// delivered (P2.2).
     pub wasted_starts: PerClass<u32>,
+    /// Preloads (loads started for the ring or an ancestor) resident when
+    /// the present need first wanted them or drew them. Not in
+    /// [`BudgetStats::digest`]: a measure of the decisions.
+    pub preload_hits: PerClass<u32>,
+    /// Preloads the budget let go of without the present need ever wanting
+    /// them. Not in [`BudgetStats::digest`].
+    pub preload_unused: PerClass<u32>,
     /// Stored resources left unstarted while a lower-priority network load
     /// started (must be 0, I15).
     pub local_waits: u32,
@@ -348,8 +355,7 @@ impl Deficit {
     /// Tiles drawn under their need, meshes and drapes (a tile counted in
     /// each it is short of).
     pub fn under_tiles(&self) -> u32 {
-        self.mesh_under_tiles
-            .saturating_add(self.imagery_under())
+        self.mesh_under_tiles.saturating_add(self.imagery_under())
     }
 
     /// Imagery under its need: tiles worn under the level decided, and
