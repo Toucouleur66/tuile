@@ -46,8 +46,8 @@ pub use readback::{MappedFrame, Readback, ReadbackRing};
 pub use renderer::{sky_wgsl, LineVertex, SkyLightRead, TileRenderer, ViewUniform};
 pub use sky::{ecef_of, Atmosphere, AtmosphereConfig, Bodies, Lights, SkyFrame, SkyView};
 pub use surface::{
-    draw_to_surface, draw_to_texture, preferred_format, surface_format, FrameOnSurface,
-    FrameOnTexture, FramePass, Presented, SurfaceFormat,
+    draw_to_surface, draw_to_texture, opaque_alpha, preferred_format, surface_format, After,
+    FrameOnSurface, FrameOnTexture, FramePass, Presented, SurfaceFormat, NOTHING_AFTER,
 };
 pub use targets::FrameTargets;
 pub use world_overlay::{Picture, WorldOverlayError, WorldOverlayRenderer, WorldOverlayView};

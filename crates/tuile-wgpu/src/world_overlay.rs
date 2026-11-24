@@ -602,7 +602,14 @@ impl WorldOverlayRenderer {
                     sample_count: crate::context::SAMPLES,
                     dimension: wgpu::TextureDimension::D2,
                     format: DEPTH_FORMAT,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    // Cleared and discarded by this one pass: transient, as
+                    // the frame's own depth is (see `crate::targets`).
+                    usage: if cfg!(target_arch = "wasm32") {
+                        wgpu::TextureUsages::RENDER_ATTACHMENT
+                    } else {
+                        wgpu::TextureUsages::RENDER_ATTACHMENT
+                            | wgpu::TextureUsages::TRANSIENT_ATTACHMENT
+                    },
                     view_formats: &[],
                 });
                 let view = texture.create_view(&wgpu::TextureViewDescriptor::default());

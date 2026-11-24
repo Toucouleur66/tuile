@@ -22,7 +22,7 @@ use tuile_core::geo::{ecef_to_geodetic, enu_frame, geodetic_to_ecef, Geodetic};
 use tuile_terrain::{fill_content, GeographicTilingScheme, TileCoord};
 use tuile_wgpu::{
     draw_to_texture, prepare, view_proj_from_world, FrameOnTexture, FrameTargets, GpuContext,
-    PreparedTile, Readback, SkyView, TileRenderer, ViewUniform,
+    PreparedTile, Readback, SkyView, TileRenderer, ViewUniform, NOTHING_AFTER,
 };
 
 const WIDTH: u32 = 384;
@@ -343,7 +343,7 @@ fn shoot_frame(
                 false,
             )
         },
-        |_, _| {},
+        NOTHING_AFTER,
     );
     let pixels = readback.take(gpu, (WIDTH, HEIGHT)).expect("read back");
     let rgba = image::RgbaImage::from_raw(WIDTH, HEIGHT, pixels).expect("image");
@@ -866,7 +866,7 @@ fn frame_time_with_and_without_the_atmosphere() {
                             false,
                         )
                     },
-                    |_, _| {},
+                    NOTHING_AFTER,
                 );
                 gpu.device
                     .poll(wgpu::PollType::wait_indefinitely())

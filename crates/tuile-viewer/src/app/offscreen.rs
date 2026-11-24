@@ -105,7 +105,7 @@ impl Offscreen {
         // separately is not a clearer signature.
         draw: (
             impl Fn(&mut wgpu::RenderPass<'_>),
-            impl Fn(&mut wgpu::CommandEncoder, &tuile_wgpu::FramePass<'_>),
+            Option<impl Fn(&mut wgpu::CommandEncoder, &tuile_wgpu::FramePass<'_>)>,
         ),
     ) {
         let (paint, after) = draw;
@@ -122,7 +122,7 @@ impl Offscreen {
                     capture: Some(&mut eye.readback),
                 },
                 &paint,
-                &after,
+                after.as_ref(),
             );
         }
     }

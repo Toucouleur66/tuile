@@ -28,7 +28,7 @@ use tuile_core::geo::{enu_frame, geodetic_to_ecef, Geodetic};
 use tuile_terrain::{fill_content, GeographicTilingScheme, TileCoord};
 use tuile_wgpu::{
     draw_to_texture, prepare, view_proj_from_world, FrameOnTexture, FrameTargets, GpuContext,
-    PreparedTile, Readback, SkyView, TileRenderer, ViewUniform,
+    PreparedTile, Readback, SkyView, TileRenderer, ViewUniform, NOTHING_AFTER,
 };
 
 const WIDTH: u32 = 384;
@@ -321,7 +321,7 @@ fn fly_clock(
                     false,
                 )
             },
-            |_, _| {},
+            NOTHING_AFTER,
         );
         let pixels = readback.take(gpu, size).expect("read back");
         let light = renderer.read_sky_light(gpu).expect("the sky is on");

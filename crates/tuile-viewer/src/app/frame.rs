@@ -639,7 +639,10 @@ impl App {
         let paint = |pass: &mut wgpu::RenderPass<'_>| paint_with(pass, on_screen);
         // The overlays' own pass, on the frame's encoder once its pass has
         // closed: the HUD's mode needs a depth attachment the ground never
-        // reached, and that is a second pass or nothing.
+        // reached, and that is a second pass or nothing. Nothing when no
+        // overlay asked for it — and then the frame's samples are discarded
+        // once resolved rather than written out for a pass that never comes.
+        let has_after = world.borrow().needs_own_depth();
         let after = |encoder: &mut wgpu::CommandEncoder, frame: &tuile_wgpu::FramePass<'_>| {
             world.borrow_mut().render_overlays_only(
                 world_gpu,
@@ -685,7 +688,7 @@ impl App {
                     || super::setup::configure(surface, &active.gpu, active.format, active.size),
                     || window.pre_present_notify(),
                     paint,
-                    after,
+                    has_after.then_some(after),
                 )
             }
             // Every eye, from the one resolved set of tiles, each with its own
@@ -700,7 +703,7 @@ impl App {
                     &views,
                     |view| renderer.set_view(&gpu.queue, view),
                     clear,
-                    (&paint, &after),
+                    (&paint, has_after.then_some(&after)),
                 );
                 tuile_wgpu::Presented::Yes
             }
@@ -715,11 +718,7 @@ impl App {
                 clear,
                 (
                     |pass: &mut wgpu::RenderPass<'_>| paint_with(pass, layers),
-                    |encoder: &mut wgpu::CommandEncoder, frame: &tuile_wgpu::FramePass<'_>| {
-                        if layers.hud {
-                            after(encoder, frame);
-                        }
-                    },
+                    (has_after && layers.hud).then_some(after),
                 ),
                 exposure,
                 picture,
