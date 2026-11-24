@@ -2321,6 +2321,15 @@ impl Budget {
                     self.down.deadline(now.plus(grace), r);
                 }
             }
+            // The present need wants it, or it is drawn: a preload served
+            // (or overtaken while it loads).
+            if in_drawn
+                || wants
+                    .get(&r)
+                    .is_some_and(|w| w.urgency < Urgency::Ring)
+            {
+                a.preload_wanted(s);
+            }
             a.mark(s, Mark::Wanted, in_wants || in_drawn);
             if in_wants || in_drawn {
                 l.slots.push(s);

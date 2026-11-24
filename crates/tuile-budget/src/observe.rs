@@ -429,6 +429,12 @@ pub struct BudgetSignals {
     pub starts_total: PerClass<[u64; 2]>,
     /// `wasted_starts_total{class}`.
     pub wasted_starts_total: PerClass<u64>,
+    /// `preload_hits_total{class}`: preloads (the ring, an ancestor)
+    /// resident when the present need first wanted or drew them.
+    pub preload_hits_total: PerClass<u64>,
+    /// `preload_unused_total{class}`: preloads let go of without the
+    /// present need ever wanting them.
+    pub preload_unused_total: PerClass<u64>,
     /// `local_waits_total`.
     pub local_waits_total: u64,
     /// `cancels_total{reason}`: grace, timeout, preempted.
@@ -1021,6 +1027,8 @@ impl BudgetSignals {
             }
         }
         per(&mut out, "wasted_starts_total", &self.wasted_starts_total);
+        per(&mut out, "preload_hits_total", &self.preload_hits_total);
+        per(&mut out, "preload_unused_total", &self.preload_unused_total);
         out.push(("local_waits_total", vec![], self.local_waits_total as f64));
         for (i, r) in labels::CANCEL.iter().enumerate() {
             out.push((
@@ -1566,6 +1574,8 @@ impl BudgetObserver for BudgetMeter {
                 s.failures_total[c][i] += u64::from(st.failures[c][i]);
             }
             s.wasted_starts_total[c] += u64::from(st.wasted_starts[c]);
+            s.preload_hits_total[c] += u64::from(st.preload_hits[c]);
+            s.preload_unused_total[c] += u64::from(st.preload_unused[c]);
             for i in 0..3 {
                 s.evictions_total[c][i] += u64::from(st.evictions[c][i]);
             }
