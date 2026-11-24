@@ -43,6 +43,14 @@ pub struct Availability {
     /// Every range folded in since the layer, with its level, in the order
     /// it was: what [`Availability::added_since`] reads.
     added: Mutex<Vec<(u32, AvailabilityRange)>>,
+    /// The layer's `metadataAvailability`: a tile at a level that is a
+    /// multiple of it carries, in its `metadata`, the availability of the
+    /// levels below it down to the next multiple. `None` for a layer whose
+    /// `available` table is all there is.
+    metadata_availability: Option<u32>,
+    /// How many levels the layer's own table describes: those are known
+    /// from the start, whatever has loaded.
+    layer_levels: u32,
 }
 
 impl Availability {
@@ -68,13 +76,53 @@ impl Availability {
             .enumerate()
             .flat_map(|(level, ranges)| ranges.iter().map(move |r| key(level as u32, r)))
             .collect();
+        let layer_levels = u32::try_from(levels.len()).unwrap_or(u32::MAX);
         Self {
             levels: RwLock::new(levels),
             seen: RwLock::new(seen),
             deferred: AtomicBool::new(false),
             held: Mutex::new(Vec::new()),
             added: Mutex::new(Vec::new()),
+            metadata_availability: layer.metadata_availability.filter(|m| *m > 0),
+            layer_levels,
         }
+    }
+
+    /// The tile whose `metadata` says whether `c` exists, when the layer's
+    /// own table does not: its ancestor at the nearest level above it that
+    /// is a multiple of `metadataAvailability`. `None` when the layer's
+    /// table already answers for `c`'s level, or when no tile carries
+    /// availability (a layer with a static table only).
+    ///
+    /// Whether `c` has data is only *knowable* once that ancestor has loaded:
+    /// before, `c` is merely not known yet, which is not the same as absent.
+    pub fn revealed_by(&self, c: TileCoord) -> Option<TileCoord> {
+        let m = self.metadata_availability?;
+        if c.level == 0 || c.level < self.layer_levels {
+            return None;
+        }
+        let base = ((c.level - 1) / m) * m;
+        let up = c.level - base;
+        Some(TileCoord::new(base, c.x >> up, c.y >> up))
+    }
+
+    /// Whether `c` is known to exist, counting the reveals held for the gap
+    /// between two passes ([`defer`](Self::defer)) as well as those folded
+    /// in. For a loader deciding whether to fetch a tile: the tree reads only
+    /// what is folded in, so that one pass sees one tree, but what a tile is
+    /// made of must not depend on whether a pass has run since its
+    /// availability arrived.
+    pub fn is_available_or_held(&self, c: TileCoord) -> bool {
+        if self.is_available(c) {
+            return true;
+        }
+        let held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        held.iter().any(|(base, ranges)| {
+            c.level
+                .checked_sub(base + 1)
+                .and_then(|offset| ranges.get(offset as usize))
+                .is_some_and(|at_level| at_level.iter().any(|r| r.contains(c.x, c.y)))
+        })
     }
 
     /// The ranges folded in since the first `from` (with their level), onto
