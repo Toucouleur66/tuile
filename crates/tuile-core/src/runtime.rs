@@ -1297,7 +1297,8 @@ impl State {
                 match spec {
                     Ok(s) => {
                         tracing::info!(spec = s.kind.label(), overridden, %query, "budget specified");
-                        self.events.push(BudgetEvent::Specify(s.kind, s.digest(), overridden));
+                        self.events
+                            .push(BudgetEvent::Specify(s.kind, s.digest(), overridden));
                     }
                     Err(e) => tracing::warn!(%query, "budget specification refused: {e}"),
                 }

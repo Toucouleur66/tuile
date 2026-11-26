@@ -362,6 +362,9 @@ pub struct Surface {
     /// Drawn tiles first, then finer before coarser.
     order: Vec<(u64, bool)>,
     tiles: HashMap<u64, Arc<SurfaceTile>>,
+    /// `order`'s tiles themselves: what `height_at` walks, many times per
+    /// ray, without hashing a key per tile.
+    ranked: Vec<(Arc<SurfaceTile>, bool)>,
     next_generation: u64,
     /// Bumped whenever what answers may have changed.
     version: u64,
@@ -381,6 +384,7 @@ impl Surface {
         let mut next = Self {
             order: Vec::new(),
             tiles: HashMap::new(),
+            ranked: Vec::new(),
             next_generation: self.next_generation,
             version: self.version,
         };
@@ -415,6 +419,11 @@ impl Surface {
                 .then(level(&b.0).cmp(&level(&a.0)))
                 .then(a.0.cmp(&b.0))
         });
+        next.ranked = next
+            .order
+            .iter()
+            .map(|&(k, drawn)| (Arc::clone(&next.tiles[&k]), drawn))
+            .collect();
         if next.order != self.order
             || next
                 .tiles
@@ -442,10 +451,8 @@ impl Surface {
 
     /// The height under `lon`/`lat` (radians): see the module.
     pub fn height_at(&self, lon: f64, lat: f64) -> SurfaceHeight {
-        for &(key, drawn) in &self.order {
-            let Some(tile) = self.tiles.get(&key) else {
-                continue;
-            };
+        for (tile, drawn) in &self.ranked {
+            let drawn = *drawn;
             if let Some(height) = tile.height_at(lon, lat) {
                 return SurfaceHeight {
                     height,
