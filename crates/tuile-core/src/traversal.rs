@@ -529,9 +529,25 @@ impl Config {
     /// What the session may hold, load and upload is the graphics budget's
     /// ([`crate::budget::BudgetConfig`]): the traversal only says what the
     /// view wants.
+    ///
+    /// **No hold-until-ready here** ([`Config::forbid_holes`] off). A
+    /// session's budget already covers the ground tile by tile: a wanted
+    /// tile not drawable yet is stood in for by its nearest drawable
+    /// ancestor, drawn only where no finer mesh stamped, and siblings
+    /// replace their parent all at once (`select_tile`). The traversal's
+    /// own hold did the same job per subtree, and worse: one missing
+    /// child dropped every drawn sibling, and a subtree with more than
+    /// [`Config::loading_descendant_limit`] loads was cut to its coarsest
+    /// resident ancestor, drawn as itself. After a jump of a few
+    /// kilometres in one frame (a late frame on a fast turn), the draw set
+    /// fell from about 100 tiles to 6–20 of level 10 or coarser, most of
+    /// them in their level-2 stand-in drape: the whole view olive for a
+    /// frame (lapoule-dev/tuile#330). Without the hold, the same scripted
+    /// turns load as many meshes and drapes, and the flash is gone.
     pub fn interactive_globe() -> Self {
         Self {
             maximum_screen_space_error: 2.0,
+            forbid_holes: false,
             ..Self::default()
         }
     }
