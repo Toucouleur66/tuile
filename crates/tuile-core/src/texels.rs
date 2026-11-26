@@ -429,8 +429,7 @@ impl Texels {
         let crossed = drape_cost(width, height, self.uploaded().cost_format());
         let cost = Cost::new(crossed.gpu, crossed.staging);
         let side = BlockFormat::BLOCK_SIDE;
-        let whole =
-            width > 0 && height > 0 && width.is_multiple_of(side) && height.is_multiple_of(side);
+        let whole = width > 0 && height > 0 && width.is_multiple_of(side) && height.is_multiple_of(side);
         if self.resident() != self.uploaded() && whole {
             let held = drape_cost(width, height, self.resident().cost_format());
             cost.compressible(held.gpu, crate::budget::cost::chain_blocks(width, height))
