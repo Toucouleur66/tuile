@@ -939,11 +939,18 @@ impl Budget {
         st.work = st.work.saturating_add(named);
     }
 
-    /// Whether `tn` asks for drapes this step: drawn or blocking, with
-    /// imagery.
+    /// Whether `tn` asks for drapes this step: drawn, blocking or an
+    /// ancestor of what is drawn, with imagery.
+    ///
+    /// An ancestor's drape is what a drawn tile wears while its own loads:
+    /// without it, the only stand-in left is the pinned floor's (level 2), a
+    /// flat colour over the ground, wherever the view turns faster than the
+    /// fine drapes come. One coarse drape serves every tile under it.
     pub(super) fn draped(tn: &TileNeed) -> bool {
-        matches!(tn.membership, Membership::Drawn | Membership::Blocker)
-            && tn.need.imagery.is_some()
+        matches!(
+            tn.membership,
+            Membership::Drawn | Membership::Blocker | Membership::Ancestor
+        ) && tn.need.imagery.is_some()
     }
 
     /// The imagery level of each layer tile `t` asks for this step, into
