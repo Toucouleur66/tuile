@@ -181,7 +181,7 @@ pub struct ContentPump {
     underlay_level: Option<u32>,
     /// The frame's view-projection, in render space, the underlay is culled
     /// against: see [`Self::set_underlay_view`].
-    underlay_view: Option<glam::Mat4>,
+    underlay_view: Option<(glam::Mat4, DVec3)>,
     /// The sources not drawn, a bit per tag: see [`Self::hide_source`].
     hidden_sources: u16,
     /// How many `Select` messages this pump has applied.
@@ -390,22 +390,30 @@ impl ContentPump {
     }
 
     /// The view-projection of the frame about to be drawn, in render space
-    /// (the pump's `render_origin`): what the underlay is culled against.
-    /// Without one the underlay is drawn whole, which is every held tile.
-    pub fn set_underlay_view(&mut self, view_proj: [f32; 16]) {
-        self.underlay_view = Some(glam::Mat4::from_cols_array(&view_proj));
+    /// (the pump's `render_origin`), and its eye (ECEF): what the underlay is
+    /// culled against. Without one the underlay is drawn whole, which is
+    /// every held tile.
+    pub fn set_underlay_view(&mut self, view_proj: [f32; 16], eye: DVec3) {
+        self.underlay_view = Some((glam::Mat4::from_cols_array(&view_proj), eye));
     }
 
-    /// Whether held tile `t` at `level` may be on screen in the underlay's
-    /// view: its sphere (its mesh's centre, a tile's width as radius) against
-    /// the view's four sides — near and far left out, whatever the depth
-    /// convention.
+    /// Whether held tile `t` at `level` belongs in the underlay's view: not
+    /// finer than a selection would take it at its distance — a tile left
+    /// from another view, finer than the ground the selection draws around
+    /// it, stands out of that ground (its peaks over the drawn horizon) —
+    /// and on screen: its sphere (its mesh's centre, a tile's width as
+    /// radius) against the view's four sides, near and far left out,
+    /// whatever the depth convention.
     fn underlay_sees(&self, t: &TileId, level: u32) -> bool {
-        let (Some(vp), Some(tile)) = (self.underlay_view, self.prepared.get(t)) else {
+        let (Some((vp, eye)), Some(tile)) = (self.underlay_view, self.prepared.get(t)) else {
             return true;
         };
+        let width = 6_378_137.0 * std::f64::consts::PI / f64::from(1u32 << level.min(30));
+        if tile.origin_ecef.distance(eye) > UNDERLAY_REACH * width {
+            return false;
+        }
         let c = (tile.origin_ecef - self.render_origin).as_vec3();
-        let radius = (6_378_137.0 * std::f64::consts::PI / f64::from(1u32 << level.min(30))) as f32;
+        let radius = width as f32;
         let (r0, r1, r3) = (vp.row(0), vp.row(1), vp.row(3));
         [r3 + r0, r3 - r0, r3 + r1, r3 - r1].iter().all(|p| {
             let n = p.truncate();
@@ -1288,6 +1296,11 @@ impl ContentPump {
                 floor.sort_by_key(|t| std::cmp::Reverse(level_of_tile(&self.ancestry, t)));
             }
             for tile in floor {
+                // An underlay tile with no drape of its own would be bare
+                // ground over the backdrop: left out.
+                if under && !self.drapes.keys().any(|r| r.tile() == tile) {
+                    continue;
+                }
                 if !dressed.contains(&tile) {
                     // The finest drape of its own it holds, per layer — or
                     // none: a floor tile is drawn bare rather than left out.
@@ -1599,6 +1612,12 @@ fn encode_share(deadline: FrameDeadline, ns_per_block: f64, frame_us: f64) -> u6
 
 /// The longest frame the encode share follows: a stall is not headroom.
 const MAX_FRAME_US: f64 = 250_000.0;
+
+/// How far from the eye an underlay tile may be, in its own widths: a
+/// selection at a few pixels of error takes a tile at four to eight widths
+/// (`set_underlay_level`); twelve keeps a level and a half finer than it at
+/// most, never the fine leftovers of a view far from this one.
+const UNDERLAY_REACH: f64 = 12.0;
 
 /// A held tile's level, 0 when its ancestry is unknown.
 fn level_of_tile(ancestry: &HashMap<TileId, Ancestry>, t: &TileId) -> u32 {
