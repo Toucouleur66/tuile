@@ -597,6 +597,8 @@ impl App {
                     .then_some(shell)
                     .into_iter()
                     .chain(coarse.iter().copied()),
+                // No underlay in the viewer yet (`ContentPump::set_underlay_level`).
+                std::iter::empty(),
                 // The 3D Tiles over the globe, before the globe's own
                 // tiles: where they are drawn they replace the ground, which
                 // keeps out of every pixel they took and covers the rest.

@@ -257,6 +257,7 @@ fn draw(
         renderer.paint_replacing(
             &mut pass,
             std::iter::empty(),
+            std::iter::empty(),
             replacing.iter().copied(),
             std::iter::empty(),
             ground.iter().copied(),

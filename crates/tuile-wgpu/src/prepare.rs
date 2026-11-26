@@ -142,7 +142,7 @@ pub struct PreparedTile {
     tile_buf: wgpu::Buffer,
     /// The tile's own rebasing origin (ECEF) and intrinsic transform, kept so
     /// the model matrix can be recomputed against a moving render origin.
-    origin_ecef: DVec3,
+    pub(crate) origin_ecef: DVec3,
     transform_local: Mat4,
     /// The tile's sides as its mesh states them, and where it is in the
     /// geographic quadtree by its own corners — `None` for content that is

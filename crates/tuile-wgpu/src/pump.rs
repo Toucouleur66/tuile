@@ -176,6 +176,12 @@ pub struct ContentPump {
     /// The level whose meshes are drawn as a backdrop behind the draw set,
     /// each in its own drape: see [`Self::set_backdrop_level`].
     backdrop_level: Option<u32>,
+    /// The level of the underlay, if one is drawn: see
+    /// [`Self::set_underlay_level`].
+    underlay_level: Option<u32>,
+    /// The frame's view-projection, in render space, the underlay is culled
+    /// against: see [`Self::set_underlay_view`].
+    underlay_view: Option<glam::Mat4>,
     /// The sources not drawn, a bit per tag: see [`Self::hide_source`].
     hidden_sources: u16,
     /// How many `Select` messages this pump has applied.
@@ -279,6 +285,8 @@ impl ContentPump {
             lost: 0,
             bare: 0,
             backdrop_level: None,
+            underlay_level: None,
+            underlay_view: None,
             hidden_sources: 0,
             selects_seen: 0,
             generation_sent: 0,
@@ -367,6 +375,42 @@ impl ContentPump {
     /// answered. `None`, the default, draws none.
     pub fn set_backdrop_level(&mut self, level: Option<u32>) {
         self.backdrop_level = level;
+    }
+
+    /// Draws the ground meshes the pump holds at `level` or finer that the
+    /// draw set does not, and that the view set by [`Self::set_underlay_view`]
+    /// sees, in their own drapes, *with depth*, over the ground nobody owns
+    /// and a little behind it ([`crate::renderer::UNDERLAY_PUSH`]), the finest
+    /// first, each where no finer one drew: real relief where a camera turned
+    /// faster than the selection, instead of the depthless backdrop, so the
+    /// skirts of the tiles around such a hole hang into ground rather than
+    /// into the open — no wall. `None`, the default, draws none.
+    pub fn set_underlay_level(&mut self, level: Option<u32>) {
+        self.underlay_level = level;
+    }
+
+    /// The view-projection of the frame about to be drawn, in render space
+    /// (the pump's `render_origin`): what the underlay is culled against.
+    /// Without one the underlay is drawn whole, which is every held tile.
+    pub fn set_underlay_view(&mut self, view_proj: [f32; 16]) {
+        self.underlay_view = Some(glam::Mat4::from_cols_array(&view_proj));
+    }
+
+    /// Whether held tile `t` at `level` may be on screen in the underlay's
+    /// view: its sphere (its mesh's centre, a tile's width as radius) against
+    /// the view's four sides — near and far left out, whatever the depth
+    /// convention.
+    fn underlay_sees(&self, t: &TileId, level: u32) -> bool {
+        let (Some(vp), Some(tile)) = (self.underlay_view, self.prepared.get(t)) else {
+            return true;
+        };
+        let c = (tile.origin_ecef - self.render_origin).as_vec3();
+        let radius = (6_378_137.0 * std::f64::consts::PI / f64::from(1u32 << level.min(30))) as f32;
+        let (r0, r1, r3) = (vp.row(0), vp.row(1), vp.row(3));
+        [r3 + r0, r3 - r0, r3 + r1, r3 - r1].iter().all(|p| {
+            let n = p.truncate();
+            n.dot(c) + p.w >= -radius * n.length()
+        })
     }
 
     /// Stops drawing the tiles of source `tag` (a composite's,
@@ -1205,7 +1249,16 @@ impl ContentPump {
         // drape, behind it all — the ground's alone: a 3D Tiles mesh at that
         // depth of its own tree is no ground.
         let mut backdrop: Vec<TileId> = Vec::new();
-        if let Some(level) = self.backdrop_level {
+        let mut underlay: Vec<TileId> = Vec::new();
+        let layers_wanted = [
+            (self.backdrop_level, false),
+            (self.underlay_level.filter(|u| Some(*u) != self.backdrop_level), true),
+        ];
+        for (level, under) in layers_wanted {
+            let Some(level) = level else { continue };
+            // The underlay takes every level from its own down; the backdrop
+            // its one.
+            let at = |l: u32| if under { l >= level } else { l == level };
             let ground = |t: &TileId| {
                 self.held
                     .get(&ResourceId::Mesh(*t))
@@ -1218,10 +1271,22 @@ impl ContentPump {
                 .filter(|t| {
                     self.ancestry
                         .get(t)
-                        .is_some_and(|a| a.level == level && !a.covers)
+                        .is_some_and(|a| at(a.level) && !a.covers)
                 })
                 .filter(ground)
+                // The underlay is what the selection does not draw, in view.
+                .filter(|t| {
+                    !under
+                        || (!exact.contains(t)
+                            && !fallback.contains(t)
+                            && self.underlay_sees(t, level_of_tile(&self.ancestry, t)))
+                })
                 .collect();
+            // The finest first: each underlay tile draws where no finer one did.
+            let mut floor = floor;
+            if under {
+                floor.sort_by_key(|t| std::cmp::Reverse(level_of_tile(&self.ancestry, t)));
+            }
             for tile in floor {
                 if !dressed.contains(&tile) {
                     // The finest drape of its own it holds, per layer — or
@@ -1254,7 +1319,7 @@ impl ContentPump {
                     let levels = Levels {
                         worn,
                         asked: worn,
-                        tile: level,
+                        tile: level_of_tile(&self.ancestry, &tile),
                         role: 2,
                         capped: 0,
                     };
@@ -1263,7 +1328,11 @@ impl ContentPump {
                     }
                     dressed.insert(tile);
                 }
-                backdrop.push(tile);
+                if under {
+                    underlay.push(tile);
+                } else {
+                    backdrop.push(tile);
+                }
             }
         }
         // Wearers of an evicted drape that nothing dressed again this frame
@@ -1327,6 +1396,7 @@ impl ContentPump {
             exact: surfaces(&exact),
             fallback: surfaces(&fallback),
             backdrop: surfaces(&backdrop),
+            underlay: surfaces(&underlay),
             covering: surfaces(&covering),
             covering_fallback: surfaces(&covering_fallback),
         };
@@ -1530,6 +1600,11 @@ fn encode_share(deadline: FrameDeadline, ns_per_block: f64, frame_us: f64) -> u6
 /// The longest frame the encode share follows: a stall is not headroom.
 const MAX_FRAME_US: f64 = 250_000.0;
 
+/// A held tile's level, 0 when its ancestry is unknown.
+fn level_of_tile(ancestry: &HashMap<TileId, Ancestry>, t: &TileId) -> u32 {
+    ancestry.get(t).map_or(0, |a| a.level)
+}
+
 /// What one mesh holds once uploaded, by the measure its estimate uses:
 /// its buffers and uniform, the textures it owns, and the CPU copy kept for
 /// stitching (which unified memory pays for).
@@ -1602,6 +1677,10 @@ pub struct Drawn<'a> {
     /// A complete coarse level of the ground behind it all (see
     /// [`ContentPump::set_backdrop_level`]).
     pub backdrop: Vec<&'a PreparedTile>,
+    /// Coarse relief under ground the selection has not reached yet (see
+    /// [`ContentPump::set_underlay_level`]): drawn with depth where nothing
+    /// owns the ground.
+    pub underlay: Vec<&'a PreparedTile>,
     /// The surfaces drawn in place of the ground (3D Tiles of a mesh of the
     /// whole surface, [`Ancestry::covers`](tuile_core::protocol::Ancestry)):
     /// drawn as themselves, and the ancestors standing in for theirs — what
