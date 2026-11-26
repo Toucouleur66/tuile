@@ -1413,12 +1413,17 @@ impl ContentPump {
             covering: surfaces(&covering),
             covering_fallback: surfaces(&covering_fallback),
         };
+        // Every tile drawn this frame is placed against this frame's render
+        // origin: a tile left at the origin it was last drawn from stands
+        // off by the eye's travel since — the underlay's held relief,
+        // kilometres away, stood up in the sky and laid sea over land.
         let origin = self.render_origin;
         for tile in drawn
             .exact
             .iter()
             .chain(drawn.fallback.iter())
             .chain(drawn.backdrop.iter())
+            .chain(drawn.underlay.iter())
             .chain(drawn.covering.iter())
             .chain(drawn.covering_fallback.iter())
         {
