@@ -188,12 +188,18 @@ pub fn skirt_height(rect: &GeoRect) -> f64 {
 ///   the edge of a source's coverage puts fine tiles against tiles several
 ///   levels coarser. The step between them is the *coarser* tile's error, and
 ///   where the fine tile is the higher side its own skirt is the only thing
-///   that can close it. So a skirt hangs as deep as that of a tile four
-///   levels coarser — sixteen times the rule, eighty
-///   geometric errors — which covers a neighbour up to six levels coarser
-///   (its error is 2⁶ = 64 of the tile's own). Coarse tiles need no such
-///   help and are left at the rule from level 6 up, where it already gives
-///   kilometres.
+///   that can close it. A skirt hung as deep as that of a tile four levels
+///   coarser closed it — sixteen times the rule — but that depth showed:
+///   wherever the selection had not reached the ground beside a fine tile
+///   (a camera orbiting fast moves its eye kilometres a second, and the
+///   ground near it is the last selected), its skirt stood hundreds of
+///   metres tall in the open, a wall of stretched texels down to whatever
+///   was drawn there. With an underlay drawn under unowned ground
+///   (`tuile_wgpu::ContentPump::set_underlay_level`), such a hole is ground,
+///   and the step to a much coarser neighbour is left to the rule: a sliver
+///   at worst, where the wall was a screen. `LEVELS_OF_REACH` keeps the
+///   choice a number. Coarse tiles are left at the rule from level 6 up,
+///   where it already gives kilometres.
 ///
 /// Depth costs nothing that shows. A wall hangs from the tile's own edge,
 /// straight down, under the line two tiles share: it is inside the ground on
@@ -205,8 +211,9 @@ pub fn skirt_depth(mesh: &QuantizedMesh, rect: &GeoRect) -> f64 {
     skirt_depth_cut(rect, mesh.cut)
 }
 
-/// A skirt reaches as deep as that of a tile this many levels coarser.
-const LEVELS_OF_REACH: i32 = 4;
+/// A skirt reaches as deep as that of a tile this many levels coarser: none,
+/// the references' rule (was 4: walls on a fast orbit, Céret, 2026-11-26).
+const LEVELS_OF_REACH: i32 = 0;
 /// …but no deeper than a tile's of this level: 6 km.
 const DEEPEST_LEVEL_REACHED: i32 = 6;
 
@@ -993,18 +1000,19 @@ mod tests {
     }
 
     /// **A skirt is sized by the terrain its surface is from, and reaches
-    /// past a neighbour of another level.**
+    /// as deep as a tile `LEVELS_OF_REACH` levels coarser.**
     #[test]
     fn skirt_depth_follows_the_source_and_reaches_coarser_neighbours() {
         let scheme = GeographicTilingScheme::default();
         let at = |level: u32| scheme.tile_rect(TileCoord::new(level, 0, 0));
         let rule = |level: u32| skirt_height(&at(level));
+        let reach = LEVELS_OF_REACH as u32;
 
-        // As deep as the rule gives a tile four levels coarser…
-        assert!((skirt_depth_cut(&at(13), 0) - rule(9)).abs() < 1.0e-6);
-        assert!((skirt_depth_cut(&at(19), 0) - rule(15)).abs() < 1.0e-6);
+        // As deep as the rule gives a tile `reach` levels coarser…
+        assert!((skirt_depth_cut(&at(13), 0) - rule(13 - reach)).abs() < 1.0e-6);
+        assert!((skirt_depth_cut(&at(19), 0) - rule(19 - reach)).abs() < 1.0e-6);
         // …down to level 6's and no deeper…
-        assert!((skirt_depth_cut(&at(8), 0) - rule(6)).abs() < 1.0e-6);
+        assert!((skirt_depth_cut(&at(8), 0) - rule((8 - reach).max(6))).abs() < 1.0e-6);
         // …and where the rule already gives that much, the rule.
         assert!((skirt_depth_cut(&at(6), 0) - rule(6)).abs() < 1.0e-6);
         assert!((skirt_depth_cut(&at(2), 0) - rule(2)).abs() < 1.0e-6);
