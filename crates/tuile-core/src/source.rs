@@ -23,10 +23,18 @@
 
 use crate::content::DecodedTileContent;
 use crate::math::BoundingVolume;
-use crate::tileset::Refine;
 use async_trait::async_trait;
 
 pub use crate::budget::tile_id::{TileId, MAX_SOURCES};
+
+/// How a tile's children refine it: `Replace` draws them in its place, `Add`
+/// draws them on top of it. A property of any tree the traversal walks, not of
+/// one content: the 3D Tiles reader maps its `refine` field onto it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refine {
+    Replace,
+    Add,
+}
 
 /// Topological properties of a tile — everything the traversal needs to make
 /// a refine/render/cull decision, without loading the tile.

@@ -230,8 +230,7 @@ impl Neighbourhood {
 mod tests {
     use super::*;
     use crate::math::Obb;
-    use crate::source::TileProperties;
-    use crate::tileset::Refine;
+    use crate::source::{Refine, TileProperties};
     use glam::DMat3;
 
     /// A flat quadtree over a square of 2²⁰ m: level `l`'s tiles are
