@@ -417,7 +417,7 @@ pub struct Sim {
     /// 0 where the platform gives no thread clock.
     pub decide_cpu_us: Vec<(Micros, f64)>,
     /// Instructions retired and cycles over each `decide` call, with the
-    /// step's time ([`instructions_cycles`]; zeros where uncounted).
+    /// step's time (`instructions_cycles`; zeros where uncounted).
     pub decide_instructions: Vec<(Micros, u64, u64)>,
     /// What the heap saw during each `decide` call, with the step's time.
     pub decide_allocs: Vec<DecideAllocs>,
@@ -427,7 +427,7 @@ pub struct Sim {
     /// with the step's time. Absent on a whole-need step.
     pub diff_us: Vec<(Micros, f64, u64)>,
     /// Also count the allocations of the step's output alone (a clone of
-    /// its `Decisions`), for [`DecideAllocs::output`]: off by default, it
+    /// its `Decisions`), for `DecideAllocs::output`: off by default, it
     /// costs a clone per step.
     pub count_output: bool,
     /// Per tile: (mesh level drawn, drape level worn, last change time),
