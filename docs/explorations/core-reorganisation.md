@@ -3,9 +3,35 @@
 
 # Reorganising the workspace around a minimal core
 
-Status: **design, for Laurent's review** (2026-11-27). No code moved yet. The
-survey it rests on is [`core-reorganisation-map.md`](core-reorganisation-map.md).
-Phase 2 (`tuile-volume`) waits for this page to be approved.
+Status: **design approved with the decisions below** (2026-11-27); moves in
+progress (see Status at the end). The survey it rests on is
+[`core-reorganisation-map.md`](core-reorganisation-map.md). Phase 2
+(`tuile-volume`) waits until phase 1 has landed.
+
+## Decisions (Laurent, 2026-11-27)
+
+1. **Option A** (§2): dependents change their `use` lines. The minimal core
+   keeps the name `tuile-core`.
+2. **Step 0 is approved as its own tests-only PR.**
+   - The traversal tests move onto a test tree built in Rust: same volumes,
+     same pre-order ids, not a JSON reader.
+   - The runtime tests that load real glb content stay in the core. They run
+     on that tree with a synthetic in-memory loader that returns exactly what
+     `decode(test_glb)` returns. A **committed** test proves that equivalence
+     bit for bit, so costs and the budget stay checked.
+   - What is really 3D Tiles moves to `tuile-3dtiles`: grafts, glb/b3dm
+     decoding, the tileset and its loader. That crate keeps at least one
+     end-to-end test that drives a `GeometryServer` through the public API
+     with a real glb and `FsFetcher`.
+   - No `test-support` feature: production code is never compiled
+     differently for tests of another crate.
+3. **Imagery gets its own crate, `tuile-imagery`**, below `tuile-bing` and
+   `tuile-planetary`, which both depend on it. The graph must stay acyclic.
+4. **The 3D Tiles crate is named `tuile-3dtiles`.**
+5. **The move order is free, provided every PR stays green and small.**
+   Moves that touch files other PRs are changing (`raster.rs`, `surface`'s
+   `height_at`, `traversal.rs`, `tuile-planetary`, `tuile-terrain/src/mesh.rs`,
+   `tuile-budget`) wait until those PRs are merged.
 
 ## 0. Summary
 
@@ -300,4 +326,18 @@ about code no test reaches (the viewer's native and web launch paths,
 
 - 2026-11-27: map and design page written on `refactor/core-reorganisation`.
   Stopped before any move, as the brief asks when moves are not pure.
-  Waiting for Laurent's answers to §10.
+- 2026-11-27, later: §10 answered (see Decisions). Stack #343 opened:
+  - #341: `Refine` → `source`.
+  - #342: step 0, the traversal side. 40 traversal tests and 2 runtime
+    tests run on `traversal::tests::TestTree`. A throwaway check found the
+    trees bit-identical, except the region fixture: 13 of its 63 OBBs differ
+    by up to 9.6e-10 m, from serde_json's float parsing. Mutation run: the
+    rewritten tests still fail when the SSE factor or ADD refinement is
+    broken.
+- Builder caveat found on the way: `git archive` dates files by their
+  commit, and the target cache is shared by slot. cargo can then reuse
+  another run's build of a crate and report results for the wrong tree.
+  Every run now starts by touching the tree.
+- Next: step 0b (the runtime tests on the synthetic loader, with its
+  committed equivalence test), then `tuile-3dtiles`. `surface`, imagery and
+  `stitch`/`seam` wait for the PRs that touch their files.
