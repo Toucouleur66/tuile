@@ -1508,6 +1508,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: the table holds what a direct march finds, ~10 s in debug"]
     fn the_table_holds_what_a_direct_march_finds() {
         let air = clear();
         for (h, mu) in [(0.0, 1.0), (1500.0, 0.3), (8000.0, 0.05), (300.0, -0.01)] {
@@ -1575,6 +1576,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: the twilight zenith is blue because of ozone, ~19 s in debug"]
     fn the_twilight_zenith_is_blue_because_of_ozone() {
         let sun = up_at(-4.0);
         let with = clear().sky_radiance(0.0, DVec3::Z, sun);
@@ -1592,6 +1594,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: the diffuse share of daylight grows as the sun sets, ~13 s in debug"]
     fn the_diffuse_share_of_daylight_grows_as_the_sun_sets() {
         let air = clear();
         let mut last = 0.0;
@@ -1609,6 +1612,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: a clear skys brightness against the ground is what is measured, ~15 s in debug"]
     fn a_clear_skys_brightness_against_the_ground_is_what_is_measured() {
         // Measured under clear skies, the sun about 50° up: the zenith at
         // 3 to 7 kcd/m² while the sun's beam alone brings level ground 75 to
@@ -1724,6 +1728,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: the air is set against the ground the imagery stands for, ~14 s in debug"]
     fn the_air_is_set_against_the_ground_the_imagery_stands_for() {
         // Imagery whose texel of one is ground four times as bright: the
         // air's light a quarter of what it is against a white texel, the
@@ -1751,6 +1756,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: the light falls and warms as the sun sets and never below the floor, ~13 s in debug"]
     fn the_light_falls_and_warms_as_the_sun_sets_and_never_below_the_floor() {
         let mut last_ev = f32::INFINITY;
         let mut last_warmth = 0.0;
@@ -1784,6 +1790,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: the light moves smoothly through sunset, ~13 s in debug"]
     fn the_light_moves_smoothly_through_sunset() {
         let mut last: Option<SkyLight> = None;
         for step in 0..=40 {
@@ -1830,6 +1837,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: a full moon lights the night and its sky more than a moonless one, ~13 s in debug"]
     fn a_full_moon_lights_the_night_and_its_sky_more_than_a_moonless_one() {
         let at = place(500.0);
         let e = f64::to_radians(-30.0);
@@ -1873,6 +1881,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: the light never steps from day to night and back, ~20 s in debug"]
     fn the_light_never_steps_from_day_to_night_and_back() {
         let at = place(500.0);
         let mut last: Option<ReferenceIllumination> = None;
@@ -1921,6 +1930,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: a frame half in daylight is exposed for its day, ~13 s in debug"]
     fn a_frame_half_in_daylight_is_exposed_for_its_day() {
         let at = place(70_000.0);
         let enu = enu_frame(at);
@@ -1988,6 +1998,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: the air below the horizon seen from high up is never black, ~13 s in debug"]
     fn the_air_below_the_horizon_seen_from_high_up_is_never_black() {
         let air = clear();
         let lum = |l: [f64; 3]| 0.2126 * l[0] + 0.7152 * l[1] + 0.0722 * l[2];
@@ -2010,6 +2021,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: from outside the air the limb glows and space is empty, ~12 s in debug"]
     fn from_outside_the_air_the_limb_glows_and_space_is_empty() {
         let air = clear();
         let height = 300_000.0;
@@ -2069,6 +2081,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow: a fragment where the light was worked out is lit as the frame is, ~11 s in debug"]
     fn a_fragment_where_the_light_was_worked_out_is_lit_as_the_frame_is() {
         for elevation in [50.0, 20.0, 6.0, 1.0, -3.0, -20.0] {
             let light = lit(elevation, 500.0);

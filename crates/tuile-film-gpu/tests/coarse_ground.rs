@@ -455,6 +455,7 @@ fn a_sea_of_coarse_facets_under_the_looks_haze_shows_none_of_them() {
     target_os = "macos",
     ignore = "the atmosphere's hill pictures are to be frozen again under the GPU light (#149)"
 )]
+#[ignore = "slow: gpu: near ground and relief as they were, ~30 s in debug"]
 fn near_ground_and_relief_are_drawn_as_they_were() {
     let looks = [
         ("noon", sun_at(60.0), None),

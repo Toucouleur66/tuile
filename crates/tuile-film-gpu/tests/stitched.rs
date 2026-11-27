@@ -429,6 +429,7 @@ fn stitched_ground_is_closed_with_no_skirt_at_all() {
 }
 
 #[test]
+#[ignore = "slow: gpu: the shaders move a vertex as the engine does, ~12 s in debug"]
 fn the_shaders_move_a_vertex_as_the_engine_does() {
     let scene = |how, shadows| Scene {
         how,

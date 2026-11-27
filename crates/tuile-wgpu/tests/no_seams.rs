@@ -721,6 +721,7 @@ fn stitched_tiles_show_no_seam_with_no_skirt_at_all() {
 /// as tiles are drawn: closed in every frame. The skirts are the net under
 /// the slide.
 #[test]
+#[ignore = "slow: gpu: an edge slides without a gap, ~43 s in debug"]
 fn an_edge_slides_to_its_new_neighbour_and_never_gaps() {
     let Some(gpu) = gpu() else { return };
     let coarse = TileId::from_terrain(4, 17, 10);

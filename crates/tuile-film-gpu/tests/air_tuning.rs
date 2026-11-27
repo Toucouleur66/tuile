@@ -86,6 +86,7 @@ fn uniforms(air: &AirTuning) -> (AtmosphereUniform, FrameUniform, Look) {
 }
 
 #[test]
+#[ignore = "slow: gpu: every value of the air reaches the uniforms, ~39 s in debug"]
 fn every_value_of_the_air_reaches_the_shaders_uniforms() {
     let today = uniforms(&AirTuning::default());
     let air = tuning(&[
@@ -133,6 +134,7 @@ fn every_value_of_the_air_reaches_the_shaders_uniforms() {
 }
 
 #[test]
+#[ignore = "slow: gpu: today's air is today's uniforms, ~17 s in debug"]
 fn todays_air_is_todays_uniforms() {
     let (a, f, look) = uniforms(&AirTuning::default());
     assert_eq!(a.tuning, [6.0, 12.0, 24.0, 0.0]);

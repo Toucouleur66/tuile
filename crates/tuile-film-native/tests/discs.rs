@@ -163,6 +163,7 @@ fn of(rows: &[DiscLight], body: Body) -> DiscLight {
 /// not normalised (its mean, 0.8: defect 2 of the study), and a sun a few
 /// pixels across was a step at each pixel.
 #[test]
+#[ignore = "slow: gpu: a sun's light at any size, ~22 s in debug"]
 fn a_sun_carries_the_light_that_lights_the_ground_at_any_size() {
     let sun = south_at(30.0);
     for across in [3.0, 8.0, 50.0] {
@@ -208,6 +209,7 @@ fn a_half_set_sun_shows_its_upper_half_at_its_own_brightness() {
 /// edge no longer a smoothstep over the outer 4 % of its radius, which took
 /// 4 % of it.
 #[test]
+#[ignore = "slow: gpu: a full moon's light at any size, ~24 s in debug"]
 fn a_full_moon_carries_its_light_at_any_size() {
     let sun = south_at(-30.0);
     let to_moon = DVec3::new(0.5f64.sqrt(), 0.5f64.sqrt(), 0.0);

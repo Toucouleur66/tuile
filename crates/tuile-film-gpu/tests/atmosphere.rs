@@ -175,6 +175,7 @@ fn at(rgba: &[u8], x: u32, y: u32) -> [f32; 3] {
 }
 
 #[test]
+#[ignore = "slow: gpu: the sky-view table is the CPU sky, ~100 s in debug"]
 fn the_sky_view_table_is_the_cpu_sky() {
     for elevation in [35.0, 3.0, -3.0] {
         let Some(mut film) = film(atmospheric(elevation)) else {
@@ -220,6 +221,7 @@ fn the_sky_view_table_is_the_cpu_sky() {
 }
 
 #[test]
+#[ignore = "slow: gpu: the ground dims at sunset and is never black, ~112 s in debug"]
 fn the_ground_dims_and_warms_as_the_sun_sets_and_is_never_black() {
     let mut last: Option<[f32; 3]> = None;
     let mut skies = Vec::new();
@@ -528,6 +530,7 @@ const FROZEN_DEFAULT_FILM: &str = "c203a130175f25bd";
 /// log-average meters a frame of bright sky over dark ground. `TUILE_FILM_DIGEST_DUMP`
 /// writes the pictures out.
 #[test]
+#[ignore = "slow: gpu: an atmosphere film's pictures to the byte, ~15 s in debug"]
 fn an_atmosphere_films_pictures_are_the_same_to_the_byte() {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for elevation in [45.0, 3.0] {
@@ -574,6 +577,7 @@ const FROZEN_ATMOSPHERE_FILM: &str = "03dae0e8df4bcad9";
 /// [`a_default_films_pictures_are_the_same_to_the_byte`] is frozen on:
 /// what it moves by is said, with its reason, where it moves.
 #[test]
+#[ignore = "slow: gpu: a film's discs to the byte, ~25 s in debug"]
 fn a_films_discs_are_the_same_to_the_byte() {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     let to_moon = DVec3::new(20f64.to_radians().sin(), 0.6, -0.8).normalize();

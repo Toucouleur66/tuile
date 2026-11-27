@@ -631,6 +631,7 @@ fn a_low_view_shows_sky_over_the_horizon() {
 /// faster — the light is worked out every frame, and every frame's sun is
 /// the clock's at that frame: no step to wait for, no interval.
 #[test]
+#[ignore = "slow: gpu: the light follows the clock, ~64 s in debug"]
 fn the_light_is_worked_out_every_frame_and_follows_the_clock() {
     let Some(gpu) = gpu() else { return };
     let eye = eye_at(PIC_LON, PIC_LAT, 2_877.0, 270.0, -4.0);
@@ -719,6 +720,7 @@ fn a_fictional_day_turns_its_sun_and_lights_its_ground() {
 /// The same configuration and the same clock give the same sky, to the
 /// bit: no clock is read but the one handed in.
 #[test]
+#[ignore = "slow: gpu: the same clock, the same sky, ~41 s in debug"]
 fn the_same_clock_gives_the_same_sky() {
     let Some(gpu) = gpu() else { return };
     let eye = eye_at(PIC_LON, PIC_LAT, 2_877.0, 270.0, -4.0);

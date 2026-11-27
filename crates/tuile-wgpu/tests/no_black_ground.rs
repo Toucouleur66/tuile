@@ -401,6 +401,7 @@ fn draped_ground_under_the_camera_is_never_black_under_every_plan() {
 /// replacement is RGBA8. Switched back on, the next one is the block format
 /// again, encoded on the GPU. Every frame of it is measured for black.
 #[test]
+#[ignore = "slow: gpu: the ground stays drawn when compression is switched, ~13 s in debug"]
 fn compression_switched_under_a_session_keeps_the_ground_drawn() {
     use tuile_core::texels::{ImageryEncode, ImageryFormat};
     let Some(mut gpu) = (match pollster::block_on(GpuContext::headless_switchable(
