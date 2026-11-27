@@ -719,7 +719,7 @@ mod tests {
                 assert!(Arc::ptr_eq(tile, &s.tiles[&key]), "key {key}");
                 assert_eq!(drawn, *ranked_drawn, "key {key}");
             }
-            for lon in [9.9, 10.0, 10.0002, 10.02, 11.0] {
+            for lon in [9.9f64, 10.0, 10.0002, 10.02, 11.0] {
                 assert_eq!(
                     s.height_at(lon.to_radians(), 45f64.to_radians()),
                     by_key(s, lon),
