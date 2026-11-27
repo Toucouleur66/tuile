@@ -210,11 +210,7 @@ pub(crate) struct Budget {
 
 impl Budget {
     /// See `tuile_planetary::LayerBudget::set_from_device_capped`.
-    pub(crate) fn set_from_device_capped(
-        &self,
-        max_sampled_textures_per_stage: u32,
-        ceiling: u32,
-    ) {
+    pub(crate) fn set_from_device_capped(&self, max_sampled_textures_per_stage: u32, ceiling: u32) {
         self.local
             .set_from_device_capped(max_sampled_textures_per_stage, ceiling);
         if let Some(link) = self.link.as_ref() {
