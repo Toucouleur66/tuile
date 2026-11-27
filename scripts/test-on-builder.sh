@@ -167,6 +167,8 @@ if [ "$build_rc" -ne 0 ] || [ ! -f "${OUT}/exit-code" ]; then
     echo "test-on-builder: step logs$([ -f "${OUT}/changes.patch" ] && echo ' and changes.patch') recovered from the progress into ${OUT}" >&2
     exit 1
 fi
+# Which tree these results are for: the commit archived, as git names it.
+echo "=== tested $(git -C "$REPO_ROOT" rev-parse "$REF") (${REF})" | tee -a "${OUT}/summary.txt"
 rc="$(cat "${OUT}/exit-code")"
 echo "=== exit ${rc}; logs in ${OUT}"
 exit "$rc"

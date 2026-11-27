@@ -100,11 +100,6 @@ ENV CARGO_HOME=/cargo-home CARGO_TERM_COLOR=never CARGO_NET_GIT_FETCH_WITH_CLI=t
 FROM base AS test
 WORKDIR /repo
 COPY . .
-# The context's files carry their commit's time, and the target caches persist
-# per slot: a ref committed before a slot's last build would look unchanged to
-# cargo and run stale code. Stamp the tree now (this layer is only rebuilt when
-# the content changes, so an unchanged tree keeps its earlier stamp).
-RUN find . -path ./target -prune -o -type f -print0 | xargs -0 touch
 
 # The slot of the builder this run holds: one target directory per slot, so
 # two runs at once never share one (two trees in one target dir thrash it and
@@ -139,6 +134,13 @@ echo "=== mesa: $(dpkg-query -W -f='${Version}' mesa-vulkan-drivers)"
 # The commands leave the tree first: they are not part of what is tested.
 if [ -f .test-on-builder/commands ]; then mv .test-on-builder/commands /tmp/commands; fi
 rm -rf .test-on-builder
+# The tree is newer than anything in the target cache. `git archive` dates
+# every file by its commit and COPY keeps those dates, while the target
+# directory is shared by every run of this slot: a commit older than the last
+# build of a crate would look fresh to cargo, which would run the previous
+# run's binary for it. Touched here, inside the run that mounts the cache (a
+# layer of its own would be cached with the old dates).
+find /repo -path /repo/target -prune -o -type f -print0 | xargs -0 touch
 snap() { git --git-dir=/tmp/tree.git --work-tree=/repo -c core.autocrlf=false "$@"; }
 snap init -q && snap add -A && snap -c user.name=t -c user.email=t@t commit -qm tree \
     || echo "=== no snapshot of the tree: changes.patch will be missing"
