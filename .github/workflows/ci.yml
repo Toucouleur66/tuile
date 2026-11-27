@@ -6,11 +6,15 @@ on:
   pull_request:
 
 # A new push to a pull request supersedes the run of the previous one: that
-# run is cancelled rather than left holding runners (macOS runners are few,
-# and a stack of pull requests pushes them all at once). Runs on main are
-# never cancelled: each merge is tested.
+# run is cancelled rather than left holding runners. Runs on main share ONE
+# group and are not cancelled while running: the run in progress finishes, and
+# of the runs waiting behind it GitHub keeps only the newest (the older
+# pending ones are cancelled). A stack of merges therefore tests the last
+# merge, which contains the others, instead of queueing one run per merge on
+# the self-hosted runners. (A broken merge followed at once by its fix shows
+# only the fix's result.)
 concurrency:
-  group: ci-${{ github.event_name == 'pull_request' && github.head_ref || github.sha }}
+  group: ${{ github.event_name == 'pull_request' && format('ci-{0}', github.head_ref) || 'ci-main' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Where the Linux jobs run. `tuile-linux` is a self-hosted runner scale set
