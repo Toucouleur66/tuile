@@ -10,8 +10,7 @@
 //! `docs/10-crate-core.md`, « Décisions tranchées »).
 
 use crate::math::{Frustum, Occluder};
-use crate::source::{TileId, TileTree};
-use crate::tileset::Refine;
+use crate::source::{Refine, TileId, TileTree};
 use glam::{DMat4, DVec2, DVec3};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -1618,7 +1617,7 @@ pub(crate) mod tests {
                     radius: if root { 10.0 } else { 5.0 },
                 }),
                 geometric_error: if root { Self::ERROR } else { 0.0 },
-                refine: crate::tileset::Refine::Replace,
+                refine: crate::source::Refine::Replace,
                 has_content: true,
             }
         }
@@ -1733,7 +1732,7 @@ pub(crate) mod tests {
             crate::source::TileProperties {
                 bounding_volume: self.at(if id == TileId(0) { 0.0 } else { 150.0 }),
                 geometric_error: 0.0,
-                refine: crate::tileset::Refine::Replace,
+                refine: crate::source::Refine::Replace,
                 has_content: true,
             }
         }
@@ -1841,7 +1840,7 @@ pub(crate) mod tests {
                     radius: 100.0,
                 }),
                 geometric_error: 0.0,
-                refine: crate::tileset::Refine::Replace,
+                refine: crate::source::Refine::Replace,
                 has_content: true,
             }
         }

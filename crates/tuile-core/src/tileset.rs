@@ -114,11 +114,8 @@ pub enum RefineJson {
 // Runtime layer (arena)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Refine {
-    Replace,
-    Add,
-}
+/// Re-exported from [`crate::source`], where the traversal reads it.
+pub use crate::source::Refine;
 
 impl From<RefineJson> for Refine {
     fn from(r: RefineJson) -> Self {

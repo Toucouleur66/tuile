@@ -4872,7 +4872,7 @@ mod tests {
                         radius: 1.0,
                     }),
                     geometric_error: 1.0,
-                    refine: crate::tileset::Refine::Replace,
+                    refine: crate::source::Refine::Replace,
                     has_content: false,
                 }
             }
