@@ -159,35 +159,38 @@ jobs:
   #     tuile-hydra (the C ABI).
   # The whole workspace is still *built* here, every test target included,
   # as `cargo test` built it, so code that only compiles on macOS is checked.
-  test-macos:
-    runs-on: macos-latest
-    env:
-      TUILE_REQUIRE_GPU: 1
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
-      MACOS_TESTS: >-
-        package(tuile-wgpu) | package(tuile-film-gpu) | package(tuile-film-native)
-        | package(tuile-atmosphere) | package(tuile-bevy) | package(tuile-bevy-viewer)
-        | package(tuile-viewer) | package(tuile-viewer-bundle) | package(tuile-record)
-        | package(tuile-globe-bulk) | package(tuile-orbit-probe)
-        | package(tuile-storage-foyer) | package(tuile-native-fetchers) | package(tuile-farm)
-        | package(tuile-bake) | package(tuile-hydra)
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: test
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: nextest@0.9.148
-      - run: cargo nextest run --profile ci --workspace -E "$MACOS_TESTS"
-      - run: >-
-          cargo test --doc
-          -p tuile-wgpu -p tuile-film-gpu -p tuile-film-native -p tuile-atmosphere
-          -p tuile-bevy -p tuile-viewer -p tuile-record
-          -p tuile-storage-foyer -p tuile-native-fetchers -p tuile-farm
-          -p tuile-bake -p tuile-hydra
+  # PAUSED: the macOS job is commented out until it can run again (the hosted
+  # macOS runners are locked by the account's billing). The job is kept as is,
+  # below, so that restoring it is un-commenting these lines.
+  # test-macos:
+  #   runs-on: macos-latest
+  #   env:
+  #     TUILE_REQUIRE_GPU: 1
+  #     CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  #     MACOS_TESTS: >-
+  #       package(tuile-wgpu) | package(tuile-film-gpu) | package(tuile-film-native)
+  #       | package(tuile-atmosphere) | package(tuile-bevy) | package(tuile-bevy-viewer)
+  #       | package(tuile-viewer) | package(tuile-viewer-bundle) | package(tuile-record)
+  #       | package(tuile-globe-bulk) | package(tuile-orbit-probe)
+  #       | package(tuile-storage-foyer) | package(tuile-native-fetchers) | package(tuile-farm)
+  #       | package(tuile-bake) | package(tuile-hydra)
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: dtolnay/rust-toolchain@stable
+  #     - uses: Swatinem/rust-cache@v2
+  #       with:
+  #         shared-key: test
+  #         save-if: ${{ github.ref == 'refs/heads/main' }}
+  #     - uses: taiki-e/install-action@v2
+  #       with:
+  #         tool: nextest@0.9.148
+  #     - run: cargo nextest run --profile ci --workspace -E "$MACOS_TESTS"
+  #     - run: >-
+  #         cargo test --doc
+  #         -p tuile-wgpu -p tuile-film-gpu -p tuile-film-native -p tuile-atmosphere
+  #         -p tuile-bevy -p tuile-viewer -p tuile-record
+  #         -p tuile-storage-foyer -p tuile-native-fetchers -p tuile-farm
+  #         -p tuile-bake -p tuile-hydra
 
   # The graphics budget's simulation and properties, in release: the
   # scenarios are too slow unoptimised (they are ignored in debug builds),
