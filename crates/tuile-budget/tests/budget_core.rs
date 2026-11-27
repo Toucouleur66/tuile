@@ -2188,6 +2188,44 @@ mod draw {
         assert_eq!((d.stats.fallback, d.stats.lost), (1, 0));
     }
 
+    /// An ancestor of what is drawn asks for its drapes: a drawn tile whose
+    /// own drape is still loading wears its ancestor's, not nothing (nor,
+    /// with a floor, the floor's). Red with `Budget::draped` listing drawn
+    /// and blocking tiles only: the ancestor's drape is never asked for,
+    /// and the tile is lost.
+    #[test]
+    fn a_drawn_tile_wears_its_ancestors_drape_while_its_own_loads() {
+        let mut r = Rig::interactive();
+        let a = t(3, 2, 2);
+        let k = children(a)[0];
+        let need = NeedSet {
+            drawn: vec![(k, draped(k, 4))],
+            ancestors: vec![(a, draped(a, 3))],
+            ..NeedSet::new()
+        };
+        // Everything lands but the drawn tile's own drapes.
+        let own = |res: ResourceId| matches!(res, ResourceId::Drape { tile, .. } if tile == k);
+        let mut d = r.step(&need);
+        for _ in 0..10 {
+            r.load_where(|res| !own(res));
+            r.upload(&d);
+            d = r.step(&need);
+        }
+        assert!(r.b.residency().drawable(k), "the tile's mesh is drawable");
+        assert!(
+            r.pending.contains_key(&dr(k, 4)),
+            "its own drape still loads"
+        );
+        let item = d.draw.get(mesh(k)).expect(RED);
+        assert_eq!(item.role, Role::Exact);
+        assert_eq!(
+            base_drape(item).map(|c| c.resource),
+            Some(dr(a, 3)),
+            "{RED}: the ancestor's drape"
+        );
+        assert_eq!(d.stats.lost, 0);
+    }
+
     /// I9 (coarsening), C19: on a zoom-out the children stay drawn until the
     /// parent is drawable, then go in the same step.
     #[test]
