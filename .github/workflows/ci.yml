@@ -88,33 +88,24 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --workspace --all-targets
       - run: cargo clippy --workspace --all-targets -- -D warnings
-
-  # The whole suite, on Linux, in three runners at once. Each test runs in
-  # its own process under nextest, and the slowest start first
-  # (`.config/nextest.toml`).
-  #
-  # One test, `the_limb_never_blinks_on_a_slow_way_out`, is a quarter of an
-  # hour of lavapipe on its own, and the rest of its binary as much again:
-  # each gets a runner, which builds that one binary only. The third runner
-  # builds the whole workspace and runs everything else — the filters are
-  # each other's complement, so a test renamed or added still runs somewhere.
       - if: always()
         uses: ./.github/actions/sccache-stats
+
+  # The whole suite, on Linux. Each test runs in its own process under
+  # nextest, and the slowest start first (`.config/nextest.toml`). The tests
+  # that take minutes of lavapipe each are tagged `slow:` and run on demand
+  # (`slow-tests` and `gpu-tests` workflows, docs/20-conventions.md), so one
+  # runner is enough. The matrix keeps its single `workspace` entry so the
+  # job's name, `test (ubuntu-24.04, workspace)`, does not change.
   test:
     name: test (ubuntu-24.04, ${{ matrix.shard.name }})
     strategy:
       fail-fast: false
       matrix:
         shard:
-          - name: limb
-            scope: -p tuile-wgpu --test sky_flicker
-            filter: test(=the_limb_never_blinks_on_a_slow_way_out)
-          - name: sky-flicker
-            scope: -p tuile-wgpu --test sky_flicker
-            filter: not test(=the_limb_never_blinks_on_a_slow_way_out)
           - name: workspace
             scope: --workspace
-            filter: not binary_id(tuile-wgpu::sky_flicker)
+            filter: all()
             doc: true
     # Pinned, not `ubuntu-latest`: the GPU tests render through lavapipe,
     # so the Linux image is also the Vulkan driver. On 2026-10-25
@@ -137,8 +128,7 @@ jobs:
         with:
           # The key the single `test` job had: main's cache keeps serving.
           shared-key: test
-          # The workspace runner builds a superset of the other two.
-          save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard.name == 'workspace' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - if: env.TUILE_CI_IMAGE != '1'
         uses: taiki-e/install-action@v2
         with:
