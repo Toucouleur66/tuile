@@ -20,3 +20,34 @@ runs:
           build-essential pkg-config cmake zstd xz-utils \
           libasound2-dev libwayland-dev libxkbcommon-dev \
           mesa-vulkan-drivers libvulkan1
+    # sccache, the shared compile cache, on a self-hosted runner only, and only
+    # when the runner pod was given the whole of it (bucket, region, key id and
+    # secret — the TUILE_SCCACHE_* of scripts/test-on-builder.sh): anything
+    # missing, nothing changes. Same install and same conventions as the
+    # builder (integrations/docker/sccache-{install,env}.sh); the key prefix is
+    # the runner's own, `gha-<arch>-gnu`, so CI and the builder never share an
+    # entry. A fork pull request never reaches here: it runs on a hosted runner.
+    - if: runner.environment == 'self-hosted' && github.event.pull_request.head.repo.fork != true
+      shell: bash
+      run: |
+        if [ -z "${TUILE_SCCACHE_BUCKET:-}" ] || [ -z "${TUILE_SCCACHE_KEY_ID:-}" ] \
+            || [ -z "${TUILE_SCCACHE_SECRET:-}" ]; then
+          echo "sccache: off (TUILE_SCCACHE_BUCKET / _KEY_ID / _SECRET not all set), compiling without it"
+          exit 0
+        fi
+        sudo sh "${GITHUB_WORKSPACE}/integrations/docker/sccache-install.sh"
+        command -v sccache > /dev/null || { echo "sccache: not installed, compiling without it"; exit 0; }
+        echo "::add-mask::${TUILE_SCCACHE_KEY_ID}"
+        echo "::add-mask::${TUILE_SCCACHE_SECRET}"
+        prefix="${TUILE_SCCACHE_PREFIX:-gha-$(uname -m)-gnu}"
+        {
+          echo "RUSTC_WRAPPER=sccache"
+          echo "CARGO_INCREMENTAL=0"
+          echo "SCCACHE_BUCKET=${TUILE_SCCACHE_BUCKET}"
+          echo "SCCACHE_S3_KEY_PREFIX=${prefix}"
+          echo "AWS_ACCESS_KEY_ID=${TUILE_SCCACHE_KEY_ID}"
+          echo "AWS_SECRET_ACCESS_KEY=${TUILE_SCCACHE_SECRET}"
+          [ -z "${TUILE_SCCACHE_REGION:-}" ] || echo "SCCACHE_REGION=${TUILE_SCCACHE_REGION}"
+          [ -z "${TUILE_SCCACHE_ENDPOINT:-}" ] || echo "SCCACHE_ENDPOINT=${TUILE_SCCACHE_ENDPOINT}"
+        } >> "${GITHUB_ENV}"
+        echo "sccache: on, s3://${TUILE_SCCACHE_BUCKET}/${prefix}"
