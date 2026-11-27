@@ -188,17 +188,22 @@ pub fn skirt_height(rect: &GeoRect) -> f64 {
 ///   the edge of a source's coverage puts fine tiles against tiles several
 ///   levels coarser. The step between them is the *coarser* tile's error, and
 ///   where the fine tile is the higher side its own skirt is the only thing
-///   that can close it. A skirt hung as deep as that of a tile four levels
-///   coarser closed it — sixteen times the rule — but that depth showed:
-///   wherever the selection had not reached the ground beside a fine tile
-///   (a camera orbiting fast moves its eye kilometres a second, and the
-///   ground near it is the last selected), its skirt stood hundreds of
-///   metres tall in the open, a wall of stretched texels down to whatever
-///   was drawn there. So the step to a much coarser neighbour is left to
-///   the rule: a sliver at worst, where the wall was a screen (a level-17
-///   tile against a level-11 one: 93 of 3840 rays through steps up to
-///   69 m). `LEVELS_OF_REACH` keeps the choice a number. Coarse tiles are
-///   left at the rule from level 6 up, where it already gives kilometres.
+///   that can close it. So a skirt hangs as deep as that of a tile
+///   [`SkirtOptions::levels_of_reach`] levels coarser — four by default:
+///   sixteen times the rule, eighty geometric errors — which covers a
+///   neighbour up to six levels coarser (its error is 2⁶ = 64 of the tile's
+///   own). Coarse tiles need no such help and are left at the rule from
+///   level [`SkirtOptions::deepest_level`] (6) up, where it already gives
+///   kilometres.
+///
+///   That depth shows where the selection has not reached the ground beside
+///   a fine tile (a camera orbiting fast moves its eye kilometres a second,
+///   and the ground near it is the last selected): the skirt stands hundreds
+///   of metres tall in the open, a wall of stretched texels. At 0 levels, the
+///   references' rule, the wall is a sliver, and the step to a much coarser
+///   neighbour is left open (a level-17 tile against a level-11 one: 93 of
+///   3840 rays through, steps up to 69 m). Which of the two a session pays is
+///   the host's number.
 ///
 /// Depth costs nothing that shows. A wall hangs from the tile's own edge,
 /// straight down, under the line two tiles share: it is inside the ground on
@@ -207,26 +212,67 @@ pub fn skirt_height(rect: &GeoRect) -> f64 {
 /// with anything: each wall is leaned (`Side::outward`) out of its own tile, so
 /// two neighbours' walls cross under the seam instead of sharing a plane.
 pub fn skirt_depth(mesh: &QuantizedMesh, rect: &GeoRect) -> f64 {
-    skirt_depth_cut(rect, mesh.cut)
+    skirt_depth_with(mesh, rect, &SkirtOptions::default())
 }
 
-/// A skirt reaches as deep as that of a tile this many levels coarser: none,
-/// the references' rule (was 4: walls on a fast orbit, Céret, 2026-11-26).
-const LEVELS_OF_REACH: i32 = 0;
-/// …but no deeper than a tile's of this level: 6 km.
-const DEEPEST_LEVEL_REACHED: i32 = 6;
+/// [`skirt_depth`], with the reach the host chose.
+pub fn skirt_depth_with(mesh: &QuantizedMesh, rect: &GeoRect, options: &SkirtOptions) -> f64 {
+    skirt_depth_cut_with(rect, mesh.cut, options)
+}
+
+/// How deep skirts reach, supplied by whoever builds the ground: numbers, so
+/// the depth is a continuous function of them, never a step.
+///
+/// - `levels_of_reach`: a skirt reaches as deep as that of a tile this many
+///   levels coarser. 4 by default, what the references' rule needs to close a
+///   neighbour up to six levels coarser; 0 is the references' own rule
+///   ([`skirt_height`]) — walls shorter by sixteen, steps to a much coarser
+///   neighbour left open (see [`skirt_depth`]). Negative or not a number is 0.
+/// - `deepest_level`: …but no deeper than a tile's of this level, 6 by
+///   default: 6 km. (Where the rule already gives more, the rule.)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SkirtOptions {
+    pub levels_of_reach: f64,
+    pub deepest_level: f64,
+}
+
+impl SkirtOptions {
+    /// The reach, in levels, of skirts nobody tuned.
+    pub const DEFAULT_LEVELS_OF_REACH: f64 = 4.0;
+    /// The deepest level a skirt reaches, when nobody tuned it.
+    pub const DEFAULT_DEEPEST_LEVEL: f64 = 6.0;
+}
+
+impl Default for SkirtOptions {
+    fn default() -> Self {
+        Self {
+            levels_of_reach: Self::DEFAULT_LEVELS_OF_REACH,
+            deepest_level: Self::DEFAULT_DEEPEST_LEVEL,
+        }
+    }
+}
 
 /// [`skirt_depth`], for a tile over `rect` whose surface was cut `cut` levels
 /// below the terrain tile it is from — for whoever knows that without holding
 /// the mesh.
 pub fn skirt_depth_cut(rect: &GeoRect, cut: u32) -> f64 {
-    let limit = std::f64::consts::PI / 2f64.powi(DEEPEST_LEVEL_REACHED);
+    skirt_depth_cut_with(rect, cut, &SkirtOptions::default())
+}
+
+/// [`skirt_depth_cut`], with the reach the host chose.
+pub fn skirt_depth_cut_with(rect: &GeoRect, cut: u32, options: &SkirtOptions) -> f64 {
+    let levels = if options.levels_of_reach.is_nan() {
+        0.0
+    } else {
+        options.levels_of_reach.max(0.0)
+    };
+    let limit = std::f64::consts::PI / 2f64.powf(options.deepest_level);
     // The rectangle of the terrain tile the surface is from.
     let source = rect.width() * 2f64.powi(cut as i32);
     let reached = if source >= limit {
         source
     } else {
-        (source * 2f64.powi(LEVELS_OF_REACH)).min(limit)
+        (source * 2f64.powf(levels)).min(limit)
     };
     skirt_height(&GeoRect {
         east: rect.west + reached,
@@ -248,7 +294,17 @@ pub fn to_ground(mesh: &QuantizedMesh, rect: &GeoRect) -> DecodedTileContent {
 /// [`to_ground`], with the mesh's normals or without them
 /// ([`to_decoded_with`]).
 pub fn to_ground_with(mesh: &QuantizedMesh, rect: &GeoRect, normals: bool) -> DecodedTileContent {
-    to_decoded_with(mesh, rect, skirt_depth(mesh, rect), normals)
+    to_ground_skirted(mesh, rect, normals, &SkirtOptions::default())
+}
+
+/// [`to_ground_with`], its skirts reaching as `options` say.
+pub fn to_ground_skirted(
+    mesh: &QuantizedMesh,
+    rect: &GeoRect,
+    normals: bool,
+    options: &SkirtOptions,
+) -> DecodedTileContent {
+    to_decoded_with(mesh, rect, skirt_depth_with(mesh, rect, options), normals)
 }
 
 /// Which side of the tile a wall stands on, and everything that follows from it.
@@ -998,21 +1054,20 @@ mod tests {
         assert!((skirt_height(&fine) - skirt_height(&coarse) / 4.0).abs() < 1.0e-9);
     }
 
-    /// **A skirt is sized by the terrain its surface is from, and hangs at
-    /// the references' rule for that terrain**: no deeper than its own
-    /// level's, at every level. Red with the skirts reaching a tile four
-    /// levels coarser (`LEVELS_OF_REACH` 4): sixteen times the rule.
+    /// **A skirt is sized by the terrain its surface is from, and reaches
+    /// past a neighbour of another level** — by default, four levels.
     #[test]
-    fn skirt_depth_follows_the_source_at_the_rule() {
+    fn skirt_depth_follows_the_source_and_reaches_coarser_neighbours() {
         let scheme = GeographicTilingScheme::default();
         let at = |level: u32| scheme.tile_rect(TileCoord::new(level, 0, 0));
         let rule = |level: u32| skirt_height(&at(level));
 
-        // A tile drawn from its own terrain hangs the rule's skirt…
-        assert!((skirt_depth_cut(&at(13), 0) - rule(13)).abs() < 1.0e-6);
-        assert!((skirt_depth_cut(&at(19), 0) - rule(19)).abs() < 1.0e-6);
-        assert!((skirt_depth_cut(&at(8), 0) - rule(8)).abs() < 1.0e-6);
-        // …and so do the coarse ones.
+        // As deep as the rule gives a tile four levels coarser…
+        assert!((skirt_depth_cut(&at(13), 0) - rule(9)).abs() < 1.0e-6);
+        assert!((skirt_depth_cut(&at(19), 0) - rule(15)).abs() < 1.0e-6);
+        // …down to level 6's and no deeper…
+        assert!((skirt_depth_cut(&at(8), 0) - rule(6)).abs() < 1.0e-6);
+        // …and where the rule already gives that much, the rule.
         assert!((skirt_depth_cut(&at(6), 0) - rule(6)).abs() < 1.0e-6);
         assert!((skirt_depth_cut(&at(2), 0) - rule(2)).abs() < 1.0e-6);
 
@@ -1028,6 +1083,65 @@ mod tests {
         let mut mesh = quad_mesh([0.0; 3]);
         mesh.cut = 3;
         assert_eq!(skirt_depth(&mesh, &at(16)), skirt_depth_cut(&at(16), 3));
+    }
+
+    /// **The reach is the host's number: 0 levels is the references' rule at
+    /// every level, and between the two the depth grows continuously.**
+    /// Red with the reach ignored (every depth the default's), and with a
+    /// reach that steps.
+    #[test]
+    fn skirt_depth_follows_the_hosts_reach() {
+        let scheme = GeographicTilingScheme::default();
+        let at = |level: u32| scheme.tile_rect(TileCoord::new(level, 0, 0));
+        let rule = |level: u32| skirt_height(&at(level));
+        let reach = |levels_of_reach: f64| SkirtOptions {
+            levels_of_reach,
+            ..SkirtOptions::default()
+        };
+
+        // No reach: a tile hangs the rule's skirt for its own terrain, at
+        // every level, and so does one cut from an ancestor.
+        let none = reach(0.0);
+        for level in [2, 6, 8, 13, 19] {
+            assert!(
+                (skirt_depth_cut_with(&at(level), 0, &none) - rule(level)).abs() < 1.0e-6,
+                "level {level}"
+            );
+        }
+        assert!((skirt_depth_cut_with(&at(16), 3, &none) - rule(13)).abs() < 1.0e-6);
+
+        // The default is the options' default, and is what the plain
+        // functions give.
+        assert_eq!(
+            skirt_depth_cut_with(&at(13), 0, &SkirtOptions::default()),
+            skirt_depth_cut(&at(13), 0)
+        );
+        let mut mesh = quad_mesh([0.0; 3]);
+        mesh.cut = 3;
+        assert_eq!(
+            skirt_depth_with(&mesh, &at(16), &none),
+            skirt_depth_cut_with(&at(16), 3, &none)
+        );
+
+        // Between: never shallower for more reach, and no step — a tenth of
+        // a level more is a tenth of a doubling more, no matter where.
+        let mut last = skirt_depth_cut_with(&at(13), 0, &none);
+        for tenth in 1..=40 {
+            let depth = skirt_depth_cut_with(&at(13), 0, &reach(f64::from(tenth) / 10.0));
+            assert!(depth >= last, "reach {}", f64::from(tenth) / 10.0);
+            assert!(
+                depth <= last * 2f64.powf(0.1) * (1.0 + 1.0e-9),
+                "a step at {tenth} tenths"
+            );
+            last = depth;
+        }
+        // A reach that is no number, or negative, is none.
+        for odd in [f64::NAN, -3.0] {
+            assert_eq!(
+                skirt_depth_cut_with(&at(13), 0, &reach(odd)),
+                skirt_depth_cut_with(&at(13), 0, &none)
+            );
+        }
     }
 
     #[test]
