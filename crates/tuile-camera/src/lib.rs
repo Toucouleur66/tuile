@@ -1163,7 +1163,10 @@ mod tests {
             ctrl.advance(1.0 / 60.0);
         }
         assert_eq!(ctrl.camera.position.to_array(), said.position.to_array());
-        assert!((ctrl.camera.position - before).length() > 1_000.0, "it coasted");
+        assert!(
+            (ctrl.camera.position - before).length() > 1_000.0,
+            "it coasted"
+        );
         for _ in 0..600 {
             ctrl.advance(1.0 / 60.0);
         }

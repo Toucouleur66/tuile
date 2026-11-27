@@ -451,12 +451,7 @@ async fn the_disk_budget_evicts_the_least_recently_read_zone() {
     let dir = tempfile::tempdir().expect("dir");
     // Measure one zone's archive, then allow a little more than one.
     let probe_dir = tempfile::tempdir().expect("dir");
-    let probe = with_disk(
-        objects.clone(),
-        &clock,
-        first_read(probe_dir.path()),
-    )
-    .await;
+    let probe = with_disk(objects.clone(), &clock, first_read(probe_dir.path())).await;
     let (x, y) = in_zone(0);
     probe.get(IMAGERY, LEVEL, x, y).await.expect("get");
     probe.settle().await;

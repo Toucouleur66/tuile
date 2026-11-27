@@ -118,7 +118,10 @@ fn a_frames_compressions_are_one_pass() {
         assert_eq!(pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED), 32);
         let _ = pump.resolve(&gpu);
         let ops = gpu.upload_ops() - before;
-        assert_eq!(ops.encode_passes, 0, "{compression:?}: display at once {ops:?}");
+        assert_eq!(
+            ops.encode_passes, 0,
+            "{compression:?}: display at once {ops:?}"
+        );
         // The budget asks for the sixteen drapes to be compressed in place.
         stream
             .inbox

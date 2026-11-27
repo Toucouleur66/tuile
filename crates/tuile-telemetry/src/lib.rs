@@ -269,10 +269,7 @@ mod tests {
         assert_eq!(r.get("service.name"), Some("tuile-viewer"));
         assert_eq!(r.get("service.version"), Some("0.17.1"));
         assert_eq!(r.get("vcs.ref.head.revision"), Some("abc123def456"));
-        assert_eq!(
-            r.get("vcs.ref.head.name"),
-            Some("v0.17.1-12-gabc123def456")
-        );
+        assert_eq!(r.get("vcs.ref.head.name"), Some("v0.17.1-12-gabc123def456"));
         assert_eq!(r.get("device.class"), Some("desktop"));
         assert_eq!(r.get("deployment.environment"), Some("test"));
         assert_ne!(r.get("service.instance.id"), Some("fixed"));

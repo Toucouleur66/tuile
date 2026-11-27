@@ -449,8 +449,12 @@ mod tests {
             Ok(("from-file".into(), TokenFrom::File(PathBuf::from(FILE))))
         );
         let mut no_file = mac(&[], None);
-        no_file.secrets.insert(TOKEN_VARIABLE.into(), "from-keychain");
-        no_file.settings.insert(TOKEN_VARIABLE.into(), "from-settings");
+        no_file
+            .secrets
+            .insert(TOKEN_VARIABLE.into(), "from-keychain");
+        no_file
+            .settings
+            .insert(TOKEN_VARIABLE.into(), "from-settings");
         assert_eq!(
             token(&no_file, TOKEN_VARIABLE),
             Ok(("from-keychain".into(), TokenFrom::SecureStorage))

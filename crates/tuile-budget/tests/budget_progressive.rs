@@ -98,7 +98,10 @@ impl View {
                 };
                 let (l, x, y) = t.terrain_coord();
                 let n = f64::from(1u32 << l);
-                let (cx, cy) = ((x as f64 + 0.5) / n - self.fx, (y as f64 + 0.5) / n - self.fy);
+                let (cx, cy) = (
+                    (x as f64 + 0.5) / n - self.fx,
+                    (y as f64 + 0.5) / n - self.fy,
+                );
                 cx * lx + cy * ly >= 0.0
             })
             .collect()
@@ -206,12 +209,18 @@ fn the_pinned_floor_stays_under_pressure_and_the_coarse_levels_go_last() {
         }
         r.complete(&d);
     }
-    assert!(evicted > 0, "the pressure evicted nothing: the test proves nothing");
+    assert!(
+        evicted > 0,
+        "the pressure evicted nothing: the test proves nothing"
+    );
     // The graded coarse levels outrank everything finer but the need.
     let p = tuile_budget::spec::PROGRESSIVE;
     let a = |l| tuile_budget::progressive_terms(&p, l, 13, 0, 4).0;
     assert!(a(3) > a(4) && a(4) > a(5) && a(5) > a(8) && a(12) > a(9));
-    assert!(a(3) > a(12) && a(3) > a(14), "level 3 is released after the levels by the need");
+    assert!(
+        a(3) > a(12) && a(3) > a(14),
+        "level 3 is released after the levels by the need"
+    );
     for l in 0..=FLOOR {
         for x in 0..(1u64 << l) {
             for y in 0..(1u64 << l) {
@@ -233,7 +242,10 @@ fn an_aggressive_zoom_out_from_level_13_finds_its_ground_resident() {
     settle(&mut r, &start.need(4), 600);
     for l in [11, 12] {
         for (_, id) in around(l, fx, fy, 2.0) {
-            assert!(gpu(&r, id), "level {l}: {id:?} not resident before the zoom-out");
+            assert!(
+                gpu(&r, id),
+                "level {l}: {id:?} not resident before the zoom-out"
+            );
         }
     }
     for n in (5..13).rev() {
@@ -283,7 +295,13 @@ fn the_release_order_follows_the_score() {
         cases: 12,
         ..ProptestConfig::default()
     });
-    let strategy = (0.05f64..0.95, 0.05f64..0.95, 9u32..14, 2u32..5, 1_800u64..2_800);
+    let strategy = (
+        0.05f64..0.95,
+        0.05f64..0.95,
+        9u32..14,
+        2u32..5,
+        1_800u64..2_800,
+    );
     runner
         .run(&strategy, |(fx, fy, n, rho, permille)| {
             let mut r = Rig::new(config(Bytes::mib(512), rho));
@@ -337,15 +355,21 @@ fn the_preloads_are_bounded_per_profile() {
                 .ancestors
                 .iter()
                 .chain(need.ring.iter())
-            .filter(|(_, n)| n.proximity.is_some())
+                .filter(|(_, n)| n.proximity.is_some())
                 .collect();
             for l in FLOOR + 1..=n + 1 {
-                let at = placed.iter().filter(|(t, _)| t.terrain_coord().0 == l).count();
+                let at = placed
+                    .iter()
+                    .filter(|(t, _)| t.terrain_coord().0 == l)
+                    .count();
                 // The chain of the drawn tiles adds at most the drawn ones'.
                 assert!(at <= k + v.drawn().len(), "ρ {rho}, level {l}: {at}");
             }
             let bound = floor + (n + 1 - FLOOR) as usize * k + v.drawn().len() * n as usize;
-            assert!(need.ancestors.len() + need.ring.len() <= bound, "ρ {rho}, n {n}");
+            assert!(
+                need.ancestors.len() + need.ring.len() <= bound,
+                "ρ {rho}, n {n}"
+            );
         }
     }
     // A(ℓ, n) and D(d) as the document writes them.
@@ -429,7 +453,10 @@ fn a_preload_worth_more_by_the_margin_takes_a_weaker_ones_place() {
     }
     assert!(swaps > 0, "no preload took a weaker one's place");
     for (_, id) in around(11, fx, fy, 1.0) {
-        assert!(gpu(&r, id), "level 11: {id:?} not resident after the zoom-in");
+        assert!(
+            gpu(&r, id),
+            "level 11: {id:?} not resident after the zoom-in"
+        );
     }
 }
 
@@ -476,7 +503,10 @@ fn a_grazing_view_loads_the_far_coarse_ground_before_a_refinement_under_the_eye(
     }
     let first_fine = order.iter().position(|t| fine.contains(t)).unwrap();
     let last_far = order.iter().rposition(|t| far_parents.contains(t)).unwrap();
-    assert!(last_far < first_fine, "the refinement came first: {order:?}");
+    assert!(
+        last_far < first_fine,
+        "the refinement came first: {order:?}"
+    );
 }
 
 /// `R` is measured: a slower network, measured, raises the restore cost of
@@ -536,14 +566,24 @@ fn a_slower_measured_network_raises_its_restore_cost() {
         (restore, preload, score)
     };
     let (default, ..) = run(None);
-    assert_eq!(default.remote, tuile_budget::Micros::from_millis(150), "the constant until samples");
+    assert_eq!(
+        default.remote,
+        tuile_budget::Micros::from_millis(150),
+        "the constant until samples"
+    );
     let (fast, fast_preload, fast_held) = run(Some(80_000));
     let (slow, slow_preload, slow_held) = run(Some(1_200_000));
     assert!(slow.remote > fast.remote, "{slow:?} {fast:?}");
-    assert!(slow_preload > fast_preload, "{slow_preload:?} {fast_preload:?}");
+    assert!(
+        slow_preload > fast_preload,
+        "{slow_preload:?} {fast_preload:?}"
+    );
     let (fast_r, fast_s) = fast_held.unwrap();
     let (slow_r, slow_s) = slow_held.unwrap();
-    assert!(slow_r > fast_r && slow_s > fast_s, "{slow_held:?} {fast_held:?}");
+    assert!(
+        slow_r > fast_r && slow_s > fast_s,
+        "{slow_held:?} {fast_held:?}"
+    );
 }
 
 /// The release order follows the camera without re-keying what is held:
@@ -590,7 +630,10 @@ fn a_turn_re_keys_what_it_names_not_what_is_held() {
     assert_eq!(places_small, places_large, "places depend on what is held");
     assert_eq!(rekeys_small, rekeys_large, "re-keys depend on what is held");
     // Bounded by the neighbourhood: K per level over the levels listed.
-    assert!(places_large as usize <= per_level(4) * 14 * 2, "{places_large}");
+    assert!(
+        places_large as usize <= per_level(4) * 14 * 2,
+        "{places_large}"
+    );
 }
 
 /// Laurent's Tuile.app, 4.3 km over a coast (main 9a5ee85e): the drapes'
@@ -603,7 +646,9 @@ fn a_pool_full_of_undrawn_fine_drapes_gives_way_to_the_need() {
     let mut r = Rig::new(config(Bytes::mib(96), 4));
     // Zoomed in: tiles of level 16 wearing level-18 imagery, as many as
     // the drapes' class holds.
-    let fine: Vec<TileId> = (0..12u64).flat_map(|x| (0..12u64).map(move |y| t(16, 21_000 + x, 14_000 + y))).collect();
+    let fine: Vec<TileId> = (0..12u64)
+        .flat_map(|x| (0..12u64).map(move |y| t(16, 21_000 + x, 14_000 + y)))
+        .collect();
     let zoomed = NeedSet {
         drawn: fine.iter().map(|&id| (id, draped(id, 18))).collect(),
         ..NeedSet::default()
@@ -611,7 +656,9 @@ fn a_pool_full_of_undrawn_fine_drapes_gives_way_to_the_need() {
     settle(&mut r, &zoomed, 600);
     // Out: other tiles, level 11, wanting level-13 imagery; the fine drapes
     // are drawn by nobody now.
-    let wide: Vec<TileId> = (0..10u64).flat_map(|x| (0..10u64).map(move |y| t(11, 600 + x, 400 + y))).collect();
+    let wide: Vec<TileId> = (0..10u64)
+        .flat_map(|x| (0..10u64).map(move |y| t(11, 600 + x, 400 + y)))
+        .collect();
     let out = NeedSet {
         drawn: wide.iter().map(|&id| (id, draped(id, 13))).collect(),
         ..NeedSet::default()
@@ -634,7 +681,8 @@ fn a_pool_full_of_undrawn_fine_drapes_gives_way_to_the_need() {
     );
     for &id in &wide {
         assert!(
-            r.b.resource(dr(id, 13)).is_some_and(|v| v.gpu > Bytes::ZERO),
+            r.b.resource(dr(id, 13))
+                .is_some_and(|v| v.gpu > Bytes::ZERO),
             "{id:?}'s own drape not resident"
         );
     }
@@ -661,8 +709,16 @@ fn a_still_view_keeps_its_pools_under_the_headroom() {
     }
     let floor = CERTAIN / 1_000 * u32::from(tuile_budget::spec::FLOOR_VALUE);
     let held = r.b.held_report();
-    for h in held.lowest.iter().filter(|h| h.state == tuile_budget::score::HeldState::Left) {
-        assert!(h.terms.p >= floor, "{:?} held under the floor value", h.resource);
+    for h in held
+        .lowest
+        .iter()
+        .filter(|h| h.state == tuile_budget::score::HeldState::Left)
+    {
+        assert!(
+            h.terms.p >= floor,
+            "{:?} held under the floor value",
+            h.resource
+        );
     }
 }
 
@@ -676,8 +732,14 @@ fn the_fine_preloads_left_behind_by_a_zoom_out_are_released() {
     let (fx, fy) = (0.7083, 0.2917);
     let low = View::at(fx, fy, 13);
     settle(&mut r, &low.need(4), 600);
-    let finer: Vec<TileId> = around(14, fx, fy, 4.0).into_iter().map(|(_, t)| t).collect();
-    assert!(finer.iter().any(|t| gpu(&r, *t)), "level 14 never preloaded");
+    let finer: Vec<TileId> = around(14, fx, fy, 4.0)
+        .into_iter()
+        .map(|(_, t)| t)
+        .collect();
+    assert!(
+        finer.iter().any(|t| gpu(&r, *t)),
+        "level 14 never preloaded"
+    );
     let high = View::at(fx, fy, 9);
     let need = high.need(4);
     for _ in 0..30 {
@@ -694,7 +756,10 @@ fn the_fine_preloads_left_behind_by_a_zoom_out_are_released() {
         r.complete(&d);
     }
     let left = finer.iter().filter(|t| gpu(&r, **t)).count();
-    assert_eq!(left, 0, "{left} level-14 preloads still held 11 s after the zoom-out");
+    assert_eq!(
+        left, 0,
+        "{left} level-14 preloads still held 11 s after the zoom-out"
+    );
 }
 
 /// Every number of the score is the specification's: re-specified at run
@@ -732,7 +797,10 @@ fn a_re_specification_changes_the_next_steps_order() {
     let (level_flat, params) = first_preload(Some("spec=interactive&a0=10&a_desc=1000"));
     assert_eq!(params.a0_permille, 10);
     assert_eq!(params.descend_permille, 1000);
-    assert_ne!(level_default, level_flat, "the order did not follow the specification");
+    assert_ne!(
+        level_default, level_flat,
+        "the order did not follow the specification"
+    );
 }
 
 /// Laurent's stall (Tuile.app on main 9a5ee85e, 2026-11-23, twice): the
@@ -749,7 +817,9 @@ fn a_relaxed_budget_between_its_watermarks_comes_back_to_full_detail() {
     c.pinned_level = None;
     let mut r = Rig::new(c);
     // Zoomed in: fine drapes filling their class.
-    let fine: Vec<TileId> = (0..9u64).flat_map(|x| (0..9u64).map(move |y| t(14, 9_000 + x, 5_000 + y))).collect();
+    let fine: Vec<TileId> = (0..9u64)
+        .flat_map(|x| (0..9u64).map(move |y| t(14, 9_000 + x, 5_000 + y)))
+        .collect();
     let zoomed = NeedSet {
         drawn: fine.iter().map(|&id| (id, draped(id, 16))).collect(),
         ..NeedSet::default()
@@ -762,7 +832,9 @@ fn a_relaxed_budget_between_its_watermarks_comes_back_to_full_detail() {
     // Out to a few tiles elsewhere, under a memory warning that relaxes
     // the picture, then normal again: the fine drapes, drawn by nobody,
     // still hold their class between its watermarks.
-    let wide: Vec<TileId> = (0..3u64).flat_map(|x| (0..3u64).map(move |y| t(12, 700 + x, 300 + y))).collect();
+    let wide: Vec<TileId> = (0..3u64)
+        .flat_map(|x| (0..3u64).map(move |y| t(12, 700 + x, 300 + y)))
+        .collect();
     let out = NeedSet {
         drawn: wide.iter().map(|&id| (id, draped(id, 14))).collect(),
         ..NeedSet::default()
@@ -776,15 +848,33 @@ fn a_relaxed_budget_between_its_watermarks_comes_back_to_full_detail() {
     let d = r.step(&zoomed);
     r.complete(&d);
     let mut last = r.step(&out);
-    eprintln!("relaxed: {:.3} of the target, scale {}", ratio(&last), last.sse_scale_milli);
-    assert!(last.sse_scale_milli > 1_000, "the warning relaxed nothing: the test proves nothing");
+    eprintln!(
+        "relaxed: {:.3} of the target, scale {}",
+        ratio(&last),
+        last.sse_scale_milli
+    );
+    assert!(
+        last.sse_scale_milli > 1_000,
+        "the warning relaxed nothing: the test proves nothing"
+    );
     for _ in 0..600 {
         r.complete(&last);
         last = r.step(&out);
     }
-    eprintln!("after: {:.3} of the target, scale {}", ratio(&last), last.sse_scale_milli);
-    assert_eq!(last.sse_scale_milli, 1_000, "still relaxed: the detail never came back");
-    assert_eq!(last.stats.deficit.imagery_under(), 0, "imagery still under its need");
+    eprintln!(
+        "after: {:.3} of the target, scale {}",
+        ratio(&last),
+        last.sse_scale_milli
+    );
+    assert_eq!(
+        last.sse_scale_milli, 1_000,
+        "still relaxed: the detail never came back"
+    );
+    assert_eq!(
+        last.stats.deficit.imagery_under(),
+        0,
+        "imagery still under its need"
+    );
 }
 
 /// Laurent's capture over Bordeaux (main, 2026-11-23): at rest, terrain
@@ -829,10 +919,15 @@ fn at_rest_the_fine_levels_left_behind_are_released_in_both_tiers() {
         "levels 14-19 held: {fine_before} -> {fine_after}; decoded {:?} -> {:?}",
         decoded_before, d.stats.decoded
     );
-    assert!(fine_before > 0, "nothing fine held: the test proves nothing");
+    assert!(
+        fine_before > 0,
+        "nothing fine held: the test proves nothing"
+    );
     assert_eq!(fine_after, 0, "fine levels still held at rest");
     // The decoded copies of the fine levels went too.
-    let fine_decoded: u32 = (14..=19).map(|l| d.stats.levels.decoded_tiles[Class::TerrainMesh][l]).sum();
+    let fine_decoded: u32 = (14..=19)
+        .map(|l| d.stats.levels.decoded_tiles[Class::TerrainMesh][l])
+        .sum();
     assert_eq!(fine_decoded, 0, "fine decoded copies still held at rest");
 }
 
@@ -855,7 +950,10 @@ fn the_headroom_follows_the_uploads() {
         r.complete(&d);
         most = most.max(d.stats.score.headroom_bytes);
     }
-    assert!(most > 4 * rest.max(1 << 16), "no headroom in motion: {most} B");
+    assert!(
+        most > 4 * rest.max(1 << 16),
+        "no headroom in motion: {most} B"
+    );
     eprintln!("headroom: {rest} B at rest, {most} B in motion");
 }
 
@@ -926,17 +1024,33 @@ fn a_wait_is_classified_first_load_or_reload_after_an_eviction() {
         }
         let after = kinds(&meter);
         (
-            [after[0] - before[0], after[1] - before[1], after[2] - before[2]],
+            [
+                after[0] - before[0],
+                after[1] - before[1],
+                after[2] - before[2],
+            ],
             meter.signals().waits.reload_reasons,
         )
     };
     let (soon, reasons) = run(1);
-    assert!(soon[1] > 0 && soon[0] == 0, "back within 5 s: reloads <5 s, {soon:?}");
-    assert!(reasons[..3].iter().sum::<u64>() > 0, "the reloads name their eviction's reason");
+    assert!(
+        soon[1] > 0 && soon[0] == 0,
+        "back within 5 s: reloads <5 s, {soon:?}"
+    );
+    assert!(
+        reasons[..3].iter().sum::<u64>() > 0,
+        "the reloads name their eviction's reason"
+    );
     let (later, _) = run(12);
-    assert!(later[2] > 0 && later[1] == 0, "back after 12 s: reloads <30 s, {later:?}");
+    assert!(
+        later[2] > 0 && later[1] == 0,
+        "back after 12 s: reloads <30 s, {later:?}"
+    );
     let (long, _) = run(40);
-    assert!(long[0] > 0 && long[1] + long[2] == 0, "back after 40 s: first loads again, {long:?}");
+    assert!(
+        long[0] > 0 && long[1] + long[2] == 0,
+        "back after 40 s: first loads again, {long:?}"
+    );
 }
 
 /// The proactive sweep never takes what the view wants now or wanted within

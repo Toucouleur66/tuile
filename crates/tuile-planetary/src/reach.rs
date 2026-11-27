@@ -624,8 +624,10 @@ mod tests {
             _asset: i64,
         ) -> Result<(LayerJson, Arc<dyn TerrainSource>), String> {
             self.answer().await?;
-            let layer = LayerJson::from_slice(br#"{"format":"quantized-mesh-1.0","tiles":["{z}/{x}/{y}.terrain"],"version":"2"}"#)
-                .map_err(|e| e.to_string())?;
+            let layer = LayerJson::from_slice(
+                br#"{"format":"quantized-mesh-1.0","tiles":["{z}/{x}/{y}.terrain"],"version":"2"}"#,
+            )
+            .map_err(|e| e.to_string())?;
             Ok((layer, Arc::new(Tiles)))
         }
         async fn imagery(&self, _asset: i64) -> Result<Arc<dyn ImageryProvider>, String> {
@@ -661,7 +663,11 @@ mod tests {
         assert!(fetch().is_err());
         assert!(!fetch().expect_err("waiting").is_absence(), "an absence");
         assert!(fetch().is_err());
-        assert_eq!(origin.asked.load(Ordering::SeqCst), 1, "asked during its wait");
+        assert_eq!(
+            origin.asked.load(Ordering::SeqCst),
+            1,
+            "asked during its wait"
+        );
         assert_eq!(terrain.is_online(), Some(false));
         origin.mode.store(SERVES, Ordering::SeqCst);
         assert!(fetch().is_err(), "asked again before its wait was over");
@@ -756,7 +762,11 @@ mod tests {
             y: 0,
         };
         assert!(futures_executor::block_on(imagery.fetch_tile_bytes(coord)).is_err());
-        assert_eq!(imagery.tiling_scheme(), geographic, "the grid changed under it");
+        assert_eq!(
+            imagery.tiling_scheme(),
+            geographic,
+            "the grid changed under it"
+        );
         assert_eq!(
             futures_executor::block_on(recall_scheme(&store, "i")),
             Some(TilingScheme::web_mercator())

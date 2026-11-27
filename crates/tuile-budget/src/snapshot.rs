@@ -174,7 +174,10 @@ impl Snapshot {
             }
         };
         eq("imagery_prev", self.imagery_prev == o.imagery_prev);
-        eq("imagery_stood_in", self.imagery_stood_in == o.imagery_stood_in);
+        eq(
+            "imagery_stood_in",
+            self.imagery_stood_in == o.imagery_stood_in,
+        );
         eq("held_last", self.held_last == o.held_last);
         eq("drawn_last", self.drawn_last == o.drawn_last);
         eq("worn_last", self.worn_last == o.worn_last);

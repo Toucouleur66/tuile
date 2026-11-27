@@ -125,7 +125,11 @@ fn a_compressible_drape_goes_up_as_rgba8_at_once() {
         assert_eq!(pump.pump(&mut stream, &gpu, one_tile()), 3, "{plan}: {RED}");
         for t in tiles {
             let r = ResourceId::drape(t, LayerId(0), 4);
-            assert_eq!(acked(&stream, r), Some(349_524), "{plan}: acknowledged at once");
+            assert_eq!(
+                acked(&stream, r),
+                Some(349_524),
+                "{plan}: acknowledged at once"
+            );
         }
         assert_eq!(pump.acks_waiting_for_the_gpu(), 0, "{plan}");
         let u = pump.last_uploads();
@@ -163,7 +167,11 @@ fn a_compression_asked_replaces_the_texture_and_acks_a_quarter() {
         assert_eq!(compressed(&stream, resource), Some(want), "{plan}: {RED}");
         let (count, live) = gpu.imagery.lock().expect("imagery").live();
         assert_eq!((count, live as u64), (1, want), "{plan}");
-        assert_eq!(pump.held_bytes()[tuile_core::budget::Class::Drape], want, "{plan}");
+        assert_eq!(
+            pump.held_bytes()[tuile_core::budget::Class::Drape],
+            want,
+            "{plan}"
+        );
     }
 }
 
@@ -190,7 +198,11 @@ fn a_tile_that_cannot_be_compressed_stays_rgba8() {
         acks_landed(&mut pump, &mut stream, &gpu);
         assert_eq!(compressed(&stream, resource), Some(rgba8), "{plan}");
         let formats = gpu.imagery.lock().expect("imagery").live_by_format();
-        assert_eq!(formats, vec![(ImageryFormat::Rgba8, rgba8 as usize)], "{plan}");
+        assert_eq!(
+            formats,
+            vec![(ImageryFormat::Rgba8, rgba8 as usize)],
+            "{plan}"
+        );
     }
 }
 
@@ -279,7 +291,10 @@ fn a_four_tile_drape_compresses_a_tile_a_frame() {
         let mut pump = ContentPump::new(glam::DVec3::ZERO);
         pump.pump(&mut stream, &gpu, one_tile());
         acks_landed(&mut pump, &mut stream, &gpu);
-        assert!(acked(&stream, resource).is_some(), "{plan}: uploaded at once");
+        assert!(
+            acked(&stream, resource).is_some(),
+            "{plan}: uploaded at once"
+        );
         ask(&mut stream, &[(resource, 1)]);
         let mut per_frame = Vec::new();
         for _ in 0..8 {
@@ -298,12 +313,18 @@ fn a_four_tile_drape_compresses_a_tile_a_frame() {
             .lock()
             .expect("sent")
             .iter()
-            .filter(|m| matches!(m, ClientMessage::Compressed { resource: r, .. } if *r == resource))
+            .filter(
+                |m| matches!(m, ClientMessage::Compressed { resource: r, .. } if *r == resource),
+            )
             .count();
         assert_eq!(acks, 1, "{plan}: acknowledged once");
         if compresses(&gpu) {
             assert!(per_frame.iter().all(|n| *n <= 2), "{plan}: {per_frame:?}");
-            assert_eq!(per_frame.iter().sum::<u32>(), 4, "{plan}: each tile once: {RED}");
+            assert_eq!(
+                per_frame.iter().sum::<u32>(),
+                4,
+                "{plan}: each tile once: {RED}"
+            );
             let formats = gpu.imagery.lock().expect("imagery").live_by_format();
             assert_eq!(formats.len(), 1, "{plan}: {formats:?}");
             assert_eq!(formats[0].1, 4 * 87_408, "{plan}");
@@ -327,7 +348,8 @@ fn a_shared_tile_is_compressed_once_for_every_drape() {
             continue;
         }
         let (a, b) = (TileId::from_terrain(4, 3, 2), TileId::from_terrain(4, 4, 2));
-        let shared = std::sync::Arc::new(painted(&gpu, 256, 256, |x, y| [x as u8, y as u8, 3, 255]));
+        let shared =
+            std::sync::Arc::new(painted(&gpu, 256, 256, |x, y| [x as u8, y as u8, 3, 255]));
         let over = |t: TileId| {
             let mut d = whole_drape(t, 4, painted(&gpu, 4, 4, |_, _| [0; 4]));
             d.tiles[0].texture = std::sync::Arc::clone(&shared);
@@ -357,4 +379,3 @@ fn a_shared_tile_is_compressed_once_for_every_drape() {
         assert_eq!(stats.encoded, 1, "{plan}");
     }
 }
-

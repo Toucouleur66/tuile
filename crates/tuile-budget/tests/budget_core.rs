@@ -27,11 +27,7 @@ fn mesh(id: tuile_budget::TileId) -> ResourceId {
 }
 
 /// The role `tile`'s mesh is drawn in by one more step of `need`.
-fn d_role(
-    r: &mut Rig,
-    need: &NeedSet,
-    tile: tuile_budget::TileId,
-) -> Option<Role> {
+fn d_role(r: &mut Rig, need: &NeedSet, tile: tuile_budget::TileId) -> Option<Role> {
     let d = r.step(need);
     d.draw.get(mesh(tile)).map(|i| i.role)
 }
@@ -185,7 +181,11 @@ mod specification {
         bad.params.margin_permille = 1_000_000;
         assert!(r.b.specify(bad).is_err());
         r.step(&drawn(&[t(3, 2, 2)]));
-        assert_eq!(r.b.specification().kind, SpecKind::Fpv, "the one in force stays");
+        assert_eq!(
+            r.b.specification().kind,
+            SpecKind::Fpv,
+            "the one in force stays"
+        );
     }
 
     /// Measured samples are smoothed at the step they are given for, once
@@ -2205,7 +2205,10 @@ mod draw {
                 "{RED}: {k:?}"
             );
         }
-        let item = d.draw.get(mesh(root)).expect("the root stands for the fourth");
+        let item = d
+            .draw
+            .get(mesh(root))
+            .expect("the root stands for the fourth");
         assert_eq!(item.role, Role::Fallback);
         assert_eq!(item.serves.to_vec(), vec![kids[3]]);
         assert_eq!(d.stats.lost, 0);
@@ -2236,7 +2239,11 @@ mod draw {
         fine.ancestors = ancestors.clone();
         r.settle(&fine, 20);
         for k in kids {
-            assert_eq!(d_role(&mut r, &fine, k), Some(Role::Exact), "{k:?} drawn first");
+            assert_eq!(
+                d_role(&mut r, &fine, k),
+                Some(Role::Exact),
+                "{k:?} drawn first"
+            );
         }
         // Zoom-out: the parent is wanted at imagery level 2. Its mesh
         // arrives, its own drape does not; the ancestors' coarser drapes
@@ -3206,7 +3213,12 @@ mod stats {
         NeedSet {
             drawn: tiles
                 .iter()
-                .map(|&a| (a, need(a).with_imagery(tuile_budget::ImageryNeed::base(fp, 22))))
+                .map(|&a| {
+                    (
+                        a,
+                        need(a).with_imagery(tuile_budget::ImageryNeed::base(fp, 22)),
+                    )
+                })
                 .collect(),
             ..NeedSet::default()
         }
@@ -3234,15 +3246,17 @@ mod stats {
         }
         let worn = d.draw.get(mesh(a)).and_then(base_drape).map(|w| w.resource);
         assert_eq!(
-            d.stats.deficit.imagery_over_tiles,
-            0,
+            d.stats.deficit.imagery_over_tiles, 0,
             "{RED}: the tile still wears {worn:?}, a level over its need, two seconds after rest"
         );
         assert_eq!(worn, Some(dr(a, 3)), "it wears its own level");
         for _ in 0..120 {
             r.complete(&d);
             d = r.step(&need);
-            assert_eq!(d.stats.deficit.imagery_over_tiles, 0, "it stays at its need");
+            assert_eq!(
+                d.stats.deficit.imagery_over_tiles, 0,
+                "it stays at its need"
+            );
             assert_eq!(d.stats.deficit.under_tiles(), 0, "and not under it");
         }
     }
@@ -3264,10 +3278,9 @@ mod stats {
         while r.now.since(rest) < Micros::from_secs(4) {
             assert_eq!(d.stats.bare, 0, "{RED}: drawn bare");
             let worn = d.draw.get(mesh(a)).and_then(base_drape).map(|w| w.resource);
-            let own_drawable = r
-                .b
-                .resource(dr(a, 3))
-                .is_some_and(|v| v.state == ResourceState::Drawable);
+            let own_drawable =
+                r.b.resource(dr(a, 3))
+                    .is_some_and(|v| v.state == ResourceState::Drawable);
             if let Some(u) = r.b.resource(dr(a, 3)).and_then(|v| v.urgency) {
                 assert_eq!(u, Urgency::Drape, "{RED}: a refinement's urgency");
             }

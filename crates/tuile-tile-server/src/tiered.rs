@@ -58,7 +58,9 @@ use object_store::{
     PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
 };
 
-use crate::tier_cache::{CacheClass, DirPiece, InFlight, TierCache, TierCacheStats, LAYOUT, ORIGIN};
+use crate::tier_cache::{
+    CacheClass, DirPiece, InFlight, TierCache, TierCacheStats, LAYOUT, ORIGIN,
+};
 
 /// Archives up to this size are brought down whole on a range miss.
 pub const DEFAULT_WHOLE_BELOW: u64 = 256 << 20;
@@ -393,7 +395,10 @@ impl Tiered {
     /// kept already costs nothing; a range of a key that is no archive is
     /// left alone (it is never kept). A range that fails is counted and
     /// left to its reader.
-    pub async fn prefetch(&self, reads: impl IntoIterator<Item = (Path, Range<u64>)>) -> Prefetched {
+    pub async fn prefetch(
+        &self,
+        reads: impl IntoIterator<Item = (Path, Range<u64>)>,
+    ) -> Prefetched {
         let inner = &self.inner;
         if inner.tiers.is_empty() {
             return Prefetched::default();
@@ -604,7 +609,12 @@ impl Inner {
         }
         let size = match size {
             Some(size) => size,
-            None => self.cache.request(ORIGIN, 0, self.origin.head(at)).await?.size,
+            None => {
+                self.cache
+                    .request(ORIGIN, 0, self.origin.head(at))
+                    .await?
+                    .size
+            }
         };
         if size <= self.whole_below {
             let (whole, meta) = self.download(at).await?;
@@ -673,7 +683,12 @@ impl Inner {
 
     /// The directory section `section` of the archive, read once for the
     /// process.
-    async fn section(self: &Arc<Self>, at: &Path, section: &Range<u64>, size: u64) -> Result<Bytes> {
+    async fn section(
+        self: &Arc<Self>,
+        at: &Path,
+        section: &Range<u64>,
+        size: u64,
+    ) -> Result<Bytes> {
         let load = async {
             let (bytes, _) = self.fetch(at, section.clone(), Some(size)).await?;
             Ok(DirPiece::Section(bytes))
@@ -696,8 +711,13 @@ impl Inner {
             let (bytes, _) = self.fetch(at, range, Some(size)).await?;
             Ok(bytes)
         };
-        self.kept(&self.cache.data, (at.to_string(), k), CacheClass::Data, load)
-            .await
+        self.kept(
+            &self.cache.data,
+            (at.to_string(), k),
+            CacheClass::Data,
+            load,
+        )
+        .await
     }
 
     /// `range` of the archive `at`, read through the cache: its head, its
@@ -726,20 +746,21 @@ impl Inner {
             pieces.push(piece);
         }
         let layout = &layout;
-        let parts = futures_util::future::try_join_all(pieces.into_iter().map(|piece| async move {
-            match piece {
-                Piece::Head(t) => cut(&layout.head, t.start, t.end),
-                Piece::Section(s, t) => {
-                    let bytes = self.section(at, &s, size).await?;
-                    cut(&bytes, t.start - s.start, t.end - s.start)
+        let parts =
+            futures_util::future::try_join_all(pieces.into_iter().map(|piece| async move {
+                match piece {
+                    Piece::Head(t) => cut(&layout.head, t.start, t.end),
+                    Piece::Section(s, t) => {
+                        let bytes = self.section(at, &s, size).await?;
+                        cut(&bytes, t.start - s.start, t.end - s.start)
+                    }
+                    Piece::Block(k, t) => {
+                        let bytes = self.block(at, k, size).await?;
+                        cut(&bytes, t.start - k * block, t.end - k * block)
+                    }
                 }
-                Piece::Block(k, t) => {
-                    let bytes = self.block(at, k, size).await?;
-                    cut(&bytes, t.start - k * block, t.end - k * block)
-                }
-            }
-        }))
-        .await?;
+            }))
+            .await?;
         let body = match parts.len() {
             1 => parts.into_iter().next().unwrap_or_default(),
             _ => {
@@ -800,7 +821,8 @@ impl Inner {
                 let meta = got.meta.clone();
                 Ok::<_, object_store::Error>((got.bytes().await?, meta))
             };
-            if let Ok((bytes, meta)) = self.cache.request(&tier.name, self.whole_below, read).await {
+            if let Ok((bytes, meta)) = self.cache.request(&tier.name, self.whole_below, read).await
+            {
                 self.hit(i, bytes.len() as u64);
                 return Ok((bytes, meta));
             }
@@ -839,7 +861,11 @@ impl Inner {
         let put = tier
             .objects
             .put_opts(at, PutPayload::from_bytes(bytes.clone()), opts);
-        match self.cache.request(&tier.name, bytes.len() as u64, put).await {
+        match self
+            .cache
+            .request(&tier.name, bytes.len() as u64, put)
+            .await
+        {
             Ok(_) => {
                 self.counters.written.fetch_add(1, Ordering::Relaxed);
                 metrics::counter!("tuile_tiles_tier_writes_total", "tier" => tier.name.clone())
@@ -982,8 +1008,8 @@ impl ObjectStore for Tiered {
 mod tests {
     use super::*;
     use crate::{TierCache, TierCacheConfig};
-    use std::time::Duration;
     use object_store::memory::InMemory;
+    use std::time::Duration;
 
     const ARCHIVE: &str =
         "imagery/zones/z4/1/2/202611-176279040000000000000000-00000000deadbeef.pmtiles";
@@ -1231,17 +1257,35 @@ mod tests {
             p.get_range(&at, 0..10).await.unwrap();
         }
         assert_eq!(origin.gets(ARCHIVE), 1, "kept: the origin is not asked");
-        assert_eq!(global.head(&at).await.unwrap().last_modified, written, "a read writes nothing");
+        assert_eq!(
+            global.head(&at).await.unwrap().last_modified,
+            written,
+            "a read writes nothing"
+        );
         // The lifecycle deletes it.
         global.delete(&at).await.unwrap();
         let p = process();
-        assert_eq!(&p.get_range(&at, 100..110).await.unwrap()[..], &bytes()[100..110]);
-        assert_eq!(origin.gets(ARCHIVE), 2, "absent from the tier: read from the origin");
+        assert_eq!(
+            &p.get_range(&at, 100..110).await.unwrap()[..],
+            &bytes()[100..110]
+        );
+        assert_eq!(
+            origin.gets(ARCHIVE),
+            2,
+            "absent from the tier: read from the origin"
+        );
         let again = global.head(&at).await.expect("kept again");
-        assert!(again.last_modified >= written, "written back, its age starting over");
+        assert!(
+            again.last_modified >= written,
+            "written back, its age starting over"
+        );
         assert_eq!(p.stats().written, 1);
         process().get(&at).await.unwrap().bytes().await.unwrap();
-        assert_eq!(origin.gets(ARCHIVE), 2, "the next reader reads the tier again");
+        assert_eq!(
+            origin.gets(ARCHIVE),
+            2,
+            "the next reader reads the tier again"
+        );
     }
 
     /// A slow tier, as a bucket across a busy network is: it counts the
@@ -1336,7 +1380,11 @@ mod tests {
             })));
         let reads = (0..200).map(|n| {
             let t = tiered.clone();
-            async move { t.get_range(&Path::from(archive(n)), 100..200).await.unwrap() }
+            async move {
+                t.get_range(&Path::from(archive(n)), 100..200)
+                    .await
+                    .unwrap()
+            }
         });
         for got in futures_util::future::join_all(reads).await {
             assert_eq!(got, bytes().slice(100..200));
@@ -1407,13 +1455,15 @@ mod tests {
 
     /// A tiered store over `global` alone, its data blocks kept `ttl`.
     fn kept_for(global: Arc<Slow>, ttl: Duration) -> Tiered {
-        Tiered::new(Arc::new(Counted::default()), vec![Tier::new("global", global)]).with_cache(
-            Arc::new(TierCache::new(TierCacheConfig {
-                block_bytes: 64 << 10,
-                data_ttl: ttl,
-                ..TierCacheConfig::default()
-            })),
+        Tiered::new(
+            Arc::new(Counted::default()),
+            vec![Tier::new("global", global)],
         )
+        .with_cache(Arc::new(TierCache::new(TierCacheConfig {
+            block_bytes: 64 << 10,
+            data_ttl: ttl,
+            ..TierCacheConfig::default()
+        })))
     }
 
     /// **Tile data is kept for its time, then read again once.**
@@ -1476,7 +1526,13 @@ mod tests {
         let archive = laid_out(1 << 20, 20_000..24_000, 24_000..1 << 20);
         global.inner.put(&at, archive.clone().into()).await.unwrap();
         let tiered = kept_for(global.clone(), Duration::from_secs(60));
-        for r in [0..1 << 20, 10..300_000, 16_000..25_000, 65_000..200_000, 1_000_000..1 << 20] {
+        for r in [
+            0..1 << 20,
+            10..300_000,
+            16_000..25_000,
+            65_000..200_000,
+            1_000_000..1 << 20,
+        ] {
             assert_eq!(
                 tiered.get_range(&at, r.clone()).await.unwrap(),
                 archive.slice(r.start as usize..r.end as usize),

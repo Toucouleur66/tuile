@@ -114,8 +114,7 @@ impl Budget {
         // already running.
         let step = self.steps;
         let still_for = if still {
-            step
-                .saturating_sub(*self.compress.still_since.get_or_insert(step))
+            step.saturating_sub(*self.compress.still_since.get_or_insert(step))
                 .saturating_add(1)
         } else {
             self.compress.still_since = None;

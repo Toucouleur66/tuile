@@ -39,10 +39,7 @@ fn the_revision_moves_with_what_is_drawn_and_holds_still_with_a_still_session() 
         height: 1.0e6,
     });
     let mut pump = ContentPump::new(eye);
-    let mut stream = Scripted::new([
-        mesh(tile, 1, content(tile)),
-        select(vec![exact(tile)], 1),
-    ]);
+    let mut stream = Scripted::new([mesh(tile, 1, content(tile)), select(vec![exact(tile)], 1)]);
     pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
     let _ = pump.resolve(&gpu);
     let landed = pump.revision();

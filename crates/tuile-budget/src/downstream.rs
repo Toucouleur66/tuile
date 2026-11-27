@@ -228,7 +228,11 @@ impl Sums {
         add(&mut self.under_tiles, i.stats.under_levels > 0);
         add(&mut self.over_tiles, i.stats.over_levels > 0);
         let sum = |x: &mut u32, v: u16| {
-            *x = if on { *x + u32::from(v) } else { *x - u32::from(v) };
+            *x = if on {
+                *x + u32::from(v)
+            } else {
+                *x - u32::from(v)
+            };
         };
         sum(&mut self.under_levels, i.stats.under_levels);
         sum(&mut self.over_levels, i.stats.over_levels);
@@ -3135,7 +3139,8 @@ impl Budget {
             let silent = Silent(std::cell::Cell::new(false));
             let oracle: &dyn PresenceOracle = if far { presence } else { &silent };
             let mut asked = false;
-            let capped = self.drape_levels(*t, tn, oracle, (last, stood_in), &mut levels, &mut asked);
+            let capped =
+                self.drape_levels(*t, tn, oracle, (last, stood_in), &mut levels, &mut asked);
             assert!(
                 far || (!asked && !silent.0.get()),
                 "{t:?} asked the presence index but is not read when it may have changed"
@@ -3198,8 +3203,15 @@ impl Budget {
             let tn = tiles.get(&t).unwrap_or_else(|| unreachable!());
             self.layers_of(t, tn, &mut drapes, &mut layers);
             reach.clear();
-            let counts =
-                self.select_tile(t, tn.need.class, &drapes, tiles, None, &mut entries, &mut reach);
+            let counts = self.select_tile(
+                t,
+                tn.need.class,
+                &drapes,
+                tiles,
+                None,
+                &mut entries,
+                &mut reach,
+            );
             reach.beyond(t, &mut beyond);
             self.reach_of(Unit::sel(t), &mut kept_reach);
             assert_eq!(kept_reach, beyond, "what {t:?}'s selection reads");

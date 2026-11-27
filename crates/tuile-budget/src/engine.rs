@@ -1448,7 +1448,10 @@ impl Budget {
         }
         kids.into_iter().filter(|s| *s != t).all(|s| {
             self.walk(1);
-            let Some(tn) = tiles.get(&s).filter(|tn| tn.membership == Membership::Drawn) else {
+            let Some(tn) = tiles
+                .get(&s)
+                .filter(|tn| tn.membership == Membership::Drawn)
+            else {
                 return true;
             };
             if self.tiles.get(&s).and_then(|i| i.parent()) != Some(p) {
@@ -2547,9 +2550,7 @@ impl Budget {
         let pressed = PerClass::from_fn(|c| {
             signalled
                 || match eff.pool {
-                    Some(p) if p.members[c] => {
-                        pool_over || settled.gpu[c] > pct(p.ceil_target[c])
-                    }
+                    Some(p) if p.members[c] => pool_over || settled.gpu[c] > pct(p.ceil_target[c]),
                     _ => eff.target[c] != Bytes::MAX && settled.gpu[c] > pct(eff.target[c]),
                 }
         });
@@ -3780,8 +3781,8 @@ impl Budget {
                 }
                 // Over its ceiling it goes; for the pool's sake, only down to
                 // its floor.
-                let goes = over[class]
-                    || (pool_trim && settled.gpu[class].minus(bytes) >= floor(class));
+                let goes =
+                    over[class] || (pool_trim && settled.gpu[class].minus(bytes) >= floor(class));
                 if goes {
                     let why = (!lawful).then_some(Reason::Fit);
                     self.evict_as(now, s, class, why, d, st);

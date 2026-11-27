@@ -2222,7 +2222,11 @@ impl<T: TerrainSource + 'static, I: ImageryProvider + 'static> TileLoader
         if let Some(s) = &self.substitute {
             let mut by = ByLevel::default();
             known |= s.provider.stored(&mut by);
-            out.add(Class::Drape, Some(layer_index(LayerId(0).substitute())), &by);
+            out.add(
+                Class::Drape,
+                Some(layer_index(LayerId(0).substitute())),
+                &by,
+            );
         }
         known
     }
@@ -2624,7 +2628,11 @@ mod tests {
                 bounding_sphere_radius: rect.height().max(rect.width()) * WGS84_A,
                 horizon_occlusion: [0.0; 3],
             };
-            let (u, v, height) = ([0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0], [0.0, 1.0, 0.0, 1.0]);
+            let (u, v, height) = (
+                [0.0, 1.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0, 1.0],
+                [0.0, 1.0, 0.0, 1.0],
+            );
             let edges = [vec![0, 2], vec![0, 1], vec![1, 3], vec![2, 3]];
             let mut bytes = tuile_terrain::decode::encode(
                 &header,

@@ -59,7 +59,7 @@ impl FrameTargets {
     /// not what a stylesheet would call a point.
     pub fn new(gpu: &GpuContext, format: wgpu::TextureFormat, size: (u32, u32)) -> Self {
         let size = (size.0.max(1), size.1.max(1));
-                Self {
+        Self {
             colour: attachment(gpu, format, size, "tuile frame colour", TRANSIENT),
             depth: attachment(gpu, DEPTH_FORMAT, size, "tuile frame depth", TRANSIENT),
             kept: std::sync::OnceLock::new(),

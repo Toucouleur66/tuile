@@ -348,8 +348,7 @@ impl Deficit {
     /// Tiles drawn under their need, meshes and drapes (a tile counted in
     /// each it is short of).
     pub fn under_tiles(&self) -> u32 {
-        self.mesh_under_tiles
-            .saturating_add(self.imagery_under())
+        self.mesh_under_tiles.saturating_add(self.imagery_under())
     }
 
     /// Imagery under its need: tiles worn under the level decided, and

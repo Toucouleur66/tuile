@@ -169,7 +169,11 @@ impl Target {
                 wgpu::TextureUsages::RENDER_ATTACHMENT,
                 SAMPLES,
             ),
-            depth: make(DEPTH_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT, SAMPLES),
+            depth: make(
+                DEPTH_FORMAT,
+                wgpu::TextureUsages::RENDER_ATTACHMENT,
+                SAMPLES,
+            ),
             renderer: TileRenderer::new(gpu, TEXTURE_FORMAT),
         }
     }
@@ -180,12 +184,8 @@ impl Target {
             view.direction().as_vec3(),
             up.as_vec3(),
         );
-        let proj = glam::camera::rh::proj::directx::perspective(
-            45f32.to_radians(),
-            1.0,
-            10.0,
-            2.0e7,
-        );
+        let proj =
+            glam::camera::rh::proj::directx::perspective(45f32.to_radians(), 1.0, 10.0, 2.0e7);
         self.renderer.set_view(
             &gpu.queue,
             &ViewUniform {
@@ -301,9 +301,7 @@ fn percentile(values: &mut [f64], p: f64) -> f64 {
 
 fn report(plan: &str, phase: &str, frames: &[FrameNumbers]) {
     let n = frames.len().max(1) as f64;
-    let ops = frames
-        .iter()
-        .fold(UploadOps::default(), |a, f| a + f.ops);
+    let ops = frames.iter().fold(UploadOps::default(), |a, f| a + f.ops);
     let uploads: u64 = frames.iter().map(|f| f.pump.uploads).sum();
     let bytes: u64 = frames.iter().map(|f| f.pump.upload_bytes).sum();
     let releases: u64 = frames.iter().map(|f| f.pump.releases).sum();
@@ -489,7 +487,9 @@ fn release_probe(plan: &str, gpu: &GpuContext) {
     use tuile_core::budget::{FrameDeadline, ResourceId};
     use tuile_core::protocol::ServerMessage;
     const N: u32 = 64;
-    let tiles: Vec<TileId> = (0..N).map(|i| TileId::from_terrain(8, u64::from(i), 3)).collect();
+    let tiles: Vec<TileId> = (0..N)
+        .map(|i| TileId::from_terrain(8, u64::from(i), 3))
+        .collect();
     let mut stream = Scripted::default();
     let mut pump = ContentPump::new(DVec3::ZERO);
     let target = Target::new(gpu);
@@ -517,13 +517,19 @@ fn release_probe(plan: &str, gpu: &GpuContext) {
     for (i, tile) in tiles.iter().enumerate() {
         let (z, x, y) = tile.terrain_coord();
         let rect = GeographicTilingScheme::default().tile_rect(TileCoord::new(z, x, y));
-        stream
-            .inbox
-            .push_back(mesh(*tile, i as u64 + 1, fill_content(&rect, [Some(0.0); 4], 0.0)));
-        let texture = painted(gpu, 256, 256, |x, y| [(x + i as u32) as u8, y as u8, 90, 255]);
-        stream
-            .inbox
-            .push_back(drape(*tile, 1000 + i as u64, whole_drape(*tile, z, texture)));
+        stream.inbox.push_back(mesh(
+            *tile,
+            i as u64 + 1,
+            fill_content(&rect, [Some(0.0); 4], 0.0),
+        ));
+        let texture = painted(gpu, 256, 256, |x, y| {
+            [(x + i as u32) as u8, y as u8, 90, 255]
+        });
+        stream.inbox.push_back(drape(
+            *tile,
+            1000 + i as u64,
+            whole_drape(*tile, z, texture),
+        ));
     }
     let items: Vec<_> = tiles
         .iter()
@@ -549,7 +555,9 @@ fn release_probe(plan: &str, gpu: &GpuContext) {
             .map(|t| ResourceId::drape(*t, tuile_core::budget::LayerId(0), t.terrain_coord().0)),
     );
     stream.inbox.push_back(select(Vec::new(), 2));
-    stream.inbox.push_back(ServerMessage::Evict { resources: evicted });
+    stream
+        .inbox
+        .push_back(ServerMessage::Evict { resources: evicted });
     let began = Instant::now();
     let mut frames = 0;
     let mut freed_at = None;

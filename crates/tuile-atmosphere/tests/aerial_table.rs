@@ -256,9 +256,9 @@ fn uniform(view: &View) -> (AtmosphereUniform, DVec3, DVec3, DVec3) {
     let eye = geodetic_to_ecef(view.at);
     let enu = enu_frame(view.at);
     let (h, p) = (view.heading.to_radians(), view.pitch.to_radians());
-    let forward = (enu.x_axis * h.sin() * p.cos() + enu.y_axis * h.cos() * p.cos()
-        + enu.z_axis * p.sin())
-    .normalize();
+    let forward =
+        (enu.x_axis * h.sin() * p.cos() + enu.y_axis * h.cos() * p.cos() + enu.z_axis * p.sin())
+            .normalize();
     let right = forward.cross(enu.z_axis).normalize();
     let up = right.cross(forward);
     let u = AtmosphereUniform::new(
@@ -382,11 +382,23 @@ fn pictures(gpu: &mut Gpu, view: &View, made: bool) -> Vec<Pixel> {
     (0..probes.len())
         .filter(|&i| f[16 * i + 3] > 0.0)
         .map(|i| {
-            let v = |k: usize| [f[16 * i + 4 * k], f[16 * i + 4 * k + 1], f[16 * i + 4 * k + 2]];
+            let v = |k: usize| {
+                [
+                    f[16 * i + 4 * k],
+                    f[16 * i + 4 * k + 1],
+                    f[16 * i + 4 * k + 2],
+                ]
+            };
             Pixel {
                 at: (i as u32 % WIDTH, i as u32 / WIDTH),
                 distance: f[16 * i + 3],
-                air: [f[16 * i + 8], f[16 * i + 9], f[16 * i + 10], f[16 * i + 11], f[16 * i + 12]],
+                air: [
+                    f[16 * i + 8],
+                    f[16 * i + 9],
+                    f[16 * i + 10],
+                    f[16 * i + 11],
+                    f[16 * i + 12],
+                ],
                 marched: display(v(0)),
                 tabled: display(v(1)),
             }
@@ -491,14 +503,16 @@ fn the_ground_through_the_table_is_the_ground_through_the_march() {
         // and the mean, held as everywhere else.
         let ground: std::collections::HashSet<(u32, u32)> = pixels.iter().map(|p| p.at).collect();
         let inside = |(x, y): (u32, u32)| {
-            [(1i64, 0i64), (-1, 0), (0, 1), (0, -1)].iter().all(|(dx, dy)| {
-                let (nx, ny) = (i64::from(x) + dx, i64::from(y) + dy);
-                match (u32::try_from(nx), u32::try_from(ny)) {
-                    (Ok(nx), Ok(ny)) if nx < WIDTH && ny < HEIGHT => ground.contains(&(nx, ny)),
-                    // The picture's own edge is no silhouette.
-                    _ => true,
-                }
-            })
+            [(1i64, 0i64), (-1, 0), (0, 1), (0, -1)]
+                .iter()
+                .all(|(dx, dy)| {
+                    let (nx, ny) = (i64::from(x) + dx, i64::from(y) + dy);
+                    match (u32::try_from(nx), u32::try_from(ny)) {
+                        (Ok(nx), Ok(ny)) if nx < WIDTH && ny < HEIGHT => ground.contains(&(nx, ny)),
+                        // The picture's own edge is no silhouette.
+                        _ => true,
+                    }
+                })
         };
         let most_inside = pixels
             .iter()

@@ -605,8 +605,7 @@ pub fn publish(m: &Metrics) {
     gauge!("tuile_predict_digest_low").set((m.predict_digest.get() & 0xffff_ffff) as f64);
     gauge!("tuile_imagery_bytes").set(m.imagery_bytes.get() as f64);
     gauge!("tuile_imagery_textures").set(m.imagery_textures.get() as f64);
-    gauge!("tuile_imagery_compressed_textures")
-        .set(m.imagery_compressed_textures.get() as f64);
+    gauge!("tuile_imagery_compressed_textures").set(m.imagery_compressed_textures.get() as f64);
     gauge!("tuile_pending_uploads").set(m.pending_uploads.get() as f64);
     gauge!("tuile_prepared_tiles").set(m.prepared_tiles.get() as f64);
     gauge!("tuile_ground_reads_pending").set(m.ground_reads_pending.get() as f64);

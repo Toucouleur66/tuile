@@ -610,11 +610,9 @@ pub(crate) fn parse_url_among(
         }
         "budget" => {
             if pairs.is_empty() {
-                return Err(
-                    "budget changes nothing: give spec=, margin=, horizon_ms=, \
+                return Err("budget changes nothing: give spec=, margin=, horizon_ms=, \
                      speculation_slots= or line="
-                        .to_owned(),
-                );
+                    .to_owned());
             }
             let mut ask = BudgetAsk::default();
             let mut forced = false;

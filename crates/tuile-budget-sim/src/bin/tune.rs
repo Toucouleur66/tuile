@@ -87,7 +87,11 @@ fn normalised(runs: &[Outcome], base: &[Outcome]) -> f64 {
         if !r.j.is_finite() {
             return f64::INFINITY;
         }
-        sum += if b.j > 0.0 && b.j.is_finite() { r.j / b.j } else { 1.0 };
+        sum += if b.j > 0.0 && b.j.is_finite() {
+            r.j / b.j
+        } else {
+            1.0
+        };
     }
     sum / runs.len().max(1) as f64
 }
@@ -107,7 +111,10 @@ fn main() {
         None => scenarios(),
     };
     let axes: Vec<(Device, Network)> = if asked.quick {
-        vec![(Device::Desktop, Network::Fast), (Device::Phone, Network::Slow)]
+        vec![
+            (Device::Desktop, Network::Fast),
+            (Device::Phone, Network::Slow),
+        ]
     } else {
         Device::ALL
             .iter()
@@ -121,7 +128,9 @@ fn main() {
     // One coordinate at a time, over a grid around the default.
     type Set = fn(&mut Specification, u32);
     let coordinates: [(&str, &[u32], Set); 3] = [
-        ("margin", &[100, 250, 500, 1_000], |s, v| s.params.margin_permille = v),
+        ("margin", &[100, 250, 500, 1_000], |s, v| {
+            s.params.margin_permille = v
+        }),
         ("horizon_ms", &[500, 1_000, 2_000], |s, v| {
             s.params.horizon = Micros::from_millis(u64::from(v))
         }),

@@ -35,7 +35,10 @@ fn main() {
             watch(&manifest_dir);
             (
                 git(&manifest_dir, &["rev-parse", "--short=12", "HEAD"]),
-                git(&manifest_dir, &["describe", "--tags", "--always", "--dirty"]),
+                git(
+                    &manifest_dir,
+                    &["describe", "--tags", "--always", "--dirty"],
+                ),
             )
         }
         None => (None, None),

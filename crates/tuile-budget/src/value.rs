@@ -19,10 +19,10 @@
 //! Nothing here reads a clock or a global: every input is a parameter.
 
 use crate::priority::Quantised;
+use crate::priority::Urgency;
 use crate::spec::{Facts, Progressive, Specification, Term};
 use crate::state::Held;
 use crate::stats::LEVELS;
-use crate::priority::Urgency;
 use crate::tier::Tier;
 use crate::types::{Bytes, Class, Micros, PerClass, TileId};
 
@@ -122,7 +122,6 @@ impl Valuation {
     }
 }
 
-
 impl Valuation {
     /// `R`: the restore-cost credit of a resource of `class` at level
     /// index `at` holding `held`, µs for a resource of the reference size.
@@ -183,13 +182,7 @@ pub const CERTAIN: u32 = 32_000;
 /// - `A(ℓ, n)` is 1 at the need's level, `a0 × 2^−(n−1−ℓ)` above it,
 ///   `a↓ × 2^−(ℓ−n−1)` below it;
 /// - `D(d)` is `ρ² / (ρ + d)²`: 1 at the footprint, ¼ at `d = ρ`.
-pub fn progressive(
-    p: &Progressive,
-    level: u32,
-    need_level: u32,
-    away: u32,
-    rho: u32,
-) -> u32 {
+pub fn progressive(p: &Progressive, level: u32, need_level: u32, away: u32, rho: u32) -> u32 {
     let (a, d) = progressive_terms(p, level, need_level, away, rho);
     product(a, d)
 }
@@ -309,7 +302,9 @@ pub fn load_gain(
         p.horizon.0.saturating_sub(t)
     };
     Flouz(
-        u64::from(probability).saturating_mul(screen).saturating_mul(after)
+        u64::from(probability)
+            .saturating_mul(screen)
+            .saturating_mul(after)
             / (u64::from(CERTAIN) * 1_000),
     )
 }
@@ -361,7 +356,11 @@ pub fn deficit_due(spec: &Specification, d: &DeficitInput) -> Option<Micros> {
     let cost = u128::from(p.restore.remote.0) * u128::from(1_000 + p.margin_permille);
     let dwell = u64::try_from(cost / u128::from(per_us)).unwrap_or(u64::MAX);
     let spread = d.tile.0.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 58;
-    Some(d.since.plus(Micros(dwell)).plus(Micros::from_millis(spread)))
+    Some(
+        d.since
+            .plus(Micros(dwell))
+            .plus(Micros::from_millis(spread)),
+    )
 }
 
 #[cfg(test)]
@@ -398,10 +397,20 @@ mod tests {
         let v = Valuation::of(&Specification::interactive(), None);
         let at = crate::stats::level_index(9);
         let bytes = Bytes(256 << 10);
-        let network =
-            v.held_value(Class::Drape, at, Micros(1_000), Some((Held::Gpu, bytes)), CERTAIN);
-        let decoded =
-            v.held_value(Class::Drape, at, Micros(1_000), Some((Held::Both, bytes)), CERTAIN);
+        let network = v.held_value(
+            Class::Drape,
+            at,
+            Micros(1_000),
+            Some((Held::Gpu, bytes)),
+            CERTAIN,
+        );
+        let decoded = v.held_value(
+            Class::Drape,
+            at,
+            Micros(1_000),
+            Some((Held::Both, bytes)),
+            CERTAIN,
+        );
         assert!(network > decoded, "{network:?} {decoded:?}");
         assert!(Flouz::loss(1, 1, Micros(150_000)) > Flouz::loss(1, 1, Micros(2_000)));
     }
@@ -430,7 +439,10 @@ mod tests {
         let at = |gap, c| deficit_due(&s, &input(gap, c)).map(|t| t.since(Micros::from_secs(10)));
         // TileId(0) spreads by nothing.
         assert_eq!(at(1, 0), Some(Micros::from_millis(375)));
-        assert_eq!(at(1, 1_000), Some(Micros::from_millis(187).plus(Micros(500))));
+        assert_eq!(
+            at(1, 1_000),
+            Some(Micros::from_millis(187).plus(Micros(500)))
+        );
         assert!(at(2, 0) < at(1, 0));
         let mut none = s.clone();
         none.set_weight(Term::Deficit, 0);
