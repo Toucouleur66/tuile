@@ -561,6 +561,13 @@ pub struct GlobeOptions {
     /// specification says so. `None` by default: no substitute is ever
     /// asked for, and nothing changes.
     pub substitute: Option<SubstituteImagery>,
+    /// How many decoded, reprojected imagery tiles the loader remembers for
+    /// the terrain tiles that share them (each lane: the imagery and its
+    /// substitute). 512 by default: 128 MiB of RGBA8 256-pixel tiles held
+    /// outside the budget, which a phone may want smaller.
+    pub imagery_cache_tiles: usize,
+    /// How many decoded terrain meshes the loader remembers. 512 by default.
+    pub mesh_cache_tiles: usize,
 }
 
 impl Default for GlobeOptions {
@@ -578,7 +585,25 @@ impl Default for GlobeOptions {
             decode_normals: true,
             skirts_apart: false,
             substitute: None,
+            imagery_cache_tiles: DEFAULT_CACHE_TILES,
+            mesh_cache_tiles: DEFAULT_CACHE_TILES,
         }
+    }
+}
+
+/// The entries each of the loader's two caches holds unless the host says
+/// otherwise ([`GlobeOptions::imagery_cache_tiles`], [`GlobeOptions::mesh_cache_tiles`]).
+pub const DEFAULT_CACHE_TILES: usize = 512;
+
+impl GlobeOptions {
+    /// The loader's cache of decoded imagery, sized by these options.
+    fn imagery_cache(&self) -> ImageryCache {
+        ImageryCache::new(self.imagery_cache_tiles)
+    }
+
+    /// The loader's cache of decoded terrain meshes, sized by these options.
+    fn mesh_cache(&self) -> MeshCache {
+        MeshCache::new(self.mesh_cache_tiles)
     }
 }
 
@@ -2336,9 +2361,10 @@ where
             .with_max_level(deepest_useful),
     );
     let heights = Arc::new(TerrainHeights::new(scheme));
+    let (cache, meshes) = (opts.imagery_cache(), opts.mesh_cache());
     let substitute = opts.substitute.clone().map(|s| SubstituteLane {
         provider: s.0,
-        cache: Mutex::new(ImageryCache::new(512)),
+        cache: Mutex::new(opts.imagery_cache()),
         fetching: ImageryInFlight::default(),
     });
     let loader: Arc<dyn TileLoader> = Arc::new(PlanetaryLoader {
@@ -2346,8 +2372,8 @@ where
         imagery,
         scheme,
         opts,
-        cache: Mutex::new(ImageryCache::new(512)),
-        meshes: Mutex::new(MeshCache::new(512)),
+        cache: Mutex::new(cache),
+        meshes: Mutex::new(meshes),
         fetching: ImageryInFlight::default(),
         substitute,
         building: TerrainInFlight::default(),
@@ -2363,6 +2389,38 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two caches take their size from the options; the default is the
+    /// 512 entries they have always held. A cache that ignored its option
+    /// (or kept a literal) would hold 512 here and never let a tile go.
+    #[test]
+    fn the_loaders_caches_are_sized_by_the_options() {
+        let defaults = GlobeOptions::default();
+        assert_eq!(defaults.imagery_cache().cap, 512);
+        assert_eq!(defaults.mesh_cache().cap, 512);
+
+        let small = GlobeOptions {
+            imagery_cache_tiles: 2,
+            mesh_cache_tiles: 3,
+            ..GlobeOptions::default()
+        };
+        let (mut imagery, meshes) = (small.imagery_cache(), small.mesh_cache());
+        assert_eq!((imagery.cap, meshes.cap), (2, 3));
+
+        let mut let_go = Vec::new();
+        let tile = |x| ImageryCoord { level: 3, x, y: 0 };
+        for x in 0..3 {
+            let texture = Arc::new(DecodedTexture::from_rgba8(1, 1, vec![0; 4]));
+            imagery.put(tile(x), texture, &mut |c, way| {
+                if matches!(way, store_log::Way::LetGo) {
+                    let_go.push(c);
+                }
+            });
+        }
+        assert_eq!(let_go, vec![tile(0)], "the oldest of three goes at two");
+        assert_eq!(imagery.map.len(), 2);
+        assert_eq!(meshes.order.len(), 0);
+    }
 
     /// The loader compresses nothing unless its consumer asks.
     #[test]
