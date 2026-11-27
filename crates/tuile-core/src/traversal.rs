@@ -1547,9 +1547,196 @@ fn request(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::tileset::Tileset;
     use glam::{dvec2, dvec3};
-    use url::Url;
+
+    /// A tree built in code for the traversal's tests: a flat arena, ids in
+    /// pre-order from the root (a node, then each child's subtree in turn),
+    /// each node's refinement inherited from its parent unless it says
+    /// otherwise, `Replace` at the root. The shape a tileset's arena has, so
+    /// a test reads the same ids, volumes and errors it read when its tree
+    /// came from tileset JSON. It parses nothing.
+    pub(crate) struct TestTree {
+        tiles: Vec<TestTile>,
+        /// How many [`TestTree::graft`]s changed it: its revision.
+        edits: u64,
+        /// The class its meshes are charged to; the trait's default unless
+        /// [`TestTree::of_class`] says otherwise.
+        class: Option<crate::budget::Class>,
+    }
+
+    /// One tile of a [`TestTree`].
+    pub(crate) struct TestTile {
+        pub(crate) bounding_volume: crate::math::BoundingVolume,
+        pub(crate) geometric_error: f64,
+        pub(crate) refine: Refine,
+        pub(crate) content: bool,
+        pub(crate) children: Vec<TileId>,
+        pub(crate) parent: Option<TileId>,
+        pub(crate) depth: u32,
+    }
+
+    /// A node to build a [`TestTree`] from: a volume and an error, content by
+    /// default, its refinement inherited unless set.
+    pub(crate) struct Node {
+        volume: crate::math::BoundingVolume,
+        error: f64,
+        refine: Option<Refine>,
+        content: bool,
+        children: Vec<Node>,
+    }
+
+    impl Node {
+        /// A sphere in the tree's own frame, taken through the identity
+        /// transform as a tileset takes its volumes.
+        pub(crate) fn sphere(x: f64, y: f64, z: f64, radius: f64, error: f64) -> Node {
+            let volume = crate::math::BoundingVolume::Sphere(crate::math::Sphere {
+                center: DVec3::new(x, y, z),
+                radius,
+            })
+            .transformed(&DMat4::IDENTITY);
+            Node {
+                volume,
+                error,
+                refine: None,
+                content: true,
+                children: Vec::new(),
+            }
+        }
+
+        /// A `[west, south, east, north, min height, max height]` region
+        /// (radians, metres), bounded as a tileset bounds one.
+        pub(crate) fn region(region: [f64; 6], error: f64) -> Node {
+            Node {
+                volume: crate::math::BoundingVolume::Obb(crate::geo::region_to_obb(&region)),
+                error,
+                refine: None,
+                content: true,
+                children: Vec::new(),
+            }
+        }
+
+        pub(crate) fn refine(mut self, refine: Refine) -> Node {
+            self.refine = Some(refine);
+            self
+        }
+
+        /// A structural tile: no content of its own.
+        pub(crate) fn empty(mut self) -> Node {
+            self.content = false;
+            self
+        }
+
+        pub(crate) fn with(mut self, children: Vec<Node>) -> Node {
+            self.children = children;
+            self
+        }
+    }
+
+    impl TestTree {
+        pub(crate) fn new(root: Node) -> TestTree {
+            let mut tree = TestTree {
+                tiles: Vec::new(),
+                edits: 0,
+                class: None,
+            };
+            tree.push(root, None, Refine::Replace, 0);
+            tree
+        }
+
+        /// The same tree, its meshes charged to `class` (a tileset's are
+        /// charged to its own class).
+        pub(crate) fn of_class(mut self, class: crate::budget::Class) -> TestTree {
+            self.class = Some(class);
+            self
+        }
+
+        pub(crate) fn root(&self) -> TileId {
+            TileId(0)
+        }
+
+        pub(crate) fn tile(&self, id: TileId) -> &TestTile {
+            &self.tiles[id.0 as usize]
+        }
+
+        /// Hangs `node` under `host`, which gives its content up for it: the
+        /// one edit a tree takes while it is walked (an external tileset's
+        /// graft, in 3D Tiles). Bumps the revision.
+        pub(crate) fn graft(&mut self, host: TileId, node: Node) -> TileId {
+            let (refine, depth) = {
+                let h = self.tile(host);
+                (h.refine, h.depth)
+            };
+            let id = self.push(node, Some(host), refine, depth + 1);
+            let h = &mut self.tiles[host.0 as usize];
+            h.content = false;
+            h.children.push(id);
+            self.edits += 1;
+            id
+        }
+
+        fn push(
+            &mut self,
+            node: Node,
+            parent: Option<TileId>,
+            inherited: Refine,
+            depth: u32,
+        ) -> TileId {
+            let refine = node.refine.unwrap_or(inherited);
+            let id = TileId(self.tiles.len() as u64);
+            self.tiles.push(TestTile {
+                bounding_volume: node.volume,
+                geometric_error: node.error,
+                refine,
+                content: node.content,
+                children: Vec::new(),
+                parent,
+                depth,
+            });
+            let children: Vec<TileId> = node
+                .children
+                .into_iter()
+                .map(|child| self.push(child, Some(id), refine, depth + 1))
+                .collect();
+            self.tiles[id.0 as usize].children = children;
+            id
+        }
+    }
+
+    impl crate::source::TileTree for TestTree {
+        fn roots(&self) -> Vec<TileId> {
+            vec![self.root()]
+        }
+
+        fn children(&self, id: TileId) -> Vec<TileId> {
+            self.tile(id).children.clone()
+        }
+
+        fn properties(&self, id: TileId) -> crate::source::TileProperties {
+            let t = self.tile(id);
+            crate::source::TileProperties {
+                bounding_volume: t.bounding_volume,
+                geometric_error: t.geometric_error,
+                refine: t.refine,
+                has_content: t.content,
+            }
+        }
+
+        fn parent(&self, id: TileId) -> Option<TileId> {
+            self.tile(id).parent
+        }
+
+        fn level(&self, id: TileId) -> u32 {
+            self.tile(id).depth
+        }
+
+        fn revision(&self) -> Option<u64> {
+            Some(self.edits)
+        }
+
+        fn mesh_class(&self, _id: TileId) -> crate::budget::Class {
+            self.class.unwrap_or(crate::budget::Class::TerrainMesh)
+        }
+    }
 
     /// Two REPLACE roots of radius 10 at one depth, 1000 m in front of an
     /// eye at the origin looking down −z: one dead ahead, one 1500 m to the
@@ -1909,11 +2096,7 @@ pub(crate) mod tests {
     #[test]
     fn a_sources_sse_factor_sets_how_finely_it_is_refined() {
         use crate::source::{SourceOptions, TileTree};
-        let tree = || -> Box<dyn TileTree> {
-            Box::new(crate::tiles3d::TilesetTree::new(std::sync::Arc::new(
-                std::sync::RwLock::new(mini_tileset()),
-            )))
-        };
+        let tree = || -> Box<dyn TileTree> { Box::new(mini_tileset()) };
         struct Nothing;
         #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
         #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
@@ -1989,35 +2172,18 @@ pub(crate) mod tests {
 
     /// Root sphere (radius 100) with four leaf children (radius 30) laid out
     /// in the Z=0 plane. REPLACE refinement, leaves have geometricError 0.
-    fn mini_tileset() -> Tileset {
-        let child = |x: f64, y: f64, name: &str| {
-            format!(
-                r#"{{
-                  "boundingVolume": {{ "sphere": [{x}, {y}, 0, 30] }},
-                  "geometricError": 0,
-                  "content": {{ "uri": "{name}.glb" }}
-                }}"#
-            )
-        };
-        let json = format!(
-            r#"{{
-              "asset": {{ "version": "1.1" }},
-              "geometricError": 200,
-              "root": {{
-                "boundingVolume": {{ "sphere": [0, 0, 0, 100] }},
-                "geometricError": 50,
-                "refine": "REPLACE",
-                "content": {{ "uri": "root.glb" }},
-                "children": [{}, {}, {}, {}]
-              }}
-            }}"#,
-            child(-50.0, -50.0, "a"),
-            child(50.0, -50.0, "b"),
-            child(-50.0, 50.0, "c"),
-            child(50.0, 50.0, "d"),
-        );
-        let base = Url::parse("file:///t/tileset.json").expect("url");
-        Tileset::from_json_bytes(json.as_bytes(), &base).expect("tileset")
+    fn mini_tileset() -> TestTree {
+        let child = |x: f64, y: f64| Node::sphere(x, y, 0.0, 30.0, 0.0);
+        TestTree::new(
+            Node::sphere(0.0, 0.0, 0.0, 100.0, 50.0)
+                .refine(Refine::Replace)
+                .with(vec![
+                    child(-50.0, -50.0),
+                    child(50.0, -50.0),
+                    child(-50.0, 50.0),
+                    child(50.0, 50.0),
+                ]),
+        )
     }
 
     /// Marks every tile at `depth` resident and nothing else — the state a
@@ -2026,8 +2192,8 @@ pub(crate) mod tests {
     /// It is the only state where speculation means anything: with an empty
     /// residency every tile is wanted *now*, so a preload is immediately
     /// upgraded to urgent and there is nothing speculative left to observe.
-    fn residency_at_depth(ts: &Tileset, depth: u32) -> ResidentSet {
-        fn walk(ts: &Tileset, id: TileId, at: u32, want: u32, out: &mut ResidentSet) {
+    fn residency_at_depth(ts: &TestTree, depth: u32) -> ResidentSet {
+        fn walk(ts: &TestTree, id: TileId, at: u32, want: u32, out: &mut ResidentSet) {
             if at == want {
                 out.insert(id);
                 return;
@@ -2043,36 +2209,21 @@ pub(crate) mod tests {
 
     /// A tileset deep enough that a close camera wants far more tiles than any
     /// one round trip can deliver: `fanout^depth` leaves under one root.
-    fn deep_tileset(depth: u32) -> Tileset {
-        fn node(level: u32, depth: u32, radius: f64, x: f64, y: f64) -> String {
-            let error = radius;
+    fn deep_tileset(depth: u32) -> TestTree {
+        fn node(level: u32, depth: u32, radius: f64, x: f64, y: f64) -> Node {
             if level == depth {
-                return format!(
-                    r#"{{ "boundingVolume": {{ "sphere": [{x}, {y}, 0, {radius}] }},
-                         "geometricError": 0, "refine": "REPLACE",
-                         "content": {{ "uri": "l{level}_{x}_{y}.glb" }} }}"#
-                );
+                return Node::sphere(x, y, 0.0, radius, 0.0).refine(Refine::Replace);
             }
             let half = radius / 2.0;
-            let kids: Vec<String> = [(-half, -half), (half, -half), (-half, half), (half, half)]
+            let kids: Vec<Node> = [(-half, -half), (half, -half), (-half, half), (half, half)]
                 .iter()
                 .map(|(dx, dy)| node(level + 1, depth, half, x + dx, y + dy))
                 .collect();
-            format!(
-                r#"{{ "boundingVolume": {{ "sphere": [{x}, {y}, 0, {radius}] }},
-                     "geometricError": {error}, "refine": "REPLACE",
-                     "content": {{ "uri": "l{level}_{x}_{y}.glb" }},
-                     "children": [{}] }}"#,
-                kids.join(",")
-            )
+            Node::sphere(x, y, 0.0, radius, radius)
+                .refine(Refine::Replace)
+                .with(kids)
         }
-        let json = format!(
-            r#"{{ "asset": {{ "version": "1.1" }}, "geometricError": 400,
-                 "root": {} }}"#,
-            node(0, depth, 100.0, 0.0, 0.0)
-        );
-        let base = Url::parse("file:///t/tileset.json").expect("url");
-        Tileset::from_json_bytes(json.as_bytes(), &base).expect("tileset")
+        TestTree::new(node(0, depth, 100.0, 0.0, 0.0))
     }
 
     /// A tile the traversal refines past is fetched anyway, at the lowest
@@ -2291,7 +2442,7 @@ pub(crate) mod tests {
     /// changes with it.
     #[allow(clippy::panic, reason = "a fixture that never settles is a bug")]
     fn converge_like_the_server(
-        ts: &Tileset,
+        ts: &TestTree,
         views: &[ViewState],
         config: &Config,
         per_round: usize,
@@ -2305,7 +2456,7 @@ pub(crate) mod tests {
     /// that one memory; only what is drawn moves from pass to pass.
     #[allow(clippy::panic, reason = "a fixture that never settles is a bug")]
     fn converge_after(
-        ts: &Tileset,
+        ts: &TestTree,
         views: &[ViewState],
         config: &Config,
         per_round: usize,
@@ -2561,24 +2712,13 @@ pub(crate) mod tests {
     /// kept distance is stale.
     #[test]
     fn a_graft_under_a_still_camera_is_priced_afresh() {
-        let json = r#"{ "asset": { "version": "1.1" }, "geometricError": 400,
-            "root": { "boundingVolume": { "sphere": [0, 0, 0, 100] },
-                      "geometricError": 100, "refine": "REPLACE",
-                      "content": { "uri": "root.glb" },
-                      "children": [{
-                        "boundingVolume": { "sphere": [0, 0, 0, 50] },
-                        "geometricError": 20, "refine": "REPLACE",
-                        "content": { "uri": "host.json" } }] } }"#;
-        let external = r#"{ "asset": { "version": "1.1" }, "geometricError": 20,
-            "root": { "boundingVolume": { "sphere": [0, 0, 0, 10] },
-                      "geometricError": 2, "refine": "REPLACE",
-                      "content": { "uri": "inner.glb" },
-                      "children": [{
-                        "boundingVolume": { "sphere": [0, 0, 0, 5] },
-                        "geometricError": 0,
-                        "content": { "uri": "leaf.glb" } }] } }"#;
-        let base = Url::parse("file:///t/tileset.json").expect("url");
-        let mut ts = Tileset::from_json_bytes(json.as_bytes(), &base).expect("tileset");
+        let mut ts = TestTree::new(
+            Node::sphere(0.0, 0.0, 0.0, 100.0, 100.0)
+                .refine(Refine::Replace)
+                .with(vec![
+                    Node::sphere(0.0, 0.0, 0.0, 50.0, 20.0).refine(Refine::Replace)
+                ]),
+        );
         let host = ts.tile(ts.root()).children[0];
         let views = [camera_at(120.0)];
         let config = Config {
@@ -2603,10 +2743,12 @@ pub(crate) mod tests {
         );
         let priced_before = nearest_content_distance(&ts, &views);
 
-        let ext_url = Url::parse("file:///t/host.json").expect("url");
-        let ext: crate::tileset::TilesetJson =
-            serde_json::from_str(external).expect("external tileset");
-        ts.graft(host, ext, &ext_url).expect("graft");
+        ts.graft(
+            host,
+            Node::sphere(0.0, 0.0, 0.0, 10.0, 2.0)
+                .refine(Refine::Replace)
+                .with(vec![Node::sphere(0.0, 0.0, 0.0, 5.0, 0.0)]),
+        );
         assert_ne!(
             nearest_content_distance(&ts, &views).to_bits(),
             priced_before.to_bits(),
@@ -2629,7 +2771,7 @@ pub(crate) mod tests {
     /// pass, as every tree did before the memo.
     #[test]
     fn a_tree_without_a_revision_descends_every_pass() {
-        struct Unsure(Tileset);
+        struct Unsure(TestTree);
         impl crate::source::TileTree for Unsure {
             fn roots(&self) -> Vec<TileId> {
                 self.0.roots()
@@ -2886,7 +3028,7 @@ pub(crate) mod tests {
         );
     }
 
-    fn run(ts: &Tileset, residency: &ResidentSet, views: &[ViewState]) -> TraversalOutput {
+    fn run(ts: &TestTree, residency: &ResidentSet, views: &[ViewState]) -> TraversalOutput {
         run_with(ts, residency, views, &Config::default(), &HashSet::new())
     }
 
@@ -2895,7 +3037,7 @@ pub(crate) mod tests {
     /// taken for what was chosen too, as it is in a previous frame that had
     /// settled.
     fn run_with(
-        ts: &Tileset,
+        ts: &TestTree,
         residency: &dyn Residency,
         views: &[ViewState],
         config: &Config,
@@ -2925,30 +3067,17 @@ pub(crate) mod tests {
     /// interactive contract, unchanged.
     #[test]
     fn uniform_detail_refines_the_far_branch_like_the_near_one() {
-        let branch = |x: f64, name: &str| {
-            format!(
-                r#"{{ "boundingVolume": {{ "sphere": [{x}, 0, 0, 30] }},
-                     "geometricError": 20, "refine": "REPLACE",
-                     "content": {{ "uri": "{name}.glb" }},
-                     "children": [{{
-                       "boundingVolume": {{ "sphere": [{x}, 0, 0, 10] }},
-                       "geometricError": 0,
-                       "content": {{ "uri": "{name}_leaf.glb" }}
-                     }}] }}"#
-            )
+        let branch = |x: f64| {
+            Node::sphere(x, 0.0, 0.0, 30.0, 20.0)
+                .refine(Refine::Replace)
+                .with(vec![Node::sphere(x, 0.0, 0.0, 10.0, 0.0)])
         };
-        let json = format!(
-            r#"{{ "asset": {{ "version": "1.1" }}, "geometricError": 400,
-                 "root": {{
-                   "boundingVolume": {{ "sphere": [2000, 0, 0, 5000] }},
-                   "geometricError": 200, "refine": "REPLACE",
-                   "children": [{}, {}]
-                 }} }}"#,
-            branch(0.0, "near"),
-            branch(4000.0, "far"),
+        let ts = TestTree::new(
+            Node::sphere(2000.0, 0.0, 0.0, 5000.0, 200.0)
+                .refine(Refine::Replace)
+                .empty()
+                .with(vec![branch(0.0), branch(4000.0)]),
         );
-        let base = Url::parse("file:///t/tileset.json").expect("url");
-        let ts = Tileset::from_json_bytes(json.as_bytes(), &base).expect("tileset");
 
         let near_leaf = ts.tile(ts.tile(ts.root()).children[0]).children[0];
         let far_leaf = ts.tile(ts.tile(ts.root()).children[1]).children[0];
@@ -3077,33 +3206,21 @@ pub(crate) mod tests {
         // Subdivision en longitude seulement : le basculement se joue entre
         // frères, et deux dimensions ne prouveraient rien de plus pour quatre
         // fois plus de JSON.
-        fn node(west: f64, east: f64, depth: u32) -> String {
-            let region = format!("[{west}, 0.60, {east}, 0.90, -1000, 9000]");
+        fn node(west: f64, east: f64, depth: u32) -> Node {
+            let region = [west, 0.60, east, 0.90, -1000.0, 9000.0];
             let error = 4000.0 / f64::from(1 << depth);
             if depth == 5 {
-                return format!(
-                    r#"{{ "boundingVolume": {{ "region": {region} }},
-                         "geometricError": 0,
-                         "content": {{ "uri": "g{west}.glb" }} }}"#
-                );
+                return Node::region(region, 0.0);
             }
             let middle = 0.5 * (west + east);
-            format!(
-                r#"{{ "boundingVolume": {{ "region": {region} }},
-                     "geometricError": {error}, "refine": "REPLACE",
-                     "content": {{ "uri": "n{west}.glb" }},
-                     "children": [{}, {}] }}"#,
-                node(west, middle, depth + 1),
-                node(middle, east, depth + 1),
-            )
+            Node::region(region, error)
+                .refine(Refine::Replace)
+                .with(vec![
+                    node(west, middle, depth + 1),
+                    node(middle, east, depth + 1),
+                ])
         }
-        let json = format!(
-            r#"{{ "asset": {{ "version": "1.1" }}, "geometricError": 8000,
-                 "root": {} }}"#,
-            node(-0.80, 0.20, 0)
-        );
-        let base = Url::parse("file:///t/tileset.json").expect("url");
-        let ts = Tileset::from_json_bytes(json.as_bytes(), &base).expect("tileset");
+        let ts = TestTree::new(node(-0.80, 0.20, 0));
 
         let look = |lon: f64| {
             let g = |height| {
@@ -3347,23 +3464,11 @@ pub(crate) mod tests {
 
     #[test]
     fn add_refinement_keeps_parent_selected() {
-        let json = r#"{
-          "asset": { "version": "1.1" },
-          "geometricError": 200,
-          "root": {
-            "boundingVolume": { "sphere": [0, 0, 0, 100] },
-            "geometricError": 50,
-            "refine": "ADD",
-            "content": { "uri": "root.glb" },
-            "children": [{
-              "boundingVolume": { "sphere": [0, 0, 0, 50] },
-              "geometricError": 0,
-              "content": { "uri": "a.glb" }
-            }]
-          }
-        }"#;
-        let base = Url::parse("file:///t/tileset.json").expect("url");
-        let ts = Tileset::from_json_bytes(json.as_bytes(), &base).expect("tileset");
+        let ts = TestTree::new(
+            Node::sphere(0.0, 0.0, 0.0, 100.0, 50.0)
+                .refine(Refine::Add)
+                .with(vec![Node::sphere(0.0, 0.0, 0.0, 50.0, 0.0)]),
+        );
         let root = ts.root();
         let child = ts.tile(root).children[0];
 
@@ -3381,23 +3486,11 @@ pub(crate) mod tests {
         // A tile with children, content and geometricError 0: sse is always
         // 0, so it is never "too coarse" — its children must never be
         // visited, requested or selected, however close the camera gets.
-        let json = r#"{
-          "asset": { "version": "1.1" },
-          "geometricError": 200,
-          "root": {
-            "boundingVolume": { "sphere": [0, 0, 0, 100] },
-            "geometricError": 0,
-            "refine": "REPLACE",
-            "content": { "uri": "mid.glb" },
-            "children": [{
-              "boundingVolume": { "sphere": [0, 0, 0, 50] },
-              "geometricError": 0,
-              "content": { "uri": "leaf.glb" }
-            }]
-          }
-        }"#;
-        let base = Url::parse("file:///t/tileset.json").expect("url");
-        let ts = Tileset::from_json_bytes(json.as_bytes(), &base).expect("tileset");
+        let ts = TestTree::new(
+            Node::sphere(0.0, 0.0, 0.0, 100.0, 0.0)
+                .refine(Refine::Replace)
+                .with(vec![Node::sphere(0.0, 0.0, 0.0, 50.0, 0.0)]),
+        );
         let root = ts.root();
         let leaf = ts.tile(root).children[0];
 
@@ -3555,25 +3648,13 @@ pub(crate) mod tests {
         // root (REPLACE, content) → empty mid (no content) → leaf (content).
         // The empty tile is structural: refinement passes through it, and
         // its readiness is its subtree's readiness.
-        let json = r#"{
-          "asset": { "version": "1.1" }, "geometricError": 200,
-          "root": {
-            "boundingVolume": { "sphere": [0, 0, 0, 100] },
-            "geometricError": 50, "refine": "REPLACE",
-            "content": { "uri": "root.glb" },
-            "children": [{
-              "boundingVolume": { "sphere": [0, 0, 0, 60] },
-              "geometricError": 40,
-              "children": [{
-                "boundingVolume": { "sphere": [0, 0, 0, 50] },
-                "geometricError": 0,
-                "content": { "uri": "leaf.glb" }
-              }]
-            }]
-          }
-        }"#;
-        let base = Url::parse("file:///t/tileset.json").expect("url");
-        let ts = Tileset::from_json_bytes(json.as_bytes(), &base).expect("tileset");
+        let ts = TestTree::new(
+            Node::sphere(0.0, 0.0, 0.0, 100.0, 50.0)
+                .refine(Refine::Replace)
+                .with(vec![Node::sphere(0.0, 0.0, 0.0, 60.0, 40.0)
+                    .empty()
+                    .with(vec![Node::sphere(0.0, 0.0, 0.0, 50.0, 0.0)])]),
+        );
         let root = ts.root();
         let mid = ts.tile(root).children[0];
         let leaf = ts.tile(mid).children[0];

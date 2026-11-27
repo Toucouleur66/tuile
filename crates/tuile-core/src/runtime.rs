@@ -2627,6 +2627,26 @@ mod tests {
         Tileset::from_json_bytes(&bytes, &url).expect("tileset")
     }
 
+    /// [`write_deep_fixture`]'s tree built in code, for a test whose loader
+    /// reads no content: the same ids, volumes and errors, its meshes charged
+    /// to the class a tileset's are.
+    fn deep_tree() -> crate::traversal::tests::TestTree {
+        use crate::source::Refine;
+        use crate::traversal::tests::{Node, TestTree};
+        let leaf = |x: f64| Node::sphere(x, 0.0, 0.0, 25.0, 0.0);
+        let mid = |x: f64, a: f64, b: f64| {
+            Node::sphere(x, 0.0, 0.0, 50.0, 50.0)
+                .refine(Refine::Replace)
+                .with(vec![leaf(a), leaf(b)])
+        };
+        TestTree::new(
+            Node::sphere(0.0, 0.0, 0.0, 100.0, 100.0)
+                .refine(Refine::Replace)
+                .with(vec![mid(-50.0, -75.0, -25.0), mid(50.0, 25.0, 75.0)]),
+        )
+        .of_class(crate::budget::Class::Tiles3dMesh)
+    }
+
     fn leaves_of(tileset: &Tileset) -> HashSet<TileId> {
         tileset
             .tile(tileset.root())
@@ -3005,10 +3025,8 @@ mod tests {
                 futures_util::future::pending().await
             }
         }
-        let dir = tempfile::tempdir().expect("tempdir");
-        let tileset = deep_tileset(dir.path());
         let live = Arc::new(std::sync::Mutex::new(Live::default()));
-        let tree: Box<dyn TileTree> = Box::new(TilesetTree::new(Arc::new(RwLock::new(tileset))));
+        let tree: Box<dyn TileTree> = Box::new(deep_tree());
         let now = Arc::new(AtomicU64::new(0));
         let clock = Arc::clone(&now);
         let (mut stream, server) = in_process_with(
@@ -3124,11 +3142,9 @@ mod tests {
                 futures_util::future::pending().await
             }
         }
-        let dir = tempfile::tempdir().expect("tempdir");
-        let tileset = deep_tileset(dir.path());
         let noted = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (mut stream, server) = in_process_with(
-            Box::new(tileset),
+            Box::new(deep_tree()),
             Arc::new(Noting(Arc::clone(&noted))),
             Config::default(),
             roomy(),
