@@ -1100,7 +1100,10 @@ fn the_globe_and_a_city_share_one_budget() {
 /// ground is never dressed — what a throttled or distant origin did to the
 /// viewer (16 drape loads in flight for ever, the imagery under its need).
 #[test]
-#[cfg_attr(debug_assertions, ignore = "slow: an origin slower than the load timeout (runs in release in budget-sim), ~22 s in debug")]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "slow: an origin slower than the load timeout (runs in release in budget-sim), ~22 s in debug"
+)]
 fn an_origin_slower_than_the_load_timeout_still_delivers() {
     let mut profile = Profile::desktop();
     profile.net.imagery.base_ms = 5_000.0;

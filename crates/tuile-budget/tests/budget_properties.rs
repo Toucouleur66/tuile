@@ -483,7 +483,10 @@ fn config() -> ProptestConfig {
 /// policies and a squeezed memory, the need in its order and permuted, every
 /// step checked against the reference (`tests/reference/`).
 #[test]
-#[cfg_attr(debug_assertions, ignore = "slow: decide agrees with the reference (runs in release in budget-sim), ~21 s in debug")]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "slow: decide agrees with the reference (runs in release in budget-sim), ~21 s in debug"
+)]
 fn decide_agrees_with_the_reference_on_a_fixed_corpus() {
     for i in 0..CORPUS {
         let ops = corpus_script(i);
