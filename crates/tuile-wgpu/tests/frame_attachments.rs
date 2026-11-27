@@ -16,10 +16,13 @@
 //! samples to draw over them. On native backends wgpu validates the two
 //! ways of getting this wrong: a transient attachment stored, or loaded by
 //! the pass after. On every backend the picture is read back.
+//!
+//! A pass after the frame that reads the frame's depth in a shader (the
+//! mist) is given it, kept, where the device can bind it at all.
 
 use tuile_wgpu::{
-    draw_to_texture, FrameOnTexture, FramePass, FrameTargets, GpuContext, Readback, NOTHING_AFTER,
-    SAMPLES, TEXTURE_FORMAT,
+    draw_to_texture, FrameOnTexture, FramePass, FrameTargets, GpuContext, MistRenderer, Readback,
+    DEPTH_FORMAT, NOTHING_AFTER, SAMPLES, TEXTURE_FORMAT,
 };
 
 const WIDTH: u32 = 64;
@@ -239,5 +242,197 @@ fn a_pass_after_can_come_and_go() {
         };
         assert_eq!(at(&pixels, 1, 1), left, "with a pass after: {with_after}");
         assert_eq!(at(&pixels, WIDTH - 2, HEIGHT - 2), [255, 0, 0, 255]);
+    }
+}
+
+/// The depth the frame's pass writes, whatever the far plane: a quarter.
+const DEPTH: f32 = 0.25;
+
+/// A full-screen triangle at [`DEPTH`], written into the frame's depth and
+/// nothing into its colour: what the frame's pass draws.
+fn at_a_quarter(gpu: &GpuContext) -> wgpu::RenderPipeline {
+    let module = gpu
+        .device
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("frame depth test (write)"),
+            source: wgpu::ShaderSource::Wgsl(
+                format!(
+                    "@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {{
+                         let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+                         return vec4<f32>(p * 2.0 - 1.0, {DEPTH:?}, 1.0);
+                     }}
+                     @fragment fn fs() -> @location(0) vec4<f32> {{
+                         return vec4<f32>(1.0, 0.0, 0.0, 1.0);
+                     }}"
+                )
+                .into(),
+            ),
+        });
+    gpu.device
+        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("frame depth test (write)"),
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(TEXTURE_FORMAT.into())],
+            }),
+            primitive: Default::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: SAMPLES,
+                ..Default::default()
+            },
+            multiview_mask: None,
+            cache: None,
+        })
+}
+
+/// Reads the frame's depth, sample 0: green where it is [`DEPTH`], blue
+/// elsewhere. What the pass after the frame draws.
+fn depth_as_green(gpu: &GpuContext) -> wgpu::RenderPipeline {
+    let texture = if SAMPLES > 1 {
+        "texture_depth_multisampled_2d"
+    } else {
+        "texture_depth_2d"
+    };
+    let module = gpu
+        .device
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("frame depth test (read)"),
+            source: wgpu::ShaderSource::Wgsl(
+                format!(
+                    "@group(0) @binding(0) var depth: {texture};
+                     @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {{
+                         let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+                         return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+                     }}
+                     @fragment fn fs(@builtin(position) at: vec4<f32>) -> @location(0) vec4<f32> {{
+                         let d = textureLoad(depth, vec2<i32>(at.xy), 0);
+                         // Green where it is the frame's, blue where it is not:
+                         // a comparison, so the target's sRGB encoding is
+                         // nothing to it.
+                         if abs(d - {DEPTH:?}) < 1e-3 {{
+                             return vec4<f32>(0.0, 1.0, 0.0, 1.0);
+                         }}
+                         return vec4<f32>(0.0, 0.0, 1.0, 1.0);
+                     }}"
+                )
+                .into(),
+            ),
+        });
+    gpu.device
+        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("frame depth test (read)"),
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(TEXTURE_FORMAT.into())],
+            }),
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: SAMPLES,
+                ..Default::default()
+            },
+            multiview_mask: None,
+            cache: None,
+        })
+}
+
+/// The depth the frame's pass wrote reaches a pass after it, as a texture
+/// to read — twice, on the same targets, and where the device can bind a
+/// multisampled depth at all. Where it cannot, the pass after is told so.
+#[test]
+fn a_pass_after_the_frame_reads_the_frames_depth() {
+    let Some(gpu) = gpu() else { return };
+    let targets = FrameTargets::new(&gpu, TEXTURE_FORMAT, (WIDTH, HEIGHT));
+    let texture = texture(&gpu);
+    let write = at_a_quarter(&gpu);
+    let read = depth_as_green(&gpu);
+    let readable = MistRenderer::supported(&gpu);
+    let given = std::cell::Cell::new(None);
+    let after = |encoder: &mut wgpu::CommandEncoder, frame: &FramePass<'_>| {
+        given.set(Some(frame.depth.is_some()));
+        let Some(depth) = frame.depth else { return };
+        let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("frame depth test"),
+            layout: &read.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(depth),
+            }],
+        });
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("after the frame, reading its depth"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: frame.colour,
+                resolve_target: Some(frame.resolve),
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            ..Default::default()
+        });
+        pass.set_pipeline(&read);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.draw(0..3, 0..1);
+    };
+    for _ in 0..2 {
+        let mut readback = Readback::default();
+        draw_to_texture(
+            FrameOnTexture {
+                gpu: &gpu,
+                texture: &texture,
+                targets: &targets,
+                clear: RED,
+                capture: Some(&mut readback),
+            },
+            |pass| {
+                pass.set_pipeline(&write);
+                pass.draw(0..3, 0..1);
+            },
+            Some(after),
+        );
+        assert_eq!(
+            given.get(),
+            Some(readable),
+            "the depth given where it can be read"
+        );
+        let pixels = readback.take(&gpu, (WIDTH, HEIGHT)).expect("read back");
+        if !readable {
+            assert_eq!(at(&pixels, WIDTH / 2, HEIGHT / 2), [255, 0, 0, 255]);
+            continue;
+        }
+        for (x, y) in [(1, 1), (WIDTH - 2, HEIGHT - 2), (WIDTH / 2, HEIGHT / 2)] {
+            assert_eq!(
+                at(&pixels, x, y),
+                [0, 255, 0, 255],
+                "pixel ({x}, {y}): the pass after read the frame's depth, {DEPTH}"
+            );
+        }
     }
 }
