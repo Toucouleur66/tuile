@@ -47,9 +47,12 @@ use tuile_film::ground::Ground;
 /// only once its replacement is whole (#324), the compression of what
 /// lasts (#312): the survey's and the bake's selections and so the pack
 /// move; every frame's ground is the same, bit for bit.
+/// And again with the skirts at the references' rule (`LEVELS_OF_REACH`
+/// 0): the pack's skirt depths move, so its digest; its size, the
+/// selections and every frame's ground are the same.
 const RECORDED: &str = concat!(
-    "{\"frames\":12,\"viewport\":[960,540],\"scene\":\"cb6dbb6b0f25b499\",\"pack_sha256\":\"9ada",
-    "009402656cd3ac4b9be0343720d7882f38931bad761bdd767987041e655f\",\"pack_bytes\":24747",
+    "{\"frames\":12,\"viewport\":[960,540],\"scene\":\"cb6dbb6b0f25b499\",\"pack_sha256\":\"b7c9",
+    "d35578f344ca459bedcbe6a7359e54ac9f9aa1c76daf121219209d10d02a\",\"pack_bytes\":24747",
     "2,\"survey_selections\":[\"234d658eb1bc893d\",\"e1996e439b9e1a5a\",\"a228670483cb67ad\",",
     "\"ed15d6e63102e802\",\"12affd49c30bbe38\",\"82b539bfc86dadcd\",\"94e9a6652bdb0814\",\"978",
     "e4f34d3fdbc87\",\"a70812ed2b993543\",\"fe08c3a03d1cac80\",\"c2f73448bb9bab96\",\"0354ec6",

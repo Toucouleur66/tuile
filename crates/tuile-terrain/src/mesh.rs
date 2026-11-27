@@ -189,10 +189,11 @@ pub fn skirt_height(rect: &GeoRect) -> f64 {
 ///   levels coarser. The step between them is the *coarser* tile's error, and
 ///   where the fine tile is the higher side its own skirt is the only thing
 ///   that can close it. So a skirt hangs as deep as that of a tile
-///   [`SkirtOptions::levels_of_reach`] levels coarser — four by default:
-///   sixteen times the rule, eighty geometric errors — which covers a
+///   [`SkirtOptions::levels_of_reach`] levels coarser — none by default, the references' rule; four
+///   is sixteen times the rule, eighty geometric errors — which covers a
 ///   neighbour up to six levels coarser (its error is 2⁶ = 64 of the tile's
-///   own). Coarse tiles need no such help and are left at the rule from
+///   own, what a host that prefers closed seams to short walls asks for).
+///   Coarse tiles need no such help and are left at the rule from
 ///   level [`SkirtOptions::deepest_level`] (6) up, where it already gives
 ///   kilometres.
 ///
@@ -224,10 +225,10 @@ pub fn skirt_depth_with(mesh: &QuantizedMesh, rect: &GeoRect, options: &SkirtOpt
 /// the depth is a continuous function of them, never a step.
 ///
 /// - `levels_of_reach`: a skirt reaches as deep as that of a tile this many
-///   levels coarser. 4 by default, what the references' rule needs to close a
-///   neighbour up to six levels coarser; 0 is the references' own rule
-///   ([`skirt_height`]) — walls shorter by sixteen, steps to a much coarser
-///   neighbour left open (see [`skirt_depth`]). Negative or not a number is 0.
+///   levels coarser. 0 by default, the references' own rule ([`skirt_height`]):
+///   short walls, the step to a much coarser neighbour left open (see
+///   [`skirt_depth`]); 4 closes a neighbour up to six levels coarser, with walls
+///   sixteen times taller. Negative or not a number is 0.
 /// - `deepest_level`: …but no deeper than a tile's of this level, 6 by
 ///   default: 6 km. (Where the rule already gives more, the rule.)
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -238,7 +239,7 @@ pub struct SkirtOptions {
 
 impl SkirtOptions {
     /// The reach, in levels, of skirts nobody tuned.
-    pub const DEFAULT_LEVELS_OF_REACH: f64 = 4.0;
+    pub const DEFAULT_LEVELS_OF_REACH: f64 = 0.0;
     /// The deepest level a skirt reaches, when nobody tuned it.
     pub const DEFAULT_DEEPEST_LEVEL: f64 = 6.0;
 }
@@ -1055,34 +1056,44 @@ mod tests {
     }
 
     /// **A skirt is sized by the terrain its surface is from, and reaches
-    /// past a neighbour of another level** — by default, four levels.
+    /// past a neighbour of another level** — with a reach of four levels.
     #[test]
     fn skirt_depth_follows_the_source_and_reaches_coarser_neighbours() {
         let scheme = GeographicTilingScheme::default();
         let at = |level: u32| scheme.tile_rect(TileCoord::new(level, 0, 0));
         let rule = |level: u32| skirt_height(&at(level));
+        let four = SkirtOptions {
+            levels_of_reach: 4.0,
+            ..SkirtOptions::default()
+        };
 
         // As deep as the rule gives a tile four levels coarser…
-        assert!((skirt_depth_cut(&at(13), 0) - rule(9)).abs() < 1.0e-6);
-        assert!((skirt_depth_cut(&at(19), 0) - rule(15)).abs() < 1.0e-6);
+        assert!((skirt_depth_cut_with(&at(13), 0, &four) - rule(9)).abs() < 1.0e-6);
+        assert!((skirt_depth_cut_with(&at(19), 0, &four) - rule(15)).abs() < 1.0e-6);
         // …down to level 6's and no deeper…
-        assert!((skirt_depth_cut(&at(8), 0) - rule(6)).abs() < 1.0e-6);
+        assert!((skirt_depth_cut_with(&at(8), 0, &four) - rule(6)).abs() < 1.0e-6);
         // …and where the rule already gives that much, the rule.
-        assert!((skirt_depth_cut(&at(6), 0) - rule(6)).abs() < 1.0e-6);
-        assert!((skirt_depth_cut(&at(2), 0) - rule(2)).abs() < 1.0e-6);
+        assert!((skirt_depth_cut_with(&at(6), 0, &four) - rule(6)).abs() < 1.0e-6);
+        assert!((skirt_depth_cut_with(&at(2), 0, &four) - rule(2)).abs() < 1.0e-6);
 
         // A tile cut from an ancestor hangs its ancestor's skirt, however
         // small it is itself.
         for level in 14..=19 {
             let cut = level - 13;
             assert!(
-                (skirt_depth_cut(&at(level), cut) - skirt_depth_cut(&at(13), 0)).abs() < 1.0e-6,
+                (skirt_depth_cut_with(&at(level), cut, &four)
+                    - skirt_depth_cut_with(&at(13), 0, &four))
+                .abs()
+                    < 1.0e-6,
                 "level {level} cut from 13"
             );
         }
         let mut mesh = quad_mesh([0.0; 3]);
         mesh.cut = 3;
-        assert_eq!(skirt_depth(&mesh, &at(16)), skirt_depth_cut(&at(16), 3));
+        assert_eq!(
+            skirt_depth_with(&mesh, &at(16), &four),
+            skirt_depth_cut_with(&at(16), 3, &four)
+        );
     }
 
     /// **The reach is the host's number: 0 levels is the references' rule at
@@ -1110,8 +1121,10 @@ mod tests {
         }
         assert!((skirt_depth_cut_with(&at(16), 3, &none) - rule(13)).abs() < 1.0e-6);
 
-        // The default is the options' default, and is what the plain
+        // The default is the references' rule, and is what the plain
         // functions give.
+        assert_eq!(SkirtOptions::default().levels_of_reach, 0.0);
+        assert_eq!(skirt_depth_cut(&at(13), 0), rule(13));
         assert_eq!(
             skirt_depth_cut_with(&at(13), 0, &SkirtOptions::default()),
             skirt_depth_cut(&at(13), 0)
