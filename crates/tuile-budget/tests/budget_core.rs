@@ -2226,6 +2226,41 @@ mod draw {
         assert_eq!(d.stats.lost, 0);
     }
 
+    /// The ancestors' drapes are asked for **once**, then the step goes
+    /// quiet: a still view that has everything (the drawn tile's drapes and
+    /// its ancestor's) starts, cancels and evicts nothing, and the ancestor's
+    /// drape stays on the GPU. What the measured preload this change is
+    /// next to failed at (work every still step, loads cancelled on a still
+    /// camera) is not asked here by a scenario: this pins it on the minimal
+    /// shape. It does not cover the pressure case (`budget_sim`'s digests
+    /// do, and they do not move).
+    #[test]
+    fn a_still_view_asks_for_its_ancestors_drapes_once_then_goes_quiet() {
+        let mut r = Rig::interactive();
+        let a = t(3, 2, 2);
+        let k = children(a)[0];
+        let need = NeedSet {
+            drawn: vec![(k, draped(k, 4))],
+            ancestors: vec![(a, draped(a, 3))],
+            ..NeedSet::new()
+        };
+        let d = r.settle(&need, 40);
+        assert!(d.start.is_empty(), "nothing left to start");
+        assert!(d.cancel.is_empty(), "nothing cancelled on a still view");
+        assert!(d.evict.is_empty(), "nothing evicted on a still view");
+        for _ in 0..8 {
+            let d = r.step(&need);
+            assert!(d.start.is_empty() && d.cancel.is_empty() && d.evict.is_empty());
+        }
+        let d = r.step(&need);
+        let item = d.draw.get(mesh(k)).expect("the tile is drawn");
+        assert_eq!(
+            base_drape(item).map(|c| c.resource),
+            Some(dr(k, 4)),
+            "the drawn tile wears its own drape"
+        );
+    }
+
     /// I9 (coarsening), C19: on a zoom-out the children stay drawn until the
     /// parent is drawable, then go in the same step.
     #[test]
