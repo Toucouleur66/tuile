@@ -528,6 +528,7 @@ fn session(
         backends,
         imagery_compression: compression,
         imagery_encode_level: encode_level,
+        underlay: Some(tuile_wgpu::UnderlayOptions::default()),
         lighting,
         record,
         tilesets: offered,
