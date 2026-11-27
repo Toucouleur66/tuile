@@ -982,8 +982,16 @@ impl BudgetSignals {
         ));
         for (i, k) in labels::DEFICIT.iter().enumerate() {
             let kind = || vec![("kind", *k)];
-            out.push(("under_need_tiles", kind(), f64::from(self.under_need_tiles[i])));
-            out.push(("over_need_tiles", kind(), f64::from(self.over_need_tiles[i])));
+            out.push((
+                "under_need_tiles",
+                kind(),
+                f64::from(self.under_need_tiles[i]),
+            ));
+            out.push((
+                "over_need_tiles",
+                kind(),
+                f64::from(self.over_need_tiles[i]),
+            ));
             out.push(("deficit_levels", kind(), f64::from(self.deficit_levels[i])));
             out.push((
                 "deficit_level_seconds_total",
@@ -1263,7 +1271,11 @@ impl BudgetSignals {
                 for (name, v) in labels::QUANTILE.iter().zip(q) {
                     out.push((
                         "score_quantile",
-                        vec![("side", side.label()), ("q", name), ("level", labels::LEVEL[l])],
+                        vec![
+                            ("side", side.label()),
+                            ("q", name),
+                            ("level", labels::LEVEL[l]),
+                        ],
                         v as f64,
                     ));
                 }
@@ -1273,7 +1285,11 @@ impl BudgetSignals {
             .iter()
             .zip(self.score_params.restore_us)
         {
-            out.push(("restore_cost_seconds", vec![("tier", tier)], us as f64 / 1e6));
+            out.push((
+                "restore_cost_seconds",
+                vec![("tier", tier)],
+                us as f64 / 1e6,
+            ));
         }
         for l in 0..LEVELS {
             for (b, band) in DISTANCE_BAND_LABELS.iter().enumerate() {
@@ -1327,7 +1343,11 @@ impl BudgetSignals {
             }
         }
         for (i, reason) in crate::score::RELEASE_REASONS.iter().enumerate() {
-            out.push(("released_total", vec![("reason", reason)], self.released_total[i] as f64));
+            out.push((
+                "released_total",
+                vec![("reason", reason)],
+                self.released_total[i] as f64,
+            ));
             for l in 0..LEVELS {
                 for (b, band) in DISTANCE_BAND_LABELS.iter().enumerate() {
                     let v = self.released_by_level_distance[i][l][b];
@@ -1542,7 +1562,10 @@ impl BudgetObserver for BudgetMeter {
                         | crate::score::Reason::Swap
                 )
         }) {
-            s.score_lambda = Some(s.score_lambda.map_or(e.terms.score, |l| l.max(e.terms.score)));
+            s.score_lambda = Some(
+                s.score_lambda
+                    .map_or(e.terms.score, |l| l.max(e.terms.score)),
+            );
         }
         for e in &d.scores {
             if s.score_events.len() < SCORE_EVENTS_KEPT {

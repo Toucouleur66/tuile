@@ -162,7 +162,6 @@ impl Predicate {
         }
     }
 
-
     /// Its nesting depth (a leaf is 1).
     fn depth(&self) -> usize {
         match self {
@@ -762,21 +761,45 @@ impl Specification {
             ("coarse_through", u64::from(p.coarse_through), 30),
             ("restore_remote_ms", p.restore.remote.0 / 1_000, 60_000),
             ("p_ring", u64::from(p.anticipation.ring_permille), 1_000),
-            ("p_ancestor", u64::from(p.anticipation.ancestor_permille), 1_000),
+            (
+                "p_ancestor",
+                u64::from(p.anticipation.ancestor_permille),
+                1_000,
+            ),
             ("a0", u64::from(p.progressive.a0_permille), 1_000),
             ("a_desc", u64::from(p.progressive.descend_permille), 1_000),
             ("coarse_from", u64::from(p.progressive.coarse_from), 30),
-            ("coarse_boost", u64::from(p.progressive.coarse_boost_permille), 1_000),
+            (
+                "coarse_boost",
+                u64::from(p.progressive.coarse_boost_permille),
+                1_000,
+            ),
             ("headroom", u64::from(p.headroom_permille), 500),
             ("floor_value", u64::from(p.floor_value_permille), 1_000),
             ("release_visits", u64::from(p.release_visits), 4_096),
             ("sweep_keep_poses", u64::from(p.sweep_keep_poses), 36_000),
             ("rho", u64::from(p.rho_tiles), 16),
             ("finer_gap", u64::from(p.finer_gap_permille), 1_000),
-            ("compress_p", u64::from(p.compress.probability_permille), 1_000),
-            ("compress_decisions", u64::from(p.compress.decisions), 10_000),
-            ("compress_still_poses", u64::from(p.compress.still_poses), 36_000),
-            ("compress_flight_tiles", u64::from(p.compress.flight_tiles), 1_024),
+            (
+                "compress_p",
+                u64::from(p.compress.probability_permille),
+                1_000,
+            ),
+            (
+                "compress_decisions",
+                u64::from(p.compress.decisions),
+                10_000,
+            ),
+            (
+                "compress_still_poses",
+                u64::from(p.compress.still_poses),
+                36_000,
+            ),
+            (
+                "compress_flight_tiles",
+                u64::from(p.compress.flight_tiles),
+                1_024,
+            ),
             ("compress_visits", u64::from(p.compress.visits), 4_096),
             ("level_margin", u64::from(p.level_margin_permille), 1_000),
         ];
@@ -976,8 +999,8 @@ mod tests {
 
     #[test]
     fn a_query_overrides_the_named_default() {
-        let s = Specification::from_query("spec=fpv&margin=300&horizon_ms=3000&w_screen=1500")
-            .unwrap();
+        let s =
+            Specification::from_query("spec=fpv&margin=300&horizon_ms=3000&w_screen=1500").unwrap();
         assert_eq!(s.kind, SpecKind::Fpv);
         assert_eq!(s.params.margin_permille, 300);
         assert_eq!(s.params.horizon, Micros::from_secs(3));

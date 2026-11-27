@@ -28,8 +28,8 @@ mod support;
 use glam::{DVec3, Vec3};
 
 use support::{
-    ask_compress, drape, encoded_as_planned, exact, fallback, gpu, gpu_with, mesh, painted,
-    select, wearing, whole_drape, Scripted, PLANS,
+    ask_compress, drape, encoded_as_planned, exact, fallback, gpu, gpu_with, mesh, painted, select,
+    wearing, whole_drape, Scripted, PLANS,
 };
 use tuile_core::budget::{FrameDeadline, LayerId, ResourceId, UvTransform};
 use tuile_core::content::DecodedTileContent;
@@ -370,7 +370,11 @@ fn draped_ground_under_the_camera_is_never_black_under_every_plan() {
         pump.pump(&mut stream, &gpu, FrameDeadline::UNBOUNDED);
         assert_eq!(pump.pending_uploads(), 0, "{plan}: every upload landed");
         let black = black_fraction_in_the_middle(&gpu, &mut pump, eye);
-        assert!(black < 0.01, "{plan}: {:.1}% black before compressing", black * 100.0);
+        assert!(
+            black < 0.01,
+            "{plan}: {:.1}% black before compressing",
+            black * 100.0
+        );
         // Then compressed in place, as the budget asks once they have
         // lasted (CB9): the frame of the swap draws the ground too.
         ask_compress(&mut stream, &[(here_r, 3), (grand_r, 4)]);

@@ -173,7 +173,15 @@ macro_rules! feed_fieldless {
         }
     )*};
 }
-feed_fieldless!(Source, tuile_budget::Precedence, Urgency, Tier, Protection, Pressure, Thermal);
+feed_fieldless!(
+    Source,
+    tuile_budget::Precedence,
+    Urgency,
+    Tier,
+    Protection,
+    Pressure,
+    Thermal
+);
 
 impl Feed for Class {
     fn feed(&self, h: &mut Fnv) {

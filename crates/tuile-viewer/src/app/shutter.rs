@@ -439,10 +439,7 @@ mod tests {
             &gpu,
             &targets,
             clear,
-            (
-                |_: &mut wgpu::RenderPass<'_>| {},
-                tuile_wgpu::NOTHING_AFTER,
-            ),
+            (|_: &mut wgpu::RenderPass<'_>| {}, tuile_wgpu::NOTHING_AFTER),
             exposure(),
             picture,
         );

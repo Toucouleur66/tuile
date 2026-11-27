@@ -3461,7 +3461,11 @@ pub(crate) mod tests {
             ..Config::interactive_globe()
         };
         let out = run_with(&ts, &residency, &[camera_at(150.0)], &held, &HashSet::new());
-        assert_eq!(ids(&out.selected), vec![root], "the hold falls back to the parent");
+        assert_eq!(
+            ids(&out.selected),
+            vec![root],
+            "the hold falls back to the parent"
+        );
     }
 
     /// Ground just off the edge of the screen is selected, not merely fetched.

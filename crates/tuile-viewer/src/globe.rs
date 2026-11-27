@@ -18,8 +18,8 @@ use tuile_core::raster::{CachedImagery, ImageryProvider};
 use tuile_core::source::{TileLoader, TileTree};
 use tuile_core::storage::ContentStore;
 use tuile_planetary::{
-    globe_on, DeferredImagery, DeferredTerrain, GlobeOptions, Held, ImageryPlanHandle,
-    LayerBudget, Memory, Sources, SwitchableImagery,
+    globe_on, DeferredImagery, DeferredTerrain, GlobeOptions, Held, ImageryPlanHandle, LayerBudget,
+    Memory, Sources, SwitchableImagery,
 };
 use tuile_terrain::{CachedTerrain, LayerJson, TerrainSource};
 
@@ -194,7 +194,8 @@ async fn terrain_of(
             if let Some(memory) = &memory {
                 memory.keep_layer(&layer).await;
             }
-            let ground = DeferredTerrain::resolved(Arc::clone(sources), terrain.asset, ground, memory);
+            let ground =
+                DeferredTerrain::resolved(Arc::clone(sources), terrain.asset, ground, memory);
             (layer, ground)
         }
     };
@@ -431,7 +432,9 @@ mod tests {
             _coord: tuile_core::raster::ImageryCoord,
         ) -> Result<tuile_core::fetch::Fetched<bytes::Bytes>, tuile_core::raster::RasterError>
         {
-            Ok(tuile_core::fetch::Fetched::undated(bytes::Bytes::from_static(b"jpeg")))
+            Ok(tuile_core::fetch::Fetched::undated(
+                bytes::Bytes::from_static(b"jpeg"),
+            ))
         }
     }
 

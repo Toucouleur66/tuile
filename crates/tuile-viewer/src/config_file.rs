@@ -785,8 +785,8 @@ fn read_snapshot(table: &Table) -> Result<crate::photo::SnapshotSettings, Proble
             ("quality", Value::Integer(q)) if (1..=100).contains(q) => quality = Some(*q as u8),
             ("layers", Value::Array(names)) => {
                 let names: Option<Vec<&str>> = names.iter().map(Value::as_str).collect();
-                let names =
-                    names.ok_or_else(|| (at.clone(), "must be a list of names in quotes".into()))?;
+                let names = names
+                    .ok_or_else(|| (at.clone(), "must be a list of names in quotes".into()))?;
                 out.layers = Some(Layers::from_names(names).map_err(|why| (at.clone(), why))?);
             }
             ("folder", _) => return Err((at, "must be a non-empty path in quotes".into())),
@@ -1025,17 +1025,30 @@ mod tests {
             })
         );
         let kept = settings_text("ion", &file.settings);
-        assert_eq!(parse("kept", &kept, "ion").expect("reads back").settings, file.settings);
+        assert_eq!(
+            parse("kept", &kept, "ion").expect("reads back").settings,
+            file.settings
+        );
         let png = parse("a.tuile", "[snapshot]\nformat = \"png\"\n", "ion").expect("reads");
-        assert_eq!(png.settings.snapshot.and_then(|s| s.format), Some(Format::Png));
+        assert_eq!(
+            png.settings.snapshot.and_then(|s| s.format),
+            Some(Format::Png)
+        );
         for (bad, key) in [
             ("[snapshot]\nformat = \"gif\"\n", "snapshot.format"),
             ("[snapshot]\nquality = 0\n", "snapshot.quality"),
-            ("[snapshot]\nformat = \"png\"\nquality = 90\n", "snapshot.quality"),
+            (
+                "[snapshot]\nformat = \"png\"\nquality = 90\n",
+                "snapshot.quality",
+            ),
             ("[snapshot]\nlayers = [\"menu\"]\n", "snapshot.layers"),
             ("[snapshot]\nfolders = \"x\"\n", "snapshot.folders"),
         ] {
-            assert_eq!(parse("a.tuile", bad, "ion").expect_err(bad).key, key, "{bad}");
+            assert_eq!(
+                parse("a.tuile", bad, "ion").expect_err(bad).key,
+                key,
+                "{bad}"
+            );
         }
     }
 

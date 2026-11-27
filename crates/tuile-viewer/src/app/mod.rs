@@ -983,9 +983,10 @@ impl App {
         // exactly as it was and a session without a host is untouched.
         // A view ahead is not one of them: it is announced as one
         // (`predicting`), loaded behind the present view.
-        let preload = self.preload.iter().filter(|view| {
-            !matches!(view.priority, crate::frame_host::Priority::Ahead { .. })
-        });
+        let preload = self
+            .preload
+            .iter()
+            .filter(|view| !matches!(view.priority, crate::frame_host::Priority::Ahead { .. }));
         views.extend(preload.map(|view| {
             // The height is the drawn frame's; only the shape differs, and a
             // view's need is counted in pixels.

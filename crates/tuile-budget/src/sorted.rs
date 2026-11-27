@@ -561,9 +561,7 @@ impl<K: Ord + Copy, V> SortedMap<K, V> {
                 let keep = BLOCK - m;
                 let (left, right) = self.blocks.split_at_mut(b + 1);
                 let (cur, next) = (&mut left[b], &mut right[0]);
-                self.upkeep = self
-                    .upkeep
-                    .saturating_add((next.len() + 2 * m) as u64);
+                self.upkeep = self.upkeep.saturating_add((next.len() + 2 * m) as u64);
                 cur.pass_end(m, next);
                 let into_next = i > keep;
                 let (blk, at) = if into_next {
@@ -571,9 +569,7 @@ impl<K: Ord + Copy, V> SortedMap<K, V> {
                 } else {
                     (cur, i)
                 };
-                self.upkeep = self
-                    .upkeep
-                    .saturating_add((blk.len() - at + 1) as u64);
+                self.upkeep = self.upkeep.saturating_add((blk.len() - at + 1) as u64);
                 blk.insert(at, k, v);
                 self.heads[b] = self.blocks[b].head();
             }

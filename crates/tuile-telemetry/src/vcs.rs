@@ -35,7 +35,9 @@ pub fn clean(raw: &str) -> Option<String> {
 /// What git says if it says anything usable, else what the environment
 /// says, else nothing.
 pub fn choose(from_git: Option<&str>, from_env: Option<&str>) -> Option<String> {
-    from_git.and_then(clean).or_else(|| from_env.and_then(clean))
+    from_git
+        .and_then(clean)
+        .or_else(|| from_env.and_then(clean))
 }
 
 /// Whether the repository whose top is `toplevel` is tuile's own checkout
@@ -82,7 +84,10 @@ mod tests {
     #[test]
     fn only_tuile_s_own_checkout_is_asked() {
         let top = Path::new("/src/tuile");
-        assert!(own_checkout(top, Path::new("/src/tuile/crates/tuile-telemetry")));
+        assert!(own_checkout(
+            top,
+            Path::new("/src/tuile/crates/tuile-telemetry")
+        ));
         // A host's repository with tuile vendored somewhere inside.
         assert!(!own_checkout(
             Path::new("/src/game"),

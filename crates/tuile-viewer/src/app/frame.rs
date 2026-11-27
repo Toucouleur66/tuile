@@ -557,7 +557,12 @@ impl App {
             .and_then(|bar| bar.label.as_ref())
             .into_iter()
             .chain(self.tile_labels.placed.iter())
-            .chain(self.budget_window.layout().into_iter().flat_map(|p| p.labels.iter()))
+            .chain(
+                self.budget_window
+                    .layout()
+                    .into_iter()
+                    .flat_map(|p| p.labels.iter()),
+            )
             .map(|label| tuile_wgpu::OverlayMask {
                 width: label.mask.width,
                 height: label.mask.height,
@@ -642,12 +647,9 @@ impl App {
         // under the finer tiles, where its label would mislead.
         self.tile_labels.tiles.clear();
         if labels_on {
-            self.tile_labels.tiles.extend(
-                drawn
-                    .exact
-                    .iter()
-                    .map(|t| (t.origin_ecef(), t.levels())),
-            );
+            self.tile_labels
+                .tiles
+                .extend(drawn.exact.iter().map(|t| (t.origin_ecef(), t.levels())));
         }
         // The 3D Tiles over the globe, from the same pump, and what their
         // tiles drawn credit, for the caption.
@@ -1232,7 +1234,11 @@ impl fmt::Display for BudgetLine {
             f64::from(s.sse_scale_milli) / 1000.0,
             if s.converged { "converged" } else { "settling" },
             s.spec.label(),
-            if s.spec_overridden { " (diagnostic)" } else { "" },
+            if s.spec_overridden {
+                " (diagnostic)"
+            } else {
+                ""
+            },
             s.under_need_tiles[0] + s.under_need_tiles[1],
         )
     }

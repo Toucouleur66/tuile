@@ -895,7 +895,9 @@ mod tests {
                 .put(&key(i), Bytes::from(vec![i as u8; 1 << 20]), None)
                 .await;
         }
-        store.put("img/t/11/0/0", tuile_core::storage::ABSENT, None).await;
+        store
+            .put("img/t/11/0/0", tuile_core::storage::ABSENT, None)
+            .await;
         let counted = || {
             let mut by = tuile_core::budget::ByLevel::default();
             assert!(store.stored("img/t", &mut by), "a store with a ledger");
@@ -934,7 +936,11 @@ mod tests {
         let first = FoyerStore::keeping(cfg()).await.expect("store");
         for i in 0..10 {
             first
-                .put(&format!("mesh/m/7/{i}/0"), Bytes::from(vec![1u8; 4096]), None)
+                .put(
+                    &format!("mesh/m/7/{i}/0"),
+                    Bytes::from(vec![1u8; 4096]),
+                    None,
+                )
                 .await;
         }
         first.close().await.expect("closed");

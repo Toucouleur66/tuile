@@ -9,6 +9,7 @@
 #![deny(clippy::iter_over_hash_type)]
 #![deny(clippy::cast_possible_truncation)]
 
+pub mod blocked;
 pub mod compress;
 mod compress_pass;
 pub mod config;
@@ -27,6 +28,7 @@ mod need_state;
 pub mod observe;
 mod origin;
 pub mod priority;
+pub mod score;
 #[doc(hidden)]
 pub mod snapshot;
 mod sorted;
@@ -35,27 +37,25 @@ mod state;
 pub mod stats;
 mod sweep;
 pub mod tier;
-pub mod tile_id;
 pub mod tiers;
+pub mod tile_id;
 pub mod types;
 mod value;
-pub mod score;
-pub mod waits;
-pub mod blocked;
 pub mod view;
+pub mod waits;
 
+pub use blocked::{Blocked, BLOCKED, BLOCKED_LABELS, REASONS as BLOCKED_REASONS};
 pub use config::{
     BudgetConfig, FailurePolicy, OriginBackoff, Pool, PressureFractions, Relaxation, Watermarks,
 };
-pub use blocked::{Blocked, BLOCKED, BLOCKED_LABELS, REASONS as BLOCKED_REASONS};
 pub use deadline::{swap_unit, EncodeBucket, FrameDeadline};
 pub use decisions::{
     Decisions, DrapeChoice, Drapes, DrawItem, DrawSet, Role, Serves, Start, SwapGroup, UploadPlan,
 };
 pub use error::{AuditError, ConfigError, SessionError};
-pub use inputs::{Measured, Prediction, Smoothed, TierSample};
 pub use fallback::{FallbackContext, FallbackReport, FallbackRule, FallbackSpec, FallbackState};
 pub use imagery::{DrapeCandidate, GeoRect, LevelClamp, TexelFootprint, UvTransform};
+pub use inputs::{Measured, Prediction, Smoothed, TierSample};
 pub use need::{
     AheadUse, ImageryNeed, LayerReach, Membership, Need, NeedDelta, NeedSet, Proximity,
 };
@@ -65,22 +65,21 @@ pub use observe::{
 };
 pub use priority::{Precedence, PriorityKey, Quantised, Urgency};
 pub use spec::{
-    Anticipation, Band, Facts, Params, Predicate, Progressive, RestoreCosts, Rule, SpecError, SpecKind,
-    Specification,
-    Speculation, Term,
+    Anticipation, Band, Facts, Params, Predicate, Progressive, RestoreCosts, Rule, SpecError,
+    SpecKind, Specification, Speculation, Term,
 };
-pub use tiers::{ByLevel, DiskTiers};
 pub use stats::{
     layer_index, level_index, prefetch_index, BudgetStats, CancelReason, Deficit, EvictReason,
     LayerStats, LevelStats, LAYERS, LEVELS,
 };
 pub use tier::{NoStore, Presence, PresenceOracle, Source, Tier};
+pub use tiers::{ByLevel, DiskTiers};
 pub use types::{
     Bytes, Class, Failure, Generation, LayerId, Micros, PerClass, Policy, Pressure, ResourceId,
     Thermal, TileId,
 };
-pub use view::{Protection, ResourceState, ResourceView};
 pub use value::{progressive, progressive_terms, CERTAIN};
+pub use view::{Protection, ResourceState, ResourceView};
 
 /// One decision step's input.
 #[derive(Clone, Copy)]
@@ -504,7 +503,11 @@ impl Budget {
         let size = self.spec.params.ref_bytes;
         let q = |m: Micros| {
             let bits = 64 - m.0.leading_zeros();
-            Micros(if bits > 4 { m.0 & !((1u64 << (bits - 4)) - 1) } else { m.0 })
+            Micros(if bits > 4 {
+                m.0 & !((1u64 << (bits - 4)) - 1)
+            } else {
+                m.0
+            })
         };
         let of = |t: &inputs::SmoothedTier, or: Micros| t.cost(size).map_or(or, q);
         let s = &self.smoothed;

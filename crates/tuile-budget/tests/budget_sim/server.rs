@@ -341,11 +341,7 @@ fn instructions_cycles() -> (u64, u64) {
         // SAFETY: the buffer is larger than `rusage_info_v4`, which the call
         // writes; the pid is this process's.
         let ok = unsafe {
-            proc_pid_rusage(
-                std::process::id() as i32,
-                RUSAGE_INFO_V4,
-                info.as_mut_ptr(),
-            )
+            proc_pid_rusage(std::process::id() as i32, RUSAGE_INFO_V4, info.as_mut_ptr())
         } == 0;
         if ok {
             (info[31], info[32])
@@ -669,18 +665,18 @@ impl Sim {
         // keeps them); its digests are folded after it, and compared with
         // the recorded reference.
         let mut out = std::mem::take(&mut self.out);
-        let (heap, us, cpu, ic) = self
-            .budget
-            .decide_into_with(input, &need, &mut out, |b, i, o| {
-                let cpu = thread_cpu_us();
-                let ic = instructions_cycles();
-                let clock = std::time::Instant::now();
-                let ((), heap) = super::alloc::counted(|| b.decide_into(i, o));
-                let us = clock.elapsed().as_secs_f64() * 1e6;
-                let ic2 = instructions_cycles();
-                let ic = (ic2.0.saturating_sub(ic.0), ic2.1.saturating_sub(ic.1));
-                (heap, us, thread_cpu_us() - cpu, ic)
-            });
+        let (heap, us, cpu, ic) =
+            self.budget
+                .decide_into_with(input, &need, &mut out, |b, i, o| {
+                    let cpu = thread_cpu_us();
+                    let ic = instructions_cycles();
+                    let clock = std::time::Instant::now();
+                    let ((), heap) = super::alloc::counted(|| b.decide_into(i, o));
+                    let us = clock.elapsed().as_secs_f64() * 1e6;
+                    let ic2 = instructions_cycles();
+                    let ic = (ic2.0.saturating_sub(ic.0), ic2.1.saturating_sub(ic.1));
+                    (heap, us, thread_cpu_us() - cpu, ic)
+                });
         self.decide_us.push((self.now, us));
         self.decide_cpu_us.push((self.now, cpu));
         self.decide_instructions.push((self.now, ic.0, ic.1));
@@ -1226,7 +1222,9 @@ impl Sim {
         self.gpu
             .drawable
             .keys()
-            .filter(|r| matches!(r, ResourceId::Drape { tile, .. } if self.drawn_last.contains(tile)))
+            .filter(
+                |r| matches!(r, ResourceId::Drape { tile, .. } if self.drawn_last.contains(tile)),
+            )
             .copied()
             .collect()
     }

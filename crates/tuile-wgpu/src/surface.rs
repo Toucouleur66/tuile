@@ -375,10 +375,7 @@ pub fn surface_format(
 ///
 /// [`Auto`]: wgpu::CompositeAlphaMode::Auto
 pub fn opaque_alpha(caps: &wgpu::SurfaceCapabilities) -> wgpu::CompositeAlphaMode {
-    if caps
-        .alpha_modes
-        .contains(&wgpu::CompositeAlphaMode::Opaque)
-    {
+    if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
         wgpu::CompositeAlphaMode::Opaque
     } else {
         wgpu::CompositeAlphaMode::Auto

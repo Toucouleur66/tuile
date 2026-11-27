@@ -124,8 +124,7 @@ impl SmoothedTier {
         if s.samples == 0 {
             return;
         }
-        self.latency_us
-            .take(u64::from(s.latency_us), dt, TAU_COST);
+        self.latency_us.take(u64::from(s.latency_us), dt, TAU_COST);
         self.bytes_per_ms
             .take(u64::from(s.bytes_per_ms), dt, TAU_COST);
         let f = u64::from(s.failures_permille);

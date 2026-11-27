@@ -1324,7 +1324,8 @@ impl State {
                 match spec {
                     Ok(s) => {
                         tracing::info!(spec = s.kind.label(), overridden, %query, "budget specified");
-                        self.events.push(BudgetEvent::Specify(s.kind, s.digest(), overridden));
+                        self.events
+                            .push(BudgetEvent::Specify(s.kind, s.digest(), overridden));
                     }
                     Err(e) => tracing::warn!(%query, "budget specification refused: {e}"),
                 }
@@ -1718,9 +1719,12 @@ impl State {
             }
             let (when, p) = match when {
                 Some(w) => (w, p),
-                None => self.ahead_when.iter().fold((Micros(u64::MAX), 0), |(w, p), (x, q)| {
-                    (w.min(*x), p.max(*q))
-                }),
+                None => self
+                    .ahead_when
+                    .iter()
+                    .fold((Micros(u64::MAX), 0), |(w, p), (x, q)| {
+                        (w.min(*x), p.max(*q))
+                    }),
             };
             if p > 0 {
                 need.ahead = Some(crate::budget::AheadUse {

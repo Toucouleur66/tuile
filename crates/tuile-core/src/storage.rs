@@ -194,8 +194,14 @@ mod tests {
     /// not a tile.
     #[test]
     fn a_tile_key_has_a_group_and_a_level() {
-        assert_eq!(tile_key_level("img/bing-aerial/12/2100/1450"), Some(("img/bing-aerial", 12)));
-        assert_eq!(tile_key_level("mesh/ion/cwt/3/1/2"), Some(("mesh/ion/cwt", 3)));
+        assert_eq!(
+            tile_key_level("img/bing-aerial/12/2100/1450"),
+            Some(("img/bing-aerial", 12))
+        );
+        assert_eq!(
+            tile_key_level("mesh/ion/cwt/3/1/2"),
+            Some(("mesh/ion/cwt", 3))
+        );
         assert_eq!(tile_key_level("img/x/99/1/2"), None, "past the levels");
         assert_eq!(tile_key_level("scheme/bing"), None);
         assert_eq!(tile_key_level("img/x/a/1/2"), None);

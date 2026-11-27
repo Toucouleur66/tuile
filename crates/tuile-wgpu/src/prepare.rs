@@ -671,16 +671,13 @@ pub(crate) fn prepare_drape_in(gpu: &GpuContext, drape: &DrapeContent) -> Prepar
             charge: (0, 0),
         });
     }
-    let whole = |i: usize, l: &tuile_core::raster::ImageryLayer| match held
-        .get(i)
-        .copied()
-        .flatten()
-    {
-        // Held otherwise than it crosses: blocks shown by a stand-in, or a
-        // tile another drape had compressed already.
-        Some(format) if format != l.texture.uploaded_format() => l.texture.cost_as(format),
-        _ => l.texture.cost(),
-    };
+    let whole =
+        |i: usize, l: &tuile_core::raster::ImageryLayer| match held.get(i).copied().flatten() {
+            // Held otherwise than it crosses: blocks shown by a stand-in, or a
+            // tile another drape had compressed already.
+            Some(format) if format != l.texture.uploaded_format() => l.texture.cost_as(format),
+            _ => l.texture.cost(),
+        };
     let charged = drape.cost_with(whole);
     // Each visible tile's share, as uploaded and once compressed.
     let mut at = 0;

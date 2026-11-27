@@ -469,7 +469,10 @@ mod tests {
         assert_eq!(c.in_flight, 4);
         assert_eq!(c.origin_in_flight, DEFAULT_ORIGIN_IN_FLIGHT, "not a number");
         assert_eq!(c.memory_bytes(), 2048 * MIB + DEFAULT_DIRECTORY_CACHE_BYTES);
-        assert_eq!(TierCacheConfig::from_vars(|_| None), TierCacheConfig::default());
+        assert_eq!(
+            TierCacheConfig::from_vars(|_| None),
+            TierCacheConfig::default()
+        );
     }
 
     #[test]

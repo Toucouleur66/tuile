@@ -492,7 +492,10 @@ mod tests {
             vec![ImageryChoice::new("aerial", "Aerial", 2, "a")]
         }
         fn tilesets(&self) -> Vec<crate::embed::TilesetChoice> {
-            vec![crate::embed::TilesetChoice::new("Photorealistic 3D Tiles", 2275207)]
+            vec![crate::embed::TilesetChoice::new(
+                "Photorealistic 3D Tiles",
+                2275207,
+            )]
         }
         async fn connect(&self) -> Result<Arc<dyn Sources>, String> {
             Err("not connected in this test".into())
@@ -508,7 +511,10 @@ mod tests {
         let host = Configured::wrap(Arc::new(Offering), settings);
         assert_eq!(
             host.tilesets(),
-            [crate::embed::TilesetChoice::new("Photorealistic 3D Tiles", 2275207)]
+            [crate::embed::TilesetChoice::new(
+                "Photorealistic 3D Tiles",
+                2275207
+            )]
         );
     }
 

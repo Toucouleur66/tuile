@@ -232,7 +232,11 @@ fn a_pass_after_can_come_and_go() {
             with_after.then_some(after),
         );
         let pixels = readback.take(&gpu, (WIDTH, HEIGHT)).expect("read back");
-        let left = if with_after { [0, 255, 0, 255] } else { [255, 0, 0, 255] };
+        let left = if with_after {
+            [0, 255, 0, 255]
+        } else {
+            [255, 0, 0, 255]
+        };
         assert_eq!(at(&pixels, 1, 1), left, "with a pass after: {with_after}");
         assert_eq!(at(&pixels, WIDTH - 2, HEIGHT - 2), [255, 0, 0, 255]);
     }

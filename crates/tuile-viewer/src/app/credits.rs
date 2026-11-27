@@ -86,7 +86,11 @@ pub(super) fn budget_line(signals: Option<&tuile_core::budget::BudgetSignals>) -
     format!(
         "budget {}{} · under need {} mesh, {} imagery ({} levels) · scale {:.2}",
         s.spec.label(),
-        if s.spec_overridden { " (diagnostic)" } else { "" },
+        if s.spec_overridden {
+            " (diagnostic)"
+        } else {
+            ""
+        },
         s.under_need_tiles[0],
         s.under_need_tiles[1],
         s.deficit_levels[0] + s.deficit_levels[1],

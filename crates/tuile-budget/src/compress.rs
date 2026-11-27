@@ -276,25 +276,13 @@ mod tests {
             at(CERTAIN, from, 100 + n - 1, 0),
             false
         ));
-        assert!(eligible(
-            &COMPRESS,
-            at(CERTAIN, from, 100 + n, 0),
-            false
-        ));
+        assert!(eligible(&COMPRESS, at(CERTAIN, from, 100 + n, 0), false));
         // A dip starts the count again.
         let dipped = track(&COMPRESS, CERTAIN / 2, from, 105);
         assert_eq!(dipped, None);
         let again = track(&COMPRESS, CERTAIN, dipped, 106);
-        assert!(!eligible(
-            &COMPRESS,
-            at(CERTAIN, again, 100 + n, 0),
-            false
-        ));
-        assert!(eligible(
-            &COMPRESS,
-            at(CERTAIN, again, 106 + n, 0),
-            false
-        ));
+        assert!(!eligible(&COMPRESS, at(CERTAIN, again, 100 + n, 0), false));
+        assert!(eligible(&COMPRESS, at(CERTAIN, again, 106 + n, 0), false));
     }
 
     /// N − 1 still poses do not compress; N do (Laurent, 2026-11-24).
@@ -316,16 +304,8 @@ mod tests {
 
     #[test]
     fn under_pressure_the_waits_are_waived_not_the_score() {
-        assert!(eligible(
-            &COMPRESS,
-            at(CERTAIN, None, 0, 0),
-            true
-        ));
-        assert!(!eligible(
-            &COMPRESS,
-            at(CERTAIN / 2, None, 0, 0),
-            true
-        ));
+        assert!(eligible(&COMPRESS, at(CERTAIN, None, 0, 0), true));
+        assert!(!eligible(&COMPRESS, at(CERTAIN / 2, None, 0, 0), true));
     }
 
     #[test]

@@ -172,11 +172,9 @@ impl SimGpu {
         } else {
             plan.items.clone()
         };
-        let now = self
-            .deadline
-            .take(&queue, &plan.groups, Bytes::ZERO, |r| {
-                cost_for(r, self.plan).transfer
-            });
+        let now = self.deadline.take(&queue, &plan.groups, Bytes::ZERO, |r| {
+            cost_for(r, self.plan).transfer
+        });
         self.deferred += (queue.len() - now.len()) as u64;
         self.frame_items = now.len();
         self.frame_bytes = Bytes::ZERO;

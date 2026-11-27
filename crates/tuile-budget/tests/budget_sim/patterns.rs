@@ -953,8 +953,7 @@ impl P64 {
         // decisions of the step before are.
         // A deficit want falling due is a time-driven event of its step,
         // as a deadline is (eviction/prefetch spec §5.3).
-        let mut e =
-            sim.step_events + self.decided + self.levels_moved + u64::from(d.stats.rewants);
+        let mut e = sim.step_events + self.decided + self.levels_moved + u64::from(d.stats.rewants);
         self.levels_moved = u64::from(d.stats.levels_moved);
         // The draw items that changed — an arrival re-dresses every item
         // that falls back on it, at rest as in motion (the deficit want

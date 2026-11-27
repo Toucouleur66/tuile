@@ -267,7 +267,13 @@ fn apple_development_identity(listing: &str) -> Option<String> {
 fn sign_and_verify(bundle: &Bundle, app: &Path) -> anyhow::Result<()> {
     let identity = signing_identity();
     run(Command::new("codesign")
-        .args(["--force", "--sign", &identity, "--identifier", &bundle.identifier])
+        .args([
+            "--force",
+            "--sign",
+            &identity,
+            "--identifier",
+            &bundle.identifier,
+        ])
         .arg(app))?;
     run(Command::new("codesign")
         .args(["--verify", "--strict", "--verbose=2"])

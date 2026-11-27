@@ -211,15 +211,18 @@ impl Picture {
                 .iter()
                 .zip(&shown.eyes)
                 .all(|(a, b)| same_place(a, b))
-            && ((self.instant - shown.instant).abs() * SKY_RADIANS_PER_SECOND)
-                < SKY_STILL_RADIANS
+            && ((self.instant - shown.instant).abs() * SKY_RADIANS_PER_SECOND) < SKY_STILL_RADIANS
     }
 }
 
 fn same_place(a: &tuile_camera::GlobeCamera, b: &tuile_camera::GlobeCamera) -> bool {
     a.fovy == b.fovy
         && a.position.distance(b.position) < EYE_STILL_METRES
-        && 1.0 - a.direction.normalize_or_zero().dot(b.direction.normalize_or_zero()) < TURN_STILL
+        && 1.0
+            - a.direction
+                .normalize_or_zero()
+                .dot(b.direction.normalize_or_zero())
+            < TURN_STILL
         && 1.0 - a.up.normalize_or_zero().dot(b.up.normalize_or_zero()) < TURN_STILL
 }
 
@@ -276,7 +279,9 @@ impl ViewSends {
         now: Instant,
     ) -> bool {
         loading
-            || self.at.is_none_or(|at| now.duration_since(at) >= VIEW_HEARTBEAT)
+            || self
+                .at
+                .is_none_or(|at| now.duration_since(at) >= VIEW_HEARTBEAT)
             || views.len() != self.sent.len()
             || views.iter().zip(&self.sent).any(|(a, b)| !a.same_as(b))
     }
@@ -436,20 +441,36 @@ mod tests {
         repaint.shown(shown.clone());
         type Change = (&'static str, Box<dyn Fn(&mut Picture)>);
         let changes: Vec<Change> = vec![
-            ("eye moved a millimetre", Box::new(|p| p.eyes[0].position.y += 1.0e-3)),
-            ("view turned", Box::new(|p| {
-                p.eyes[0].direction = (p.eyes[0].direction + glam::DVec3::new(0.0, 0.0, 1.0e-5)).normalize()
-            })),
+            (
+                "eye moved a millimetre",
+                Box::new(|p| p.eyes[0].position.y += 1.0e-3),
+            ),
+            (
+                "view turned",
+                Box::new(|p| {
+                    p.eyes[0].direction =
+                        (p.eyes[0].direction + glam::DVec3::new(0.0, 0.0, 1.0e-5)).normalize()
+                }),
+            ),
             ("zoomed", Box::new(|p| p.eyes[0].fovy *= 0.99)),
             ("a second eye", Box::new(|p| p.eyes.push(camera()))),
             ("resized", Box::new(|p| p.settings.size.0 += 1)),
             ("letterboxed", Box::new(|p| p.settings.picture.1 += 1)),
-            ("the ground rose", Box::new(|p| p.settings.clearance -= 0.01)),
+            (
+                "the ground rose",
+                Box::new(|p| p.settings.clearance -= 0.01),
+            ),
             ("a tile landed", Box::new(|p| p.settings.content += 1)),
             ("a control lit", Box::new(|p| p.settings.overlays += 1)),
             ("a host's shape", Box::new(|p| p.settings.shapes += 1)),
-            ("the air switched off", Box::new(|p| p.settings.air_shown = false)),
-            ("the atmosphere off", Box::new(|p| p.settings.atmosphere.enabled = !p.settings.atmosphere.enabled)),
+            (
+                "the air switched off",
+                Box::new(|p| p.settings.air_shown = false),
+            ),
+            (
+                "the atmosphere off",
+                Box::new(|p| p.settings.atmosphere.enabled = !p.settings.atmosphere.enabled),
+            ),
             ("a diagnostic view", Box::new(|p| p.settings.view.0 = 1)),
             ("the labels", Box::new(|p| p.settings.view.1 = true)),
             ("the wireframe", Box::new(|p| p.settings.view.2 = true)),
@@ -492,7 +513,11 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(drawn_at, Some(4), "30 µm a step adds up to a tenth of a millimetre at the fourth");
+        assert_eq!(
+            drawn_at,
+            Some(4),
+            "30 µm a step adds up to a tenth of a millimetre at the fourth"
+        );
     }
 
     /// The loop never spins: a busy turn that presented nothing waits one
@@ -512,7 +537,10 @@ mod tests {
         // A device held back by its heat keeps its own, longer interval.
         let hot = Duration::from_secs(1) / 30;
         assert_eq!(turn_interval(Pace::Continuous, hot, false, refresh), hot);
-        assert_eq!(turn_interval(Pace::Idle, Duration::ZERO, true, refresh), IDLE_WAKE);
+        assert_eq!(
+            turn_interval(Pace::Idle, Duration::ZERO, true, refresh),
+            IDLE_WAKE
+        );
     }
 
     /// A still camera is not sent to the server on every turn — once a
@@ -524,7 +552,8 @@ mod tests {
         let view = |y: f64| {
             let mut c = camera();
             c.position.y += y;
-            c.view_state(glam::DVec2::new(2400.0, 1436.0)).with_scale(2.0)
+            c.view_state(glam::DVec2::new(2400.0, 1436.0))
+                .with_scale(2.0)
         };
         let mut sends = ViewSends::default();
         let still = [view(0.0)];
@@ -534,7 +563,13 @@ mod tests {
         assert!(!sends.due(&still, false, soon), "a still view sent again");
         assert!(sends.due(&still, true, soon), "loads under way: every turn");
         assert!(sends.due(&[view(1.0e-9)], false, soon), "a moved view");
-        assert!(sends.due(&[view(0.0), view(0.0)], false, soon), "a second eye");
-        assert!(sends.due(&still, false, t0 + VIEW_HEARTBEAT), "the heartbeat");
+        assert!(
+            sends.due(&[view(0.0), view(0.0)], false, soon),
+            "a second eye"
+        );
+        assert!(
+            sends.due(&still, false, t0 + VIEW_HEARTBEAT),
+            "the heartbeat"
+        );
     }
 }

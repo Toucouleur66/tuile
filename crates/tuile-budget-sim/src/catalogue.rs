@@ -185,7 +185,12 @@ fn fast_dive(t: f64) -> Camera {
     at(MOUNTAINS, geo(400_000.0, 500.0, ease(t / 4.0)), 90.0, 30.0)
 }
 fn climb_to_orbit(t: f64) -> Camera {
-    at(MOUNTAINS, geo(500.0, 1_500_000.0, ease(t / 10.0)), 90.0, 40.0)
+    at(
+        MOUNTAINS,
+        geo(500.0, 1_500_000.0, ease(t / 10.0)),
+        90.0,
+        40.0,
+    )
 }
 fn yaw_sweep(t: f64) -> Camera {
     at(MOUNTAINS, 3_000.0, 360.0 * ease(t / 6.0), 25.0)
@@ -201,12 +206,19 @@ fn long_pan(t: f64) -> Camera {
 fn zoom_thrash(t: f64) -> Camera {
     // Ten in-and-outs in 20 s: 3 km ↔ 24 km.
     let phase = (t / 2.0).fract();
-    let u = if phase < 0.5 { phase * 2.0 } else { 2.0 - phase * 2.0 };
+    let u = if phase < 0.5 {
+        phase * 2.0
+    } else {
+        2.0 - phase * 2.0
+    };
     at(MOUNTAINS, geo(3_000.0, 24_000.0, ease(u)), 90.0, 30.0)
 }
 fn city_fly_through(t: f64) -> Camera {
     let mut c = at(
-        (crate::world::CITY_X0 + 2_000.0, crate::world::CITY_Y0 + 2_000.0),
+        (
+            crate::world::CITY_X0 + 2_000.0,
+            crate::world::CITY_Y0 + 2_000.0,
+        ),
         150.0,
         45.0,
         15.0,
@@ -234,9 +246,18 @@ fn fpv_valley(t: f64) -> Camera {
 /// FPV along a ridge: 45 m/s, yaw reversals every 4 s, a dive at 30 s.
 fn fpv_ridge(t: f64) -> Camera {
     let t = t.min(45.0);
-    let rev = if (t / 4.0).floor() as i64 % 2 == 0 { 1.0 } else { -1.0 };
+    let rev = if (t / 4.0).floor() as i64 % 2 == 0 {
+        1.0
+    } else {
+        -1.0
+    };
     let dive = if t > 30.0 { -40.0 * (t - 30.0) } else { 0.0 };
-    let mut c = at(MOUNTAINS, (2_500.0 + dive).max(600.0), 90.0 + 20.0 * rev, 8.0);
+    let mut c = at(
+        MOUNTAINS,
+        (2_500.0 + dive).max(600.0),
+        90.0 + 20.0 * rev,
+        8.0,
+    );
     c.x += 45.0 * t;
     c
 }
@@ -292,7 +313,12 @@ pub fn scenarios() -> Vec<Scenario> {
     vec![
         Scenario {
             phases: AGGRESSIVE_PHASES,
-            ..s("aggressive-sequence", aggressive_sequence as Path, 14.0, true)
+            ..s(
+                "aggressive-sequence",
+                aggressive_sequence as Path,
+                14.0,
+                true,
+            )
         },
         s("still-low", still_low, 6.0, true),
         s("still-mid", still_mid, 6.0, true),

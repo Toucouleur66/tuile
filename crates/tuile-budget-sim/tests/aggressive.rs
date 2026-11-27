@@ -23,9 +23,15 @@ fn holes(device: Device, network: Network, lag: usize) -> Vec<(&'static str, u64
 
 /// With the selection drawn the step it is made, no phase shows a hole.
 #[test]
-#[cfg_attr(debug_assertions, ignore = "release only: cargo test --release -p tuile-budget-sim")]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "release only: cargo test --release -p tuile-budget-sim"
+)]
 fn the_aggressive_sequence_shows_no_hole_drawn_at_once() {
-    for (d, n) in [(Device::Desktop, Network::Fast), (Device::Phone, Network::Slow)] {
+    for (d, n) in [
+        (Device::Desktop, Network::Fast),
+        (Device::Phone, Network::Slow),
+    ] {
         assert_eq!(holes(d, n, 0), vec![], "{d:?} {n:?}");
     }
 }
@@ -38,7 +44,10 @@ fn the_aggressive_sequence_shows_no_hole_drawn_at_once() {
 #[test]
 #[ignore = "red: law 2b (the reachable coarse neighbourhood drawn under a late selection) is not implemented yet"]
 fn the_aggressive_sequence_shows_no_hole_with_a_late_selection() {
-    for (d, n) in [(Device::Desktop, Network::Fast), (Device::Phone, Network::Slow)] {
+    for (d, n) in [
+        (Device::Desktop, Network::Fast),
+        (Device::Phone, Network::Slow),
+    ] {
         assert_eq!(holes(d, n, 15), vec![], "{d:?} {n:?}");
     }
 }

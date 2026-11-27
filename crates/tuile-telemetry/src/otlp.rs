@@ -246,7 +246,10 @@ mod tests {
             })
         };
         assert_eq!(
-            value(point("tuile_budget_under_need_tiles", &[("kind", "imagery")])),
+            value(point(
+                "tuile_budget_under_need_tiles",
+                &[("kind", "imagery")]
+            )),
             Some(2.0)
         );
         assert_eq!(
@@ -254,7 +257,10 @@ mod tests {
             Some(3.0)
         );
         assert_eq!(
-            value(point("tuile_budget_deficit_level_seconds_total", &[("kind", "mesh")])),
+            value(point(
+                "tuile_budget_deficit_level_seconds_total",
+                &[("kind", "mesh")]
+            )),
             Some(1.0)
         );
         assert_eq!(
@@ -271,7 +277,10 @@ mod tests {
             )),
             Some(0.0)
         );
-        assert_eq!(value(point("tuile_budget_spec_changes_total", &[])), Some(2.0));
+        assert_eq!(
+            value(point("tuile_budget_spec_changes_total", &[])),
+            Some(2.0)
+        );
     }
 
     /// The mapping: names, kinds, temporality, labels, the 64-bit integers

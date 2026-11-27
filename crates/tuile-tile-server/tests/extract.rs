@@ -149,10 +149,10 @@ async fn archives_copied_to_this_disk_are_read_from_it() {
     let counted = Counting::over(objects.clone());
     let s = store_on(counted.clone(), &clock, eager())
         .with_disk_cache(DiskCacheConfig {
-                // A zone copied on its first read.
-                copy_after_reads: 1,
-                ..DiskCacheConfig::new(dir.path())
-            })
+            // A zone copied on its first read.
+            copy_after_reads: 1,
+            ..DiskCacheConfig::new(dir.path())
+        })
         .await
         .expect("disk cache");
     // A read of the zone copies its archives here.

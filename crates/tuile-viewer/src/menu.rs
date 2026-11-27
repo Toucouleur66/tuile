@@ -209,12 +209,12 @@ impl Ask {
             Self::ToggleBudgetWindowCumulative => Command::BudgetWindow(
                 crate::steer::WindowAsk::Cumulative(!now.budget_window_cumulative),
             ),
-            Self::ToggleBudgetWindowTables => Command::BudgetWindow(
-                crate::steer::WindowAsk::Tables(!now.budget_window_tables),
-            ),
-            Self::ToggleBudgetWindowIssues => Command::BudgetWindow(
-                crate::steer::WindowAsk::Levels(!now.budget_window_issues),
-            ),
+            Self::ToggleBudgetWindowTables => {
+                Command::BudgetWindow(crate::steer::WindowAsk::Tables(!now.budget_window_tables))
+            }
+            Self::ToggleBudgetWindowIssues => {
+                Command::BudgetWindow(crate::steer::WindowAsk::Levels(!now.budget_window_issues))
+            }
             Self::BudgetSpec(kind) => Command::Budget(crate::steer::BudgetAsk {
                 kind,
                 ..Default::default()
@@ -471,7 +471,12 @@ pub(crate) fn layout(
             ("FPV", tuile_core::budget::SpecKind::Fpv),
             ("Known Path", tuile_core::budget::SpecKind::KnownPath),
         ]
-        .map(|(name, kind)| item(&format!("Diagnostic: Force {name}"), Ask::BudgetSpec(Some(kind)))),
+        .map(|(name, kind)| {
+            item(
+                &format!("Diagnostic: Force {name}"),
+                Ask::BudgetSpec(Some(kind)),
+            )
+        }),
     );
     let mut sections = vec![
         ("View", view),
