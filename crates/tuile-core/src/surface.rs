@@ -678,6 +678,61 @@ mod tests {
         assert!((h.height - 50.0).abs() < sag(4_000.0));
     }
 
+    /// `height_at` walks `ranked`, so `ranked` must be `order` with its keys
+    /// resolved: the same tiles in the same order with the same drawn marks,
+    /// in every snapshot made from another, and the answers those of the
+    /// walk by key it replaced.
+    #[test]
+    fn the_ranked_tiles_are_the_ordered_tiles() {
+        let coarse = square(10.0, 45.0, 4_000.0, [50.0; 4]);
+        let fine = square(10.0, 45.0, 1_000.0, [60.0; 4]);
+        let finer = square(10.0, 45.0, 500.0, [70.0; 4]);
+        let all = [r(1, 10, &coarse), r(2, 12, &fine), r(3, 13, &finer)];
+        let a = Surface::default().with(all, &drawn(&[1, 2]));
+        // The same tiles, drawn differently: the order moves, the tiles stay.
+        let b = a.with(all, &drawn(&[1, 3]));
+        let c = b.with([r(1, 10, &coarse), r(3, 13, &finer)], &drawn(&[3]));
+        let by_key = |s: &Surface, lon: f64| {
+            let (lon, lat) = (lon.to_radians(), 45f64.to_radians());
+            s.order
+                .iter()
+                .find_map(|&(key, drawn)| {
+                    s.tiles[&key]
+                        .height_at(lon, lat)
+                        .map(|height| SurfaceHeight {
+                            height,
+                            level: Some(s.tiles[&key].level),
+                            generation: s.tiles[&key].generation,
+                            drawn,
+                        })
+                })
+                .unwrap_or(SurfaceHeight {
+                    height: 0.0,
+                    level: None,
+                    generation: 0,
+                    drawn: false,
+                })
+        };
+        for s in [&a, &b, &c] {
+            assert_eq!(s.ranked.len(), s.order.len());
+            for (&(key, drawn), (tile, ranked_drawn)) in s.order.iter().zip(&s.ranked) {
+                assert!(Arc::ptr_eq(tile, &s.tiles[&key]), "key {key}");
+                assert_eq!(drawn, *ranked_drawn, "key {key}");
+            }
+            for lon in [9.9, 10.0, 10.0002, 10.02, 11.0] {
+                assert_eq!(
+                    s.height_at(lon.to_radians(), 45f64.to_radians()),
+                    by_key(s, lon),
+                    "lon {lon}"
+                );
+            }
+        }
+        // The order really moved between the first two snapshots.
+        let levels = |s: &Surface| s.ranked.iter().map(|(t, _)| t.level).collect::<Vec<_>>();
+        assert_eq!(levels(&a), [12, 10, 13]);
+        assert_eq!(levels(&b), [13, 10, 12]);
+    }
+
     /// A tile keeps its generation from one snapshot to the next; a new one
     /// in its place has a new generation, and the version moves with it.
     #[test]
