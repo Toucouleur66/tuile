@@ -15,7 +15,7 @@ concurrency:
 
 # Where the Linux jobs run. `tuile-linux` is a self-hosted runner scale set
 # (ARC, on the project's own Kubernetes cluster): one ephemeral pod per job,
-# one job at a time, 2 CPU / 4 GiB (beside the cluster's control plane: a
+# one job at a time, 4 CPU / 16 GiB (beside the cluster's control plane: a
 # build that needs more is OOMKilled in its own pod, never the node's
 # problem), cargo and rustup caches kept between jobs.
 # A pull request from a FORK never gets it: the repository is public, and a
