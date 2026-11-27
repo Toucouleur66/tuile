@@ -16,6 +16,7 @@ workspace = true
 # §9.3) and writes its results as Parquet tables.
 [dependencies]
 tuile-budget = { version = "0.18.0", path = "../tuile-budget" }
+tuile-camera = { version = "0.18.0", path = "../tuile-camera" }
 parquet = { version = "58.4.0", default-features = false, features = ["arrow", "snap"] }
 arrow-array = "58.4.0"
 arrow-schema = "58.4.0"

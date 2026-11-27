@@ -329,6 +329,10 @@ impl App {
         // most demanding eye needs, and every eye is drawn from it.
         let views = self.eye_views();
         self.uploaded = 0;
+        // The views ahead first: the step this camera starts reads them.
+        if !self.views.freeze && self.active.is_some() {
+            self.send_the_views_ahead();
+        }
         // Anti-jitter: render origin = eye, so the f32 the GPU sees is small.
         let origin = cam.position;
         let Some(active) = self.active.as_mut() else {

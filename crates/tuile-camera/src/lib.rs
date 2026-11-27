@@ -3,7 +3,9 @@
 
 #![doc = include_str!("../README.md")]
 
+pub mod inertia;
 pub mod path;
+pub mod predict;
 
 use glam::{DQuat, DVec3};
 use std::sync::Arc;
@@ -436,6 +438,9 @@ pub struct CameraController {
     /// Forgotten once the eye is back there, and by a gesture that asks for
     /// another height (a zoom, a tilt).
     lifted_from: Option<f64>,
+    /// A gesture's momentum: the coast after a hand lets go
+    /// ([`inertia`]).
+    pub inertia: inertia::Inertia,
 }
 
 /// The terrain where it has an opinion, sea level where it does not.
@@ -482,6 +487,7 @@ impl CameraController {
             ground: None,
             driven: false,
             lifted_from: None,
+            inertia: inertia::Inertia::default(),
         }
     }
 
@@ -679,7 +685,22 @@ impl CameraController {
         }
         // Rotate the camera by the rotation taking p1 → p0: the end-cursor ray,
         // which currently hits p1, then hits p0 instead.
-        let q = DQuat::from_axis_angle(axis / len, a.dot(b).clamp(-1.0, 1.0).acos());
+        let angle = a.dot(b).clamp(-1.0, 1.0).acos();
+        self.inertia.viewport = viewport;
+        self.inertia.stroke(inertia::Rates {
+            spin: axis / len * angle,
+            ..inertia::Rates::default()
+        });
+        self.spin(axis / len * angle);
+    }
+
+    /// Turns the globe under the eye by `scaled_axis` (an axis scaled by
+    /// the angle, radians) about its centre: a drag's rotation.
+    fn spin(&mut self, scaled_axis: DVec3) {
+        if scaled_axis.length_squared() < 1e-30 {
+            return;
+        }
+        let q = DQuat::from_scaled_axis(scaled_axis);
         let c = &mut self.target;
         c.position = q * c.position;
         c.direction = (q * c.direction).normalize();
@@ -689,6 +710,11 @@ impl CameraController {
     /// Zoom toward the point under `cursor`, scaling altitude (gentle near the
     /// ground), clamped above the surface. `delta` > 0 zooms in.
     pub fn zoom(&mut self, delta: f64, cursor: (f64, f64), viewport: (f64, f64)) {
+        self.inertia.viewport = viewport;
+        self.inertia.stroke(inertia::Rates {
+            zoom: delta,
+            ..inertia::Rates::default()
+        });
         // Read the orientation before the eye moves, so it can be restated after
         // — zooming must not turn the map.
         let (heading, pitch) = (self.target.heading(), self.target.pitch());
@@ -797,6 +823,11 @@ impl CameraController {
         // person's.
         self.lifted_from = None;
         self.target = tilted;
+        self.inertia.viewport = viewport;
+        self.inertia.stroke(inertia::Rates {
+            tilt: delta,
+            ..inertia::Rates::default()
+        });
     }
 
     /// Rotate heading about the surface point under the screen centre (spin the
@@ -809,6 +840,77 @@ impl CameraController {
         c.position = center + q * (c.position - center);
         c.direction = (q * c.direction).normalize();
         c.up = (q * c.up).normalize();
+        self.inertia.viewport = viewport;
+        self.inertia.stroke(inertia::Rates {
+            heading: delta,
+            ..inertia::Rates::default()
+        });
+    }
+
+    /// A hand is on the globe: any coast stops, and the gestures from now
+    /// on are its stroke ([`inertia`]).
+    pub fn press(&mut self) {
+        self.inertia.press();
+    }
+
+    /// The hand let go: the camera coasts on the rate it was moving at.
+    pub fn let_go(&mut self) {
+        self.inertia.let_go();
+    }
+
+    /// Whether the camera is coasting after a fling.
+    pub fn is_coasting(&self) -> bool {
+        self.inertia.is_coasting()
+    }
+
+    /// Where the camera will be `seconds` from now if no hand touches it:
+    /// the controller itself run forward on a copy, frame by frame at
+    /// `frame_s`, coast, ease, floor and all — what it will actually draw,
+    /// not an extrapolation of it.
+    pub fn coast_ahead(&self, seconds: f64, frame_s: f64) -> GlobeCamera {
+        self.coast_path(&[seconds], frame_s)[0]
+    }
+
+    /// [`Self::coast_ahead`] at each of `seconds` (in increasing order), in
+    /// one run of the copy.
+    pub fn coast_path(&self, seconds: &[f64], frame_s: f64) -> Vec<GlobeCamera> {
+        let mut ahead = self.clone();
+        let frame_s = frame_s.max(1e-3);
+        let mut at = 0.0;
+        let mut out = Vec::with_capacity(seconds.len());
+        // Whole frames of `frame_s`, as the controller will be advanced:
+        // a horizon is rounded to the frame it falls on.
+        for &s in seconds {
+            let frames = ((s - at) / frame_s).round().max(0.0) as u64;
+            for _ in 0..frames {
+                ahead.advance(frame_s);
+            }
+            at += frames as f64 * frame_s;
+            out.push(ahead.camera);
+        }
+        out
+    }
+
+    /// Applies one frame of the coast.
+    fn coast(&mut self, dt: f64) {
+        let Some(step) = self.inertia.frame(dt) else {
+            return;
+        };
+        let viewport = self.inertia.viewport;
+        // Applied through the gestures themselves, so a coast is what the
+        // same hand would have done; what they stroke is let go of below.
+        self.spin(step.spin);
+        if step.heading != 0.0 {
+            self.rotate_heading(step.heading, viewport);
+        }
+        if step.tilt != 0.0 {
+            self.tilt(step.tilt, viewport);
+        }
+        if step.zoom != 0.0 {
+            self.zoom(step.zoom, (viewport.0 * 0.5, viewport.1 * 0.5), viewport);
+        }
+        // The coast's own steps are not a hand's.
+        let _ = self.inertia.frame(0.0);
     }
 
     /// Jump the view to look straight down at a geodetic point.
@@ -860,6 +962,7 @@ impl CameraController {
     /// that wants the floor should use [`crate::CameraController::jump_to`]
     /// and let the controller take over.
     pub fn drive(&mut self, camera: GlobeCamera) {
+        self.inertia.halt();
         self.camera = camera;
         self.target = camera;
         self.driven = true;
@@ -889,6 +992,7 @@ impl CameraController {
     /// of it as a gesture would be — and so does the ceiling
     /// ([`Self::max_altitude`]), so a pose beyond it is brought down to it.
     pub fn jump_to(&mut self, camera: GlobeCamera) {
+        self.inertia.halt();
         self.camera = camera;
         self.target = camera;
         // Placing is handing the camera back: a host that places is no longer
@@ -929,6 +1033,9 @@ impl CameraController {
         const LONGEST_STEP: f64 = 1.0 / 30.0;
 
         let dt = dt.clamp(0.0, LONGEST_STEP);
+        if !self.driven {
+            self.coast(dt);
+        }
         self.update(1.0 - (-dt / SETTLE_SECONDS).exp());
     }
 
@@ -1033,6 +1140,51 @@ mod tests {
     fn nadir_over(lat: f64, lon: f64, alt: f64) -> CameraController {
         let cam = GlobeCamera::from_geodetic(lat, lon, alt, 0.0, FRAC_PI_2, 60f64.to_radians());
         CameraController::new(cam).with_min_altitude(100.0)
+    }
+
+    /// A drag let go while moving coasts on, and stops by itself; where the
+    /// controller said it would be is where it is, bit for bit.
+    #[test]
+    fn a_fling_coasts_to_where_coast_ahead_said() {
+        let vp = (1000.0, 800.0);
+        let mut ctrl = nadir_over(0.5, 0.1, 50_000.0);
+        ctrl.press();
+        let mut x = 500.0;
+        for _ in 0..20 {
+            ctrl.drag((x, 400.0), (x + 8.0, 400.0), vp);
+            x += 8.0;
+            ctrl.advance(1.0 / 60.0);
+        }
+        ctrl.let_go();
+        assert!(ctrl.is_coasting());
+        let said = ctrl.coast_ahead(1.0, 1.0 / 60.0);
+        let before = ctrl.camera.position;
+        for _ in 0..60 {
+            ctrl.advance(1.0 / 60.0);
+        }
+        assert_eq!(ctrl.camera.position.to_array(), said.position.to_array());
+        assert!((ctrl.camera.position - before).length() > 1_000.0, "it coasted");
+        for _ in 0..600 {
+            ctrl.advance(1.0 / 60.0);
+        }
+        assert!(!ctrl.is_coasting(), "and stopped");
+    }
+
+    /// A hand put back on the globe stops the coast at once.
+    #[test]
+    fn a_press_stops_the_coast() {
+        let vp = (1000.0, 800.0);
+        let mut ctrl = nadir_over(0.5, 0.1, 50_000.0);
+        ctrl.press();
+        for i in 0..10 {
+            let x = 500.0 + 10.0 * f64::from(i);
+            ctrl.drag((x, 400.0), (x + 10.0, 400.0), vp);
+            ctrl.advance(1.0 / 60.0);
+        }
+        ctrl.let_go();
+        assert!(ctrl.is_coasting());
+        ctrl.press();
+        assert!(!ctrl.is_coasting());
     }
 
     /// The contract a host is given: what it drives is what is drawn.

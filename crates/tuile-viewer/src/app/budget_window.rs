@@ -76,6 +76,9 @@ pub(super) struct BudgetWindow {
     /// Only the levels with an issue (`window_levels=issues`).
     issues_only: bool,
     laid: Option<(Instant, (u32, u32), u64)>,
+    /// The prediction section's rows, laid out under the budget's
+    /// (`predicting::prediction_rows`).
+    prediction: Vec<Vec<String>>,
 }
 
 impl BudgetWindow {
@@ -277,7 +280,9 @@ impl BudgetWindow {
         let width = sized.then(|| f64::from(frame.0) / scale.max(1.0) - at.0 / scale.max(1.0));
         let mut texts = std::mem::take(&mut self.texts);
         let drawing: tuile_ui::Drawing = if self.tables {
-            let rows = self.rows_for(signals, now, layers);
+            let mut rows = self.rows_for(signals, now, layers);
+            // The prediction section, under the budget's tables.
+            rows.extend(self.prediction.iter().cloned());
             // The table's own height: scrolled like the board.
             let frame_for = if self.own_window {
                 (frame.0, 16_384)
@@ -301,6 +306,11 @@ impl BudgetWindow {
         self.texts = texts;
         self.laid = Some((now, frame, step));
         true
+    }
+
+    /// The prediction section, laid out with the next panel.
+    pub(super) fn set_prediction(&mut self, rows: Vec<Vec<String>>) {
+        self.prediction = rows;
     }
 
     /// The rows for `signals`, in the view asked for, at `now`.

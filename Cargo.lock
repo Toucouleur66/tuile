@@ -9221,6 +9221,7 @@ dependencies = [
  "arrow-schema",
  "parquet",
  "tuile-budget",
+ "tuile-camera",
 ]
 
 [[package]]
@@ -9229,6 +9230,7 @@ version = "0.18.0"
 dependencies = [
  "biquad",
  "glam 0.33.2",
+ "nalgebra",
  "tuile-core",
 ]
 

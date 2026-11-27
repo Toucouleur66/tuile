@@ -17,4 +17,5 @@ workspace = true
 [dependencies]
 biquad = { workspace = true }
 glam = { workspace = true }
+nalgebra = { workspace = true }
 tuile-core = { version = "0.18.0", path = "../tuile-core" }

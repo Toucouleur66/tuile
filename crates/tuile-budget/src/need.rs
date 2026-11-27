@@ -5,7 +5,7 @@
 //! about the view.
 
 use super::imagery::{GeoRect, TexelFootprint};
-use super::types::{Class, LayerId, TileId};
+use super::types::{Class, LayerId, Micros, TileId};
 
 /// What the traversal wants: the whole need of one decision step.
 ///
@@ -546,6 +546,9 @@ pub struct Need {
     /// does not say: a preload is then worth the specification's flat
     /// anticipation.
     pub proximity: Option<Proximity>,
+    /// When a prediction expects the tile to be used, and how likely: set
+    /// on a tile of the ring the views ahead list, `None` elsewhere.
+    pub ahead: Option<AheadUse>,
 }
 
 /// A tile's place against the view's present need: what the progressive
@@ -557,6 +560,18 @@ pub struct Proximity {
     /// The distance from the view's ground footprint to the tile, in tiles
     /// of the tile's own level (`d`).
     pub tiles_away: f32,
+}
+
+/// A predicted use of a ring tile: the views ahead that see it, the earliest
+/// of them and the likeliest (`ClientMessage::Ahead` in the geometry
+/// server's protocol). Part of the need, so recorded with every step and fed
+/// back the same by a replay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AheadUse {
+    /// The delay before the earliest view ahead that sees the tile.
+    pub next_use_in: Micros,
+    /// The likeliest of those views' probabilities, thousandths.
+    pub probability: u16,
 }
 
 // By hand for `clone_from`, which keeps the layers' buffer: the budget
@@ -573,6 +588,7 @@ impl Clone for Need {
             imagery: self.imagery.clone(),
             rect: self.rect,
             proximity: self.proximity,
+            ahead: self.ahead,
         }
     }
 
@@ -586,6 +602,7 @@ impl Clone for Need {
         self.imagery.clone_from(&source.imagery);
         self.rect = source.rect;
         self.proximity = source.proximity;
+        self.ahead = source.ahead;
     }
 }
 
@@ -617,6 +634,7 @@ impl Need {
                 == other
                     .proximity
                     .map(|p| (p.need_level, p.tiles_away.to_bits()))
+            && self.ahead == other.ahead
     }
 
     /// A need for a tile at `level`, of mesh class `class`, with neutral
@@ -632,6 +650,7 @@ impl Need {
             imagery: None,
             rect: None,
             proximity: None,
+            ahead: None,
         }
     }
 
@@ -673,6 +692,11 @@ impl Need {
             need_level,
             tiles_away,
         });
+        self
+    }
+    /// Sets the predicted use.
+    pub fn with_ahead(mut self, v: AheadUse) -> Self {
+        self.ahead = Some(v);
         self
     }
 }

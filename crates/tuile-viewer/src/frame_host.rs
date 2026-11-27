@@ -132,6 +132,12 @@ pub enum Priority {
     Now,
     /// Wanted, but behind the drawn view.
     Later,
+    /// Where the host will put the camera `in_us` microseconds from now: a
+    /// view ahead (`ClientMessage::Ahead`), its tiles loaded with what the
+    /// present view leaves and never in its place — not traversed with the
+    /// eyes. Its probability decays with the time ahead as a hand may
+    /// interrupt the host's path (`tuile_camera::predict`).
+    Ahead { in_us: u64 },
 }
 
 /// A pose traversed but never drawn, so its tiles are on hand before the
@@ -152,6 +158,18 @@ impl PreloadView {
             pose,
             aspect,
             priority: Priority::Now,
+        }
+    }
+
+    /// Where the camera will be `seconds` from now, at `aspect`: a view
+    /// ahead ([`Priority::Ahead`]).
+    pub fn ahead(pose: Pose, aspect: f64, seconds: f64) -> Self {
+        Self {
+            pose,
+            aspect,
+            priority: Priority::Ahead {
+                in_us: (seconds.max(0.0) * 1e6).round() as u64,
+            },
         }
     }
 }

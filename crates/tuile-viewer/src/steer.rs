@@ -32,7 +32,7 @@
 //! | `tuile://compression?mode=off\|auto\|bc7\|astc` | how the imagery is held on the GPU, from now on and for the next session: `off` RGBA8, `auto` the best block format the device holds; every drape is prepared again in the new form, the old one drawn until its replacement is up |
 //! | `tuile://import?src=https://…` | fetches a configuration file and imports it, as opening it would (`crate::import`) |
 //! | `tuile://telemetry?metrics=on\|off&profiling=on\|off` | the performance numbers sent to the configured collector, or not: see `tuile_telemetry` (nothing happens where none is configured) |
-//! | `tuile://budget?spec=auto\|interactive\|fpv\|known_path\|film\|fpv_film&margin=&horizon_ms=&speculation_slots=&line=on\|off&window=on\|off\|instant\|cumulative\|reset\|graph\|table&window_levels=all\|issues` | **a diagnostic**: forces the budget's specification (the context chooses it otherwise: ordinary navigation runs `interactive`), a few of its numbers, the budget's line over the view, and the budget window — a window of its own on a desktop and on a page (a browser window the page opens), over the view on a phone (per level and per layer, drawn as gauges and bars coloured by what deserves a look — `graph`, the default — or as tables, `table`; this step or summed since its start, `reset` summing from now); `spec=auto` gives the choice back to the context (`docs/explorations/budget-eviction-prefetch-spec.md` §3.3) |
+//! | `tuile://budget?spec=auto\|interactive\|fpv\|known_path\|film\|fpv_film&margin=&horizon_ms=&speculation_slots=&line=on\|off&window=on\|off\|instant\|cumulative\|reset\|graph\|table&window_levels=all\|issues&horizons=250,500,1000,2000&laplace_s=&interrupt_s=&rate_decay_s=\|inf&coast_s=&q_ground=&q_log_height=&q_angle=&reach_heights_per_s=&reach_zoom_out_per_s=&moving_heights_per_s=&prediction=context` | **a diagnostic**: forces the budget's specification (the context chooses it otherwise: ordinary navigation runs `interactive`), a few of its numbers, the budget's line over the view, and the budget window — a window of its own on a desktop and on a page (a browser window the page opens), over the view on a phone (per level and per layer, drawn as gauges and bars coloured by what deserves a look — `graph`, the default — or as tables, `table`; this step or summed since its start, `reset` summing from now); `spec=auto` gives the choice back to the context (`docs/explorations/budget-eviction-prefetch-spec.md` §3.3); the prediction's numbers (`tuile_camera::predict`: horizons in ms, decays and the fling's coast in seconds, `coast_s=0` no momentum) replace the use context's from the next frame, `prediction=context` gives them back |
 //!
 //! ## The scene's clock in a link
 //!
@@ -158,6 +158,99 @@ impl BudgetAsk {
     }
 }
 
+/// The prediction's numbers asked on the `tuile://budget?…` route
+/// (`tuile_camera::predict::QUERY_KEYS`): each set one replaces the use
+/// context's (`PredictConfig::for_context`), and stays until asked again or
+/// cleared (`prediction=context`). Small and fixed-size, so a command stays
+/// a copy: horizons in milliseconds, the other numbers in millionths
+/// (`u64::MAX` infinite).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(crate) struct PredictAsk {
+    /// The horizons, milliseconds, and how many (`Some` with 0: none).
+    pub horizons: Option<([u16; 16], u8)>,
+    /// Which of the other keys are set, a bit each in `QUERY_KEYS[1..]`'s
+    /// order, and their values in millionths.
+    pub set: u16,
+    pub millionths: [u64; 10],
+}
+
+impl PredictAsk {
+    /// Sets `key` from `text`, checked against the prediction's grammar.
+    pub(crate) fn set(&mut self, key: &str, text: &str) -> Result<(), String> {
+        use tuile_camera::predict::{PredictConfig, QUERY_KEYS};
+        let checked = PredictConfig::default().with_query(&format!("{key}={text}"))?;
+        if key == "horizons" {
+            let mut h = [0u16; 16];
+            for (slot, s) in h.iter_mut().zip(&checked.horizons_s) {
+                *slot = (s * 1000.0).round() as u16;
+            }
+            self.horizons = Some((h, checked.horizons_s.len() as u8));
+            return Ok(());
+        }
+        let i = QUERY_KEYS
+            .iter()
+            .skip(1)
+            .position(|k| *k == key)
+            .ok_or_else(|| format!("not a prediction key: {key:?}"))?;
+        self.millionths[i] = if text == "inf" {
+            u64::MAX
+        } else {
+            let v: f64 = text.parse().map_err(|_| format!("{key} is a number"))?;
+            (v * 1e6).round() as u64
+        };
+        self.set |= 1 << i;
+        Ok(())
+    }
+
+    /// Whether it asks anything.
+    pub(crate) fn is_empty(&self) -> bool {
+        *self == PredictAsk::default()
+    }
+
+    /// `self`'s keys over `earlier`'s.
+    pub(crate) fn over(&self, earlier: &PredictAsk) -> PredictAsk {
+        let mut out = *earlier;
+        if self.horizons.is_some() {
+            out.horizons = self.horizons;
+        }
+        for i in 0..out.millionths.len() {
+            if self.set & (1 << i) != 0 {
+                out.millionths[i] = self.millionths[i];
+                out.set |= 1 << i;
+            }
+        }
+        out
+    }
+
+    /// The query of the keys asked (`tuile_camera::predict` grammar).
+    pub(crate) fn query(&self) -> String {
+        use tuile_camera::predict::QUERY_KEYS;
+        let mut pairs = Vec::new();
+        if let Some((h, n)) = self.horizons {
+            let list: Vec<String> = h[..usize::from(n)].iter().map(u16::to_string).collect();
+            pairs.push(format!("horizons={}", list.join(",")));
+        }
+        for (i, k) in QUERY_KEYS.iter().skip(1).enumerate() {
+            if self.set & (1 << i) == 0 {
+                continue;
+            }
+            let v = self.millionths[i];
+            pairs.push(if v == u64::MAX {
+                format!("{k}=inf")
+            } else {
+                let frac = format!("{:06}", v % 1_000_000);
+                let frac = frac.trim_end_matches('0');
+                if frac.is_empty() {
+                    format!("{k}={}", v / 1_000_000)
+                } else {
+                    format!("{k}={}.{frac}", v / 1_000_000)
+                }
+            });
+        }
+        pairs.join("&")
+    }
+}
+
 /// What the budget window is asked: shown or not, which of its views, and
 /// whether its cumulative view starts again from now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +274,9 @@ pub(crate) enum WindowAsk {
 pub(crate) enum Command {
     /// A diagnostic override of the budget's specification, or its end.
     Budget(BudgetAsk),
+    /// The prediction's numbers, over the use context's; `None`: back to
+    /// the context's alone.
+    Predict(Option<PredictAsk>),
     /// The budget's line over the view (its specification, the tiles under
     /// their need), shown or not.
     BudgetLine(bool),
@@ -523,6 +619,7 @@ pub(crate) fn parse_url_among(
             let mut ask = BudgetAsk::default();
             let mut forced = false;
             let mut out = Vec::new();
+            let mut predict = PredictAsk::default();
             for (key, text) in &pairs {
                 let number = || {
                     text.parse::<u32>()
@@ -556,6 +653,8 @@ pub(crate) fn parse_url_among(
                             Some(u16::try_from(n).map_err(|_| format!("{key} is at most 1000"))?);
                         forced = true;
                     }
+                    "prediction" if *text == "context" => out.push(Command::Predict(None)),
+                    k if tuile_camera::predict::QUERY_KEYS.contains(&k) => predict.set(k, text)?,
                     "line" => out.push(Command::BudgetLine(match *text {
                         "on" => true,
                         "off" => false,
@@ -584,7 +683,8 @@ pub(crate) fn parse_url_among(
                     _ => {
                         return Err(format!(
                             "budget takes spec=, margin=, horizon_ms=, speculation_slots=, \
-                             line=, window= and window_levels=, not {key:?}"
+                             line=, window=, window_levels=, prediction=context and the prediction's {}, not {key:?}",
+                            tuile_camera::predict::QUERY_KEYS.join("=, ")
                         ))
                     }
                 }
@@ -592,6 +692,9 @@ pub(crate) fn parse_url_among(
             // Numbers alone override the interactive one.
             if ask.kind.is_none() && ask != BudgetAsk::default() {
                 ask.kind = Some(tuile_core::budget::SpecKind::Interactive);
+            }
+            if !predict.is_empty() {
+                out.push(Command::Predict(Some(predict)));
             }
             if forced {
                 out.insert(0, Command::Budget(ask));
@@ -1371,6 +1474,25 @@ mod tests {
             Ok(vec![Command::BudgetWindow(WindowAsk::Levels(false))])
         );
         assert!(parse_url("tuile://budget?window_levels=some").is_err());
+        // The prediction's numbers, without forcing a specification.
+        let Ok(asked) =
+            parse_url("tuile://budget?horizons=250,500,1000,2000&coast_s=0.35&rate_decay_s=inf")
+        else {
+            panic!("refused");
+        };
+        let [Command::Predict(Some(p))] = asked.as_slice() else {
+            panic!("{asked:?}");
+        };
+        assert_eq!(
+            p.query(),
+            "horizons=250,500,1000,2000&rate_decay_s=inf&coast_s=0.35"
+        );
+        assert_eq!(
+            parse_url("tuile://budget?prediction=context"),
+            Ok(vec![Command::Predict(None)])
+        );
+        assert!(parse_url("tuile://budget?coast_s=-1").is_err());
+        assert!(parse_url("tuile://budget?horizons=0").is_err());
         for bad in [
             "tuile://budget",
             "tuile://budget?spec=warp",

@@ -56,7 +56,9 @@ pub use error::{AuditError, ConfigError, SessionError};
 pub use inputs::{Measured, Prediction, Smoothed, TierSample};
 pub use fallback::{FallbackContext, FallbackReport, FallbackRule, FallbackSpec, FallbackState};
 pub use imagery::{DrapeCandidate, GeoRect, LevelClamp, TexelFootprint, UvTransform};
-pub use need::{ImageryNeed, LayerReach, Membership, Need, NeedDelta, NeedSet, Proximity};
+pub use need::{
+    AheadUse, ImageryNeed, LayerReach, Membership, Need, NeedDelta, NeedSet, Proximity,
+};
 pub use observe::{
     check, BudgetEvent, BudgetMeter, BudgetObserver, BudgetSignals, EyeCoverage, FrameRecord,
     Histogram, StepRecord, Violations,
