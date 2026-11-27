@@ -177,7 +177,7 @@ fn vs_main(in: VsIn) -> VsOut {
 }
 
 // The underlay (`ContentPump::set_underlay_level`): the same vertex, pushed
-// away from the eye by `UNDERLAY_PUSH` of its distance — in depth only, the
+// away from the eye by the underlay's push (`UnderlayOptions::push`) of its distance — in depth only, the
 // picture where it was. Scaling the view-space position by `s` about the eye
 // leaves `xy / w` as it was and moves the depth: with the far plane far
 // beyond the near (`A ≈ -1`), forward depth `d` goes to `d + (d - 1)(1/s - 1)`,

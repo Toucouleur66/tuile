@@ -75,11 +75,43 @@ const REPLACED: u32 = 2;
 /// underlay tile did, so two levels of it never fight over a pixel.
 const UNDER: u32 = 4;
 
-/// How far behind the ground the underlay sits, as a fraction of its distance
-/// from the eye (`Pass::Underlay`): 1 %, 50 m at five kilometres — more than
-/// a coarse level's relief stands above the fine ground it approximates over
-/// most of a view, less than the skirts hang under it.
-pub const UNDERLAY_PUSH: f32 = 0.01;
+/// What shapes the underlay (`ContentPump::set_underlay_level`), supplied when
+/// the renderer and the pump are made: numbers in the units of what they
+/// scale, so they hold from a globe seen from orbit down to a street.
+///
+/// - `push`: how far behind the ground the underlay sits, as a fraction of its
+///   distance from the eye (`Pass::Underlay`). The default, 1 %, is 50 m at five
+///   kilometres: more than a coarse level's relief stands above the fine ground
+///   it approximates over most of a view, less than the skirts hang under it.
+///   It is proportional to the distance, so it grows with the depth buffer's
+///   own step. 0 puts the underlay at the ground's depth; a negative or
+///   non-finite value is taken as 0 (an underlay in front of the ground would
+///   win its pixels).
+/// - `reach`: how far from the eye an underlay tile may be, in its own widths.
+///   A selection at a few pixels of error takes a tile at four to eight widths;
+///   the default, twelve, keeps a level and a half finer than it at most, never
+///   the fine leftovers of a view far from this one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UnderlayOptions {
+    pub push: f32,
+    pub reach: f64,
+}
+
+impl UnderlayOptions {
+    /// The push of an underlay nobody tuned.
+    pub const DEFAULT_PUSH: f32 = 0.01;
+    /// The reach of an underlay nobody tuned.
+    pub const DEFAULT_REACH: f64 = 12.0;
+}
+
+impl Default for UnderlayOptions {
+    fn default() -> Self {
+        Self {
+            push: Self::DEFAULT_PUSH,
+            reach: Self::DEFAULT_REACH,
+        }
+    }
+}
 
 pub struct TileRenderer {
     pipeline: wgpu::RenderPipeline,
@@ -127,13 +159,31 @@ impl TileRenderer {
     /// ([`TargetLayout::own`]). Wireframe is created only when the device has
     /// `POLYGON_MODE_LINE`.
     pub fn new(gpu: &GpuContext, target_format: wgpu::TextureFormat) -> Self {
-        Self::for_layout(gpu, TargetLayout::own(target_format))
+        Self::new_with(gpu, target_format, &UnderlayOptions::default())
+    }
+
+    /// [`TileRenderer::new`], with the underlay's `push` the host chose.
+    pub fn new_with(
+        gpu: &GpuContext,
+        target_format: wgpu::TextureFormat,
+        underlay: &UnderlayOptions,
+    ) -> Self {
+        Self::for_layout_with(gpu, TargetLayout::own(target_format), underlay)
     }
 
     /// The pipelines for targets of `layout`: a host's colour format, sample
     /// count and depth convention, drawn through a [`crate::HostPass`] of the
     /// same layout.
     pub fn for_layout(gpu: &GpuContext, layout: TargetLayout) -> Self {
+        Self::for_layout_with(gpu, layout, &UnderlayOptions::default())
+    }
+
+    /// [`TileRenderer::for_layout`], with the underlay's `push` the host chose.
+    pub fn for_layout_with(
+        gpu: &GpuContext,
+        layout: TargetLayout,
+        underlay: &UnderlayOptions,
+    ) -> Self {
         let target_format = layout.colour;
         let depth_format = layout.drawn_depth(&gpu.device);
         let direction = layout.direction;
@@ -150,7 +200,9 @@ impl TileRenderer {
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("tuile ground"),
-                source: wgpu::ShaderSource::Wgsl(ground_wgsl(gpu.imagery_slots).into()),
+                source: wgpu::ShaderSource::Wgsl(
+                    ground_wgsl_with(gpu.imagery_slots, underlay.push).into(),
+                ),
             });
         // The physical atmosphere: the ground reads its tables (group 3),
         // the sky its sky-view besides.
@@ -1025,15 +1077,18 @@ impl TileRenderer {
         }
     }
 
-    /// [`TileRenderer::paint`], with the underlay (`Drawn::underlay`):
-    /// coarse relief drawn, with depth, where the selection has not reached
-    /// yet, before the surfaces' skirts.
+    /// [`TileRenderer::paint_replacing`], with the underlay
+    /// (`Drawn::underlay`): coarse relief drawn, with depth, where the
+    /// selection has not reached yet, before the surfaces' skirts. With an
+    /// empty underlay it is `paint_replacing`, pass for pass.
     #[allow(clippy::too_many_arguments)]
     pub fn paint_under<'t>(
         &self,
         pass: &mut wgpu::RenderPass<'_>,
         backdrop: impl Iterator<Item = &'t PreparedTile>,
         underlay: impl Iterator<Item = &'t PreparedTile>,
+        replacing: impl Iterator<Item = &'t PreparedTile>,
+        replacing_fallback: impl Iterator<Item = &'t PreparedTile>,
         tiles: impl Iterator<Item = &'t PreparedTile>,
         fallback: impl Iterator<Item = &'t PreparedTile>,
         overlay: Option<&crate::overlay::OverlayRenderer>,
@@ -1043,8 +1098,8 @@ impl TileRenderer {
             pass,
             backdrop,
             underlay,
-            std::iter::empty(),
-            std::iter::empty(),
+            replacing,
+            replacing_fallback,
             tiles,
             fallback,
             overlay,
@@ -1110,6 +1165,13 @@ impl TileRenderer {
 /// ask for exactly what the backend compiles, rather than reassembling it and
 /// hoping the order matches.
 pub fn ground_wgsl(slots: u32) -> String {
+    ground_wgsl_with(slots, UnderlayOptions::DEFAULT_PUSH)
+}
+
+/// [`ground_wgsl`] with the underlay pushed back by `push` of its distance
+/// ([`UnderlayOptions::push`]); a negative or non-finite `push` is 0.
+pub fn ground_wgsl_with(slots: u32, push: f32) -> String {
+    let push = if push.is_finite() { push.max(0.0) } else { 0.0 };
     let air = format!(
         "{}{}\n{}\n{}",
         tuile_atmosphere::hillaire::wgsl_bindings(3),
@@ -1147,7 +1209,7 @@ pub fn ground_wgsl(slots: u32) -> String {
                 "/*STITCH_BAND*/",
                 &format!("{:?}", tuile_core::stitch::BAND)
             )
-            .replace("/*UNDERLAY_PUSH*/", &format!("{UNDERLAY_PUSH:?}"))
+            .replace("/*UNDERLAY_PUSH*/", &format!("{push:?}"))
             .replace("//#IMAGERY_BINDINGS", &bindings)
             .replace("//#IMAGERY_SAMPLES", samples.trim_start()),
     )

@@ -20,6 +20,7 @@
 
 use crate::context::GpuContext;
 use crate::prepare::{Levels, PreparedDrape, PreparedTile};
+use crate::renderer::UnderlayOptions;
 use glam::DVec3;
 use std::collections::{BTreeMap, HashMap};
 use std::task::{Context, Poll};
@@ -182,6 +183,9 @@ pub struct ContentPump {
     /// The frame's view-projection, in render space, the underlay is culled
     /// against: see [`Self::set_underlay_view`].
     underlay_view: Option<(glam::Mat4, DVec3)>,
+    /// How far from the eye an underlay tile may be, in its own widths: see
+    /// [`Self::set_underlay_options`].
+    underlay_reach: f64,
     /// The sources not drawn, a bit per tag: see [`Self::hide_source`].
     hidden_sources: u16,
     /// How many `Select` messages this pump has applied.
@@ -291,6 +295,7 @@ impl ContentPump {
             backdrop_level: None,
             underlay_level: None,
             underlay_view: None,
+            underlay_reach: UnderlayOptions::DEFAULT_REACH,
             hidden_sources: 0,
             selects_seen: 0,
             generation_sent: 0,
@@ -411,7 +416,26 @@ impl ContentPump {
     /// skirts of the tiles around such a hole hang into ground rather than
     /// into the open — no wall. `None`, the default, draws none.
     pub fn set_underlay_level(&mut self, level: Option<u32>) {
+        if self.underlay_level != level {
+            self.changed();
+        }
         self.underlay_level = level;
+    }
+
+    /// The underlay's `reach` (see [`UnderlayOptions`]); its `push` is the
+    /// renderer's ([`crate::TileRenderer::new_with`]). The default is
+    /// [`UnderlayOptions::DEFAULT_REACH`]; a value that is not a positive
+    /// number leaves the underlay empty, which is what no reach is.
+    pub fn set_underlay_options(&mut self, options: &UnderlayOptions) {
+        let reach = if options.reach.is_nan() {
+            0.0
+        } else {
+            options.reach
+        };
+        if self.underlay_reach != reach {
+            self.changed();
+        }
+        self.underlay_reach = reach;
     }
 
     /// The view-projection of the frame about to be drawn, in render space
@@ -434,7 +458,7 @@ impl ContentPump {
             return true;
         };
         let width = 6_378_137.0 * std::f64::consts::PI / f64::from(1u32 << level.min(30));
-        if tile.origin_ecef().distance(eye) > UNDERLAY_REACH * width {
+        if tile.origin_ecef().distance(eye) > self.underlay_reach * width {
             return false;
         }
         let c = (tile.origin_ecef() - self.render_origin).as_vec3();
@@ -1687,12 +1711,6 @@ fn encode_share(deadline: FrameDeadline, ns_per_block: f64, frame_us: f64) -> u6
 
 /// The longest frame the encode share follows: a stall is not headroom.
 const MAX_FRAME_US: f64 = 250_000.0;
-
-/// How far from the eye an underlay tile may be, in its own widths: a
-/// selection at a few pixels of error takes a tile at four to eight widths
-/// (`set_underlay_level`); twelve keeps a level and a half finer than it at
-/// most, never the fine leftovers of a view far from this one.
-const UNDERLAY_REACH: f64 = 12.0;
 
 /// A held tile's level, 0 when its ancestry is unknown.
 fn level_of_tile(ancestry: &HashMap<TileId, Ancestry>, t: &TileId) -> u32 {

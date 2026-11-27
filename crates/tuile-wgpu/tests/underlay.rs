@@ -28,8 +28,8 @@ use tuile_terrain::{
     skirt_height, to_decoded, GeoRect, GeographicTilingScheme, Header, QuantizedMesh, TileCoord,
 };
 use tuile_wgpu::{
-    ContentPump, GpuContext, PreparedTile, TileRenderer, ViewUniform, DEPTH_FORMAT, SAMPLES,
-    TEXTURE_FORMAT,
+    ContentPump, GpuContext, PreparedTile, TileRenderer, UnderlayOptions, ViewUniform,
+    DEPTH_FORMAT, SAMPLES, TEXTURE_FORMAT,
 };
 
 const SIZE: u32 = 256;
@@ -199,7 +199,7 @@ fn the_underlay_is_held_ground_the_selection_does_not_draw() {
         (drawn, "drawn by the selection"),
         (bare, "wearing no drape of its own"),
         (out_of_view, "out of the view"),
-        (beyond_reach, "farther than UNDERLAY_REACH of its widths"),
+        (beyond_reach, "farther than the reach of its widths"),
         (coarser, "coarser than the underlay's level"),
     ] {
         assert!(
@@ -223,6 +223,17 @@ fn the_underlay_is_held_ground_the_selection_does_not_draw() {
 /// seen through `view_proj` (in render space); returns the frame, RGBA8.
 fn draw(
     gpu: &GpuContext,
+    view_proj: Mat4,
+    underlay: &[&PreparedTile],
+    tiles: &[&PreparedTile],
+) -> Vec<u8> {
+    draw_with(gpu, &UnderlayOptions::default(), view_proj, underlay, tiles)
+}
+
+/// [`draw`] through a renderer made with `options`.
+fn draw_with(
+    gpu: &GpuContext,
+    options: &UnderlayOptions,
     view_proj: Mat4,
     underlay: &[&PreparedTile],
     tiles: &[&PreparedTile],
@@ -265,7 +276,7 @@ fn draw(
     );
     let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
 
-    let renderer = TileRenderer::new(gpu, TEXTURE_FORMAT);
+    let renderer = TileRenderer::new_with(gpu, TEXTURE_FORMAT, options);
     renderer.set_view(
         &gpu.queue,
         &ViewUniform {
@@ -309,6 +320,8 @@ fn draw(
             &mut pass,
             std::iter::empty(),
             underlay.iter().copied(),
+            std::iter::empty(),
+            std::iter::empty(),
             tiles.iter().copied(),
             std::iter::empty(),
             None,
@@ -447,4 +460,106 @@ fn an_underlay_tile_is_placed_against_the_frames_render_origin() {
         "{green_px} of {area} middle pixels are the selection's: the underlay \
          is drawn only where nothing the selection drew is"
     );
+}
+
+/// **The underlay's reach is the host's number, in the tile's own widths.**
+///
+/// Two level-10 tiles (≈ 19.6 km wide), one under the eye and one ≈ 390 km
+/// north, ≈ 20 widths away. The default reach, 12 widths, takes the first
+/// alone; 30 takes both; 0.5 takes neither (the near one's centre is
+/// ≈ 1 width away).
+#[test]
+fn the_underlays_reach_is_the_hosts_number() {
+    let Some(gpu) = gpu() else { return };
+    let near = TileId::from_terrain(10, 1024, 512);
+    let far = TileId::from_terrain(10, 1024, 532);
+    let all = [near, far];
+    let mut messages: Vec<ServerMessage> = Vec::new();
+    for (i, t) in all.iter().enumerate() {
+        messages.push(mesh(*t, 1 + i as u64, flat(*t)));
+        messages.push(drape(*t, 100 + i as u64, own_drape(*t)));
+    }
+    messages.push(select(Vec::new(), 1));
+    let eye = centre(near) + centre(near).normalize() * 20_000.0;
+    let mut pump = ContentPump::new(eye);
+    pump.pump(&mut Scripted::new(messages), &gpu, FrameDeadline::UNBOUNDED);
+    let view =
+        glam::camera::rh::proj::directx::orthographic(-1.0e6, 1.0e6, -1.0e6, 1.0e6, -1.0e7, 1.0e7);
+    pump.set_underlay_level(Some(10));
+    pump.set_underlay_view(view.to_cols_array(), eye);
+
+    let mut under_with = |reach: f64| {
+        pump.set_underlay_options(&UnderlayOptions {
+            reach,
+            ..UnderlayOptions::default()
+        });
+        let (frame, _) = pump.resolve(&gpu);
+        let mut under = named(&frame.underlay, &all);
+        under.sort();
+        under
+    };
+    let mut both = all.to_vec();
+    both.sort();
+    assert_eq!(
+        under_with(UnderlayOptions::DEFAULT_REACH),
+        vec![near],
+        "the default reach takes the near tile alone"
+    );
+    assert_eq!(under_with(30.0), both, "a longer reach takes both");
+    assert_eq!(
+        under_with(0.5),
+        Vec::<TileId>::new(),
+        "a shorter one takes neither"
+    );
+}
+
+/// **A renderer made with another push still draws the underlay where
+/// nothing else is.**
+///
+/// The push is a number the shader is assembled with; whatever it is, the
+/// underlay tile stands in the middle of the frame, in its own drape, and
+/// the pipeline compiles (0 and a half of the distance are as good as 1 %).
+#[test]
+fn an_underlay_pushed_by_the_hosts_number_still_draws() {
+    let Some(gpu) = gpu() else { return };
+    let child = TileId::from_terrain(10, 1024, 512);
+    let look_at = centre(child);
+    let up = look_at.normalize();
+    let eye = look_at + up * 20_000.0;
+    let east = DVec3::Z.cross(up).normalize();
+    let mut pump = ContentPump::new(eye);
+    let red = painted(&gpu, 4, 4, |_, _| [230, 30, 30, 255]);
+    pump.pump(
+        &mut Scripted::new([
+            mesh(child, 1, flat(child)),
+            drape(child, 2, whole_drape(child, 10, red)),
+            select(Vec::new(), 1),
+        ]),
+        &gpu,
+        FrameDeadline::UNBOUNDED,
+    );
+    let forward = -up;
+    let side = east.cross(forward).normalize();
+    let view_m =
+        glam::camera::rh::view::look_to_mat4(Vec3::ZERO, forward.as_vec3(), side.as_vec3());
+    let proj =
+        glam::camera::rh::proj::directx::perspective(40f32.to_radians(), 1.0, 100.0, 40_000_000.0);
+    let view_proj = proj * view_m;
+    pump.set_underlay_level(Some(10));
+    pump.set_underlay_view(view_proj.to_cols_array(), eye);
+    let (frame, _) = pump.resolve(&gpu);
+    assert_eq!(frame.underlay.len(), 1);
+    let area = u64::from(SIZE / 4) * u64::from(SIZE / 4);
+    for push in [0.0, 0.5] {
+        let options = UnderlayOptions {
+            push,
+            ..UnderlayOptions::default()
+        };
+        let pixels = draw_with(&gpu, &options, view_proj, &frame.underlay, &[]);
+        let red_px = middle_won_by(&pixels, 0);
+        assert_eq!(
+            red_px, area,
+            "push {push}: {red_px} of {area} middle pixels are the underlay tile"
+        );
+    }
 }

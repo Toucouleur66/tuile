@@ -134,6 +134,11 @@ pub struct ViewerConfig {
     /// (`--imagery-encode-level`, or the phone's settings page):
     /// [`tuile_wgpu::DEFAULT_ENCODE_LEVEL`] unless asked.
     pub(crate) imagery_encode_level: u32,
+    /// The underlay drawn beneath the ground the selection has not reached
+    /// (`tuile_wgpu::ContentPump::set_underlay_level`), with its push and
+    /// reach; `None` draws none, which is what a scenario run's digests are
+    /// made of.
+    pub(crate) underlay: Option<tuile_wgpu::UnderlayOptions>,
     /// Whether the ground is lit: the person's choice, off unless they
     /// asked (`--lighting`, a page's option, the phone's settings page, the
     /// menu's last choice) — see `crate::lighting`. A headless run is lit.
@@ -371,6 +376,8 @@ pub struct App {
     keeps_choices: bool,
     /// See [`ViewerConfig::imagery_encode_level`].
     imagery_encode_level: u32,
+    /// See [`ViewerConfig::underlay`].
+    underlay: Option<tuile_wgpu::UnderlayOptions>,
     /// The loader's imagery plan, once a session is up: told the device's.
     imagery_plan: Option<tuile_planetary::ImageryPlanHandle>,
     lifecycle: lifecycle::Lifecycle,
@@ -660,6 +667,7 @@ impl App {
             imagery_compression: config.imagery_compression,
             keeps_choices: config.keeps_choices,
             imagery_encode_level: config.imagery_encode_level,
+            underlay: config.underlay,
             imagery_plan: None,
             rig: Rig::MONO,
             speaker: crate::desktop::try_alert,
