@@ -68,6 +68,8 @@ jobs:
   # The oldest compiler the workspace says it builds with (`rust-version`),
   # pinned to a patch release: every other job runs on stable, so nothing
   # else would notice a newer language feature creeping in.
+      - if: always()
+        uses: ./.github/actions/sccache-stats
   msrv:
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'tuile-linux' }}
     steps:
@@ -91,6 +93,8 @@ jobs:
   # each gets a runner, which builds that one binary only. The third runner
   # builds the whole workspace and runs everything else — the filters are
   # each other's complement, so a test renamed or added still runs somewhere.
+      - if: always()
+        uses: ./.github/actions/sccache-stats
   test:
     name: test (ubuntu-24.04, ${{ matrix.shard.name }})
     strategy:
@@ -196,6 +200,8 @@ jobs:
   # scenarios are too slow unoptimised (they are ignored in debug builds),
   # and the properties run at 10 000 cases here. The golden decision digests
   # are checked on Linux as on the Mac that recorded them.
+      - if: always()
+        uses: ./.github/actions/sccache-stats
   budget-sim:
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'tuile-linux' }}
     env:
@@ -216,6 +222,8 @@ jobs:
       # than one binary after the other.
       - run: cargo nextest run --profile ci --cargo-profile release -p tuile-budget --test budget_sim --test budget_properties --test budget_core --test budget_signals
       - run: cargo nextest run --profile ci --cargo-profile release -p tuile-core --test budget_imagery
+      - if: always()
+        uses: ./.github/actions/sccache-stats
 
   wasm-guard:
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'tuile-linux' }}
@@ -261,6 +269,8 @@ jobs:
 
   # The package a page imports: the wasm build and its bindings, the
   # typings checked by tsc, and a bundler that ships the worker and the wasm.
+      - if: always()
+        uses: ./.github/actions/sccache-stats
   web-package:
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'tuile-linux' }}
     steps:
@@ -288,6 +298,8 @@ jobs:
   # The Android shell, as the device builds it: no host build ever compiles
   # that code. Clippy on the target, then the APK through the same script a
   # developer runs — the runner image carries the SDK and the NDK.
+      - if: always()
+        uses: ./.github/actions/sccache-stats
   android:
     runs-on: ubuntu-latest
     steps:
@@ -324,3 +336,5 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo doc --workspace --no-deps
+      - if: always()
+        uses: ./.github/actions/sccache-stats

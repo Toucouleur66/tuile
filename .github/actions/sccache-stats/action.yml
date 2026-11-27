@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+name: sccache statistics
+description: >-
+  Last step of a job that ran `.github/actions/linux-host`: prints what sccache
+  hit and missed, then stops its server so the last writes reach the bucket
+  (the builder does the same with tuile_sccache_stop). Does nothing when
+  sccache is off.
+runs:
+  using: composite
+  steps:
+    - if: always()
+      shell: bash
+      run: |
+        if [ "${RUSTC_WRAPPER:-}" = sccache ] && command -v sccache > /dev/null; then
+          sccache --show-stats || true
+          sccache --stop-server || true
+        fi
