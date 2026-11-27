@@ -1163,7 +1163,9 @@ impl TileRenderer {
 ///
 /// Public so a test — or a translator aiming at another shading language — can
 /// ask for exactly what the backend compiles, rather than reassembling it and
-/// hoping the order matches.
+/// hoping the order matches. This one is the default underlay push's, for the
+/// tests; the renderer assembles [`ground_wgsl_with`] with the host's.
+#[cfg(test)]
 pub fn ground_wgsl(slots: u32) -> String {
     ground_wgsl_with(slots, UnderlayOptions::DEFAULT_PUSH)
 }
