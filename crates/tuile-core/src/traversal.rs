@@ -541,9 +541,30 @@ impl Config {
     /// What the session may hold, load and upload is the graphics budget's
     /// ([`crate::budget::BudgetConfig`]): the traversal only says what the
     /// view wants.
+    ///
+    /// **No hold-until-ready here** ([`Config::forbid_holes`] off). A
+    /// session's budget already covers the ground tile by tile: a wanted
+    /// tile not drawable yet is stood in for by its nearest drawable
+    /// ancestor, drawn only where no finer mesh stamped, and siblings
+    /// replace their parent all at once (`select_tile`). The traversal's
+    /// own hold did the same job per subtree, and worse: one missing
+    /// child dropped every drawn sibling, and a subtree with more than
+    /// [`Config::loading_descendant_limit`] loads was cut to its coarsest
+    /// resident ancestor, drawn as itself. After a jump of a few
+    /// kilometres in one frame (a late frame on a fast turn), the draw set
+    /// fell from about 100 tiles to 6–20 of level 10 or coarser, most of
+    /// them in their level-2 stand-in drape: the whole view olive for a
+    /// frame (lapoule-dev/tuile#330). Without the hold, the same scripted
+    /// turns load as many meshes and drapes, and the flash is gone.
+    ///
+    /// This is a default of the configuration, not a mode: a host that
+    /// wants the hold back builds `Config { forbid_holes: true,
+    /// ..Config::interactive_globe() }` when it instantiates its session
+    /// (the recorder does, whatever it is given).
     pub fn interactive_globe() -> Self {
         Self {
             maximum_screen_space_error: 2.0,
+            forbid_holes: false,
             ..Self::default()
         }
     }
@@ -3371,6 +3392,76 @@ pub(crate) mod tests {
         assert_eq!(sel.len(), 4);
         assert!(!sel.contains(&root), "parent and children never coexist");
         assert!(out.requests.is_empty());
+    }
+
+    /// **The interactive globe's traversal does not hold a refinement**
+    /// (#330): two of four children resident, the parent resident too, the
+    /// traversal selects the two and asks for the other two, and does not
+    /// fall back to the parent. The stand-in for the missing two is the
+    /// budget's, tile by tile (`select_tile`). Red with `forbid_holes` on in
+    /// [`Config::interactive_globe`]: the parent alone.
+    #[test]
+    fn the_interactive_globe_selects_ready_children_without_holding() {
+        let ts = mini_tileset();
+        let root = ts.root();
+        let children = ts.tile(root).children.clone();
+        let mut residency = ResidentSet::default();
+        residency.insert(root);
+        residency.insert(children[0]);
+        residency.insert(children[1]);
+
+        let out = run_with(
+            &ts,
+            &residency,
+            &[camera_at(150.0)],
+            &Config::interactive_globe(),
+            &HashSet::new(),
+        );
+        let mut sel = ids(&out.selected);
+        sel.sort();
+        let mut ready = vec![children[0], children[1]];
+        ready.sort();
+        assert_eq!(sel, ready, "the ready children, not the parent");
+        let mut asked: Vec<TileId> = out.requests.iter().map(|r| r.tile).collect();
+        asked.sort();
+        let mut missing = vec![children[2], children[3]];
+        missing.sort();
+        assert_eq!(asked, missing, "the missing children are still asked for");
+        assert!(
+            out.awaiting.is_empty(),
+            "nothing is held: {:?}",
+            out.awaiting
+        );
+    }
+
+    /// **The hold is the instance's configuration, not a property of the
+    /// globe**: the default configuration (the recorder's, which
+    /// `exact_traversal` forces anyway) keeps it, and a host that builds
+    /// from [`Config::interactive_globe`] may ask for it back. Same inputs
+    /// as the test above: with the hold, two of four children resident
+    /// select the parent alone.
+    #[test]
+    fn the_hold_is_supplied_by_the_configuration() {
+        assert!(Config::default().forbid_holes, "the default holds");
+        assert!(
+            !Config::interactive_globe().forbid_holes,
+            "the interactive globe's default does not"
+        );
+
+        let ts = mini_tileset();
+        let root = ts.root();
+        let children = ts.tile(root).children.clone();
+        let mut residency = ResidentSet::default();
+        residency.insert(root);
+        residency.insert(children[0]);
+        residency.insert(children[1]);
+
+        let held = Config {
+            forbid_holes: true,
+            ..Config::interactive_globe()
+        };
+        let out = run_with(&ts, &residency, &[camera_at(150.0)], &held, &HashSet::new());
+        assert_eq!(ids(&out.selected), vec![root], "the hold falls back to the parent");
     }
 
     /// Ground just off the edge of the screen is selected, not merely fetched.
