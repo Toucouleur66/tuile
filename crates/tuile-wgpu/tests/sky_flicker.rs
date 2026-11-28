@@ -638,7 +638,7 @@ fn the_limb_stays_from_ten_kilometres_to_geostationary_height() {
 /// down over the same span, as a wheel makes it: the limb is drawn in
 /// every frame it is in the picture, and its light never jumps.
 #[test]
-#[ignore = "slow: gpu: the limb never blinks on a slow way out, ~680 s in debug"]
+#[ignore = "disabled: ~680 s of lavapipe in debug for a flicker that is unlikely to come back; run it by hand with --run-ignored only when touching the limb"]
 fn the_limb_never_blinks_on_a_slow_way_out() {
     let Some(gpu) = gpu() else { return };
     let size = (WIDTH, HEIGHT);
