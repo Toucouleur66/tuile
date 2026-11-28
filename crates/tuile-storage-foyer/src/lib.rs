@@ -177,7 +177,12 @@ impl FoyerStore {
     /// process killed without calling this keeps none of its cache, however
     /// long it ran. Hosts should call it on their way out.
     pub async fn close(&self) -> Result<(), StoreError> {
-        // The ledger first, settled: what the next process opens with.
+        // The ledger first, settled once the queued writes have landed: what
+        // the next process opens with.
+        self.cache.storage().wait().await;
+        if let Some(n) = self.ledger.begin_barrier() {
+            self.ledger.barrier_done(n);
+        }
         self.settle();
         if let Err(e) = self.ledger.save(&self.dir) {
             tracing::warn!(error = %e, "the store's ledger was not written");
@@ -188,8 +193,18 @@ impl FoyerStore {
             .map_err(|e| StoreError::from_error(&e))
     }
 
-    /// The ledger's suspects asked of the index.
+    /// The ledger's suspects asked of the index, those the queued writes
+    /// have passed: the index does not hold an entry still in the queue, and
+    /// that is not a reason to forget it.
     fn settle(&self) {
+        if let Some(n) = self.ledger.begin_barrier() {
+            let cache = self.cache.clone();
+            let ledger = Arc::clone(&self.ledger);
+            self.cache.storage().spawner().spawn(async move {
+                cache.storage().wait().await;
+                ledger.barrier_done(n);
+            });
+        }
         self.ledger.settle(|key| self.cache.contains(key));
     }
 
@@ -921,6 +936,46 @@ mod tests {
         assert_eq!(last.0, held(), "the count is what the index holds");
         assert_eq!(last.1, last.0 as u64 * (1 << 20), "and their bytes");
         assert_eq!(last.2, 0, "an absence is not a tile");
+    }
+
+    /// A tile the memory tier lets go of while its write to the disk is
+    /// still queued is not on the disk's index yet, and is not gone: the
+    /// count must not ask the index at that moment. Counted all along (the
+    /// disk is large enough to reclaim nothing), every tile is still counted
+    /// once the writes have landed.
+    #[tokio::test]
+    async fn a_tile_whose_write_is_queued_stays_counted() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = FoyerStore::keeping(StoreConfig {
+            dir: dir.path().to_path_buf(),
+            memory_bytes: 1 << 20,
+            disk_bytes: 1 << 30,
+            default_ttl: None,
+        })
+        .await
+        .expect("store");
+        const TILES: usize = 100;
+        let key = |i: usize| format!("img/q/10/{i}/0");
+        let counted = || {
+            let mut by = tuile_core::budget::ByLevel::default();
+            assert!(store.stored("img/q", &mut by), "a store with a ledger");
+            by[10][0] as usize
+        };
+        for i in 0..TILES {
+            store
+                .put(&key(i), Bytes::from(vec![i as u8; 1 << 20]), None)
+                .await;
+            // The budget asks all the time, while the disk is behind.
+            counted();
+        }
+        store.cache.storage().wait().await;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            counted();
+        }
+        let held = (0..TILES).filter(|i| store.holds(&key(*i))).count();
+        assert!(held > 0, "the disk took some of the writes");
+        assert_eq!(counted(), held, "and the count has all of them");
     }
 
     /// The count survives the store being closed and opened again.
