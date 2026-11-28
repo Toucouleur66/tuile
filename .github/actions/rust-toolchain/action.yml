@@ -31,6 +31,9 @@ runs:
           exit 0
         fi
         echo "image=1" >> "$GITHUB_OUTPUT"
+        # The workflow's `if: env.TUILE_CI_IMAGE != '1'` sees only the env the
+        # workflow and its steps set, not the container's own: say it to them.
+        echo "TUILE_CI_IMAGE=1" >> "$GITHUB_ENV"
         # What dtolnay/rust-toolchain does on a hosted runner: `cargo install`ed
         # tools (wasm-bindgen-cli in web-package) land in $CARGO_HOME/bin, and the
         # next steps must find them.
