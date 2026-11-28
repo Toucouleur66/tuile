@@ -923,6 +923,46 @@ mod tests {
         assert_eq!(last.2, 0, "an absence is not a tile");
     }
 
+    /// A tile the memory tier lets go of while its write to the disk is
+    /// still queued is not on the disk's index yet, and is not gone: the
+    /// count must not ask the index at that moment. Counted all along (the
+    /// disk is large enough to reclaim nothing), every tile is still counted
+    /// once the writes have landed.
+    #[tokio::test]
+    async fn a_tile_whose_write_is_queued_stays_counted() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = FoyerStore::keeping(StoreConfig {
+            dir: dir.path().to_path_buf(),
+            memory_bytes: 1 << 20,
+            disk_bytes: 1 << 30,
+            default_ttl: None,
+        })
+        .await
+        .expect("store");
+        const TILES: usize = 100;
+        let key = |i: usize| format!("img/q/10/{i}/0");
+        let counted = || {
+            let mut by = tuile_core::budget::ByLevel::default();
+            assert!(store.stored("img/q", &mut by), "a store with a ledger");
+            by[10][0] as usize
+        };
+        for i in 0..TILES {
+            store
+                .put(&key(i), Bytes::from(vec![i as u8; 1 << 20]), None)
+                .await;
+            // The budget asks all the time, while the disk is behind.
+            counted();
+        }
+        store.cache.storage().wait().await;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            counted();
+        }
+        let held = (0..TILES).filter(|i| store.holds(&key(*i))).count();
+        assert_eq!(held, TILES, "the disk took every write");
+        assert_eq!(counted(), held, "and the count has all of them");
+    }
+
     /// The count survives the store being closed and opened again.
     #[tokio::test]
     async fn the_count_is_kept_between_runs() {
