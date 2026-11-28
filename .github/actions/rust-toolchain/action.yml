@@ -31,6 +31,10 @@ runs:
           exit 0
         fi
         echo "image=1" >> "$GITHUB_OUTPUT"
+        # What dtolnay/rust-toolchain does on a hosted runner: `cargo install`ed
+        # tools (wasm-bindgen-cli in web-package) land in $CARGO_HOME/bin, and the
+        # next steps must find them.
+        echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
         . /usr/local/share/tuile/ci-image.env
         case "$TOOLCHAIN" in
           stable) version="$rust" ;;
