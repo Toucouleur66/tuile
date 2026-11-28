@@ -552,7 +552,7 @@ pub struct Need {
 }
 
 /// A tile's place against the view's present need: what the progressive
-/// score reads ([`crate::value::probability`]).
+/// score reads (`crate::value::probability`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Proximity {
     /// The level the view needs at its nearest point (`n`).

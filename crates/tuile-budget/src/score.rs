@@ -11,7 +11,7 @@
 //! window, the metrics and the log records all read these, never a
 //! recomputation of their own. Everything is an integer, in the decider's
 //! units: `A`, `D` and `P` in [`CERTAIN`] units, `R` in µs, bytes in bytes,
-//! the score in µflouz per reference byte ([`crate::value::FlouzPerByte`]'s
+//! the score in µflouz per reference byte (`crate::value::FlouzPerByte`'s
 //! unit: `P × R × ref_bytes / bytes`, µs at certainty for a resource of the
 //! reference size).
 

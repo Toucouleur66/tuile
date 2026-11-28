@@ -298,7 +298,7 @@ impl Side {
 /// side, the edge vertices they hang from — each with its place in the tile
 /// and its height — in the order its wall is stitched.
 ///
-/// What [`to_decoded`] hangs under a tile, and what [`Skirts::hang`] hangs
+/// What [`to_decoded`] hangs under a tile, and what `Skirts::hang` hangs
 /// again under the same surface, bit for bit: the one function does both.
 /// So a consumer that keeps a tile's surface can keep its skirts as this —
 /// a few numbers an edge vertex — rather than as the walls themselves.
