@@ -799,9 +799,19 @@ impl Budget {
                 }
                 Event::Drawable(r, g, actual) => {
                     let Some(s) = self.arena.find(r) else {
+                        // Uploaded although its delivery was withdrawn and
+                        // its slot is gone: the GPU holds a copy nothing
+                        // tracks; the step evicts it (a consumer a message
+                        // late, the web's worker, uploads what it was handed
+                        // before it reads the withdrawal).
                         st.stale += 1;
+                        if self.cfg.policy == Policy::Interactive {
+                            self.orphans.push(r);
+                        }
                         continue;
                     };
+                    // The epoch now, for a copy whose delivery is forgotten.
+                    let epoch_now = self.epoch(r, self.arena.class(s));
                     let a = &mut self.arena;
                     // The cost it was delivered at, once drawable: what
                     // the compression reads of it (CB9).
@@ -828,14 +838,15 @@ impl Budget {
                             );
                         }
                         a.mark_delivered(s, g);
-                    } else if !a.has_transit(s)
-                        && !a.has_gpu(s)
-                        && a.cpu(s).is_some_and(|c| c.gen == g)
-                    {
+                    } else if !a.has_transit(s) && !a.has_gpu(s) {
                         // Uploaded although its delivery was withdrawn: the
-                        // GPU holds it, so the ledger does.
-                        let epoch = a.cpu(s).map(|c| c.epoch).unwrap_or(0);
-                        landed = a.cpu(s).map(|c| c.cost);
+                        // GPU holds it, so the ledger does — its decoded
+                        // copy kept or not (released since the withdrawal,
+                        // the copy on the GPU is the same content: of the
+                        // epoch the copy had, or the epoch now).
+                        let same = a.cpu(s).filter(|c| c.gen == g);
+                        let epoch = same.map_or(epoch_now, |c| c.epoch);
+                        landed = same.map(|c| c.cost);
                         a.put_gpu(
                             s,
                             &mut self.ledger,
@@ -1994,6 +2005,19 @@ impl Budget {
 
         let arrivals = self.events.len();
         self.apply_events(now, &mut st);
+        // What the GPU holds untracked goes first; nothing of it is
+        // delivered this step (`deliver_one`).
+        self.orphans_now.clear();
+        for r in std::mem::take(&mut self.orphans) {
+            let tracked = self
+                .arena
+                .find(r)
+                .is_some_and(|s| self.arena.has_gpu(s) || self.arena.has_transit(s));
+            if !tracked && !self.orphans_now.contains(&r) {
+                d.evict.push(r);
+                self.orphans_now.push(r);
+            }
+        }
         let mut need = std::mem::take(&mut self.need);
         self.read_need(&mut need, &input, &mut st);
         let tiles = need.tiles();
@@ -3135,6 +3159,9 @@ impl Budget {
         let Some(s) = self.arena.find(r) else {
             return;
         };
+        if self.orphans_now.contains(&r) {
+            return;
+        }
         let class = self.arena.class(s);
         let epoch = self.epoch(r, class);
         // Already on its way, or on the GPU at the current epoch (a stale

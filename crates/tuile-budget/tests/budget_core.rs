@@ -1566,6 +1566,78 @@ mod protection {
         );
     }
 
+    /// An upload acknowledged `late` after its delivery was withdrawn (the
+    /// grace ran out while it crossed): the consumer holds it. Whether the
+    /// budget still tracks it or not, it is charged or evicted, and never
+    /// delivered again while the consumer holds it (a consumer a message
+    /// late, the web's worker, uploads what it was handed before it reads
+    /// the withdrawal).
+    fn a_late_acknowledgement(late: Micros) {
+        // The decoded tier holds next to nothing: an unneeded decoded copy
+        // goes at once, so the GPU's copy is the only one left.
+        let mut c = Rig::interactive_config();
+        c.decoded_target = Bytes(1);
+        let mut r = Rig::new(c);
+        let a = t(3, 2, 2);
+        let d = r.step(&drawn(&[a]));
+        r.load(&d);
+        let d = r.step(&drawn(&[a]));
+        let (_, g) = *d
+            .deliver
+            .iter()
+            .find(|(x, _)| *x == mesh(a))
+            .expect("delivered");
+        let ds = r.idle_for(&NeedSet::new(), late);
+        assert!(
+            ds.iter().any(|d| d.cancel.contains(&(mesh(a), g))),
+            "the delivery is withdrawn"
+        );
+        assert!(
+            r.b.resource(mesh(a))
+                .is_none_or(|v| v.decoded == Bytes::ZERO),
+            "its decoded copy is gone: the test proves nothing"
+        );
+        // The consumer had uploaded it: its acknowledgement comes late.
+        r.b.on_drawable(mesh(a), g, est(mesh(a)).gpu);
+        let mut holds = true;
+        let mut ds = vec![r.step(&drawn(&[a]))];
+        let charged = r.b.resource(mesh(a)).map(|v| v.gpu) == Some(est(mesh(a)).gpu);
+        assert!(
+            charged || ds[0].evict.contains(&mesh(a)),
+            "{RED}: the GPU holds it, the budget neither charges nor evicts it"
+        );
+        // Its loads complete; what is delivered is uploaded, as a consumer
+        // that holds nothing twice.
+        for _ in 0..120 {
+            let d = ds.pop().unwrap_or_else(|| r.step(&drawn(&[a])));
+            assert!(
+                !(holds && d.deliver.iter().any(|(x, _)| *x == mesh(a))),
+                "{RED}: delivered again while the consumer holds it"
+            );
+            if d.evict.contains(&mesh(a)) {
+                holds = false;
+            }
+            if d.deliver.iter().any(|(x, _)| *x == mesh(a)) {
+                holds = true;
+            }
+            r.complete(&d);
+        }
+        assert!(holds && r.b.residency().drawable(a), "{RED}: drawn again");
+    }
+
+    /// I11: just past the grace, the slot still tracked: charged.
+    #[test]
+    fn an_upload_acknowledged_after_its_withdrawal_is_held() {
+        let grace = Rig::interactive_config().cancel_grace;
+        a_late_acknowledgement(grace.plus(Micros::from_millis(100)));
+    }
+
+    /// I11: long after, the slot gone: the copy nothing tracks is evicted.
+    #[test]
+    fn an_upload_acknowledged_after_its_slot_left_is_evicted() {
+        a_late_acknowledgement(Micros::from_secs(60));
+    }
+
     /// C8: eviction takes the longest-unneeded first, then the deepest.
     #[test]
     fn eviction_takes_the_longest_unneeded_first_then_the_deepest() {
