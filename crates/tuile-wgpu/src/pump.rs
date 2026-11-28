@@ -1845,7 +1845,7 @@ pub struct Resolution {
     pub capped: usize,
     pub worst_capped: u32,
     /// How many drawn meshes wear base imagery at each level, by level, up
-    /// to [`LEVELS_COUNTED`]: the numbers behind the level view. A mesh
+    /// to `LEVELS_COUNTED`: the numbers behind the level view. A mesh
     /// wearing nothing is counted at 0.
     pub worn_by_level: [u32; LEVELS_COUNTED],
 }

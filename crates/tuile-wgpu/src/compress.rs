@@ -92,7 +92,7 @@ pub fn stored_features(stored: StoredPlan) -> wgpu::Features {
 /// device with for it: the format's, the formats tiles stored compressed are
 /// held in under the same choice ([`ImageryCompression::stored`]), and
 /// timestamps where the adapter has them and the GPU encodes — what
-/// [`EncodePace`] measures with. Off is RGBA8 and no feature at all.
+/// `EncodePace` measures with. Off is RGBA8 and no feature at all.
 pub fn plan_for(
     choice: ImageryCompression,
     adapter: &wgpu::Adapter,
