@@ -867,6 +867,10 @@ async fn main() -> Result<(), Error> {
         "drapes: {} kept from a smaller level, their tiles being far; {} entered again larger, their tiles come closer",
         done.drapes_reduced, done.drapes_regrown,
     );
+    println!(
+        "read ahead: {} meshes and imagery tiles ready when needed, {} waited for, {} made when needed ({} started a frame or more before)",
+        done.ahead.ready, done.ahead.waited, done.ahead.here, done.ahead.early,
+    );
     if let Some((fine, coarse)) = done.shadow_texel {
         println!(
             "shadows: a texel of the sun's map is {fine:.1} to {coarse:.1} m of ground, frame by frame"

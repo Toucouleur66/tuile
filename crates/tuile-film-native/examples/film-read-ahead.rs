@@ -21,7 +21,7 @@ mod moving;
 
 use std::time::Instant;
 
-use tuile_film_native::{render, Av1Film, FrameOut, Observer, Order, Timings, Tone};
+use tuile_film_native::{render, Av1Film, FrameOut, Observer, Order, ReadAhead, Timings, Tone};
 
 fn knob(name: &str, default: u32) -> u32 {
     std::env::var(name)
@@ -81,11 +81,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         written.imagery_bytes as f64 / 1e6,
         t.elapsed().as_secs_f64()
     );
+    let stock = ReadAhead::default();
     let order = Order {
         supersample: 1,
         tone: Tone::Off,
+        ahead: ReadAhead {
+            frames: knob("READ_AHEAD_WINDOW", stock.frames),
+            bytes: u64::from(knob("READ_AHEAD_MIB", (stock.bytes >> 20) as u32)) << 20,
+            workers: knob("READ_AHEAD_WORKERS", stock.workers),
+        },
         ..Order::default()
     };
+    println!("{:?}", order.ahead);
     let mut frames = Frames::default();
     let mut sink = Av1Film::at(&out, 0);
     let began = Instant::now();
@@ -142,6 +149,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!(
         "worst frame after the first: {:.1} ms of store side (frame {})",
         worst.0, worst.1
+    );
+    println!(
+        "made ahead: {} ready when needed, {} waited for, {} made when needed, {} started a frame or more before",
+        done.ahead.ready, done.ahead.waited, done.ahead.here, done.ahead.early
     );
     let (asked, fetched) = written.sources.archives.reads();
     println!(

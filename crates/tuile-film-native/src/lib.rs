@@ -3,6 +3,7 @@
 
 #![doc = include_str!("../README.md")]
 
+pub mod ahead;
 pub mod av1;
 pub mod compress;
 pub mod discs;
@@ -25,6 +26,7 @@ pub mod timelapse;
 #[cfg(all(target_os = "macos", feature = "videotoolbox"))]
 pub mod videotoolbox;
 
+pub use ahead::ReadAhead;
 pub use discs::DiscEnergy;
 pub use meter::LightMeter;
 #[cfg(all(target_os = "linux", feature = "nvenc"))]

@@ -16,7 +16,10 @@ Three things, kept apart:
   `tuile_repository::Objects`, both through a cache of chunks on disk,
   both counted;
 - **the render** ([`render`](fn@render)): frame after frame, tiles entering and
-  leaving as the plan says, each picture handed to a [`Sink`];
+  leaving as the plan says, each picture handed to a [`Sink`]; what the next
+  frames' tiles need of the store — meshes built, imagery decoded — is made
+  a few frames ahead, off the render's thread ([`ahead`]), and handed to the
+  GPU in the render's own order;
 - **what watches** ([`observe`]): an [`Observer`] is told of every
   imagery tile that comes in, every tile built, every picture that comes
   out. The render knows nothing of what an observer does with it;

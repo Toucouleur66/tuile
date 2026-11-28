@@ -8,7 +8,7 @@
 mod support;
 
 use support::moving::{self, Shape};
-use tuile_film_native::{render, Ahead, Error, FrameOut, Observer, Order, Sink, Tone};
+use tuile_film_native::{render, Ahead, Error, FrameOut, Observer, Order, ReadAhead, Sink, Tone};
 
 fn has_adapter() -> bool {
     pollster::block_on(async {
@@ -136,5 +136,84 @@ async fn what_the_next_frames_need_is_made_before_they_need_it() {
         );
         let early = if n == 0 { 0 } else { entered * per_tile };
         assert_eq!(ahead.early, early, "frame {frame}: {ahead:?}");
+    }
+}
+
+/// The pictures of the regrowing film as the render made them before it
+/// read ahead — every tile made on its thread when a frame needed it — on
+/// the adapter the suite runs on (lavapipe): what reading ahead must give
+/// back, bit for bit.
+const BEFORE_READING_AHEAD: &[u64] = &[
+    0x198d7266a0318d50,
+    0x9da2531ee1d024fb,
+    0x267d2633143734b7,
+    0xfba715c07ae11254,
+    0xacafde0f73cdf225,
+    0x2c6e1c567e97ae31,
+];
+
+fn adapter_name() -> String {
+    pollster::block_on(async {
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle())
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .await
+            .map(|a| a.get_info().name)
+            .unwrap_or_default()
+    })
+}
+
+/// Reading ahead changes when a tile is made, never what it is made into:
+/// however far ahead, with room for nearly nothing, the pictures are the
+/// same — tiles whose drape grows as the camera comes closer made the old
+/// way among them — and on the suite's adapter they are those the render
+/// made before it read ahead.
+#[tokio::test(flavor = "multi_thread")]
+async fn reading_ahead_changes_no_picture() {
+    if !has_adapter() {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("dir");
+    let shape = Shape::regrowing();
+    let written = moving::write(dir.path(), shape).await;
+    let mut films = Vec::new();
+    for ahead in [
+        ReadAhead::default(),
+        ReadAhead {
+            frames: 0,
+            workers: 1,
+            ..ReadAhead::default()
+        },
+        ReadAhead {
+            frames: 64,
+            bytes: 1,
+            workers: 3,
+        },
+    ] {
+        let mut pictures = Digests::default();
+        let mut took = Took::default();
+        let order = Order { ahead, ..order() };
+        let done = render(
+            &written.sources,
+            &written.film,
+            &order,
+            &mut (),
+            &mut pictures,
+            &mut took,
+        )
+        .await
+        .expect("render");
+        // Drapes regrown: their tiles entered again, made the old way.
+        assert!(done.drapes_regrown > 0, "{ahead:?}: {done:?}");
+        let here: usize = took.0.iter().map(|(_, _, a)| a.here).sum();
+        assert!(here > 0, "{ahead:?}");
+        films.push((ahead, pictures.0));
+    }
+    let (_, first) = &films[0];
+    for (ahead, pictures) in &films {
+        assert_eq!(pictures, first, "{ahead:?}");
+    }
+    if adapter_name().contains("llvmpipe") {
+        assert_eq!(first.as_slice(), BEFORE_READING_AHEAD);
     }
 }

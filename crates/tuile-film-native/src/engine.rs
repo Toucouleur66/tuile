@@ -348,11 +348,17 @@ const LATER_FIELDS: [&str; 10] = [
 ];
 
 /// The text a rendering is named by: everything but which frames are
-/// rendered, the later fields at their defaults left out.
+/// rendered and how far ahead the store is read — neither changes a
+/// picture — the later fields at their defaults left out.
 fn canonical(rendering: &Rendering) -> String {
     let mut rendering = rendering.clone();
     rendering.order.frames = None;
-    let mut text = format!("{rendering:?}");
+    rendering.order.ahead = crate::ReadAhead::default();
+    let mut text = format!("{rendering:?}").replacen(
+        &format!(", ahead: {:?}", crate::ReadAhead::default()),
+        "",
+        1,
+    );
     for field in LATER_FIELDS {
         text = text.replacen(field, "", 1);
     }
@@ -636,6 +642,14 @@ mod tests {
         let mut part = rendering();
         part.order.frames = Some((51, 100));
         assert_eq!(film_prefix("packs/abc.references", &part), film);
+        // However far ahead the store is read, it is the same film.
+        let mut ahead = rendering();
+        ahead.order.ahead = crate::ReadAhead {
+            frames: 12,
+            bytes: 1 << 30,
+            workers: 3,
+        };
+        assert_eq!(film_prefix("packs/abc.references", &ahead), film);
 
         // Anything of the picture is another film; another bake too.
         let mut others = vec![film_prefix("packs/abd.references", &rendering())];
