@@ -54,9 +54,11 @@ pub struct Timings {
     pub read_imagery: f64,
     /// Reading payloads from the pack.
     pub read_pack: f64,
-    /// Terrain tiles made into meshes.
+    /// Terrain tiles made into meshes — on the render's thread, or the wait
+    /// for those made ahead ([`Ahead`]).
     pub mesh: f64,
-    /// Imagery decoded and laid on the terrain's spacing.
+    /// Imagery decoded and laid on the terrain's spacing — on the render's
+    /// thread, or the wait for what was decoded ahead.
     pub decode: f64,
     /// Textures written to the GPU.
     pub upload: f64,
@@ -120,6 +122,28 @@ impl Timings {
     }
 }
 
+/// What a frame took from the store's side, counted in meshes and imagery
+/// tiles: what was built ahead — off the render's thread, from the plan —
+/// and was ready when the frame needed it, or was waited for; and what
+/// the render built on its own thread when it needed it. `early` is how
+/// many of those built ahead were started during an earlier frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Ahead {
+    pub ready: usize,
+    pub waited: usize,
+    pub here: usize,
+    pub early: usize,
+}
+
+impl Ahead {
+    pub fn add(&mut self, other: &Ahead) {
+        self.ready += other.ready;
+        self.waited += other.waited;
+        self.here += other.here;
+        self.early += other.early;
+    }
+}
+
 /// A picture, as it leaves.
 pub struct FrameOut<'a> {
     /// The frame's number in the film.
@@ -141,6 +165,9 @@ pub struct FrameOut<'a> {
     pub camera: &'a FrameCamera,
     /// Up to the picture's readback: what follows has not happened yet.
     pub timings: Timings,
+    /// The meshes and imagery tiles its entering tiles took, built ahead
+    /// or not.
+    pub ahead: Ahead,
     /// The picture's light as its pixels average it, before the lens's
     /// glare, the exposure and the grade — RGBA, 32-bit floats, row after
     /// row, in the renderer's units — when an observer asked for it

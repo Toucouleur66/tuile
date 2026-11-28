@@ -32,7 +32,7 @@ use tuile_film_gpu::{
 use tuile_radiometry::{linear_of, through, Affine, Blended, FilmGrade, Local, MatrixField, SAME};
 use tuile_repository::TileRepository;
 
-use crate::observe::{FrameOut, ImageryIn, Observer, Origin, TileIn, Timings};
+use crate::observe::{Ahead, FrameOut, ImageryIn, Observer, Origin, TileIn, Timings};
 use crate::sink::Sink;
 use crate::source::{Film, Sources};
 use crate::Error;
@@ -750,6 +750,7 @@ pub async fn render(
             }
             .ok_or("the pack ended before its last frame")??;
             let mut timings = Timings::default();
+            let mut ahead = Ahead::default();
             let mut entered = 0usize;
 
             // The pixels a tile's sphere can span in this frame's picture, as
@@ -888,6 +889,7 @@ pub async fn render(
                             let t = Instant::now();
                             let mesh = terrain_mesh(tile.id(), &refs, terrain, factor)?;
                             timings.mesh += ms(t);
+                            ahead.here += 1;
 
                             let mut drape = Vec::with_capacity(refs.imagery.len());
                             let mut translucent = false;
@@ -922,6 +924,7 @@ pub async fn render(
                                     let opaque =
                                         rgba8.as_chunks::<4>().0.iter().all(|p| p[3] == 255);
                                     timings.decode += ms(t);
+                                    ahead.here += 1;
                                     let t = Instant::now();
                                     let texture = gpu.create_imagery(decoded.width, decoded.height);
                                     gpu.write_rgba(&texture, rgba8);
@@ -1281,6 +1284,7 @@ pub async fn render(
                 selection: &diff.selection,
                 camera: &camera,
                 timings,
+                ahead,
                 linear: (!linear.is_empty()).then_some(linear.as_slice()),
                 sky: sky
                     .as_ref()

@@ -161,6 +161,7 @@ fn the_meter_reads_a_picture_in_stops_and_by_thirds() {
         selection: &[],
         camera: &a_camera(),
         timings: Timings::default(),
+        ahead: Default::default(),
         linear: None,
         sky: None,
     });

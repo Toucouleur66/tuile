@@ -29,7 +29,7 @@ pub use discs::DiscEnergy;
 pub use meter::LightMeter;
 #[cfg(all(target_os = "linux", feature = "nvenc"))]
 pub use nvenc::{NvencCodec, NvencFilm};
-pub use observe::{FrameOut, ImageryIn, Observer, Origin, SkyOut, TileIn, Timings};
+pub use observe::{Ahead, FrameOut, ImageryIn, Observer, Origin, SkyOut, TileIn, Timings};
 pub use reference::{Reference, SetAgainst};
 pub use render::{render, AbsentTiles, Order, Tone};
 pub use seams::SeamLog;
