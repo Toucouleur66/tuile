@@ -22,9 +22,12 @@ concurrency:
 # one job at a time, 4 CPU / 16 GiB (beside the cluster's control plane: a
 # build that needs more is OOMKilled in its own pod, never the node's
 # problem), cargo and rustup caches kept between jobs.
-# A pull request from a FORK never gets it: the repository is public, and a
-# self-hosted runner would run a stranger's code on our cluster. Forks keep
-# the GitHub-hosted image they had. The stock runner image carries no
+# A pull request from a FORK runs there too (the GitHub-hosted runners are
+# locked by the account's billing). The repository is public, so that is a
+# stranger's code on our cluster: the repository setting "approval for all
+# outside collaborators" must stay on (a maintainer reads the diff and
+# approves each run), and a fork's job never gets the sccache of the runner
+# (`.github/actions/linux-host`). The stock runner image carries no
 # compiler: `.github/actions/linux-host` installs what the hosted image has
 # (and does nothing on a hosted runner). Not moved: macOS (no macOS in a
 # Linux pod).
@@ -38,7 +41,7 @@ jobs:
   # goes through the same check as the local hook (`.githooks/commit-msg`).
   commit-messages:
     if: github.event_name == 'pull_request'
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'tuile-linux' }}
+    runs-on: tuile-linux
     steps:
       - uses: actions/checkout@v4
         with:
@@ -56,7 +59,7 @@ jobs:
           exit $status
 
   lint:
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'tuile-linux' }}
+    runs-on: tuile-linux
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/linux-host
@@ -80,7 +83,7 @@ jobs:
       - if: always()
         uses: ./.github/actions/sccache-stats
   msrv:
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'tuile-linux' }}
+    runs-on: tuile-linux
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/linux-host
@@ -123,7 +126,7 @@ jobs:
     # ubuntu-26.04 (Mesa 26.0.8), whose lavapipe dies with SIGSEGV in
     # `tuile-film-gpu`'s headless and atmosphere tests. Moving the image
     # is a deliberate change, made here with the driver it brings.
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || 'tuile-linux' }}
+    runs-on: tuile-linux
     env:
       # A GPU test that finds no adapter fails instead of passing empty.
       TUILE_REQUIRE_GPU: 1
@@ -215,7 +218,7 @@ jobs:
       - if: always()
         uses: ./.github/actions/sccache-stats
   budget-sim:
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'tuile-linux' }}
+    runs-on: tuile-linux
     env:
       PROPTEST_CASES: 10000
     steps:
@@ -244,7 +247,7 @@ jobs:
         uses: ./.github/actions/sccache-stats
 
   wasm-guard:
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'tuile-linux' }}
+    runs-on: tuile-linux
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/linux-host
@@ -295,7 +298,7 @@ jobs:
       - if: always()
         uses: ./.github/actions/sccache-stats
   web-package:
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'tuile-linux' }}
+    runs-on: tuile-linux
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/linux-host
@@ -331,7 +334,7 @@ jobs:
   # developer runs. The hosted image carries the SDK and the NDK;
   # `.github/actions/android-sdk` installs them on the self-hosted runner.
   android:
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'tuile-linux' }}
+    runs-on: tuile-linux
     env:
       # The runner pod has no UTF-8 locale by default; the hosted image has.
       LANG: C.UTF-8
@@ -363,7 +366,7 @@ jobs:
         run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" crates/tuile-viewer/android/build.sh
 
   docs:
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'tuile-linux' }}
+    runs-on: tuile-linux
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
