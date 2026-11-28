@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+name: Rust toolchain
+description: >-
+  In the prebuilt CI image (TUILE_CI_IMAGE=1: integrations/docker/Dockerfile.ci),
+  installs nothing: it selects the toolchain the image carries (`stable`, or
+  `msrv`) and checks that it has the components and targets asked for. On a
+  GitHub-hosted runner it is dtolnay/rust-toolchain, as before.
+inputs:
+  toolchain:
+    description: "`stable`, or `msrv` (the `rust-version` toolchain, pinned to a patch release)"
+    default: stable
+  components:
+    description: Components, comma-separated
+    default: ""
+  targets:
+    description: Targets, comma-separated
+    default: ""
+runs:
+  using: composite
+  steps:
+    - id: image
+      shell: bash
+      env:
+        TOOLCHAIN: ${{ inputs.toolchain }}
+        COMPONENTS: ${{ inputs.components }}
+        TARGETS: ${{ inputs.targets }}
+      run: |
+        if [ "${TUILE_CI_IMAGE:-}" != 1 ]; then
+          echo "image=0" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        echo "image=1" >> "$GITHUB_OUTPUT"
+        . /usr/local/share/tuile/ci-image.env
+        case "$TOOLCHAIN" in
+          stable) version="$rust" ;;
+          msrv) version="$rust_msrv"; echo "RUSTUP_TOOLCHAIN=${version}" >> "$GITHUB_ENV" ;;
+          *) echo "::error::unknown toolchain '${TOOLCHAIN}' (stable or msrv)"; exit 1 ;;
+        esac
+        export RUSTUP_TOOLCHAIN="$version"
+        rustc --version
+        installed="$(rustup component list --installed; rustup target list --installed)"
+        for want in $(echo "${COMPONENTS},${TARGETS}" | tr ',' ' '); do
+          echo "$installed" | grep -q "^${want}" \
+            || { echo "::error::the CI image's ${version} toolchain has no ${want}: add it to integrations/docker/Dockerfile.ci"; exit 1; }
+        done
+    - if: steps.image.outputs.image != '1' && inputs.toolchain == 'stable'
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+    # Keep this version equal to the image's RUST_MSRV (Dockerfile.ci) and `rust-version`.
+    - if: steps.image.outputs.image != '1' && inputs.toolchain == 'msrv'
+      uses: dtolnay/rust-toolchain@1.97.1
+      with:
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}

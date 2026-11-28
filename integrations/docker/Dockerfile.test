@@ -8,8 +8,8 @@
 # directory, not an image.
 #
 # Do not build this by hand: scripts/test-on-builder.sh makes the context (the
-# tracked files of a commit, plus .test-on-builder/: this file and the sccache
-# helpers from the checkout that runs it, and the commands) and passes the
+# tracked files of a commit, plus .test-on-builder/: this file
+# from the checkout that runs it, and the commands) and passes the
 # arguments.
 #
 # The stack is CI's `test` job's (ubuntu-24.04):
@@ -44,55 +44,20 @@
 # change the steps made to the tree: blessed references come back that way),
 # and exit-code (0, or the first failing step's code).
 
-FROM ubuntu:24.04@sha256:562111b88caa79c71391c0c4d3c2114a7d5c35915c20561fd893cb1e07929e6b AS base
-
-# The compiler's needs (the -sys crates: aws-lc, jemalloc, zstd, lz4, webp,
-# alsa, wayland), git for the git dependencies, and the Vulkan loader with
-# lavapipe for the GPU tests.
-RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-       ca-certificates curl git build-essential cmake pkg-config python3 \
-       libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev \
-       mesa-vulkan-drivers libvulkan1 \
-    && rm -rf /var/lib/apt/lists/*
-
-# Rust: CI takes `stable`; here it is pinned to the stable of the day, so the
-# layer is not a stale `stable` cached forever. Move it with CI's stable.
-ARG RUSTUP_VERSION=1.29.3
-ARG RUSTUP_SHA256=b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55
-ARG RUST_VERSION=1.100.0
-ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
-RUN curl -fsSL -o /tmp/rustup-init \
-       "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init" \
-    && echo "${RUSTUP_SHA256}  /tmp/rustup-init" | sha256sum -c - \
-    && chmod +x /tmp/rustup-init \
-    && /tmp/rustup-init -y --no-modify-path --profile minimal \
-       --default-toolchain "${RUST_VERSION}" \
-       --component clippy --target wasm32-unknown-unknown \
-    && rm /tmp/rustup-init \
-    && rustc --version
-
-# cargo-nextest at CI's version (taiki-e/install-action, nextest@0.9.148),
-# pinned by checksum.
-ARG NEXTEST_VERSION=0.9.148
-ARG NEXTEST_SHA256=223ba936714cc861a9cdedad5a8eb664dfdd69d6fbdf6cea6aa8184f523290dc
-RUN curl -fsSL -o /tmp/nextest.tar.gz \
-       "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
-    && echo "${NEXTEST_SHA256}  /tmp/nextest.tar.gz" | sha256sum -c - \
-    && tar -xzf /tmp/nextest.tar.gz -C /usr/local/cargo/bin cargo-nextest \
-    && rm /tmp/nextest.tar.gz
-
-# sccache, used only when the build is given a bucket and a key
-# (sccache-env.sh): without them the steps compile as they would anyway.
-COPY .test-on-builder/sccache-install.sh .test-on-builder/sccache-env.sh /usr/local/share/tuile/
-RUN sh /usr/local/share/tuile/sccache-install.sh
+# The stack is the prebuilt CI image's (integrations/docker/Dockerfile.ci,
+# built by scripts/build-ci-images.sh): Ubuntu 24.04, the apt packages of CI's
+# jobs, lavapipe, the pinned stable toolchain with clippy and the wasm32
+# target, nextest, sccache. Pinned by digest, never by tag: move it with the
+# digest `scripts/build-ci-images.sh` printed.
+ARG CI_BASE_IMAGE=ghcr.io/lapoule-dev/tuile-ci-builder@sha256:385231a66f99cde3849a626d5144dd5ef474db6e08e1013498648227fe7305d7
+FROM ${CI_BASE_IMAGE} AS base
 
 # CARGO_HOME in one shared cache mount (`id=tuile-cargo-home`): the registry,
 # the git checkouts AND cargo's own download lock (`$CARGO_HOME/.package-cache`)
 # live together, so two runs on one builder fetching the same crate or git
 # dependency wait on cargo's lock instead of racing (a checkout left without
-# its Cargo.toml broke every later run). The tools stay in /usr/local/cargo/bin,
-# on PATH (rustup's proxies, cargo-nextest).
+# its Cargo.toml broke every later run). The tools are the image's, in
+# /usr/local/bin (rustup's proxies, cargo-nextest, sccache).
 ENV CARGO_HOME=/cargo-home CARGO_TERM_COLOR=never CARGO_NET_GIT_FETCH_WITH_CLI=true \
     RUSTFLAGS="-D warnings" CARGO_PROFILE_DEV_DEBUG=line-tables-only \
     TUILE_REQUIRE_GPU=1

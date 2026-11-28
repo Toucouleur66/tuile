@@ -105,9 +105,7 @@ git -C "$REPO_ROOT" archive --format=tar -o "$CTX" "$REF"
 # the steps run.
 EXTRA="${OUT}/ctx-extra/.test-on-builder"
 mkdir -p "$EXTRA"
-cp "${REPO_ROOT}/integrations/docker/Dockerfile.test" \
-    "${REPO_ROOT}/integrations/docker/sccache-install.sh" \
-    "${REPO_ROOT}/integrations/docker/sccache-env.sh" "$EXTRA/"
+cp "${REPO_ROOT}/integrations/docker/Dockerfile.test" "$EXTRA/"
 if [ -n "$COMMANDS" ]; then cp "$COMMANDS" "${EXTRA}/commands"; fi
 tar -rf "$CTX" -C "${OUT}/ctx-extra" .test-on-builder
 rm -rf "${OUT}/ctx-extra"
