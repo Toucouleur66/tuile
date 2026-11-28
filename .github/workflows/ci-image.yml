@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+#
+# Rebuilds and publishes the prebuilt CI images (integrations/docker/Dockerfile.ci):
+# by hand only, when a tool of the Dockerfile moved (Rust, nextest, sccache,
+# the SDK) or the runner image did. Run it from the branch that changed the
+# Dockerfile; the job summary gives each image's digest, which is what
+# Dockerfile.test (CI_BASE_IMAGE) and the runner's values pin.
+#
+# On a GitHub-hosted runner, not on tuile-linux: the pod has no Docker. The
+# push uses the workflow's own token (`packages: write`), so for it to work the
+# two packages (tuile-ci, tuile-ci-builder) must give this repository write
+# access (package settings, "Manage Actions access").
+name: CI image
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_image:
+        description: "The actions-runner image the pod image starts from (name@digest); empty: the one pinned in scripts/build-ci-images.sh"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and push
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TUILE_CI_PUSH: "1"
+          TUILE_CI_RUNNER: ${{ inputs.runner_image }}
+        run: |
+          [ -n "$TUILE_CI_RUNNER" ] || unset TUILE_CI_RUNNER
+          TUILE_BUILDER="$(docker buildx inspect --bootstrap | sed -n 's/^Name: *//p' | head -n1)" \
+            scripts/build-ci-images.sh | tee "$RUNNER_TEMP/build.out"
+          { echo '### CI images'; grep -E '^=== [a-z]+: pushed ' "$RUNNER_TEMP/build.out" | sed 's/^/- /'; } >> "$GITHUB_STEP_SUMMARY"

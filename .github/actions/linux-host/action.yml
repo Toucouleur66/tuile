@@ -5,7 +5,8 @@ description: >-
   On a self-hosted Linux runner (tuile-linux), installs what the GitHub-hosted
   Ubuntu image already carries and the workspace needs to build: a C
   toolchain and linker, pkg-config, cmake, the ALSA and Wayland headers, and
-  lavapipe. On a GitHub-hosted runner it does nothing.
+  lavapipe. On a GitHub-hosted runner, or in the prebuilt CI image
+  (TUILE_CI_IMAGE=1, which has all of it), it does nothing.
 runs:
   using: composite
   steps:
@@ -15,6 +16,8 @@ runs:
     - if: runner.environment == 'self-hosted'
       shell: bash
       run: |
+        # The prebuilt CI image (integrations/docker/Dockerfile.ci) has all of this.
+        if [ "${TUILE_CI_IMAGE:-}" = 1 ]; then echo "CI image: host packages already installed"; exit 0; fi
         # The stock runner image lists the git-core PPA, which the runner's
         # network policy does not allow: `apt-get update` waited for its
         # connections to time out on every job. Nothing here comes from it.
@@ -40,7 +43,7 @@ runs:
           echo "sccache: off (TUILE_SCCACHE_BUCKET / _KEY_ID / _SECRET not all set), compiling without it"
           exit 0
         fi
-        sudo sh "${GITHUB_WORKSPACE}/integrations/docker/sccache-install.sh"
+        command -v sccache > /dev/null || sudo sh "${GITHUB_WORKSPACE}/integrations/docker/sccache-install.sh"
         command -v sccache > /dev/null || { echo "sccache: not installed, compiling without it"; exit 0; }
         echo "::add-mask::${TUILE_SCCACHE_KEY_ID}"
         echo "::add-mask::${TUILE_SCCACHE_SECRET}"
