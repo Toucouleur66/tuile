@@ -591,6 +591,7 @@ fn a_slower_measured_network_raises_its_restore_cost() {
 /// and re-keys the persistent index only for those filed whose probability
 /// moved, as many with 4 000 as with 40 000 copies held.
 #[test]
+#[ignore = "slow: a turn re-keys what it names, ~68 s in debug"]
 fn a_turn_re_keys_what_it_names_not_what_is_held() {
     let rekeys_with = |held: u64| -> (u32, u32) {
         let mut c = config(Bytes::gib(64), 4);

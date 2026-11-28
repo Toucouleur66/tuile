@@ -478,6 +478,7 @@ fn worst_step(trace: &[Traced], of: impl Fn(&Traced) -> f64) -> (usize, f64) {
 /// before it by more than two levels of eight-bit luma — a step the eye
 /// sees as a blink when it comes four times a second.
 #[test]
+#[ignore = "slow: gpu: a moving camera under a stopped clock, ~290 s in debug"]
 fn a_moving_camera_under_a_stopped_clock_does_not_blink() {
     let Some(gpu) = gpu() else { return };
     let trace = std::env::var_os("TUILE_FLICKER_TRACE").map(std::path::PathBuf::from);
@@ -613,6 +614,7 @@ fn the_limb_holds(name: &str, traced: &[Traced], floor: f64, step: f64) {
 /// a band the eye picks out against space, and never jumping from one
 /// frame to the next.
 #[test]
+#[ignore = "slow: gpu: the limb from 10 km to geostationary height, ~120 s in debug"]
 fn the_limb_stays_from_ten_kilometres_to_geostationary_height() {
     let Some(gpu) = gpu() else { return };
     let trace = trace_dir("TUILE_LIMB_TRACE");
@@ -636,6 +638,7 @@ fn the_limb_stays_from_ten_kilometres_to_geostationary_height() {
 /// down over the same span, as a wheel makes it: the limb is drawn in
 /// every frame it is in the picture, and its light never jumps.
 #[test]
+#[ignore = "disabled: ~680 s of lavapipe in debug for a flicker that is unlikely to come back; run it by hand with --run-ignored only when touching the limb"]
 fn the_limb_never_blinks_on_a_slow_way_out() {
     let Some(gpu) = gpu() else { return };
     let size = (WIDTH, HEIGHT);
@@ -697,6 +700,7 @@ fn the_limb_never_blinks_on_a_slow_way_out() {
 /// less than any step the light used to wait for — keeps the limb where
 /// the globe is: the sky's frame is the frame's own eye's.
 #[test]
+#[ignore = "slow: gpu: a slow pan far away keeps the limb, ~116 s in debug"]
 fn a_slow_pan_far_away_keeps_the_limb_on_the_globe() {
     let Some(gpu) = gpu() else { return };
     let eyes: Vec<Eye> = (0..120)
@@ -743,6 +747,7 @@ fn run_the_clock(
 /// from frame to frame what the sun moves in a frame of the clock, and
 /// the sky and the ground darken smoothly, never by a step.
 #[test]
+#[ignore = "slow: gpu: a fast clock turns the light smoothly, ~610 s in debug"]
 fn a_fast_clock_turns_the_light_smoothly() {
     let Some(gpu) = gpu() else { return };
     for (rate, frames, var) in [

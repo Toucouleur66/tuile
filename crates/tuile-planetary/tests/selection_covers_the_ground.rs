@@ -158,6 +158,7 @@ fn covered(selected: &HashSet<(u32, u64, u64)>, max_level: u32, geo: Geodetic) -
 }
 
 #[test]
+#[ignore = "slow: every visible ground point is selected, ~300 s in debug"]
 fn every_visible_ground_point_is_selected() {
     let tree = tuile_planetary::terrain_tree(boundary_layer());
     let residency = all_resident(tree.as_ref());

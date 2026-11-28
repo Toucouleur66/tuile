@@ -32,3 +32,17 @@ slow-timeout = { period = "60s" }
 
 [profile.ci.junit]
 path = "junit.xml"
+
+# The slow tests: `#[ignore = "slow: ..."]` in the source, so the default and
+# `ci` runs skip them. Their filterset is derived from the source, not listed
+# here: `scripts/slow-tests-filter.sh cpu|gpu` (docs/20-conventions.md).
+#
+#   cargo nextest run --profile slow --run-ignored only --workspace \
+#       -E "$(scripts/slow-tests-filter.sh cpu)"
+[profile.slow]
+fail-fast = false
+failure-output = "immediate-final"
+slow-timeout = { period = "120s" }
+
+[profile.slow.junit]
+path = "junit.xml"

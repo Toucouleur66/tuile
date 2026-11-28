@@ -483,6 +483,10 @@ fn config() -> ProptestConfig {
 /// policies and a squeezed memory, the need in its order and permuted, every
 /// step checked against the reference (`tests/reference/`).
 #[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "slow: decide agrees with the reference (runs in release in budget-sim), ~21 s in debug"
+)]
 fn decide_agrees_with_the_reference_on_a_fixed_corpus() {
     for i in 0..CORPUS {
         let ops = corpus_script(i);
@@ -729,6 +733,7 @@ proptest! {
     /// I13: under Batch, a ready frame is exact: every wanted tile drawn as
     /// itself with its needed drape; nothing it needs is evicted.
     #[test]
+    #[cfg_attr(debug_assertions, ignore = "slow: a ready batch frame is exact (runs in release in budget-sim), ~16 s in debug")]
     fn a_ready_batch_frame_is_exact(ops in script(), view_seed in any::<u64>()) {
         // A film holds its frame until complete: end on one view, completed.
         // Failures end a film (tested by hand); here every load succeeds.

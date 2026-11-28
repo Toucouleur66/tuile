@@ -219,6 +219,7 @@ fn limb_energy(rgba: &[u8]) -> f64 {
 }
 
 #[test]
+#[ignore = "slow: gpu: a film's limb from 10 km to geostationary height, ~44 s in debug"]
 fn a_films_limb_stays_from_ten_kilometres_to_geostationary_height() {
     let Some(mut film) = film() else {
         eprintln!("skipping GPU test: no usable adapter");
@@ -286,6 +287,7 @@ fn a_films_limb_stays_from_ten_kilometres_to_geostationary_height() {
 /// frames they share are the same to the byte: nothing a frame is lit by
 /// was kept from the frames before it.
 #[test]
+#[ignore = "slow: gpu: two segments join without a seam, ~26 s in debug"]
 fn two_segments_join_without_a_seam() {
     let (Some(mut first), Some(mut second)) = (film(), film()) else {
         eprintln!("skipping GPU test: no usable adapter");

@@ -402,6 +402,7 @@ impl Bench {
 /// ancestor chain to draw. That is the number that means *black on screen*, and
 /// it must be zero on every frame, not on average.
 #[test]
+#[ignore = "slow: gpu: a fast zoom never leaves a tile empty, ~1300 s in debug"]
 fn a_fast_zoom_never_leaves_a_tile_empty() {
     for (plan, compression) in PLANS {
         let Some(gpu) = gpu_with(compression) else {

@@ -1614,6 +1614,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(32))]
 
     #[test]
+    #[ignore = "slow: the heightfield on a planar frame, ~10 s in debug"]
     fn the_heightfield_on_a_planar_frame(
         edits in arb_script(planar()), delivery in arb_delivery(), ends in arb_ray_ends(),
     ) {
@@ -1621,6 +1622,7 @@ proptest! {
     }
 
     #[test]
+    #[ignore = "slow: the heightfield on a geodetic frame, ~13 s in debug"]
     fn the_heightfield_on_a_geodetic_frame(
         edits in arb_script(geodetic()), delivery in arb_delivery(), ends in arb_ray_ends(),
     ) {
@@ -1628,6 +1630,7 @@ proptest! {
     }
 
     #[test]
+    #[ignore = "slow: the heightfield around a pole, ~25 s in debug"]
     fn the_heightfield_around_a_pole(
         edits in arb_globe_script(polar(), true), delivery in arb_delivery(), ends in arb_ray_ends(),
     ) {
@@ -1643,6 +1646,7 @@ proptest! {
     }
 
     #[test]
+    #[ignore = "slow: a ground that keeps nothing resident, ~16 s in debug"]
     fn a_ground_that_keeps_nothing_resident(
         edits in arb_script(geodetic()), delivery in arb_delivery(), ends in arb_ray_ends(),
     ) {

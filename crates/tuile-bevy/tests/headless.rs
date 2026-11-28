@@ -110,6 +110,7 @@ fn out_dir() -> std::path::PathBuf {
 /// The ground is there from the first frame: the backdrop covers the planet
 /// before the session has answered anything.
 #[test]
+#[ignore = "slow: gpu: the first frame is not black, ~30 s in debug"]
 fn the_first_frame_is_not_black() {
     if !support::has_gpu() {
         eprintln!("no GPU: skipped");
@@ -134,6 +135,7 @@ fn the_first_frame_is_not_black() {
 /// Settled, the frame is all ground, the host's cube above it is seen and
 /// the one buried under it is not.
 #[test]
+#[ignore = "slow: gpu: the host shares the ground's depth, ~148 s in debug"]
 fn the_host_shares_the_grounds_depth_and_no_ground_is_black() {
     if !support::has_gpu() {
         eprintln!("no GPU: skipped");
@@ -211,6 +213,7 @@ fn the_host_shares_the_grounds_depth_and_no_ground_is_black() {
 /// nothing changes; and the ray through the middle of the frame meets it
 /// under the camera.
 #[test]
+#[ignore = "slow: gpu: the host reads the ground it sees, ~26 s in debug"]
 fn the_host_reads_the_ground_it_sees() {
     if !support::has_gpu() {
         eprintln!("no GPU: skipped");
