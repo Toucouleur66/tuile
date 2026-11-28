@@ -1,0 +1,164 @@
+# syntax=docker/dockerfile:1.10
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+#
+# The CI toolchain, baked once, so that no job installs it. ONE image with
+# everything the Linux jobs of .github/workflows/ci.yml need, android included:
+#
+#   - the apt packages of .github/actions/linux-host and the -sys crates
+#     (build-essential, cmake, pkg-config, ALSA, udev, Wayland, xkbcommon),
+#     lavapipe (mesa-vulkan-drivers, libvulkan1) for the GPU tests;
+#   - JDK 17, the Android SDK (platform 35, build-tools 35.0.0), the NDK
+#     27.3.13750724: the versions of .github/actions/android-sdk;
+#   - rustup, the stable toolchain pinned by version number and the MSRV
+#     toolchain beside it, clippy and rustfmt, the wasm32-unknown-unknown and
+#     aarch64-linux-android targets;
+#   - cargo-nextest, sccache, cargo-ndk, all pinned.
+#
+# Built twice by scripts/build-ci-images.sh, from this one file, differing only
+# by BASE_IMAGE and CI_USER:
+#
+#   BASE_IMAGE=ubuntu:24.04 (default), CI_USER=root
+#       the builder's test image: Dockerfile.test starts FROM it;
+#   BASE_IMAGE=ghcr.io/actions/actions-runner:<version>@<digest>, CI_USER=runner
+#       the `tuile-linux` runner pod; the user (uid 1001) and the entrypoint
+#       (/home/runner/run.sh) are the base image's, untouched.
+#
+# Layer order is the order of change: the apt packages, the JDK and the SDK
+# (moved a few times a year) come first; Rust, nextest and sccache (bumped
+# often) last. A toolchain bump rebuilds and re-pulls only the layers after
+# it, never the SDK.
+#
+# Where things live, and why:
+#   - rustup's home is /opt/rustup (RUSTUP_HOME), the toolchains read-only for
+#     everybody: a job installs nothing. The runner pod must NOT set
+#     RUSTUP_HOME to a cache volume any more, or it hides them.
+#   - the rustup proxies (cargo, rustc, rustup...), nextest, sccache and
+#     cargo-ndk are in /usr/local/bin, not in $CARGO_HOME/bin: the pod points
+#     CARGO_HOME at a per-pod directory, and the tools must not depend on where
+#     it is. CARGO_HOME itself is left to the consumer (the registry and git
+#     checkouts are not baked: they are keyed by Cargo.lock).
+#   - TUILE_CI_IMAGE=1 tells the workflows' own actions (rust-toolchain,
+#     linux-host, android-sdk) that there is nothing to install. A GitHub-hosted
+#     runner never has it, and installs as before.
+#   - no target/ directory: stale at each lock change, and sccache covers the
+#     compilation.
+#
+# Versions are build arguments with defaults here; the tag of the image says them.
+
+ARG BASE_IMAGE=ubuntu:24.04@sha256:562111b88caa79c71391c0c4d3c2114a7d5c35915c20561fd893cb1e07929e6b
+
+FROM ${BASE_IMAGE} AS ci-base
+# The user the image ends as: root for the builder's base, `runner` over the
+# actions-runner image.
+ARG CI_USER=root
+USER root
+
+# The compiler's needs (the -sys crates: aws-lc, jemalloc, zstd, lz4, webp,
+# alsa, wayland, udev), git for the git dependencies, python3 for the build
+# scripts that use it, the Vulkan loader with lavapipe for the GPU tests: the
+# union of .github/actions/linux-host, Dockerfile.test and what CI installs
+# in the test job. The Ubuntu 24.04 archive, so lavapipe is the hosted
+# ubuntu-24.04's Mesa (26.04's dies in tuile-film-gpu: see ci.yml).
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       ca-certificates curl git sudo build-essential cmake pkg-config python3 zstd xz-utils \
+       libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev \
+       mesa-vulkan-drivers libvulkan1 vulkan-tools \
+    && rm -rf /var/lib/apt/lists/* \
+    # lavapipe must be there and answer: its ICD, and a device in vulkaninfo.
+    && ls /usr/share/vulkan/icd.d/lvp_icd*.json \
+    && vulkaninfo --summary | tee /dev/stderr | grep -qi llvmpipe
+
+# Java 17 from the Ubuntu archive, as .github/actions/android-sdk installs it.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       unzip zip openjdk-17-jdk-headless \
+    && rm -rf /var/lib/apt/lists/*
+
+# Google's command-line tools, pinned by checksum, then the platform, the
+# build-tools and the NDK of .github/actions/android-sdk. World-readable,
+# owned by root: a job reads the SDK, it does not update it.
+ARG ANDROID_PLATFORM=35
+ARG ANDROID_BUILD_TOOLS=35.0.0
+ARG ANDROID_NDK=27.3.13750724
+ARG CMDLINE_TOOLS_ZIP=commandlinetools-linux-11076708_latest.zip
+ARG CMDLINE_TOOLS_SHA256=2d2d50857e4eb553af5a6dc3ad507a17adf43d115264b1afc116f95c92e5e258
+ENV ANDROID_HOME=/opt/android-sdk \
+    ANDROID_SDK_ROOT=/opt/android-sdk \
+    ANDROID_NDK_HOME=/opt/android-sdk/ndk/${ANDROID_NDK} \
+    ANDROID_NDK_LATEST_HOME=/opt/android-sdk/ndk/${ANDROID_NDK} \
+    JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+RUN set -eux; \
+    mkdir -p "${ANDROID_HOME}/cmdline-tools" /tmp/ct; \
+    curl -fsSL -o /tmp/ct.zip "https://dl.google.com/android/repository/${CMDLINE_TOOLS_ZIP}"; \
+    echo "${CMDLINE_TOOLS_SHA256}  /tmp/ct.zip" | sha256sum -c -; \
+    unzip -q /tmp/ct.zip -d /tmp/ct; \
+    mv /tmp/ct/cmdline-tools "${ANDROID_HOME}/cmdline-tools/latest"; \
+    rm -rf /tmp/ct /tmp/ct.zip; \
+    (yes || true) | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --sdk_root="${ANDROID_HOME}" --licenses > /dev/null; \
+    "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --sdk_root="${ANDROID_HOME}" \
+        "platforms;android-${ANDROID_PLATFORM}" "build-tools;${ANDROID_BUILD_TOOLS}" "ndk;${ANDROID_NDK}" > /dev/null; \
+    chmod -R a+rX "${ANDROID_HOME}"; \
+    test -d "${ANDROID_NDK_HOME}"; \
+    "${JAVA_HOME}/bin/javac" -version
+
+# Rust: CI takes `stable`; here it is pinned to a version number, so the layer
+# is not a stale `stable` cached forever. Bump with scripts/build-ci-images.sh
+# (RUST_VERSION), and move CI's MSRV job with RUST_MSRV.
+ARG RUSTUP_VERSION=1.29.3
+ARG RUSTUP_SHA256=b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55
+ARG RUST_VERSION=1.100.1
+ARG RUST_MSRV=1.97.1
+ENV RUSTUP_HOME=/opt/rustup
+RUN curl -fsSL -o /tmp/rustup-init \
+       "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init" \
+    && echo "${RUSTUP_SHA256}  /tmp/rustup-init" | sha256sum -c - \
+    && chmod +x /tmp/rustup-init \
+    && CARGO_HOME=/opt/cargo /tmp/rustup-init -y --no-modify-path --profile minimal \
+       --default-toolchain "${RUST_VERSION}" \
+       --component clippy --component rustfmt --target wasm32-unknown-unknown \
+    && CARGO_HOME=/opt/cargo /opt/cargo/bin/rustup toolchain install "${RUST_MSRV}" \
+       --profile minimal --component clippy \
+    && rm /tmp/rustup-init \
+    # The proxies out of CARGO_HOME, onto the PATH of everybody.
+    && cp -a /opt/cargo/bin/. /usr/local/bin/ \
+    && rm -rf /opt/cargo "${RUSTUP_HOME}/downloads" "${RUSTUP_HOME}/tmp" \
+    && chmod -R a+rX "${RUSTUP_HOME}" \
+    && rustc --version && cargo --version && cargo fmt --version && cargo clippy --version \
+    && rustc +${RUST_MSRV} --version
+
+# cargo-nextest at CI's version (ci.yml, nextest@0.9.148), pinned by checksum.
+ARG NEXTEST_VERSION=0.9.148
+ARG NEXTEST_SHA256=223ba936714cc861a9cdedad5a8eb664dfdd69d6fbdf6cea6aa8184f523290dc
+RUN curl -fsSL -o /tmp/nextest.tar.gz \
+       "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+    && echo "${NEXTEST_SHA256}  /tmp/nextest.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/nextest.tar.gz -C /usr/local/bin cargo-nextest \
+    && rm /tmp/nextest.tar.gz \
+    && cargo nextest --version
+
+# cargo-ndk and the Rust target of the Android shell.
+# cargo-ndk is built from source at a pinned version (about 15 s on the builder;
+# no release binary is published), with a throwaway CARGO_HOME: only the binary stays.
+ARG CARGO_NDK_VERSION=4.1.2
+RUN rustup target add aarch64-linux-android \
+    && chmod -R a+rX "${RUSTUP_HOME}" \
+    && CARGO_HOME=/tmp/cargo-ndk-home cargo install cargo-ndk --locked --version "${CARGO_NDK_VERSION}" --root /usr/local \
+    && rm -rf /tmp/cargo-ndk-home \
+    && cargo ndk --version
+
+# sccache: installed, switched on by nothing here (sccache-env.sh on the
+# builder, the runner pod's TUILE_SCCACHE_* in linux-host).
+COPY sccache-install.sh sccache-env.sh /usr/local/share/tuile/
+RUN sh /usr/local/share/tuile/sccache-install.sh
+
+# What is in the image, for the workflows to read and for whoever debugs a job.
+ARG IMAGE_VARIANT=ci
+RUN printf 'rust=%s\nrust_msrv=%s\nnextest=%s\nrustup=%s\ncargo_ndk=%s\nandroid_platform=%s\nandroid_build_tools=%s\nandroid_ndk=%s\nvariant=%s\n' \
+       "${RUST_VERSION}" "${RUST_MSRV}" "${NEXTEST_VERSION}" "${RUSTUP_VERSION}" "${CARGO_NDK_VERSION}" \
+       "${ANDROID_PLATFORM}" "${ANDROID_BUILD_TOOLS}" "${ANDROID_NDK}" "${IMAGE_VARIANT}" \
+       > /usr/local/share/tuile/ci-image.env
+ENV TUILE_CI_IMAGE=1
+
+USER ${CI_USER}
