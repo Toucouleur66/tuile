@@ -51,7 +51,7 @@
 //! down a channel, to one thread that blocks on it while there is none —
 //! not as tasks of the rayon pool, whose idle threads spin for the one job
 //! at a time a single ground out gives them. The reading that ends gives its
-//! ground back and wakes the builder ([`Out`]'s condition variable), which
+//! ground back and wakes the builder (`Out`'s condition variable), which
 //! sleeps until then: no timeout, no yield, no sleep in a loop. A reading
 //! is free to use the pool itself; what it runs there is its own work.
 

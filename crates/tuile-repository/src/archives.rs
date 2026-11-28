@@ -312,7 +312,7 @@ pub struct PinReport {
     pub archives: u64,
     pub tiles: u64,
     /// Tiles asked for that no live archive holds, and the first
-    /// [`ABSENT_NAMED`] of them.
+    /// `ABSENT_NAMED` of them.
     pub absent: u64,
     pub absent_first: Vec<(String, u8, u32, u32)>,
 }
