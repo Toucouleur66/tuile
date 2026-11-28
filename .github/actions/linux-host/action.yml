@@ -15,6 +15,11 @@ runs:
     - if: runner.environment == 'self-hosted'
       shell: bash
       run: |
+        # The stock runner image lists the git-core PPA, which the runner's
+        # network policy does not allow: `apt-get update` waited for its
+        # connections to time out on every job. Nothing here comes from it.
+        sudo rm -f /etc/apt/sources.list.d/git-core-ubuntu-ppa*.list \
+          /etc/apt/sources.list.d/git-core-ubuntu-ppa*.sources
         sudo apt-get update
         sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
           build-essential pkg-config cmake zstd xz-utils \
