@@ -70,6 +70,8 @@
 //!   --every <n>           one frame in n (default 1)
 //!   --scale <s>           picture size against the bake's (default 1)
 //!   --supersample <n>     default 2
+//!   --read-ahead-frames <n>  frames whose tiles are made ahead (default 4)
+//!   --read-ahead-mib <n>  what is made ahead and not taken, at most (default 512)
 //!   --fps <n>             default 30
 //!   --mbps <n>            default: the encoder's own by the picture's size
 //!   --no-tone             no grade: imagery as stored, the look as it is
@@ -485,6 +487,12 @@ async fn main() -> Result<(), Error> {
     if let Some(n) = value("--supersample") {
         order.supersample = n.parse()?;
     }
+    if let Some(n) = value("--read-ahead-frames") {
+        order.ahead.frames = n.parse()?;
+    }
+    if let Some(mib) = value("--read-ahead-mib") {
+        order.ahead.bytes = mib.parse::<u64>()? << 20;
+    }
     order.stitch = !flag("--no-stitch");
     order.skirts = !flag("--no-skirts");
     order.holes = flag("--holes");
@@ -866,6 +874,17 @@ async fn main() -> Result<(), Error> {
     println!(
         "drapes: {} kept from a smaller level, their tiles being far; {} entered again larger, their tiles come closer",
         done.drapes_reduced, done.drapes_regrown,
+    );
+    println!(
+        "read ahead ({} frames, {} MiB): {} meshes and imagery tiles ready when needed, {} waited for, {} made when needed ({} started a frame or more before); stopped {} times by its bytes, at most {:.0} MiB waiting",
+        order.ahead.frames,
+        order.ahead.bytes >> 20,
+        done.ahead.ready,
+        done.ahead.waited,
+        done.ahead.here,
+        done.ahead.early,
+        done.ahead.full,
+        done.ahead.most_waiting as f64 / f64::from(1u32 << 20),
     );
     if let Some((fine, coarse)) = done.shadow_texel {
         println!(

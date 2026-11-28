@@ -9427,6 +9427,7 @@ dependencies = [
  "tuile-repository",
  "tuile-storage-foyer",
  "tuile-tape",
+ "tuile-terrain",
  "tuile-tile-server",
  "wgpu",
 ]

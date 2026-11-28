@@ -87,6 +87,8 @@ pollster = { workspace = true }
 reqwest = { workspace = true }
 # The spans a segment opens, read back by a test subscriber.
 tracing-subscriber = { workspace = true }
+# A moving film's terrain tiles, encoded as a source serves them.
+tuile-terrain = { version = "0.18.0", path = "../tuile-terrain" }
 
 [features]
 # rav1e's own assembly: several times faster, and no longer Rust alone.

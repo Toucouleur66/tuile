@@ -128,6 +128,7 @@ mod tests {
                 selection: &[],
                 camera: &camera,
                 timings: Default::default(),
+                ahead: Default::default(),
                 linear: None,
                 sky: None,
             });
