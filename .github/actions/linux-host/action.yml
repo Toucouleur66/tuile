@@ -34,7 +34,8 @@ runs:
     # missing, nothing changes. Same install and same conventions as the
     # builder (integrations/docker/sccache-{install,env}.sh); the key prefix is
     # the runner's own, `gha-<arch>-gnu`, so CI and the builder never share an
-    # entry. A fork pull request never reaches here: it runs on a hosted runner.
+    # entry. A fork pull request is excluded below: it runs on this runner but
+    # without the shared compile cache (its code must not write to it).
     - if: runner.environment == 'self-hosted' && github.event.pull_request.head.repo.fork != true
       shell: bash
       run: |
