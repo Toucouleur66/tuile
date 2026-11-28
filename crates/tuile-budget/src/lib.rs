@@ -283,6 +283,12 @@ pub struct Budget {
     /// The need last read, each wanted tile's best entry: a step changes
     /// it by what changed.
     need: need_state::NeedState,
+    /// Uploads acknowledged for a resource the budget no longer tracks —
+    /// its delivery withdrawn, its slot gone, before the consumer read the
+    /// withdrawal: the GPU holds them, so the next step evicts them.
+    orphans: Vec<ResourceId>,
+    /// The orphans this step evicts: none of them is delivered in it.
+    orphans_now: Vec<ResourceId>,
     /// Each drawn or blocking tile's imagery level per layer, as last
     /// chosen (the hysteresis reads it), and those of the tiles held. Its
     /// upkeep is not counted into `work` (on the sorted blocks it put P6.4
@@ -399,6 +405,8 @@ impl Budget {
             events: Vec::new(),
             tiles: Default::default(),
             need: Default::default(),
+            orphans: Vec::new(),
+            orphans_now: Vec::new(),
             imagery_prev: Default::default(),
             imagery_stood_in: Default::default(),
             imagery_short: Default::default(),
