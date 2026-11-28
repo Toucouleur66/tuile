@@ -433,7 +433,7 @@ pub struct Sim {
     /// Per tile, while the camera is still (I4): each (mesh level drawn,
     /// drape level worn) it showed, with the time it began — the first as
     /// first drawn, then one per change.
-    levels: BTreeMap<TileId, Vec<(Micros, (u32, u32))>>,
+    levels: BTreeMap<TileId, LevelHistory>,
     /// Arrivals and acknowledgements fed to the budget so far.
     fed: u64,
     /// Those fed at the last `decide`, which it applied.
@@ -1194,7 +1194,7 @@ impl Sim {
         }
     }
 
-    /// I4: the worst flapping of any tile while still ([`flapping_of`]).
+    /// I4: the worst flapping of any tile while still (`flapping_of`).
     pub fn worst_flapping(&self) -> usize {
         self.levels
             .values()
@@ -1333,6 +1333,10 @@ fn class_of(r: ResourceId) -> Class {
         ResourceId::Drape { .. } => Class::Drape,
     }
 }
+
+/// One tile's levels while the camera is still: each (mesh level, drape
+/// level) it showed, with the time it began (I4).
+pub type LevelHistory = Vec<(Micros, (u32, u32))>;
 
 /// I4's measure on one tile's history while still — each (mesh level,
 /// drape level) it showed, with the time it began, the first as first
