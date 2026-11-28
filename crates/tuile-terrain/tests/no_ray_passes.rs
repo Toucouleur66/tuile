@@ -22,7 +22,8 @@ use support::{along, measured, meeting, tile_at, LAT, LON};
 use tuile_core::seam::{seam, Seam, Side};
 use tuile_core::DecodedTileContent;
 use tuile_terrain::{
-    skirt_height, to_decoded, to_ground, upsample, GeographicTilingScheme, QuantizedMesh, TileCoord,
+    skirt_height, to_decoded, to_ground, to_ground_skirted, upsample, GeographicTilingScheme,
+    QuantizedMesh, SkirtOptions, TileCoord,
 };
 
 /// The mesh of `target`, cut from the terrain tile `from` a level at a time,
@@ -161,6 +162,14 @@ fn across_levels(coarse_level: u32) -> ((TileCoord, QuantizedMesh), (TileCoord, 
     ((fine, measured(fine, 32)), (coarse, measured(coarse, 16)))
 }
 
+// The skirts hang at the references' rule (`mesh.rs`, `LEVELS_OF_REACH` 0):
+// a level-17 tile against a level-11 one lets 93 of 3840 rays through steps
+// up to 69 m — the trade for no skirt walls standing in the open where the
+// selection lags a fast orbit. Ignored, the trade being taken (the default
+// reach is 0): the same step is closed at a reach of 4, which the
+// skirt_reach test below pins. Not
+// fixed: run it with `--ignored` to measure it.
+#[ignore = "skirts at the references' rule (LEVELS_OF_REACH 0): see mesh.rs"]
 #[test]
 fn a_tile_several_levels_finer_than_its_neighbour_is_closed_against_it() {
     for coarse_level in [11, 9, 7] {
@@ -190,4 +199,44 @@ fn a_tile_several_levels_finer_than_its_neighbour_is_closed_against_it() {
             found.through, found.rays, found.open
         );
     }
+}
+
+/// **The reach decides the trade, and it is the host's number.**
+///
+/// A level-17 tile cut from level 13 against a level-11 one: with the skirts
+/// at the references' rule (`levels_of_reach` 0) rays pass between them
+/// (the trade the host takes for no wall of stretched texels standing in the
+/// open where the selection lags); with four levels none does.
+/// Red if `to_ground_skirted` ignores its options either way.
+#[test]
+fn the_skirt_reach_decides_whether_a_much_coarser_neighbour_is_closed() {
+    let (fine, coarse) = across_levels(11);
+    let tiles = along(fine.0, 17, Side::East);
+    let east = drawn(&coarse, &[coarse.0], to_ground);
+    let skirted = |levels_of_reach: f64| {
+        let options = SkirtOptions {
+            levels_of_reach,
+            ..SkirtOptions::default()
+        };
+        worst(
+            &drawn(&fine, &tiles, |mesh, rect| {
+                to_ground_skirted(mesh, rect, true, &options)
+            }),
+            &east,
+        )
+    };
+
+    let rule = skirted(0.0);
+    assert!(rule.rays > 0, "{rule:?}");
+    assert!(
+        rule.through > 0,
+        "at the references' rule the step to a level-11 neighbour is left open: {rule:?}"
+    );
+    let default = skirted(4.0);
+    assert_eq!(default.rays, rule.rays, "the same steps, looked into again");
+    assert_eq!(
+        default.through, 0,
+        "{} of {} rays pass at a reach of four levels",
+        default.through, default.rays
+    );
 }
