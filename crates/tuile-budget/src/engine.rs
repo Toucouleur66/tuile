@@ -939,11 +939,77 @@ impl Budget {
         st.work = st.work.saturating_add(named);
     }
 
-    /// Whether `tn` asks for drapes this step: drawn or blocking, with
-    /// imagery.
+    /// Whether `tn` asks for drapes at its own levels this step: drawn or
+    /// blocking, with imagery.
+    ///
+    /// An ancestor does not: the whole chain of every drawn tile asking for
+    /// its drapes is a load per ancestor and per layer whatever its
+    /// children wear (measured on `budget_sim`: still views that never
+    /// converge, the work bound broken on still steps). What a drawn tile
+    /// wears while its own drape loads is asked by its parent only, and
+    /// only while a child needs it ([`Self::stand_ins_of`]).
     pub(super) fn draped(tn: &TileNeed) -> bool {
         matches!(tn.membership, Membership::Drawn | Membership::Blocker)
             && tn.need.imagery.is_some()
+    }
+
+    /// The drapes ancestor `p` (`pn` its need) asks for as its drawn
+    /// children's stand-in, into `out`: for each layer, its drape one level under the finest need of
+    /// its drawn children that wear two levels or more under their need,
+    /// or nothing — the pinned floor's at best, a flat colour over the
+    /// ground, wherever the view turns faster than the fine drapes come.
+    /// One parent's drape dresses its four children at half their
+    /// resolution, a quarter of their loads. A child dressed at that level
+    /// or finer (its own drape on arrival) asks nothing: a dressed view
+    /// asks for no stand-in, and a coarse ancestor further up is never
+    /// asked (the parent's drape is the one that comes as soon as the
+    /// children's). Reads at most the four children's levels and items
+    /// (the wants pass reads a drawn tile's parent again with it).
+    pub(super) fn stand_ins_of(
+        &self,
+        p: TileId,
+        pn: &TileNeed,
+        tiles: &SortedMap<TileId, TileNeed>,
+        out: &mut SmallVec<[ResourceId; 4]>,
+    ) {
+        out.clear();
+        let Some(img) = pn.need.imagery.as_ref() else {
+            return;
+        };
+        let Some(kids) = super::held::geometric_children(p) else {
+            return;
+        };
+        let floor = self.cfg.pinned_level.unwrap_or(0);
+        for reach in layers(img) {
+            let mut finest: Option<u32> = None;
+            for c in kids {
+                self.walk(1);
+                let drawn = tiles
+                    .get(&c)
+                    .is_some_and(|cn| cn.membership == Membership::Drawn);
+                if !drawn || self.tiles.get(&c).and_then(|i| i.parent()) != Some(p) {
+                    continue;
+                }
+                // Its level, chosen by the levels pass.
+                let Some(n) = self.imagery_prev.get(&(c, reach.layer)).map(|x| x.level) else {
+                    continue;
+                };
+                let Some(level) = n.checked_sub(1).filter(|l| *l >= floor) else {
+                    continue;
+                };
+                let dressed = self
+                    .down
+                    .drawn(ResourceId::Mesh(c))
+                    .and_then(|i| i.drape(reach.layer))
+                    .is_some_and(|w| w.resource.layer() == Some(reach.layer) && w.level >= level);
+                if !dressed {
+                    finest = Some(finest.map_or(n, |f| f.max(n)));
+                }
+            }
+            if let Some(n) = finest {
+                out.push(ResourceId::drape(p, reach.layer, n - 1));
+            }
+        }
     }
 
     /// The imagery level of each layer tile `t` asks for this step, into
@@ -1616,6 +1682,7 @@ impl Budget {
         &self,
         t: TileId,
         tn: &TileNeed,
+        tiles: &SortedMap<TileId, TileNeed>,
         item: Option<&Item>,
         meshes_in: bool,
         drapes: &mut Vec<(LayerId, u32)>,
@@ -1683,11 +1750,9 @@ impl Budget {
                     }
                     // A ring tile not drawn (the neighbourhood, the views
                     // ahead): its drapes are preloads too, of the tile's own
-                    // score — never the present need's. An ancestor of what
-                    // is drawn keeps its drapes in the present need's band:
-                    // a coarse drape serves every tile under it, and its
-                    // arrival re-reads them all — early, while the view
-                    // moves, not on a still step (the work bound).
+                    // score — never the present need's. (An ancestor of
+                    // what is drawn asks for no drape of its own levels: its
+                    // children's stand-in only, below.)
                     Membership::Ring if item.is_none() => Some(urgency),
                     _ => {
                         let worn = item.and_then(|i| i.drape(layer).copied());
@@ -1746,6 +1811,26 @@ impl Budget {
                         },
                     );
                 }
+            }
+        }
+        // An ancestor's drape, as its drawn children's stand-in while their
+        // own load: the present need's, as theirs (a child wearing the floor
+        // is ground on screen), and never under Batch, which draws exact
+        // levels only.
+        if meshes_in && !batch && !floor && tn.membership == Membership::Ancestor {
+            let mut stand_ins = SmallVec::new();
+            self.stand_ins_of(t, tn, tiles, &mut stand_ins);
+            for drape in stand_ins {
+                put(
+                    out,
+                    drape,
+                    Want {
+                        urgency: Urgency::Drape,
+                        q: tn.q,
+                        class: Class::Drape,
+                        level: tn.need.level,
+                    },
+                );
             }
         }
         // Per resource the most urgent, then the best scored; of equals,

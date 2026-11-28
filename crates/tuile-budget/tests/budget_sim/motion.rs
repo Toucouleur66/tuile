@@ -889,8 +889,9 @@ fn a_turn_and_back_flaps_nothing_and_refetches_nothing() {
                 .filter(|l| l.now >= back_from)
                 .map(|l| l.stats.thrash)
                 .sum();
-            assert!(
-                sim.worst_flapping() <= 1,
+            assert_eq!(
+                sim.worst_flapping(),
+                0,
                 "P4.3 (a), {name} pause {pause}: flapping"
             );
             if name == "desktop" {

@@ -2188,6 +2188,120 @@ mod draw {
         assert_eq!((d.stats.fallback, d.stats.lost), (1, 0));
     }
 
+    /// An ancestor of what is drawn asks for its drapes: a drawn tile whose
+    /// own drape is still loading wears its ancestor's, not nothing (nor,
+    /// with a floor, the floor's). Red with `Budget::draped` listing drawn
+    /// and blocking tiles only: the ancestor's drape is never asked for,
+    /// and the tile is lost.
+    #[test]
+    fn a_drawn_tile_wears_its_ancestors_drape_while_its_own_loads() {
+        let mut r = Rig::interactive();
+        let a = t(3, 2, 2);
+        let k = children(a)[0];
+        let need = NeedSet {
+            drawn: vec![(k, draped(k, 4))],
+            ancestors: vec![(a, draped(a, 3))],
+            ..NeedSet::new()
+        };
+        // Everything lands but the drawn tile's own drapes.
+        let own = |res: ResourceId| matches!(res, ResourceId::Drape { tile, .. } if tile == k);
+        let mut d = r.step(&need);
+        for _ in 0..10 {
+            r.load_where(|res| !own(res));
+            r.upload(&d);
+            d = r.step(&need);
+        }
+        assert!(r.b.residency().drawable(k), "the tile's mesh is drawable");
+        assert!(
+            r.pending.contains_key(&dr(k, 4)),
+            "its own drape still loads"
+        );
+        let item = d.draw.get(mesh(k)).expect(RED);
+        assert_eq!(item.role, Role::Exact);
+        assert_eq!(
+            base_drape(item).map(|c| c.resource),
+            Some(dr(a, 3)),
+            "{RED}: the ancestor's drape"
+        );
+        assert_eq!(d.stats.lost, 0);
+    }
+
+    /// The ancestors' drapes are asked for **once**, then the step goes
+    /// quiet: a still view that has everything (the drawn tile's drapes and
+    /// its ancestor's) starts, cancels and evicts nothing, and the ancestor's
+    /// drape stays on the GPU. What the measured preload this change is
+    /// next to failed at (work every still step, loads cancelled on a still
+    /// camera) is not asked here by a scenario: this pins it on the minimal
+    /// shape. It does not cover the pressure case (`budget_sim`'s digests
+    /// do, and they do not move).
+    #[test]
+    fn a_still_view_asks_for_its_ancestors_drapes_once_then_goes_quiet() {
+        let mut r = Rig::interactive();
+        let a = t(3, 2, 2);
+        let k = children(a)[0];
+        let need = NeedSet {
+            drawn: vec![(k, draped(k, 4))],
+            ancestors: vec![(a, draped(a, 3))],
+            ..NeedSet::new()
+        };
+        let d = r.settle(&need, 40);
+        assert!(d.start.is_empty(), "nothing left to start");
+        assert!(d.cancel.is_empty(), "nothing cancelled on a still view");
+        assert!(d.evict.is_empty(), "nothing evicted on a still view");
+        for _ in 0..8 {
+            let d = r.step(&need);
+            assert!(d.start.is_empty() && d.cancel.is_empty() && d.evict.is_empty());
+        }
+        let d = r.step(&need);
+        let item = d.draw.get(mesh(k)).expect("the tile is drawn");
+        assert_eq!(
+            base_drape(item).map(|c| c.resource),
+            Some(dr(k, 4)),
+            "the drawn tile wears its own drape"
+        );
+    }
+
+    /// The stand-in is the parent's drape one level under the drawn tile's
+    /// need, and nothing further up: a chain of ancestors listed with
+    /// imagery asks for one drape, not one per ancestor. Red with every
+    /// ancestor asking for its drapes (the grandparent's is loaded too: a
+    /// load per ancestor and per layer, whatever the children wear, which
+    /// `budget_sim` measured as still views that never converge) and red on
+    /// `main`, where no ancestor's drape is asked at all.
+    #[test]
+    fn a_drawn_tile_asks_for_its_parents_drape_only_as_its_stand_in() {
+        let mut r = Rig::interactive();
+        let g = t(3, 2, 2);
+        let a = children(g)[0];
+        let k = children(a)[0];
+        let need = NeedSet {
+            drawn: vec![(k, draped(k, 5))],
+            ancestors: vec![(g, draped(g, 3)), (a, draped(a, 4))],
+            ..NeedSet::new()
+        };
+        let own = |res: ResourceId| matches!(res, ResourceId::Drape { tile, .. } if tile == k);
+        let mut started = Vec::new();
+        let mut d = r.step(&need);
+        for _ in 0..10 {
+            started.extend(d.start.iter().map(|s| s.resource));
+            r.load_where(|res| !own(res));
+            r.upload(&d);
+            d = r.step(&need);
+        }
+        assert!(
+            started.contains(&dr(a, 4)),
+            "{RED}: the parent's drape, one level under the need"
+        );
+        assert!(
+            !started
+                .iter()
+                .any(|res| matches!(res, ResourceId::Drape { tile, .. } if *tile == g)),
+            "{RED}: no drape of an ancestor further up: {started:?}"
+        );
+        let item = d.draw.get(mesh(k)).expect("the tile is drawn");
+        assert_eq!(base_drape(item).map(|c| c.resource), Some(dr(a, 4)));
+    }
+
     /// I9 (coarsening), C19: on a zoom-out the children stay drawn until the
     /// parent is drawable, then go in the same step.
     #[test]

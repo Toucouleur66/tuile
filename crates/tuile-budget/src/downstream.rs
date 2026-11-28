@@ -1746,6 +1746,25 @@ impl Budget {
         } else if pressure {
             add(&mut dirty, self.down.pressure_readers.iter().copied());
         }
+        // A tile's level and item are read by its quadtree parent too when
+        // that parent is an ancestor of what is drawn: the stand-in it may
+        // ask for (`Budget::stand_ins_of`). By the id, not the tree: a
+        // child that left the need is read by its parent all the same.
+        if !all {
+            let read = dirty.len();
+            self.walk(read);
+            for i in 0..read {
+                let Some(p) = super::held::geometric_parent(dirty[i]) else {
+                    continue;
+                };
+                if tiles
+                    .get(&p)
+                    .is_some_and(|pn| pn.membership == Membership::Ancestor)
+                {
+                    dirty.push(p);
+                }
+            }
+        }
         dirty.sort_unstable();
         dirty.dedup();
         self.walk(dirty.len());
@@ -1757,6 +1776,7 @@ impl Budget {
                     let reads = self.tile_wants(
                         t,
                         tn,
+                        tiles,
                         item,
                         meshes_in,
                         &mut l.drapes,
@@ -3345,7 +3365,16 @@ impl Budget {
         let (mut drapes, mut put) = (Vec::new(), Vec::new());
         for (t, tn) in tiles.iter() {
             let item = self.down.drawn(ResourceId::Mesh(*t));
-            if self.tile_wants(*t, tn, item, meshes_in, &mut drapes, &mut put, &mut None) {
+            if self.tile_wants(
+                *t,
+                tn,
+                tiles,
+                item,
+                meshes_in,
+                &mut drapes,
+                &mut put,
+                &mut None,
+            ) {
                 readers.push(*t);
             }
             want.extend(put.iter().map(|(r, _, w)| (*r, *w)));
