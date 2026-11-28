@@ -65,6 +65,11 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
+          # sccache carries the compilation: no multi-GB target/ tarball, no
+          # executables from $CARGO_HOME/bin, and a red job still saves what it has.
+          cache-targets: false
+          cache-bin: false
+          cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
@@ -85,6 +90,11 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
+          # sccache carries the compilation: no multi-GB target/ tarball, no
+          # executables from $CARGO_HOME/bin, and a red job still saves what it has.
+          cache-targets: false
+          cache-bin: false
+          cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --workspace --all-targets
       - run: cargo clippy --workspace --all-targets -- -D warnings
@@ -135,6 +145,11 @@ jobs:
       - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
         with:
+          # sccache carries the compilation: no multi-GB target/ tarball, no
+          # executables from $CARGO_HOME/bin, and a red job still saves what it has.
+          cache-targets: false
+          cache-bin: false
+          cache-on-failure: true
           # The key the single `test` job had: main's cache keeps serving.
           shared-key: test
           # The workspace runner builds a superset of the other two.
@@ -219,6 +234,11 @@ jobs:
       - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
         with:
+          # sccache carries the compilation: no multi-GB target/ tarball, no
+          # executables from $CARGO_HOME/bin, and a red job still saves what it has.
+          cache-targets: false
+          cache-bin: false
+          cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # The budget is its own crate, `tuile-budget`; the imagery tests drive it
       # through the core's traversal and stay in `tuile-core`.
@@ -244,6 +264,11 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
+          # sccache carries the compilation: no multi-GB target/ tarball, no
+          # executables from $CARGO_HOME/bin, and a red job still saves what it has.
+          cache-targets: false
+          cache-bin: false
+          cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # Every crate that claims wasm, not only the core. `tuile-web` is
       # entirely gated on wasm32, so no native build ever compiled it: it
@@ -289,6 +314,11 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
+          # sccache carries the compilation: no multi-GB target/ tarball, no
+          # executables from $CARGO_HOME/bin, and a red job still saves what it has.
+          cache-targets: false
+          cache-bin: false
+          cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: wasm-bindgen at the locked version
         run: |
@@ -325,6 +355,11 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
+          # sccache carries the compilation: no multi-GB target/ tarball, no
+          # executables from $CARGO_HOME/bin, and a red job still saves what it has.
+          cache-targets: false
+          cache-bin: false
+          cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # The hosted image's Temurin; on tuile-linux the android-sdk action installs
       # OpenJDK 17 from the Ubuntu mirrors.
@@ -353,6 +388,11 @@ jobs:
       - uses: ./.github/actions/rust-toolchain
       - uses: Swatinem/rust-cache@v2
         with:
+          # sccache carries the compilation: no multi-GB target/ tarball, no
+          # executables from $CARGO_HOME/bin, and a red job still saves what it has.
+          cache-targets: false
+          cache-bin: false
+          cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo doc --workspace --no-deps
       - if: always()
