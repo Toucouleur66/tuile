@@ -1,7 +1,7 @@
 still-allocs-per-step 0
 meter-allocs-per-still-step 0
-motion-allocs-per-step-p99 39
+motion-allocs-per-step-p99 36
 diff-allocs-per-step-p99 0
-scratch-bytes-after-tour 342184
-bytes-per-tracked-resource 470
-bytes-per-tracked-resource-after-shrinking 804
+scratch-bytes-after-tour 380616
+bytes-per-tracked-resource 449
+bytes-per-tracked-resource-after-shrinking 785
