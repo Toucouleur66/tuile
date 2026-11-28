@@ -17,7 +17,7 @@ cd "$(dirname "$0")/.."
 kind="${1:?usage: slow-tests-filter.sh cpu|gpu|check}"
 
 # kind<TAB>function name, for each slow tag and the first `fn` below it.
-tags="$(git ls-files 'crates/**/*.rs' | xargs awk '
+tags="$(find crates -name '*.rs' -not -path '*/target/*' | xargs awk '
     /ignore = "slow:/ { k = ($0 ~ /ignore = "slow: gpu:/) ? "gpu" : "cpu"; file = FILENAME; line = FNR; pending = 1; next }
     pending && match($0, /fn [A-Za-z0-9_]+/) {
         print k "\t" substr($0, RSTART + 3, RLENGTH - 3); pending = 0; next }
