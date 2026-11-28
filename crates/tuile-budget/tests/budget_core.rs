@@ -2261,6 +2261,47 @@ mod draw {
         );
     }
 
+    /// The stand-in is the parent's drape one level under the drawn tile's
+    /// need, and nothing further up: a chain of ancestors listed with
+    /// imagery asks for one drape, not one per ancestor. Red with every
+    /// ancestor asking for its drapes (the grandparent's is loaded too: a
+    /// load per ancestor and per layer, whatever the children wear, which
+    /// `budget_sim` measured as still views that never converge) and red on
+    /// `main`, where no ancestor's drape is asked at all.
+    #[test]
+    fn a_drawn_tile_asks_for_its_parents_drape_only_as_its_stand_in() {
+        let mut r = Rig::interactive();
+        let g = t(3, 2, 2);
+        let a = children(g)[0];
+        let k = children(a)[0];
+        let need = NeedSet {
+            drawn: vec![(k, draped(k, 5))],
+            ancestors: vec![(g, draped(g, 3)), (a, draped(a, 4))],
+            ..NeedSet::new()
+        };
+        let own = |res: ResourceId| matches!(res, ResourceId::Drape { tile, .. } if tile == k);
+        let mut started = Vec::new();
+        let mut d = r.step(&need);
+        for _ in 0..10 {
+            started.extend(d.start.iter().map(|s| s.resource));
+            r.load_where(|res| !own(res));
+            r.upload(&d);
+            d = r.step(&need);
+        }
+        assert!(
+            started.contains(&dr(a, 4)),
+            "{RED}: the parent's drape, one level under the need"
+        );
+        assert!(
+            !started
+                .iter()
+                .any(|res| matches!(res, ResourceId::Drape { tile, .. } if *tile == g)),
+            "{RED}: no drape of an ancestor further up: {started:?}"
+        );
+        let item = d.draw.get(mesh(k)).expect("the tile is drawn");
+        assert_eq!(base_drape(item).map(|c| c.resource), Some(dr(a, 4)));
+    }
+
     /// I9 (coarsening), C19: on a zoom-out the children stay drawn until the
     /// parent is drawable, then go in the same step.
     #[test]
