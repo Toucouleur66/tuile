@@ -1336,16 +1336,28 @@ fn class_of(r: ResourceId) -> Class {
 
 /// I4's measure on one tile's history while still — each (mesh level,
 /// drape level) it showed, with the time it began, the first as first
-/// drawn: the most level changes within any 10 s window.
+/// drawn: the most returns within any 10 s window, a return being a change
+/// back to a level the tile showed and left less than 10 s before
+/// (A -> B -> A). A tile that only goes one way (a refinement through a
+/// stand-in, coarse to fine) or changes once does not flap.
 pub fn flapping_of(history: &[(Micros, (u32, u32))]) -> usize {
-    let changes: Vec<Micros> = history.iter().skip(1).map(|x| x.0).collect();
-    changes
+    let window = Micros::from_secs(10);
+    let returns: Vec<Micros> = (1..history.len())
+        .filter(|&j| {
+            let (t, level) = history[j];
+            // Shown at `i`, left at `i + 1`, before the change `j - 1`
+            // that led away from what `j` returns from.
+            (0..j - 1).any(|i| history[i].1 == level && t.since(history[i + 1].0) < window)
+        })
+        .map(|j| history[j].0)
+        .collect();
+    returns
         .iter()
         .enumerate()
         .map(|(i, t)| {
-            changes[i..]
+            returns[i..]
                 .iter()
-                .take_while(|u| u.since(*t) < Micros::from_secs(10))
+                .take_while(|u| u.since(*t) < window)
                 .count()
         })
         .max()

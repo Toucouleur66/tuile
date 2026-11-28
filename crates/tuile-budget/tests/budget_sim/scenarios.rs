@@ -205,8 +205,9 @@ fn a_still_camera_converges_at_the_handheld_low_clamp() {
     converges(Profile::handheld_low());
 }
 
-/// I3, I4, I5, S2 (M2.1): ten still minutes cancel nothing, change no
-/// tile's level twice in ten seconds, and hold the decision digest.
+/// I3, I4, I5, S2 (M2.1): ten still minutes cancel nothing, send no tile
+/// back to a level it left within ten seconds, and hold the decision
+/// digest.
 #[test]
 #[cfg_attr(
     debug_assertions,
@@ -220,10 +221,10 @@ fn ten_still_minutes_cancel_nothing_flap_nothing_and_hold_the_digest() {
     let still: Vec<_> = sim.log.iter().filter(|l| l.now >= from).collect();
     let cancelled: u32 = still.iter().map(|l| l.stats.cancelled).sum();
     assert_eq!(cancelled, 0, "I5: a still camera cancelled loads");
-    assert!(
-        sim.worst_flapping() <= 1,
-        "I4: a tile changed level {} times in 10 s",
-        sim.worst_flapping()
+    assert_eq!(
+        sim.worst_flapping(),
+        0,
+        "I4: a tile went back to a level it left within 10 s"
     );
     // Once the budget has nothing left to do (preload and ring included),
     // its decisions do not move.
