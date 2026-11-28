@@ -430,9 +430,10 @@ pub struct Sim {
     /// its `Decisions`), for `DecideAllocs::output`: off by default, it
     /// costs a clone per step.
     pub count_output: bool,
-    /// Per tile: (mesh level drawn, drape level worn, last change time),
-    /// tracked while the camera is still (I4).
-    levels: BTreeMap<TileId, (u32, u32, Vec<Micros>)>,
+    /// Per tile, while the camera is still (I4): each (mesh level drawn,
+    /// drape level worn) it showed, with the time it began — the first as
+    /// first drawn, then one per change.
+    levels: BTreeMap<TileId, Vec<(Micros, (u32, u32))>>,
     /// Arrivals and acknowledgements fed to the budget so far.
     fed: u64,
     /// Those fed at the last `decide`, which it applied.
@@ -1185,34 +1186,19 @@ impl Sim {
             let mesh = i.mesh.tile().terrain_coord().0;
             let drape = i.drapes.first().map(|x| x.level).unwrap_or(0);
             for t in &i.serves {
-                let e = self.levels.entry(*t).or_insert((mesh, drape, Vec::new()));
-                if (e.0, e.1) != (mesh, drape) {
-                    e.0 = mesh;
-                    e.1 = drape;
-                    e.2.push(self.now);
+                let h = self.levels.entry(*t).or_default();
+                if h.last().is_none_or(|x| x.1 != (mesh, drape)) {
+                    h.push((self.now, (mesh, drape)));
                 }
             }
         }
     }
 
-    /// I4: the most level changes of any tile within any 10 s window while
-    /// still.
+    /// I4: the worst flapping of any tile while still ([`flapping_of`]).
     pub fn worst_flapping(&self) -> usize {
         self.levels
             .values()
-            .map(|(_, _, changes)| {
-                changes
-                    .iter()
-                    .enumerate()
-                    .map(|(i, t)| {
-                        changes[i..]
-                            .iter()
-                            .take_while(|u| u.since(*t) < Micros::from_secs(10))
-                            .count()
-                    })
-                    .max()
-                    .unwrap_or(0)
-            })
+            .map(|h| flapping_of(h.as_slice()))
             .max()
             .unwrap_or(0)
     }
@@ -1346,4 +1332,45 @@ fn class_of(r: ResourceId) -> Class {
         ResourceId::Mesh(_) => Class::TerrainMesh,
         ResourceId::Drape { .. } => Class::Drape,
     }
+}
+
+/// I4's measure on one tile's history while still — each (mesh level,
+/// drape level) it showed, with the time it began, the first as first
+/// drawn: the most level changes within any 10 s window.
+pub fn flapping_of(history: &[(Micros, (u32, u32))]) -> usize {
+    let changes: Vec<Micros> = history.iter().skip(1).map(|x| x.0).collect();
+    changes
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            changes[i..]
+                .iter()
+                .take_while(|u| u.since(*t) < Micros::from_secs(10))
+                .count()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// I4 is flapping, not refinement: a tile that only goes finer while the
+/// camera is still — the floor's drape, its parent's (the stand-in), then
+/// its own, within a third of a second, as `budget_sim`'s still views do
+/// with the stand-in — does not flap.
+#[test]
+fn i4_a_monotone_refinement_is_not_flapping() {
+    let ms = |m: u64| Micros(m * 1_000);
+    let h = [(ms(17), (11, 10)), (ms(33), (11, 11)), (ms(267), (11, 12))];
+    assert_eq!(flapping_of(&h), 0, "a refinement counted as flapping");
+}
+
+/// I4 still catches a flap: a tile that goes back to a level it left,
+/// A -> B -> A, within 10 s while the camera is still.
+#[test]
+fn i4_a_return_to_a_level_left_is_flapping() {
+    let s = |x: u64| Micros::from_secs(x);
+    let h = [(s(0), (11, 12)), (s(2), (11, 11)), (s(5), (11, 12))];
+    assert!(flapping_of(&h) >= 1, "a flap A -> B -> A not counted");
+    // The same return after 10 s is not within the window.
+    let late = [(s(0), (11, 12)), (s(2), (11, 11)), (s(13), (11, 12))];
+    assert_eq!(flapping_of(&late), 0, "a return after 10 s counted");
 }
