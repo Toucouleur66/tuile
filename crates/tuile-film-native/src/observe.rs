@@ -127,12 +127,19 @@ impl Timings {
 /// and was ready when the frame needed it, or was waited for; and what
 /// the render built on its own thread when it needed it. `early` is how
 /// many of those built ahead were started during an earlier frame.
+///
+/// And what tunes [`crate::ReadAhead`]: how many times the reading ahead
+/// stopped with something left to start because what was made and not
+/// taken filled its bytes (`full`), and the most bytes that were waiting
+/// to be taken (`most_waiting`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Ahead {
     pub ready: usize,
     pub waited: usize,
     pub here: usize,
     pub early: usize,
+    pub full: usize,
+    pub most_waiting: u64,
 }
 
 impl Ahead {
@@ -141,6 +148,8 @@ impl Ahead {
         self.waited += other.waited;
         self.here += other.here;
         self.early += other.early;
+        self.full += other.full;
+        self.most_waiting = self.most_waiting.max(other.most_waiting);
     }
 }
 

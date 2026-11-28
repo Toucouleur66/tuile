@@ -94,6 +94,16 @@ pub struct RenderSpec {
     /// (`Look::penumbra_scale`; 0: hard).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub penumbra_scale: Option<f32>,
+    /// Frames past the one being drawn whose tiles are made from the store
+    /// ahead of them ([`crate::ReadAhead::frames`]); `None`,
+    /// [`crate::ReadAhead::FRAMES`]. Neither it nor the next changes a
+    /// picture, nor the film's name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_ahead_frames: Option<u32>,
+    /// The bytes of what was made ahead and not taken yet, at most
+    /// ([`crate::ReadAhead::bytes`]); `None`, [`crate::ReadAhead::BYTES`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_ahead_bytes: Option<u64>,
 }
 
 /// A film for two eyes, as a caller writes it: see [`tuile_film::Stereo`].
@@ -197,6 +207,8 @@ impl Default for RenderSpec {
             moon_scale: None,
             glare: None,
             penumbra_scale: None,
+            read_ahead_frames: None,
+            read_ahead_bytes: None,
         }
     }
 }
@@ -240,6 +252,11 @@ impl RenderSpec {
         // The air's settings, today's where the environment states none:
         // what the look starts from, the spec's own over them.
         order.look = order.look.tuned(air);
+        order.ahead = crate::ReadAhead {
+            frames: self.read_ahead_frames.unwrap_or(crate::ReadAhead::FRAMES),
+            bytes: self.read_ahead_bytes.unwrap_or(crate::ReadAhead::BYTES),
+            ..crate::ReadAhead::default()
+        };
         if let Some(scale) = self.sun_scale {
             order.look.sun_scale = scale;
         }
@@ -650,6 +667,21 @@ mod tests {
             workers: 3,
         };
         assert_eq!(film_prefix("packs/abc.references", &ahead), film);
+        // Nor as the spec asks it.
+        let asked = RenderSpec {
+            read_ahead_frames: Some(16),
+            read_ahead_bytes: Some(1),
+            ..RenderSpec::default()
+        }
+        .rendering()
+        .expect("rendering");
+        assert_eq!(asked.order.ahead.frames, 16);
+        assert_eq!(asked.order.ahead.bytes, 1);
+        let stock = RenderSpec::default().rendering().expect("rendering");
+        assert_eq!(
+            film_prefix("packs/abc.references", &asked),
+            film_prefix("packs/abc.references", &stock)
+        );
 
         // Anything of the picture is another film; another bake too.
         let mut others = vec![film_prefix("packs/abd.references", &rendering())];

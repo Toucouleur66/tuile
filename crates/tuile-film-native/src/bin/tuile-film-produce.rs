@@ -181,6 +181,13 @@ struct Args {
     /// (1: the sun's own, 0: hard).
     #[arg(long)]
     penumbra_scale: Option<f32>,
+    /// Frames past the one being drawn whose tiles are made from the store
+    /// ahead of them (default 4). Changes no picture.
+    #[arg(long)]
+    read_ahead_frames: Option<u32>,
+    /// MiB of what was made ahead and not taken yet, at most (default 512).
+    #[arg(long)]
+    read_ahead_mib: Option<u64>,
     /// For two eyes, packed into one picture: `side-by-side` or `top-bottom`.
     #[arg(long, value_parser = ["side-by-side", "top-bottom"])]
     stereo: Option<String>,
@@ -352,6 +359,8 @@ fn rendering(args: &Args, tape_clock: Option<tuile_tape::Clock>) -> Result<Rende
         moon_scale: args.moon_scale,
         glare: args.glare,
         penumbra_scale: args.penumbra_scale,
+        read_ahead_frames: args.read_ahead_frames,
+        read_ahead_bytes: args.read_ahead_mib.map(|mib| mib << 20),
         stereo: args.stereo.as_deref().map(|packing| StereoSpec {
             packing: if packing == "top-bottom" {
                 StereoPacking::TopBottom

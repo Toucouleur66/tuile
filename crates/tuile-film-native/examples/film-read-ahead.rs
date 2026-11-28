@@ -151,8 +151,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         worst.0, worst.1
     );
     println!(
-        "made ahead: {} ready when needed, {} waited for, {} made when needed, {} started a frame or more before",
-        done.ahead.ready, done.ahead.waited, done.ahead.here, done.ahead.early
+        "made ahead: {} ready when needed, {} waited for, {} made when needed, {} started a frame or more before; stopped {} times by its bytes, at most {:.1} MiB waiting",
+        done.ahead.ready,
+        done.ahead.waited,
+        done.ahead.here,
+        done.ahead.early,
+        done.ahead.full,
+        done.ahead.most_waiting as f64 / f64::from(1u32 << 20)
     );
     let (asked, fetched) = written.sources.archives.reads();
     println!(

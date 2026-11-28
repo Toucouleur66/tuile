@@ -163,10 +163,10 @@ fn adapter_name() -> String {
 }
 
 /// Reading ahead changes when a tile is made, never what it is made into:
-/// however far ahead, with room for nearly nothing, the pictures are the
-/// same — tiles whose drape grows as the camera comes closer made the old
-/// way among them — and on the suite's adapter they are those the render
-/// made before it read ahead.
+/// however far ahead — three depths — with room for a lot or for nearly
+/// nothing, the pictures are the same — tiles whose drape grows as the
+/// camera comes closer made the old way among them — and on the suite's
+/// adapter they are those the render made before it read ahead.
 #[tokio::test(flavor = "multi_thread")]
 async fn reading_ahead_changes_no_picture() {
     if !has_adapter() {
@@ -177,19 +177,18 @@ async fn reading_ahead_changes_no_picture() {
     let shape = Shape::regrowing();
     let written = moving::write(dir.path(), shape).await;
     let mut films = Vec::new();
-    for ahead in [
-        ReadAhead::default(),
-        ReadAhead {
-            frames: 0,
-            workers: 1,
-            ..ReadAhead::default()
-        },
-        ReadAhead {
-            frames: 64,
-            bytes: 1,
-            workers: 3,
-        },
-    ] {
+    // Three depths, two caps — one that holds a frame's worth and more, one
+    // that holds nearly nothing — and one worker or several.
+    let settings = [0, ReadAhead::FRAMES, 16].into_iter().flat_map(|frames| {
+        [ReadAhead::BYTES, 1]
+            .into_iter()
+            .map(move |bytes| ReadAhead {
+                frames,
+                bytes,
+                workers: if frames == 0 { 1 } else { ReadAhead::WORKERS },
+            })
+    });
+    for ahead in settings {
         let mut pictures = Digests::default();
         let mut took = Took::default();
         let order = Order { ahead, ..order() };
@@ -207,8 +206,19 @@ async fn reading_ahead_changes_no_picture() {
         assert!(done.drapes_regrown > 0, "{ahead:?}: {done:?}");
         let here: usize = took.0.iter().map(|(_, _, a)| a.here).sum();
         assert!(here > 0, "{ahead:?}");
+        // What tunes it: room for nearly nothing fills at once, and then
+        // holds no more than what one need is made into.
+        let full: usize = took.0.iter().map(|(_, _, a)| a.full).sum();
+        let most = took.0.iter().map(|(_, _, a)| a.most_waiting).max();
+        assert_eq!(done.ahead.full, full, "{ahead:?}");
+        assert_eq!(Some(done.ahead.most_waiting), most, "{ahead:?}");
+        assert!(done.ahead.most_waiting > 0, "{ahead:?}");
+        if ahead.bytes == 1 {
+            assert!(full > 0, "{ahead:?}: {:?}", done.ahead);
+        }
         films.push((ahead, pictures.0));
     }
+    assert_eq!(films.len(), 6);
     let (_, first) = &films[0];
     for (ahead, pictures) in &films {
         assert_eq!(pictures, first, "{ahead:?}");

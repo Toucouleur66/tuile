@@ -53,16 +53,29 @@ pub struct ReadAhead {
     pub workers: u32,
 }
 
+impl ReadAhead {
+    /// The frames read ahead when the host says nothing: a frame of a film
+    /// is drawn in tens of milliseconds, a terrain tile is made in about one
+    /// and an imagery tile decoded in under one to three, so a frame's
+    /// entering tiles are made, across the cores, well within the frames
+    /// before it (measured on the moving film of `tests/support/moving.rs`:
+    /// nothing waited for at four).
+    pub const FRAMES: u32 = 4;
+    /// The bytes made and not taken when the host says nothing: about two
+    /// thousand decoded imagery tiles of 256 texels a side, the opening
+    /// frame of a film over a town.
+    pub const BYTES: u64 = 512 << 20;
+    /// The workers when the host says nothing: as many as the machine has
+    /// cores but one.
+    pub const WORKERS: u32 = 0;
+}
+
 impl Default for ReadAhead {
-    /// A few frames: a frame of a film is drawn in tens of milliseconds, a
-    /// terrain tile is made in about one and an imagery tile decoded in two
-    /// or three, so a frame's entering tiles are made, across the cores,
-    /// well within the frames before it.
     fn default() -> Self {
         Self {
-            frames: 4,
-            bytes: 512 << 20,
-            workers: 0,
+            frames: Self::FRAMES,
+            bytes: Self::BYTES,
+            workers: Self::WORKERS,
         }
     }
 }
@@ -262,18 +275,23 @@ impl<'w> Lookahead<'w> {
         store: &ArchivedTiles,
         on_gpu: &dyn Fn(&(u8, u32, u32)) -> bool,
         timings: &mut Timings,
+        took: &mut Took,
     ) -> Result<(), Error> {
         if self.layers.is_none() {
             return Ok(());
         }
         loop {
-            if self.held.load(Ordering::Relaxed) >= self.settings.bytes as i64 {
+            let held = self.held.load(Ordering::Relaxed);
+            took.most_waiting = took.most_waiting.max(held.max(0) as u64);
+            let within = self.planned < self.plan.len()
+                && self.planned <= self.drawing + self.settings.frames as usize;
+            if held >= self.settings.bytes as i64 {
+                // Stopped by the bytes, with something left to start.
+                took.full += usize::from(!self.needs.is_empty() || within);
                 return Ok(());
             }
             let Some(need) = self.needs.pop_front() else {
-                if self.planned >= self.plan.len()
-                    || self.planned > self.drawing + self.settings.frames as usize
-                {
+                if !within {
                     return Ok(());
                 }
                 self.plan_next(pack)?;

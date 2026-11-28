@@ -778,6 +778,7 @@ pub async fn render(
                     &sources.store.tiles,
                     &|at| textures.contains_key(at),
                     &mut timings,
+                    &mut ahead,
                 )
                 .await?;
 
@@ -840,6 +841,7 @@ pub async fn render(
                         &sources.store.tiles,
                         &|at| textures.contains_key(at),
                         &mut timings,
+                        &mut ahead,
                     )
                     .await?;
                 // What was not started ahead is read now, as before.
@@ -908,6 +910,7 @@ pub async fn render(
                             &sources.store.tiles,
                             &|at| textures.contains_key(at),
                             &mut timings,
+                            &mut ahead,
                         )
                         .await?;
                     let key = TileKey::of(tile);
