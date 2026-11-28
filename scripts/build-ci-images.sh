@@ -74,9 +74,11 @@ if [ -n "$PUSH" ]; then
     fi
     DOCKER_CONFIG_DIR="$(mktemp -d)"
     trap 'rm -rf "$DOCKER_CONFIG_DIR"' EXIT
-    # The plugins stay where they are; only the credentials are throwaway.
+    # The plugins, the builders and the contexts stay where they are; only the credentials are throwaway.
     mkdir -p "$DOCKER_CONFIG_DIR"
-    ln -s "${DOCKER_CONFIG:-$HOME/.docker}/cli-plugins" "$DOCKER_CONFIG_DIR/cli-plugins" 2>/dev/null || true
+    for d in cli-plugins buildx contexts; do
+        ln -s "${DOCKER_CONFIG:-$HOME/.docker}/${d}" "$DOCKER_CONFIG_DIR/${d}" 2>/dev/null || true
+    done
     printf '%s' "$GHCR_TOKEN" | DOCKER_CONFIG="$DOCKER_CONFIG_DIR" docker login ghcr.io -u "$GHCR_USER" --password-stdin > /dev/null
 fi
 
