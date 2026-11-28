@@ -27,7 +27,7 @@ concurrency:
 # the GitHub-hosted image they had. The stock runner image carries no
 # compiler: `.github/actions/linux-host` installs what the hosted image has
 # (and does nothing on a hosted runner). Not moved: macOS (no macOS in a
-# Linux pod), and android, which needs the hosted image's SDK and NDK.
+# Linux pod).
 
 env:
   CARGO_TERM_COLOR: always
@@ -299,15 +299,22 @@ jobs:
           npm install --no-audit --no-fund
           npm run build
 
-  # The Android shell, as the device builds it: no host build ever compiles
-  # that code. Clippy on the target, then the APK through the same script a
-  # developer runs — the runner image carries the SDK and the NDK.
       - if: always()
         uses: ./.github/actions/sccache-stats
+
+  # The Android shell, as the device builds it: no host build ever compiles
+  # that code. Clippy on the target, then the APK through the same script a
+  # developer runs. The hosted image carries the SDK and the NDK;
+  # `.github/actions/android-sdk` installs them on the self-hosted runner.
   android:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'tuile-linux' }}
+    env:
+      # The runner pod has no UTF-8 locale by default; the hosted image has.
+      LANG: C.UTF-8
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/linux-host
+      - uses: ./.github/actions/android-sdk
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
@@ -315,7 +322,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: actions/setup-java@v4
+      # The hosted image's Temurin; on tuile-linux the android-sdk action installs
+      # OpenJDK 17 from the Ubuntu mirrors.
+      - if: runner.environment == 'github-hosted'
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17

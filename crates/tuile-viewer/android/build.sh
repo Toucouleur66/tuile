@@ -131,7 +131,7 @@ if [[ ! -f "$kotlin" ]] || ! echo "$kotlin_sha256  $kotlin" | shasum -a 256 -c -
   fi
   mv "$kotlin.part" "$kotlin"
 fi
-javac -source 8 -target 8 -Xlint:-options \
+javac -encoding UTF-8 -source 8 -target 8 -Xlint:-options \
   -bootclasspath "$android_jar" -classpath "$build/verifier/classes.jar" \
   -d "$build/classes" $(find "$here/java" -name '*.java')
 (cd "$build/classes" && jar cf "$build/activity.jar" .)

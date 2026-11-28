@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+name: Android SDK and NDK
+description: >-
+  On a self-hosted Linux runner (tuile-linux), installs the Android SDK the
+  APK build needs (OpenJDK 17, platform 35, build-tools, the NDK) from Google's command-line
+  tools into the pod's own disk, and exports ANDROID_HOME, ANDROID_NDK_HOME and ANDROID_NDK_LATEST_HOME
+  as the GitHub-hosted image does. It does nothing on a GitHub-hosted runner,
+  nor when the prebuilt CI image (TUILE_CI_IMAGE=1) or ANDROID_HOME already
+  holds these versions.
+runs:
+  using: composite
+  steps:
+    - if: runner.environment == 'self-hosted'
+      shell: bash
+      env:
+        PLATFORM: "35"
+        BUILD_TOOLS: 35.0.0
+        NDK: 27.3.13750724
+        CMDLINE_TOOLS_ZIP: commandlinetools-linux-11076708_latest.zip
+        CMDLINE_TOOLS_SHA256: 2d2d50857e4eb553af5a6dc3ad507a17adf43d115264b1afc116f95c92e5e258
+      run: |
+        set -euo pipefail
+        have() { # the SDK in $1 holds exactly the versions the build needs
+          [ -d "$1/platforms/android-$PLATFORM" ] && [ -d "$1/build-tools/$BUILD_TOOLS" ] && [ -d "$1/ndk/$NDK" ]
+        }
+        # Fast path: the prebuilt CI image (TUILE_CI_IMAGE=1), or any runner whose
+        # ANDROID_HOME already holds these versions, installs nothing.
+        if [ "${TUILE_CI_IMAGE:-}" = 1 ] || { [ -n "${ANDROID_HOME:-}" ] && have "$ANDROID_HOME"; }; then
+          echo "Android SDK already present at ${ANDROID_HOME:-?}: nothing to install"
+          ndk="${ANDROID_NDK_HOME:-$ANDROID_HOME/ndk/$NDK}"
+          { echo "ANDROID_NDK_HOME=$ndk"; echo "ANDROID_NDK_LATEST_HOME=${ANDROID_NDK_LATEST_HOME:-$ndk}"; } >> "$GITHUB_ENV"
+          exit 0
+        fi
+        # Fallback, until the image is live: install into the pod's own disk
+        # (nothing outlives the pod, so each run pays the download). Built in a
+        # temporary directory and renamed into place in one step.
+        sudo apt-get update
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          unzip zip python3 openjdk-17-jdk-headless
+        java_home="$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")"
+        root="$HOME/android-sdk"
+        start=$(date +%s)
+        if ! have "$root"; then
+          tmp="$root.tmp.$$"
+          rm -rf "$tmp"; mkdir -p "$tmp/cmdline-tools"
+          zip="$RUNNER_TEMP/cmdline-tools.zip"
+          curl -sfL -o "$zip" "https://dl.google.com/android/repository/$CMDLINE_TOOLS_ZIP"
+          echo "$CMDLINE_TOOLS_SHA256  $zip" | sha256sum -c --status \
+            || { echo "::error::the Android command-line tools did not match their digest"; exit 1; }
+          unzip -q -o "$zip" -d "$tmp/ct"
+          mv "$tmp/ct/cmdline-tools" "$tmp/cmdline-tools/latest"; rmdir "$tmp/ct"
+          # Licences accepted non-interactively.
+          yes | "$tmp/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$tmp" --licenses >/dev/null || true
+          "$tmp/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$tmp" \
+            "platforms;android-$PLATFORM" "build-tools;$BUILD_TOOLS" "ndk;$NDK" >/dev/null
+          rm -rf "$root"; mv "$tmp" "$root"
+        fi
+        echo "Android SDK ready in $(( $(date +%s) - start )) s"
+        {
+          echo "ANDROID_HOME=$root"
+          echo "ANDROID_SDK_ROOT=$root"
+          echo "ANDROID_NDK_HOME=$root/ndk/$NDK"
+          echo "ANDROID_NDK_LATEST_HOME=$root/ndk/$NDK"
+          echo "JAVA_HOME=$java_home"
+        } >> "$GITHUB_ENV"
+        echo "$java_home/bin" >> "$GITHUB_PATH"
