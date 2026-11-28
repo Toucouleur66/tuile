@@ -56,7 +56,7 @@ Jobs:
 4. `budget-sim`: the graphics budget's simulation and property tests in release (10,000 property cases), golden decision digests checked on Linux as on the Mac that recorded them.
 5. `wasm-guard`: `cargo check --target wasm32-unknown-unknown` with `-D warnings` for every crate that claims wasm (budget, ground, core, web, wgpu, planetary, terrain, camera, atmosphere, film, film-gpu, ui), and clippy for the viewer's web shell.
 6. `web-package`: the wasm build and bindings of `packages/tuile-viewer` (wasm-bindgen at the locked version), its typings, and a bundler build of `examples/web-viewer-vite`.
-7. `android`: clippy for `aarch64-linux-android` and the APK through `crates/tuile-viewer/android/build.sh`.
+7. `android`: the APK through `crates/tuile-viewer/android/build.sh` (a cross-build for `aarch64-linux-android`; no clippy there, so the lints of the android-only `cfg` code are not checked).
 8. `docs`: `cargo doc --workspace --no-deps` with `-D warnings`.
 
 Release workflows, on a `vX.Y.Z` tag: `release-apps.yml` (macOS, iOS, Android) and `release-crates.yml` (crates.io, behind the `CRATES_IO_PUBLISH` variable) — `docs/releasing.md`.
