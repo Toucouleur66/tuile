@@ -93,7 +93,7 @@ pub struct SessionConfig {
     /// which imagery layers' far tiles are draped from a substitute
     /// (`docs/explorations/imagery-layer-substitution.md`). None, the
     /// default, substitutes nothing; a rule names a substitute only where
-    /// the globe was opened with one ([`crate::GlobeConfig::substitute`]).
+    /// the globe was opened with one (`GlobeConfig::substitute_asset_id`).
     /// Batch decides it from each frame alone: the near level of the frame.
     pub fallbacks: tuile_core::budget::FallbackSpec,
 }
