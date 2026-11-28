@@ -18,7 +18,10 @@
 //!   the disk still (a memory eviction writes it there; a reclaimed block's
 //!   entry may have a newer copy elsewhere), so it is asked of the store's
 //!   index ([`Ledger::settle`]) and leaves the ledger once the index says
-//!   it is gone;
+//!   it is gone — but only once the store's writes queued when it was let
+//!   go of have landed (a *barrier*, [`Ledger::begin_barrier`]): an entry
+//!   the memory tier evicts while its write is still in the queue is not in
+//!   the index yet, and is not gone;
 //! - the ledger is written next to the store when the store closes, and
 //!   read back when it opens again, each entry kept only if the index
 //!   still holds it.
@@ -52,8 +55,22 @@ struct Inner {
     groups: HashMap<String, ByLevel>,
     /// Keys let go of by the memory tier, and hashes by the disk, to ask
     /// the index about; with how many times they were asked.
-    suspect_keys: Vec<(String, u8)>,
-    suspect_hashes: Vec<(u64, u8)>,
+    suspect_keys: Vec<Suspect<String>>,
+    suspect_hashes: Vec<Suspect<u64>>,
+    /// Barriers begun, and the highest one done: a barrier is the store's
+    /// queued writes all landed.
+    begun: u64,
+    done: u64,
+}
+
+/// A key or hash to ask the index about once a barrier begun after it was
+/// let go of is done.
+struct Suspect<T> {
+    what: T,
+    /// The barriers begun when it was let go of.
+    seen: u64,
+    /// How many times the index was asked.
+    tries: u8,
 }
 
 /// See the module.
@@ -126,7 +143,12 @@ impl Ledger {
     pub(crate) fn suspect_key(&self, key: &str) {
         let mut i = self.inner();
         if i.keys.contains_key(key) {
-            i.suspect_keys.push((key.to_owned(), 0));
+            let seen = i.begun;
+            i.suspect_keys.push(Suspect {
+                what: key.to_owned(),
+                seen,
+                tries: 0,
+            });
         }
     }
 
@@ -134,37 +156,68 @@ impl Ledger {
     pub(crate) fn suspect_hash(&self, hash: u64) {
         let mut i = self.inner();
         if i.by_hash.contains_key(&hash) {
-            i.suspect_hashes.push((hash, 0));
+            let seen = i.begun;
+            i.suspect_hashes.push(Suspect {
+                what: hash,
+                seen,
+                tries: 0,
+            });
         }
     }
 
-    /// Asks `holds` — the store's index — about every suspect: those it no
-    /// longer holds leave the ledger.
+    /// Begins a barrier if a suspect waits for one: the caller waits for
+    /// the store's queued writes to land, then calls [`Ledger::barrier_done`]
+    /// with the number returned.
+    pub(crate) fn begin_barrier(&self) -> Option<u64> {
+        let mut i = self.inner();
+        let begun = i.begun;
+        let waiting = i.suspect_keys.iter().any(|s| s.seen >= begun)
+            || i.suspect_hashes.iter().any(|s| s.seen >= begun);
+        waiting.then(|| {
+            i.begun += 1;
+            i.begun
+        })
+    }
+
+    /// The writes queued when barrier `n` began have landed.
+    pub(crate) fn barrier_done(&self, n: u64) {
+        let mut i = self.inner();
+        i.done = i.done.max(n);
+    }
+
+    /// Asks `holds` — the store's index — about every suspect a barrier
+    /// begun after it was let go of has passed: those it no longer holds
+    /// leave the ledger. The others wait.
     pub(crate) fn settle(&self, holds: impl Fn(&str) -> bool) {
         let mut i = self.inner();
-        let keys = std::mem::take(&mut i.suspect_keys);
-        let hashes = std::mem::take(&mut i.suspect_hashes);
-        let mut again = Vec::new();
-        for (key, tries) in keys {
-            if !holds(&key) {
-                i.forget(&key);
-            } else if tries + 1 < PATIENCE {
-                again.push((key, tries + 1));
+        let done = i.done;
+        let (ready, mut waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut i.suspect_keys)
+            .into_iter()
+            .partition(|s| s.seen < done);
+        for mut s in ready {
+            if !holds(&s.what) {
+                i.forget(&s.what);
+            } else if s.tries + 1 < PATIENCE {
+                s.tries += 1;
+                waiting.push(s);
             }
         }
-        let mut again_h = Vec::new();
-        for (hash, tries) in hashes {
-            let Some(key) = i.by_hash.get(&hash).cloned() else {
+        i.suspect_keys = waiting;
+        let (ready, mut waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut i.suspect_hashes)
+            .into_iter()
+            .partition(|s| s.seen < done);
+        for mut s in ready {
+            let Some(key) = i.by_hash.get(&s.what).cloned() else {
                 continue;
             };
             if !holds(&key) {
                 i.forget(&key);
-            } else if tries + 1 < PATIENCE {
-                again_h.push((hash, tries + 1));
+            } else if s.tries + 1 < PATIENCE {
+                s.tries += 1;
+                waiting.push(s);
             }
         }
-        i.suspect_keys = again;
-        i.suspect_hashes = again_h;
+        i.suspect_hashes = waiting;
     }
 
     /// `group`'s tiles and bytes by level, added into `out`.
@@ -237,6 +290,13 @@ mod tests {
         out
     }
 
+    /// The queued writes landed: every suspect so far may be asked.
+    fn landed(l: &Ledger) {
+        if let Some(n) = l.begin_barrier() {
+            l.barrier_done(n);
+        }
+    }
+
     /// A put counts at its group and level; put again, its new size; an
     /// absence and a key of another shape are not tiles.
     #[test]
@@ -270,11 +330,14 @@ mod tests {
         l.put("img/a/12/1/2", 1, 100, false);
         l.put("img/a/12/1/3", 2, 50, false);
         l.suspect_key("img/a/12/1/2");
+        landed(&l);
         l.settle(|_| true);
         assert_eq!(group(&l, "img/a")[12], [2, 150], "still held: on the disk");
         l.suspect_hash(2);
+        landed(&l);
         l.settle(|k| k != "img/a/12/1/3");
         assert_eq!(group(&l, "img/a")[12], [1, 100], "reclaimed from the disk");
+        landed(&l);
         l.settle(|_| false);
         assert_eq!(
             group(&l, "img/a")[12],
@@ -282,6 +345,27 @@ mod tests {
             "the memory tier's suspect, gone at last"
         );
         assert_eq!(l.len(), 0);
+    }
+
+    /// A suspect is not asked about before the writes queued when it was
+    /// let go of have landed: the index does not hold what is still queued.
+    #[test]
+    fn a_suspect_waits_for_the_queued_writes() {
+        let l = Ledger::default();
+        l.put("img/a/12/1/2", 1, 100, false);
+        l.suspect_key("img/a/12/1/2");
+        let n = l.begin_barrier().expect("a suspect waits");
+        // Let go of after the barrier began: it needs the next one.
+        l.put("img/a/12/1/3", 2, 50, false);
+        l.suspect_key("img/a/12/1/3");
+        l.settle(|_| false);
+        assert_eq!(group(&l, "img/a")[12], [2, 150], "no barrier is done");
+        l.barrier_done(n);
+        l.settle(|_| false);
+        assert_eq!(group(&l, "img/a")[12], [1, 50], "only the first has passed");
+        landed(&l);
+        l.settle(|_| false);
+        assert_eq!(group(&l, "img/a")[12], [0, 0]);
     }
 
     /// Written and read back, the ledger keeps what the index still holds.
